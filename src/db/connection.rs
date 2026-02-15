@@ -1,6 +1,7 @@
 use oracle::{Connection, Error as OracleError};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::session::SessionState;
 
@@ -178,31 +179,146 @@ impl Default for DatabaseConnection {
 
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
+static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn db_activity_slot() -> &'static Mutex<Option<String>> {
+    ACTIVE_DB_ACTIVITY.get_or_init(|| Mutex::new(None))
+}
+
+fn set_current_db_activity(activity: Option<String>) {
+    match db_activity_slot().lock() {
+        Ok(mut guard) => {
+            *guard = activity;
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            *poisoned.into_inner() = activity;
+        }
+    }
+}
+
+pub fn current_db_activity() -> Option<String> {
+    match db_activity_slot().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+pub fn format_connection_busy_message() -> String {
+    match current_db_activity() {
+        Some(activity) => format!(
+            "Connection is busy. Current DB activity: {}",
+            activity
+        ),
+        None => "Connection is busy. Try again after the current operation finishes."
+            .to_string(),
+    }
+}
+
+pub struct ConnectionLockGuard<'a> {
+    guard: MutexGuard<'a, DatabaseConnection>,
+    tracks_activity: bool,
+}
+
+impl<'a> ConnectionLockGuard<'a> {
+    fn with_activity(mut self, activity: String) -> Self {
+        set_current_db_activity(Some(activity));
+        self.tracks_activity = true;
+        self
+    }
+}
+
+impl<'a> Deref for ConnectionLockGuard<'a> {
+    type Target = DatabaseConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a> DerefMut for ConnectionLockGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<'a> Drop for ConnectionLockGuard<'a> {
+    fn drop(&mut self) {
+        if self.tracks_activity {
+            set_current_db_activity(None);
+        }
+    }
+}
+
 pub fn create_shared_connection() -> SharedConnection {
     Arc::new(Mutex::new(DatabaseConnection::new()))
 }
 
-pub fn lock_connection(connection: &SharedConnection) -> MutexGuard<'_, DatabaseConnection> {
-    match connection.lock() {
+pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_> {
+    let guard = match connection.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             eprintln!("Warning: database connection lock was poisoned; recovering.");
             poisoned.into_inner()
         }
+    };
+    ConnectionLockGuard {
+        guard,
+        tracks_activity: false,
     }
+}
+
+pub fn lock_connection_with_activity(
+    connection: &SharedConnection,
+    activity: impl Into<String>,
+) -> ConnectionLockGuard<'_> {
+    lock_connection(connection).with_activity(activity.into())
 }
 
 /// Try to acquire the connection lock without blocking.
 /// Returns None if the lock is already held (query is running).
 pub fn try_lock_connection(
     connection: &SharedConnection,
-) -> Option<MutexGuard<'_, DatabaseConnection>> {
+) -> Option<ConnectionLockGuard<'_>> {
     match connection.try_lock() {
-        Ok(guard) => Some(guard),
+        Ok(guard) => Some(ConnectionLockGuard {
+            guard,
+            tracks_activity: false,
+        }),
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
             eprintln!("Warning: database connection lock was poisoned; recovering.");
-            Some(poisoned.into_inner())
+            Some(ConnectionLockGuard {
+                guard: poisoned.into_inner(),
+                tracks_activity: false,
+            })
+        }
+    }
+}
+
+pub fn try_lock_connection_with_activity(
+    connection: &SharedConnection,
+    activity: impl Into<String>,
+) -> Option<ConnectionLockGuard<'_>> {
+    match connection.try_lock() {
+        Ok(guard) => {
+            set_current_db_activity(Some(activity.into()));
+            Some(ConnectionLockGuard {
+                guard,
+                tracks_activity: true,
+            })
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            set_current_db_activity(Some(activity.into()));
+            Some(ConnectionLockGuard {
+                guard: poisoned.into_inner(),
+                tracks_activity: true,
+            })
         }
     }
 }

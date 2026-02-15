@@ -21,8 +21,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    lock_connection, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem, QueryExecutor,
-    QueryResult, ScriptItem, SessionState, ToolCommand,
+    lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
+    QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
 use crate::ui::SQL_KEYWORDS;
 
@@ -46,6 +46,25 @@ const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(0);
 const PROGRESS_ROWS_MAX_BATCH: usize = 1;
 
 impl SqlEditorWidget {
+    fn db_activity_label_for_sql(sql: &str, script_mode: bool) -> String {
+        let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = if compact.is_empty() {
+            "<empty>".to_string()
+        } else {
+            compact.chars().take(72).collect::<String>()
+        };
+        let preview = if compact.chars().count() > 72 {
+            format!("{}...", preview)
+        } else {
+            preview
+        };
+        if script_mode {
+            format!("Executing script: {}", preview)
+        } else {
+            format!("Executing SQL: {}", preview)
+        }
+    }
+
     pub fn execute_sql_text(&self, sql: &str) {
         self.execute_sql(sql, false);
     }
@@ -2948,7 +2967,7 @@ impl SqlEditorWidget {
         }
 
         if *self.query_running.borrow() {
-            fltk::dialog::alert_default("A query is already running");
+            self.emit_status("A query is already running. Please wait for it to finish.");
             return;
         }
 
@@ -2967,9 +2986,8 @@ impl SqlEditorWidget {
         // Pre-check connection status without holding lock for long
         {
             let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
-                fltk::dialog::alert_default(
-                    "Connection is busy. Try again after the current operation finishes.",
-                );
+                let busy_message = crate::db::format_connection_busy_message();
+                self.emit_status(&busy_message);
                 return;
             };
 
@@ -2989,6 +3007,7 @@ impl SqlEditorWidget {
         let shared_connection = self.connection.clone();
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let sql_text = sql.to_string();
+        let db_activity = Self::db_activity_label_for_sql(&sql_text, script_mode);
         let sender = self.progress_sender.clone();
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
@@ -3011,7 +3030,8 @@ impl SqlEditorWidget {
                 }
 
                 // Acquire connection lock inside thread and hold it during execution
-                let mut conn_guard = lock_connection(&shared_connection);
+                let mut conn_guard =
+                    lock_connection_with_activity(&shared_connection, db_activity.clone());
 
                 let mut conn_opt = conn_guard.get_connection();
                 let mut conn_name = if conn_guard.is_connected() {

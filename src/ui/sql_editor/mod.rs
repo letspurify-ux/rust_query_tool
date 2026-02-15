@@ -821,9 +821,9 @@ impl SqlEditorWidget {
                                 }
                             }
                             UiActionResult::QueryAlreadyRunning => {
-                                fltk::dialog::message_default(
-                                    "A query is already running. Please wait for it to complete.",
-                                );
+                                let busy_message = crate::db::format_connection_busy_message();
+                                widget.emit_status(&busy_message);
+                                fltk::dialog::message_default(&busy_message);
                             }
                         }
                         if should_reset_cursor {
@@ -942,7 +942,10 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection(&connection) else {
+            let Some(conn_guard) = crate::db::try_lock_connection_with_activity(
+                &connection,
+                "Generating explain plan",
+            ) else {
                 // Query is already running, notify user
                 let _ = sender.send(UiActionResult::QueryAlreadyRunning);
                 app::awake();
@@ -1038,7 +1041,9 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection(&connection) else {
+            let Some(conn_guard) =
+                crate::db::try_lock_connection_with_activity(&connection, "Commit transaction")
+            else {
                 // Query is already running, notify user
                 let _ = sender.send(UiActionResult::QueryAlreadyRunning);
                 app::awake();
@@ -1065,7 +1070,9 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection(&connection) else {
+            let Some(conn_guard) =
+                crate::db::try_lock_connection_with_activity(&connection, "Rollback transaction")
+            else {
                 // Query is already running, notify user
                 let _ = sender.send(UiActionResult::QueryAlreadyRunning);
                 app::awake();

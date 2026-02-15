@@ -22,8 +22,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    create_shared_connection, lock_connection, try_lock_connection, ObjectBrowser, QueryResult,
-    SharedConnection,
+    create_shared_connection, format_connection_busy_message, lock_connection_with_activity,
+    try_lock_connection_with_activity, ObjectBrowser, QueryResult, SharedConnection,
 };
 use crate::ui::constants::*;
 use crate::ui::theme;
@@ -1202,9 +1202,13 @@ impl MainWindow {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
                 return;
             };
-            let mut s = state_for_status.borrow_mut();
-            let conn_info = s.connection_info.borrow().clone();
-            s.status_bar.set_label(&format_status(message, &conn_info));
+            match state_for_status.try_borrow_mut() {
+                Ok(mut s) => {
+                    let conn_info = s.connection_info.borrow().clone();
+                    s.status_bar.set_label(&format_status(message, &conn_info));
+                }
+                Err(_) => {}
+            };
         });
 
         let weak_state_for_find = Rc::downgrade(state);
@@ -1321,7 +1325,10 @@ impl MainWindow {
                         let connection = s.connection.clone();
                         thread::spawn(move || {
                             let conn = {
-                                let conn_guard = lock_connection(&connection);
+                                let conn_guard = lock_connection_with_activity(
+                                    &connection,
+                                    "Loading schema metadata",
+                                );
                                 conn_guard.get_connection()
                             };
                             if let Some(conn) = conn {
@@ -1369,6 +1376,16 @@ impl MainWindow {
                 QueryProgress::BatchFinished => {
                     s.result_tabs.finish_all_streaming();
                     s.fetch_row_counts.clear();
+                    let current_status = s.status_bar.label().to_ascii_lowercase();
+                    let needs_reset = current_status.contains("executing query")
+                        || current_status.contains("fetching rows")
+                        || current_status.contains("connection is busy")
+                        || current_status.contains("query is already running");
+                    if needs_reset {
+                        let conn_info = s.connection_info.borrow().clone();
+                        s.status_bar
+                            .set_label(&format_status("Ready", &conn_info));
+                    }
                 }
             }
         });
@@ -1442,7 +1459,10 @@ impl MainWindow {
                         s.status_bar.set_label(&format!("Connecting to {}...", info.display_string()));
                     }
                     thread::spawn(move || {
-                        let mut db_conn = lock_connection(&connection);
+                        let mut db_conn = lock_connection_with_activity(
+                            &connection,
+                            format!("Connecting to {}", info.name),
+                        );
                         match db_conn.connect(info.clone()) {
                             Ok(_) => {
                                 let session = db_conn.session_state();
@@ -1470,10 +1490,15 @@ impl MainWindow {
             }
             "File/Disconnect" => {
                 let connection = state.borrow().connection.clone();
-                let Some(mut db_conn) = try_lock_connection(&connection) else {
-                    fltk::dialog::alert_default(
-                        "Connection is busy. Try again after the current operation finishes.",
-                    );
+                let Some(mut db_conn) =
+                    try_lock_connection_with_activity(&connection, "Disconnecting session")
+                else {
+                    let busy_message = format_connection_busy_message();
+                    fltk::dialog::alert_default(&busy_message);
+                    let mut s = state.borrow_mut();
+                    let conn_info = s.connection_info.borrow().clone();
+                    s.status_bar
+                        .set_label(&format_status(&busy_message, &conn_info));
                     return true;
                 };
                 db_conn.disconnect();
@@ -1775,12 +1800,18 @@ impl MainWindow {
                     let s = state.borrow();
                     s.connection.clone()
                 };
-                if let Some(mut connection) = crate::db::try_lock_connection(&connection) {
+                if let Some(mut connection) = try_lock_connection_with_activity(
+                    &connection,
+                    "Updating auto-commit setting",
+                ) {
                     connection.set_auto_commit(enabled);
                 } else {
-                    fltk::dialog::alert_default(
-                        "Connection is busy. Try again after the current operation finishes.",
-                    );
+                    let busy_message = format_connection_busy_message();
+                    fltk::dialog::alert_default(&busy_message);
+                    let mut s = state.borrow_mut();
+                    let conn_info = s.connection_info.borrow().clone();
+                    s.status_bar
+                        .set_label(&format_status(&busy_message, &conn_info));
                     if let Some(mut item) = item.take() {
                         if enabled {
                             item.clear();
@@ -1988,6 +2019,23 @@ impl MainWindow {
         let mut state_borrow = state.borrow_mut();
 
         // Setup object browser callback
+        let weak_state_for_browser_status = Rc::downgrade(&state);
+        state_borrow
+            .object_browser
+            .set_status_callback(move |message| {
+                let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
+                    return;
+                };
+                match state_for_status.try_borrow_mut() {
+                    Ok(mut s) => {
+                        let conn_info = s.connection_info.borrow().clone();
+                        s.status_bar
+                            .set_label(&format_status(message, &conn_info));
+                    }
+                    Err(_) => {}
+                };
+            });
+
         let weak_state_for_browser = Rc::downgrade(&state);
         state_borrow.object_browser.set_sql_callback(move |action| {
             let Some(state_for_browser) = weak_state_for_browser.upgrade() else {
@@ -2179,7 +2227,10 @@ impl MainWindow {
                                     let connection = s.connection.clone();
                                     thread::spawn(move || {
                                         let conn = {
-                                            let conn_guard = lock_connection(&connection);
+                                            let conn_guard = lock_connection_with_activity(
+                                                &connection,
+                                                "Loading schema metadata",
+                                            );
                                             conn_guard.get_connection()
                                         };
                                         if let Some(conn) = conn {

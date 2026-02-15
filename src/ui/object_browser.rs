@@ -12,9 +12,9 @@ use std::rc::Rc;
 use std::thread;
 
 use crate::db::{
-    lock_connection, try_lock_connection, CompilationError, ConstraintInfo, IndexInfo,
-    ObjectBrowser, PackageRoutine, ProcedureArgument, SequenceInfo, SharedConnection, SynonymInfo,
-    TableColumnDetail,
+    format_connection_busy_message, lock_connection_with_activity,
+    try_lock_connection_with_activity, CompilationError, ConstraintInfo, IndexInfo, ObjectBrowser,
+    PackageRoutine, ProcedureArgument, SequenceInfo, SharedConnection, SynonymInfo, TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::FontProfile;
@@ -31,6 +31,7 @@ pub enum SqlAction {
 
 /// Callback type for executing SQL from object browser
 pub type SqlExecuteCallback = Rc<RefCell<Option<Box<dyn FnMut(SqlAction)>>>>;
+type StatusCallback = Rc<RefCell<Option<Box<dyn FnMut(&str)>>>>;
 
 #[derive(Clone)]
 enum ObjectItem {
@@ -100,6 +101,7 @@ pub struct ObjectBrowserWidget {
     tree: Tree,
     connection: SharedConnection,
     sql_callback: SqlExecuteCallback,
+    status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Rc<RefCell<ObjectCache>>,
     refresh_sender: std::sync::mpsc::Sender<ObjectCache>,
@@ -171,6 +173,7 @@ impl ObjectBrowserWidget {
         }
 
         let sql_callback: SqlExecuteCallback = Rc::new(RefCell::new(None));
+        let status_callback: StatusCallback = Rc::new(RefCell::new(None));
         let object_cache = Rc::new(RefCell::new(ObjectCache::default()));
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<ObjectCache>();
@@ -183,6 +186,7 @@ impl ObjectBrowserWidget {
             filter_input,
             object_cache,
             sql_callback,
+            status_callback,
             refresh_sender,
             action_sender,
         };
@@ -286,6 +290,7 @@ impl ObjectBrowserWidget {
         action_receiver: std::sync::mpsc::Receiver<ObjectActionResult>,
     ) {
         let sql_callback = self.sql_callback.clone();
+        let status_callback = self.status_callback.clone();
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
@@ -296,6 +301,7 @@ impl ObjectBrowserWidget {
         fn schedule_poll(
             receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectActionResult>>>,
             sql_callback: SqlExecuteCallback,
+            status_callback: StatusCallback,
             mut tree: Tree,
             object_cache: Rc<RefCell<ObjectCache>>,
             filter_input: Input,
@@ -563,9 +569,12 @@ impl ObjectBrowserWidget {
                             }
                         },
                         ObjectActionResult::QueryAlreadyRunning => {
-                            fltk::dialog::message_default(
-                                "A query is already running. Please wait for it to complete.",
+                            let busy_message = format_connection_busy_message();
+                            ObjectBrowserWidget::emit_status_callback(
+                                &status_callback,
+                                &busy_message,
                             );
+                            fltk::dialog::message_default(&busy_message);
                         }
                     },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -584,6 +593,7 @@ impl ObjectBrowserWidget {
                 schedule_poll(
                     Rc::clone(&receiver),
                     sql_callback.clone(),
+                    status_callback.clone(),
                     tree.clone(),
                     Rc::clone(&object_cache),
                     filter_input.clone(),
@@ -591,12 +601,20 @@ impl ObjectBrowserWidget {
             });
         }
 
-        schedule_poll(receiver, sql_callback, tree, object_cache, filter_input);
+        schedule_poll(
+            receiver,
+            sql_callback,
+            status_callback,
+            tree,
+            object_cache,
+            filter_input,
+        );
     }
 
     fn setup_callbacks(&mut self) {
         let connection = self.connection.clone();
         let sql_callback = self.sql_callback.clone();
+        let status_callback = self.status_callback.clone();
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
 
@@ -620,6 +638,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &item,
                                 &sql_callback,
+                                &status_callback,
                                 &action_sender,
                             );
                         } else if let Some(item) = t.first_selected_item() {
@@ -627,6 +646,7 @@ impl ObjectBrowserWidget {
                                 &connection,
                                 &item,
                                 &sql_callback,
+                                &status_callback,
                                 &action_sender,
                             );
                         }
@@ -651,10 +671,23 @@ impl ObjectBrowserWidget {
                                         if should_fetch {
                                             let connection = connection.clone();
                                             let sender = action_sender.clone();
+                                            Self::emit_status_callback(
+                                                &status_callback,
+                                                &format!(
+                                                    "Loading package members for {}",
+                                                    package_name
+                                                ),
+                                            );
                                             thread::spawn(move || {
                                                 // Try to acquire connection lock without blocking
                                                 let Some(conn_guard) =
-                                                    try_lock_connection(&connection)
+                                                    try_lock_connection_with_activity(
+                                                        &connection,
+                                                        format!(
+                                                            "Loading package members for {}",
+                                                            package_name
+                                                        ),
+                                                    )
                                                 else {
                                                     // Query is already running, notify user
                                                     let _ = sender.send(
@@ -1186,6 +1219,7 @@ impl ObjectBrowserWidget {
         connection: &SharedConnection,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
+        status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
     ) {
         if let Some(item_info) = Self::get_item_info(item) {
@@ -1249,7 +1283,14 @@ impl ObjectBrowserWidget {
 
                 match (choice_label.as_str(), &item_info) {
                     ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
-                        let Some(conn_guard) = try_lock_connection(connection) else {
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Preparing SELECT TOP 100 for {}", object_name),
+                        );
+                        let Some(conn_guard) = try_lock_connection_with_activity(
+                            connection,
+                            format!("Preparing SELECT TOP 100 for {}", object_name),
+                        ) else {
                             let _ = action_sender.send(ObjectActionResult::QueryAlreadyRunning);
                             app::awake();
                             return;
@@ -1284,9 +1325,16 @@ impl ObjectBrowserWidget {
                         } else {
                             "PROCEDURE".to_string()
                         };
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Loading {} arguments for {}", routine_type, object_name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Loading {} arguments for {}", routine_type, object_name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1336,9 +1384,22 @@ impl ObjectBrowserWidget {
                         let package_name = package_name.clone();
                         let routine_name = routine_name.clone();
                         let routine_type = routine_type.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!(
+                                "Loading {} arguments for {}",
+                                routine_type, qualified_name
+                            ),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!(
+                                    "Loading {} arguments for {}",
+                                    routine_type, qualified_name
+                                ),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1391,9 +1452,16 @@ impl ObjectBrowserWidget {
                         let sender = action_sender.clone();
                         let object_name = object_name.clone();
                         let object_type = db_object_type.to_string();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Checking compilation status for {}", object_name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Checking compilation status for {}", object_name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1476,9 +1544,16 @@ impl ObjectBrowserWidget {
                         let connection = connection.clone();
                         let sender = action_sender.clone();
                         let table_name = object_name.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Loading table structure for {}", table_name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Loading table structure for {}", table_name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1503,9 +1578,16 @@ impl ObjectBrowserWidget {
                         let connection = connection.clone();
                         let sender = action_sender.clone();
                         let table_name = object_name.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Loading indexes for {}", table_name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Loading indexes for {}", table_name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1530,9 +1612,16 @@ impl ObjectBrowserWidget {
                         let connection = connection.clone();
                         let sender = action_sender.clone();
                         let table_name = object_name.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Loading constraints for {}", table_name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Loading constraints for {}", table_name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1564,9 +1653,16 @@ impl ObjectBrowserWidget {
                         let sender = action_sender.clone();
                         let name = object_name.clone();
                         let obj_type = object_type.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Loading {} info for {}", obj_type, name),
+                        );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection(&connection) else {
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                &connection,
+                                format!("Loading {} info for {}", obj_type, name),
+                            ) else {
                                 // Query is already running, notify user
                                 let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                 app::awake();
@@ -1652,9 +1748,19 @@ impl ObjectBrowserWidget {
                             let sender = action_sender.clone();
                             let object_type = obj_type.to_string();
                             let object_name = object_name.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Generating {} DDL for {}", object_type, object_name),
+                            );
                             thread::spawn(move || {
                                 // Try to acquire connection lock without blocking
-                                let Some(conn_guard) = try_lock_connection(&connection) else {
+                                let Some(conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!(
+                                        "Generating {} DDL for {}",
+                                        object_type, object_name
+                                    ),
+                                ) else {
                                     // Query is already running, notify user
                                     let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
                                     app::awake();
@@ -1772,18 +1878,46 @@ impl ObjectBrowserWidget {
         *self.sql_callback.borrow_mut() = Some(Box::new(callback));
     }
 
+    fn emit_status_callback(callback_slot: &StatusCallback, message: &str) {
+        let callback = {
+            let mut slot = callback_slot.borrow_mut();
+            slot.take()
+        };
+
+        if let Some(mut cb) = callback {
+            cb(message);
+            let mut slot = callback_slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+        }
+    }
+
+    fn emit_status(&self, message: &str) {
+        Self::emit_status_callback(&self.status_callback, message);
+    }
+
+    pub fn set_status_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&str) + 'static,
+    {
+        *self.status_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
     pub fn refresh(&mut self) {
         // First clear items and filter
         self.clear_items();
         self.filter_input.set_value("");
         *self.object_cache.borrow_mut() = ObjectCache::default();
+        self.emit_status("Refreshing object browser metadata");
 
         let sender = self.refresh_sender.clone();
         let connection = self.connection.clone();
 
         thread::spawn(move || {
             // Acquire connection lock and hold it during all queries
-            let conn_guard = lock_connection(&connection);
+            let conn_guard =
+                lock_connection_with_activity(&connection, "Refreshing object browser metadata");
             if !conn_guard.is_connected() {
                 return;
             }

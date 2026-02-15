@@ -1180,7 +1180,10 @@ impl SqlEditorWidget {
             // background column loading a chance when the connection is briefly busy.
             let mut conn_guard = None;
             for attempt in 0..Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                if let Some(guard) = crate::db::try_lock_connection(&connection) {
+                if let Some(guard) = crate::db::try_lock_connection_with_activity(
+                    &connection,
+                    format!("Loading columns for {}", table_key_for_thread),
+                ) {
                     conn_guard = Some(guard);
                     break;
                 }
@@ -2118,7 +2121,10 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection(&connection) else {
+            let Some(conn_guard) = crate::db::try_lock_connection_with_activity(
+                &connection,
+                format!("Quick describe {}", object_name),
+            ) else {
                 // Query is already running, notify user
                 let _ = sender.send(UiActionResult::QueryAlreadyRunning);
                 app::awake();

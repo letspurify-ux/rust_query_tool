@@ -1,6 +1,6 @@
 use fltk::{
     app,
-    enums::{Event, Key},
+    enums::{Align, Event, Key},
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
     text::{TextBuffer, TextDisplay},
@@ -57,6 +57,12 @@ impl ResultTabsWidget {
         }
     }
 
+    fn reset_tab_strip_left_anchor(&mut self) {
+        // Re-applying overflow mode resets FLTK's internal tab offset,
+        // keeping the visible strip anchored from the left.
+        self.tabs.handle_overflow(TabsOverflow::Pulldown);
+    }
+
     fn maybe_shrink_tab_storage(data: &mut Vec<ResultTab>) {
         // Avoid frequent shrinking; only compact when capacity is materially over-provisioned.
         let len = data.len();
@@ -105,6 +111,8 @@ impl ResultTabsWidget {
         tabs.set_selection_color(theme::selection_strong());
         tabs.set_label_color(theme::text_secondary());
         tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
+        // Center labels in tab headers.
+        tabs.set_tab_align(Align::Center);
         // Keep tab header widths stable while surrounding panes are resized.
         // `Compress` dynamically shrinks/expands tab buttons as width changes,
         // which causes distracting header size jumps during splitter drags.
@@ -123,6 +131,7 @@ impl ResultTabsWidget {
         let mut script_group = Group::new(x, y, w, h, None).with_label("Script Output");
         script_group.set_color(theme::panel_bg());
         script_group.set_label_color(theme::text_secondary());
+        script_group.set_align(Align::Center | Align::Inside);
         script_group.begin();
         let padding = constants::SCRIPT_OUTPUT_PADDING;
         let display_x = x + padding;
@@ -247,6 +256,7 @@ impl ResultTabsWidget {
             script_output.group.clone()
         };
         let _ = self.tabs.set_value(&script_group);
+        self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
         let script_output = self.script_output.borrow();
         let mut script_group = script_output.group.clone();
@@ -297,6 +307,7 @@ impl ResultTabsWidget {
         let mut group = Group::new(x, y, w, h, None).with_label(label);
         group.set_color(theme::panel_bg());
         group.set_label_color(theme::text_secondary());
+        group.set_align(Align::Center | Align::Inside);
 
         group.begin();
         let mut table = ResultTableWidget::with_size(x, y, w, h);
@@ -313,6 +324,7 @@ impl ResultTabsWidget {
         // when the tabs callback fires
         let group = self.data.borrow()[new_index].group.clone();
         let _ = self.tabs.set_value(&group);
+        self.reset_tab_strip_left_anchor();
         *self.active_index.borrow_mut() = Some(new_index);
     }
 

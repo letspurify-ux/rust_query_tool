@@ -1,4 +1,5 @@
 use fltk::{
+    enums::Align,
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
 };
@@ -63,6 +64,12 @@ impl QueryTabsWidget {
         }
     }
 
+    fn reset_tab_strip_left_anchor(&mut self) {
+        // Re-applying overflow mode resets FLTK's internal tab offset,
+        // keeping the visible strip anchored from the left.
+        self.tabs.handle_overflow(TabsOverflow::Pulldown);
+    }
+
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         let mut tabs = Tabs::new(x, y, w, h, None);
         tabs.end();
@@ -70,6 +77,8 @@ impl QueryTabsWidget {
         tabs.set_selection_color(theme::selection_strong());
         tabs.set_label_color(theme::text_secondary());
         tabs.set_label_size((TAB_HEADER_HEIGHT - 8).max(8));
+        // Center labels in tab headers.
+        tabs.set_tab_align(Align::Center);
         // Keep tab header widths stable while surrounding panes are resized.
         // `Compress` dynamically shrinks/expands tab buttons as width changes,
         // which causes distracting header size jumps during splitter drags.
@@ -138,6 +147,7 @@ impl QueryTabsWidget {
         let mut group = Group::new(x, y, w, h, None).with_label(&Self::display_label(label));
         group.set_color(theme::panel_bg());
         group.set_label_color(theme::text_secondary());
+        group.set_align(Align::Center | Align::Inside);
         group.end();
         self.tabs.end();
 
@@ -148,6 +158,7 @@ impl QueryTabsWidget {
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         let _ = self.tabs.set_value(&group);
+        self.reset_tab_strip_left_anchor();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         tab_id
@@ -158,6 +169,7 @@ impl QueryTabsWidget {
             let _suppress_guard =
                 CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
             let _ = self.tabs.set_value(&group);
+            self.reset_tab_strip_left_anchor();
             self.tabs.redraw();
         }
     }
@@ -176,6 +188,7 @@ impl QueryTabsWidget {
         if let Some(group) = self.tab_group(tab_id) {
             let mut group = group;
             group.set_label(&Self::display_label(label));
+            group.set_align(Align::Center | Align::Inside);
             self.tabs.redraw();
         }
     }
@@ -195,6 +208,7 @@ impl QueryTabsWidget {
             self.tabs.remove(&group);
         }
         fltk::group::Group::delete(group);
+        self.reset_tab_strip_left_anchor();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         true
