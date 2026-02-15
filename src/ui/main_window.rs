@@ -585,7 +585,24 @@ impl MainWindow {
                 fltk::enums::Event::Drag => {
                     if split_drag_active_for_tile.get() {
                         query_split_adjusted_for_tile.set(true);
-                        MainWindow::clamp_query_split_with(tile, &mut query_top_group_for_tile);
+                        let right_height = tile.h();
+                        if right_height > 0 {
+                            let max_query_height =
+                                (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+                            let split_pos = app::event_y() - tile.y();
+                            let desired_query_height =
+                                split_pos.clamp(MIN_QUERY_HEIGHT, max_query_height);
+                            query_top_group_for_tile.resize(
+                                tile.x(),
+                                tile.y(),
+                                tile.w(),
+                                desired_query_height,
+                            );
+                            MainWindow::clamp_query_split_with(
+                                tile,
+                                &mut query_top_group_for_tile,
+                            );
+                        }
                         return true;
                     }
                     false
@@ -911,17 +928,8 @@ impl MainWindow {
         }
 
         let max_query_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
-        let mut desired_query_height = query_top_group
-            .h()
-            .clamp(MIN_QUERY_HEIGHT, max_query_height);
-        if desired_query_height <= 0 {
-            desired_query_height = MIN_QUERY_HEIGHT;
-        }
-
-        let current_split_y = query_top_group.y() + query_top_group.h();
-        let target_split_y = right_tile.y() + desired_query_height;
-        right_tile.move_intersection(0, current_split_y, 0, target_split_y);
-        right_tile.redraw();
+        let desired_query_height = query_top_group.h().clamp(MIN_QUERY_HEIGHT, max_query_height);
+        Self::apply_query_split_layout(right_tile, query_top_group, desired_query_height);
     }
 
     fn adjust_query_layout_with(right_tile: &mut Tile, query_top_group: &mut Group) {
@@ -936,13 +944,39 @@ impl MainWindow {
         } else if desired_height > max_height {
             desired_height = max_height;
         }
-        query_top_group.resize(
-            query_top_group.x(),
-            query_top_group.y(),
-            query_top_group.w(),
-            desired_height,
-        );
-        Self::clamp_query_split_with(right_tile, query_top_group);
+        Self::apply_query_split_layout(right_tile, query_top_group, desired_height);
+    }
+
+    fn apply_query_split_layout(
+        right_tile: &mut Tile,
+        query_top_group: &mut Group,
+        desired_query_height: i32,
+    ) {
+        let right_height = right_tile.h().max(1);
+        let right_width = right_tile.w();
+        let tile_x = right_tile.x();
+        let tile_y = right_tile.y();
+
+        let max_query_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let mut query_height = desired_query_height.clamp(MIN_QUERY_HEIGHT, max_query_height);
+        if query_height >= right_height {
+            query_height = right_height.saturating_sub(1).max(1);
+        }
+        let result_y = tile_y + query_height;
+        let result_height = (right_height - query_height).max(1);
+        let top_ptr = query_top_group.as_widget_ptr();
+
+        query_top_group.resize(tile_x, tile_y, right_width, query_height);
+        for mut child in right_tile.clone().into_iter() {
+            let Some(mut child_group) = child.as_group() else {
+                continue;
+            };
+            if child_group.as_widget_ptr() == top_ptr {
+                continue;
+            }
+            child_group.resize(tile_x, result_y, right_width, result_height);
+        }
+        right_tile.redraw();
     }
 
     fn adjust_query_layout_on_resize(state: &AppState) {
