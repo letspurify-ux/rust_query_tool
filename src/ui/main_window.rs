@@ -54,6 +54,7 @@ pub struct AppState {
     pub connection: SharedConnection,
     query_tabs: QueryTabsWidget,
     query_top_group: Group,
+    pub query_split_bar: Frame,
     editor_tabs: Vec<QueryEditorTab>,
     active_editor_tab_id: QueryTabId,
     next_editor_tab_number: usize,
@@ -468,7 +469,8 @@ impl MainWindow {
         let tile_y = right_tile.y();
         let tile_w = right_tile.w().max(1);
         let tile_h = right_tile.h().max(1);
-        let max_initial_query_height = (tile_h - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let max_initial_query_height =
+            (tile_h - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
         let initial_query_height = 250.clamp(MIN_QUERY_HEIGHT, max_initial_query_height);
 
         right_tile.begin();
@@ -506,8 +508,8 @@ impl MainWindow {
         query_top_group.resizable(&query_top_flex);
         query_top_group.end();
 
-        let result_y = tile_y + initial_query_height;
-        let result_h = (tile_h - initial_query_height).max(1);
+        let result_y = tile_y + initial_query_height + QUERY_SPLIT_BAR_HEIGHT;
+        let result_h = (tile_h - initial_query_height - QUERY_SPLIT_BAR_HEIGHT).max(1);
         let mut result_bottom_group = Group::new(tile_x, result_y, tile_w, result_h, None);
         result_bottom_group.set_frame(FrameType::FlatBox);
         result_bottom_group.set_color(theme::panel_bg());
@@ -561,10 +563,18 @@ impl MainWindow {
         result_bottom_group.resizable(&result_bottom_flex);
 
         result_bottom_group.end();
+
+        let mut query_split_bar = Frame::default().with_size(tile_w, QUERY_SPLIT_BAR_HEIGHT);
+        query_split_bar.set_frame(FrameType::FlatBox);
+        query_split_bar.set_color(theme::border());
+        query_split_bar.set_tooltip("Drag to resize query and result panes");
+        query_split_bar.resize(tile_x, tile_y + initial_query_height, tile_w, QUERY_SPLIT_BAR_HEIGHT);
+
         right_tile.end();
 
         let query_split_adjusted_for_tile = query_split_adjusted.clone();
         let mut query_top_group_for_tile = query_top_group.clone();
+        let mut query_split_bar_for_tile = query_split_bar.clone();
         let split_drag_active = Rc::new(Cell::new(false));
         let split_drag_active_for_tile = split_drag_active.clone();
         right_tile.handle(move |tile, ev| {
@@ -572,8 +582,11 @@ impl MainWindow {
             match ev {
                 fltk::enums::Event::Push => {
                     if app::event_mouse_button() == fltk::app::MouseButton::Left {
-                        let split_y = query_top_group_for_tile.y() + query_top_group_for_tile.h();
-                        let near_split = (app::event_y() - split_y).abs() <= SPLIT_GRAB_MARGIN;
+                        let split_top = query_split_bar_for_tile.y();
+                        let split_bottom = split_top + query_split_bar_for_tile.h();
+                        let near_split =
+                            (app::event_y() >= split_top - SPLIT_GRAB_MARGIN)
+                                && (app::event_y() <= split_bottom + SPLIT_GRAB_MARGIN);
                         if near_split {
                             split_drag_active_for_tile.set(true);
                             query_split_adjusted_for_tile.set(true);
@@ -588,7 +601,8 @@ impl MainWindow {
                         let right_height = tile.h();
                         if right_height > 0 {
                             let max_query_height =
-                                (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+                                (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT)
+                                    .max(MIN_QUERY_HEIGHT);
                             let split_pos = app::event_y() - tile.y();
                             let desired_query_height =
                                 split_pos.clamp(MIN_QUERY_HEIGHT, max_query_height);
@@ -601,6 +615,7 @@ impl MainWindow {
                             MainWindow::clamp_query_split_with(
                                 tile,
                                 &mut query_top_group_for_tile,
+                                &mut query_split_bar_for_tile,
                             );
                         }
                         return true;
@@ -609,7 +624,11 @@ impl MainWindow {
                 }
                 fltk::enums::Event::Released => {
                     if split_drag_active_for_tile.replace(false) {
-                        MainWindow::clamp_query_split_with(tile, &mut query_top_group_for_tile);
+                        MainWindow::clamp_query_split_with(
+                            tile,
+                            &mut query_top_group_for_tile,
+                            &mut query_split_bar_for_tile,
+                        );
                         return true;
                     }
                     false
@@ -675,6 +694,7 @@ impl MainWindow {
             connection,
             query_tabs: query_tabs.clone(),
             query_top_group: query_top_group.clone(),
+            query_split_bar: query_split_bar.clone(),
             editor_tabs,
             active_editor_tab_id: first_tab_id,
             next_editor_tab_number: 2,
@@ -839,10 +859,15 @@ impl MainWindow {
     fn adjust_query_layout(state: &mut AppState) {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
+        let mut query_split_bar = state.query_split_bar.clone();
         if state.query_split_adjusted.get() {
-            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group);
+            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group, &mut query_split_bar);
         } else {
-            Self::adjust_query_layout_with(&mut right_tile, &mut query_top_group);
+            Self::adjust_query_layout_with(
+                &mut right_tile,
+                &mut query_top_group,
+                &mut query_split_bar,
+            );
         }
     }
 
@@ -921,35 +946,56 @@ impl MainWindow {
         }
     }
 
-    fn clamp_query_split_with(right_tile: &mut Tile, query_top_group: &mut Group) {
+    fn clamp_query_split_with(
+        right_tile: &mut Tile,
+        query_top_group: &mut Group,
+        query_split_bar: &mut Frame,
+    ) {
         let right_height = right_tile.h();
         if right_height <= 0 {
             return;
         }
 
-        let max_query_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let max_query_height =
+            (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
         let desired_query_height = query_top_group.h().clamp(MIN_QUERY_HEIGHT, max_query_height);
-        Self::apply_query_split_layout(right_tile, query_top_group, desired_query_height);
+        Self::apply_query_split_layout(
+            right_tile,
+            query_top_group,
+            query_split_bar,
+            desired_query_height,
+        );
     }
 
-    fn adjust_query_layout_with(right_tile: &mut Tile, query_top_group: &mut Group) {
+    fn adjust_query_layout_with(
+        right_tile: &mut Tile,
+        query_top_group: &mut Group,
+        query_split_bar: &mut Frame,
+    ) {
         let right_height = right_tile.h();
         if right_height <= 0 {
             return;
         }
-        let max_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let max_height =
+            (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
         let mut desired_height = ((right_height as f32) * 0.4).round() as i32;
         if desired_height < MIN_QUERY_HEIGHT {
             desired_height = MIN_QUERY_HEIGHT;
         } else if desired_height > max_height {
             desired_height = max_height;
         }
-        Self::apply_query_split_layout(right_tile, query_top_group, desired_height);
+        Self::apply_query_split_layout(
+            right_tile,
+            query_top_group,
+            query_split_bar,
+            desired_height,
+        );
     }
 
     fn apply_query_split_layout(
         right_tile: &mut Tile,
         query_top_group: &mut Group,
+        query_split_bar: &mut Frame,
         desired_query_height: i32,
     ) {
         let right_height = right_tile.h().max(1);
@@ -957,13 +1003,15 @@ impl MainWindow {
         let tile_x = right_tile.x();
         let tile_y = right_tile.y();
 
-        let max_query_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let max_query_height =
+            (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
         let mut query_height = desired_query_height.clamp(MIN_QUERY_HEIGHT, max_query_height);
         if query_height >= right_height {
             query_height = right_height.saturating_sub(1).max(1);
         }
-        let result_y = tile_y + query_height;
-        let result_height = (right_height - query_height).max(1);
+        let split_bar_height = QUERY_SPLIT_BAR_HEIGHT.min(right_height.max(0));
+        let result_y = tile_y + query_height + split_bar_height;
+        let result_height = (right_height - query_height - split_bar_height).max(1);
         let top_ptr = query_top_group.as_widget_ptr();
 
         query_top_group.resize(tile_x, tile_y, right_width, query_height);
@@ -976,16 +1024,22 @@ impl MainWindow {
             }
             child_group.resize(tile_x, result_y, right_width, result_height);
         }
+        query_split_bar.resize(tile_x, tile_y + query_height, right_width, split_bar_height);
         right_tile.redraw();
     }
 
     fn adjust_query_layout_on_resize(state: &AppState) {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
+        let mut query_split_bar = state.query_split_bar.clone();
         if state.query_split_adjusted.get() {
-            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group);
+            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group, &mut query_split_bar);
         } else {
-            Self::adjust_query_layout_with(&mut right_tile, &mut query_top_group);
+            Self::adjust_query_layout_with(
+                &mut right_tile,
+                &mut query_top_group,
+                &mut query_split_bar,
+            );
         }
     }
 
