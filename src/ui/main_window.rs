@@ -967,7 +967,7 @@ impl MainWindow {
         let top_ptr = query_top_group.as_widget_ptr();
 
         query_top_group.resize(tile_x, tile_y, right_width, query_height);
-        for mut child in right_tile.clone().into_iter() {
+        for child in right_tile.clone().into_iter() {
             let Some(mut child_group) = child.as_group() else {
                 continue;
             };
@@ -1239,7 +1239,7 @@ impl MainWindow {
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::AutoCommitChanged { enabled } => {
                     if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
-                        if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit\t") {
+                        if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") {
                             if enabled {
                                 item.set();
                             } else {
@@ -1368,9 +1368,558 @@ impl MainWindow {
         });
     }
 
+    fn execute_menu_action(
+        state: &Rc<RefCell<AppState>>,
+        schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
+        conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+        choice: &str,
+    ) -> bool {
+        match choice {
+            "File/Connect..." => {
+                let (popups, connection) = {
+                    let s = state.borrow();
+                    (s.popups.clone(), s.connection.clone())
+                };
+                if let Some(info) = ConnectionDialog::show_with_registry(popups) {
+                    let conn_sender = conn_sender.clone();
+                    {
+                        let mut s = state.borrow_mut();
+                        s.status_bar.set_label(&format!("Connecting to {}...", info.display_string()));
+                    }
+                    thread::spawn(move || {
+                        let mut db_conn = lock_connection(&connection);
+                        match db_conn.connect(info.clone()) {
+                            Ok(_) => {
+                                let session = db_conn.session_state();
+                                drop(db_conn);
+                                match session.lock() {
+                                    Ok(mut guard) => guard.reset(),
+                                    Err(poisoned) => {
+                                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                                        poisoned.into_inner().reset();
+                                    }
+                                }
+                                let mut info = info;
+                                info.clear_password();
+                                let _ = conn_sender.send(ConnectionResult::Success(info));
+                                app::awake();
+                            }
+                            Err(e) => {
+                                let _ = conn_sender.send(ConnectionResult::Failure(e.to_string()));
+                                app::awake();
+                            }
+                        }
+                    });
+                }
+                true
+            }
+            "File/Disconnect" => {
+                let connection = state.borrow().connection.clone();
+                let Some(mut db_conn) = try_lock_connection(&connection) else {
+                    fltk::dialog::alert_default(
+                        "Connection is busy. Try again after the current operation finishes.",
+                    );
+                    return true;
+                };
+                db_conn.disconnect();
+                let session = db_conn.session_state();
+                drop(db_conn);
+                match session.lock() {
+                    Ok(mut guard) => guard.reset(),
+                    Err(poisoned) => {
+                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                        poisoned.into_inner().reset();
+                    }
+                }
+
+                let mut s = state.borrow_mut();
+                *s.connection_info.borrow_mut() = None;
+                s.status_bar.set_label("Disconnected");
+                let reset_data = IntellisenseData::new();
+                let reset_highlight = HighlightData::new();
+                MainWindow::apply_schema_to_all_editors(&mut s, &reset_data, &reset_highlight);
+                true
+            }
+            "File/Open SQL File..." => {
+                let mut dialog = FileDialog::new(FileDialogType::BrowseFile);
+                dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
+                dialog.show();
+                let filename = dialog.filename();
+                if !filename.as_os_str().is_empty() {
+                    let sender = file_sender.clone();
+                    thread::spawn(move || {
+                        let result = fs::read_to_string(&filename).map_err(|err| err.to_string());
+                        let _ = sender.send(FileActionResult::OpenInNewTab {
+                            path: filename,
+                            result,
+                        });
+                        app::awake();
+                    });
+                }
+                true
+            }
+            "File/Save SQL File..." => {
+                let tab_id = state.borrow().active_editor_tab_id;
+                if let SaveTabOutcome::Failed(err) =
+                    MainWindow::save_tab(state, tab_id, false)
+                {
+                    fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
+                }
+                true
+            }
+            "File/Save SQL File As..." => {
+                let tab_id = state.borrow().active_editor_tab_id;
+                if let SaveTabOutcome::Failed(err) =
+                    MainWindow::save_tab(state, tab_id, true)
+                {
+                    fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
+                }
+                true
+            }
+            "File/Exit" => {
+                let mut window = state.borrow().window.clone();
+                window.do_callback();
+                true
+            }
+            "Edit/Undo" => {
+                state.borrow().sql_editor.undo();
+                true
+            }
+            "Edit/Redo" => {
+                state.borrow().sql_editor.redo();
+                true
+            }
+            "Edit/Cut" => {
+                state.borrow_mut().sql_editor.get_editor().cut();
+                true
+            }
+            "Edit/Copy" => {
+                let mut s = state.borrow_mut();
+                let result_tabs_widget = s.result_tabs.get_widget();
+                let focus_in_results = if let Some(focus) = app::focus() {
+                    focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
+                        || focus.inside(&result_tabs_widget)
+                } else {
+                    false
+                };
+
+                if focus_in_results {
+                    let cell_count = s.result_tabs.copy();
+                    let conn_info = s.connection_info.borrow().clone();
+                    if cell_count > 0 {
+                        s.status_bar.set_label(&format_status(
+                            &format!("Copied {} cells to clipboard", cell_count),
+                            &conn_info,
+                        ));
+                    } else {
+                        s.status_bar.set_label(&format_status(
+                            "No cells selected to copy",
+                            &conn_info,
+                        ));
+                    }
+                } else {
+                    s.sql_editor.get_editor().copy();
+                }
+                true
+            }
+            "Edit/Copy with Headers" => {
+                let mut s = state.borrow_mut();
+                let result_tabs_widget = s.result_tabs.get_widget();
+                let focus_in_results = if let Some(focus) = app::focus() {
+                    focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
+                        || focus.inside(&result_tabs_widget)
+                } else {
+                    false
+                };
+
+                if focus_in_results {
+                    s.result_tabs.copy_with_headers();
+                    let conn_info = s.connection_info.borrow().clone();
+                    s.status_bar.set_label(&format_status(
+                        "Copied selection with headers",
+                        &conn_info,
+                    ));
+                } else {
+                    s.sql_editor.get_editor().copy();
+                }
+                true
+            }
+            "Edit/Paste" => {
+                state.borrow_mut().sql_editor.get_editor().paste();
+                true
+            }
+            "Edit/Select All" => {
+                let mut s = state.borrow_mut();
+                let result_tabs_widget = s.result_tabs.get_widget();
+                let focus_in_results = if let Some(focus) = app::focus() {
+                    focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
+                        || focus.inside(&result_tabs_widget)
+                } else {
+                    false
+                };
+
+                if focus_in_results {
+                    s.result_tabs.select_all();
+                } else {
+                    let len = s.sql_buffer.length();
+                    s.sql_buffer.select(0, len);
+                }
+                true
+            }
+            "Query/Execute" => {
+                state.borrow_mut().sql_editor.execute_current();
+                true
+            }
+            "Query/New Tab" => {
+                let created_tab_id = {
+                    let mut s = state.borrow_mut();
+                    let created = MainWindow::create_query_editor_tab(&mut s);
+                    s.right_tile.redraw();
+                    created
+                };
+                if let Some(tab_id) = created_tab_id {
+                    MainWindow::attach_editor_callbacks(state, tab_id, schema_sender.clone());
+                    MainWindow::attach_file_drop_callback(
+                        state,
+                        tab_id,
+                        file_sender.clone(),
+                    );
+                    state.borrow_mut().sql_editor.focus();
+                    app::redraw();
+                }
+                true
+            }
+            "Query/Close Tab" => {
+                let tab_id = state.borrow().active_editor_tab_id;
+                MainWindow::close_query_editor_tab(state, tab_id);
+                true
+            }
+            "Query/Execute Statement" => {
+                state.borrow_mut().sql_editor.execute_statement_at_cursor();
+                true
+            }
+            "Query/Execute Statement (F9)" => {
+                state.borrow_mut().sql_editor.execute_statement_at_cursor();
+                true
+            }
+            "Query/Execute Selected" => {
+                state.borrow_mut().sql_editor.execute_selected();
+                true
+            }
+            "Query/Quick Describe" => {
+                state.borrow_mut().sql_editor.quick_describe_at_cursor();
+                true
+            }
+            "Query/Explain Plan" => {
+                state.borrow_mut().sql_editor.explain_current();
+                true
+            }
+            "Query/Commit" => {
+                state.borrow_mut().sql_editor.commit();
+                true
+            }
+            "Query/Rollback" => {
+                state.borrow_mut().sql_editor.rollback();
+                true
+            }
+            "Tools/Refresh Objects" => {
+                state.borrow_mut().object_browser.refresh();
+                true
+            }
+            "Tools/Export Results..." => {
+                let has_data = state.borrow().result_tabs.has_data();
+                if !has_data {
+                    fltk::dialog::alert_default("No results to export");
+                    return true;
+                }
+
+                let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
+                dialog.set_filter("CSV Files\t*.csv");
+                dialog.show();
+                let filename = dialog.filename();
+                if filename.as_os_str().is_empty() {
+                    return true;
+                }
+
+                let csv = state.borrow().result_tabs.export_to_csv();
+                let row_count = state.borrow().result_tabs.row_count();
+                let sender = file_sender.clone();
+                thread::spawn(move || {
+                    let result = fs::write(&filename, csv).map_err(|err| err.to_string());
+                    let _ = sender.send(FileActionResult::Export { path: filename, row_count, result });
+                    app::awake();
+                });
+                true
+            }
+            "Edit/Find..." => {
+                let (mut editor, mut buffer, popups) = {
+                    let s = state.borrow_mut();
+                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                };
+                FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
+                true
+            }
+            "Edit/Find Next" => {
+                let (mut editor, mut buffer, popups) = {
+                    let s = state.borrow_mut();
+                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                };
+                if !FindReplaceDialog::find_next_from_session(&mut editor, &mut buffer)
+                    && !FindReplaceDialog::has_search_text()
+                {
+                    FindReplaceDialog::show_find_with_registry(
+                        &mut editor,
+                        &mut buffer,
+                        popups,
+                    );
+                }
+                true
+            }
+            "Edit/Replace..." => {
+                let (mut editor, mut buffer, popups) = {
+                    let s = state.borrow_mut();
+                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                };
+                FindReplaceDialog::show_replace_with_registry(&mut editor, &mut buffer, popups);
+                true
+            }
+            "Edit/Format SQL" => {
+                state.borrow_mut().sql_editor.format_selected_sql();
+                true
+            }
+            "Edit/Toggle Comment" => {
+                state.borrow_mut().sql_editor.toggle_comment();
+                true
+            }
+            "Edit/Uppercase Selection" => {
+                state.borrow_mut().sql_editor.convert_selection_case(true);
+                true
+            }
+            "Edit/Lowercase Selection" => {
+                state.borrow_mut().sql_editor.convert_selection_case(false);
+                true
+            }
+            "Edit/Intellisense" => {
+                state.borrow().sql_editor.show_intellisense();
+                true
+            }
+            "Tools/Query History..." => {
+                MainWindow::open_query_history_dialog(state);
+                true
+            }
+            "Tools/Auto-Commit" => {
+                let mut item = app::widget_from_id::<MenuBar>("main_menu")
+                    .and_then(|menu| menu.find_item("&Tools/&Auto-Commit"));
+                let enabled = item.as_ref().map(|item| item.value()).unwrap_or(false);
+                let status = if enabled {
+                    "Auto-commit enabled"
+                } else {
+                    "Auto-commit disabled"
+                };
+                let connection = {
+                    let s = state.borrow();
+                    s.connection.clone()
+                };
+                if let Some(mut connection) = crate::db::try_lock_connection(&connection) {
+                    connection.set_auto_commit(enabled);
+                } else {
+                    fltk::dialog::alert_default(
+                        "Connection is busy. Try again after the current operation finishes.",
+                    );
+                    if let Some(mut item) = item.take() {
+                        if enabled {
+                            item.clear();
+                        } else {
+                            item.set();
+                        }
+                    }
+                    return true;
+                }
+                let mut s = state.borrow_mut();
+                let conn_info = s.connection_info.borrow().clone();
+                s.status_bar.set_label(&format_status(status, &conn_info));
+                true
+            }
+            "Settings/Preferences..." => {
+                let config_snapshot = {
+                    let s = state.borrow();
+                    let config_snapshot = s.config.borrow().clone();
+                    config_snapshot
+                };
+                if let Some(settings) = show_settings_dialog(&config_snapshot) {
+                    let mut s = state.borrow_mut();
+                    let save_result = {
+                        let mut config = s.config.borrow_mut();
+                        config.editor_font = settings.font.clone();
+                        config.ui_font_size = settings.ui_size;
+                        config.editor_font_size = settings.editor_size;
+                        config.result_font = settings.font;
+                        config.result_font_size = settings.result_size;
+                        config.result_cell_max_chars = settings.result_cell_max_chars;
+                        config.save()
+                    };
+                    if let Err(err) = save_result {
+                        fltk::dialog::alert_default(&format!("Failed to save settings: {}", err));
+                    }
+                    MainWindow::apply_font_settings(&mut s);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn strip_menu_label_shortcut(path: &str) -> String {
+        let raw = path.split('\t').next().unwrap_or(path).trim();
+        let label = if let Some(open_paren) = raw.rfind(" (") {
+            if raw.ends_with(')') && raw[open_paren..].starts_with(" (") {
+                raw[..open_paren].trim_end()
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        label.replace('&', "")
+    }
+
+    fn menu_shortcut_for_key(
+        key: fltk::enums::Key,
+        modifiers: fltk::enums::Shortcut,
+    ) -> Option<&'static str> {
+        let ctrl_or_cmd =
+            modifiers.contains(fltk::enums::Shortcut::Ctrl) || modifiers.contains(fltk::enums::Shortcut::Command);
+        let shift = modifiers.contains(fltk::enums::Shortcut::Shift);
+
+        match key {
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('n') || k == fltk::enums::Key::from_char('N')) => {
+                Some("File/Connect...")
+            }
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('d')
+                    || k == fltk::enums::Key::from_char('D')) =>
+            {
+                Some("File/Disconnect")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('o') || k == fltk::enums::Key::from_char('O')) => {
+                Some("File/Open SQL File...")
+            }
+            k if ctrl_or_cmd
+                && !shift
+                && (k == fltk::enums::Key::from_char('s')
+                    || k == fltk::enums::Key::from_char('S')) =>
+            {
+                Some("File/Save SQL File...")
+            }
+            k if ctrl_or_cmd
+                && shift
+                && (k == fltk::enums::Key::from_char('s')
+                    || k == fltk::enums::Key::from_char('S')) =>
+            {
+                Some("File/Save SQL File As...")
+            }
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('q')
+                    || k == fltk::enums::Key::from_char('Q')) =>
+            {
+                Some("File/Exit")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('z') || k == fltk::enums::Key::from_char('Z')) => {
+                Some("Edit/Undo")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('y') || k == fltk::enums::Key::from_char('Y')) => {
+                Some("Edit/Redo")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('x') || k == fltk::enums::Key::from_char('X')) => {
+                Some("Edit/Cut")
+            }
+            k if ctrl_or_cmd
+                && shift
+                && (k == fltk::enums::Key::from_char('c') || k == fltk::enums::Key::from_char('C')) =>
+            {
+                Some("Edit/Copy with Headers")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('c') || k == fltk::enums::Key::from_char('C')) => {
+                Some("Edit/Copy")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('v') || k == fltk::enums::Key::from_char('V')) => {
+                Some("Edit/Paste")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('a') || k == fltk::enums::Key::from_char('A')) => {
+                Some("Edit/Select All")
+            }
+            fltk::enums::Key::F3 => Some("Edit/Find Next"),
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('h') || k == fltk::enums::Key::from_char('H')) => {
+                Some("Edit/Replace...")
+            }
+            k if ctrl_or_cmd && shift
+                && (k == fltk::enums::Key::from_char('f') || k == fltk::enums::Key::from_char('F')) =>
+            {
+                Some("Edit/Format SQL")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('f') || k == fltk::enums::Key::from_char('F')) => {
+                Some("Edit/Find...")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('/') || k == fltk::enums::Key::from_char('?')) => {
+                Some("Edit/Toggle Comment")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('u') || k == fltk::enums::Key::from_char('U')) => {
+                Some("Edit/Uppercase Selection")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('l') || k == fltk::enums::Key::from_char('L')) => {
+                Some("Edit/Lowercase Selection")
+            }
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char(' ') || k == fltk::enums::Key::from_char('\u{0020}')) => {
+                Some("Edit/Intellisense")
+            }
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('t')
+                    || k == fltk::enums::Key::from_char('T')) =>
+            {
+                Some("Query/New Tab")
+            }
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('w')
+                    || k == fltk::enums::Key::from_char('W')) =>
+            {
+                Some("Query/Close Tab")
+            }
+            fltk::enums::Key::F5 => Some("Query/Execute"),
+            k if ctrl_or_cmd && (k == fltk::enums::Key::Enter || k == fltk::enums::Key::KPEnter) => {
+                Some("Query/Execute Statement")
+            }
+            fltk::enums::Key::F9 => Some("Query/Execute Statement (F9)"),
+            fltk::enums::Key::F4 => Some("Query/Quick Describe"),
+            fltk::enums::Key::F6 => Some("Query/Explain Plan"),
+            fltk::enums::Key::F7 => Some("Query/Commit"),
+            fltk::enums::Key::F8 => Some("Query/Rollback"),
+            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('e') || k == fltk::enums::Key::from_char('E')) => {
+                Some("Tools/Export Results...")
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_window_shortcut(
+        state: &Rc<RefCell<AppState>>,
+        schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
+        conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+    ) -> bool {
+        let event_key = app::event_key();
+        let event_state = app::event_state();
+        let Some(action) = Self::menu_shortcut_for_key(event_key, event_state) else {
+            return false;
+        };
+        Self::execute_menu_action(state, schema_sender, conn_sender, file_sender, action)
+    }
+
     pub fn setup_callbacks(&mut self) {
         let state = self.state.clone();
         let (schema_sender, schema_receiver) = std::sync::mpsc::channel::<SchemaUpdate>();
+        let (conn_sender, conn_receiver) = std::sync::mpsc::channel::<ConnectionResult>();
+        let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
 
         let tab_ids: Vec<QueryTabId> = state
             .borrow()
@@ -1433,6 +1982,9 @@ impl MainWindow {
         });
 
         let weak_state_for_window = Rc::downgrade(&state);
+        let schema_sender_for_window = schema_sender.clone();
+        let conn_sender_for_window = conn_sender.clone();
+        let file_sender_for_window = file_sender.clone();
         state_borrow.window.handle(move |_w, ev| {
             let Some(state_for_window) = weak_state_for_window.upgrade() else {
                 return false;
@@ -1440,6 +1992,25 @@ impl MainWindow {
             match ev {
                 fltk::enums::Event::KeyDown => {
                     if app::event_key() == fltk::enums::Key::Escape {
+                        return true;
+                    }
+                    if MainWindow::handle_window_shortcut(
+                        &state_for_window,
+                        &schema_sender_for_window,
+                        &conn_sender_for_window,
+                        &file_sender_for_window,
+                    ) {
+                        return true;
+                    }
+                    false
+                }
+                fltk::enums::Event::Shortcut => {
+                    if MainWindow::handle_window_shortcut(
+                        &state_for_window,
+                        &schema_sender_for_window,
+                        &conn_sender_for_window,
+                        &file_sender_for_window,
+                    ) {
                         return true;
                     }
                     false
@@ -1464,17 +2035,26 @@ impl MainWindow {
         });
 
         drop(state_borrow);
-        self.setup_menu_callbacks(schema_sender, schema_receiver);
+        self.setup_menu_callbacks(
+            schema_sender,
+            schema_receiver,
+            conn_sender,
+            conn_receiver,
+            file_sender,
+            file_receiver,
+        );
     }
 
     fn setup_menu_callbacks(
         &mut self,
         schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
         schema_receiver: std::sync::mpsc::Receiver<SchemaUpdate>,
+        conn_sender: std::sync::mpsc::Sender<ConnectionResult>,
+        conn_receiver: std::sync::mpsc::Receiver<ConnectionResult>,
+        file_sender: std::sync::mpsc::Sender<FileActionResult>,
+        file_receiver: std::sync::mpsc::Receiver<FileActionResult>,
     ) {
         let state = self.state.clone();
-        let (conn_sender, conn_receiver) = std::sync::mpsc::channel::<ConnectionResult>();
-        let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
 
         // Wrap receivers in Rc<RefCell> to share across timeout callbacks
         let schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>> =
@@ -1724,393 +2304,29 @@ impl MainWindow {
 
         if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
             let weak_state_for_menu = Rc::downgrade(&state);
-            let file_sender = file_sender.clone();
+            let schema_sender_for_menu = schema_sender.clone();
+            let conn_sender_for_menu = conn_sender.clone();
+            let file_sender_for_menu = file_sender.clone();
             menu.set_callback(move |m| {
                 let Some(state_for_menu) = weak_state_for_menu.upgrade() else {
                     return;
                 };
                 let menu_path = m.item_pathname(None).ok().or_else(|| m.choice().map(|p| p.to_string()));
                 if let Some(path) = menu_path {
-                    let choice = path.split('\t').next().unwrap_or(&path).trim().replace('&', "");
-                    match choice.as_str() {
-                        "File/Connect..." => {
-                            let (popups, connection) = {
-                                let s = state_for_menu.borrow();
-                                (s.popups.clone(), s.connection.clone())
-                            };
-                            if let Some(info) = ConnectionDialog::show_with_registry(popups) {
-                                let conn_sender = conn_sender.clone();
-                                {
-                                    let mut s = state_for_menu.borrow_mut();
-                                    s.status_bar.set_label(&format!("Connecting to {}...", info.display_string()));
-                                }
-                                thread::spawn(move || {
-                                    let mut db_conn = lock_connection(&connection);
-                                    match db_conn.connect(info.clone()) {
-                                        Ok(_) => {
-                                            let session = db_conn.session_state();
-                                            drop(db_conn);
-                                            match session.lock() {
-                                                Ok(mut guard) => guard.reset(),
-                                                Err(poisoned) => {
-                                                    eprintln!(
-                                                        "Warning: session state lock was poisoned; recovering."
-                                                    );
-                                                    poisoned.into_inner().reset();
-                                                }
-                                            }
-                                            // Clear password before sending info across channel
-                                            let mut info = info;
-                                            info.clear_password();
-                                            let _ = conn_sender.send(ConnectionResult::Success(info));
-                                            app::awake();
-                                        }
-                                        Err(e) => {
-                                            let _ = conn_sender.send(ConnectionResult::Failure(e.to_string()));
-                                            app::awake();
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        "File/Disconnect" => {
-                            let connection = state_for_menu.borrow().connection.clone();
-                            let Some(mut db_conn) = try_lock_connection(&connection) else {
-                                fltk::dialog::alert_default(
-                                    "Connection is busy. Try again after the current operation finishes.",
-                                );
-                                return;
-                            };
-                            db_conn.disconnect();
-                            let session = db_conn.session_state();
-                            drop(db_conn);
-                            match session.lock() {
-                                Ok(mut guard) => guard.reset(),
-                                Err(poisoned) => {
-                                    eprintln!(
-                                        "Warning: session state lock was poisoned; recovering."
-                                    );
-                                    poisoned.into_inner().reset();
-                                }
-                            }
-
-                            let mut s = state_for_menu.borrow_mut();
-                            *s.connection_info.borrow_mut() = None;
-                            s.status_bar.set_label("Disconnected");
-                            let reset_data = IntellisenseData::new();
-                            let reset_highlight = HighlightData::new();
-                            MainWindow::apply_schema_to_all_editors(
-                                &mut s,
-                                &reset_data,
-                                &reset_highlight,
-                            );
-                        }
-                        "File/Open SQL File..." => {
-                            let mut dialog = FileDialog::new(FileDialogType::BrowseFile);
-                            dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
-                            dialog.show();
-                            let filename = dialog.filename();
-                            if !filename.as_os_str().is_empty() {
-                                let sender = file_sender.clone();
-                                thread::spawn(move || {
-                                    let result = fs::read_to_string(&filename)
-                                        .map_err(|err| err.to_string());
-                                    let _ = sender.send(FileActionResult::OpenInNewTab {
-                                        path: filename,
-                                        result,
-                                    });
-                                    app::awake();
-                                });
-                            }
-                        }
-                        "File/Save SQL File..." => {
-                            let tab_id = state_for_menu.borrow().active_editor_tab_id;
-                            if let SaveTabOutcome::Failed(err) =
-                                MainWindow::save_tab(&state_for_menu, tab_id, false)
-                            {
-                                fltk::dialog::alert_default(&format!(
-                                    "Failed to save SQL file: {}",
-                                    err
-                                ));
-                            }
-                        }
-                        "File/Save SQL File As..." => {
-                            let tab_id = state_for_menu.borrow().active_editor_tab_id;
-                            if let SaveTabOutcome::Failed(err) =
-                                MainWindow::save_tab(&state_for_menu, tab_id, true)
-                            {
-                                fltk::dialog::alert_default(&format!(
-                                    "Failed to save SQL file: {}",
-                                    err
-                                ));
-                            }
-                        }
-                        "File/Exit" => {
-                            let mut window = state_for_menu.borrow().window.clone();
-                            window.do_callback();
-                        }
-                        "Edit/Undo" => state_for_menu.borrow().sql_editor.undo(),
-                        "Edit/Redo" => state_for_menu.borrow().sql_editor.redo(),
-                        "Edit/Cut" => state_for_menu.borrow_mut().sql_editor.get_editor().cut(),
-                        "Edit/Copy" => {
-                            let mut s = state_for_menu.borrow_mut();
-                            let result_tabs_widget = s.result_tabs.get_widget();
-                            let focus_in_results = if let Some(focus) = app::focus() {
-                                focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr() ||
-                                focus.inside(&result_tabs_widget)
-                            } else {
-                                false
-                            };
-
-                            if focus_in_results {
-                                let cell_count = s.result_tabs.copy();
-                                let conn_info = s.connection_info.borrow().clone();
-                                if cell_count > 0 {
-                                    s.status_bar.set_label(&format_status(
-                                        &format!("Copied {} cells to clipboard", cell_count),
-                                        &conn_info,
-                                    ));
-                                } else {
-                                    s.status_bar.set_label(&format_status(
-                                        "No cells selected to copy",
-                                        &conn_info,
-                                    ));
-                                }
-                            } else {
-                                s.sql_editor.get_editor().copy();
-                            }
-                        }
-                        "Edit/Copy with Headers" => {
-                            let mut s = state_for_menu.borrow_mut();
-                            let result_tabs_widget = s.result_tabs.get_widget();
-                            let focus_in_results = if let Some(focus) = app::focus() {
-                                focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr() ||
-                                focus.inside(&result_tabs_widget)
-                            } else {
-                                false
-                            };
-
-                            if focus_in_results {
-                                s.result_tabs.copy_with_headers();
-                                let conn_info = s.connection_info.borrow().clone();
-                                s.status_bar.set_label(&format_status(
-                                    "Copied selection with headers",
-                                    &conn_info,
-                                ));
-                            } else {
-                                s.sql_editor.get_editor().copy();
-                            }
-                        }
-                        "Edit/Paste" => state_for_menu.borrow_mut().sql_editor.get_editor().paste(),
-                        "Edit/Select All" => {
-                            let mut s = state_for_menu.borrow_mut();
-                            let result_tabs_widget = s.result_tabs.get_widget();
-                            let focus_in_results = if let Some(focus) = app::focus() {
-                                focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr() ||
-                                focus.inside(&result_tabs_widget)
-                            } else {
-                                false
-                            };
-
-                            if focus_in_results {
-                                s.result_tabs.select_all();
-                            } else {
-                                let len = s.sql_buffer.length();
-                                s.sql_buffer.select(0, len);
-                            }
-                        }
-                        "Query/Execute" => state_for_menu.borrow_mut().sql_editor.execute_current(),
-                        "Query/New Tab" => {
-                            let created_tab_id = {
-                                let mut s = state_for_menu.borrow_mut();
-                                let created = MainWindow::create_query_editor_tab(&mut s);
-                                s.right_tile.redraw();
-                                created
-                            };
-                            if let Some(tab_id) = created_tab_id {
-                                MainWindow::attach_editor_callbacks(
-                                    &state_for_menu,
-                                    tab_id,
-                                    schema_sender.clone(),
-                                );
-                                MainWindow::attach_file_drop_callback(
-                                    &state_for_menu,
-                                    tab_id,
-                                    file_sender.clone(),
-                                );
-                                state_for_menu.borrow_mut().sql_editor.focus();
-                                app::redraw();
-                            }
-                        }
-                        "Query/Close Tab" => {
-                            let tab_id = state_for_menu.borrow().active_editor_tab_id;
-                            MainWindow::close_query_editor_tab(&state_for_menu, tab_id);
-                        }
-                        "Query/Execute Statement" => state_for_menu
-                            .borrow_mut()
-                            .sql_editor
-                            .execute_statement_at_cursor(),
-                        "Query/Execute Statement (F9)" => state_for_menu
-                            .borrow_mut()
-                            .sql_editor
-                            .execute_statement_at_cursor(),
-                        "Query/Execute Selected" => state_for_menu.borrow_mut().sql_editor.execute_selected(),
-                        "Query/Quick Describe" => {
-                            state_for_menu.borrow_mut().sql_editor.quick_describe_at_cursor();
-                        }
-                        "Query/Explain Plan" => state_for_menu.borrow_mut().sql_editor.explain_current(),
-                        "Query/Commit" => state_for_menu.borrow_mut().sql_editor.commit(),
-                        "Query/Rollback" => state_for_menu.borrow_mut().sql_editor.rollback(),
-                        "Tools/Refresh Objects" => state_for_menu.borrow_mut().object_browser.refresh(),
-                        "Tools/Export Results..." => {
-                            let has_data = state_for_menu.borrow().result_tabs.has_data();
-                            if !has_data {
-                                fltk::dialog::alert_default("No results to export");
-                                return;
-                            }
-
-                            let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
-                            dialog.set_filter("CSV Files\t*.csv");
-                            dialog.show();
-                            let filename = dialog.filename();
-                            if filename.as_os_str().is_empty() {
-                                return;
-                            }
-
-                            let csv = state_for_menu.borrow().result_tabs.export_to_csv();
-                            let row_count = state_for_menu.borrow().result_tabs.row_count();
-                            let sender = file_sender.clone();
-                            thread::spawn(move || {
-                                let result =
-                                    fs::write(&filename, csv).map_err(|err| err.to_string());
-                                let _ = sender.send(FileActionResult::Export {
-                                    path: filename,
-                                    row_count,
-                                    result,
-                                });
-                                app::awake();
-                            });
-                        }
-                        "Edit/Find..." => {
-                            let (mut editor, mut buffer, popups) = {
-                                let s = state_for_menu.borrow_mut();
-                                (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
-                            };
-                            FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
-                        }
-                        "Edit/Find Next" => {
-                            let (mut editor, mut buffer, popups) = {
-                                let s = state_for_menu.borrow_mut();
-                                (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
-                            };
-                            if !FindReplaceDialog::find_next_from_session(&mut editor, &mut buffer)
-                                && !FindReplaceDialog::has_search_text()
-                            {
-                                FindReplaceDialog::show_find_with_registry(
-                                    &mut editor,
-                                    &mut buffer,
-                                    popups,
-                                );
-                            }
-                        }
-                        "Edit/Replace..." => {
-                            let (mut editor, mut buffer, popups) = {
-                                let s = state_for_menu.borrow_mut();
-                                (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
-                            };
-                            FindReplaceDialog::show_replace_with_registry(&mut editor, &mut buffer, popups);
-                        }
-                        "Edit/Format SQL" => {
-                            state_for_menu.borrow_mut().sql_editor.format_selected_sql();
-                        }
-                        "Edit/Toggle Comment" => {
-                            state_for_menu.borrow_mut().sql_editor.toggle_comment();
-                        }
-                        "Edit/Uppercase Selection" => {
-                            state_for_menu
-                                .borrow_mut()
-                                .sql_editor
-                                .convert_selection_case(true);
-                        }
-                        "Edit/Lowercase Selection" => {
-                            state_for_menu
-                                .borrow_mut()
-                                .sql_editor
-                                .convert_selection_case(false);
-                        }
-                        "Edit/Intellisense" => {
-                            state_for_menu.borrow().sql_editor.show_intellisense();
-                        }
-                        "Tools/Query History..." => {
-                            MainWindow::open_query_history_dialog(&state_for_menu);
-                        }
-                        "Tools/Auto-Commit" => {
-                            let mut item = m.find_item("&Tools/&Auto-Commit\t");
-                            let enabled = item.as_ref().map(|item| item.value()).unwrap_or(false);
-                            let status = if enabled {
-                                "Auto-commit enabled"
-                            } else {
-                                "Auto-commit disabled"
-                            };
-                            let connection = {
-                                let s = state_for_menu.borrow();
-                                s.connection.clone()
-                            };
-                            if let Some(mut connection) = crate::db::try_lock_connection(&connection)
-                            {
-                                connection.set_auto_commit(enabled);
-                            } else {
-                                fltk::dialog::alert_default(
-                                    "Connection is busy. Try again after the current operation finishes.",
-                                );
-                                if let Some(mut item) = item.take() {
-                                    if enabled {
-                                        item.clear();
-                                    } else {
-                                        item.set();
-                                    }
-                                }
-                                return;
-                            }
-                            let mut s = state_for_menu.borrow_mut();
-                            let conn_info = s.connection_info.borrow().clone();
-                            s.status_bar.set_label(&format_status(status, &conn_info));
-                        }
-                        "Settings/Preferences..." => {
-                            let config_snapshot = {
-                                let s = state_for_menu.borrow();
-                                let config_snapshot = s.config.borrow().clone();
-                                config_snapshot
-                            };
-                            if let Some(settings) = show_settings_dialog(&config_snapshot) {
-                                let mut s = state_for_menu.borrow_mut();
-                                let save_result = {
-                                    let mut config = s.config.borrow_mut();
-                                    config.editor_font = settings.font.clone();
-                                    config.ui_font_size = settings.ui_size;
-                                    config.editor_font_size = settings.editor_size;
-                                    config.result_font = settings.font;
-                                    config.result_font_size = settings.result_size;
-                                    config.result_cell_max_chars = settings.result_cell_max_chars;
-                                    config.save()
-                                };
-                                if let Err(err) = save_result {
-                                    fltk::dialog::alert_default(&format!(
-                                        "Failed to save settings: {}",
-                                        err
-                                    ));
-                                }
-                                MainWindow::apply_font_settings(&mut s);
-                            }
-                        }
-                        _ => {}
+                    let choice = MainWindow::strip_menu_label_shortcut(&path);
+                    if MainWindow::execute_menu_action(
+                        &state_for_menu,
+                        &schema_sender_for_menu,
+                        &conn_sender_for_menu,
+                        &file_sender_for_menu,
+                        &choice,
+                    ) {
+                        // FLTK keeps the last activated menu item selected. When the selection
+                        // doesn't change, repeated keyboard shortcuts for the same item may not
+                        // trigger again. Clear the current value so Ctrl+N/Ctrl+S can fire
+                        // repeatedly without requiring a different shortcut in between.
+                        m.set_value(-1);
                     }
-
-                    // FLTK keeps the last activated menu item selected. When the selection
-                    // doesn't change, repeated keyboard shortcuts for the same item may not
-                    // trigger again. Clear the current value so Ctrl+N/Ctrl+S can fire
-                    // repeatedly without requiring a different shortcut in between.
-                    m.set_value(-1);
                 }
             });
         }

@@ -76,13 +76,13 @@ impl MenuBarBuilder {
 
         // File menu
         menu.add(
-            "&File/&Connect...\t",
+            "&File/&Connect...",
             Shortcut::Ctrl | Shortcut::Command | 'n',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Disconnect\t",
+            "&File/&Disconnect",
             Shortcut::Ctrl | Shortcut::Command | 'd',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -94,19 +94,19 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Open SQL File...\t",
+            "&File/&Open SQL File...",
             Shortcut::Ctrl | Shortcut::Command | 'o',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Save SQL File...\t",
+            "&File/&Save SQL File...",
             Shortcut::Ctrl | Shortcut::Command | 's',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&File/Save SQL File &As...\t",
+            "&File/Save SQL File &As...",
             Shortcut::Ctrl | Shortcut::Command | Shortcut::Shift | 's',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -118,7 +118,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&File/E&xit\t",
+            "&File/E&xit",
             Shortcut::Ctrl | Shortcut::Command | 'q',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -126,13 +126,13 @@ impl MenuBarBuilder {
 
         // Edit menu
         menu.add(
-            "&Edit/&Undo\t",
+            "&Edit/&Undo",
             Shortcut::Ctrl | Shortcut::Command | 'z',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Redo\t",
+            "&Edit/&Redo",
             Shortcut::Ctrl | Shortcut::Command | 'y',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -144,25 +144,25 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Cu&t\t",
+            "&Edit/Cu&t",
             Shortcut::Ctrl | Shortcut::Command | 'x',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Copy\t",
+            "&Edit/&Copy",
             Shortcut::Ctrl | Shortcut::Command | 'c',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Copy with &Headers\t",
+            "&Edit/Copy with &Headers",
             Shortcut::Ctrl | Shortcut::Command | Shortcut::Shift | 'c',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Paste\t",
+            "&Edit/&Paste",
             Shortcut::Ctrl | Shortcut::Command | 'v',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -174,7 +174,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Select &All\t",
+            "&Edit/Select &All",
             Shortcut::Ctrl | Shortcut::Command | 'a',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -186,19 +186,19 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Find...\t",
+            "&Edit/&Find...",
             Shortcut::Ctrl | Shortcut::Command | 'f',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Find &Next\t",
+            "&Edit/Find &Next",
             Shortcut::from_key(fltk::enums::Key::F3),
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Replace...\t",
+            "&Edit/&Replace...",
             Shortcut::Ctrl | Shortcut::Command | 'h',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -210,31 +210,31 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Format SQL\t",
+            "&Edit/&Format SQL",
             Shortcut::Ctrl | Shortcut::Command | Shortcut::Shift | 'f',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Toggle &Comment\t",
+            "&Edit/Toggle &Comment",
             Shortcut::Ctrl | Shortcut::Command | '/',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Upper&case Selection\t",
+            "&Edit/Upper&case Selection",
             Shortcut::Ctrl | Shortcut::Command | 'u',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/Lower&case Selection\t",
+            "&Edit/Lower&case Selection",
             Shortcut::Ctrl | Shortcut::Command | 'l',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Intellisense\t",
+            "&Edit/&Intellisense",
             Shortcut::Ctrl | Shortcut::Command | ' ',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -242,13 +242,13 @@ impl MenuBarBuilder {
 
         // Query menu
         menu.add(
-            "&Query/&New Tab\t",
+            "&Query/&New Tab",
             Shortcut::Command | 't',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/&Close Tab\t",
+            "&Query/&Close Tab",
             Shortcut::Command | 'w',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -260,31 +260,31 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Query/&Execute\t",
+            "&Query/&Execute",
             Shortcut::from_key(fltk::enums::Key::F5),
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/Execute &Statement\t",
+            "&Query/Execute &Statement",
             Shortcut::Ctrl | fltk::enums::Key::Enter,
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/Execute Statement (&F9)\t",
+            "&Query/Execute Statement (&F9)",
             Shortcut::from_key(fltk::enums::Key::F9),
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/Execute &Selected\t",
+            "&Query/Execute &Selected",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/&Quick Describe\t",
+            "&Query/&Quick Describe",
             Shortcut::from_key(fltk::enums::Key::F4),
             MenuFlag::Normal,
             forward_menu_callback,
@@ -296,7 +296,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Query/E&xplain Plan\t",
+            "&Query/E&xplain Plan",
             Shortcut::from_key(fltk::enums::Key::F6),
             MenuFlag::Normal,
             forward_menu_callback,
@@ -308,13 +308,13 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Query/&Commit\t",
+            "&Query/&Commit",
             Shortcut::from_key(fltk::enums::Key::F7),
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Query/&Rollback\t",
+            "&Query/&Rollback",
             Shortcut::from_key(fltk::enums::Key::F8),
             MenuFlag::Normal,
             forward_menu_callback,
@@ -322,7 +322,7 @@ impl MenuBarBuilder {
 
         // Tools menu
         menu.add(
-            "&Tools/&Refresh Objects\t",
+            "&Tools/&Refresh Objects",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
@@ -334,13 +334,13 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Export Results...\t",
+            "&Tools/&Export Results...",
             Shortcut::Ctrl | Shortcut::Command | 'e',
             MenuFlag::Normal,
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Query History...\t",
+            "&Tools/&Query History...",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
@@ -352,7 +352,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Auto-Commit\t",
+            "&Tools/&Auto-Commit",
             Shortcut::None,
             MenuFlag::Toggle,
             forward_menu_callback,
@@ -360,18 +360,18 @@ impl MenuBarBuilder {
 
         // Settings menu
         menu.add(
-            "&Settings/&Preferences...\t",
+            "&Settings/&Preferences...",
             Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
         );
 
         // Help menu
-        menu.add("&Help/&About\t", Shortcut::None, MenuFlag::Normal, |_| {
+        menu.add("&Help/&About", Shortcut::None, MenuFlag::Normal, |_| {
             show_info_dialog("About", "SPACE Query\n\nBuilt with Rust and FLTK", 420, 240);
         });
         menu.add(
-            "&Help/&Keyboard Shortcuts\t",
+            "&Help/&Keyboard Shortcuts",
             Shortcut::None,
             MenuFlag::Normal,
             |_| {
