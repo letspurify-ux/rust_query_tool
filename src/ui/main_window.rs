@@ -244,6 +244,34 @@ enum SaveTabOutcome {
 }
 
 impl MainWindow {
+    fn cancel_all_running_queries(state: &Rc<RefCell<AppState>>) {
+        let (running_editors, fallback_editor) = {
+            let s = state.borrow();
+            let running_editors = s
+                .editor_tabs
+                .iter()
+                .filter(|tab| tab.sql_editor.is_query_running())
+                .map(|tab| tab.sql_editor.clone())
+                .collect::<Vec<_>>();
+            (running_editors, s.sql_editor.clone())
+        };
+
+        if running_editors.is_empty() {
+            fallback_editor.cancel_current();
+            return;
+        }
+
+        for editor in &running_editors {
+            editor.cancel_current();
+        }
+
+        if let Ok(mut s) = state.try_borrow_mut() {
+            let conn_info = s.connection_info.borrow().clone();
+            s.status_bar
+                .set_label(&format_status("Cancelling running queries...", &conn_info));
+        }
+    }
+
     fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
         let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else {
             return false;
@@ -775,7 +803,7 @@ impl MainWindow {
         let weak_state_for_cancel = Rc::downgrade(&state);
         cancel_btn.set_callback(move |_| {
             if let Some(state_for_cancel) = weak_state_for_cancel.upgrade() {
-                state_for_cancel.borrow().sql_editor.cancel_current();
+                MainWindow::cancel_all_running_queries(&state_for_cancel);
             }
         });
 

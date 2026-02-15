@@ -5255,7 +5255,10 @@ impl SqlEditorWidget {
                                     &session,
                                     timing_duration,
                                 );
-                                if timed_out || (!result_success && !continue_on_error) {
+                                if cancel_flag.load(Ordering::Relaxed)
+                                    || timed_out
+                                    || (!result_success && !continue_on_error)
+                                {
                                     stop_execution = true;
                                 }
                                 continue;
@@ -5322,7 +5325,10 @@ impl SqlEditorWidget {
                                     &session,
                                     timing_duration,
                                 );
-                                if timed_out || (!result_success && !continue_on_error) {
+                                if cancel_flag.load(Ordering::Relaxed)
+                                    || timed_out
+                                    || (!result_success && !continue_on_error)
+                                {
                                     stop_execution = true;
                                 }
                                 continue;
@@ -5944,7 +5950,10 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if timed_out || (!result.success && !continue_on_error) {
+                                if cancel_flag.load(Ordering::Relaxed)
+                                    || timed_out
+                                    || (!result.success && !continue_on_error)
+                                {
                                     stop_execution = true;
                                 }
                             } else if is_select {
@@ -6346,7 +6355,10 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if timed_out || (!result.success && !continue_on_error) {
+                                if cancel_flag.load(Ordering::Relaxed)
+                                    || timed_out
+                                    || (!result.success && !continue_on_error)
+                                {
                                     stop_execution = true;
                                 }
                             } else {
@@ -6649,7 +6661,10 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if timed_out || (!result.success && !continue_on_error) {
+                                if cancel_flag.load(Ordering::Relaxed)
+                                    || timed_out
+                                    || (!result.success && !continue_on_error)
+                                {
                                     stop_execution = true;
                                 }
                             }
