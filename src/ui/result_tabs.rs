@@ -357,6 +357,11 @@ impl ResultTabsWidget {
         }
     }
 
+    pub fn align_tab_strip_left(&mut self) {
+        self.reset_tab_strip_left_anchor();
+        self.tabs.redraw();
+    }
+
     pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
         if let Some(tab) = self.data.borrow().get(index) {
             let mut table = tab.table.clone();

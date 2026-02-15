@@ -16,7 +16,7 @@ use fltk::{
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -174,6 +174,35 @@ impl AppState {
             self.refresh_window_title();
         }
     }
+
+    fn find_tab_id_by_file_name(&self, file_name: &str) -> Option<QueryTabId> {
+        let target = file_name.trim();
+        if target.is_empty() {
+            return None;
+        }
+        self.editor_tabs.iter().find_map(|tab| {
+            let current_name = tab
+                .current_file
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())?;
+            if current_name.eq_ignore_ascii_case(target) {
+                Some(tab.tab_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn activate_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
+        self.query_tabs.select(tab_id);
+        if self.set_active_editor_tab(tab_id) {
+            self.sql_editor.focus();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -215,6 +244,24 @@ enum SaveTabOutcome {
 }
 
 impl MainWindow {
+    fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
+        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else {
+            return false;
+        };
+        let Some(tab_id) = state.find_tab_id_by_file_name(&file_name) else {
+            return false;
+        };
+        if !state.activate_editor_tab(tab_id) {
+            return false;
+        }
+        let conn_info = state.connection_info.borrow().clone();
+        state.status_bar.set_label(&format_status(
+            &format!("{} is already open. Switched to existing tab", file_name),
+            &conn_info,
+        ));
+        true
+    }
+
     fn save_tab(
         state: &Rc<RefCell<AppState>>,
         tab_id: QueryTabId,
@@ -1375,6 +1422,7 @@ impl MainWindow {
                 }
                 QueryProgress::BatchFinished => {
                     s.result_tabs.finish_all_streaming();
+                    s.result_tabs.align_tab_strip_left();
                     s.fetch_row_counts.clear();
                     let current_status = s.status_bar.label().to_ascii_lowercase();
                     let needs_reset = current_status.contains("executing query")
@@ -1397,8 +1445,10 @@ impl MainWindow {
                 let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                     return;
                 };
-                let mut s = state_for_dirty.borrow_mut();
-                s.set_tab_dirty(tab_id, true);
+                match state_for_dirty.try_borrow_mut() {
+                    Ok(mut s) => s.set_tab_dirty(tab_id, true),
+                    Err(_) => {}
+                };
             },
         );
     }
@@ -1422,6 +1472,9 @@ impl MainWindow {
         editor.set_file_drop_callback(move |path| {
             if let Some(state_for_drop) = weak_state_for_file_drop.upgrade() {
                 let mut s = state_for_drop.borrow_mut();
+                if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
+                    return;
+                }
                 let conn_info = s.connection_info.borrow().clone();
                 let file_label = path.file_name().unwrap_or_default().to_string_lossy();
                 s.status_bar.set_label(&format_status(
@@ -1526,6 +1579,12 @@ impl MainWindow {
                 dialog.show();
                 let filename = dialog.filename();
                 if !filename.as_os_str().is_empty() {
+                    {
+                        let mut s = state.borrow_mut();
+                        if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &filename) {
+                            return true;
+                        }
+                    }
                     let sender = file_sender.clone();
                     thread::spawn(move || {
                         let result = fs::read_to_string(&filename).map_err(|err| err.to_string());
@@ -2289,6 +2348,11 @@ impl MainWindow {
                                     FileActionResult::OpenInNewTab { path, result } => match result
                                     {
                                         Ok(content) => {
+                                            if MainWindow::focus_existing_tab_with_same_file_name(
+                                                &mut s, &path,
+                                            ) {
+                                                continue;
+                                            }
                                             if let Some(tab_id) =
                                                 MainWindow::create_query_editor_tab(&mut s)
                                             {
