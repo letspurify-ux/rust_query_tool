@@ -173,7 +173,6 @@ impl AppState {
             self.refresh_window_title();
         }
     }
-
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -228,12 +227,7 @@ impl MainWindow {
             (s.tab_file_path(tab_id), sql_text)
         };
 
-        let target_path = if force_save_as {
-            None
-        } else {
-            current_file
-        }
-        .or_else(|| {
+        let target_path = if force_save_as { None } else { current_file }.or_else(|| {
             let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
             dialog.set_filter("SQL Files\t*.sql\nAll Files\t*.*");
             dialog.show();
@@ -477,14 +471,6 @@ impl MainWindow {
         let max_initial_query_height = (tile_h - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
         let initial_query_height = 250.clamp(MIN_QUERY_HEIGHT, max_initial_query_height);
 
-        let query_split_adjusted_for_tile = query_split_adjusted.clone();
-        right_tile.handle(move |_tile, ev| {
-            if matches!(ev, fltk::enums::Event::Drag) {
-                query_split_adjusted_for_tile.set(true);
-            }
-            false
-        });
-
         right_tile.begin();
         let mut query_top_group = Group::new(tile_x, tile_y, tile_w, initial_query_height, None);
         query_top_group.set_frame(FrameType::FlatBox);
@@ -576,6 +562,44 @@ impl MainWindow {
 
         result_bottom_group.end();
         right_tile.end();
+
+        let query_split_adjusted_for_tile = query_split_adjusted.clone();
+        let mut query_top_group_for_tile = query_top_group.clone();
+        let split_drag_active = Rc::new(Cell::new(false));
+        let split_drag_active_for_tile = split_drag_active.clone();
+        right_tile.handle(move |tile, ev| {
+            const SPLIT_GRAB_MARGIN: i32 = 6;
+            match ev {
+                fltk::enums::Event::Push => {
+                    if app::event_mouse_button() == fltk::app::MouseButton::Left {
+                        let split_y = query_top_group_for_tile.y() + query_top_group_for_tile.h();
+                        let near_split = (app::event_y() - split_y).abs() <= SPLIT_GRAB_MARGIN;
+                        if near_split {
+                            split_drag_active_for_tile.set(true);
+                            query_split_adjusted_for_tile.set(true);
+                            return true;
+                        }
+                    }
+                    false
+                }
+                fltk::enums::Event::Drag => {
+                    if split_drag_active_for_tile.get() {
+                        query_split_adjusted_for_tile.set(true);
+                        MainWindow::clamp_query_split_with(tile, &mut query_top_group_for_tile);
+                        return true;
+                    }
+                    false
+                }
+                fltk::enums::Event::Released => {
+                    if split_drag_active_for_tile.replace(false) {
+                        MainWindow::clamp_query_split_with(tile, &mut query_top_group_for_tile);
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        });
 
         let mut first_tab_id = query_tabs.add_tab("Query 1");
         let mut first_tab_group = query_tabs.tab_group(first_tab_id);
@@ -799,7 +823,7 @@ impl MainWindow {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         if state.query_split_adjusted.get() {
-            right_tile.redraw();
+            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group);
         } else {
             Self::adjust_query_layout_with(&mut right_tile, &mut query_top_group);
         }
@@ -880,10 +904,27 @@ impl MainWindow {
         }
     }
 
-    fn adjust_query_layout_with(
-        right_tile: &mut Tile,
-        query_top_group: &mut Group,
-    ) {
+    fn clamp_query_split_with(right_tile: &mut Tile, query_top_group: &mut Group) {
+        let right_height = right_tile.h();
+        if right_height <= 0 {
+            return;
+        }
+
+        let max_query_height = (right_height - MIN_RESULTS_HEIGHT).max(MIN_QUERY_HEIGHT);
+        let mut desired_query_height = query_top_group
+            .h()
+            .clamp(MIN_QUERY_HEIGHT, max_query_height);
+        if desired_query_height <= 0 {
+            desired_query_height = MIN_QUERY_HEIGHT;
+        }
+
+        let current_split_y = query_top_group.y() + query_top_group.h();
+        let target_split_y = right_tile.y() + desired_query_height;
+        right_tile.move_intersection(0, current_split_y, 0, target_split_y);
+        right_tile.redraw();
+    }
+
+    fn adjust_query_layout_with(right_tile: &mut Tile, query_top_group: &mut Group) {
         let right_height = right_tile.h();
         if right_height <= 0 {
             return;
@@ -895,17 +936,20 @@ impl MainWindow {
         } else if desired_height > max_height {
             desired_height = max_height;
         }
-        let current_split_y = query_top_group.y() + query_top_group.h();
-        let target_split_y = right_tile.y() + desired_height;
-        right_tile.move_intersection(0, current_split_y, 0, target_split_y);
-        right_tile.redraw();
+        query_top_group.resize(
+            query_top_group.x(),
+            query_top_group.y(),
+            query_top_group.w(),
+            desired_height,
+        );
+        Self::clamp_query_split_with(right_tile, query_top_group);
     }
 
     fn adjust_query_layout_on_resize(state: &AppState) {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         if state.query_split_adjusted.get() {
-            right_tile.redraw();
+            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group);
         } else {
             Self::adjust_query_layout_with(&mut right_tile, &mut query_top_group);
         }
@@ -1243,13 +1287,15 @@ impl MainWindow {
 
         let weak_state_for_dirty = Rc::downgrade(state);
         let mut buffer_for_dirty = editor.get_buffer();
-        buffer_for_dirty.add_modify_callback2(move |_buf, _pos, _ins, _del, _restyled, _deleted| {
-            let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
-                return;
-            };
-            let mut s = state_for_dirty.borrow_mut();
-            s.set_tab_dirty(tab_id, true);
-        });
+        buffer_for_dirty.add_modify_callback2(
+            move |_buf, _pos, _ins, _del, _restyled, _deleted| {
+                let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
+                    return;
+                };
+                let mut s = state_for_dirty.borrow_mut();
+                s.set_tab_dirty(tab_id, true);
+            },
+        );
     }
 
     fn attach_file_drop_callback(
@@ -1521,9 +1567,11 @@ impl MainWindow {
                             {
                                 let mut s = state.borrow_mut();
                                 match result {
-                                    FileActionResult::OpenInNewTab { path, result } => match result {
+                                    FileActionResult::OpenInNewTab { path, result } => match result
+                                    {
                                         Ok(content) => {
-                                            if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s)
+                                            if let Some(tab_id) =
+                                                MainWindow::create_query_editor_tab(&mut s)
                                             {
                                                 s.sql_buffer.set_text(&content);
                                                 s.sql_editor.reset_undo_redo_history();
