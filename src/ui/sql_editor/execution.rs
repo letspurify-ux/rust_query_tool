@@ -3172,6 +3172,9 @@ impl SqlEditorWidget {
                     cleanup.track_timeout(Arc::clone(conn), previous_timeout);
                 }
 
+                let requires_transaction_first_statement =
+                    SqlEditorWidget::requires_transaction_first_statement(&items);
+
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
                         if script_mode {
@@ -3191,10 +3194,14 @@ impl SqlEditorWidget {
                         }
                         return;
                     }
-                    if let Err(err) =
-                        SqlEditorWidget::sync_serveroutput_with_session(conn.as_ref(), &session)
-                    {
-                        eprintln!("Failed to apply SERVEROUTPUT setting on session start: {err}");
+                    if !requires_transaction_first_statement {
+                        if let Err(err) =
+                            SqlEditorWidget::sync_serveroutput_with_session(conn.as_ref(), &session)
+                        {
+                            eprintln!(
+                                "Failed to apply SERVEROUTPUT setting on session start: {err}"
+                            );
+                        }
                     }
                 }
 
@@ -7843,6 +7850,26 @@ impl SqlEditorWidget {
         }
     }
 
+    fn requires_transaction_first_statement(items: &[ScriptItem]) -> bool {
+        let first_statement = items.iter().find_map(|item| match item {
+            ScriptItem::Statement(statement) => Some(statement.as_str()),
+            ScriptItem::ToolCommand(_) => None,
+        });
+        first_statement
+            .map(Self::is_transaction_first_statement)
+            .unwrap_or(false)
+    }
+
+    fn is_transaction_first_statement(statement: &str) -> bool {
+        let trimmed = statement.trim().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        Self::starts_with_keyword_token(&upper, "SET TRANSACTION")
+            || Self::starts_with_keyword_token(&upper, "ALTER SESSION SET ISOLATION_LEVEL")
+    }
+
     fn sync_serveroutput_with_session(
         conn: &Connection,
         session: &Arc<Mutex<SessionState>>,
@@ -8000,7 +8027,7 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_regression_tests {
-    use super::SqlEditorWidget;
+    use super::{ScriptItem, SqlEditorWidget};
 
     #[test]
     fn resets_paren_tracking_after_malformed_statement_before_next_statement() {
@@ -8152,6 +8179,22 @@ END oqt_mega_pkg;"#;
         assert!(!SqlEditorWidget::starts_with_keyword_token(
             "SELECTED", "SELECT"
         ));
+    }
+
+    #[test]
+    fn detects_set_transaction_as_first_statement() {
+        let items = vec![ScriptItem::Statement(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;".to_string(),
+        )];
+        assert!(SqlEditorWidget::requires_transaction_first_statement(&items));
+    }
+
+    #[test]
+    fn detects_alter_session_isolation_level_as_first_statement() {
+        let items = vec![ScriptItem::Statement(
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;".to_string(),
+        )];
+        assert!(SqlEditorWidget::requires_transaction_first_statement(&items));
     }
 
     #[test]
