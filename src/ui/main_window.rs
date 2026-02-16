@@ -1206,12 +1206,20 @@ impl MainWindow {
             let next_tab_id = s
                 .query_tabs
                 .selected_id()
-                .or_else(|| s.query_tabs.tab_ids().first().copied());
+                .or_else(|| s.query_tabs.tab_ids().first().copied())
+                .or_else(|| s.editor_tabs.first().map(|tab| tab.tab_id));
             if let Some(next_tab_id) = next_tab_id {
                 let _ = s.set_active_editor_tab(next_tab_id);
                 if was_active {
                     s.sql_editor.focus();
                 }
+            } else if was_active {
+                // Defensive fallback: if tab selection cannot be resolved,
+                // clear active editor references so closed-tab resources are
+                // not kept alive by stale handles in application state.
+                s.active_editor_tab_id = 0;
+                *s.current_file.borrow_mut() = None;
+                s.refresh_window_title();
             }
 
             s.right_tile.redraw();
