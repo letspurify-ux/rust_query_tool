@@ -12,8 +12,10 @@ use app::App;
 use utils::logging;
 
 fn main() {
+    let previous_panic_hook = std::panic::take_hook();
+
     // Install custom panic hook for crash handling
-    std::panic::set_hook(Box::new(|panic_info| {
+    std::panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info
             .location()
             .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
@@ -39,6 +41,9 @@ fn main() {
         // If panic happens while a log mutex is held, logging from the panic hook
         // can deadlock before the process exits.
         logging::write_crash_log(&crash_message);
+
+        // Preserve default panic diagnostics (panic message, stack trace behavior, etc.).
+        previous_panic_hook(panic_info);
 
         eprintln!("SPACE Query crashed: {}", crash_message);
     }));
