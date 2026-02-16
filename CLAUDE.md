@@ -5,10 +5,15 @@
 ## 1) 현재 코드베이스 개요
 
 - 언어/빌드: Rust 2021 + Cargo
-- GUI: FLTK (`fltk = 1.5`)
+- GUI: FLTK (`fltk = 1.5`, `no-pango` feature)
 - DB: Oracle Rust Driver (`oracle = 0.6`)
 - 설정 저장: `serde`, `serde_json`, `dirs`
-- 비밀번호 저장: `keyring` (플랫폼별 native backend)
+- 날짜/시간: `chrono = 0.4`
+- 지연 초기화: `once_cell = 1.19`
+- 비밀번호 저장: `keyring = 3` (플랫폼별 native backend)
+  - macOS: `apple-native`
+  - Windows: `windows-native`
+  - Linux: `sync-secret-service` + `crypto-rust` (libdbus vendored)
 
 엔트리포인트는 `src/main.rs`이며, `App::new()`에서 설정을 로드한 뒤 `MainWindow::run()`으로 UI를 시작합니다.
 
@@ -19,31 +24,46 @@ src/
 ├── app.rs
 ├── main.rs
 ├── db/
-│   ├── connection.rs       # 연결 정보 + Oracle 연결 래핑
-│   ├── session.rs          # SQL*Plus 유사 세션 상태(변수/설정)
+│   ├── mod.rs
+│   ├── connection.rs           # 연결 정보 + Oracle 연결 래핑
+│   ├── session.rs              # SQL*Plus 유사 세션 상태(변수/설정)
 │   └── query/
-│       ├── executor.rs     # 쿼리 실행/스트리밍/오브젝트 메타데이터
-│       ├── script.rs       # 스크립트 파싱/분리/툴 커맨드 해석
-│       ├── types.rs        # QueryResult/결과 타입
+│       ├── mod.rs
+│       ├── executor.rs         # 쿼리 실행/스트리밍/오브젝트 메타데이터
+│       ├── script.rs           # 스크립트 파싱/분리/툴 커맨드 해석
+│       ├── types.rs            # QueryResult/결과 타입
 │       └── query_tests.rs
 ├── ui/
-│   ├── main_window.rs      # 앱 오케스트레이션(탭/메뉴/상태)
-│   ├── sql_editor/         # 에디터 + 실행/인텔리센스 결합
-│   ├── object_browser.rs   # DB 오브젝트 트리
-│   ├── result_table.rs     # 결과 테이블 렌더링
-│   ├── result_tabs.rs      # 데이터/메시지 탭 관리
-│   ├── query_tabs.rs       # 다중 쿼리 탭
+│   ├── mod.rs
+│   ├── main_window.rs          # 앱 오케스트레이션(탭/메뉴/상태)
+│   ├── menu.rs                 # 메뉴바 구성 및 액션 바인딩
+│   ├── sql_editor/
+│   │   ├── mod.rs              # SQL 에디터 위젯 조합
+│   │   ├── execution.rs        # 실행 버튼/단축키 처리 및 결과 전달
+│   │   ├── intellisense.rs     # 에디터 IntelliSense 훅
+│   │   └── sql_editor_tests.rs
+│   ├── object_browser.rs       # DB 오브젝트 트리
+│   ├── result_table.rs         # 결과 테이블 렌더링
+│   ├── result_tabs.rs          # 데이터/메시지 탭 관리
+│   ├── query_tabs.rs           # 다중 쿼리 탭
+│   ├── query_history.rs        # 쿼리 히스토리 다이얼로그
 │   ├── syntax_highlight.rs
-│   ├── syntax_highlight/   # 하이라이트 테스트
-│   ├── intellisense.rs
-│   ├── intellisense_context.rs
-│   ├── connection_dialog.rs
-│   ├── query_history.rs
-│   ├── settings_dialog.rs
-│   └── 기타 UI 보조 모듈
+│   ├── syntax_highlight/
+│   │   └── syntax_highlight_tests.rs
+│   ├── intellisense.rs         # IntelliSense 팝업/완성 목록
+│   ├── intellisense_context.rs # IntelliSense 컨텍스트 분석
+│   ├── intellisense_context/
+│   │   └── tests.rs
+│   ├── connection_dialog.rs    # 연결 정보 입력 다이얼로그
+│   ├── settings_dialog.rs      # 앱 설정 다이얼로그
+│   ├── find_replace.rs         # 찾기/바꾸기 다이얼로그
+│   ├── font_settings.rs        # 폰트 목록 조회 및 선택
+│   ├── theme.rs                # 앱 색상/테마 팔레트 정의
+│   └── constants.rs            # UI 크기/레이아웃 상수
 └── utils/
-    ├── config.rs           # 설정/연결목록/히스토리 저장
-    └── credential_store.rs # keyring 연동
+    ├── mod.rs
+    ├── config.rs               # 설정/연결목록/히스토리 저장
+    └── credential_store.rs     # keyring 연동
 ```
 
 > 과거 문서에 있던 `src/ui/feature_catalog.rs`, `src/utils/feature_catalog.rs` 등은 현재 트리에 존재하지 않습니다.
@@ -72,10 +92,22 @@ src/
 - `ui/main_window.rs`
   - 앱 상태의 중심
   - 연결/해제, 메뉴 액션, 쿼리 탭/결과 탭/브라우저 동기화
-- `ui/sql_editor/*`
-  - SQL 입력, 실행 트리거, 인텔리센스 훅
+- `ui/menu.rs`
+  - 메뉴바 항목 정의 및 단축키 바인딩
+- `ui/sql_editor/`
+  - `mod.rs`: SQL 에디터 위젯 조합 및 초기화
+  - `execution.rs`: 실행 버튼/단축키 처리, 쿼리 분리 후 결과 탭 전달
+  - `intellisense.rs`: 타이핑 중 IntelliSense 팝업 트리거
 - `ui/object_browser.rs`
   - 스키마 오브젝트 조회 및 선택 액션
+- `ui/find_replace.rs`
+  - 에디터 내 찾기/바꾸기 다이얼로그
+- `ui/font_settings.rs`
+  - 시스템 폰트 목록 조회 및 에디터 폰트 적용
+- `ui/theme.rs`
+  - Windows 11 스타일 다크 팔레트 등 색상 상수 정의
+- `ui/constants.rs`
+  - 버튼/다이얼로그 등 UI 전반에 사용되는 크기/레이아웃 상수
 
 ### 설정/보안
 

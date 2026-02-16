@@ -19,28 +19,39 @@ src/
 ├── app.rs
 ├── main.rs
 ├── db/
-│   ├── connection.rs
-│   ├── session.rs
+│   ├── connection.rs       # 연결 정보 + Oracle 연결 래핑
+│   ├── session.rs          # SQL*Plus 유사 세션 상태(변수/설정)
 │   └── query/
-│       ├── executor.rs
-│       ├── script.rs
-│       ├── types.rs
+│       ├── executor.rs     # 쿼리 실행/스트리밍/오브젝트 메타데이터
+│       ├── script.rs       # 스크립트 파싱/분리/툴 커맨드 해석
+│       ├── types.rs        # QueryResult/결과 타입
 │       └── query_tests.rs
 ├── ui/
-│   ├── main_window.rs
+│   ├── main_window.rs      # 앱 오케스트레이션(탭/메뉴/상태)
+│   ├── menu.rs             # 메뉴바 구성
 │   ├── sql_editor/
-│   ├── object_browser.rs
-│   ├── result_table.rs
-│   ├── result_tabs.rs
-│   ├── query_tabs.rs
-│   ├── syntax_highlight/
-│   ├── intellisense*.rs
+│   │   ├── mod.rs
+│   │   ├── execution.rs    # SQL 실행 처리
+│   │   ├── intellisense.rs # 에디터 IntelliSense
+│   │   └── sql_editor_tests.rs
+│   ├── object_browser.rs   # DB 오브젝트 트리
+│   ├── result_table.rs     # 결과 테이블 렌더링
+│   ├── result_tabs.rs      # 데이터/메시지 탭 관리
+│   ├── query_tabs.rs       # 다중 쿼리 탭
+│   ├── query_history.rs    # 쿼리 히스토리
+│   ├── syntax_highlight.rs
+│   ├── syntax_highlight/   # 하이라이트 테스트
+│   ├── intellisense.rs
+│   ├── intellisense_context.rs
 │   ├── connection_dialog.rs
 │   ├── settings_dialog.rs
-│   └── ...
+│   ├── find_replace.rs     # 찾기/바꾸기 다이얼로그
+│   ├── font_settings.rs    # 폰트 설정
+│   ├── theme.rs            # 색상/테마 정의
+│   └── constants.rs        # UI 크기 상수
 └── utils/
-    ├── config.rs
-    └── credential_store.rs
+    ├── config.rs           # 설정/연결목록/히스토리 저장
+    └── credential_store.rs # keyring 연동
 ```
 
 ## 실행
