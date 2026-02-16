@@ -10,6 +10,7 @@ use fltk::{
 };
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -622,6 +623,8 @@ impl SqlEditorWidget {
         let intellisense_data = self.intellisense_data.clone();
         let editor = self.editor.clone();
         let buffer = self.buffer.clone();
+        let style_buffer = self.style_buffer.clone();
+        let highlighter = self.highlighter.clone();
         let intellisense_popup = self.intellisense_popup.clone();
         let completion_range = self.completion_range.clone();
         let column_sender = self.column_sender.clone();
@@ -641,6 +644,8 @@ impl SqlEditorWidget {
             intellisense_data: Rc<RefCell<IntellisenseData>>,
             editor: TextEditor,
             buffer: TextBuffer,
+            style_buffer: TextBuffer,
+            highlighter: Rc<RefCell<SqlHighlighter>>,
             intellisense_popup: Rc<RefCell<IntellisensePopup>>,
             completion_range: Rc<RefCell<Option<(usize, usize)>>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -660,18 +665,46 @@ impl SqlEditorWidget {
                     match r.try_recv() {
                         Ok(update) => {
                             processed += 1;
-                            let (should_refresh_pending, should_clear_pending) = {
+                            let (should_refresh_pending, should_clear_pending, highlight_columns) = {
                                 let mut data = intellisense_data.borrow_mut();
                                 if update.cache_columns {
                                     data.set_columns_for_table(&update.table, update.columns);
-                                    (true, false)
+                                    (
+                                        true,
+                                        false,
+                                        Some(collect_highlight_columns_from_intellisense(&data)),
+                                    )
                                 } else {
                                     data.clear_columns_loading(&update.table);
                                     // If every pending table load has completed without cached
                                     // columns, clear pending intellisense to avoid retry loops.
-                                    (false, data.columns_loading.is_empty())
+                                    (false, data.columns_loading.is_empty(), None)
                                 }
                             };
+
+                            if let Some(highlight_columns) = highlight_columns {
+                                let should_refresh_highlighting = {
+                                    let mut highlighter = highlighter.borrow_mut();
+                                    let mut highlight_data = highlighter.get_highlight_data();
+                                    if highlight_data.columns == highlight_columns {
+                                        false
+                                    } else {
+                                        highlight_data.columns = highlight_columns;
+                                        highlighter.set_highlight_data(highlight_data);
+                                        true
+                                    }
+                                };
+
+                                if should_refresh_highlighting {
+                                    let cursor_pos = editor.insert_position().max(0) as usize;
+                                    highlighter.borrow().highlight_buffer_window(
+                                        &buffer,
+                                        &mut style_buffer.clone(),
+                                        cursor_pos,
+                                        None,
+                                    );
+                                }
+                            }
 
                             if should_refresh_pending {
                                 let pending = pending_intellisense.borrow().clone();
@@ -748,6 +781,8 @@ impl SqlEditorWidget {
                     Rc::clone(&intellisense_data),
                     editor.clone(),
                     buffer.clone(),
+                    style_buffer.clone(),
+                    Rc::clone(&highlighter),
                     Rc::clone(&intellisense_popup),
                     Rc::clone(&completion_range),
                     column_sender.clone(),
@@ -763,6 +798,8 @@ impl SqlEditorWidget {
             intellisense_data,
             editor,
             buffer,
+            style_buffer,
+            highlighter,
             intellisense_popup,
             completion_range,
             column_sender,
@@ -1608,6 +1645,20 @@ fn is_word_edit_char(ch: char) -> bool {
 
 fn is_identifier_continue_byte_for_expand(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut columns = Vec::new();
+    for names in data.columns.values() {
+        for name in names {
+            let upper = name.to_uppercase();
+            if seen.insert(upper) {
+                columns.push(name.clone());
+            }
+        }
+    }
+    columns
 }
 
 fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (usize, usize) {

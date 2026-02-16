@@ -20,6 +20,7 @@ pub const STYLE_OPERATOR: char = 'G';
 pub const STYLE_IDENTIFIER: char = 'H';
 pub const STYLE_HINT: char = 'I';
 pub const STYLE_DATETIME_LITERAL: char = 'J';
+pub const STYLE_COLUMN: char = 'K';
 
 static SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| SQL_KEYWORDS.iter().copied().collect());
@@ -88,6 +89,12 @@ pub fn create_style_table_with(profile: FontProfile, size: u32) -> Vec<StyleTabl
             font: profile.normal,
             size: size as i32,
         },
+        // K - Columns (near-white)
+        StyleTableEntry {
+            color: Color::from_rgb(225, 235, 242),
+            font: profile.normal,
+            size: size as i32,
+        },
     ]
 }
 
@@ -103,6 +110,7 @@ enum TokenType {
     Number,
     Operator,
     Identifier,
+    Column,
 }
 
 impl TokenType {
@@ -116,6 +124,7 @@ impl TokenType {
             TokenType::Number => STYLE_NUMBER,
             TokenType::Operator => STYLE_OPERATOR,
             TokenType::Identifier => STYLE_IDENTIFIER,
+            TokenType::Column => STYLE_COLUMN,
         }
     }
 }
@@ -141,7 +150,8 @@ impl HighlightData {
 /// SQL Syntax Highlighter
 pub struct SqlHighlighter {
     highlight_data: HighlightData,
-    identifier_lookup: HashSet<String>,
+    relation_lookup: HashSet<String>,
+    column_lookup: HashSet<String>,
 }
 
 const HIGHLIGHT_WINDOW_THRESHOLD: usize = 20_000;
@@ -152,7 +162,8 @@ impl SqlHighlighter {
     pub fn new() -> Self {
         Self {
             highlight_data: HighlightData::new(),
-            identifier_lookup: HashSet::new(),
+            relation_lookup: HashSet::new(),
+            column_lookup: HashSet::new(),
         }
     }
 
@@ -161,18 +172,27 @@ impl SqlHighlighter {
         self.rebuild_identifier_lookup();
     }
 
+    pub fn get_highlight_data(&self) -> HighlightData {
+        self.highlight_data.clone()
+    }
+
     fn rebuild_identifier_lookup(&mut self) {
-        let mut lookup = HashSet::new();
+        let mut relation_lookup = HashSet::new();
         for name in self
             .highlight_data
             .tables
             .iter()
             .chain(self.highlight_data.views.iter())
-            .chain(self.highlight_data.columns.iter())
         {
-            lookup.insert(name.to_uppercase());
+            relation_lookup.insert(name.to_uppercase());
         }
-        self.identifier_lookup = lookup;
+        self.relation_lookup = relation_lookup;
+        self.column_lookup = self
+            .highlight_data
+            .columns
+            .iter()
+            .map(|name| name.to_uppercase())
+            .collect();
     }
 
     /// Highlights using a windowed range from the buffer to avoid full-buffer scans.
@@ -395,6 +415,29 @@ impl SqlHighlighter {
                 continue;
             }
 
+            // Check for quoted identifiers ("..."), including escaped quotes ("")
+            if byte == b'"' {
+                let start = idx;
+                idx += 1;
+                while let Some(&b) = bytes.get(idx) {
+                    if b == b'"' {
+                        if bytes.get(idx + 1) == Some(&b'"') {
+                            idx += 2;
+                            continue;
+                        }
+                        idx += 1;
+                        break;
+                    }
+                    idx += 1;
+                }
+                for b in start..idx {
+                    if let Some(style) = styles.get_mut(b) {
+                        *style = STYLE_IDENTIFIER;
+                    }
+                }
+                continue;
+            }
+
             // Check for numbers
             if byte.is_ascii_digit()
                 || (byte == b'.' && bytes.get(idx + 1).map_or(false, |b| b.is_ascii_digit()))
@@ -508,8 +551,11 @@ impl SqlHighlighter {
         }
 
         // Check if it's a known identifier (table, view, column)
-        if self.identifier_lookup.contains(&upper) {
+        if self.relation_lookup.contains(&upper) {
             return TokenType::Identifier;
+        }
+        if self.column_lookup.contains(&upper) {
+            return TokenType::Column;
         }
 
         TokenType::Default
@@ -526,6 +572,7 @@ fn windowed_range_from_buffer(
     buffer: &TextBuffer,
     cursor_pos: usize,
     text_len: usize,
+    full_text: Option<&str>,
 ) -> (usize, usize) {
     let start_candidate = cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS);
     let end_candidate = (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text_len);
@@ -533,7 +580,14 @@ fn windowed_range_from_buffer(
     let mut start = buffer.line_start(start_candidate as i32).max(0) as usize;
     let mut end = buffer.line_end(end_candidate as i32).max(0) as usize;
 
-    if let Some(text) = buffer.text_range(0, text_len as i32) {
+    let owned_full_text = if full_text.is_none() {
+        buffer.text_range(0, text_len as i32)
+    } else {
+        None
+    };
+    let full_text = full_text.or_else(|| owned_full_text.as_deref());
+
+    if let Some(text) = full_text {
         let bytes = text.as_bytes();
         let mut idx = 0usize;
         let mut last_ws_before_start: Option<usize> = None;
@@ -651,9 +705,17 @@ fn select_highlight_ranges(
         }
     }
 
+    // For multi-window passes, fetch full text once and reuse it when expanding
+    // lexical boundaries so we don't rescan/clone the full buffer per window.
+    let full_text = if anchors.len() > 1 {
+        buffer.text_range(0, text_len as i32)
+    } else {
+        None
+    };
+
     let mut ranges: Vec<(usize, usize)> = anchors
         .into_iter()
-        .map(|anchor| windowed_range_from_buffer(buffer, anchor, text_len))
+        .map(|anchor| windowed_range_from_buffer(buffer, anchor, text_len, full_text.as_deref()))
         .collect();
 
     ranges.sort_unstable_by_key(|(start, _)| *start);
@@ -669,10 +731,55 @@ fn select_highlight_ranges(
     }
 
     if merged.len() > MAX_HIGHLIGHT_WINDOWS_PER_PASS {
-        merged.truncate(MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+        let mut focus_points = vec![cursor_pos.min(text_len)];
+        if let Some((edit_start, edit_end)) = edited_range {
+            focus_points.push(edit_start.min(text_len));
+            focus_points.push(edit_end.min(text_len));
+        }
+        merged = prioritize_ranges_for_focus(
+            merged,
+            &focus_points,
+            MAX_HIGHLIGHT_WINDOWS_PER_PASS,
+        );
     }
 
     merged
+}
+
+fn prioritize_ranges_for_focus(
+    mut ranges: Vec<(usize, usize)>,
+    focus_points: &[usize],
+    max_ranges: usize,
+) -> Vec<(usize, usize)> {
+    if ranges.len() <= max_ranges {
+        return ranges;
+    }
+
+    // Keep windows closest to current editing focus (cursor/edited range).
+    ranges.sort_unstable_by(|(start_a, end_a), (start_b, end_b)| {
+        let dist_a = range_focus_distance(*start_a, *end_a, focus_points);
+        let dist_b = range_focus_distance(*start_b, *end_b, focus_points);
+        dist_a.cmp(&dist_b).then_with(|| start_a.cmp(start_b))
+    });
+    ranges.truncate(max_ranges);
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    ranges
+}
+
+fn range_focus_distance(start: usize, end: usize, focus_points: &[usize]) -> usize {
+    focus_points
+        .iter()
+        .map(|&point| {
+            if point < start {
+                start - point
+            } else if point > end {
+                point - end
+            } else {
+                0
+            }
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 fn is_operator_byte(byte: u8) -> bool {

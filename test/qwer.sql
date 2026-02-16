@@ -1,1 +1,1 @@
-select 2 from help;
+select 3 from help;

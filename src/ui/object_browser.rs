@@ -29,6 +29,7 @@ pub enum SqlAction {
     Set(String),
     Insert(String),
     Append(String),
+    OpenInNewTab(String),
     Execute(String),
 }
 
@@ -468,7 +469,7 @@ impl ObjectBrowserWidget {
                             Ok(ddl) => {
                                 ObjectBrowserWidget::emit_sql_callback(
                                     &sql_callback,
-                                    SqlAction::Append(ddl),
+                                    SqlAction::OpenInNewTab(ddl),
                                 );
                             }
                             Err(err) => {

@@ -14,7 +14,7 @@ use fltk::{
     window::Window,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -1171,6 +1171,15 @@ impl MainWindow {
         group.end();
         let inherited_intellisense = state.sql_editor.get_intellisense_data().borrow().clone();
         *editor.get_intellisense_data().borrow_mut() = inherited_intellisense;
+        let inherited_highlight = state
+            .sql_editor
+            .get_highlighter()
+            .borrow()
+            .get_highlight_data();
+        editor
+            .get_highlighter()
+            .borrow_mut()
+            .set_highlight_data(inherited_highlight);
         let buffer = editor.get_buffer();
         state.editor_tabs.push(QueryEditorTab {
             tab_id,
@@ -1292,13 +1301,44 @@ impl MainWindow {
         data: &IntellisenseData,
         highlight_data: &HighlightData,
     ) {
+        let mut combined_highlight = highlight_data.clone();
+        let columns_from_intellisense = Self::collect_highlight_columns(data);
+        if !columns_from_intellisense.is_empty() {
+            let mut seen: HashSet<String> = combined_highlight
+                .columns
+                .iter()
+                .map(|name| name.to_uppercase())
+                .collect();
+            for name in columns_from_intellisense {
+                let upper = name.to_uppercase();
+                if seen.insert(upper) {
+                    combined_highlight.columns.push(name);
+                }
+            }
+        }
+
         for tab in &mut state.editor_tabs {
             *tab.sql_editor.get_intellisense_data().borrow_mut() = data.clone();
             tab.sql_editor
                 .get_highlighter()
                 .borrow_mut()
-                .set_highlight_data(highlight_data.clone());
+                .set_highlight_data(combined_highlight.clone());
+            tab.sql_editor.refresh_highlighting();
         }
+    }
+
+    fn collect_highlight_columns(data: &IntellisenseData) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut columns = Vec::new();
+        for names in data.columns.values() {
+            for name in names {
+                let upper = name.to_uppercase();
+                if seen.insert(upper) {
+                    columns.push(name.clone());
+                }
+            }
+        }
+        columns
     }
 
     fn attach_editor_callbacks(
@@ -1485,6 +1525,7 @@ impl MainWindow {
                                     data.views = views;
                                 }
                                 data.rebuild_indices();
+                                highlight_data.columns = MainWindow::collect_highlight_columns(&data);
                                 let _ = schema_sender.send(SchemaUpdate {
                                     data,
                                     highlight_data,
@@ -2239,49 +2280,81 @@ impl MainWindow {
             });
 
         let weak_state_for_browser = Rc::downgrade(&state);
+        let schema_sender_for_browser = schema_sender.clone();
+        let file_sender_for_browser = file_sender.clone();
         state_borrow.object_browser.set_sql_callback(move |action| {
             let Some(state_for_browser) = weak_state_for_browser.upgrade() else {
                 return;
             };
-            let mut s = state_for_browser.borrow_mut();
-            match action {
-                SqlAction::Set(sql) => {
-                    s.sql_buffer.set_text(&sql);
-                    s.sql_editor.refresh_highlighting();
+            let mut created_tab_for_generated_sql: Option<QueryTabId> = None;
+            {
+                let mut s = state_for_browser.borrow_mut();
+                match action {
+                    SqlAction::Set(sql) => {
+                        s.sql_buffer.set_text(&sql);
+                        s.sql_editor.refresh_highlighting();
+                    }
+                    SqlAction::Insert(text) => {
+                        let mut editor = s.sql_editor.get_editor();
+                        let insert_pos = editor.insert_position();
+                        s.sql_buffer.insert(insert_pos, &text);
+                        editor.set_insert_position(insert_pos + text.len() as i32);
+                        s.sql_editor.refresh_highlighting();
+                    }
+                    SqlAction::Append(text) => {
+                        let mut editor = s.sql_editor.get_editor();
+                        let buffer_length = s.sql_buffer.length();
+
+                        // Add newline prefix if buffer is not empty
+                        let text_to_insert = if buffer_length > 0 {
+                            format!("\n{}", text)
+                        } else {
+                            text
+                        };
+
+                        // Insert at the end of the buffer
+                        s.sql_buffer.insert(buffer_length, &text_to_insert);
+
+                        // Move cursor to the end
+                        let new_length = s.sql_buffer.length();
+                        editor.set_insert_position(new_length);
+
+                        // Scroll to the bottom to show the inserted text
+                        editor.show_insert_position();
+
+                        s.sql_editor.refresh_highlighting();
+                    }
+                    SqlAction::OpenInNewTab(sql) => {
+                        if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
+                            s.sql_buffer.set_text(&sql);
+                            s.sql_editor.reset_undo_redo_history();
+                            s.set_tab_file_path(tab_id, None);
+                            s.set_tab_dirty(tab_id, false);
+                            s.sql_editor.refresh_highlighting();
+                            s.sql_editor.focus();
+                            s.right_tile.redraw();
+                            created_tab_for_generated_sql = Some(tab_id);
+                        }
+                    }
+                    SqlAction::Execute(sql) => {
+                        s.sql_editor.execute_sql_text(&sql);
+                    }
                 }
-                SqlAction::Insert(text) => {
-                    let mut editor = s.sql_editor.get_editor();
-                    let insert_pos = editor.insert_position();
-                    s.sql_buffer.insert(insert_pos, &text);
-                    editor.set_insert_position(insert_pos + text.len() as i32);
-                    s.sql_editor.refresh_highlighting();
-                }
-                SqlAction::Append(text) => {
-                    let mut editor = s.sql_editor.get_editor();
-                    let buffer_length = s.sql_buffer.length();
+            }
 
-                    // Add newline prefix if buffer is not empty
-                    let text_to_insert = if buffer_length > 0 {
-                        format!("\n{}", text)
-                    } else {
-                        text
-                    };
-
-                    // Insert at the end of the buffer
-                    s.sql_buffer.insert(buffer_length, &text_to_insert);
-
-                    // Move cursor to the end
-                    let new_length = s.sql_buffer.length();
-                    editor.set_insert_position(new_length);
-
-                    // Scroll to the bottom to show the inserted text
-                    editor.show_insert_position();
-
-                    s.sql_editor.refresh_highlighting();
-                }
-                SqlAction::Execute(sql) => {
-                    s.sql_editor.execute_sql_text(&sql);
-                }
+            if let Some(tab_id) = created_tab_for_generated_sql {
+                MainWindow::attach_editor_callbacks(
+                    &state_for_browser,
+                    tab_id,
+                    schema_sender_for_browser.clone(),
+                );
+                MainWindow::attach_file_drop_callback(
+                    &state_for_browser,
+                    tab_id,
+                    file_sender_for_browser.clone(),
+                );
+                state_for_browser.borrow_mut().sql_editor.focus();
+                app::redraw();
             }
         });
 
@@ -2468,6 +2541,8 @@ impl MainWindow {
                                                 data.views = views;
                                             }
                                             data.rebuild_indices();
+                                            highlight_data.columns =
+                                                MainWindow::collect_highlight_columns(&data);
                                             let _ = schema_sender.send(SchemaUpdate {
                                                 data,
                                                 highlight_data,

@@ -522,3 +522,102 @@ fn test_lowercase_date_literal() {
         "Lowercase date literal should be styled as datetime literal"
     );
 }
+
+#[test]
+fn test_quoted_identifier_does_not_trigger_keyword_or_comment() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"SELECT "FROM" AS "A--B" FROM dual"#;
+    let styles = highlighter.generate_styles(text);
+
+    let from_ident_start = text.find(r#""FROM""#).unwrap();
+    let from_ident_end = from_ident_start + r#""FROM""#.len();
+    assert!(
+        styles[from_ident_start..from_ident_end]
+            .chars()
+            .all(|c| c == STYLE_IDENTIFIER),
+        "quoted identifier should be identifier style"
+    );
+
+    let comment_like_start = text.find(r#""A--B""#).unwrap();
+    let comment_like_end = comment_like_start + r#""A--B""#.len();
+    assert!(
+        styles[comment_like_start..comment_like_end]
+            .chars()
+            .all(|c| c == STYLE_IDENTIFIER),
+        "double dash inside quoted identifier must not start comment"
+    );
+}
+
+#[test]
+fn test_quoted_identifier_with_escaped_quote_is_identifier_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"SELECT "A""B" FROM dual"#;
+    let styles = highlighter.generate_styles(text);
+
+    let quoted_start = text.find(r#""A""B""#).unwrap();
+    let quoted_end = quoted_start + r#""A""B""#.len();
+    assert!(
+        styles[quoted_start..quoted_end]
+            .chars()
+            .all(|c| c == STYLE_IDENTIFIER),
+        "escaped quote in quoted identifier should remain identifier style"
+    );
+}
+
+#[test]
+fn test_prioritize_ranges_keeps_focus_window_when_truncating() {
+    let ranges = vec![
+        (0, 100),
+        (200, 300),
+        (400, 500),
+        (600, 700),
+        (800, 900),
+        (1000, 1100),
+        (5000, 5100),
+    ];
+    let focus_points = vec![5050];
+    let prioritized = prioritize_ranges_for_focus(
+        ranges,
+        &focus_points,
+        MAX_HIGHLIGHT_WINDOWS_PER_PASS,
+    );
+
+    assert_eq!(prioritized.len(), MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+    assert!(
+        prioritized
+            .iter()
+            .any(|(start, end)| *start <= 5050 && 5050 <= *end),
+        "focus-adjacent range should be retained after truncation"
+    );
+}
+
+#[test]
+fn test_columns_and_relations_use_different_styles() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_highlight_data(HighlightData {
+        tables: vec!["EMP".to_string()],
+        views: Vec::new(),
+        columns: vec!["ENAME".to_string()],
+    });
+
+    let text = "SELECT ENAME FROM EMP";
+    let styles = highlighter.generate_styles(text);
+
+    let col_start = text.find("ENAME").unwrap();
+    let col_end = col_start + "ENAME".len();
+    assert!(
+        styles[col_start..col_end]
+            .chars()
+            .all(|c| c == STYLE_COLUMN),
+        "columns should use column style"
+    );
+
+    let table_start = text.find("EMP").unwrap();
+    let table_end = table_start + "EMP".len();
+    assert!(
+        styles[table_start..table_end]
+            .chars()
+            .all(|c| c == STYLE_IDENTIFIER),
+        "relations should use identifier style"
+    );
+}
