@@ -34,7 +34,9 @@ libdbus-sys = { version = "0.2.7", default-features = false, features = ["vendor
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Keep unwinding enabled so runtime panic guards (catch_unwind) can recover
+# in production instead of terminating the whole process immediately.
+panic = "unwind"
 strip = true
 
 [build-dependencies]

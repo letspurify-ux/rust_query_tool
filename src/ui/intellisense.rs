@@ -1,7 +1,9 @@
 use crate::ui::theme;
 use fltk::{browser::HoldBrowser, prelude::*, window::Window};
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -1237,6 +1239,25 @@ pub struct IntellisensePopup {
 }
 
 impl IntellisensePopup {
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn log_callback_panic(context: &str, payload: &(dyn Any + Send)) {
+        let panic_payload = Self::panic_payload_to_string(payload);
+        crate::utils::logging::log_error(
+            "intellisense_popup::callback",
+            &format!("{context} panicked: {panic_payload}"),
+        );
+        eprintln!("{context} panicked: {panic_payload}");
+    }
+
     pub fn new() -> Self {
         // Temporarily suspend current group to prevent popup window from being
         // added to the parent container (which causes layout issues)
@@ -1302,8 +1323,14 @@ impl IntellisensePopup {
                     // This ensures the RefCell is not borrowed during callback execution
                     let cb_opt = callback.borrow_mut().take();
                     if let Some(mut cb) = cb_opt {
-                        cb(text);
+                        let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(text)));
                         *callback.borrow_mut() = Some(cb);
+                        if let Err(payload) = call_result {
+                            Self::log_callback_panic(
+                                "intellisense selected callback",
+                                payload.as_ref(),
+                            );
+                        }
                     }
                     window.hide();
                     *visible.borrow_mut() = false;

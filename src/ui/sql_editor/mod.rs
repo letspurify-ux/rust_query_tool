@@ -8,7 +8,9 @@ use fltk::{
     prelude::*,
     text::{TextBuffer, TextEditor, WrapMode},
 };
+use std::any::Any;
 use std::cell::RefCell;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,6 +197,25 @@ pub struct SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn log_callback_panic(context: &str, payload: &(dyn Any + Send)) {
+        let panic_payload = Self::panic_payload_to_string(payload);
+        crate::utils::logging::log_error(
+            "sql_editor::callback",
+            &format!("{context} panicked: {panic_payload}"),
+        );
+        eprintln!("{context} panicked: {panic_payload}");
+    }
+
     fn invoke_query_result_callback(
         callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>>,
         result: &QueryResult,
@@ -205,10 +226,13 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb(result);
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(result)));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("query result callback", payload.as_ref());
             }
         }
     }
@@ -223,10 +247,13 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb(message);
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("progress callback", payload.as_ref());
             }
         }
     }
@@ -241,10 +268,13 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb(message);
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("status callback", payload.as_ref());
             }
         }
     }

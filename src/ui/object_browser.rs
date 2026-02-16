@@ -6,8 +6,10 @@ use fltk::{
     prelude::*,
     tree::{Tree, TreeItem, TreeSelect},
 };
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::thread;
 
@@ -464,11 +466,10 @@ impl ObjectBrowserWidget {
                         },
                         ObjectActionResult::Ddl(result) => match result {
                             Ok(ddl) => {
-                                let cb_opt = sql_callback.borrow_mut().take();
-                                if let Some(mut cb) = cb_opt {
-                                    cb(SqlAction::Append(ddl));
-                                    *sql_callback.borrow_mut() = Some(cb);
-                                }
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::Append(ddl),
+                                );
                             }
                             Err(err) => {
                                 fltk::dialog::alert_default(&format!(
@@ -500,11 +501,10 @@ impl ObjectBrowserWidget {
                                     }
                                 }
                             };
-                            let cb_opt = sql_callback.borrow_mut().take();
-                            if let Some(mut cb) = cb_opt {
-                                cb(SqlAction::Append(sql));
-                                *sql_callback.borrow_mut() = Some(cb);
-                            }
+                            ObjectBrowserWidget::emit_sql_callback(
+                                &sql_callback,
+                                SqlAction::Append(sql),
+                            );
                         }
                         ObjectActionResult::PackageRoutines {
                             package_name,
@@ -726,13 +726,10 @@ impl ObjectBrowserWidget {
 
                                 // Double-click on other items: insert text into SQL editor
                                 if let Some(insert_text) = Self::get_insert_text(&item) {
-                                    // Take the callback out, call it, then put it back
-                                    // This ensures the RefCell is not borrowed during callback execution
-                                    let cb_opt = sql_callback.borrow_mut().take();
-                                    if let Some(mut cb) = cb_opt {
-                                        cb(SqlAction::Insert(insert_text));
-                                        *sql_callback.borrow_mut() = Some(cb);
-                                    }
+                                    ObjectBrowserWidget::emit_sql_callback(
+                                        &sql_callback,
+                                        SqlAction::Insert(insert_text),
+                                    );
                                     return true;
                                 }
                             }
@@ -755,12 +752,10 @@ impl ObjectBrowserWidget {
                                         "SELECT * FROM {} WHERE ROWNUM <= 100",
                                         object_name
                                     );
-                                    // Take the callback out, call it, then put it back
-                                    let cb_opt = sql_callback.borrow_mut().take();
-                                    if let Some(mut cb) = cb_opt {
-                                        cb(SqlAction::Set(sql));
-                                        *sql_callback.borrow_mut() = Some(cb);
-                                    }
+                                    ObjectBrowserWidget::emit_sql_callback(
+                                        &sql_callback,
+                                        SqlAction::Set(sql),
+                                    );
                                 }
                             }
                         }
@@ -1301,11 +1296,10 @@ impl ObjectBrowserWidget {
                         }
                         drop(conn_guard);
                         let sql = format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name);
-                        let cb_opt = sql_callback.borrow_mut().take();
-                        if let Some(mut cb) = cb_opt {
-                            cb(SqlAction::Execute(sql));
-                            *sql_callback.borrow_mut() = Some(cb);
-                        }
+                        ObjectBrowserWidget::emit_sql_callback(
+                            &sql_callback,
+                            SqlAction::Execute(sql),
+                        );
                     }
                     (
                         label @ ("Execute Procedure" | "Execute Function"),
@@ -1847,6 +1841,43 @@ impl ObjectBrowserWidget {
         *self.sql_callback.borrow_mut() = Some(Box::new(callback));
     }
 
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(msg) = payload.downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = payload.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn log_callback_panic(context: &str, payload: &(dyn Any + Send)) {
+        let panic_payload = Self::panic_payload_to_string(payload);
+        crate::utils::logging::log_error(
+            "object_browser::callback",
+            &format!("{context} panicked: {panic_payload}"),
+        );
+        eprintln!("{context} panicked: {panic_payload}");
+    }
+
+    fn emit_sql_callback(callback_slot: &SqlExecuteCallback, action: SqlAction) {
+        let callback = {
+            let mut slot = callback_slot.borrow_mut();
+            slot.take()
+        };
+
+        if let Some(mut cb) = callback {
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(action)));
+            let mut slot = callback_slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("SQL callback", payload.as_ref());
+            }
+        }
+    }
+
     fn emit_status_callback(callback_slot: &StatusCallback, message: &str) {
         let callback = {
             let mut slot = callback_slot.borrow_mut();
@@ -1854,10 +1885,13 @@ impl ObjectBrowserWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb(message);
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("status callback", payload.as_ref());
             }
         }
     }
