@@ -120,6 +120,7 @@ impl AppConfig {
                 match fs::create_dir_all(parent) {
                     Ok(()) => {}
                     Err(err) => {
+                        crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
                         eprintln!("Config persistence error: {err}");
                         return Err(Box::new(err));
                     }
@@ -128,6 +129,7 @@ impl AppConfig {
             let content = match serde_json::to_string_pretty(self) {
                 Ok(content) => content,
                 Err(err) => {
+                    crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
                     eprintln!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
@@ -135,6 +137,7 @@ impl AppConfig {
             match fs::write(&path, content) {
                 Ok(()) => {}
                 Err(err) => {
+                    crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
                     eprintln!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
@@ -290,6 +293,7 @@ impl QueryHistory {
                 match fs::create_dir_all(parent) {
                     Ok(()) => {}
                     Err(err) => {
+                        crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
                         eprintln!("History persistence error: {err}");
                         return Err(Box::new(err));
                     }
@@ -298,12 +302,14 @@ impl QueryHistory {
             let file = match fs::File::create(&path) {
                 Ok(f) => f,
                 Err(err) => {
+                    crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
                     eprintln!("History persistence error: {err}");
                     return Err(Box::new(err));
                 }
             };
             let writer = BufWriter::new(file);
             if let Err(err) = serde_json::to_writer(writer, self) {
+                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
                 eprintln!("History persistence error: {err}");
                 return Err(Box::new(err));
             }
