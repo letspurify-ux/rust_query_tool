@@ -28,14 +28,16 @@ fn main() {
         };
 
         let crash_message = format!(
-            "Panic at {}\nMessage: {}\n\nFull info: {}",
-            location, payload, panic_info
+            "Panic at {}\nMessage: {}\n\nFull info: {}\n\nBacktrace:\n{}",
+            location,
+            payload,
+            panic_info,
+            std::backtrace::Backtrace::force_capture()
         );
 
-        // Log the crash
-        logging::log_error("panic", &crash_message);
-
-        // Write crash log file synchronously
+        // NOTE: Avoid using the async logger here.
+        // If panic happens while a log mutex is held, logging from the panic hook
+        // can deadlock before the process exits.
         logging::write_crash_log(&crash_message);
 
         eprintln!("SPACE Query crashed: {}", crash_message);
