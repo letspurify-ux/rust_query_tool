@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
-    QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
+    QueryExecutor, QueryResult, ScriptItem, SessionState, SplitState, ToolCommand,
 };
 use crate::ui::SQL_KEYWORDS;
 
@@ -2749,13 +2749,7 @@ impl SqlEditorWidget {
         let chars: Vec<char> = sql.chars().collect();
         let mut i = 0;
         let mut current = String::new();
-
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut in_q_quote = false;
-        let mut q_quote_end: Option<char> = None;
+        let mut scan_state = SplitState::default();
         let mut pending_newline = false;
 
         let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
@@ -2772,17 +2766,17 @@ impl SqlEditorWidget {
                 None
             };
 
-            if in_line_comment {
+            if scan_state.in_line_comment {
                 current.push(c);
                 if c == '\n' {
                     tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    in_line_comment = false;
+                    scan_state.in_line_comment = false;
                 }
                 i += 1;
                 continue;
             }
 
-            if in_block_comment {
+            if scan_state.in_block_comment {
                 current.push(c);
                 if c == '*' && next == Some('/') {
                     current.push('/');
@@ -2791,7 +2785,7 @@ impl SqlEditorWidget {
                         i += 1;
                     }
                     tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    in_block_comment = false;
+                    scan_state.in_block_comment = false;
                     i += 2;
                     continue;
                 }
@@ -2799,13 +2793,13 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            if in_q_quote {
+            if scan_state.in_q_quote {
                 current.push(c);
-                if Some(c) == q_quote_end && next == Some('\'') {
+                if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
                     current.push('\'');
                     tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    in_q_quote = false;
-                    q_quote_end = None;
+                    scan_state.in_q_quote = false;
+                    scan_state.q_quote_end = None;
                     i += 2;
                     continue;
                 }
@@ -2813,7 +2807,7 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            if in_single_quote {
+            if scan_state.in_single_quote {
                 current.push(c);
                 if c == '\'' {
                     if next == Some('\'') {
@@ -2822,7 +2816,7 @@ impl SqlEditorWidget {
                         continue;
                     }
                     tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    in_single_quote = false;
+                    scan_state.in_single_quote = false;
                     i += 1;
                     continue;
                 }
@@ -2830,7 +2824,7 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            if in_double_quote {
+            if scan_state.in_double_quote {
                 current.push(c);
                 if c == '"' {
                     if next == Some('"') {
@@ -2839,7 +2833,7 @@ impl SqlEditorWidget {
                         continue;
                     }
                     tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-                    in_double_quote = false;
+                    scan_state.in_double_quote = false;
                     i += 1;
                     continue;
                 }
@@ -2858,7 +2852,7 @@ impl SqlEditorWidget {
 
             if c == '-' && next == Some('-') {
                 flush_word(&mut current, &mut tokens);
-                in_line_comment = true;
+                scan_state.in_line_comment = true;
                 if pending_newline {
                     current.push('\n');
                 }
@@ -2871,7 +2865,7 @@ impl SqlEditorWidget {
 
             if c == '/' && next == Some('*') {
                 flush_word(&mut current, &mut tokens);
-                in_block_comment = true;
+                scan_state.in_block_comment = true;
                 if pending_newline {
                     current.push('\n');
                 }
@@ -2904,8 +2898,8 @@ impl SqlEditorWidget {
                 current.push(chars[i + 1]);
                 current.push('\'');
                 current.push(delimiter);
-                in_q_quote = true;
-                q_quote_end = Some(closing);
+                scan_state.start_q_quote(delimiter);
+                debug_assert_eq!(scan_state.q_quote_end(), Some(closing));
                 i += 4;
                 continue;
             }
@@ -2924,15 +2918,15 @@ impl SqlEditorWidget {
                 current.push(c);
                 current.push('\'');
                 current.push(delimiter);
-                in_q_quote = true;
-                q_quote_end = Some(closing);
+                scan_state.start_q_quote(delimiter);
+                debug_assert_eq!(scan_state.q_quote_end(), Some(closing));
                 i += 3;
                 continue;
             }
 
             if c == '\'' {
                 flush_word(&mut current, &mut tokens);
-                in_single_quote = true;
+                scan_state.in_single_quote = true;
                 current.push('\'');
                 i += 1;
                 continue;
@@ -2940,7 +2934,7 @@ impl SqlEditorWidget {
 
             if c == '"' {
                 flush_word(&mut current, &mut tokens);
-                in_double_quote = true;
+                scan_state.in_double_quote = true;
                 current.push('"');
                 i += 1;
                 continue;
@@ -2994,15 +2988,15 @@ impl SqlEditorWidget {
             i += 1;
         }
 
-        if in_line_comment || in_block_comment {
+        if scan_state.in_line_comment || scan_state.in_block_comment {
             if !current.is_empty() {
                 tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
             }
-        } else if in_single_quote || in_q_quote {
+        } else if scan_state.in_single_quote || scan_state.in_q_quote {
             if !current.is_empty() {
                 tokens.push(SqlToken::String(std::mem::take(&mut current)));
             }
-        } else if in_double_quote {
+        } else if scan_state.in_double_quote {
             if !current.is_empty() {
                 tokens.push(SqlToken::Word(std::mem::take(&mut current)));
             }
