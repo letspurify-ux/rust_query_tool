@@ -1208,8 +1208,24 @@ impl MainWindow {
                 .selected_id()
                 .or_else(|| s.query_tabs.tab_ids().first().copied())
                 .or_else(|| s.editor_tabs.first().map(|tab| tab.tab_id));
-            if let Some(next_tab_id) = next_tab_id {
-                let _ = s.set_active_editor_tab(next_tab_id);
+            let switched_to_next = next_tab_id
+                .map(|next_tab_id| s.set_active_editor_tab(next_tab_id))
+                .unwrap_or(false);
+
+            if switched_to_next {
+                if was_active {
+                    s.sql_editor.focus();
+                }
+            } else if let Some(fallback_tab) = s.editor_tabs.first().cloned() {
+                // Defensive fallback: if tab/widget selection loses sync, still point
+                // app state to a live editor tab so closed-tab resources are not held
+                // by stale SqlEditorWidget/TextBuffer handles.
+                s.active_editor_tab_id = fallback_tab.tab_id;
+                s.sql_editor = fallback_tab.sql_editor;
+                s.sql_buffer = fallback_tab.sql_buffer;
+                *s.current_file.borrow_mut() = fallback_tab.current_file;
+                s.query_tabs.select(fallback_tab.tab_id);
+                s.refresh_window_title();
                 if was_active {
                     s.sql_editor.focus();
                 }
