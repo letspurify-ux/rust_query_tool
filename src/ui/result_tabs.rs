@@ -19,7 +19,7 @@ pub struct ResultTabsWidget {
     data: Rc<RefCell<Vec<ResultTab>>>,
     active_index: Rc<RefCell<Option<usize>>>,
     script_output: Rc<RefCell<ScriptOutputTab>>,
-    app_log: Rc<RefCell<ScriptOutputTab>>,
+    app_log: Rc<RefCell<Option<ScriptOutputTab>>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
     max_cell_display_chars: Rc<Cell<usize>>,
@@ -158,32 +158,8 @@ impl ResultTabsWidget {
             buffer: script_buffer,
         }));
 
-        // Create "App Log" tab for displaying tracing log entries in the UI
-        tabs.begin();
-        let (x, y, w, h) = Self::content_bounds(&tabs);
-        let mut log_group = Group::new(x, y, w, h, None).with_label("App Log");
-        log_group.set_color(theme::panel_bg());
-        log_group.set_label_color(theme::text_secondary());
-        log_group.set_align(Align::Center | Align::Inside);
-        log_group.begin();
-        let mut log_display =
-            TextDisplay::new(display_x, display_y, display_w, display_h, None);
-        log_display.set_color(theme::panel_bg());
-        log_display.set_text_color(theme::text_primary());
-        log_display.set_text_font(font_profile.get().normal);
-        log_display.set_text_size(font_size.get() as i32);
-        let mut log_buffer = TextBuffer::default();
-        log_buffer.set_text("");
-        log_display.set_buffer(log_buffer.clone());
-        log_group.resizable(&log_display);
-        log_group.end();
-        tabs.end();
-
-        let app_log = Rc::new(RefCell::new(ScriptOutputTab {
-            group: log_group,
-            display: log_display,
-            buffer: log_buffer,
-        }));
+        // App Log tab is created lazily on first log entry (see ensure_app_log_tab)
+        let app_log: Rc<RefCell<Option<ScriptOutputTab>>> = Rc::new(RefCell::new(None));
 
         let data_for_cb = data.clone();
         let active_for_cb = active_index.clone();
@@ -193,10 +169,15 @@ impl ResultTabsWidget {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
                 let script_ptr = script_for_cb.borrow().group.as_widget_ptr();
-                let log_ptr = log_for_cb.borrow().group.as_widget_ptr();
-                if ptr == script_ptr || ptr == log_ptr {
+                if ptr == script_ptr {
                     *active_for_cb.borrow_mut() = None;
                     return;
+                }
+                if let Some(ref log_tab) = *log_for_cb.borrow() {
+                    if ptr == log_tab.group.as_widget_ptr() {
+                        *active_for_cb.borrow_mut() = None;
+                        return;
+                    }
                 }
                 let data = data_for_cb.borrow();
                 let index = data.iter().position(|tab| tab.group.as_widget_ptr() == ptr);
@@ -265,8 +246,7 @@ impl ResultTabsWidget {
             script_output.display.set_text_size(size as i32);
             script_output.display.redraw();
         }
-        {
-            let mut app_log = self.app_log.borrow_mut();
+        if let Some(ref mut app_log) = *self.app_log.borrow_mut() {
             app_log.display.set_text_font(profile.normal);
             app_log.display.set_text_size(size as i32);
             app_log.display.redraw();
@@ -277,13 +257,58 @@ impl ResultTabsWidget {
         self.max_cell_display_chars.set(max_chars);
     }
 
-    /// Append formatted log entries to the App Log tab.
+    /// Create the App Log tab on demand (called on first log entry).
+    fn ensure_app_log_tab(&mut self) {
+        if self.app_log.borrow().is_some() {
+            return;
+        }
+
+        self.tabs.begin();
+        let (x, y, w, h) = Self::content_bounds(&self.tabs);
+        let padding = constants::SCRIPT_OUTPUT_PADDING;
+        let mut log_group = Group::new(x, y, w, h, None).with_label("App Log");
+        log_group.set_color(theme::panel_bg());
+        log_group.set_label_color(theme::text_secondary());
+        log_group.set_align(Align::Center | Align::Inside);
+        log_group.begin();
+        let mut log_display = TextDisplay::new(
+            x + padding,
+            y + padding,
+            (w - padding * 2).max(10),
+            (h - padding * 2).max(10),
+            None,
+        );
+        log_display.set_color(theme::panel_bg());
+        log_display.set_text_color(theme::text_primary());
+        log_display.set_text_font(self.font_profile.get().normal);
+        log_display.set_text_size(self.font_size.get() as i32);
+        let mut log_buffer = TextBuffer::default();
+        log_buffer.set_text("");
+        log_display.set_buffer(log_buffer.clone());
+        log_group.resizable(&log_display);
+        log_group.end();
+        self.tabs.end();
+
+        *self.app_log.borrow_mut() = Some(ScriptOutputTab {
+            group: log_group,
+            display: log_display,
+            buffer: log_buffer,
+        });
+
+        self.reset_tab_strip_left_anchor();
+        self.tabs.redraw();
+    }
+
+    /// Append formatted log entries to the App Log tab (creates tab on first call).
     pub fn append_log_lines(&mut self, lines: &[String]) {
-        let mut app_log = self.app_log.borrow_mut();
-        let mut buffer = app_log.buffer.clone();
         if lines.is_empty() {
             return;
         }
+        self.ensure_app_log_tab();
+
+        let mut borrow = self.app_log.borrow_mut();
+        let app_log = borrow.as_mut().unwrap();
+        let mut buffer = app_log.buffer.clone();
         for line in lines {
             buffer.append(line);
             buffer.append("\n");
@@ -293,9 +318,10 @@ impl ResultTabsWidget {
         app_log.display.scroll(line_count, 0);
     }
 
-    /// Switch the active tab to the App Log tab.
+    /// Switch the active tab to the App Log tab (creates tab if needed).
     pub fn select_app_log(&mut self) {
-        let log_group = self.app_log.borrow().group.clone();
+        self.ensure_app_log_tab();
+        let log_group = self.app_log.borrow().as_ref().unwrap().group.clone();
         let _ = self.tabs.set_value(&log_group);
         *self.active_index.borrow_mut() = None;
     }
