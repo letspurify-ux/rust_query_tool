@@ -1,6 +1,6 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -211,10 +211,12 @@ pub fn write_crash_log(info: &str) {
         }
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let report = format!(
-            "=== SPACE Query Crash Report ===\nTimestamp: {}\n\n{}\n",
+            "=== SPACE Query Crash Report ===\nTimestamp: {}\n\n{}\n\n",
             timestamp, info
         );
-        let _ = fs::write(&path, report);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = std::io::Write::write_all(&mut file, report.as_bytes());
+        }
     }
 }
 
