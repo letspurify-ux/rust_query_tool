@@ -1482,10 +1482,6 @@ impl MainWindow {
                 QueryProgress::StatementFinished { index, result, .. } => {
                     let tab_index = s.result_tab_offset + index;
                     if !result.success && !result.message.trim().is_empty() {
-                        crate::utils::logging::log_error(
-                            "query",
-                            &format!("Statement {} failed: {}", index + 1, result.message.trim()),
-                        );
                         let lines: Vec<String> =
                             result.message.lines().map(|l| l.to_string()).collect();
                         s.result_tabs.append_script_output_lines(&lines);
