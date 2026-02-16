@@ -143,8 +143,8 @@ impl SplitState {
             if self.block_depth > 0 {
                 self.block_depth -= 1;
             } else {
-                eprintln!(
-                    "Warning: encountered TYPE body terminator while block depth was already zero."
+                tracing::warn!(
+                    "Encountered TYPE body terminator while block depth was already zero"
                 );
             }
             self.after_as_is = false;

@@ -1124,7 +1124,7 @@ impl SqlEditorWidget {
         match current_query_connection.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
-                eprintln!("Warning: current query connection lock was poisoned; recovering.");
+                tracing::warn!("Current query connection lock was poisoned; recovering");
                 poisoned.into_inner().clone()
             }
         }
@@ -1139,7 +1139,7 @@ impl SqlEditorWidget {
                 *guard = value;
             }
             Err(poisoned) => {
-                eprintln!("Warning: current query connection lock was poisoned; recovering.");
+                tracing::warn!("Current query connection lock was poisoned; recovering");
                 *poisoned.into_inner() = value;
             }
         }

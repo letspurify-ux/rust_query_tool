@@ -99,7 +99,7 @@ impl DatabaseConnection {
             match Connection::connect(&info.username, &info.password, &conn_str) {
                 Ok(connection) => connection,
                 Err(err) => {
-                    eprintln!("Connection error: {err}");
+                    tracing::error!("Connection error: {err}");
                     return Err(err);
                 }
             },
@@ -124,7 +124,7 @@ impl DatabaseConnection {
 
         for statement in statements {
             if let Err(err) = conn.execute(statement, &[]) {
-                eprintln!("Warning: failed to apply default session setting `{statement}`: {err}");
+                tracing::warn!("Failed to apply default session setting `{statement}`: {err}");
             }
         }
     }
@@ -163,7 +163,7 @@ impl DatabaseConnection {
         match Connection::connect(&info.username, &info.password, &conn_str) {
             Ok(_connection) => {}
             Err(err) => {
-                eprintln!("Connection error: {err}");
+                tracing::error!("Connection error: {err}");
                 return Err(err);
             }
         }
@@ -191,7 +191,7 @@ fn set_current_db_activity(activity: Option<String>) {
             *guard = activity;
         }
         Err(poisoned) => {
-            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            tracing::warn!("DB activity lock was poisoned; recovering");
             *poisoned.into_inner() = activity;
         }
     }
@@ -201,7 +201,7 @@ pub fn current_db_activity() -> Option<String> {
     match db_activity_slot().lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => {
-            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            tracing::warn!("DB activity lock was poisoned; recovering");
             poisoned.into_inner().clone()
         }
     }
@@ -261,7 +261,7 @@ pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_>
     let guard = match connection.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            tracing::warn!("Database connection lock was poisoned; recovering");
             poisoned.into_inner()
         }
     };
@@ -290,7 +290,7 @@ pub fn try_lock_connection(
         }),
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            tracing::warn!("Database connection lock was poisoned; recovering");
             Some(ConnectionLockGuard {
                 guard: poisoned.into_inner(),
                 tracks_activity: false,
@@ -313,7 +313,7 @@ pub fn try_lock_connection_with_activity(
         }
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            tracing::warn!("Database connection lock was poisoned; recovering");
             set_current_db_activity(Some(activity.into()));
             Some(ConnectionLockGuard {
                 guard: poisoned.into_inner(),

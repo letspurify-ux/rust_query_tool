@@ -715,8 +715,8 @@ impl MainWindow {
         let mut first_tab_id = query_tabs.add_tab("Query 1");
         let mut first_tab_group = query_tabs.tab_group(first_tab_id);
         if first_tab_group.is_none() {
-            eprintln!(
-                "Warning: initial query tab group was missing; attempting recovery by creating a new tab."
+            tracing::warn!(
+                "Initial query tab group was missing; attempting recovery by creating a new tab"
             );
             let recovered_tab_id = query_tabs.add_tab("Query 1");
             first_tab_group = query_tabs.tab_group(recovered_tab_id);
@@ -1551,7 +1551,7 @@ impl MainWindow {
                                 match session.lock() {
                                     Ok(mut guard) => guard.reset(),
                                     Err(poisoned) => {
-                                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         poisoned.into_inner().reset();
                                     }
                                 }
@@ -1588,7 +1588,7 @@ impl MainWindow {
                 match session.lock() {
                     Ok(mut guard) => guard.reset(),
                     Err(poisoned) => {
-                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                        tracing::warn!("Session state lock was poisoned; recovering");
                         poisoned.into_inner().reset();
                     }
                 }
@@ -2599,7 +2599,7 @@ impl MainWindow {
         match app.run() {
             Ok(()) => {}
             Err(err) => {
-                eprintln!("Failed to run app: {err}");
+                tracing::error!("Failed to run app: {err}");
             }
         }
         // Restore current group
@@ -2627,7 +2627,7 @@ impl MainWindow {
         match fs::write(path, output) {
             Ok(()) => {}
             Err(err) => {
-                eprintln!("CSV export error: {err}");
+                tracing::error!("CSV export error: {err}");
                 return Err(Box::new(err));
             }
         }

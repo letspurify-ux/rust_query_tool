@@ -284,7 +284,7 @@ impl FindReplaceDialog {
             let replace_input_clone = match replace_input.clone() {
                 Some(input) => input,
                 None => {
-                    eprintln!("Replace input not available for replace action.");
+                    tracing::warn!("Replace input not available for replace action");
                     return;
                 }
             };
@@ -314,7 +314,7 @@ impl FindReplaceDialog {
             let replace_input_clone = match replace_input.clone() {
                 Some(input) => input,
                 None => {
-                    eprintln!("Replace input not available for replace-all action.");
+                    tracing::warn!("Replace input not available for replace-all action");
                     return;
                 }
             };

@@ -3093,7 +3093,7 @@ impl SqlEditorWidget {
                     if let Err(err) =
                         SqlEditorWidget::sync_serveroutput_with_session(conn.as_ref(), &session)
                     {
-                        eprintln!("Failed to apply SERVEROUTPUT setting on session start: {err}");
+                        tracing::error!("Failed to apply SERVEROUTPUT setting on session start: {err}");
                     }
                 }
 
@@ -3102,7 +3102,7 @@ impl SqlEditorWidget {
                 let mut continue_on_error = match session.lock() {
                     Ok(guard) => guard.continue_on_error,
                     Err(poisoned) => {
-                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                        tracing::warn!("Session state lock was poisoned; recovering");
                         poisoned.into_inner().continue_on_error
                     }
                 };
@@ -3130,7 +3130,7 @@ impl SqlEditorWidget {
                     let echo_enabled = match session.lock() {
                         Ok(guard) => guard.echo_enabled,
                         Err(poisoned) => {
-                            eprintln!("Warning: session state lock was poisoned; recovering.");
+                            tracing::warn!("Session state lock was poisoned; recovering");
                             poisoned.into_inner().echo_enabled
                         }
                     };
@@ -3156,9 +3156,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -3183,9 +3181,7 @@ impl SqlEditorWidget {
                                     let binds_snapshot = match session.lock() {
                                         Ok(guard) => guard.binds.clone(),
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             poisoned.into_inner().binds.clone()
                                         }
                                     };
@@ -3374,9 +3370,7 @@ impl SqlEditorWidget {
                                     let current_size = match session.lock() {
                                         Ok(guard) => guard.server_output.size,
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             poisoned.into_inner().server_output.size
                                         }
                                     };
@@ -3396,7 +3390,7 @@ impl SqlEditorWidget {
                                                     let mut guard = match session.lock() {
                                                         Ok(guard) => guard,
                                                         Err(poisoned) => {
-                                                            eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                            tracing::warn!("Session state lock was poisoned; recovering");
                                                             poisoned.into_inner()
                                                         }
                                                     };
@@ -3447,7 +3441,7 @@ impl SqlEditorWidget {
                                                     let mut guard = match session.lock() {
                                                         Ok(guard) => guard,
                                                         Err(poisoned) => {
-                                                            eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                            tracing::warn!("Session state lock was poisoned; recovering");
                                                             poisoned.into_inner()
                                                         }
                                                     };
@@ -3475,7 +3469,7 @@ impl SqlEditorWidget {
                                                 let mut guard = match session.lock() {
                                                     Ok(guard) => guard,
                                                     Err(poisoned) => {
-                                                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                        tracing::warn!("Session state lock was poisoned; recovering");
                                                         poisoned.into_inner()
                                                     }
                                                 };
@@ -3523,7 +3517,7 @@ impl SqlEditorWidget {
                                         target = match session.lock() {
                                             Ok(guard) => guard.last_compiled.clone(),
                                             Err(poisoned) => {
-                                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner().last_compiled.clone()
                                             }
                                         };
@@ -3706,9 +3700,7 @@ impl SqlEditorWidget {
                                             guard.spool_path.clone(),
                                         ),
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let guard = poisoned.into_inner();
                                             (
                                                 guard.server_output.clone(),
@@ -3986,9 +3978,7 @@ impl SqlEditorWidget {
                                     let (define_enabled, scan_enabled) = match session.lock() {
                                         Ok(guard) => (guard.define_enabled, guard.scan_enabled),
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let guard = poisoned.into_inner();
                                             (guard.define_enabled, guard.scan_enabled)
                                         }
@@ -4063,9 +4053,7 @@ impl SqlEditorWidget {
                                                         .insert(key.clone(), value.clone());
                                                 }
                                                 Err(poisoned) => {
-                                                    eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                    tracing::warn!("Session state lock was poisoned; recovering");
                                                     let mut guard = poisoned.into_inner();
                                                     guard
                                                         .define_vars
@@ -4094,9 +4082,7 @@ impl SqlEditorWidget {
                                     let (define_enabled, scan_enabled) = match session.lock() {
                                         Ok(guard) => (guard.define_enabled, guard.scan_enabled),
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let guard = poisoned.into_inner();
                                             (guard.define_enabled, guard.scan_enabled)
                                         }
@@ -4131,9 +4117,7 @@ impl SqlEditorWidget {
                                                     .insert(key.clone(), resolved_value.clone());
                                             }
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 let mut guard = poisoned.into_inner();
                                                 guard
                                                     .define_vars
@@ -4155,9 +4139,7 @@ impl SqlEditorWidget {
                                             guard.define_vars.remove(&key);
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.define_vars.remove(&key);
                                         }
@@ -4182,9 +4164,7 @@ impl SqlEditorWidget {
                                                 .insert(column_key.clone(), variable_key.clone());
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard
                                                 .column_new_values
@@ -4211,9 +4191,7 @@ impl SqlEditorWidget {
                                             guard.break_column = Some(key.clone());
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.break_column = Some(key.clone());
                                         }
@@ -4231,9 +4209,7 @@ impl SqlEditorWidget {
                                             guard.break_column = None;
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.break_column = None;
                                         }
@@ -4251,9 +4227,7 @@ impl SqlEditorWidget {
                                             guard.break_column = None;
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.break_column = None;
                                         }
@@ -4271,9 +4245,7 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.compute = None;
                                         }
@@ -4292,9 +4264,7 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.break_column = None;
                                             guard.compute = None;
@@ -4321,9 +4291,7 @@ impl SqlEditorWidget {
                                             });
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.compute = Some(crate::db::ComputeConfig {
                                                 mode,
@@ -4352,9 +4320,7 @@ impl SqlEditorWidget {
                                             guard.compute = None;
                                         }
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             let mut guard = poisoned.into_inner();
                                             guard.compute = None;
                                         }
@@ -4371,9 +4337,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4416,9 +4380,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4444,9 +4406,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4464,9 +4424,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4484,9 +4442,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4504,9 +4460,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4524,9 +4478,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4544,9 +4496,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4564,9 +4514,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4584,9 +4532,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4604,9 +4550,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4627,9 +4571,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4647,9 +4589,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4670,9 +4610,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4690,9 +4628,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4710,9 +4646,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4738,9 +4672,7 @@ impl SqlEditorWidget {
                                                 guard.spool_truncate = !append;
                                             }
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 let mut guard = poisoned.into_inner();
                                                 guard.spool_path = Some(target_path.clone());
                                                 guard.spool_truncate = !append;
@@ -4765,9 +4697,7 @@ impl SqlEditorWidget {
                                                 has_target
                                             }
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 let mut guard = poisoned.into_inner();
                                                 let has_target = guard.spool_path.is_some();
                                                 guard.spool_truncate = false;
@@ -4798,9 +4728,7 @@ impl SqlEditorWidget {
                                                 guard.spool_truncate = false;
                                             }
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 let mut guard = poisoned.into_inner();
                                                 guard.spool_path = None;
                                                 guard.spool_truncate = false;
@@ -4834,9 +4762,7 @@ impl SqlEditorWidget {
                                             let mut guard = match session.lock() {
                                                 Ok(guard) => guard,
                                                 Err(poisoned) => {
-                                                    eprintln!(
-                                                        "Warning: session state lock was poisoned; recovering."
-                                                    );
+                                                    tracing::warn!("Session state lock was poisoned; recovering");
                                                     poisoned.into_inner()
                                                 }
                                             };
@@ -4856,9 +4782,7 @@ impl SqlEditorWidget {
                                         let mut guard = match session.lock() {
                                             Ok(guard) => guard,
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner()
                                             }
                                         };
@@ -4925,9 +4849,7 @@ impl SqlEditorWidget {
                                             match session.lock() {
                                                 Ok(mut guard) => guard.reset(),
                                                 Err(poisoned) => {
-                                                    eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
+                                                    tracing::warn!("Session state lock was poisoned; recovering");
                                                     poisoned.into_inner().reset();
                                                 }
                                             }
@@ -4952,7 +4874,7 @@ impl SqlEditorWidget {
                                                         &session,
                                                     )
                                                 {
-                                                    eprintln!(
+                                                    tracing::error!(
                                                         "Failed to apply SERVEROUTPUT after CONNECT: {err}"
                                                     );
                                                 }
@@ -4989,9 +4911,7 @@ impl SqlEditorWidget {
                                         match session.lock() {
                                             Ok(mut guard) => guard.reset(),
                                             Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
+                                                tracing::warn!("Session state lock was poisoned; recovering");
                                                 poisoned.into_inner().reset();
                                             }
                                         }
@@ -5103,8 +5023,8 @@ impl SqlEditorWidget {
                                 Some(c) => c,
                                 None => {
                                     // This shouldn't happen as we checked earlier
-                                    eprintln!(
-                                        "Error: No connection available for statement execution"
+                                    tracing::error!(
+                                        "No connection available for statement execution"
                                     );
                                     let emitted = SqlEditorWidget::emit_non_select_result(
                                         &sender,
@@ -5139,9 +5059,7 @@ impl SqlEditorWidget {
                                         guard.verify_enabled,
                                     ),
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         let guard = poisoned.into_inner();
                                         (
                                             guard.define_enabled,
@@ -5340,9 +5258,7 @@ impl SqlEditorWidget {
                                 let mut guard = match session.lock() {
                                     Ok(guard) => guard,
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         poisoned.into_inner()
                                     }
                                 };
@@ -5391,9 +5307,7 @@ impl SqlEditorWidget {
                                         QueryExecutor::resolve_binds(&sql_to_execute, &guard)
                                     }
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         QueryExecutor::resolve_binds(
                                             &sql_to_execute,
                                             &poisoned.into_inner(),
@@ -5511,9 +5425,7 @@ impl SqlEditorWidget {
                                     let mut guard = match session.lock() {
                                         Ok(guard) => guard,
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             poisoned.into_inner()
                                         }
                                     };
@@ -5720,7 +5632,7 @@ impl SqlEditorWidget {
                                             let mut guard = match session.lock() {
                                                 Ok(guard) => guard,
                                                 Err(poisoned) => {
-                                                    eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                    tracing::warn!("Session state lock was poisoned; recovering");
                                                     poisoned.into_inner()
                                                 }
                                             };
@@ -5964,9 +5876,7 @@ impl SqlEditorWidget {
                                         QueryExecutor::resolve_binds(&sql_to_execute, &guard)
                                     }
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         QueryExecutor::resolve_binds(
                                             &sql_to_execute,
                                             &poisoned.into_inner(),
@@ -6018,9 +5928,7 @@ impl SqlEditorWidget {
                                         (guard.break_column.clone(), guard.compute.clone())
                                     }
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         let guard = poisoned.into_inner();
                                         (guard.break_column.clone(), guard.compute.clone())
                                     }
@@ -6372,9 +6280,7 @@ impl SqlEditorWidget {
                                         QueryExecutor::resolve_binds(&sql_to_execute, &guard)
                                     }
                                     Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                        tracing::warn!("Session state lock was poisoned; recovering");
                                         QueryExecutor::resolve_binds(
                                             &sql_to_execute,
                                             &poisoned.into_inner(),
@@ -6518,9 +6424,7 @@ impl SqlEditorWidget {
                                     let mut guard = match session.lock() {
                                         Ok(guard) => guard,
                                         Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
+                                            tracing::warn!("Session state lock was poisoned; recovering");
                                             poisoned.into_inner()
                                         }
                                     };
@@ -6685,7 +6589,7 @@ impl SqlEditorWidget {
             })); // end catch_unwind
 
             if let Err(e) = result {
-                eprintln!("Query thread panicked: {:?}", e);
+                tracing::error!("Query thread panicked: {:?}", e);
                 SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
                 let _ = sender.send(QueryProgress::BatchFinished);
                 app::awake();
@@ -6790,7 +6694,7 @@ impl SqlEditorWidget {
                 }
             }
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let mut guard = poisoned.into_inner();
                 if guard.column_new_values.is_empty() {
                     return;
@@ -6814,7 +6718,7 @@ impl SqlEditorWidget {
         match session.lock() {
             Ok(guard) => (guard.heading_enabled, guard.feedback_enabled),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let guard = poisoned.into_inner();
                 (guard.heading_enabled, guard.feedback_enabled)
             }
@@ -6829,7 +6733,7 @@ impl SqlEditorWidget {
                 guard.trimspool_enabled,
             ),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let guard = poisoned.into_inner();
                 (
                     guard.colsep.clone(),
@@ -6844,7 +6748,7 @@ impl SqlEditorWidget {
         match session.lock() {
             Ok(guard) => (guard.trimout_enabled, guard.tab_enabled),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let guard = poisoned.into_inner();
                 (guard.trimout_enabled, guard.tab_enabled)
             }
@@ -6855,7 +6759,7 @@ impl SqlEditorWidget {
         match session.lock() {
             Ok(guard) => guard.spool_path.is_some(),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 poisoned.into_inner().spool_path.is_some()
             }
         }
@@ -7196,7 +7100,7 @@ impl SqlEditorWidget {
         let enabled = match session.lock() {
             Ok(guard) => guard.timing_enabled,
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 poisoned.into_inner().timing_enabled
             }
         };
@@ -7248,7 +7152,7 @@ impl SqlEditorWidget {
                 (path, truncate, guard.trimspool_enabled)
             }
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let mut guard = poisoned.into_inner();
                 let path = guard.spool_path.clone();
                 let truncate = guard.spool_truncate;
@@ -7274,7 +7178,7 @@ impl SqlEditorWidget {
         let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!("Failed to open spool file {}: {}", path.display(), err);
+                tracing::error!("Failed to open spool file {}: {}", path.display(), err);
                 return;
             }
         };
@@ -7286,7 +7190,7 @@ impl SqlEditorWidget {
                 line.as_str()
             };
             if let Err(err) = writeln!(file, "{}", line_to_write) {
-                eprintln!("Failed to write to spool file {}: {}", path.display(), err);
+                tracing::error!("Failed to write to spool file {}: {}", path.display(), err);
                 break;
             }
         }
@@ -7316,7 +7220,7 @@ impl SqlEditorWidget {
         let define_char = match session.lock() {
             Ok(guard) => guard.define_char,
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 poisoned.into_inner().define_char
             }
         };
@@ -7415,7 +7319,7 @@ impl SqlEditorWidget {
                         guard.binds.get(&key).cloned(),
                     ),
                     Err(poisoned) => {
-                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                        tracing::warn!("Session state lock was poisoned; recovering");
                         let guard = poisoned.into_inner();
                         (
                             guard.define_vars.get(&key).cloned(),
@@ -7437,7 +7341,7 @@ impl SqlEditorWidget {
                                 guard.define_vars.insert(key.clone(), input.clone());
                             }
                             Err(poisoned) => {
-                                eprintln!("Warning: session state lock was poisoned; recovering.");
+                                tracing::warn!("Session state lock was poisoned; recovering");
                                 let mut guard = poisoned.into_inner();
                                 guard.define_vars.insert(key.clone(), input.clone());
                             }
@@ -7753,7 +7657,7 @@ impl SqlEditorWidget {
         let (enabled, size) = match session.lock() {
             Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let guard = poisoned.into_inner();
                 (guard.server_output.enabled, guard.server_output.size)
             }
@@ -7777,7 +7681,7 @@ impl SqlEditorWidget {
         let (enabled, size) = match session.lock() {
             Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
             Err(poisoned) => {
-                eprintln!("Warning: session state lock was poisoned; recovering.");
+                tracing::warn!("Session state lock was poisoned; recovering");
                 let guard = poisoned.into_inner();
                 (guard.server_output.enabled, guard.server_output.size)
             }
@@ -7882,7 +7786,7 @@ impl SqlEditorWidget {
         let secs = match trimmed.parse::<u64>() {
             Ok(secs) => secs,
             Err(err) => {
-                eprintln!("Invalid timeout value '{trimmed}': {err}");
+                tracing::warn!("Invalid timeout value '{trimmed}': {err}");
                 return None;
             }
         };

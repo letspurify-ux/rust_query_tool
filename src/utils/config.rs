@@ -92,7 +92,7 @@ impl AppConfig {
         for conn in &mut config.recent_connections {
             if !conn.password.is_empty() {
                 if let Err(e) = credential_store::store_password(&conn.name, &conn.password) {
-                    eprintln!("Keyring migration warning: {}", e);
+                    tracing::warn!("Keyring migration failed: {}", e);
                 }
                 conn.clear_password();
                 needs_resave = true;
@@ -102,12 +102,12 @@ impl AppConfig {
         // Re-save to strip plain-text passwords from config.json
         if needs_resave {
             if let Err(e) = config.save() {
-                eprintln!("Failed to re-save config after keyring migration: {}", e);
+                tracing::error!("Failed to re-save config after keyring migration: {}", e);
             }
         } else if loaded_from_legacy {
             // Migrate config location from legacy app folder to new app folder.
             if let Err(e) = config.save() {
-                eprintln!("Failed to migrate config path: {}", e);
+                tracing::error!("Failed to migrate config path: {}", e);
             }
         }
 
@@ -120,7 +120,7 @@ impl AppConfig {
                 match fs::create_dir_all(parent) {
                     Ok(()) => {}
                     Err(err) => {
-                        eprintln!("Config persistence error: {err}");
+                        tracing::error!("Config persistence error: {err}");
                         return Err(Box::new(err));
                     }
                 }
@@ -128,14 +128,14 @@ impl AppConfig {
             let content = match serde_json::to_string_pretty(self) {
                 Ok(content) => content,
                 Err(err) => {
-                    eprintln!("Config persistence error: {err}");
+                    tracing::error!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
             };
             match fs::write(&path, content) {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("Config persistence error: {err}");
+                    tracing::error!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
             }
@@ -145,7 +145,7 @@ impl AppConfig {
             {
                 let permissions = fs::Permissions::from_mode(0o600);
                 if let Err(e) = fs::set_permissions(&path, permissions) {
-                    eprintln!("Warning: could not set config file permissions: {}", e);
+                    tracing::warn!("Could not set config file permissions: {}", e);
                 }
             }
         }
@@ -156,7 +156,7 @@ impl AppConfig {
         // Store password in OS keyring, then clear from memory
         if !info.password.is_empty() {
             if let Err(e) = credential_store::store_password(&info.name, &info.password) {
-                eprintln!("Keyring store warning: {}", e);
+                tracing::warn!("Keyring store failed: {}", e);
             }
         }
         info.clear_password();
@@ -182,7 +182,7 @@ impl AppConfig {
             Ok(Some(password)) => Some(password),
             Ok(None) => None,
             Err(e) => {
-                eprintln!("Keyring load warning: {}", e);
+                tracing::warn!("Keyring load failed: {}", e);
                 None
             }
         }
@@ -191,7 +191,7 @@ impl AppConfig {
     pub fn remove_connection(&mut self, name: &str) {
         // Remove password from OS keyring
         if let Err(e) = credential_store::delete_password(name) {
-            eprintln!("Keyring delete warning: {}", e);
+            tracing::warn!("Keyring delete failed: {}", e);
         }
         self.recent_connections.retain(|c| c.name != name);
     }
@@ -290,7 +290,7 @@ impl QueryHistory {
                 match fs::create_dir_all(parent) {
                     Ok(()) => {}
                     Err(err) => {
-                        eprintln!("History persistence error: {err}");
+                        tracing::error!("History persistence error: {err}");
                         return Err(Box::new(err));
                     }
                 }
@@ -298,13 +298,13 @@ impl QueryHistory {
             let file = match fs::File::create(&path) {
                 Ok(f) => f,
                 Err(err) => {
-                    eprintln!("History persistence error: {err}");
+                    tracing::error!("History persistence error: {err}");
                     return Err(Box::new(err));
                 }
             };
             let writer = BufWriter::new(file);
             if let Err(err) = serde_json::to_writer(writer, self) {
-                eprintln!("History persistence error: {err}");
+                tracing::error!("History persistence error: {err}");
                 return Err(Box::new(err));
             }
         }

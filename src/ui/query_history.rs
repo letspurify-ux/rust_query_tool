@@ -43,7 +43,7 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
                     }
                 }
                 if let Err(err) = history.save() {
-                    eprintln!("Query history save error: {err}");
+                    tracing::error!("Query history save error: {err}");
                 }
             }
         });

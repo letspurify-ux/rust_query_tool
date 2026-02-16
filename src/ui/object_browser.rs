@@ -1686,7 +1686,7 @@ impl ObjectBrowserWidget {
                                         )));
                                     }
                                     other => {
-                                        eprintln!("Unexpected object type for View Info: {other}");
+                                        tracing::warn!("Unexpected object type for View Info: {other}");
                                     }
                                 }
                             };

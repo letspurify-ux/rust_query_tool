@@ -919,7 +919,7 @@ impl QueryExecutor {
             match conn.commit() {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -937,7 +937,7 @@ impl QueryExecutor {
             match conn.rollback() {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -1231,7 +1231,7 @@ impl QueryExecutor {
         match conn.execute(&sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -1244,7 +1244,7 @@ impl QueryExecutor {
         match conn.execute("BEGIN DBMS_OUTPUT.DISABLE; END;", &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -1263,7 +1263,7 @@ impl QueryExecutor {
         {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1275,14 +1275,14 @@ impl QueryExecutor {
             match stmt.execute(&[]) {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
             let status: i32 = match stmt.bind_value("status") {
                 Ok(val) => val,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1292,7 +1292,7 @@ impl QueryExecutor {
             let line: Option<String> = match stmt.bind_value("line") {
                 Ok(val) => val,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1316,7 +1316,7 @@ impl QueryExecutor {
         let result = match Self::execute_batch(conn, sql) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1334,14 +1334,14 @@ impl QueryExecutor {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1361,7 +1361,7 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1401,14 +1401,14 @@ impl QueryExecutor {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1431,7 +1431,7 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1473,18 +1473,18 @@ impl QueryExecutor {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         if let Err(err) = Self::bind_statement(&mut stmt, binds) {
-            eprintln!("Database operation failed: {err}");
+            tracing::error!("Database operation failed: {err}");
             return Err(err);
         }
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1507,7 +1507,7 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1548,7 +1548,7 @@ impl QueryExecutor {
         let result_set = match cursor.query() {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1571,7 +1571,7 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -1607,14 +1607,14 @@ impl QueryExecutor {
         let stmt = match conn.execute(sql, &[]) {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let affected_rows = match stmt.row_count() {
             Ok(affected_rows) => affected_rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -1635,7 +1635,7 @@ impl QueryExecutor {
         match conn.execute(sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -1919,7 +1919,7 @@ impl QueryExecutor {
         match conn.execute(sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -1945,7 +1945,7 @@ impl QueryExecutor {
         match conn.execute(sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -1983,7 +1983,7 @@ impl QueryExecutor {
         match conn.execute(&plsql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -2179,7 +2179,7 @@ impl QueryExecutor {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2188,7 +2188,7 @@ impl QueryExecutor {
             match stmt.query(&[owner, &name]) {
                 Ok(rows) => rows,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -2196,7 +2196,7 @@ impl QueryExecutor {
             match stmt.query(&[&name]) {
                 Ok(rows) => rows,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -2207,63 +2207,63 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name = match row.get(0) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_type = match row.get(1) {
                 Ok(data_type) => data_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_length = match row.get::<_, Option<i32>>(2) {
                 Ok(value) => value.unwrap_or(0),
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_precision = match row.get::<_, Option<i32>>(3) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_scale = match row.get::<_, Option<i32>>(4) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let nullable = match row.get::<_, String>(5) {
                 Ok(value) => value == "Y",
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let default_value = match row.get(6) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let is_primary_key = match row.get::<_, Option<String>>(7) {
                 Ok(value) => value.is_some(),
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -2343,7 +2343,7 @@ impl QueryExecutor {
         match conn.execute(&explain_sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         }
@@ -2353,14 +2353,14 @@ impl QueryExecutor {
         let mut stmt = match conn.statement(plan_sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2370,14 +2370,14 @@ impl QueryExecutor {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let line: Option<String> = match row.get(0) {
                 Ok(line) => line,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -2499,14 +2499,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&seq_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2550,14 +2550,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&syn_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2764,14 +2764,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&package_name]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2781,21 +2781,21 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name: String = match row.get(0) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let routine_type: String = match row.get(1) {
                 Ok(routine_type) => routine_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -2844,14 +2844,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2861,28 +2861,28 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let package_name: String = match row.get(0) {
                 Ok(package_name) => package_name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name: String = match row.get(1) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let routine_type: String = match row.get(2) {
                 Ok(routine_type) => routine_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -2962,7 +2962,7 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -2971,7 +2971,7 @@ impl ObjectBrowser {
             match stmt.query(&[&pkg_name.to_uppercase(), &procedure_name.to_uppercase()]) {
                 Ok(rows) => rows,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -2979,7 +2979,7 @@ impl ObjectBrowser {
             match stmt.query(&[&procedure_name.to_uppercase()]) {
                 Ok(rows) => rows,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             }
@@ -2990,7 +2990,7 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -2998,91 +2998,91 @@ impl ObjectBrowser {
             let name: Option<String> = match row.get(0) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let position: i32 = match row.get(1) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let sequence: i32 = match row.get(2) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_type: Option<String> = match row.get(3) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let in_out: Option<String> = match row.get(4) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_length: Option<i32> = match row.get(5) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_precision: Option<i32> = match row.get(6) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_scale: Option<i32> = match row.get(7) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let type_owner: Option<String> = match row.get(8) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let type_name: Option<String> = match row.get(9) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let pls_type: Option<String> = match row.get(10) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let overload: Option<i32> = match row.get(11) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let default_value: Option<String> = match row.get(12) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Failed to read default_value (ignored): {err}");
+                    tracing::warn!("Failed to read default_value (ignored): {err}");
                     None
                 }
             };
@@ -3116,14 +3116,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&table_name.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3133,21 +3133,21 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name: String = match row.get(0) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_type: String = match row.get(1) {
                 Ok(data_type) => data_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3161,14 +3161,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3178,14 +3178,14 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name: String = match row.get(0) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3203,14 +3203,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&object_name.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3220,14 +3220,14 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let object_type: String = match row.get(0) {
                 Ok(object_type) => object_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3265,14 +3265,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&table_name.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3282,63 +3282,63 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name = match row.get(0) {
                 Ok(name) => name,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_type = match row.get(1) {
                 Ok(data_type) => data_type,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_length = match row.get::<_, Option<i32>>(2) {
                 Ok(value) => value.unwrap_or(0),
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_precision = match row.get::<_, Option<i32>>(3) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let data_scale = match row.get::<_, Option<i32>>(4) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let nullable = match row.get::<_, String>(5) {
                 Ok(value) => value == "Y",
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let default_value = match row.get(6) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let is_primary_key = match row.get::<_, Option<String>>(7) {
                 Ok(value) => value.is_some(),
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3377,14 +3377,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&table_name.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3394,28 +3394,28 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name = match row.get(0) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let is_unique = match row.get::<_, String>(1) {
                 Ok(value) => value == "UNIQUE",
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let columns = match row.get(2) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3451,14 +3451,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&table_name.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3468,35 +3468,35 @@ impl ObjectBrowser {
             let row: Row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let constraint_type: String = match row.get(1) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let name = match row.get(0) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let columns = match row.get::<_, Option<String>>(2) {
                 Ok(value) => value.unwrap_or_default(),
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
             let ref_table = match row.get(4) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3523,21 +3523,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&table_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3550,21 +3550,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&view_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3577,21 +3577,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&proc_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3604,21 +3604,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&func_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3631,21 +3631,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&seq_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3658,21 +3658,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&syn_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3688,21 +3688,21 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let row = match stmt.query_row(&[&package_name.to_uppercase()]) {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3719,7 +3719,7 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3727,14 +3727,14 @@ impl ObjectBrowser {
         {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let ddl: String = match row.get(0) {
             Ok(ddl) => ddl,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3754,14 +3754,14 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
         let rows = match stmt.query(&[&object_name.to_uppercase(), &object_type.to_uppercase()]) {
             Ok(rows) => rows,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3771,7 +3771,7 @@ impl ObjectBrowser {
             let row = match row_result {
                 Ok(row) => row,
                 Err(err) => {
-                    eprintln!("Database operation failed: {err}");
+                    tracing::error!("Database operation failed: {err}");
                     return Err(err);
                 }
             };
@@ -3807,7 +3807,7 @@ impl ObjectBrowser {
         let mut stmt = match conn.statement(sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };
@@ -3815,7 +3815,7 @@ impl ObjectBrowser {
         {
             Ok(row) => row,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
+                tracing::error!("Database operation failed: {err}");
                 return Err(err);
             }
         };

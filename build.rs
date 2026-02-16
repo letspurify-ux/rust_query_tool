@@ -28,21 +28,23 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let out_path = Path::new(&out_dir);
 
-    let missing_xinerama = !has_system_lib_via_pkg_config("xinerama");
-    let missing_xcursor = !has_system_lib_via_pkg_config("xcursor");
-    let missing_xfixes = !has_system_lib_via_pkg_config("xfixes");
+    let stub_libs = [
+        ("xinerama", "Xinerama"),
+        ("xcursor", "Xcursor"),
+        ("xfixes", "Xfixes"),
+        ("xft", "Xft"),
+        ("fontconfig", "fontconfig"),
+    ];
 
-    if missing_xinerama {
-        build_empty_stub(out_path, "Xinerama");
-    }
-    if missing_xcursor {
-        build_empty_stub(out_path, "Xcursor");
-    }
-    if missing_xfixes {
-        build_empty_stub(out_path, "Xfixes");
+    let mut any_missing = false;
+    for (pkg_name, lib_name) in &stub_libs {
+        if !has_system_lib_via_pkg_config(pkg_name) {
+            build_empty_stub(out_path, lib_name);
+            any_missing = true;
+        }
     }
 
-    if missing_xinerama || missing_xcursor || missing_xfixes {
+    if any_missing {
         println!("cargo:warning=Missing X11 dev libs detected; linking local stubs for test/build in this environment.");
         println!("cargo:rustc-link-search=native={}", out_path.display());
     }
