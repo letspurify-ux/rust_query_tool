@@ -8214,4 +8214,55 @@ mod query_execution_cleanup_tests {
             .expect("BatchFinished should be emitted");
         assert!(matches!(msg, QueryProgress::BatchFinished));
     }
+
+    #[test]
+    fn cleanup_guard_drop_tolerates_closed_progress_channel() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
+            Arc::new(Mutex::new(None));
+
+        let drop_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = QueryExecutionCleanupGuard::new(
+                sender,
+                current_query_connection.clone(),
+                cancel_flag.clone(),
+            );
+        }));
+
+        assert!(drop_result.is_ok(), "Drop must ignore send failures");
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cleanup_guard_recovers_from_poisoned_connection_mutex() {
+        let (sender, receiver) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
+            Arc::new(Mutex::new(None));
+
+        let poison_target = Arc::clone(&current_query_connection);
+        let _ = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _lock = poison_target
+                .lock()
+                .expect("mutex lock should succeed before poisoning");
+            panic!("poison current_query_connection mutex");
+        }));
+
+        {
+            let _guard = QueryExecutionCleanupGuard::new(
+                sender,
+                current_query_connection.clone(),
+                cancel_flag.clone(),
+            );
+        }
+
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        let msg = receiver
+            .try_recv()
+            .expect("BatchFinished should be emitted");
+        assert!(matches!(msg, QueryProgress::BatchFinished));
+    }
 }
