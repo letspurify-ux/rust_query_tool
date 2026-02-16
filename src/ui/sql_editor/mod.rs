@@ -1621,4 +1621,35 @@ fn is_string_or_comment_style(style: char) -> bool {
 }
 
 #[cfg(test)]
+mod execution_state_tests {
+    use super::SqlEditorWidget;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn finalize_execution_state_clears_running_and_cancel_flags() {
+        let query_running = Rc::new(RefCell::new(true));
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+
+        SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
+
+        assert!(!*query_running.borrow());
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn finalize_execution_state_is_idempotent_when_already_reset() {
+        let query_running = Rc::new(RefCell::new(false));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
+
+        assert!(!*query_running.borrow());
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
 mod sql_editor_tests;
