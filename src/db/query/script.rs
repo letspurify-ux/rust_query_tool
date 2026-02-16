@@ -32,6 +32,10 @@ pub(crate) struct SplitState {
     /// from nested block END (plain END at deeper block_depth) inside a CASE statement.
     /// CASE expressions end with plain END; PL/SQL CASE statements end with END CASE.
     pub(crate) case_depth_stack: Vec<usize>,
+    /// Parenthesis nesting depth. Tracked by the execution-layer parser so that
+    /// formatting and intellisense can derive their own depth from this base
+    /// without duplicating quote/comment-aware character scanning.
+    pub(crate) paren_depth: usize,
     /// True when we're creating a TRIGGER (not PROCEDURE/FUNCTION/PACKAGE/TYPE).
     /// TRIGGER headers can contain INSERT/UPDATE/DELETE/SELECT keywords as event types
     /// before block_depth increases, so we must not force-terminate on those keywords.
@@ -579,6 +583,14 @@ impl StatementBuilder {
 
             self.state.flush_token();
 
+            // Track parenthesis depth at the execution layer so that
+            // formatting/intellisense can build on this base.
+            if c == '(' {
+                self.state.paren_depth += 1;
+            } else if c == ')' {
+                self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+            }
+
             if c == ';' {
                 self.state.resolve_pending_end_on_terminator();
                 if self.state.block_depth == 0 {
@@ -616,6 +628,7 @@ impl StatementBuilder {
         self.state.pending_end = false;
         self.state.token.clear();
         self.state.block_depth = 0;
+        self.state.paren_depth = 0;
         self.state.case_depth_stack.clear();
         let trimmed = self.current.trim();
         if !trimmed.is_empty() {
@@ -670,11 +683,6 @@ impl QueryExecutor {
         let mut exception_depth_stack: Vec<usize> = Vec::new();
         let mut exception_handler_body = false;
         let mut case_branch_stack: Vec<bool> = Vec::new();
-        let mut scan_in_single_quote = false;
-        let mut scan_in_double_quote = false;
-        let mut scan_in_block_comment = false;
-        let mut scan_in_q_quote = false;
-        let mut scan_q_quote_end: Option<char> = None;
 
         for line in sql.lines() {
             let words = if builder.is_idle() {
@@ -802,6 +810,10 @@ impl QueryExecutor {
             depths.push(depth);
 
             // Update additional depth state with a very lightweight token pass.
+            // Instead of maintaining duplicate quote/comment state machines,
+            // derive the carry-over literal state from SplitState (the execution
+            // base). process_text runs at the end of each iteration, so at this
+            // point builder.state reflects the end of the previous line.
             let raw = line;
             let upper = raw.to_uppercase();
 
@@ -813,13 +825,21 @@ impl QueryExecutor {
 
             let chars: Vec<char> = raw.chars().collect();
             let mut i = 0usize;
+            // Base literal/comment state from the execution-layer parser.
+            // SplitState already tracks these across lines via process_text,
+            // so we read the carry-over state instead of duplicating the state machine.
+            let mut in_block_comment = builder.state.in_block_comment;
+            let mut in_q_quote = builder.state.in_q_quote;
+            let mut q_quote_end = builder.state.q_quote_end;
+            let mut in_single_quote = builder.state.in_single_quote;
+            let mut in_double_quote = builder.state.in_double_quote;
             while i < chars.len() {
                 let c = chars[i];
                 let next = chars.get(i + 1).copied();
 
-                if scan_in_block_comment {
+                if in_block_comment {
                     if c == '*' && next == Some('/') {
-                        scan_in_block_comment = false;
+                        in_block_comment = false;
                         i += 2;
                         continue;
                     }
@@ -827,10 +847,10 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if scan_in_q_quote {
-                    if Some(c) == scan_q_quote_end && next == Some('\'') {
-                        scan_in_q_quote = false;
-                        scan_q_quote_end = None;
+                if in_q_quote {
+                    if Some(c) == q_quote_end && next == Some('\'') {
+                        in_q_quote = false;
+                        q_quote_end = None;
                         i += 2;
                         continue;
                     }
@@ -838,25 +858,25 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if scan_in_single_quote {
+                if in_single_quote {
                     if c == '\'' {
                         if next == Some('\'') {
                             i += 2;
                             continue;
                         }
-                        scan_in_single_quote = false;
+                        in_single_quote = false;
                     }
                     i += 1;
                     continue;
                 }
 
-                if scan_in_double_quote {
+                if in_double_quote {
                     if c == '"' {
                         if next == Some('"') {
                             i += 2;
                             continue;
                         }
-                        scan_in_double_quote = false;
+                        in_double_quote = false;
                     }
                     i += 1;
                     continue;
@@ -867,7 +887,7 @@ impl QueryExecutor {
                 }
 
                 if c == '/' && next == Some('*') {
-                    scan_in_block_comment = true;
+                    in_block_comment = true;
                     i += 2;
                     continue;
                 }
@@ -885,8 +905,8 @@ impl QueryExecutor {
                         '<' => '>',
                         _ => delimiter,
                     };
-                    scan_in_q_quote = true;
-                    scan_q_quote_end = Some(closing);
+                    in_q_quote = true;
+                    q_quote_end = Some(closing);
                     i += 4;
                     continue;
                 }
@@ -900,20 +920,20 @@ impl QueryExecutor {
                         '<' => '>',
                         _ => delimiter,
                     };
-                    scan_in_q_quote = true;
-                    scan_q_quote_end = Some(closing);
+                    in_q_quote = true;
+                    q_quote_end = Some(closing);
                     i += 3;
                     continue;
                 }
 
                 if c == '\'' {
-                    scan_in_single_quote = true;
+                    in_single_quote = true;
                     i += 1;
                     continue;
                 }
 
                 if c == '"' {
-                    scan_in_double_quote = true;
+                    in_double_quote = true;
                     i += 1;
                     continue;
                 }

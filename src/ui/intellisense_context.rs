@@ -160,15 +160,22 @@ struct PhaseAnalysis {
     visible_scope_chain: Vec<usize>,
 }
 
+/// Returns true for functions whose syntax includes a FROM keyword as part of
+/// the function call rather than a SQL clause (e.g. `EXTRACT(YEAR FROM ...)`,
+/// `TRIM(LEADING '0' FROM ...)`).
+fn is_from_consuming_function(name: &str) -> bool {
+    matches!(name, "EXTRACT" | "TRIM" | "XMLCAST")
+}
+
 /// Walk tokens up to cursor to determine the current SQL phase and depth.
 fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut depth: usize = 0;
     // Track phase at each depth level
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
-    // Track whether SELECT has been seen at each depth level.
-    // Used to distinguish function-internal FROM (e.g. EXTRACT(YEAR FROM ...))
-    // from real FROM clauses in subqueries.
-    let mut select_seen_stack: Vec<bool> = vec![true]; // depth 0 is top-level, always treat as real
+    // Track the function name before '(' at each depth level, used to
+    // distinguish function-internal FROM (EXTRACT, TRIM) from SQL FROM clauses.
+    let mut paren_func_stack: Vec<Option<String>> = vec![None];
+    let mut last_word: Option<String> = None;
     let mut next_scope_id = 1usize;
     let mut scope_stack = vec![0usize];
     let mut visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
@@ -196,11 +203,13 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 } else {
                     phase_stack[depth] = inherited_phase;
                 }
-                // New depth: no SELECT seen yet at this level
-                if select_seen_stack.len() <= depth {
-                    select_seen_stack.push(false);
+                // Record the function name that preceded this '(' so we can
+                // distinguish function-internal FROM from SQL FROM clauses.
+                let func_name = last_word.take().map(|w| w.to_uppercase());
+                if paren_func_stack.len() <= depth {
+                    paren_func_stack.push(func_name);
                 } else {
-                    select_seen_stack[depth] = false;
+                    paren_func_stack[depth] = func_name;
                 }
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
@@ -237,6 +246,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     scope_stack.pop();
                 }
                 pending_lateral_subquery = false;
+                last_word = None;
                 idx += 1;
                 continue;
             }
@@ -300,18 +310,19 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
-                        if select_seen_stack.len() <= depth {
-                            select_seen_stack.resize(depth + 1, false);
-                        }
-                        select_seen_stack[depth] = true;
                     }
                     "FROM" => {
-                        // Avoid transition for function-internal FROM:
-                        // EXTRACT(YEAR FROM ...), TRIM(LEADING '0' FROM ...)
-                        // At depth > 0, if no SELECT was seen at this depth,
-                        // FROM is part of a function call, not a SQL clause.
-                        let select_seen = select_seen_stack.get(depth).copied().unwrap_or(false);
-                        if depth == 0 || select_seen {
+                        // Only suppress FROM transition when the enclosing '('
+                        // belongs to a function that uses FROM as part of its
+                        // syntax (EXTRACT, TRIM, XMLCAST). All other cases —
+                        // including incomplete SQL with unclosed parens — treat
+                        // FROM as a real SQL clause.
+                        let is_func_from = depth > 0
+                            && paren_func_stack
+                                .get(depth)
+                                .and_then(|name| name.as_deref())
+                                .is_some_and(is_from_consuming_function);
+                        if !is_func_from {
                             phase_stack[depth] = SqlPhase::FromClause;
                         }
                     }
@@ -405,6 +416,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                         }
                     }
                 }
+                last_word = Some(upper);
             }
             SqlToken::Symbol(sym) if sym == "," => {
                 pending_lateral_subquery = false;
@@ -466,7 +478,8 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
     let mut all_subqueries: Vec<ParsedSubquery> = Vec::new();
     let mut depth: usize = 0;
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
-    let mut select_seen_stack: Vec<bool> = vec![true]; // depth 0 is top-level
+    let mut paren_func_stack: Vec<Option<String>> = vec![None];
+    let mut last_word: Option<String> = None;
     let mut expect_table = false;
     let mut cte_state = CteState::None;
     let mut cte_paren_depth: usize = 0;
@@ -488,11 +501,11 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                     phase_stack.push(SqlPhase::Initial);
                 }
                 phase_stack[depth] = SqlPhase::Initial;
-                // New depth: no SELECT seen yet at this level
-                if select_seen_stack.len() <= depth {
-                    select_seen_stack.push(false);
+                let func_name = last_word.take().map(|w| w.to_uppercase());
+                if paren_func_stack.len() <= depth {
+                    paren_func_stack.push(func_name);
                 } else {
-                    select_seen_stack[depth] = false;
+                    paren_func_stack[depth] = func_name;
                 }
                 expect_table = false;
                 scope_stack.push(next_scope_id);
@@ -601,6 +614,7 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
                 }
+                last_word = None;
                 idx += 1;
                 continue;
             }
@@ -638,7 +652,8 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                 all_subqueries.clear();
                 depth = 0;
                 phase_stack = vec![SqlPhase::Initial];
-                select_seen_stack = vec![true];
+                paren_func_stack = vec![None];
+                last_word = None;
                 expect_table = false;
                 cte_state = CteState::None;
                 subquery_tracks.clear();
@@ -698,17 +713,15 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
-                        if select_seen_stack.len() <= depth {
-                            select_seen_stack.resize(depth + 1, false);
-                        }
-                        select_seen_stack[depth] = true;
                         expect_table = false;
                     }
                     "FROM" => {
-                        // Avoid transition for function-internal FROM:
-                        // EXTRACT(YEAR FROM ...), TRIM(LEADING '0' FROM ...)
-                        let select_seen = select_seen_stack.get(depth).copied().unwrap_or(false);
-                        if depth == 0 || select_seen {
+                        let is_func_from = depth > 0
+                            && paren_func_stack
+                                .get(depth)
+                                .and_then(|name| name.as_deref())
+                                .is_some_and(is_from_consuming_function);
+                        if !is_func_from {
                             phase_stack[depth] = SqlPhase::FromClause;
                             expect_table = true;
                         }
@@ -823,8 +836,11 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                         }
                     }
                 }
+                last_word = Some(upper);
             }
-            _ => {}
+            _ => {
+                last_word = None;
+            }
         }
         idx += 1;
     }
