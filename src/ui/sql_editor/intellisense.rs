@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use oracle::Connection;
 
+use crate::db::query::SplitState;
 use crate::db::{
     ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection, TableColumnDetail,
 };
@@ -1658,81 +1659,12 @@ impl SqlEditorWidget {
     }
 
     fn statement_bounds_in_text(text: &str, cursor_pos: usize) -> (usize, usize) {
-        #[derive(Default)]
-        struct StatementScanState {
-            in_single_quote: bool,
-            in_double_quote: bool,
-            in_line_comment: bool,
-            in_block_comment: bool,
-            in_q_quote: bool,
-            q_quote_end: Option<char>,
-            pending_create: bool,
-            in_create_plsql: bool,
-            pending_end_qualifier: bool,
-            block_depth: usize,
-        }
-
-        fn apply_word(state: &mut StatementScanState, word: &mut String) {
-            if word.is_empty() {
-                return;
-            }
-
-            let upper = word.to_uppercase();
-
-            if state.pending_end_qualifier {
-                if matches!(upper.as_str(), "IF" | "LOOP" | "CASE") {
-                    state.pending_end_qualifier = false;
-                    word.clear();
-                    return;
-                }
-                state.pending_end_qualifier = false;
-            }
-
-            if upper == "CREATE" {
-                state.pending_create = true;
-                word.clear();
-                return;
-            }
-
-            if state.pending_create {
-                match upper.as_str() {
-                    "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE" => {}
-                    "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TRIGGER" | "TYPE" => {
-                        state.in_create_plsql = true;
-                        state.pending_create = false;
-                    }
-                    _ => {
-                        state.pending_create = false;
-                    }
-                }
-            }
-
-            if matches!(upper.as_str(), "DECLARE" | "BEGIN")
-                || (state.in_create_plsql
-                    && state.block_depth == 0
-                    && matches!(upper.as_str(), "AS" | "IS"))
-            {
-                state.block_depth = state.block_depth.saturating_add(1);
-            } else if upper == "END" {
-                state.block_depth = state.block_depth.saturating_sub(1);
-                state.pending_end_qualifier = true;
-                if state.in_create_plsql && state.block_depth == 0 {
-                    state.in_create_plsql = false;
-                }
-            } else if state.block_depth > 0 && matches!(upper.as_str(), "IF" | "LOOP" | "CASE") {
-                state.block_depth = state.block_depth.saturating_add(1);
-            }
-
-            word.clear();
-        }
-
         let bytes = text.as_bytes();
         let len = bytes.len();
         let cursor = cursor_pos.min(len);
         let mut last_terminator = 0usize;
         let mut next_terminator = len;
-        let mut word = String::new();
-        let mut state = StatementScanState::default();
+        let mut state = SplitState::default();
         let mut i = 0usize;
 
         while i < len {
@@ -1762,7 +1694,7 @@ impl SqlEditorWidget {
             }
 
             if state.in_q_quote {
-                if Some(b as char) == state.q_quote_end && next == Some(b'\'') {
+                if Some(b as char) == state.q_quote_end() && next == Some(b'\'') {
                     state.in_q_quote = false;
                     state.q_quote_end = None;
                     i += 2;
@@ -1797,20 +1729,20 @@ impl SqlEditorWidget {
             }
 
             if b.is_ascii_whitespace() {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 i += 1;
                 continue;
             }
 
             if b == b'-' && next == Some(b'-') {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 state.in_line_comment = true;
                 i += 2;
                 continue;
             }
 
             if b == b'/' && next == Some(b'*') {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 state.in_block_comment = true;
                 i += 2;
                 continue;
@@ -1821,56 +1753,42 @@ impl SqlEditorWidget {
                 && (bytes[i + 1] == b'q' || bytes[i + 1] == b'Q')
                 && bytes[i + 2] == b'\''
             {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 let delimiter = bytes[i + 3] as char;
-                state.q_quote_end = Some(match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    other => other,
-                });
-                state.in_q_quote = true;
+                state.start_q_quote(delimiter);
                 i += 4;
                 continue;
             }
 
             if (b == b'q' || b == b'Q') && i + 2 < len && bytes[i + 1] == b'\'' {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 let delimiter = bytes[i + 2] as char;
-                state.q_quote_end = Some(match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    other => other,
-                });
-                state.in_q_quote = true;
+                state.start_q_quote(delimiter);
                 i += 3;
                 continue;
             }
 
             if b == b'\'' {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 state.in_single_quote = true;
                 i += 1;
                 continue;
             }
 
             if b == b'"' {
-                apply_word(&mut state, &mut word);
+                state.flush_token();
                 state.in_double_quote = true;
                 i += 1;
                 continue;
             }
 
             if Self::is_identifier_byte(b) {
-                word.push(b as char);
+                state.token.push(b as char);
                 i += 1;
                 continue;
             }
 
-            apply_word(&mut state, &mut word);
+            state.flush_token();
 
             // Handle '/' on its own line as a PL/SQL block terminator.
             // In Oracle, a standalone '/' terminates CREATE FUNCTION/PROCEDURE/PACKAGE/TRIGGER
@@ -1879,8 +1797,11 @@ impl SqlEditorWidget {
                 let is_solo_slash = Self::is_solo_slash_at(bytes, i, len);
                 if is_solo_slash {
                     state.block_depth = 0;
-                    state.in_create_plsql = false;
-                    state.pending_create = false;
+                    state.reset_create_state();
+                    state.pending_end = false;
+                    state.after_declare = false;
+                    state.case_depth_stack.clear();
+                    state.pending_subprogram_begins = 0;
                     // Skip to end of line
                     let mut end_of_line = i + 1;
                     while end_of_line < len && bytes[end_of_line] != b'\n' {
@@ -1900,18 +1821,21 @@ impl SqlEditorWidget {
                 }
             }
 
-            if b == b';' && state.block_depth == 0 {
-                if i < cursor {
-                    last_terminator = i + 1;
-                } else {
-                    next_terminator = i;
-                    break;
+            if b == b';' {
+                state.resolve_pending_end_on_terminator();
+                if state.block_depth == 0 {
+                    if i < cursor {
+                        last_terminator = i + 1;
+                    } else {
+                        next_terminator = i;
+                        break;
+                    }
                 }
             }
             i += 1;
         }
 
-        apply_word(&mut state, &mut word);
+        state.flush_token();
         (last_terminator.min(len), next_terminator.min(len))
     }
 

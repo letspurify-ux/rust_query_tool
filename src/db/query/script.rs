@@ -3,27 +3,27 @@ use crate::db::session::{BindDataType, ComputeMode};
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 
 #[derive(Default)]
-struct SplitState {
-    in_single_quote: bool,
-    in_double_quote: bool,
-    in_line_comment: bool,
-    in_block_comment: bool,
-    in_q_quote: bool,
-    q_quote_end: Option<char>,
-    block_depth: usize,
-    pending_end: bool,
-    token: String,
-    in_create_plsql: bool,
-    create_pending: bool,
+pub(crate) struct SplitState {
+    pub(crate) in_single_quote: bool,
+    pub(crate) in_double_quote: bool,
+    pub(crate) in_line_comment: bool,
+    pub(crate) in_block_comment: bool,
+    pub(crate) in_q_quote: bool,
+    pub(crate) q_quote_end: Option<char>,
+    pub(crate) block_depth: usize,
+    pub(crate) pending_end: bool,
+    pub(crate) token: String,
+    pub(crate) in_create_plsql: bool,
+    pub(crate) create_pending: bool,
     create_or_seen: bool,
-    after_declare: bool, // Track if we're inside DECLARE block waiting for BEGIN
+    pub(crate) after_declare: bool, // Track if we're inside DECLARE block waiting for BEGIN
     after_as_is: bool,   // Track if we've seen AS/IS in CREATE PL/SQL (for BEGIN handling)
     nested_subprogram: bool, // Track nested PROCEDURE/FUNCTION inside DECLARE block
     /// Count of nested subprogram declarations awaiting their BEGIN.
     /// In package bodies, nested PROCEDURE/FUNCTION IS increments this,
     /// and BEGIN decrements it. This allows the outer procedure's BEGIN
     /// to still be recognized even after nested procedure's END.
-    pending_subprogram_begins: usize,
+    pub(crate) pending_subprogram_begins: usize,
     /// True when we're creating a PACKAGE (spec or body), not PROCEDURE/FUNCTION/TRIGGER/TYPE
     /// Packages don't have a BEGIN at the AS level, only their contained procedures do.
     is_package: bool,
@@ -31,11 +31,11 @@ struct SplitState {
     /// Used to distinguish CASE expression END (plain END at same block_depth)
     /// from nested block END (plain END at deeper block_depth) inside a CASE statement.
     /// CASE expressions end with plain END; PL/SQL CASE statements end with END CASE.
-    case_depth_stack: Vec<usize>,
+    pub(crate) case_depth_stack: Vec<usize>,
     /// True when we're creating a TRIGGER (not PROCEDURE/FUNCTION/PACKAGE/TYPE).
     /// TRIGGER headers can contain INSERT/UPDATE/DELETE/SELECT keywords as event types
     /// before block_depth increases, so we must not force-terminate on those keywords.
-    is_trigger: bool,
+    pub(crate) is_trigger: bool,
     /// True when we're inside a COMPOUND TRIGGER definition.
     /// COMPOUND TRIGGERs have timing points like BEFORE STATEMENT IS...END BEFORE STATEMENT;
     in_compound_trigger: bool,
@@ -51,7 +51,7 @@ struct SplitState {
 }
 
 impl SplitState {
-    fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         !self.in_single_quote
             && !self.in_double_quote
             && !self.in_block_comment
@@ -59,7 +59,7 @@ impl SplitState {
             && !self.in_line_comment
     }
 
-    fn flush_token(&mut self) {
+    pub(crate) fn flush_token(&mut self) {
         if self.token.is_empty() {
             return;
         }
@@ -249,7 +249,7 @@ impl SplitState {
         self.token.clear();
     }
 
-    fn resolve_pending_end_on_terminator(&mut self) {
+    pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
         if self.pending_end {
             // END followed by terminator (;) - determine what it closes
             if self
@@ -272,7 +272,7 @@ impl SplitState {
         }
     }
 
-    fn resolve_pending_end_on_eof(&mut self) {
+    pub(crate) fn resolve_pending_end_on_eof(&mut self) {
         if self.pending_end {
             // END at EOF - determine what it closes
             if self
@@ -295,7 +295,7 @@ impl SplitState {
         }
     }
 
-    fn reset_create_state(&mut self) {
+    pub(crate) fn reset_create_state(&mut self) {
         self.in_create_plsql = false;
         self.create_pending = false;
         self.create_or_seen = false;
@@ -363,7 +363,7 @@ impl SplitState {
         }
     }
 
-    fn start_q_quote(&mut self, delimiter: char) {
+    pub(crate) fn start_q_quote(&mut self, delimiter: char) {
         self.in_q_quote = true;
         self.q_quote_end = Some(match delimiter {
             '[' => ']',
@@ -374,7 +374,7 @@ impl SplitState {
         });
     }
 
-    fn q_quote_end(&self) -> Option<char> {
+    pub(crate) fn q_quote_end(&self) -> Option<char> {
         self.q_quote_end
     }
 }
