@@ -409,6 +409,7 @@ impl SqlEditorWidget {
     ) {
         let execute_callback = self.execute_callback.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let lifecycle_group = self.group.clone();
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
         let receiver: Rc<RefCell<mpsc::Receiver<QueryProgress>>> =
@@ -420,7 +421,12 @@ impl SqlEditorWidget {
             query_running: Rc<RefCell<bool>>,
             execute_callback: Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>>,
             cancel_flag: Arc<AtomicBool>,
+            lifecycle_group: Flex,
         ) {
+            if lifecycle_group.was_deleted() {
+                return;
+            }
+
             let mut disconnected = false;
             let mut processed = 0usize;
             let mut hit_budget = false;
@@ -557,6 +563,7 @@ impl SqlEditorWidget {
                     Rc::clone(&query_running),
                     Rc::clone(&execute_callback),
                     Arc::clone(&cancel_flag),
+                    lifecycle_group.clone(),
                 );
             });
         }
@@ -568,6 +575,7 @@ impl SqlEditorWidget {
             query_running,
             execute_callback,
             cancel_flag,
+            lifecycle_group,
         );
     }
 
@@ -605,6 +613,10 @@ impl SqlEditorWidget {
             connection: SharedConnection,
             pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
         ) {
+            if editor.was_deleted() {
+                return;
+            }
+
             let mut disconnected = false;
             let mut processed = 0usize;
             // Process any pending messages
@@ -735,6 +747,10 @@ impl SqlEditorWidget {
             receiver: Rc<RefCell<mpsc::Receiver<UiActionResult>>>,
             widget: SqlEditorWidget,
         ) {
+            if widget.group.was_deleted() {
+                return;
+            }
+
             let mut disconnected = false;
             loop {
                 let message = {
