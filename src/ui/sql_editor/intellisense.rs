@@ -1871,6 +1871,35 @@ impl SqlEditorWidget {
             }
 
             apply_word(&mut state, &mut word);
+
+            // Handle '/' on its own line as a PL/SQL block terminator.
+            // In Oracle, a standalone '/' terminates CREATE FUNCTION/PROCEDURE/PACKAGE/TRIGGER
+            // blocks and anonymous PL/SQL blocks, acting as a statement boundary.
+            if b == b'/' && next != Some(b'*') {
+                let is_solo_slash = Self::is_solo_slash_at(bytes, i, len);
+                if is_solo_slash {
+                    state.block_depth = 0;
+                    state.in_create_plsql = false;
+                    state.pending_create = false;
+                    // Skip to end of line
+                    let mut end_of_line = i + 1;
+                    while end_of_line < len && bytes[end_of_line] != b'\n' {
+                        end_of_line += 1;
+                    }
+                    if end_of_line < len {
+                        end_of_line += 1; // include the newline
+                    }
+                    if i < cursor {
+                        last_terminator = end_of_line;
+                    } else {
+                        next_terminator = i;
+                        break;
+                    }
+                    i = end_of_line;
+                    continue;
+                }
+            }
+
             if b == b';' && state.block_depth == 0 {
                 if i < cursor {
                     last_terminator = i + 1;
@@ -1884,6 +1913,37 @@ impl SqlEditorWidget {
 
         apply_word(&mut state, &mut word);
         (last_terminator.min(len), next_terminator.min(len))
+    }
+
+    /// Check if the '/' at position `pos` is a standalone slash on its own line
+    /// (only whitespace before and after on the same line).
+    fn is_solo_slash_at(bytes: &[u8], pos: usize, len: usize) -> bool {
+        // Check that everything before '/' on this line is whitespace
+        if pos > 0 {
+            let mut j = pos - 1;
+            loop {
+                let ch = bytes[j];
+                if ch == b'\n' {
+                    break;
+                }
+                if !ch.is_ascii_whitespace() {
+                    return false;
+                }
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+        }
+        // Check that everything after '/' on this line is whitespace
+        let mut k = pos + 1;
+        while k < len && bytes[k] != b'\n' {
+            if !bytes[k].is_ascii_whitespace() {
+                return false;
+            }
+            k += 1;
+        }
+        true
     }
 
     fn strip_identifier_quotes(value: &str) -> String {
@@ -2261,6 +2321,107 @@ mod intellisense_regression_tests {
         assert_eq!(
             sql.get(start..end).unwrap_or(""),
             "BEGIN\n  v := 1;\n  v := v + 1;\nEND"
+        );
+    }
+
+    #[test]
+    fn statement_bounds_slash_terminates_create_plsql_block() {
+        // After 'CREATE FUNCTION ... IS BEGIN ... END;\n/\n', a subsequent
+        // SELECT should be recognised as a separate statement.
+        let sql = "\
+CREATE OR REPLACE FUNCTION oqt_f_add(p_a NUMBER, p_b NUMBER)\nRETURN NUMBER\nIS\nBEGIN\n  RETURN NVL(p_a,0) + NVL(p_b,0);\nEND;\n/\nSELECT empno FROM oqt_emp;";
+        let cursor = sql.find("empno FROM").unwrap();
+        let (start, end) = SqlEditorWidget::statement_bounds_in_text(sql, cursor);
+        let stmt = sql.get(start..end).unwrap_or("");
+        assert!(
+            stmt.contains("SELECT empno FROM oqt_emp"),
+            "expected SELECT statement, got: {:?}",
+            stmt
+        );
+        assert!(
+            !stmt.contains("CREATE"),
+            "CREATE should not leak into the SELECT statement: {:?}",
+            stmt
+        );
+    }
+
+    #[test]
+    fn statement_bounds_multiple_create_blocks_with_slash() {
+        // Multiple CREATE blocks terminated by '/' followed by a SELECT
+        let sql = "\
+CREATE OR REPLACE FUNCTION f1 RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND;\n/\n\
+CREATE OR REPLACE PROCEDURE p1 IS\nBEGIN\n  NULL;\nEND;\n/\n\
+SELECT sa FROM oqt_emp ORDER BY empno;";
+        let cursor = sql.find("sa FROM").unwrap();
+        let (start, end) = SqlEditorWidget::statement_bounds_in_text(sql, cursor);
+        let stmt = sql.get(start..end).unwrap_or("");
+        assert!(
+            stmt.starts_with("SELECT") || stmt.trim_start().starts_with("SELECT"),
+            "expected SELECT statement, got: {:?}",
+            stmt
+        );
+        assert!(
+            stmt.contains("oqt_emp"),
+            "expected oqt_emp in statement: {:?}",
+            stmt
+        );
+    }
+
+    #[test]
+    fn statement_bounds_script_with_plsql_blocks_then_select() {
+        // Simulates a realistic script: anonymous PL/SQL blocks, CREATE blocks,
+        // followed by a SELECT at the end. The cursor is inside the final SELECT.
+        let sql = "\
+BEGIN\n  EXECUTE IMMEDIATE 'DROP TABLE oqt_emp PURGE';\nEXCEPTION WHEN OTHERS THEN NULL;\nEND;\n/\n\
+CREATE TABLE oqt_emp (\n  empno NUMBER PRIMARY KEY,\n  ename VARCHAR2(50),\n  salary NUMBER\n);\n\
+INSERT INTO oqt_emp(empno, ename, salary) VALUES (100, 'ALICE', 3000);\nCOMMIT;\n\
+CREATE OR REPLACE FUNCTION oqt_f_add(p_a NUMBER, p_b NUMBER)\nRETURN NUMBER\nIS\nBEGIN\n  RETURN NVL(p_a,0) + NVL(p_b,0);\nEND;\n/\n\
+PROMPT === final ===\n\
+SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
+
+        let cursor = sql.find("sa FROM oqt_emp").unwrap();
+        let (stmt_start, stmt_end) =
+            SqlEditorWidget::statement_bounds_in_text(sql, cursor);
+        let stmt = sql.get(stmt_start..stmt_end).unwrap_or("");
+        assert!(
+            stmt.contains("oqt_emp"),
+            "statement should contain oqt_emp: {:?}",
+            stmt
+        );
+        assert!(
+            stmt.contains("SELECT"),
+            "statement should contain SELECT: {:?}",
+            stmt
+        );
+
+        // Now test context analysis for intellisense
+        let context_text = SqlEditorWidget::normalize_intellisense_context_text(
+            sql.get(stmt_start..cursor).unwrap_or(""),
+        );
+        let statement_text = SqlEditorWidget::normalize_intellisense_context_text(
+            sql.get(stmt_start..stmt_end).unwrap_or(""),
+        );
+
+        let before_tokens = SqlEditorWidget::tokenize_sql(&context_text);
+        let full_tokens = SqlEditorWidget::tokenize_sql(&statement_text);
+        let deep_ctx =
+            intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::SelectList,
+            "cursor should be in SelectList phase"
+        );
+
+        let table_names: Vec<String> = deep_ctx
+            .tables_in_scope
+            .iter()
+            .map(|t| t.name.to_uppercase())
+            .collect();
+        assert!(
+            table_names.contains(&"OQT_EMP".to_string()),
+            "oqt_emp should be in scope: {:?}",
+            table_names
         );
     }
 
