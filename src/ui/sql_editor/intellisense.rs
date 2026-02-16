@@ -2422,6 +2422,35 @@ mod intellisense_regression_tests {
     }
 
     #[test]
+    fn invoke_void_callback_can_run_again_after_panic() {
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_for_cb = calls.clone();
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> =
+            Rc::new(RefCell::new(Some(Box::new(move || {
+                let mut count = calls_for_cb.borrow_mut();
+                *count += 1;
+                if *count == 1 {
+                    panic!("expected first callback panic");
+                }
+            }))));
+
+        let first_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_void_callback(&callback_slot)
+        }));
+
+        assert!(first_panic.is_err());
+        assert!(callback_slot.borrow().is_some());
+
+        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_void_callback(&callback_slot)
+        }));
+
+        assert!(second_call.is_ok());
+        assert_eq!(*calls.borrow(), 2);
+        assert!(callback_slot.borrow().is_some());
+    }
+
+    #[test]
     fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
         let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
@@ -2439,5 +2468,38 @@ mod intellisense_regression_tests {
         assert!(panic_result.is_err());
         assert!(callback_slot.borrow().is_some());
         assert_eq!(calls.borrow().as_slice(), &[expected_path]);
+    }
+
+    #[test]
+    fn invoke_file_drop_callback_can_run_again_after_panic() {
+        let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let calls_for_cb = calls.clone();
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(RefCell::new(Some(Box::new(move |path: PathBuf| {
+                let mut events = calls_for_cb.borrow_mut();
+                let should_panic = events.is_empty();
+                events.push(path);
+                if should_panic {
+                    panic!("expected first callback panic");
+                }
+            }))));
+
+        let first_path = PathBuf::from("/tmp/first.sql");
+        let second_path = PathBuf::from("/tmp/second.sql");
+
+        let first_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path.clone())
+        }));
+
+        assert!(first_panic.is_err());
+        assert!(callback_slot.borrow().is_some());
+
+        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone())
+        }));
+
+        assert!(second_call.is_ok());
+        assert!(callback_slot.borrow().is_some());
+        assert_eq!(calls.borrow().as_slice(), &[first_path, second_path]);
     }
 }
