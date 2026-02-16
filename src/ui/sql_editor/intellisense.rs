@@ -1206,7 +1206,7 @@ impl SqlEditorWidget {
                 }
             }
 
-            let Some(conn_guard) = conn_guard else {
+            let Some(mut conn_guard) = conn_guard else {
                 let _ = sender.send(ColumnLoadUpdate {
                     table: table_key_for_thread,
                     columns: Vec::new(),
@@ -1216,18 +1216,17 @@ impl SqlEditorWidget {
                 return;
             };
 
-            let (columns, cache_columns) = if !conn_guard.is_connected() {
-                (Vec::new(), false)
-            } else if let Some(conn) = conn_guard.get_connection() {
-                match crate::db::ObjectBrowser::get_table_columns(
-                    conn.as_ref(),
-                    &table_key_for_thread,
-                ) {
-                    Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
-                    Err(_) => (Vec::new(), false),
+            let (columns, cache_columns) = match conn_guard.require_live_connection() {
+                Ok(conn) => {
+                    match crate::db::ObjectBrowser::get_table_columns(
+                        conn.as_ref(),
+                        &table_key_for_thread,
+                    ) {
+                        Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                        Err(_) => (Vec::new(), false),
+                    }
                 }
-            } else {
-                (Vec::new(), false)
+                Err(_) => (Vec::new(), false),
             };
 
             let _ = sender.send(ColumnLoadUpdate {
@@ -2133,7 +2132,7 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection_with_activity(
+            let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
                 &connection,
                 format!("Quick describe {}", object_name),
             ) else {
@@ -2143,12 +2142,9 @@ impl SqlEditorWidget {
                 return;
             };
 
-            let result = if !conn_guard.is_connected() {
-                Err("Not connected to database".to_string())
-            } else if let Some(db_conn) = conn_guard.get_connection() {
-                Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
-            } else {
-                Err("Not connected to database".to_string())
+            let result = match conn_guard.require_live_connection() {
+                Ok(db_conn) => Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref()),
+                Err(message) => Err(message.to_string()),
             };
 
             let _ = sender.send(UiActionResult::QuickDescribe {

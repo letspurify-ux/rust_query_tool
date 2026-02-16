@@ -254,12 +254,21 @@ impl LogViewerDialog {
                             "",
                         );
                         if choice == Some(1) {
-                            logging::clear_log();
-                            entries.borrow_mut().clear();
-                            filtered_indices.borrow_mut().clear();
-                            browser.clear();
-                            detail_buffer.set_text("");
-                            count_label.set_label("0 entries");
+                            match logging::clear_log() {
+                                Ok(()) => {
+                                    entries.borrow_mut().clear();
+                                    filtered_indices.borrow_mut().clear();
+                                    browser.clear();
+                                    detail_buffer.set_text("");
+                                    count_label.set_label("0 entries");
+                                }
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&format!(
+                                        "Failed to clear application log: {}",
+                                        err
+                                    ));
+                                }
+                            }
                         }
                     }
                     DialogMessage::ExportLog => {

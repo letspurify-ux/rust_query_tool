@@ -20,13 +20,13 @@ use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, Ta
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
-use crate::ui::query_history::QueryHistoryDialog;
+use crate::ui::query_history::{flush_history_writer_with_timeout, QueryHistoryDialog};
 use crate::ui::syntax_highlight::{
     create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_DEFAULT,
     STYLE_STRING,
 };
 use crate::ui::theme;
-use crate::utils::{AppConfig, QueryHistory};
+use crate::utils::{AppConfig, QueryHistory, QueryHistoryEntry};
 use oracle::Connection;
 
 mod execution;
@@ -48,6 +48,7 @@ const MAX_PROGRESS_MESSAGES_PER_POLL: usize = 200;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const EDITOR_TOP_PADDING: i32 = 4;
+const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditGranularity {
@@ -189,6 +190,7 @@ pub struct SqlEditorWidget {
     pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
     history_cursor: Rc<RefCell<Option<usize>>>,
     history_original: Rc<RefCell<Option<String>>>,
+    history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
     undo_redo_state: Rc<RefCell<WordUndoRedoState>>,
 }
 
@@ -315,6 +317,7 @@ impl SqlEditorWidget {
         let pending_intellisense = Rc::new(RefCell::new(None::<PendingIntellisense>));
         let history_cursor = Rc::new(RefCell::new(None::<usize>));
         let history_original = Rc::new(RefCell::new(None::<String>));
+        let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
         let undo_redo_state = Rc::new(RefCell::new(WordUndoRedoState::new(String::new())));
 
         let mut widget = Self {
@@ -343,6 +346,7 @@ impl SqlEditorWidget {
             pending_intellisense,
             history_cursor,
             history_original,
+            history_navigation_entries,
             undo_redo_state,
         };
 
@@ -972,7 +976,7 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) = crate::db::try_lock_connection_with_activity(
+            let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
                 &connection,
                 "Generating explain plan",
             ) else {
@@ -982,13 +986,10 @@ impl SqlEditorWidget {
                 return;
             };
 
-            let result = if !conn_guard.is_connected() {
-                Err("Not connected to database".to_string())
-            } else if let Some(db_conn) = conn_guard.get_connection() {
-                QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
-                    .map_err(|err| err.to_string())
-            } else {
-                Err("Not connected to database".to_string())
+            let result = match conn_guard.require_live_connection() {
+                Ok(db_conn) => QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
+                    .map_err(|err| err.to_string()),
+                Err(message) => Err(message.to_string()),
             };
 
             let _ = sender.send(UiActionResult::ExplainPlan(result));
@@ -1071,7 +1072,7 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) =
+            let Some(mut conn_guard) =
                 crate::db::try_lock_connection_with_activity(&connection, "Commit transaction")
             else {
                 // Query is already running, notify user
@@ -1080,12 +1081,9 @@ impl SqlEditorWidget {
                 return;
             };
 
-            let result = if !conn_guard.is_connected() {
-                Err("Not connected to database".to_string())
-            } else if let Some(db_conn) = conn_guard.get_connection() {
-                db_conn.commit().map_err(|err| err.to_string())
-            } else {
-                Err("Not connected to database".to_string())
+            let result = match conn_guard.require_live_connection() {
+                Ok(db_conn) => db_conn.commit().map_err(|err| err.to_string()),
+                Err(message) => Err(message.to_string()),
             };
 
             let _ = sender.send(UiActionResult::Commit(result));
@@ -1100,7 +1098,7 @@ impl SqlEditorWidget {
         app::flush();
         thread::spawn(move || {
             // Try to acquire connection lock without blocking
-            let Some(conn_guard) =
+            let Some(mut conn_guard) =
                 crate::db::try_lock_connection_with_activity(&connection, "Rollback transaction")
             else {
                 // Query is already running, notify user
@@ -1109,12 +1107,9 @@ impl SqlEditorWidget {
                 return;
             };
 
-            let result = if !conn_guard.is_connected() {
-                Err("Not connected to database".to_string())
-            } else if let Some(db_conn) = conn_guard.get_connection() {
-                db_conn.rollback().map_err(|err| err.to_string())
-            } else {
-                Err("Not connected to database".to_string())
+            let result = match conn_guard.require_live_connection() {
+                Ok(db_conn) => db_conn.rollback().map_err(|err| err.to_string()),
+                Err(message) => Err(message.to_string()),
             };
 
             let _ = sender.send(UiActionResult::Rollback(result));
@@ -1234,6 +1229,7 @@ impl SqlEditorWidget {
         self.pending_intellisense.borrow_mut().take();
         self.history_cursor.borrow_mut().take();
         self.history_original.borrow_mut().take();
+        self.history_navigation_entries.borrow_mut().take();
         Self::reset_word_undo_state(&self.undo_redo_state);
     }
 
@@ -1346,6 +1342,7 @@ impl SqlEditorWidget {
         }
         *self.history_cursor.borrow_mut() = None;
         *self.history_original.borrow_mut() = None;
+        self.history_navigation_entries.borrow_mut().take();
     }
 
     pub fn undo(&self) {
@@ -1415,17 +1412,25 @@ impl SqlEditorWidget {
     }
 
     pub fn navigate_history(&mut self, direction: i32) {
-        let history = QueryHistory::load();
-        if history.queries.is_empty() {
-            return;
-        }
-
         let mut cursor = self.history_cursor.borrow_mut();
         let mut original = self.history_original.borrow_mut();
+        let mut history_entries = self.history_navigation_entries.borrow_mut();
 
         if cursor.is_none() {
+            // Keep navigation aligned with persisted history while avoiding long UI stalls
+            // on each key press: flush once when navigation starts, then reuse a snapshot.
+            let _ = flush_history_writer_with_timeout(HISTORY_NAVIGATION_FLUSH_TIMEOUT);
+            let loaded = QueryHistory::load();
+            if loaded.queries.is_empty() {
+                return;
+            }
+            *history_entries = Some(loaded.queries);
             *original = Some(self.buffer.text());
         }
+
+        let Some(entries) = history_entries.as_ref() else {
+            return;
+        };
 
         let next_index = match *cursor {
             None => {
@@ -1446,6 +1451,7 @@ impl SqlEditorWidget {
                         self.editor.show_insert_position();
                     }
                     *cursor = None;
+                    history_entries.take();
                     return;
                 } else {
                     Some(index.saturating_sub(1))
@@ -1457,12 +1463,12 @@ impl SqlEditorWidget {
             return;
         };
 
-        if next_index >= history.queries.len() {
+        if next_index >= entries.len() {
             return;
         }
 
         *cursor = Some(next_index);
-        let sql = &history.queries[next_index].sql;
+        let sql = &entries[next_index].sql;
         self.buffer.set_text(sql);
         self.refresh_highlighting();
         self.editor.set_insert_position(sql.len() as i32);

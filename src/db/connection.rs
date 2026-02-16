@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::session::SessionState;
 
+pub const NOT_CONNECTED_MESSAGE: &str = "Not connected to database";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub name: String,
@@ -80,6 +82,7 @@ pub struct DatabaseConnection {
     connected: bool,
     auto_commit: bool,
     session: Arc<Mutex<SessionState>>,
+    last_disconnect_reason: Option<String>,
 }
 
 impl DatabaseConnection {
@@ -90,6 +93,7 @@ impl DatabaseConnection {
             connected: false,
             auto_commit: false,
             session: Arc::new(Mutex::new(SessionState::default())),
+            last_disconnect_reason: None,
         }
     }
 
@@ -112,6 +116,7 @@ impl DatabaseConnection {
         // Clear password from memory now that the connection is established
         self.info.clear_password();
         self.connected = true;
+        self.last_disconnect_reason = None;
 
         Ok(())
     }
@@ -132,6 +137,19 @@ impl DatabaseConnection {
     pub fn disconnect(&mut self) {
         self.connection = None;
         self.connected = false;
+        self.last_disconnect_reason = None;
+    }
+
+    fn mark_disconnected_with_reason(&mut self, reason: impl Into<String>) {
+        self.connection = None;
+        self.connected = false;
+        self.last_disconnect_reason = Some(reason.into());
+    }
+
+    fn disconnect_message(&self) -> String {
+        self.last_disconnect_reason
+            .clone()
+            .unwrap_or_else(|| NOT_CONNECTED_MESSAGE.to_string())
     }
 
     /// Validate that the current connection is still alive.
@@ -145,6 +163,9 @@ impl DatabaseConnection {
 
         let Some(conn) = self.connection.as_ref() else {
             self.connected = false;
+            if self.last_disconnect_reason.is_none() {
+                self.last_disconnect_reason = Some(NOT_CONNECTED_MESSAGE.to_string());
+            }
             return false;
         };
 
@@ -152,10 +173,21 @@ impl DatabaseConnection {
             Ok(()) => true,
             Err(err) => {
                 eprintln!("Detected stale DB connection during ping: {err}");
-                self.disconnect();
+                self.mark_disconnected_with_reason(format!(
+                    "Connection was lost unexpectedly: {err}"
+                ));
                 false
             }
         }
+    }
+
+    pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
+        if !self.ensure_connection_alive() {
+            return Err(self.disconnect_message());
+        }
+
+        self.get_connection()
+            .ok_or_else(|| self.disconnect_message())
     }
 
     pub fn is_connected(&self) -> bool {
@@ -233,12 +265,8 @@ pub fn current_db_activity() -> Option<String> {
 
 pub fn format_connection_busy_message() -> String {
     match current_db_activity() {
-        Some(activity) => format!(
-            "Connection is busy. Current DB activity: {}",
-            activity
-        ),
-        None => "Connection is busy. Try again after the current operation finishes."
-            .to_string(),
+        Some(activity) => format!("Connection is busy. Current DB activity: {}", activity),
+        None => "Connection is busy. Try again after the current operation finishes.".to_string(),
     }
 }
 
@@ -304,9 +332,7 @@ pub fn lock_connection_with_activity(
 
 /// Try to acquire the connection lock without blocking.
 /// Returns None if the lock is already held (query is running).
-pub fn try_lock_connection(
-    connection: &SharedConnection,
-) -> Option<ConnectionLockGuard<'_>> {
+pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLockGuard<'_>> {
     match connection.try_lock() {
         Ok(guard) => Some(ConnectionLockGuard {
             guard,
@@ -344,5 +370,41 @@ pub fn try_lock_connection_with_activity(
                 tracks_activity: true,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_live_connection_returns_default_message_when_never_connected() {
+        let mut conn = DatabaseConnection::new();
+        let err = conn
+            .require_live_connection()
+            .expect_err("must be disconnected");
+        assert_eq!(err, NOT_CONNECTED_MESSAGE);
+    }
+
+    #[test]
+    fn require_live_connection_returns_unexpected_disconnect_reason() {
+        let mut conn = DatabaseConnection::new();
+        let reason = "Connection was lost unexpectedly: ORA-03113".to_string();
+        conn.mark_disconnected_with_reason(reason.clone());
+        let err = conn
+            .require_live_connection()
+            .expect_err("must be disconnected");
+        assert_eq!(err, reason);
+    }
+
+    #[test]
+    fn manual_disconnect_clears_unexpected_disconnect_reason() {
+        let mut conn = DatabaseConnection::new();
+        conn.mark_disconnected_with_reason("Connection was lost unexpectedly: ORA-00028");
+        conn.disconnect();
+        let err = conn
+            .require_live_connection()
+            .expect_err("must be disconnected");
+        assert_eq!(err, NOT_CONNECTED_MESSAGE);
     }
 }

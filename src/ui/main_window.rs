@@ -206,6 +206,7 @@ impl AppState {
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const CONNECTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 접속 정보를 상태 표시줄 메시지 끝에 붙는 헬퍼
 fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> String {
@@ -223,6 +224,10 @@ pub struct MainWindow {
 enum ConnectionResult {
     Success(crate::db::ConnectionInfo),
     Failure(String),
+}
+
+enum ConnectionHealthResult {
+    Checked(Option<String>),
 }
 
 enum FileActionResult {
@@ -244,6 +249,22 @@ enum SaveTabOutcome {
 }
 
 impl MainWindow {
+    fn transition_to_disconnected_state(state: &mut AppState, error_message: Option<&str>) {
+        *state.connection_info.borrow_mut() = None;
+        state.status_bar.set_label("Disconnected");
+        let reset_data = IntellisenseData::new();
+        let reset_highlight = HighlightData::new();
+        Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
+
+        if let Some(message) = error_message {
+            crate::utils::logging::log_error("connection", message);
+            state
+                .result_tabs
+                .append_script_output_lines(&[message.to_string()]);
+            state.result_tabs.select_script_output();
+        }
+    }
+
     fn cancel_all_running_queries(state: &Rc<RefCell<AppState>>) {
         let (running_editors, fallback_editor) = {
             let s = state.borrow();
@@ -1446,11 +1467,11 @@ impl MainWindow {
                         let connection = s.connection.clone();
                         thread::spawn(move || {
                             let conn = {
-                                let conn_guard = lock_connection_with_activity(
+                                let mut conn_guard = lock_connection_with_activity(
                                     &connection,
                                     "Loading schema metadata",
                                 );
-                                conn_guard.get_connection()
+                                conn_guard.require_live_connection().ok()
                             };
                             if let Some(conn) = conn {
                                 let mut data = IntellisenseData::new();
@@ -1472,11 +1493,7 @@ impl MainWindow {
                             }
                         });
                     } else {
-                        *s.connection_info.borrow_mut() = None;
-                        s.status_bar.set_label("Disconnected");
-                        let reset_data = IntellisenseData::new();
-                        let reset_highlight = HighlightData::new();
-                        Self::apply_schema_to_all_editors(&mut s, &reset_data, &reset_highlight);
+                        Self::transition_to_disconnected_state(&mut s, None);
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
@@ -1643,11 +1660,7 @@ impl MainWindow {
                 }
 
                 let mut s = state.borrow_mut();
-                *s.connection_info.borrow_mut() = None;
-                s.status_bar.set_label("Disconnected");
-                let reset_data = IntellisenseData::new();
-                let reset_highlight = HighlightData::new();
-                MainWindow::apply_schema_to_all_editors(&mut s, &reset_data, &reset_highlight);
+                MainWindow::transition_to_disconnected_state(&mut s, None);
                 true
             }
             "File/Open SQL File..." => {
@@ -2354,11 +2367,24 @@ impl MainWindow {
             Rc::new(RefCell::new(conn_receiver));
         let file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>> =
             Rc::new(RefCell::new(file_receiver));
+        let (health_sender, health_receiver) = std::sync::mpsc::channel::<ConnectionHealthResult>();
+        let health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
+            Rc::new(RefCell::new(health_receiver));
+        let health_check_in_flight = Rc::new(Cell::new(false));
+        let last_health_check = Rc::new(Cell::new(
+            Instant::now()
+                .checked_sub(CONNECTION_HEALTH_CHECK_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        ));
 
         fn schedule_poll(
             schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>>,
             conn_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionResult>>>,
             file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>>,
+            health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
+            health_sender: std::sync::mpsc::Sender<ConnectionHealthResult>,
+            health_check_in_flight: Rc<Cell<bool>>,
+            last_health_check: Rc<Cell<Instant>>,
             state_weak: Weak<RefCell<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
@@ -2420,11 +2446,11 @@ impl MainWindow {
                                     let connection = s.connection.clone();
                                     thread::spawn(move || {
                                         let conn = {
-                                            let conn_guard = lock_connection_with_activity(
+                                            let mut conn_guard = lock_connection_with_activity(
                                                 &connection,
                                                 "Loading schema metadata",
                                             );
-                                            conn_guard.get_connection()
+                                            conn_guard.require_live_connection().ok()
                                         };
                                         if let Some(conn) = conn {
                                             let mut data = IntellisenseData::new();
@@ -2564,6 +2590,58 @@ impl MainWindow {
                 }
             }
 
+            {
+                let r = health_receiver.borrow();
+                loop {
+                    match r.try_recv() {
+                        Ok(ConnectionHealthResult::Checked(disconnect_message)) => {
+                            health_check_in_flight.set(false);
+                            if let Some(message) = disconnect_message {
+                                let mut s = state.borrow_mut();
+                                if s.connection_info.borrow().is_some() {
+                                    MainWindow::transition_to_disconnected_state(
+                                        &mut s,
+                                        Some(&message),
+                                    );
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            health_check_in_flight.set(false);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let should_run_health_check = {
+                let s = state.borrow();
+                s.connection_info.borrow().is_some()
+                    && !health_check_in_flight.get()
+                    && last_health_check.get().elapsed() >= CONNECTION_HEALTH_CHECK_INTERVAL
+            };
+            if should_run_health_check {
+                health_check_in_flight.set(true);
+                last_health_check.set(Instant::now());
+                let connection = state.borrow().connection.clone();
+                let health_sender = health_sender.clone();
+                thread::spawn(move || {
+                    let disconnect_message =
+                        if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
+                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                                Some(crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                            } else {
+                                conn_guard.require_live_connection().err()
+                            }
+                        } else {
+                            None
+                        };
+                    let _ = health_sender.send(ConnectionHealthResult::Checked(disconnect_message));
+                    app::awake();
+                });
+            }
+
             // Stop polling if all channels are disconnected
             if schema_disconnected && conn_disconnected && file_disconnected {
                 return;
@@ -2575,6 +2653,10 @@ impl MainWindow {
                     Rc::clone(&schema_receiver),
                     Rc::clone(&conn_receiver),
                     Rc::clone(&file_receiver),
+                    Rc::clone(&health_receiver),
+                    health_sender.clone(),
+                    Rc::clone(&health_check_in_flight),
+                    Rc::clone(&last_health_check),
                     state_weak.clone(),
                     schema_sender.clone(),
                     file_sender.clone(),
@@ -2585,6 +2667,7 @@ impl MainWindow {
         // Start polling
         let weak_state_for_poll = Rc::downgrade(&state);
         let schema_sender_for_poll = schema_sender.clone();
+        let health_sender_for_poll = health_sender.clone();
         {
             let mut s = state.borrow_mut();
             s.schema_sender = Some(schema_sender.clone());
@@ -2594,6 +2677,10 @@ impl MainWindow {
             schema_receiver,
             conn_receiver,
             file_receiver,
+            health_receiver,
+            health_sender_for_poll,
+            health_check_in_flight,
+            last_health_check,
             weak_state_for_poll,
             schema_sender_for_poll,
             file_sender.clone(),
@@ -2671,6 +2758,12 @@ impl MainWindow {
                 }
                 // Clean up result tabs to release FLTK widget callbacks and data buffers
                 result_tabs.clear();
+            }
+            if let Err(err) = crate::ui::query_history::flush_history_writer() {
+                eprintln!("Query history flush on exit failed: {err}");
+            }
+            if let Err(err) = crate::utils::logging::flush_log_writer() {
+                eprintln!("Application log flush on exit failed: {err}");
             }
             w.hide();
             app::quit();

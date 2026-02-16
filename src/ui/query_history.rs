@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{mpsc, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
@@ -23,7 +24,10 @@ enum HistoryCommand {
     Add(QueryHistoryEntry),
     Clear,
     Snapshot(mpsc::Sender<Vec<QueryHistoryEntry>>),
+    Flush(mpsc::Sender<Result<(), String>>),
 }
+
+const HISTORY_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
     static HISTORY_WRITER: OnceLock<mpsc::Sender<HistoryCommand>> = OnceLock::new();
@@ -31,47 +35,106 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
         thread::spawn(move || {
             let mut history = QueryHistory::load();
-            while let Ok(cmd) = receiver.recv() {
-                let mut needs_save = false;
-                match cmd {
+            let mut last_persist_error: Option<String> = None;
+            let apply_command = |history: &mut QueryHistory,
+                                 command: HistoryCommand,
+                                 needs_save: &mut bool,
+                                 snapshot_replies: &mut Vec<mpsc::Sender<Vec<QueryHistoryEntry>>>,
+                                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+                match command {
                     HistoryCommand::Add(entry) => {
                         history.add_entry(entry);
-                        needs_save = true;
+                        *needs_save = true;
                     }
                     HistoryCommand::Clear => {
                         history.queries.clear();
-                        needs_save = true;
+                        *needs_save = true;
                     }
                     HistoryCommand::Snapshot(reply) => {
-                        let _ = reply.send(history.queries.clone());
+                        snapshot_replies.push(reply);
+                    }
+                    HistoryCommand::Flush(reply) => {
+                        flush_replies.push(reply);
                     }
                 }
+            };
+            while let Ok(cmd) = receiver.recv() {
+                let previous_state = history.clone();
+                let mut needs_save = false;
+                let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
+                let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+                apply_command(
+                    &mut history,
+                    cmd,
+                    &mut needs_save,
+                    &mut snapshot_replies,
+                    &mut flush_replies,
+                );
                 // Drain any pending commands before saving
                 while let Ok(next) = receiver.try_recv() {
-                    match next {
-                        HistoryCommand::Add(entry) => {
-                            history.add_entry(entry);
-                            needs_save = true;
+                    apply_command(
+                        &mut history,
+                        next,
+                        &mut needs_save,
+                        &mut snapshot_replies,
+                        &mut flush_replies,
+                    );
+                }
+                if needs_save {
+                    match history.save() {
+                        Ok(()) => {
+                            last_persist_error = None;
                         }
-                        HistoryCommand::Clear => {
-                            history.queries.clear();
-                            needs_save = true;
-                        }
-                        HistoryCommand::Snapshot(reply) => {
-                            let _ = reply.send(history.queries.clone());
+                        Err(err) => {
+                            let msg = format!("Query history save error: {err}");
+                            crate::utils::logging::log_error("history", &msg);
+                            eprintln!("{msg}");
+                            history = previous_state;
+                            last_persist_error = Some(msg);
                         }
                     }
                 }
-                if needs_save {
-                    if let Err(err) = history.save() {
-                        crate::utils::logging::log_error("history", &format!("Query history save error: {err}"));
-                        eprintln!("Query history save error: {err}");
-                    }
+
+                for reply in snapshot_replies {
+                    let _ = reply.send(history.queries.clone());
+                }
+
+                let save_result: Result<(), String> = match &last_persist_error {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(()),
+                };
+
+                for reply in flush_replies {
+                    let _ = reply.send(save_result.clone());
                 }
             }
         });
         sender
     })
+}
+
+pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    if history_writer_sender()
+        .send(HistoryCommand::Flush(tx))
+        .is_err()
+    {
+        return Err("Query history writer is not available".to_string());
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("Timed out while waiting for query history persistence".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("Query history writer disconnected while flushing".to_string())
+        }
+    }
+}
+
+pub fn flush_history_writer() -> Result<(), String> {
+    flush_history_writer_with_timeout(HISTORY_WRITER_RESPONSE_TIMEOUT)
 }
 
 fn parse_error_line(message: &str) -> Option<usize> {
@@ -141,10 +204,31 @@ fn load_snapshot() -> Vec<QueryHistoryEntry> {
         .send(HistoryCommand::Snapshot(tx))
         .is_ok()
     {
-        rx.recv().unwrap_or_default()
+        match rx.recv_timeout(HISTORY_WRITER_RESPONSE_TIMEOUT) {
+            Ok(snapshot) => snapshot,
+            Err(_) => QueryHistory::load().queries,
+        }
     } else {
         // Writer thread dead – fall back to disk
         QueryHistory::load().queries
+    }
+}
+
+pub fn clear_history() -> Result<(), String> {
+    match history_writer_sender().send(HistoryCommand::Clear) {
+        Ok(()) => flush_history_writer(),
+        Err(send_err) => {
+            if let HistoryCommand::Clear = send_err.0 {
+                let mut history = QueryHistory::load();
+                history.queries.clear();
+                history
+                    .save()
+                    .map_err(|err| format!("Failed to clear query history: {err}"))?;
+                Ok(())
+            } else {
+                Err("Failed to clear query history".to_string())
+            }
+        }
     }
 }
 
@@ -389,18 +473,25 @@ impl QueryHistoryDialog {
                             "",
                         );
                         if choice == Some(1) {
-                            // Notify the background writer so its in-memory
-                            // history is cleared along with the file.
-                            let _ = history_writer_sender().send(HistoryCommand::Clear);
-                            app::awake();
-                            queries.borrow_mut().clear();
-                            browser.clear();
-                            preview_buffer.set_text("");
-                            preview_style_buffer.set_text("");
-                            error_buffer.set_text("");
-                            error_display.hide();
-                            error_label.hide();
-                            preview_flex_for_error.layout();
+                            match clear_history() {
+                                Ok(()) => {
+                                    app::awake();
+                                    queries.borrow_mut().clear();
+                                    browser.clear();
+                                    preview_buffer.set_text("");
+                                    preview_style_buffer.set_text("");
+                                    error_buffer.set_text("");
+                                    error_display.hide();
+                                    error_label.hide();
+                                    preview_flex_for_error.layout();
+                                }
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&format!(
+                                        "Failed to clear query history: {}",
+                                        err
+                                    ));
+                                }
+                            }
                         }
                     }
                     DialogMessage::Close => {

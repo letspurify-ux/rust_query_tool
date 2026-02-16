@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -210,7 +211,7 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueryHistory {
     pub queries: Vec<QueryHistoryEntry>,
 }
@@ -253,20 +254,102 @@ impl QueryHistory {
         Self::history_path_for(LEGACY_APP_DIR_NAME)
     }
 
+    fn preserve_corrupt_history_file(path: &PathBuf) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let backup_path = path.with_extension(format!("corrupt.{}.json", timestamp));
+        if let Err(err) = fs::rename(path, &backup_path) {
+            crate::utils::logging::log_warning(
+                "config",
+                &format!(
+                    "Failed to preserve corrupt history file {}: {}",
+                    path.display(),
+                    err
+                ),
+            );
+            eprintln!(
+                "Failed to preserve corrupt history file {}: {}",
+                path.display(),
+                err
+            );
+        } else {
+            crate::utils::logging::log_warning(
+                "config",
+                &format!(
+                    "Corrupt history file was moved to {}",
+                    backup_path.display()
+                ),
+            );
+            eprintln!(
+                "Corrupt history file was moved to {}",
+                backup_path.display()
+            );
+        }
+    }
+
+    fn load_from_path(path: &PathBuf, source_label: &str) -> Option<Self> {
+        if !path.exists() {
+            return None;
+        }
+
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                crate::utils::logging::log_warning(
+                    "config",
+                    &format!(
+                        "Failed to read {} history file {}: {}",
+                        source_label,
+                        path.display(),
+                        err
+                    ),
+                );
+                eprintln!(
+                    "Failed to read {} history file {}: {}",
+                    source_label,
+                    path.display(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        match serde_json::from_str::<Self>(&content) {
+            Ok(history) => Some(history),
+            Err(err) => {
+                crate::utils::logging::log_warning(
+                    "config",
+                    &format!(
+                        "Failed to parse {} history file {}: {}",
+                        source_label,
+                        path.display(),
+                        err
+                    ),
+                );
+                eprintln!(
+                    "Failed to parse {} history file {}: {}",
+                    source_label,
+                    path.display(),
+                    err
+                );
+                Self::preserve_corrupt_history_file(path);
+                None
+            }
+        }
+    }
+
     pub fn load() -> Self {
         let mut loaded_from_legacy = false;
 
         let loaded = if let Some(path) = Self::history_path() {
             if path.exists() {
-                fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|content| serde_json::from_str::<Self>(&content).ok())
+                Self::load_from_path(&path, "primary")
             } else if let Some(legacy_path) = Self::legacy_history_path() {
                 if legacy_path.exists() {
                     loaded_from_legacy = true;
-                    fs::read_to_string(&legacy_path)
-                        .ok()
-                        .and_then(|content| serde_json::from_str::<Self>(&content).ok())
+                    Self::load_from_path(&legacy_path, "legacy")
                 } else {
                     None
                 }

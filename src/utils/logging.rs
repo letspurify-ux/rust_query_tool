@@ -5,11 +5,14 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_DIR_NAME: &str = "space_query";
 const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 5000;
+const LOG_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -44,7 +47,7 @@ pub struct LogEntry {
     pub message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppLog {
     pub entries: Vec<LogEntry>,
 }
@@ -64,12 +67,43 @@ impl AppLog {
         })
     }
 
+    fn preserve_corrupt_log_file(path: &PathBuf) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let backup_path = path.with_extension(format!("corrupt.{}.json", timestamp));
+        match fs::rename(path, &backup_path) {
+            Ok(()) => {
+                eprintln!("Corrupt app log was moved to {}", backup_path.display());
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to preserve corrupt app log file {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
     pub fn load() -> Self {
         if let Some(path) = Self::log_path() {
             if path.exists() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(log) = serde_json::from_str::<Self>(&content) {
-                        return log;
+                match fs::read_to_string(&path) {
+                    Ok(content) => match serde_json::from_str::<Self>(&content) {
+                        Ok(log) => return log,
+                        Err(err) => {
+                            eprintln!(
+                                "Failed to parse app log file {}: {}",
+                                path.display(),
+                                err
+                            );
+                            Self::preserve_corrupt_log_file(&path);
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!("Failed to read app log file {}: {}", path.display(), err);
                     }
                 }
             }
@@ -82,9 +116,13 @@ impl AppLog {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let file = fs::File::create(&path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer(writer, self)?;
+            let tmp_path = path.with_extension("json.tmp");
+            let file = fs::File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self)?;
+            use std::io::Write;
+            writer.flush()?;
+            fs::rename(&tmp_path, &path)?;
         }
         Ok(())
     }
@@ -104,6 +142,7 @@ impl Default for AppLog {
 enum LogCommand {
     Write(LogEntry),
     Clear,
+    Flush(mpsc::Sender<Result<(), String>>),
 }
 
 fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
@@ -112,24 +151,77 @@ fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
         let (sender, receiver) = mpsc::channel::<LogCommand>();
         thread::spawn(move || {
             let mut log = AppLog::load();
+            let mut last_persist_error: Option<String> = None;
+            let apply_command =
+                |log: &mut AppLog,
+                 command: LogCommand,
+                 needs_save: &mut bool,
+                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+                    match command {
+                        LogCommand::Write(entry) => {
+                            log.add_entry(entry);
+                            *needs_save = true;
+                        }
+                        LogCommand::Clear => {
+                            log.entries.clear();
+                            *needs_save = true;
+                        }
+                        LogCommand::Flush(reply) => {
+                            flush_replies.push(reply);
+                        }
+                    }
+                };
             while let Ok(cmd) = receiver.recv() {
-                match cmd {
-                    LogCommand::Write(entry) => log.add_entry(entry),
-                    LogCommand::Clear => log.entries.clear(),
-                }
+                let previous_state = log.clone();
+                let mut needs_save = false;
+                let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+                apply_command(&mut log, cmd, &mut needs_save, &mut flush_replies);
                 while let Ok(next) = receiver.try_recv() {
-                    match next {
-                        LogCommand::Write(entry) => log.add_entry(entry),
-                        LogCommand::Clear => log.entries.clear(),
+                    apply_command(&mut log, next, &mut needs_save, &mut flush_replies);
+                }
+                if needs_save {
+                    match log.save() {
+                        Ok(()) => {
+                            last_persist_error = None;
+                        }
+                        Err(err) => {
+                            let msg = format!("Log save error: {err}");
+                            eprintln!("{msg}");
+                            log = previous_state;
+                            last_persist_error = Some(msg);
+                        }
                     }
                 }
-                if let Err(err) = log.save() {
-                    eprintln!("Log save error: {err}");
+
+                let save_result: Result<(), String> = match &last_persist_error {
+                    Some(err) => Err(err.clone()),
+                    None => Ok(()),
+                };
+
+                for reply in flush_replies {
+                    let _ = reply.send(save_result.clone());
                 }
             }
         });
         sender
     })
+}
+
+pub fn flush_log_writer() -> Result<(), String> {
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    if log_writer_sender().send(LogCommand::Flush(tx)).is_err() {
+        return Err("Log writer is not available".to_string());
+    }
+
+    match rx.recv_timeout(LOG_WRITER_RESPONSE_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("Timed out while waiting for log persistence".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("Log writer disconnected while flushing".to_string())
+        }
+    }
 }
 
 /// In-memory ring buffer so the UI can show recent entries without
@@ -186,11 +278,30 @@ pub fn get_log_entries() -> Vec<LogEntry> {
 }
 
 /// Clear all log entries (in-memory + persisted).
-pub fn clear_log() {
-    if let Ok(mut buf) = in_memory_log().lock() {
-        buf.clear();
+pub fn clear_log() -> Result<(), String> {
+    match log_writer_sender().send(LogCommand::Clear) {
+        Ok(()) => {
+            flush_log_writer()?;
+            if let Ok(mut buf) = in_memory_log().lock() {
+                buf.clear();
+            }
+            Ok(())
+        }
+        Err(send_err) => {
+            if let LogCommand::Clear = send_err.0 {
+                let mut log = AppLog::load();
+                log.entries.clear();
+                log.save()
+                    .map_err(|err| format!("Failed to clear persisted log: {err}"))?;
+                if let Ok(mut buf) = in_memory_log().lock() {
+                    buf.clear();
+                }
+                Ok(())
+            } else {
+                Err("Failed to clear application log".to_string())
+            }
+        }
     }
-    let _ = log_writer_sender().send(LogCommand::Clear);
 }
 
 // ── Crash log helpers ──

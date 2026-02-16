@@ -14,7 +14,8 @@ use std::thread;
 use crate::db::{
     format_connection_busy_message, lock_connection_with_activity,
     try_lock_connection_with_activity, CompilationError, ConstraintInfo, IndexInfo, ObjectBrowser,
-    PackageRoutine, ProcedureArgument, SequenceInfo, SharedConnection, SynonymInfo, TableColumnDetail,
+    PackageRoutine, ProcedureArgument, SequenceInfo, SharedConnection, SynonymInfo,
+    TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::FontProfile;
@@ -680,7 +681,7 @@ impl ObjectBrowserWidget {
                                             );
                                             thread::spawn(move || {
                                                 // Try to acquire connection lock without blocking
-                                                let Some(conn_guard) =
+                                                let Some(mut conn_guard) =
                                                     try_lock_connection_with_activity(
                                                         &connection,
                                                         format!(
@@ -697,19 +698,17 @@ impl ObjectBrowserWidget {
                                                     return;
                                                 };
 
-                                                let result = if !conn_guard.is_connected() {
-                                                    Err("Not connected to database".to_string())
-                                                } else if let Some(db_conn) =
-                                                    conn_guard.get_connection()
-                                                {
-                                                    ObjectBrowser::get_package_routines(
-                                                        db_conn.as_ref(),
-                                                        &package_name,
-                                                    )
-                                                    .map_err(|err| err.to_string())
-                                                } else {
-                                                    Err("Not connected to database".to_string())
-                                                };
+                                                let result =
+                                                    match conn_guard.require_live_connection() {
+                                                        Ok(db_conn) => {
+                                                            ObjectBrowser::get_package_routines(
+                                                                db_conn.as_ref(),
+                                                                &package_name,
+                                                            )
+                                                            .map_err(|err| err.to_string())
+                                                        }
+                                                        Err(message) => Err(message.to_string()),
+                                                    };
 
                                                 let _ = sender.send(
                                                     ObjectActionResult::PackageRoutines {
@@ -1295,7 +1294,7 @@ impl ObjectBrowserWidget {
                             app::awake();
                             return;
                         };
-                        if !conn_guard.is_connected() {
+                        if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
                             drop(conn_guard);
                             fltk::dialog::alert_default("Not connected to database");
                             return;
@@ -1331,7 +1330,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading {} arguments for {}", routine_type, object_name),
                             ) else {
@@ -1341,10 +1340,8 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            let result = if !conn_guard.is_connected() {
-                                Err("Not connected to database".to_string())
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
-                                ObjectBrowser::get_procedure_arguments(
+                            let result = match conn_guard.require_live_connection() {
+                                Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
                                     db_conn.as_ref(),
                                     &object_name,
                                 )
@@ -1354,9 +1351,8 @@ impl ObjectBrowserWidget {
                                         &arguments,
                                     )
                                 })
-                                .map_err(|err| err.to_string())
-                            } else {
-                                Err("Not connected to database".to_string())
+                                .map_err(|err| err.to_string()),
+                                Err(message) => Err(message.to_string()),
                             };
 
                             let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -1386,14 +1382,11 @@ impl ObjectBrowserWidget {
                         let routine_type = routine_type.clone();
                         Self::emit_status_callback(
                             status_callback,
-                            &format!(
-                                "Loading {} arguments for {}",
-                                routine_type, qualified_name
-                            ),
+                            &format!("Loading {} arguments for {}", routine_type, qualified_name),
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!(
                                     "Loading {} arguments for {}",
@@ -1406,10 +1399,8 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            let result = if !conn_guard.is_connected() {
-                                Err("Not connected to database".to_string())
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
-                                ObjectBrowser::get_package_procedure_arguments(
+                            let result = match conn_guard.require_live_connection() {
+                                Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
                                     db_conn.as_ref(),
                                     &package_name,
                                     &routine_name,
@@ -1420,9 +1411,8 @@ impl ObjectBrowserWidget {
                                         &arguments,
                                     )
                                 })
-                                .map_err(|err| err.to_string())
-                            } else {
-                                Err("Not connected to database".to_string())
+                                .map_err(|err| err.to_string()),
+                                Err(message) => Err(message.to_string()),
                             };
 
                             let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -1458,7 +1448,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Checking compilation status for {}", object_name),
                             ) else {
@@ -1468,15 +1458,7 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            if !conn_guard.is_connected() {
-                                let _ = sender.send(ObjectActionResult::CompilationErrors {
-                                    object_name,
-                                    object_type,
-                                    status: String::new(),
-                                    result: Err("Not connected to database".to_string()),
-                                });
-                                app::awake();
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
+                            if let Ok(db_conn) = conn_guard.require_live_connection() {
                                 let status = ObjectBrowser::get_object_status(
                                     db_conn.as_ref(),
                                     &object_name,
@@ -1532,7 +1514,7 @@ impl ObjectBrowserWidget {
                                     object_name,
                                     object_type,
                                     status: String::new(),
-                                    result: Err("Not connected to database".to_string()),
+                                    result: Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
                                 });
                                 app::awake();
                             }
@@ -1550,7 +1532,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading table structure for {}", table_name),
                             ) else {
@@ -1560,13 +1542,13 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            let result = if !conn_guard.is_connected() {
-                                Err("Not connected to database".to_string())
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
-                                ObjectBrowser::get_table_structure(db_conn.as_ref(), &table_name)
-                                    .map_err(|err| err.to_string())
-                            } else {
-                                Err("Not connected to database".to_string())
+                            let result = match conn_guard.require_live_connection() {
+                                Ok(db_conn) => ObjectBrowser::get_table_structure(
+                                    db_conn.as_ref(),
+                                    &table_name,
+                                )
+                                .map_err(|err| err.to_string()),
+                                Err(message) => Err(message.to_string()),
                             };
                             let _ = sender
                                 .send(ObjectActionResult::TableStructure { table_name, result });
@@ -1584,7 +1566,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading indexes for {}", table_name),
                             ) else {
@@ -1594,13 +1576,12 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            let result = if !conn_guard.is_connected() {
-                                Err("Not connected to database".to_string())
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
-                                ObjectBrowser::get_table_indexes(db_conn.as_ref(), &table_name)
-                                    .map_err(|err| err.to_string())
-                            } else {
-                                Err("Not connected to database".to_string())
+                            let result = match conn_guard.require_live_connection() {
+                                Ok(db_conn) => {
+                                    ObjectBrowser::get_table_indexes(db_conn.as_ref(), &table_name)
+                                        .map_err(|err| err.to_string())
+                                }
+                                Err(message) => Err(message.to_string()),
                             };
                             let _ = sender
                                 .send(ObjectActionResult::TableIndexes { table_name, result });
@@ -1618,7 +1599,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading constraints for {}", table_name),
                             ) else {
@@ -1628,13 +1609,13 @@ impl ObjectBrowserWidget {
                                 return;
                             };
 
-                            let result = if !conn_guard.is_connected() {
-                                Err("Not connected to database".to_string())
-                            } else if let Some(db_conn) = conn_guard.get_connection() {
-                                ObjectBrowser::get_table_constraints(db_conn.as_ref(), &table_name)
-                                    .map_err(|err| err.to_string())
-                            } else {
-                                Err("Not connected to database".to_string())
+                            let result = match conn_guard.require_live_connection() {
+                                Ok(db_conn) => ObjectBrowser::get_table_constraints(
+                                    db_conn.as_ref(),
+                                    &table_name,
+                                )
+                                .map_err(|err| err.to_string()),
+                                Err(message) => Err(message.to_string()),
                             };
                             let _ = sender
                                 .send(ObjectActionResult::TableConstraints { table_name, result });
@@ -1659,7 +1640,7 @@ impl ObjectBrowserWidget {
                         );
                         thread::spawn(move || {
                             // Try to acquire connection lock without blocking
-                            let Some(conn_guard) = try_lock_connection_with_activity(
+                            let Some(mut conn_guard) = try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading {} info for {}", obj_type, name),
                             ) else {
@@ -1691,13 +1672,7 @@ impl ObjectBrowserWidget {
                                 }
                             };
 
-                            if !conn_guard.is_connected() {
-                                send_err(&sender, &obj_type, "Not connected to database");
-                                app::awake();
-                                return;
-                            }
-
-                            if let Some(db_conn) = conn_guard.get_connection() {
+                            if let Ok(db_conn) = conn_guard.require_live_connection() {
                                 match obj_type.as_str() {
                                     "SYNONYMS" => {
                                         let result = ObjectBrowser::get_synonym_info(
@@ -1719,7 +1694,7 @@ impl ObjectBrowserWidget {
                                     }
                                 }
                             } else {
-                                send_err(&sender, &obj_type, "Not connected to database");
+                                send_err(&sender, &obj_type, crate::db::NOT_CONNECTED_MESSAGE);
                             }
                             app::awake();
                             // conn_guard drops here, releasing the lock
@@ -1754,12 +1729,9 @@ impl ObjectBrowserWidget {
                             );
                             thread::spawn(move || {
                                 // Try to acquire connection lock without blocking
-                                let Some(conn_guard) = try_lock_connection_with_activity(
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
                                     &connection,
-                                    format!(
-                                        "Generating {} DDL for {}",
-                                        object_type, object_name
-                                    ),
+                                    format!("Generating {} DDL for {}", object_type, object_name),
                                 ) else {
                                     // Query is already running, notify user
                                     let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
@@ -1767,10 +1739,8 @@ impl ObjectBrowserWidget {
                                     return;
                                 };
 
-                                let result = if !conn_guard.is_connected() {
-                                    Err("Not connected to database".to_string())
-                                } else if let Some(db_conn) = conn_guard.get_connection() {
-                                    match object_type.as_str() {
+                                let result = match conn_guard.require_live_connection() {
+                                    Ok(db_conn) => match object_type.as_str() {
                                         "TABLE" => ObjectBrowser::get_table_ddl(
                                             db_conn.as_ref(),
                                             &object_name,
@@ -1806,9 +1776,8 @@ impl ObjectBrowserWidget {
                                         ),
                                         _ => return,
                                     }
-                                    .map_err(|err| err.to_string())
-                                } else {
-                                    Err("Not connected to database".to_string())
+                                    .map_err(|err| err.to_string()),
+                                    Err(message) => Err(message.to_string()),
                                 };
                                 let _ = sender.send(ObjectActionResult::Ddl(result));
                                 app::awake();
@@ -1916,13 +1885,9 @@ impl ObjectBrowserWidget {
 
         thread::spawn(move || {
             // Acquire connection lock and hold it during all queries
-            let conn_guard =
+            let mut conn_guard =
                 lock_connection_with_activity(&connection, "Refreshing object browser metadata");
-            if !conn_guard.is_connected() {
-                return;
-            }
-
-            let Some(db_conn) = conn_guard.get_connection() else {
+            let Ok(db_conn) = conn_guard.require_live_connection() else {
                 return;
             };
             // Keep conn_guard alive (don't drop it) so the lock is held during execution
