@@ -43,6 +43,7 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
                     }
                 }
                 if let Err(err) = history.save() {
+                    crate::utils::logging::log_error("history", &format!("Query history save error: {err}"));
                     eprintln!("Query history save error: {err}");
                 }
             }

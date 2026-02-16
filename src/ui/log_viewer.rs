@@ -1,0 +1,426 @@
+use fltk::{
+    app,
+    browser::HoldBrowser,
+    button::Button,
+    enums::FrameType,
+    group::Flex,
+    menu::Choice,
+    prelude::*,
+    text::{TextBuffer, TextDisplay},
+    window::Window,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::mpsc;
+
+use crate::ui::center_on_main;
+use crate::ui::constants::*;
+use crate::ui::theme;
+use crate::ui::{configured_editor_profile, configured_ui_font_size};
+use crate::utils::logging::{self, LogEntry, LogLevel};
+
+enum DialogMessage {
+    UpdatePreview(usize),
+    FilterChanged,
+    ClearLog,
+    ExportLog,
+    Close,
+}
+
+pub struct LogViewerDialog;
+
+impl LogViewerDialog {
+    pub fn show(popups: Rc<RefCell<Vec<Window>>>) {
+        let all_entries = logging::get_log_entries();
+
+        let current_group = fltk::group::Group::try_current();
+        fltk::group::Group::set_current(None::<&fltk::group::Group>);
+
+        let mut dialog = Window::default()
+            .with_size(900, 560)
+            .with_label("Application Log");
+        center_on_main(&mut dialog);
+        dialog.set_color(theme::panel_raised());
+        dialog.make_modal(true);
+
+        let mut main_flex = Flex::default().with_pos(10, 10).with_size(880, 540);
+        main_flex.set_type(fltk::group::FlexType::Column);
+        main_flex.set_spacing(DIALOG_SPACING);
+
+        // -- Filter row --
+        let mut filter_row = Flex::default();
+        filter_row.set_type(fltk::group::FlexType::Row);
+        filter_row.set_spacing(DIALOG_SPACING);
+
+        let mut filter_label = fltk::frame::Frame::default().with_label("Filter Level:");
+        filter_label.set_label_color(theme::text_primary());
+        filter_row.fixed(&filter_label, 80);
+
+        let mut level_choice = Choice::default();
+        level_choice.set_color(theme::input_bg());
+        level_choice.set_text_color(theme::text_primary());
+        level_choice.add_choice("All|Error|Warning|Info|Debug");
+        level_choice.set_value(0);
+        filter_row.fixed(&level_choice, 120);
+
+        let mut count_label = fltk::frame::Frame::default();
+        count_label.set_label_color(theme::text_muted());
+        count_label.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
+
+        filter_row.end();
+        main_flex.fixed(&filter_row, INPUT_ROW_HEIGHT);
+
+        // -- Content: list + detail --
+        let mut content_flex = Flex::default();
+        content_flex.set_type(fltk::group::FlexType::Row);
+        content_flex.set_spacing(DIALOG_SPACING);
+
+        // Left - Log list
+        let mut list_flex = Flex::default();
+        list_flex.set_type(fltk::group::FlexType::Column);
+        list_flex.set_spacing(DIALOG_SPACING);
+
+        let mut list_label =
+            fltk::frame::Frame::default().with_label("Log Entries (Most Recent First):");
+        list_label.set_label_color(theme::text_primary());
+        list_flex.fixed(&list_label, LABEL_ROW_HEIGHT);
+
+        let mut browser = HoldBrowser::default();
+        browser.set_color(theme::input_bg());
+        browser.set_selection_color(theme::selection_strong());
+
+        list_flex.end();
+        content_flex.fixed(&list_flex, 420);
+
+        // Right - Detail view
+        let mut detail_flex = Flex::default();
+        detail_flex.set_type(fltk::group::FlexType::Column);
+        detail_flex.set_spacing(DIALOG_SPACING);
+
+        let mut detail_label = fltk::frame::Frame::default().with_label("Details:");
+        detail_label.set_label_color(theme::text_primary());
+        detail_flex.fixed(&detail_label, LABEL_ROW_HEIGHT);
+
+        let detail_buffer = TextBuffer::default();
+        let mut detail_display = TextDisplay::default();
+        detail_display.set_buffer(detail_buffer.clone());
+        detail_display.set_color(theme::editor_bg());
+        detail_display.set_text_color(theme::text_primary());
+        detail_display.set_text_font(configured_editor_profile().normal);
+        detail_display.set_text_size(configured_ui_font_size());
+        detail_display.wrap_mode(fltk::text::WrapMode::AtBounds, 0);
+
+        detail_flex.end();
+
+        content_flex.end();
+
+        // -- Bottom buttons --
+        let mut button_flex = Flex::default();
+        button_flex.set_type(fltk::group::FlexType::Row);
+        button_flex.set_spacing(DIALOG_SPACING);
+
+        let _spacer = fltk::frame::Frame::default();
+
+        let mut export_btn = Button::default()
+            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
+            .with_label("Export...");
+        export_btn.set_color(theme::button_primary());
+        export_btn.set_label_color(theme::text_primary());
+        export_btn.set_frame(FrameType::RFlatBox);
+
+        let mut clear_btn = Button::default()
+            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
+            .with_label("Clear Log");
+        clear_btn.set_color(theme::button_danger());
+        clear_btn.set_label_color(theme::text_primary());
+        clear_btn.set_frame(FrameType::RFlatBox);
+
+        let mut close_btn = Button::default()
+            .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("Close");
+        close_btn.set_color(theme::button_subtle());
+        close_btn.set_label_color(theme::text_primary());
+        close_btn.set_frame(FrameType::RFlatBox);
+
+        button_flex.fixed(&export_btn, BUTTON_WIDTH_LARGE);
+        button_flex.fixed(&clear_btn, BUTTON_WIDTH_LARGE);
+        button_flex.fixed(&close_btn, BUTTON_WIDTH);
+        button_flex.end();
+        main_flex.fixed(&button_flex, BUTTON_ROW_HEIGHT);
+
+        main_flex.end();
+        dialog.end();
+        fltk::group::Group::set_current(current_group.as_ref());
+
+        popups.borrow_mut().push(dialog.clone());
+
+        let entries: Rc<RefCell<Vec<LogEntry>>> = Rc::new(RefCell::new(all_entries));
+        let filtered_indices: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let (sender, receiver) = mpsc::channel::<DialogMessage>();
+
+        // Initial population
+        populate_browser(
+            &entries.borrow(),
+            &mut browser,
+            &filtered_indices,
+            &mut count_label,
+            None,
+        );
+
+        // Browser selection callback
+        let sender_for_preview = sender.clone();
+        browser.set_callback(move |b| {
+            let selected = b.value();
+            if selected > 0 {
+                if let Some(idx) = (selected - 1).try_into().ok() {
+                    let _ = sender_for_preview.send(DialogMessage::UpdatePreview(idx));
+                    app::awake();
+                }
+            }
+        });
+
+        // Level filter callback
+        let sender_for_filter = sender.clone();
+        level_choice.set_callback(move |_| {
+            let _ = sender_for_filter.send(DialogMessage::FilterChanged);
+            app::awake();
+        });
+
+        // Export button
+        let sender_for_export = sender.clone();
+        export_btn.set_callback(move |_| {
+            let _ = sender_for_export.send(DialogMessage::ExportLog);
+            app::awake();
+        });
+
+        // Clear button
+        let sender_for_clear = sender.clone();
+        clear_btn.set_callback(move |_| {
+            let _ = sender_for_clear.send(DialogMessage::ClearLog);
+            app::awake();
+        });
+
+        // Close button
+        let sender_for_close = sender.clone();
+        close_btn.set_callback(move |_| {
+            let _ = sender_for_close.send(DialogMessage::Close);
+            app::awake();
+        });
+
+        dialog.show();
+
+        let mut detail_buffer = detail_buffer.clone();
+        let mut browser = browser.clone();
+        let mut count_label = count_label.clone();
+        let level_choice = level_choice.clone();
+
+        while dialog.shown() {
+            fltk::app::wait();
+            while let Ok(message) = receiver.try_recv() {
+                match message {
+                    DialogMessage::UpdatePreview(browser_index) => {
+                        let fi = filtered_indices.borrow();
+                        if let Some(&entry_index) = fi.get(browser_index) {
+                            let ents = entries.borrow();
+                            if let Some(entry) = ents.get(entry_index) {
+                                let detail = format!(
+                                    "Timestamp: {}\nLevel: {}\nSource: {}\n\n{}",
+                                    entry.timestamp,
+                                    entry.level.label(),
+                                    entry.source,
+                                    entry.message
+                                );
+                                detail_buffer.set_text(&detail);
+                            }
+                        }
+                    }
+                    DialogMessage::FilterChanged => {
+                        let filter = selected_filter(&level_choice);
+                        populate_browser(
+                            &entries.borrow(),
+                            &mut browser,
+                            &filtered_indices,
+                            &mut count_label,
+                            filter,
+                        );
+                        detail_buffer.set_text("");
+                    }
+                    DialogMessage::ClearLog => {
+                        let choice = fltk::dialog::choice2_default(
+                            "Are you sure you want to clear all application logs?",
+                            "Cancel",
+                            "Clear All",
+                            "",
+                        );
+                        if choice == Some(1) {
+                            logging::clear_log();
+                            entries.borrow_mut().clear();
+                            filtered_indices.borrow_mut().clear();
+                            browser.clear();
+                            detail_buffer.set_text("");
+                            count_label.set_label("0 entries");
+                        }
+                    }
+                    DialogMessage::ExportLog => {
+                        let mut dlg = fltk::dialog::FileDialog::new(
+                            fltk::dialog::FileDialogType::BrowseSaveFile,
+                        );
+                        dlg.set_filter("Text Files\t*.txt\nAll Files\t*.*");
+                        dlg.show();
+                        let path = dlg.filename();
+                        if !path.as_os_str().is_empty() {
+                            let ents = entries.borrow();
+                            let fi = filtered_indices.borrow();
+                            let mut output = String::new();
+                            for &idx in fi.iter() {
+                                if let Some(entry) = ents.get(idx) {
+                                    output.push_str(&format!(
+                                        "[{}] [{}] [{}] {}\n",
+                                        entry.timestamp,
+                                        entry.level.label(),
+                                        entry.source,
+                                        entry.message
+                                    ));
+                                }
+                            }
+                            match std::fs::write(&path, output) {
+                                Ok(()) => {
+                                    fltk::dialog::message_default(&format!(
+                                        "Log exported to {}",
+                                        path.display()
+                                    ));
+                                }
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&format!(
+                                        "Failed to export log: {}",
+                                        err
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    DialogMessage::Close => {
+                        dialog.hide();
+                    }
+                }
+            }
+        }
+
+        popups
+            .borrow_mut()
+            .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
+    }
+}
+
+fn selected_filter(choice: &Choice) -> Option<LogLevel> {
+    match choice.value() {
+        1 => Some(LogLevel::Error),
+        2 => Some(LogLevel::Warning),
+        3 => Some(LogLevel::Info),
+        4 => Some(LogLevel::Debug),
+        _ => None, // 0 = All
+    }
+}
+
+fn populate_browser(
+    entries: &[LogEntry],
+    browser: &mut HoldBrowser,
+    filtered_indices: &Rc<RefCell<Vec<usize>>>,
+    count_label: &mut fltk::frame::Frame,
+    filter: Option<LogLevel>,
+) {
+    browser.clear();
+    let mut indices = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(level) = filter {
+            if entry.level != level {
+                continue;
+            }
+        }
+
+        let color_prefix = match entry.level {
+            LogLevel::Error => "@C1 ",   // red
+            LogLevel::Warning => "@C95 ", // orange
+            LogLevel::Info => "@C255 ",   // white
+            LogLevel::Debug => "@C246 ",  // gray
+        };
+
+        let short_msg = truncate_message(&entry.message, 60);
+        let display = format!(
+            "{}{} [{}] [{}] {}",
+            color_prefix,
+            entry.timestamp,
+            entry.level.label(),
+            entry.source,
+            short_msg
+        );
+        browser.add(&display);
+        indices.push(i);
+    }
+
+    count_label.set_label(&format!("{} entries", indices.len()));
+    *filtered_indices.borrow_mut() = indices;
+}
+
+fn truncate_message(msg: &str, max_len: usize) -> String {
+    // Replace newlines with spaces for single-line display
+    let mut normalized = String::with_capacity(msg.len());
+    for ch in msg.chars() {
+        if ch.is_whitespace() {
+            normalized.push(' ');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let trimmed = normalized.trim();
+
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.chars().count() > max_len {
+        let end = trimmed
+            .char_indices()
+            .nth(max_len)
+            .map(|(idx, _)| idx)
+            .unwrap_or(trimmed.len());
+        format!("{}...", &trimmed[..end])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod log_viewer_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_message_handles_long_text() {
+        let msg = "a".repeat(100);
+        let result = truncate_message(&msg, 50);
+        assert!(result.ends_with("..."));
+        // 50 chars + "..."
+        assert_eq!(result.len(), 53);
+    }
+
+    #[test]
+    fn truncate_message_preserves_short_text() {
+        let msg = "short message";
+        assert_eq!(truncate_message(msg, 50), "short message");
+    }
+
+    #[test]
+    fn truncate_message_normalizes_whitespace() {
+        let msg = "line1\nline2\ttab";
+        assert_eq!(truncate_message(msg, 100), "line1 line2 tab");
+    }
+
+    #[test]
+    fn truncate_message_handles_multibyte() {
+        let msg = "가나다라마바사아자차";
+        let result = truncate_message(msg, 5);
+        assert_eq!(result, "가나다라마...");
+    }
+}

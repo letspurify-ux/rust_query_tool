@@ -1482,6 +1482,10 @@ impl MainWindow {
                 QueryProgress::StatementFinished { index, result, .. } => {
                     let tab_index = s.result_tab_offset + index;
                     if !result.success && !result.message.trim().is_empty() {
+                        crate::utils::logging::log_error(
+                            "query",
+                            &format!("Statement {} failed: {}", index + 1, result.message.trim()),
+                        );
                         let lines: Vec<String> =
                             result.message.lines().map(|l| l.to_string()).collect();
                         s.result_tabs.append_script_output_lines(&lines);
@@ -1630,6 +1634,7 @@ impl MainWindow {
                         .set_label(&format_status(&busy_message, &conn_info));
                     return true;
                 };
+                crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
                 let session = db_conn.session_state();
                 drop(db_conn);
@@ -1920,6 +1925,11 @@ impl MainWindow {
             }
             "Tools/Query History..." => {
                 MainWindow::open_query_history_dialog(state);
+                true
+            }
+            "Tools/Application Log..." => {
+                let popups = state.borrow().popups.clone();
+                crate::ui::log_viewer::LogViewerDialog::show(popups);
                 true
             }
             "Tools/Auto-Commit" => {
@@ -2397,6 +2407,10 @@ impl MainWindow {
                             let mut s = state.borrow_mut();
                             match result {
                                 ConnectionResult::Success(info) => {
+                                    crate::utils::logging::log_info(
+                                        "connection",
+                                        &format!("Connected to {}", info.display_string()),
+                                    );
                                     *s.connection_info.borrow_mut() = Some(info.clone());
                                     s.status_bar.set_label(&format!(
                                         "Connected | {}",
@@ -2441,6 +2455,10 @@ impl MainWindow {
                                     });
                                 }
                                 ConnectionResult::Failure(err) => {
+                                    crate::utils::logging::log_error(
+                                        "connection",
+                                        &format!("Connection failed: {}", err),
+                                    );
                                     s.status_bar.set_label("Connection failed");
                                     s.result_tabs.append_script_output_lines(&[format!(
                                         "Connection failed: {}",
@@ -2695,9 +2713,23 @@ impl MainWindow {
         main_window.setup_callbacks();
         main_window.show();
 
+        // Check for crash log from a previous session
+        if let Some(crash_report) = crate::utils::logging::take_crash_log() {
+            crate::utils::logging::log_warning(
+                "app",
+                "Previous session ended with a crash. Crash report was shown to user.",
+            );
+            let msg = format!(
+                "The previous session ended unexpectedly.\n\n{}\n\nThe crash has been recorded in the application log.",
+                crash_report
+            );
+            fltk::dialog::alert_default(&msg);
+        }
+
         match app.run() {
             Ok(()) => {}
             Err(err) => {
+                crate::utils::logging::log_error("app", &format!("App run error: {err}"));
                 eprintln!("Failed to run app: {err}");
             }
         }
