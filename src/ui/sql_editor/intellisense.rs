@@ -2451,6 +2451,46 @@ mod intellisense_regression_tests {
     }
 
     #[test]
+    fn invoke_void_callback_returns_false_when_slot_is_empty() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+
+        let invoked = SqlEditorWidget::invoke_void_callback(&callback_slot);
+
+        assert!(!invoked);
+        assert!(callback_slot.borrow().is_none());
+    }
+
+    #[test]
+    fn invoke_void_callback_keeps_replaced_callback_when_original_panics() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let replacement_ran = Rc::new(RefCell::new(false));
+        let replacement_ran_for_cb = replacement_ran.clone();
+        let callback_slot_for_cb = callback_slot.clone();
+
+        *callback_slot.borrow_mut() = Some(Box::new(move || {
+            let replacement_ran_for_replacement = replacement_ran_for_cb.clone();
+            *callback_slot_for_cb.borrow_mut() = Some(Box::new(move || {
+                *replacement_ran_for_replacement.borrow_mut() = true;
+            }));
+            panic!("expected panic after replacement");
+        }));
+
+        let first_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_void_callback(&callback_slot)
+        }));
+
+        assert!(first_call.is_err());
+        assert!(callback_slot.borrow().is_some());
+
+        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_void_callback(&callback_slot)
+        }));
+
+        assert!(second_call.is_ok());
+        assert!(*replacement_ran.borrow());
+    }
+
+    #[test]
     fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
         let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
@@ -2501,5 +2541,51 @@ mod intellisense_regression_tests {
         assert!(second_call.is_ok());
         assert!(callback_slot.borrow().is_some());
         assert_eq!(calls.borrow().as_slice(), &[first_path, second_path]);
+    }
+
+    #[test]
+    fn invoke_file_drop_callback_returns_false_when_slot_is_empty() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(RefCell::new(None));
+        let path = PathBuf::from("/tmp/ignored.sql");
+
+        let invoked = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, path);
+
+        assert!(!invoked);
+        assert!(callback_slot.borrow().is_none());
+    }
+
+    #[test]
+    fn invoke_file_drop_callback_keeps_replaced_callback_when_original_panics() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(RefCell::new(None));
+        let captured_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let captured_paths_for_cb = captured_paths.clone();
+        let callback_slot_for_cb = callback_slot.clone();
+
+        *callback_slot.borrow_mut() = Some(Box::new(move |_path: PathBuf| {
+            let captured_paths_for_replacement = captured_paths_for_cb.clone();
+            *callback_slot_for_cb.borrow_mut() = Some(Box::new(move |path: PathBuf| {
+                captured_paths_for_replacement.borrow_mut().push(path);
+            }));
+            panic!("expected panic after replacement");
+        }));
+
+        let first_path = PathBuf::from("/tmp/first-replace.sql");
+        let second_path = PathBuf::from("/tmp/second-replace.sql");
+
+        let first_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path)
+        }));
+
+        assert!(first_call.is_err());
+        assert!(callback_slot.borrow().is_some());
+
+        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone())
+        }));
+
+        assert!(second_call.is_ok());
+        assert_eq!(captured_paths.borrow().as_slice(), &[second_path]);
     }
 }
