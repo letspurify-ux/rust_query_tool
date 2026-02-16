@@ -273,7 +273,10 @@ impl MainWindow {
     }
 
     fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
-        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        let Some(file_name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
             return false;
         };
         let Some(tab_id) = state.find_tab_id_by_file_name(&file_name) else {
@@ -643,7 +646,12 @@ impl MainWindow {
         query_split_bar.set_frame(FrameType::FlatBox);
         query_split_bar.set_color(theme::border());
         query_split_bar.set_tooltip("Drag to resize query and result panes");
-        query_split_bar.resize(tile_x, tile_y + initial_query_height, tile_w, QUERY_SPLIT_BAR_HEIGHT);
+        query_split_bar.resize(
+            tile_x,
+            tile_y + initial_query_height,
+            tile_w,
+            QUERY_SPLIT_BAR_HEIGHT,
+        );
 
         right_tile.end();
 
@@ -659,9 +667,8 @@ impl MainWindow {
                     if app::event_mouse_button() == fltk::app::MouseButton::Left {
                         let split_top = query_split_bar_for_tile.y();
                         let split_bottom = split_top + query_split_bar_for_tile.h();
-                        let near_split =
-                            (app::event_y() >= split_top - SPLIT_GRAB_MARGIN)
-                                && (app::event_y() <= split_bottom + SPLIT_GRAB_MARGIN);
+                        let near_split = (app::event_y() >= split_top - SPLIT_GRAB_MARGIN)
+                            && (app::event_y() <= split_bottom + SPLIT_GRAB_MARGIN);
                         if near_split {
                             split_drag_active_for_tile.set(true);
                             query_split_adjusted_for_tile.set(true);
@@ -936,7 +943,11 @@ impl MainWindow {
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
         if state.query_split_adjusted.get() {
-            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group, &mut query_split_bar);
+            Self::clamp_query_split_with(
+                &mut right_tile,
+                &mut query_top_group,
+                &mut query_split_bar,
+            );
         } else {
             Self::adjust_query_layout_with(
                 &mut right_tile,
@@ -1033,7 +1044,9 @@ impl MainWindow {
 
         let max_query_height =
             (right_height - MIN_RESULTS_HEIGHT - QUERY_SPLIT_BAR_HEIGHT).max(MIN_QUERY_HEIGHT);
-        let desired_query_height = query_top_group.h().clamp(MIN_QUERY_HEIGHT, max_query_height);
+        let desired_query_height = query_top_group
+            .h()
+            .clamp(MIN_QUERY_HEIGHT, max_query_height);
         Self::apply_query_split_layout(
             right_tile,
             query_top_group,
@@ -1108,7 +1121,11 @@ impl MainWindow {
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
         if state.query_split_adjusted.get() {
-            Self::clamp_query_split_with(&mut right_tile, &mut query_top_group, &mut query_split_bar);
+            Self::clamp_query_split_with(
+                &mut right_tile,
+                &mut query_top_group,
+                &mut query_split_bar,
+            );
         } else {
             Self::adjust_query_layout_with(
                 &mut right_tile,
@@ -1172,6 +1189,7 @@ impl MainWindow {
             };
 
             let was_active = s.active_editor_tab_id == tab_id;
+            s.editor_tabs[index].sql_editor.cleanup_for_close();
             if !s.query_tabs.close_tab(tab_id) {
                 return false;
             }
@@ -1459,8 +1477,7 @@ impl MainWindow {
                         || current_status.contains("query is already running");
                     if needs_reset {
                         let conn_info = s.connection_info.borrow().clone();
-                        s.status_bar
-                            .set_label(&format_status("Ready", &conn_info));
+                        s.status_bar.set_label(&format_status("Ready", &conn_info));
                     }
                 }
             }
@@ -1537,7 +1554,8 @@ impl MainWindow {
                     let conn_sender = conn_sender.clone();
                     {
                         let mut s = state.borrow_mut();
-                        s.status_bar.set_label(&format!("Connecting to {}...", info.display_string()));
+                        s.status_bar
+                            .set_label(&format!("Connecting to {}...", info.display_string()));
                     }
                     thread::spawn(move || {
                         let mut db_conn = lock_connection_with_activity(
@@ -1551,7 +1569,9 @@ impl MainWindow {
                                 match session.lock() {
                                     Ok(mut guard) => guard.reset(),
                                     Err(poisoned) => {
-                                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                                        eprintln!(
+                                            "Warning: session state lock was poisoned; recovering."
+                                        );
                                         poisoned.into_inner().reset();
                                     }
                                 }
@@ -1627,18 +1647,14 @@ impl MainWindow {
             }
             "File/Save SQL File..." => {
                 let tab_id = state.borrow().active_editor_tab_id;
-                if let SaveTabOutcome::Failed(err) =
-                    MainWindow::save_tab(state, tab_id, false)
-                {
+                if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, false) {
                     fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
                 }
                 true
             }
             "File/Save SQL File As..." => {
                 let tab_id = state.borrow().active_editor_tab_id;
-                if let SaveTabOutcome::Failed(err) =
-                    MainWindow::save_tab(state, tab_id, true)
-                {
+                if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, true) {
                     fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
                 }
                 true
@@ -1679,10 +1695,8 @@ impl MainWindow {
                             &conn_info,
                         ));
                     } else {
-                        s.status_bar.set_label(&format_status(
-                            "No cells selected to copy",
-                            &conn_info,
-                        ));
+                        s.status_bar
+                            .set_label(&format_status("No cells selected to copy", &conn_info));
                     }
                 } else {
                     s.sql_editor.get_editor().copy();
@@ -1702,10 +1716,8 @@ impl MainWindow {
                 if focus_in_results {
                     s.result_tabs.copy_with_headers();
                     let conn_info = s.connection_info.borrow().clone();
-                    s.status_bar.set_label(&format_status(
-                        "Copied selection with headers",
-                        &conn_info,
-                    ));
+                    s.status_bar
+                        .set_label(&format_status("Copied selection with headers", &conn_info));
                 } else {
                     s.sql_editor.get_editor().copy();
                 }
@@ -1746,11 +1758,7 @@ impl MainWindow {
                 };
                 if let Some(tab_id) = created_tab_id {
                     MainWindow::attach_editor_callbacks(state, tab_id, schema_sender.clone());
-                    MainWindow::attach_file_drop_callback(
-                        state,
-                        tab_id,
-                        file_sender.clone(),
-                    );
+                    MainWindow::attach_file_drop_callback(state, tab_id, file_sender.clone());
                     state.borrow_mut().sql_editor.focus();
                     app::redraw();
                 }
@@ -1813,7 +1821,11 @@ impl MainWindow {
                 let sender = file_sender.clone();
                 thread::spawn(move || {
                     let result = fs::write(&filename, csv).map_err(|err| err.to_string());
-                    let _ = sender.send(FileActionResult::Export { path: filename, row_count, result });
+                    let _ = sender.send(FileActionResult::Export {
+                        path: filename,
+                        row_count,
+                        result,
+                    });
                     app::awake();
                 });
                 true
@@ -1821,7 +1833,11 @@ impl MainWindow {
             "Edit/Find..." => {
                 let (mut editor, mut buffer, popups) = {
                     let s = state.borrow_mut();
-                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                    (
+                        s.sql_editor.get_editor(),
+                        s.sql_buffer.clone(),
+                        s.popups.clone(),
+                    )
                 };
                 FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
                 true
@@ -1829,23 +1845,27 @@ impl MainWindow {
             "Edit/Find Next" => {
                 let (mut editor, mut buffer, popups) = {
                     let s = state.borrow_mut();
-                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                    (
+                        s.sql_editor.get_editor(),
+                        s.sql_buffer.clone(),
+                        s.popups.clone(),
+                    )
                 };
                 if !FindReplaceDialog::find_next_from_session(&mut editor, &mut buffer)
                     && !FindReplaceDialog::has_search_text()
                 {
-                    FindReplaceDialog::show_find_with_registry(
-                        &mut editor,
-                        &mut buffer,
-                        popups,
-                    );
+                    FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
                 }
                 true
             }
             "Edit/Replace..." => {
                 let (mut editor, mut buffer, popups) = {
                     let s = state.borrow_mut();
-                    (s.sql_editor.get_editor(), s.sql_buffer.clone(), s.popups.clone())
+                    (
+                        s.sql_editor.get_editor(),
+                        s.sql_buffer.clone(),
+                        s.popups.clone(),
+                    )
                 };
                 FindReplaceDialog::show_replace_with_registry(&mut editor, &mut buffer, popups);
                 true
@@ -1887,10 +1907,9 @@ impl MainWindow {
                     let s = state.borrow();
                     s.connection.clone()
                 };
-                if let Some(mut connection) = try_lock_connection_with_activity(
-                    &connection,
-                    "Updating auto-commit setting",
-                ) {
+                if let Some(mut connection) =
+                    try_lock_connection_with_activity(&connection, "Updating auto-commit setting")
+                {
                     connection.set_auto_commit(enabled);
                 } else {
                     let busy_message = format_connection_busy_message();
@@ -1960,12 +1979,15 @@ impl MainWindow {
         key: fltk::enums::Key,
         modifiers: fltk::enums::Shortcut,
     ) -> Option<&'static str> {
-        let ctrl_or_cmd =
-            modifiers.contains(fltk::enums::Shortcut::Ctrl) || modifiers.contains(fltk::enums::Shortcut::Command);
+        let ctrl_or_cmd = modifiers.contains(fltk::enums::Shortcut::Ctrl)
+            || modifiers.contains(fltk::enums::Shortcut::Command);
         let shift = modifiers.contains(fltk::enums::Shortcut::Shift);
 
         match key {
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('n') || k == fltk::enums::Key::from_char('N')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('n')
+                    || k == fltk::enums::Key::from_char('N')) =>
+            {
                 Some("File/Connect...")
             }
             k if ctrl_or_cmd
@@ -1974,7 +1996,10 @@ impl MainWindow {
             {
                 Some("File/Disconnect")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('o') || k == fltk::enums::Key::from_char('O')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('o')
+                    || k == fltk::enums::Key::from_char('O')) =>
+            {
                 Some("File/Open SQL File...")
             }
             k if ctrl_or_cmd
@@ -1997,52 +2022,91 @@ impl MainWindow {
             {
                 Some("File/Exit")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('z') || k == fltk::enums::Key::from_char('Z')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('z')
+                    || k == fltk::enums::Key::from_char('Z')) =>
+            {
                 Some("Edit/Undo")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('y') || k == fltk::enums::Key::from_char('Y')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('y')
+                    || k == fltk::enums::Key::from_char('Y')) =>
+            {
                 Some("Edit/Redo")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('x') || k == fltk::enums::Key::from_char('X')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('x')
+                    || k == fltk::enums::Key::from_char('X')) =>
+            {
                 Some("Edit/Cut")
             }
             k if ctrl_or_cmd
                 && shift
-                && (k == fltk::enums::Key::from_char('c') || k == fltk::enums::Key::from_char('C')) =>
+                && (k == fltk::enums::Key::from_char('c')
+                    || k == fltk::enums::Key::from_char('C')) =>
             {
                 Some("Edit/Copy with Headers")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('c') || k == fltk::enums::Key::from_char('C')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('c')
+                    || k == fltk::enums::Key::from_char('C')) =>
+            {
                 Some("Edit/Copy")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('v') || k == fltk::enums::Key::from_char('V')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('v')
+                    || k == fltk::enums::Key::from_char('V')) =>
+            {
                 Some("Edit/Paste")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('a') || k == fltk::enums::Key::from_char('A')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('a')
+                    || k == fltk::enums::Key::from_char('A')) =>
+            {
                 Some("Edit/Select All")
             }
             fltk::enums::Key::F3 => Some("Edit/Find Next"),
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('h') || k == fltk::enums::Key::from_char('H')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('h')
+                    || k == fltk::enums::Key::from_char('H')) =>
+            {
                 Some("Edit/Replace...")
             }
-            k if ctrl_or_cmd && shift
-                && (k == fltk::enums::Key::from_char('f') || k == fltk::enums::Key::from_char('F')) =>
+            k if ctrl_or_cmd
+                && shift
+                && (k == fltk::enums::Key::from_char('f')
+                    || k == fltk::enums::Key::from_char('F')) =>
             {
                 Some("Edit/Format SQL")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('f') || k == fltk::enums::Key::from_char('F')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('f')
+                    || k == fltk::enums::Key::from_char('F')) =>
+            {
                 Some("Edit/Find...")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('/') || k == fltk::enums::Key::from_char('?')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('/')
+                    || k == fltk::enums::Key::from_char('?')) =>
+            {
                 Some("Edit/Toggle Comment")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('u') || k == fltk::enums::Key::from_char('U')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('u')
+                    || k == fltk::enums::Key::from_char('U')) =>
+            {
                 Some("Edit/Uppercase Selection")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('l') || k == fltk::enums::Key::from_char('L')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('l')
+                    || k == fltk::enums::Key::from_char('L')) =>
+            {
                 Some("Edit/Lowercase Selection")
             }
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char(' ') || k == fltk::enums::Key::from_char('\u{0020}')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char(' ')
+                    || k == fltk::enums::Key::from_char('\u{0020}')) =>
+            {
                 Some("Edit/Intellisense")
             }
             k if ctrl_or_cmd
@@ -2058,7 +2122,9 @@ impl MainWindow {
                 Some("Query/Close Tab")
             }
             fltk::enums::Key::F5 => Some("Query/Execute"),
-            k if ctrl_or_cmd && (k == fltk::enums::Key::Enter || k == fltk::enums::Key::KPEnter) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::Enter || k == fltk::enums::Key::KPEnter) =>
+            {
                 Some("Query/Execute Statement")
             }
             fltk::enums::Key::F9 => Some("Query/Execute Statement (F9)"),
@@ -2066,7 +2132,10 @@ impl MainWindow {
             fltk::enums::Key::F6 => Some("Query/Explain Plan"),
             fltk::enums::Key::F7 => Some("Query/Commit"),
             fltk::enums::Key::F8 => Some("Query/Rollback"),
-            k if ctrl_or_cmd && (k == fltk::enums::Key::from_char('e') || k == fltk::enums::Key::from_char('E')) => {
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('e')
+                    || k == fltk::enums::Key::from_char('E')) =>
+            {
                 Some("Tools/Export Results...")
             }
             _ => None,
@@ -2116,8 +2185,7 @@ impl MainWindow {
                 match state_for_status.try_borrow_mut() {
                     Ok(mut s) => {
                         let conn_info = s.connection_info.borrow().clone();
-                        s.status_bar
-                            .set_label(&format_status(message, &conn_info));
+                        s.status_bar.set_label(&format_status(message, &conn_info));
                     }
                     Err(_) => {}
                 };
@@ -2508,7 +2576,10 @@ impl MainWindow {
                 let Some(state_for_menu) = weak_state_for_menu.upgrade() else {
                     return;
                 };
-                let menu_path = m.item_pathname(None).ok().or_else(|| m.choice().map(|p| p.to_string()));
+                let menu_path = m
+                    .item_pathname(None)
+                    .ok()
+                    .or_else(|| m.choice().map(|p| p.to_string()));
                 if let Some(path) = menu_path {
                     let choice = MainWindow::strip_menu_label_shortcut(&path);
                     if MainWindow::execute_menu_action(

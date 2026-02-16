@@ -1210,6 +1210,29 @@ impl SqlEditorWidget {
         *self.file_drop_callback.borrow_mut() = Some(Box::new(callback));
     }
 
+    /// Releases callback/data references so a closing tab can be dropped promptly.
+    pub fn cleanup_for_close(&mut self) {
+        Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+        Self::set_current_query_connection(&self.current_query_connection, None);
+
+        *self.execute_callback.borrow_mut() = None;
+        *self.progress_callback.borrow_mut() = None;
+        *self.status_callback.borrow_mut() = None;
+        *self.find_callback.borrow_mut() = None;
+        *self.replace_callback.borrow_mut() = None;
+        *self.file_drop_callback.borrow_mut() = None;
+
+        self.intellisense_popup.borrow_mut().hide();
+
+        self.buffer.set_text("");
+        self.style_buffer.set_text("");
+        self.completion_range.borrow_mut().take();
+        self.pending_intellisense.borrow_mut().take();
+        self.history_cursor.borrow_mut().take();
+        self.history_original.borrow_mut().take();
+        self.undo_redo_state.borrow_mut().history.clear();
+    }
+
     #[allow(dead_code)]
     pub fn update_highlight_data(&mut self, data: HighlightData) {
         self.highlighter.borrow_mut().set_highlight_data(data);
