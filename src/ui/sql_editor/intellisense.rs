@@ -7,6 +7,7 @@ use fltk::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -39,10 +40,13 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| cb()));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = result {
+                panic::resume_unwind(payload);
             }
             true
         } else {
@@ -60,10 +64,13 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            cb(path);
+            let result = panic::catch_unwind(AssertUnwindSafe(|| cb(path)));
             let mut slot = callback_slot.borrow_mut();
             if slot.is_none() {
                 *slot = Some(cb);
+            }
+            if let Err(payload) = result {
+                panic::resume_unwind(payload);
             }
             true
         } else {
@@ -933,8 +940,7 @@ impl SqlEditorWidget {
                 )
             }
         };
-        let context_alias_suggestions =
-            Self::collect_context_alias_suggestions(&prefix, &deep_ctx);
+        let context_alias_suggestions = Self::collect_context_alias_suggestions(&prefix, &deep_ctx);
         let suggestions = Self::merge_suggestions_with_context_aliases(
             suggestions,
             context_alias_suggestions,
@@ -1063,9 +1069,7 @@ impl SqlEditorWidget {
             }
             if !prefix_upper.is_empty() {
                 let candidate_upper = candidate.to_uppercase();
-                if !candidate_upper.starts_with(&prefix_upper)
-                    || candidate_upper == prefix_upper
-                {
+                if !candidate_upper.starts_with(&prefix_upper) || candidate_upper == prefix_upper {
                     return;
                 }
             }
@@ -1188,9 +1192,7 @@ impl SqlEditorWidget {
                     break;
                 }
                 if attempt + 1 < Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                    thread::sleep(Duration::from_millis(
-                        Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS,
-                    ));
+                    thread::sleep(Duration::from_millis(Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS));
                 }
             }
 
@@ -2398,5 +2400,44 @@ mod intellisense_regression_tests {
         let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, vec![], false);
 
         assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+    }
+
+    #[test]
+    fn invoke_void_callback_restores_slot_even_when_callback_panics() {
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_for_cb = calls.clone();
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> =
+            Rc::new(RefCell::new(Some(Box::new(move || {
+                *calls_for_cb.borrow_mut() += 1;
+                panic!("expected callback panic");
+            }))));
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_void_callback(&callback_slot)
+        }));
+
+        assert!(panic_result.is_err());
+        assert!(callback_slot.borrow().is_some());
+        assert_eq!(*calls.borrow(), 1);
+    }
+
+    #[test]
+    fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
+        let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let calls_for_cb = calls.clone();
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(RefCell::new(Some(Box::new(move |path: PathBuf| {
+                calls_for_cb.borrow_mut().push(path);
+                panic!("expected callback panic");
+            }))));
+
+        let expected_path = PathBuf::from("/tmp/panic.sql");
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone())
+        }));
+
+        assert!(panic_result.is_err());
+        assert!(callback_slot.borrow().is_some());
+        assert_eq!(calls.borrow().as_slice(), &[expected_path]);
     }
 }
