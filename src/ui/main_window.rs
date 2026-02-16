@@ -2092,6 +2092,7 @@ impl MainWindow {
         let (schema_sender, schema_receiver) = std::sync::mpsc::channel::<SchemaUpdate>();
         let (conn_sender, conn_receiver) = std::sync::mpsc::channel::<ConnectionResult>();
         let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
+        let log_receiver = crate::utils::logging::take_ui_receiver();
 
         let tab_ids: Vec<QueryTabId> = state
             .borrow()
@@ -2231,6 +2232,7 @@ impl MainWindow {
             conn_receiver,
             file_sender,
             file_receiver,
+            log_receiver,
         );
     }
 
@@ -2242,6 +2244,7 @@ impl MainWindow {
         conn_receiver: std::sync::mpsc::Receiver<ConnectionResult>,
         file_sender: std::sync::mpsc::Sender<FileActionResult>,
         file_receiver: std::sync::mpsc::Receiver<FileActionResult>,
+        log_receiver: Option<std::sync::mpsc::Receiver<crate::utils::logging::LogEntry>>,
     ) {
         let state = self.state.clone();
 
@@ -2257,6 +2260,7 @@ impl MainWindow {
             schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>>,
             conn_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionResult>>>,
             file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>>,
+            log_receiver: Rc<RefCell<Option<std::sync::mpsc::Receiver<crate::utils::logging::LogEntry>>>>,
             state_weak: Weak<RefCell<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
@@ -2454,6 +2458,51 @@ impl MainWindow {
                 }
             }
 
+            // Drain log entries from the tracing layer into the App Log tab
+            {
+                let receiver = log_receiver.borrow();
+                if let Some(ref rx) = *receiver {
+                    let mut log_lines = Vec::new();
+                    let mut had_error = false;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(entry) => {
+                                let level_tag = match entry.level {
+                                    tracing::Level::ERROR => "ERROR",
+                                    tracing::Level::WARN => "WARN ",
+                                    tracing::Level::INFO => "INFO ",
+                                    tracing::Level::DEBUG => "DEBUG",
+                                    tracing::Level::TRACE => "TRACE",
+                                };
+                                log_lines.push(format!(
+                                    "[{}] {} {} — {}",
+                                    entry.timestamp, level_tag, entry.target, entry.message
+                                ));
+                                if entry.level <= tracing::Level::ERROR {
+                                    had_error = true;
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if !log_lines.is_empty() {
+                        let mut s = state.borrow_mut();
+                        s.result_tabs.append_log_lines(&log_lines);
+                        if had_error {
+                            let conn_info = s.connection_info.borrow().clone();
+                            let current = s.status_bar.label();
+                            if !current.contains("[!]") {
+                                s.status_bar.set_label(&format_status(
+                                    &format!("[!] Error logged — see App Log tab | {}", current),
+                                    &conn_info,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Stop polling if all channels are disconnected
             if schema_disconnected && conn_disconnected && file_disconnected {
                 return;
@@ -2465,6 +2514,7 @@ impl MainWindow {
                     Rc::clone(&schema_receiver),
                     Rc::clone(&conn_receiver),
                     Rc::clone(&file_receiver),
+                    Rc::clone(&log_receiver),
                     state_weak.clone(),
                     schema_sender.clone(),
                     file_sender.clone(),
@@ -2475,6 +2525,7 @@ impl MainWindow {
         // Start polling
         let weak_state_for_poll = Rc::downgrade(&state);
         let schema_sender_for_poll = schema_sender.clone();
+        let log_receiver_rc = Rc::new(RefCell::new(log_receiver));
         {
             let mut s = state.borrow_mut();
             s.schema_sender = Some(schema_sender.clone());
@@ -2484,6 +2535,7 @@ impl MainWindow {
             schema_receiver,
             conn_receiver,
             file_receiver,
+            log_receiver_rc,
             weak_state_for_poll,
             schema_sender_for_poll,
             file_sender.clone(),

@@ -19,6 +19,7 @@ pub struct ResultTabsWidget {
     data: Rc<RefCell<Vec<ResultTab>>>,
     active_index: Rc<RefCell<Option<usize>>>,
     script_output: Rc<RefCell<ScriptOutputTab>>,
+    app_log: Rc<RefCell<ScriptOutputTab>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
     max_cell_display_chars: Rc<Cell<usize>>,
@@ -157,14 +158,43 @@ impl ResultTabsWidget {
             buffer: script_buffer,
         }));
 
+        // Create "App Log" tab for displaying tracing log entries in the UI
+        tabs.begin();
+        let (x, y, w, h) = Self::content_bounds(&tabs);
+        let mut log_group = Group::new(x, y, w, h, None).with_label("App Log");
+        log_group.set_color(theme::panel_bg());
+        log_group.set_label_color(theme::text_secondary());
+        log_group.set_align(Align::Center | Align::Inside);
+        log_group.begin();
+        let mut log_display =
+            TextDisplay::new(display_x, display_y, display_w, display_h, None);
+        log_display.set_color(theme::panel_bg());
+        log_display.set_text_color(theme::text_primary());
+        log_display.set_text_font(font_profile.get().normal);
+        log_display.set_text_size(font_size.get() as i32);
+        let mut log_buffer = TextBuffer::default();
+        log_buffer.set_text("");
+        log_display.set_buffer(log_buffer.clone());
+        log_group.resizable(&log_display);
+        log_group.end();
+        tabs.end();
+
+        let app_log = Rc::new(RefCell::new(ScriptOutputTab {
+            group: log_group,
+            display: log_display,
+            buffer: log_buffer,
+        }));
+
         let data_for_cb = data.clone();
         let active_for_cb = active_index.clone();
         let script_for_cb = script_output.clone();
+        let log_for_cb = app_log.clone();
         tabs.set_callback(move |t| {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
                 let script_ptr = script_for_cb.borrow().group.as_widget_ptr();
-                if ptr == script_ptr {
+                let log_ptr = log_for_cb.borrow().group.as_widget_ptr();
+                if ptr == script_ptr || ptr == log_ptr {
                     *active_for_cb.borrow_mut() = None;
                     return;
                 }
@@ -215,6 +245,7 @@ impl ResultTabsWidget {
             data,
             active_index,
             script_output,
+            app_log,
             font_profile,
             font_size,
             max_cell_display_chars,
@@ -234,10 +265,39 @@ impl ResultTabsWidget {
             script_output.display.set_text_size(size as i32);
             script_output.display.redraw();
         }
+        {
+            let mut app_log = self.app_log.borrow_mut();
+            app_log.display.set_text_font(profile.normal);
+            app_log.display.set_text_size(size as i32);
+            app_log.display.redraw();
+        }
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
         self.max_cell_display_chars.set(max_chars);
+    }
+
+    /// Append formatted log entries to the App Log tab.
+    pub fn append_log_lines(&mut self, lines: &[String]) {
+        let mut app_log = self.app_log.borrow_mut();
+        let mut buffer = app_log.buffer.clone();
+        if lines.is_empty() {
+            return;
+        }
+        for line in lines {
+            buffer.append(line);
+            buffer.append("\n");
+        }
+        Self::trim_script_output_buffer(&mut buffer);
+        let line_count = app_log.display.count_lines(0, buffer.length(), true);
+        app_log.display.scroll(line_count, 0);
+    }
+
+    /// Switch the active tab to the App Log tab.
+    pub fn select_app_log(&mut self) {
+        let log_group = self.app_log.borrow().group.clone();
+        let _ = self.tabs.set_value(&log_group);
+        *self.active_index.borrow_mut() = None;
     }
 
     pub fn clear(&mut self) {
