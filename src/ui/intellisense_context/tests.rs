@@ -583,6 +583,29 @@ fn semicolon_resets_state() {
     assert!(!names.contains(&"DUAL".to_string()));
 }
 
+#[test]
+fn trailing_semicolon_preserves_current_statement_table_aliases() {
+    let ctx = analyze("SELECT e.| FROM employees e;");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
+
+    let result = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(result, vec!["employees"]);
+}
+
+#[test]
+fn trailing_semicolon_preserves_cte_alias_resolution() {
+    let ctx = analyze(
+        "WITH base AS (SELECT empno FROM emp), filtered AS (SELECT * FROM base) SELECT f.| FROM filtered f;",
+    );
+    let result = resolve_qualifier_tables("f", &ctx.tables_in_scope);
+    assert_eq!(result, vec!["filtered"]);
+}
+
 // ─── UPDATE statement tests ──────────────────────────────────────────────
 
 #[test]

@@ -47,6 +47,8 @@ struct QueryEditorTab {
     sql_editor: SqlEditorWidget,
     sql_buffer: TextBuffer,
     current_file: Option<PathBuf>,
+    pristine_text: String,
+    current_text_len: usize,
     is_dirty: bool,
 }
 
@@ -160,6 +162,45 @@ impl AppState {
         if self.active_editor_tab_id == tab_id {
             self.refresh_window_title();
         }
+    }
+
+    fn set_tab_pristine_text(&mut self, tab_id: QueryTabId, text: String) {
+        let Some(index) = self.find_tab_index(tab_id) else {
+            return;
+        };
+        self.editor_tabs[index].current_text_len = text.len();
+        self.editor_tabs[index].pristine_text = text;
+        self.set_tab_dirty(tab_id, false);
+    }
+
+    fn refresh_tab_dirty_from_text(&mut self, tab_id: QueryTabId, current_text: &str) {
+        let Some(index) = self.find_tab_index(tab_id) else {
+            return;
+        };
+        let is_dirty = self.editor_tabs[index].pristine_text != current_text;
+        self.set_tab_dirty(tab_id, is_dirty);
+    }
+
+    fn on_tab_buffer_modified(&mut self, tab_id: QueryTabId, ins: i32, del: i32, buf: &TextBuffer) {
+        let Some(index) = self.find_tab_index(tab_id) else {
+            return;
+        };
+
+        let inserted = ins.max(0) as usize;
+        let deleted = del.max(0) as usize;
+        let tab = &mut self.editor_tabs[index];
+        tab.current_text_len = tab
+            .current_text_len
+            .saturating_add(inserted)
+            .saturating_sub(deleted);
+
+        if tab.current_text_len != tab.pristine_text.len() {
+            self.set_tab_dirty(tab_id, true);
+            return;
+        }
+
+        let current_text = buf.text();
+        self.refresh_tab_dirty_from_text(tab_id, &current_text);
     }
 
     fn set_tab_file_path(&mut self, tab_id: QueryTabId, path: Option<PathBuf>) {
@@ -343,13 +384,13 @@ impl MainWindow {
             return SaveTabOutcome::Cancelled;
         };
 
-        if let Err(err) = fs::write(&path, sql_text) {
+        if let Err(err) = fs::write(&path, &sql_text) {
             return SaveTabOutcome::Failed(err.to_string());
         }
 
         let mut s = state.borrow_mut();
         s.set_tab_file_path(tab_id, Some(path.clone()));
-        s.set_tab_dirty(tab_id, false);
+        s.set_tab_pristine_text(tab_id, sql_text);
         let file_label = path.file_name().unwrap_or_default().to_string_lossy();
         let conn_info = s.connection_info.borrow().clone();
         s.status_bar
@@ -774,6 +815,8 @@ impl MainWindow {
             sql_editor: first_editor,
             sql_buffer: sql_buffer.clone(),
             current_file: None,
+            pristine_text: String::new(),
+            current_text_len: 0,
             is_dirty: false,
         }];
 
@@ -1187,6 +1230,8 @@ impl MainWindow {
             sql_editor: editor.clone(),
             sql_buffer: buffer.clone(),
             current_file: None,
+            pristine_text: String::new(),
+            current_text_len: 0,
             is_dirty: false,
         });
         state.query_tabs.select(tab_id);
@@ -1572,12 +1617,12 @@ impl MainWindow {
         let weak_state_for_dirty = Rc::downgrade(state);
         let mut buffer_for_dirty = editor.get_buffer();
         buffer_for_dirty.add_modify_callback2(
-            move |_buf, _pos, _ins, _del, _restyled, _deleted| {
+            move |buf, _pos, ins, del, _restyled, _deleted| {
                 let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                     return;
                 };
                 match state_for_dirty.try_borrow_mut() {
-                    Ok(mut s) => s.set_tab_dirty(tab_id, true),
+                    Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
                     Err(_) => {}
                 };
             },
@@ -2329,7 +2374,7 @@ impl MainWindow {
                             s.sql_buffer.set_text(&sql);
                             s.sql_editor.reset_undo_redo_history();
                             s.set_tab_file_path(tab_id, None);
-                            s.set_tab_dirty(tab_id, false);
+                            s.set_tab_pristine_text(tab_id, sql);
                             s.sql_editor.refresh_highlighting();
                             s.sql_editor.focus();
                             s.right_tile.redraw();
@@ -2598,7 +2643,7 @@ impl MainWindow {
                                                 s.sql_buffer.set_text(&content);
                                                 s.sql_editor.reset_undo_redo_history();
                                                 s.set_tab_file_path(tab_id, Some(path.clone()));
-                                                s.set_tab_dirty(tab_id, false);
+                                                s.set_tab_pristine_text(tab_id, content);
                                                 s.sql_editor.refresh_highlighting();
                                                 s.sql_editor.focus();
                                                 s.right_tile.redraw();

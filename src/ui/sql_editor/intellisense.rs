@@ -106,7 +106,9 @@ impl SqlEditorWidget {
             popup.set_selected_callback(move |selected| {
                 let cursor_pos = editor_for_insert.insert_position().max(0);
                 let cursor_pos_usize = cursor_pos as usize;
-                let context_text = Self::context_before_cursor(&buffer_for_insert, cursor_pos);
+                let context_text = Self::normalize_intellisense_context_text(
+                    &Self::context_before_cursor(&buffer_for_insert, cursor_pos),
+                );
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
                     let should_prefetch = {
@@ -559,7 +561,9 @@ impl SqlEditorWidget {
 
                     // Handle typing - update intellisense filter
                     let (word, _, _) = Self::word_at_cursor(&buffer_for_handle, cursor_pos);
-                    let context_text = Self::context_before_cursor(&buffer_for_handle, cursor_pos);
+                    let context_text = Self::normalize_intellisense_context_text(
+                        &Self::context_before_cursor(&buffer_for_handle, cursor_pos),
+                    );
                     let context = detect_sql_context(&context_text, context_text.len());
 
                     if key == Key::BackSpace || key == Key::Delete {
@@ -798,8 +802,10 @@ impl SqlEditorWidget {
         let prefix = word;
 
         // Use deep context analyzer for accurate depth-aware analysis
-        let context_text = Self::context_before_cursor(buffer, cursor_pos);
-        let statement_text = Self::statement_context(buffer, cursor_pos);
+        let context_text =
+            Self::normalize_intellisense_context_text(&Self::context_before_cursor(buffer, cursor_pos));
+        let statement_text =
+            Self::normalize_intellisense_context_text(&Self::statement_context(buffer, cursor_pos));
 
         let before_tokens = Self::tokenize_sql(&context_text);
         let full_text = if statement_text.is_empty() {
@@ -1579,6 +1585,78 @@ impl SqlEditorWidget {
         text.get(stmt_start..stmt_end).unwrap_or("").to_string()
     }
 
+    fn normalize_intellisense_context_text(text: &str) -> String {
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let rest = &text[offset..];
+            let line_len = rest
+                .find('\n')
+                .map(|idx| idx + 1)
+                .unwrap_or_else(|| rest.len());
+            let line = &rest[..line_len];
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() || trimmed.starts_with("--") {
+                offset += line_len;
+                continue;
+            }
+
+            if Self::is_sqlplus_command_line(trimmed) {
+                offset += line_len;
+                continue;
+            }
+
+            break;
+        }
+        text.get(offset..).unwrap_or("").to_string()
+    }
+
+    fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
+        if trimmed_line == "/" {
+            return true;
+        }
+        if trimmed_line.starts_with("@@") || trimmed_line.starts_with('@') {
+            return true;
+        }
+
+        let mut parts = trimmed_line.split_whitespace();
+        let Some(first) = parts.next() else {
+            return false;
+        };
+
+        let upper = first.to_uppercase();
+        matches!(
+            upper.as_str(),
+            "PROMPT"
+                | "SET"
+                | "SHOW"
+                | "DEFINE"
+                | "UNDEFINE"
+                | "VAR"
+                | "VARIABLE"
+                | "PRINT"
+                | "ACCEPT"
+                | "PAUSE"
+                | "SPOOL"
+                | "COLUMN"
+                | "COL"
+                | "BREAK"
+                | "COMPUTE"
+                | "CLEAR"
+                | "TTITLE"
+                | "BTITLE"
+                | "WHENEVER"
+                | "EXIT"
+                | "QUIT"
+                | "CONNECT"
+                | "CONN"
+                | "DISCONNECT"
+                | "HOST"
+                | "REM"
+                | "REMARK"
+        )
+    }
+
     fn statement_bounds_in_text(text: &str, cursor_pos: usize) -> (usize, usize) {
         #[derive(Default)]
         struct StatementScanState {
@@ -2196,6 +2274,80 @@ mod intellisense_regression_tests {
     }
 
     #[test]
+    fn normalize_intellisense_context_text_skips_leading_prompt_lines() {
+        let input = "PROMPT [3] WITH basic + note\n-- separator\nWITH cte AS (SELECT 1 FROM dual)\nSELECT * FROM cte";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert!(normalized.starts_with("WITH cte AS"));
+        assert!(!normalized.starts_with("PROMPT"));
+    }
+
+    #[test]
+    fn prompt_line_before_with_does_not_break_cte_qualified_column_resolution() {
+        let sql_with_cursor = r#"
+PROMPT [3] WITH basic + multiple CTE + join + scalar subquery + nested expressions
+WITH
+  d AS (
+    SELECT deptno, dname, loc
+    FROM oqt_t_dept
+  )
+SELECT d.|, d.loc
+FROM d
+"#;
+
+        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let context_text = SqlEditorWidget::normalize_intellisense_context_text(
+            sql.get(..cursor).unwrap_or(""),
+        );
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+        let statement_text = SqlEditorWidget::normalize_intellisense_context_text(
+            sql.get(stmt_start..stmt_end).unwrap_or(""),
+        );
+
+        let before_tokens = SqlEditorWidget::tokenize_sql(&context_text);
+        let full_tokens = SqlEditorWidget::tokenize_sql(&statement_text);
+        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        assert!(
+            deep_ctx.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case("d")),
+            "expected CTE d in parsed context: {:?}",
+            deep_ctx
+                .ctes
+                .iter()
+                .map(|cte| cte.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("d", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["d".to_string()]);
+
+        let mut data = IntellisenseData::new();
+        for cte in &deep_ctx.ctes {
+            let mut columns = if !cte.explicit_columns.is_empty() {
+                cte.explicit_columns.clone()
+            } else if !cte.body_tokens.is_empty() {
+                intellisense_context::extract_select_list_columns(&cte.body_tokens)
+            } else {
+                Vec::new()
+            };
+            SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
+            if !columns.is_empty() {
+                data.set_virtual_table_columns(&cte.name, columns);
+            }
+        }
+
+        let suggestions = data.get_column_suggestions("", Some(&column_tables));
+        assert!(
+            suggestions.iter().any(|col| col.eq_ignore_ascii_case("DNAME")),
+            "expected DNAME suggestion for d.* scope, got: {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
     fn parse_dropped_file_token_decodes_utf8_percent_sequences() {
         let token = "file:///tmp/%ED%95%9C%EA%B8%80.sql";
         let parsed = SqlEditorWidget::parse_dropped_file_token(token);
@@ -2417,6 +2569,118 @@ mod intellisense_regression_tests {
         let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, vec![], false);
 
         assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+    }
+
+    #[test]
+    fn cte_chain_qualified_column_suggestions_include_wildcard_expansion() {
+        let sql_with_cursor = r#"
+WITH
+  base AS (
+    SELECT e.empno, e.ename, e.job, e.deptno, e.sal,
+           REGEXP_REPLACE(e.ename, '[AEIOU]', '*') AS masked_name
+    FROM oqt_t_emp e
+  ),
+  enriched AS (
+    SELECT
+      b.*,
+      (SELECT d.dname FROM oqt_t_dept d WHERE d.deptno = b.deptno) AS dname,
+      NTILE(3) OVER (PARTITION BY b.deptno ORDER BY b.sal DESC) AS sal_band
+    FROM base b
+  ),
+  filtered AS (
+    SELECT *
+    FROM enriched
+    WHERE (sal > (SELECT AVG(sal) FROM oqt_t_emp WHERE deptno = enriched.deptno))
+       OR (job IN ('MANAGER','ANALYST') AND sal >= 2500)
+  )
+SELECT
+  f.|,
+  f.dname,
+  f.empno,
+  f.ename,
+  f.masked_name,
+  f.job,
+  f.sal,
+  f.sal_band,
+  -- window frame with last_value (needs careful frame)
+  LAST_VALUE(f.sal) OVER (
+    PARTITION BY f.deptno
+    ORDER BY f.sal
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS max_sal_via_last_value
+FROM filtered f
+ORDER BY f.deptno, f.sal DESC, f.empno;
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+        let before = &sql[..cursor];
+
+        let before_tokens = SqlEditorWidget::tokenize_sql(before);
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+        let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+        let full_tokens = SqlEditorWidget::tokenize_sql(statement_text);
+        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("f", &deep_ctx.tables_in_scope);
+        assert_eq!(
+            column_tables,
+            vec!["filtered".to_string()],
+            "qualifier should resolve to filtered CTE alias"
+        );
+
+        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+
+        for cte in &deep_ctx.ctes {
+            let mut columns = if !cte.explicit_columns.is_empty() {
+                cte.explicit_columns.clone()
+            } else if !cte.body_tokens.is_empty() {
+                intellisense_context::extract_select_list_columns(&cte.body_tokens)
+            } else {
+                Vec::new()
+            };
+            if cte.explicit_columns.is_empty() && !cte.body_tokens.is_empty() {
+                let (wildcard_columns, _wildcard_tables) =
+                    SqlEditorWidget::expand_virtual_table_wildcards(
+                        &cte.body_tokens,
+                        &data,
+                        &sender,
+                        &connection,
+                    );
+                columns.extend(wildcard_columns);
+            }
+            SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
+            if !columns.is_empty() {
+                data.borrow_mut()
+                    .set_virtual_table_columns(&cte.name, columns);
+            }
+        }
+
+        let mut guard = data.borrow_mut();
+        let suggestions = guard.get_column_suggestions("", Some(&column_tables));
+
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("EMPNO")),
+            "expected EMPNO in suggestions: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("DNAME")),
+            "expected DNAME in suggestions: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("SAL_BAND")),
+            "expected SAL_BAND in suggestions: {:?}",
+            suggestions
+        );
     }
 
     #[test]

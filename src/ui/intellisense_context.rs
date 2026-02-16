@@ -602,7 +602,15 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                 continue;
             }
             SqlToken::Symbol(sym) if sym == ";" => {
-                // Statement boundary - reset everything
+                // Statement boundary - reset only when another statement follows.
+                // Keep collected state for trailing terminators in the final statement.
+                let has_following_statement = tokens[idx + 1..]
+                    .iter()
+                    .any(|t| !matches!(t, SqlToken::Comment(_)));
+                if !has_following_statement {
+                    break;
+                }
+
                 all_tables.clear();
                 all_subqueries.clear();
                 depth = 0;
