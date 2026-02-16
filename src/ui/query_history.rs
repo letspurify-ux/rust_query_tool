@@ -22,6 +22,7 @@ use crate::utils::config::{QueryHistory, QueryHistoryEntry};
 enum HistoryCommand {
     Add(QueryHistoryEntry),
     Clear,
+    Snapshot(mpsc::Sender<Vec<QueryHistoryEntry>>),
 }
 
 fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
@@ -31,20 +32,41 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
         thread::spawn(move || {
             let mut history = QueryHistory::load();
             while let Ok(cmd) = receiver.recv() {
+                let mut needs_save = false;
                 match cmd {
-                    HistoryCommand::Add(entry) => history.add_entry(entry),
-                    HistoryCommand::Clear => history.queries.clear(),
+                    HistoryCommand::Add(entry) => {
+                        history.add_entry(entry);
+                        needs_save = true;
+                    }
+                    HistoryCommand::Clear => {
+                        history.queries.clear();
+                        needs_save = true;
+                    }
+                    HistoryCommand::Snapshot(reply) => {
+                        let _ = reply.send(history.queries.clone());
+                    }
                 }
                 // Drain any pending commands before saving
                 while let Ok(next) = receiver.try_recv() {
                     match next {
-                        HistoryCommand::Add(entry) => history.add_entry(entry),
-                        HistoryCommand::Clear => history.queries.clear(),
+                        HistoryCommand::Add(entry) => {
+                            history.add_entry(entry);
+                            needs_save = true;
+                        }
+                        HistoryCommand::Clear => {
+                            history.queries.clear();
+                            needs_save = true;
+                        }
+                        HistoryCommand::Snapshot(reply) => {
+                            let _ = reply.send(history.queries.clone());
+                        }
                     }
                 }
-                if let Err(err) = history.save() {
-                    crate::utils::logging::log_error("history", &format!("Query history save error: {err}"));
-                    eprintln!("Query history save error: {err}");
+                if needs_save {
+                    if let Err(err) = history.save() {
+                        crate::utils::logging::log_error("history", &format!("Query history save error: {err}"));
+                        eprintln!("Query history save error: {err}");
+                    }
                 }
             }
         });
@@ -110,6 +132,22 @@ fn preview_style_table() -> Vec<StyleTableEntry> {
     ]
 }
 
+/// Retrieve a snapshot of the current history from the background writer thread,
+/// avoiding a redundant disk read + parse.  Falls back to disk if the writer
+/// thread is unreachable.
+fn load_snapshot() -> Vec<QueryHistoryEntry> {
+    let (tx, rx) = mpsc::channel();
+    if history_writer_sender()
+        .send(HistoryCommand::Snapshot(tx))
+        .is_ok()
+    {
+        rx.recv().unwrap_or_default()
+    } else {
+        // Writer thread dead – fall back to disk
+        QueryHistory::load().queries
+    }
+}
+
 /// Query history dialog for viewing and re-executing past queries
 pub struct QueryHistoryDialog;
 
@@ -122,7 +160,7 @@ impl QueryHistoryDialog {
             Close,
         }
 
-        let history = QueryHistory::load();
+        let snapshot = load_snapshot();
 
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
@@ -158,7 +196,7 @@ impl QueryHistoryDialog {
         browser.set_selection_color(theme::selection_strong());
 
         // Populate browser with history entries
-        for entry in history.queries.iter() {
+        for entry in snapshot.iter() {
             let color_prefix = if entry.success { "@C255 " } else { "@C1 " };
             let display = format!(
                 "{color_prefix}{} | {} | {}ms | {} rows",
@@ -257,7 +295,7 @@ impl QueryHistoryDialog {
         popups.borrow_mut().push(dialog.clone());
         // State for selected query
         let selected_sql: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let queries: Rc<RefCell<Vec<QueryHistoryEntry>>> = Rc::new(RefCell::new(history.queries));
+        let queries: Rc<RefCell<Vec<QueryHistoryEntry>>> = Rc::new(RefCell::new(snapshot));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
