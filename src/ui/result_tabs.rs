@@ -424,11 +424,11 @@ impl ResultTabsWidget {
         // Step 1: Cleanup the table widget (clears callbacks and data buffers)
         tab.table.cleanup();
 
-        // Step 2 & 3: Get the Table widget and remove from group, then delete
-        let table_widget = tab.table.get_widget();
+        // Step 2 & 3: Clear and delete all tab children. This is intentionally
+        // group-wide (instead of deleting only the table) so newly added tab
+        // child widgets are also released when a result tab is closed.
         let mut group = tab.group;
-        group.remove(&table_widget);
-        fltk::table::Table::delete(table_widget);
+        group.clear();
 
         // Step 4: Remove group from tabs and delete
         if self.tabs.find(&group) >= 0 {
