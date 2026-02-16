@@ -215,7 +215,7 @@ pub struct QueryHistory {
     pub queries: Vec<QueryHistoryEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueryHistoryEntry {
     pub sql: String,
     pub timestamp: String,
@@ -290,29 +290,38 @@ impl QueryHistory {
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = Self::history_path() {
             if let Some(parent) = path.parent() {
-                match fs::create_dir_all(parent) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
-                        eprintln!("History persistence error: {err}");
-                        return Err(Box::new(err));
-                    }
-                }
-            }
-            let file = match fs::File::create(&path) {
-                Ok(f) => f,
-                Err(err) => {
+                fs::create_dir_all(parent).map_err(|err| {
                     crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
                     eprintln!("History persistence error: {err}");
-                    return Err(Box::new(err));
-                }
-            };
-            let writer = BufWriter::new(file);
-            if let Err(err) = serde_json::to_writer(writer, self) {
+                    err
+                })?;
+            }
+            // Atomic write: write to temp file first, then rename to avoid
+            // data loss if the process crashes mid-write.
+            let tmp_path = path.with_extension("json.tmp");
+            let file = fs::File::create(&tmp_path).map_err(|err| {
                 crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
                 eprintln!("History persistence error: {err}");
-                return Err(Box::new(err));
-            }
+                err
+            })?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self).map_err(|err| {
+                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                eprintln!("History persistence error: {err}");
+                err
+            })?;
+            // Explicit flush so buffered bytes reach disk before rename.
+            use std::io::Write;
+            writer.flush().map_err(|err| {
+                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                eprintln!("History persistence error: {err}");
+                err
+            })?;
+            fs::rename(&tmp_path, &path).map_err(|err| {
+                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                eprintln!("History persistence error: {err}");
+                err
+            })?;
         }
         Ok(())
     }
