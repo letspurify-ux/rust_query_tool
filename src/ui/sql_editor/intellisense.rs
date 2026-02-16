@@ -697,6 +697,16 @@ impl SqlEditorWidget {
 
     fn parse_dropped_file_token(token: &str) -> Option<PathBuf> {
         let cleaned = token.trim_matches('\0').trim();
+        let cleaned = cleaned
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                cleaned
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(cleaned)
+            .trim();
         if cleaned.is_empty() {
             return None;
         }
@@ -2201,6 +2211,17 @@ mod intellisense_regression_tests {
         let token = "FiLe://LOCALHOST/tmp/My%20File.sql";
         let parsed = SqlEditorWidget::parse_dropped_file_token(token);
         assert_eq!(parsed, Some(PathBuf::from("/tmp/My File.sql")));
+    }
+
+    #[test]
+    fn parse_dropped_file_token_strips_wrapping_quotes() {
+        let token = "\"file:///tmp/Quoted%20Name.sql\"";
+        let parsed = SqlEditorWidget::parse_dropped_file_token(token);
+        assert_eq!(parsed, Some(PathBuf::from("/tmp/Quoted Name.sql")));
+
+        let single_quoted = "'file:///tmp/Single%20Quoted.sql'";
+        let parsed = SqlEditorWidget::parse_dropped_file_token(single_quoted);
+        assert_eq!(parsed, Some(PathBuf::from("/tmp/Single Quoted.sql")));
     }
 
     #[test]
