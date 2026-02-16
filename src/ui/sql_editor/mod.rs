@@ -1234,7 +1234,17 @@ impl SqlEditorWidget {
         self.pending_intellisense.borrow_mut().take();
         self.history_cursor.borrow_mut().take();
         self.history_original.borrow_mut().take();
-        self.undo_redo_state.borrow_mut().history.clear();
+        Self::reset_word_undo_state(&self.undo_redo_state);
+    }
+
+    fn reset_word_undo_state(undo_redo_state: &Rc<RefCell<WordUndoRedoState>>) {
+        let mut state = undo_redo_state.borrow_mut();
+        let mut fresh_history = Vec::with_capacity(1);
+        fresh_history.push(String::new());
+        state.history = fresh_history;
+        state.index = 0;
+        state.active_group = None;
+        state.applying_history = false;
     }
 
     #[allow(dead_code)]
@@ -1665,7 +1675,7 @@ fn is_string_or_comment_style(style: char) -> bool {
 
 #[cfg(test)]
 mod execution_state_tests {
-    use super::SqlEditorWidget;
+    use super::{SqlEditorWidget, WordUndoRedoState};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1682,6 +1692,23 @@ mod execution_state_tests {
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 
+    #[test]
+    fn reset_word_undo_state_reinitializes_history_safely() {
+        let undo_state = Rc::new(RefCell::new(WordUndoRedoState {
+            history: vec!["SELECT 1".to_string(), "SELECT 2".to_string()],
+            index: 1,
+            active_group: None,
+            applying_history: true,
+        }));
+
+        SqlEditorWidget::reset_word_undo_state(&undo_state);
+
+        let state = undo_state.borrow();
+        assert_eq!(state.history, vec![String::new()]);
+        assert_eq!(state.index, 0);
+        assert!(state.active_group.is_none());
+        assert!(!state.applying_history);
+    }
     #[test]
     fn finalize_execution_state_is_idempotent_when_already_reset() {
         let query_running = Rc::new(RefCell::new(false));
