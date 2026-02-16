@@ -3036,22 +3036,24 @@ impl SqlEditorWidget {
 
         // Pre-check connection status without holding lock for long
         {
-            let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
+            let Some(mut conn_guard) = crate::db::try_lock_connection(&self.connection) else {
                 let busy_message = crate::db::format_connection_busy_message();
                 self.emit_status(&busy_message);
                 return;
             };
 
             // Only check connection status if this is not a CONNECT/DISCONNECT command
-            if !has_connect_command && !conn_guard.is_connected() {
-                fltk::dialog::alert_default("Not connected to database");
-                return;
-            }
+            if !has_connect_command {
+                if !conn_guard.ensure_connection_alive() {
+                    fltk::dialog::alert_default("Not connected to database");
+                    return;
+                }
 
-            // For normal commands (not CONNECT/DISCONNECT), we need a connection
-            if !has_connect_command && conn_guard.get_connection().is_none() {
-                fltk::dialog::alert_default("Not connected to database");
-                return;
+                // For normal commands (not CONNECT/DISCONNECT), we need a connection
+                if conn_guard.get_connection().is_none() {
+                    fltk::dialog::alert_default("Not connected to database");
+                    return;
+                }
             }
         } // Release lock early for the pre-check
 
@@ -3090,12 +3092,35 @@ impl SqlEditorWidget {
                 let mut conn_guard =
                     lock_connection_with_activity(&shared_connection, db_activity.clone());
 
-                let mut conn_opt = conn_guard.get_connection();
                 let mut conn_name = if conn_guard.is_connected() {
                     conn_guard.get_info().name.clone()
                 } else {
                     String::new()
                 };
+
+                if !has_connect_command && !conn_guard.ensure_connection_alive() {
+                    let message = "Not connected to database".to_string();
+                    if script_mode {
+                        let result = QueryResult::new_error(&sql_text, &message);
+                        SqlEditorWidget::emit_script_result(&sender, &conn_name, 0, result, false);
+                    } else {
+                        let _ = sender.send(QueryProgress::StatementFinished {
+                            index: 0,
+                            result: QueryResult::new_error(&sql_text, &message),
+                            connection_name: conn_name.clone(),
+                            timed_out: false,
+                        });
+                        app::awake();
+                    }
+                    return;
+                }
+
+                let mut conn_opt = conn_guard.get_connection();
+                if conn_guard.is_connected() {
+                    conn_name = conn_guard.get_info().name.clone();
+                } else {
+                    conn_name.clear();
+                }
                 let auto_commit = conn_guard.auto_commit();
                 let session = conn_guard.session_state();
 
