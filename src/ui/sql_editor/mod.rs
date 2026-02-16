@@ -511,7 +511,10 @@ impl SqlEditorWidget {
                             }
                             QueryProgress::BatchFinished => {
                                 flush_rows(&mut pending_rows, cancelled);
-                                *query_running.borrow_mut() = false;
+                                SqlEditorWidget::finalize_execution_state(
+                                    &query_running,
+                                    &cancel_flag,
+                                );
                                 set_cursor(Cursor::Default);
                                 app::flush();
                             }
@@ -534,8 +537,7 @@ impl SqlEditorWidget {
                 // Fail-safe cleanup: if the worker thread exits unexpectedly and the
                 // channel closes before BatchFinished arrives, make sure execution
                 // state/cursor do not stay stuck as "running".
-                *query_running.borrow_mut() = false;
-                cancel_flag.store(false, Ordering::SeqCst);
+                SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
                 set_cursor(Cursor::Default);
                 app::flush();
                 return;
@@ -567,6 +569,11 @@ impl SqlEditorWidget {
             execute_callback,
             cancel_flag,
         );
+    }
+
+    fn finalize_execution_state(query_running: &Rc<RefCell<bool>>, cancel_flag: &Arc<AtomicBool>) {
+        *query_running.borrow_mut() = false;
+        cancel_flag.store(false, Ordering::SeqCst);
     }
 
     fn setup_column_loader(&self, column_receiver: mpsc::Receiver<ColumnLoadUpdate>) {
