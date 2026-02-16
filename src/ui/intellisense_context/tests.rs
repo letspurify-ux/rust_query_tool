@@ -1215,3 +1215,79 @@ fn malformed_subquery_parentheses_do_not_panic() {
     let names = table_names(&ctx);
     assert!(names.contains(&"BROKEN_ALIAS".to_string()));
 }
+
+// ─── EXTRACT / TRIM function-internal FROM ───────────────────────────────
+
+#[test]
+fn extract_from_does_not_trigger_from_clause() {
+    // EXTRACT(YEAR FROM ...) uses FROM as function syntax, not as a SQL clause.
+    // The cursor inside EXTRACT should stay in column context (SelectList).
+    let ctx = analyze("SELECT EXTRACT(YEAR FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn trim_from_does_not_trigger_from_clause() {
+    // TRIM(LEADING '0' FROM col) uses FROM as function syntax.
+    let ctx = analyze("SELECT TRIM(LEADING '0' FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn real_from_after_extract_still_works() {
+    // The outer FROM clause should still be detected correctly.
+    let ctx = analyze("SELECT EXTRACT(YEAR FROM hire_date) FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn subquery_from_inside_parens_still_works() {
+    // A subquery inside parentheses should still detect FROM correctly.
+    let ctx = analyze("SELECT * FROM (SELECT id FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert_eq!(ctx.depth, 1);
+}
+
+#[test]
+fn extract_does_not_confuse_table_collection() {
+    // Tables referenced after EXTRACT should still be collected.
+    let ctx = analyze("SELECT EXTRACT(YEAR FROM hire_date) FROM employees WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
+}
+
+// ─── DELETE without FROM ─────────────────────────────────────────────────
+
+#[test]
+fn delete_without_from_collects_target_table() {
+    // Oracle allows DELETE table_name WHERE ... (without FROM).
+    let ctx = analyze("DELETE employees WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "DELETE without FROM should collect target table: {:?}",
+        names
+    );
+}
+
+#[test]
+fn delete_with_from_collects_target_table() {
+    // Standard DELETE FROM table_name should also work.
+    let ctx = analyze("DELETE FROM employees WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
+}

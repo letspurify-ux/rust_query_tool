@@ -351,7 +351,6 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "COLUMNS",
     "PATH",
     "PASSING",
-    "RETURNING",
     "CONTENT",
     "DOCUMENT",
     "WELLFORMED",
@@ -370,10 +369,6 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "AFTER",
     "TRANSACTION",
     // FOR UPDATE keywords
-    "NOWAIT",
-    "WAIT",
-    "SKIP",
-    "LOCKED",
     "OF",
     // Analytic keywords
     "NTILE",
@@ -390,11 +385,8 @@ pub const SQL_KEYWORDS: &[&str] = &[
     // Additional Oracle keywords
     "PURGE",
     "RECYCLEBIN",
-    "FLASHBACK",
     "ARCHIVE",
     "NOARCHIVE",
-    "LOGGING",
-    "NOLOGGING",
     "INITRANS",
     "MAXTRANS",
     "PCTFREE",
@@ -422,25 +414,19 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "NOEXCEPTIONS",
     "USING_NLS_COMP",
     // Partitioning
-    "PARTITION",
     "SUBPARTITION",
     "HASH",
     "LIST",
-    "RANGE",
-    "INTERVAL",
     "MAXVALUE",
     "MINVALUE",
     "LESS",
     "THAN",
     "STORE",
-    "OVERFLOW",
     // LOB keywords
     "LOB",
-    "STORE",
     "SECUREFILE",
     "BASICFILE",
     "DEDUPLICATE",
-    "COMPRESS",
     "RETENTION",
     "FREEPOOLS",
     "PCTVERSION",
@@ -587,7 +573,6 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "NEXT_DAY",
     "NUMTODSINTERVAL",
     "NUMTOYMINTERVAL",
-    "ROUND",
     "SESSIONTIMEZONE",
     "SYSDATE",
     "SYSTIMESTAMP",
@@ -602,7 +587,6 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "TO_TIMESTAMP",
     "TO_TIMESTAMP_TZ",
     "TO_YMINTERVAL",
-    "TRUNC",
     "TZ_OFFSET",
     // Conversion functions
     "BIN_TO_NUM",
@@ -745,11 +729,6 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     // Hierarchical functions
     "SYS_CONNECT_BY_PATH",
     // Miscellaneous functions
-    "BFILENAME",
-    "COALESCE",
-    "LNNVL",
-    "NANVL",
-    "NULLIF",
     "ORA_INVOKING_USER",
     "ORA_INVOKING_USERID",
     "PREDICTION",
@@ -1605,5 +1584,29 @@ mod intellisense_tests {
 
         assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("ab")));
         assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("abc_table")));
+    }
+
+    #[test]
+    fn sql_keywords_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for keyword in SQL_KEYWORDS {
+            assert!(
+                seen.insert(*keyword),
+                "Duplicate SQL keyword found: {}",
+                keyword
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_functions_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for func in ORACLE_FUNCTIONS {
+            assert!(
+                seen.insert(*func),
+                "Duplicate Oracle function found: {}",
+                func
+            );
+        }
     }
 }

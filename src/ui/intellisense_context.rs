@@ -165,6 +165,10 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut depth: usize = 0;
     // Track phase at each depth level
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
+    // Track whether SELECT has been seen at each depth level.
+    // Used to distinguish function-internal FROM (e.g. EXTRACT(YEAR FROM ...))
+    // from real FROM clauses in subqueries.
+    let mut select_seen_stack: Vec<bool> = vec![true]; // depth 0 is top-level, always treat as real
     let mut next_scope_id = 1usize;
     let mut scope_stack = vec![0usize];
     let mut visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
@@ -191,6 +195,12 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     phase_stack.push(inherited_phase);
                 } else {
                     phase_stack[depth] = inherited_phase;
+                }
+                // New depth: no SELECT seen yet at this level
+                if select_seen_stack.len() <= depth {
+                    select_seen_stack.push(false);
+                } else {
+                    select_seen_stack[depth] = false;
                 }
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
@@ -290,12 +300,18 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
+                        if select_seen_stack.len() <= depth {
+                            select_seen_stack.resize(depth + 1, false);
+                        }
+                        select_seen_stack[depth] = true;
                     }
                     "FROM" => {
-                        // Avoid transition for EXTRACT(... FROM ...)
-                        if !matches!(current_phase, SqlPhase::Initial) || depth > 0 {
-                            phase_stack[depth] = SqlPhase::FromClause;
-                        } else {
+                        // Avoid transition for function-internal FROM:
+                        // EXTRACT(YEAR FROM ...), TRIM(LEADING '0' FROM ...)
+                        // At depth > 0, if no SELECT was seen at this depth,
+                        // FROM is part of a function call, not a SQL clause.
+                        let select_seen = select_seen_stack.get(depth).copied().unwrap_or(false);
+                        if depth == 0 || select_seen {
                             phase_stack[depth] = SqlPhase::FromClause;
                         }
                     }
@@ -450,6 +466,7 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
     let mut all_subqueries: Vec<ParsedSubquery> = Vec::new();
     let mut depth: usize = 0;
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
+    let mut select_seen_stack: Vec<bool> = vec![true]; // depth 0 is top-level
     let mut expect_table = false;
     let mut cte_state = CteState::None;
     let mut cte_paren_depth: usize = 0;
@@ -471,6 +488,12 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                     phase_stack.push(SqlPhase::Initial);
                 }
                 phase_stack[depth] = SqlPhase::Initial;
+                // New depth: no SELECT seen yet at this level
+                if select_seen_stack.len() <= depth {
+                    select_seen_stack.push(false);
+                } else {
+                    select_seen_stack[depth] = false;
+                }
                 expect_table = false;
                 scope_stack.push(next_scope_id);
                 next_scope_id += 1;
@@ -615,6 +638,7 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                 all_subqueries.clear();
                 depth = 0;
                 phase_stack = vec![SqlPhase::Initial];
+                select_seen_stack = vec![true];
                 expect_table = false;
                 cte_state = CteState::None;
                 subquery_tracks.clear();
@@ -674,11 +698,20 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
+                        if select_seen_stack.len() <= depth {
+                            select_seen_stack.resize(depth + 1, false);
+                        }
+                        select_seen_stack[depth] = true;
                         expect_table = false;
                     }
                     "FROM" => {
-                        phase_stack[depth] = SqlPhase::FromClause;
-                        expect_table = true;
+                        // Avoid transition for function-internal FROM:
+                        // EXTRACT(YEAR FROM ...), TRIM(LEADING '0' FROM ...)
+                        let select_seen = select_seen_stack.get(depth).copied().unwrap_or(false);
+                        if depth == 0 || select_seen {
+                            phase_stack[depth] = SqlPhase::FromClause;
+                            expect_table = true;
+                        }
                     }
                     "JOIN" => {
                         phase_stack[depth] = SqlPhase::FromClause;
@@ -704,6 +737,10 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                     }
                     "UPDATE" => {
                         phase_stack[depth] = SqlPhase::UpdateTarget;
+                        expect_table = true;
+                    }
+                    "DELETE" => {
+                        phase_stack[depth] = SqlPhase::DeleteTarget;
                         expect_table = true;
                     }
                     "ON" if matches!(phase_stack[depth], SqlPhase::FromClause) => {
