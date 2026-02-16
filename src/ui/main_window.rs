@@ -1233,7 +1233,11 @@ impl MainWindow {
                 // Defensive fallback: if tab selection cannot be resolved,
                 // clear active editor references so closed-tab resources are
                 // not kept alive by stale handles in application state.
+                let detached_editor =
+                    SqlEditorWidget::new(s.connection.clone(), s.query_timeout_input.clone());
                 s.active_editor_tab_id = 0;
+                s.sql_buffer = detached_editor.get_buffer();
+                s.sql_editor = detached_editor;
                 *s.current_file.borrow_mut() = None;
                 s.refresh_window_title();
             }
