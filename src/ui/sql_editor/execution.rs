@@ -3026,6 +3026,7 @@ impl SqlEditorWidget {
                 struct QueryExecutionCleanupGuard {
                     sender: mpsc::Sender<QueryProgress>,
                     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+                    cancel_flag: Arc<AtomicBool>,
                     timeout_connection: Option<Arc<Connection>>,
                     previous_timeout: Option<Duration>,
                 }
@@ -3034,10 +3035,12 @@ impl SqlEditorWidget {
                     fn new(
                         sender: mpsc::Sender<QueryProgress>,
                         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+                        cancel_flag: Arc<AtomicBool>,
                     ) -> Self {
                         Self {
                             sender,
                             current_query_connection,
+                            cancel_flag,
                             timeout_connection: None,
                             previous_timeout: None,
                         }
@@ -3067,6 +3070,7 @@ impl SqlEditorWidget {
                             &self.current_query_connection,
                             None,
                         );
+                        self.cancel_flag.store(false, Ordering::SeqCst);
                         let _ = self.sender.send(QueryProgress::BatchFinished);
                         app::awake();
                     }
@@ -3081,6 +3085,7 @@ impl SqlEditorWidget {
                 let mut cleanup = QueryExecutionCleanupGuard::new(
                     sender.clone(),
                     current_query_connection.clone(),
+                    cancel_flag.clone(),
                 );
 
                 // Acquire connection lock inside thread and hold it during execution
