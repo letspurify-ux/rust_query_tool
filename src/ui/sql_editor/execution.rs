@@ -45,6 +45,52 @@ struct SelectTransformState {
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(0);
 const PROGRESS_ROWS_MAX_BATCH: usize = 1;
 
+struct QueryExecutionCleanupGuard {
+    sender: mpsc::Sender<QueryProgress>,
+    current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    cancel_flag: Arc<AtomicBool>,
+    timeout_connection: Option<Arc<Connection>>,
+    previous_timeout: Option<Duration>,
+}
+
+impl QueryExecutionCleanupGuard {
+    fn new(
+        sender: mpsc::Sender<QueryProgress>,
+        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            sender,
+            current_query_connection,
+            cancel_flag,
+            timeout_connection: None,
+            previous_timeout: None,
+        }
+    }
+
+    fn track_timeout(&mut self, connection: Arc<Connection>, previous_timeout: Option<Duration>) {
+        self.timeout_connection = Some(connection);
+        self.previous_timeout = previous_timeout;
+    }
+
+    fn clear_timeout_tracking(&mut self) {
+        self.timeout_connection = None;
+        self.previous_timeout = None;
+    }
+}
+
+impl Drop for QueryExecutionCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.timeout_connection.as_ref() {
+            let _ = conn.set_call_timeout(self.previous_timeout);
+        }
+        SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        let _ = self.sender.send(QueryProgress::BatchFinished);
+        app::awake();
+    }
+}
+
 impl SqlEditorWidget {
     fn db_activity_label_for_sql(sql: &str, script_mode: bool) -> String {
         let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -424,7 +470,10 @@ impl SqlEditorWidget {
             })
             .collect();
         matches!(
-            (words.first().map(String::as_str), words.get(1).map(String::as_str)),
+            (
+                words.first().map(String::as_str),
+                words.get(1).map(String::as_str)
+            ),
             (Some("ALTER"), Some("TRIGGER"))
         )
     }
@@ -1734,12 +1783,14 @@ impl SqlEditorWidget {
                             let indent_increase = if is_subquery || is_column_list {
                                 let in_cte_as_subquery = with_cte_active
                                     && matches!(prev_word_upper.as_deref(), Some("AS"));
-                                let deep_subquery_indent = matches!(
-                                    current_clause.as_deref(),
-                                    Some("SELECT" | "FROM")
-                                ) && !in_cte_as_subquery
-                                    || (matches!(current_clause.as_deref(), Some("WHERE"))
-                                        && matches!(prev_word_upper.as_deref(), Some("EXISTS")));
+                                let deep_subquery_indent =
+                                    matches!(current_clause.as_deref(), Some("SELECT" | "FROM"))
+                                        && !in_cte_as_subquery
+                                        || (matches!(current_clause.as_deref(), Some("WHERE"))
+                                            && matches!(
+                                                prev_word_upper.as_deref(),
+                                                Some("EXISTS")
+                                            ));
                                 if is_subquery && deep_subquery_indent {
                                     2
                                 } else {
@@ -3023,59 +3074,6 @@ impl SqlEditorWidget {
 
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                struct QueryExecutionCleanupGuard {
-                    sender: mpsc::Sender<QueryProgress>,
-                    current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
-                    cancel_flag: Arc<AtomicBool>,
-                    timeout_connection: Option<Arc<Connection>>,
-                    previous_timeout: Option<Duration>,
-                }
-
-                impl QueryExecutionCleanupGuard {
-                    fn new(
-                        sender: mpsc::Sender<QueryProgress>,
-                        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
-                        cancel_flag: Arc<AtomicBool>,
-                    ) -> Self {
-                        Self {
-                            sender,
-                            current_query_connection,
-                            cancel_flag,
-                            timeout_connection: None,
-                            previous_timeout: None,
-                        }
-                    }
-
-                    fn track_timeout(
-                        &mut self,
-                        connection: Arc<Connection>,
-                        previous_timeout: Option<Duration>,
-                    ) {
-                        self.timeout_connection = Some(connection);
-                        self.previous_timeout = previous_timeout;
-                    }
-
-                    fn clear_timeout_tracking(&mut self) {
-                        self.timeout_connection = None;
-                        self.previous_timeout = None;
-                    }
-                }
-
-                impl Drop for QueryExecutionCleanupGuard {
-                    fn drop(&mut self) {
-                        if let Some(conn) = self.timeout_connection.as_ref() {
-                            let _ = conn.set_call_timeout(self.previous_timeout);
-                        }
-                        SqlEditorWidget::set_current_query_connection(
-                            &self.current_query_connection,
-                            None,
-                        );
-                        self.cancel_flag.store(false, Ordering::SeqCst);
-                        let _ = self.sender.send(QueryProgress::BatchFinished);
-                        app::awake();
-                    }
-                }
-
                 struct ScriptFrame {
                     items: Vec<ScriptItem>,
                     index: usize,
@@ -6728,7 +6726,6 @@ impl SqlEditorWidget {
                         }
                     }
                 }
-
             })); // end catch_unwind
 
             if let Err(e) = result {
@@ -7964,10 +7961,10 @@ mod formatter_regression_tests {
 
         assert!(formatted.contains("/* comment with (, ), and , */"));
         assert!(
-            formatted.contains("SELECT\n    a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;")
-                || formatted.contains(
-                    "SELECT a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;"
-                ),
+            formatted
+                .contains("SELECT\n    a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;")
+                || formatted
+                    .contains("SELECT a,\n    /* comment with (, ), and , */\n    b\nFROM DUAL;"),
             "Comment-preserving select formatting should remain stable, got:\n{}",
             formatted
         );
@@ -8089,12 +8086,15 @@ END oqt_mega_pkg;"#;
 
     #[test]
     fn keyword_token_match_handles_exact_keyword_lines() {
-        assert!(SqlEditorWidget::starts_with_keyword_token("SELECT", "SELECT"));
+        assert!(SqlEditorWidget::starts_with_keyword_token(
+            "SELECT", "SELECT"
+        ));
         assert!(SqlEditorWidget::starts_with_keyword_token("INTO", "INTO"));
-        assert!(SqlEditorWidget::starts_with_keyword_token("SELECT x", "SELECT"));
+        assert!(SqlEditorWidget::starts_with_keyword_token(
+            "SELECT x", "SELECT"
+        ));
         assert!(!SqlEditorWidget::starts_with_keyword_token(
-            "SELECTED",
-            "SELECT"
+            "SELECTED", "SELECT"
         ));
     }
 
@@ -8153,5 +8153,65 @@ END oqt_mega_pkg;"#;
             "CREATE/ALTER trigger pair should not be separated by a blank line, got:\n{}",
             formatted
         );
+    }
+}
+
+#[cfg(test)]
+mod query_execution_cleanup_tests {
+    use super::{QueryExecutionCleanupGuard, QueryProgress};
+    use oracle::Connection;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[test]
+    fn cleanup_guard_resets_cancel_and_emits_batch_finished_on_drop() {
+        let (sender, receiver) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
+            Arc::new(Mutex::new(None));
+
+        {
+            let _guard = QueryExecutionCleanupGuard::new(
+                sender,
+                current_query_connection.clone(),
+                cancel_flag.clone(),
+            );
+        }
+
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        let msg = receiver
+            .try_recv()
+            .expect("BatchFinished should be emitted");
+        assert!(matches!(msg, QueryProgress::BatchFinished));
+        assert!(current_query_connection
+            .lock()
+            .expect("connection mutex should not be poisoned")
+            .is_none());
+    }
+
+    #[test]
+    fn cleanup_guard_runs_during_panic_unwind() {
+        let (sender, receiver) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
+            Arc::new(Mutex::new(None));
+
+        let unwind_result = panic::catch_unwind(AssertUnwindSafe({
+            let cancel_flag = cancel_flag.clone();
+            let current_query_connection = current_query_connection.clone();
+            move || {
+                let _guard =
+                    QueryExecutionCleanupGuard::new(sender, current_query_connection, cancel_flag);
+                panic!("simulate execution panic");
+            }
+        }));
+
+        assert!(unwind_result.is_err());
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        let msg = receiver
+            .try_recv()
+            .expect("BatchFinished should be emitted");
+        assert!(matches!(msg, QueryProgress::BatchFinished));
     }
 }
