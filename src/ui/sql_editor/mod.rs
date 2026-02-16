@@ -531,6 +531,13 @@ impl SqlEditorWidget {
             flush_rows(&mut pending_rows, cancel_flag.load(Ordering::Relaxed));
 
             if disconnected {
+                // Fail-safe cleanup: if the worker thread exits unexpectedly and the
+                // channel closes before BatchFinished arrives, make sure execution
+                // state/cursor do not stay stuck as "running".
+                *query_running.borrow_mut() = false;
+                cancel_flag.store(false, Ordering::SeqCst);
+                set_cursor(Cursor::Default);
+                app::flush();
                 return;
             }
 
