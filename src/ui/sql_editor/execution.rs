@@ -3023,11 +3023,65 @@ impl SqlEditorWidget {
 
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                struct QueryExecutionCleanupGuard {
+                    sender: mpsc::Sender<QueryProgress>,
+                    current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+                    timeout_connection: Option<Arc<Connection>>,
+                    previous_timeout: Option<Duration>,
+                }
+
+                impl QueryExecutionCleanupGuard {
+                    fn new(
+                        sender: mpsc::Sender<QueryProgress>,
+                        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+                    ) -> Self {
+                        Self {
+                            sender,
+                            current_query_connection,
+                            timeout_connection: None,
+                            previous_timeout: None,
+                        }
+                    }
+
+                    fn track_timeout(
+                        &mut self,
+                        connection: Arc<Connection>,
+                        previous_timeout: Option<Duration>,
+                    ) {
+                        self.timeout_connection = Some(connection);
+                        self.previous_timeout = previous_timeout;
+                    }
+
+                    fn clear_timeout_tracking(&mut self) {
+                        self.timeout_connection = None;
+                        self.previous_timeout = None;
+                    }
+                }
+
+                impl Drop for QueryExecutionCleanupGuard {
+                    fn drop(&mut self) {
+                        if let Some(conn) = self.timeout_connection.as_ref() {
+                            let _ = conn.set_call_timeout(self.previous_timeout);
+                        }
+                        SqlEditorWidget::set_current_query_connection(
+                            &self.current_query_connection,
+                            None,
+                        );
+                        let _ = self.sender.send(QueryProgress::BatchFinished);
+                        app::awake();
+                    }
+                }
+
                 struct ScriptFrame {
                     items: Vec<ScriptItem>,
                     index: usize,
                     base_dir: PathBuf,
                 }
+
+                let mut cleanup = QueryExecutionCleanupGuard::new(
+                    sender.clone(),
+                    current_query_connection.clone(),
+                );
 
                 // Acquire connection lock inside thread and hold it during execution
                 let mut conn_guard =
@@ -3054,8 +3108,6 @@ impl SqlEditorWidget {
 
                 let items = QueryExecutor::split_script_items(&sql_text);
                 if items.is_empty() {
-                    let _ = sender.send(QueryProgress::BatchFinished);
-                    app::awake();
                     return;
                 }
 
@@ -3063,10 +3115,14 @@ impl SqlEditorWidget {
                 app::awake();
 
                 // Set timeout only if we have a connection
-                let mut previous_timeout = conn_opt
+                let previous_timeout = conn_opt
                     .as_ref()
                     .and_then(|c| c.call_timeout().ok())
                     .flatten();
+
+                if let Some(conn) = conn_opt.as_ref() {
+                    cleanup.track_timeout(Arc::clone(conn), previous_timeout);
+                }
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
@@ -3085,9 +3141,6 @@ impl SqlEditorWidget {
                             });
                             app::awake();
                         }
-                        let _ = sender.send(QueryProgress::BatchFinished);
-                        app::awake();
-                        let _ = conn.set_call_timeout(previous_timeout);
                         return;
                     }
                     if let Err(err) =
@@ -4940,11 +4993,13 @@ impl SqlEditorWidget {
                                                     conn_info.display_string()
                                                 ),
                                             );
-                                            previous_timeout = conn_opt
-                                                .as_ref()
-                                                .and_then(|c| c.call_timeout().ok())
-                                                .flatten();
                                             if let Some(conn) = conn_opt.as_ref() {
+                                                let previous_timeout =
+                                                    conn.call_timeout().ok().flatten();
+                                                cleanup.track_timeout(
+                                                    Arc::clone(conn),
+                                                    previous_timeout,
+                                                );
                                                 let _ = conn.set_call_timeout(query_timeout);
                                                 if let Err(err) =
                                                     SqlEditorWidget::sync_serveroutput_with_session(
@@ -5001,10 +5056,7 @@ impl SqlEditorWidget {
                                             "DISCONNECT",
                                             "Disconnected from database",
                                         );
-                                        previous_timeout = conn_opt
-                                            .as_ref()
-                                            .and_then(|c| c.call_timeout().ok())
-                                            .flatten();
+                                        cleanup.clear_timeout_tracking();
                                         let _ = sender
                                             .send(QueryProgress::ConnectionChanged { info: None });
                                         app::awake();
@@ -6672,23 +6724,10 @@ impl SqlEditorWidget {
                     }
                 }
 
-                // Restore previous timeout if we have a connection
-                if let Some(conn) = conn_opt.as_ref() {
-                    let _ = conn.set_call_timeout(previous_timeout);
-                }
-
-                // Clear current query connection
-                SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
-
-                let _ = sender.send(QueryProgress::BatchFinished);
-                app::awake();
             })); // end catch_unwind
 
             if let Err(e) = result {
                 eprintln!("Query thread panicked: {:?}", e);
-                SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
-                let _ = sender.send(QueryProgress::BatchFinished);
-                app::awake();
             }
         });
     }
