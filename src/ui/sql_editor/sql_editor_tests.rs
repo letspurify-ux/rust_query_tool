@@ -1,8 +1,12 @@
 use super::*;
 use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_KEYWORD, STYLE_STRING};
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 fn load_test_file(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1273,7 +1277,8 @@ ORDER BY d.deptno;"#;
 
 #[test]
 fn format_sql_from_subqueries_with_comma_aligns_as_expected() {
-    let input = "SELECT * FROM (SELECT * FROM help) a, (SELECT * FROM help) b WHERE a.TOPIC = b.TOPIC;";
+    let input =
+        "SELECT * FROM (SELECT * FROM help) a, (SELECT * FROM help) b WHERE a.TOPIC = b.TOPIC;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"SELECT *
@@ -1602,4 +1607,15 @@ BEGIN
 END;"#;
 
     assert_eq!(formatted, expected);
+}
+
+#[test]
+fn finalize_execution_state_clears_running_and_cancel_flags() {
+    let query_running = Rc::new(RefCell::new(true));
+    let cancel_flag = Arc::new(AtomicBool::new(true));
+
+    SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
+
+    assert!(!*query_running.borrow());
+    assert!(!cancel_flag.load(Ordering::SeqCst));
 }
