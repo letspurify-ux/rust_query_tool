@@ -31,6 +31,7 @@ fn main() {
     let missing_xinerama = !has_system_lib_via_pkg_config("xinerama");
     let missing_xcursor = !has_system_lib_via_pkg_config("xcursor");
     let missing_xfixes = !has_system_lib_via_pkg_config("xfixes");
+    let missing_xft = !has_system_lib_via_pkg_config("xft");
 
     if missing_xinerama {
         build_empty_stub(out_path, "Xinerama");
@@ -41,8 +42,11 @@ fn main() {
     if missing_xfixes {
         build_empty_stub(out_path, "Xfixes");
     }
+    if missing_xft {
+        build_empty_stub(out_path, "Xft");
+    }
 
-    if missing_xinerama || missing_xcursor || missing_xfixes {
+    if missing_xinerama || missing_xcursor || missing_xfixes || missing_xft {
         println!("cargo:warning=Missing X11 dev libs detected; linking local stubs for test/build in this environment.");
         println!("cargo:rustc-link-search=native={}", out_path.display());
     }
