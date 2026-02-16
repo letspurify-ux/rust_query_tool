@@ -1222,7 +1222,11 @@ impl SqlEditorWidget {
         *self.replace_callback.borrow_mut() = None;
         *self.file_drop_callback.borrow_mut() = None;
 
-        self.intellisense_popup.borrow_mut().hide();
+        self.intellisense_popup.borrow_mut().clear_for_close();
+        *self.intellisense_data.borrow_mut() = IntellisenseData::new();
+        self.highlighter
+            .borrow_mut()
+            .set_highlight_data(HighlightData::new());
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");
