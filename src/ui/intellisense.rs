@@ -1348,8 +1348,16 @@ impl IntellisensePopup {
     }
 
     pub fn hide(&mut self) {
+        self.window.hide();
         self.window.resize(0, 0, 0, 0);
         *self.visible.borrow_mut() = false;
+    }
+
+    pub fn clear_for_close(&mut self) {
+        self.hide();
+        self.browser.clear();
+        self.suggestions.borrow_mut().clear();
+        *self.selected_callback.borrow_mut() = None;
     }
 
     pub fn is_visible(&self) -> bool {
