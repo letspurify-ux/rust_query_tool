@@ -134,6 +134,30 @@ impl DatabaseConnection {
         self.connected = false;
     }
 
+    /// Validate that the current connection is still alive.
+    ///
+    /// Some DB servers terminate idle sessions; in that case we clear the stale
+    /// handle so callers can prompt for reconnect before running work.
+    pub fn ensure_connection_alive(&mut self) -> bool {
+        if !self.connected {
+            return false;
+        }
+
+        let Some(conn) = self.connection.as_ref() else {
+            self.connected = false;
+            return false;
+        };
+
+        match conn.ping() {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("Detected stale DB connection during ping: {err}");
+                self.disconnect();
+                false
+            }
+        }
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected
     }
