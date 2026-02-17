@@ -268,7 +268,10 @@ enum ConnectionResult {
 }
 
 enum ConnectionHealthResult {
-    Checked(Option<String>),
+    Checked {
+        disconnect_message: Option<String>,
+        checked_connection_id: Option<usize>,
+    },
 }
 
 enum FileActionResult {
@@ -2714,11 +2717,32 @@ impl MainWindow {
                 let r = health_receiver.borrow();
                 loop {
                     match r.try_recv() {
-                        Ok(ConnectionHealthResult::Checked(disconnect_message)) => {
+                        Ok(ConnectionHealthResult::Checked {
+                            disconnect_message,
+                            checked_connection_id,
+                        }) => {
                             health_check_in_flight.set(false);
+
                             if let Some(message) = disconnect_message {
                                 let mut s = state.borrow_mut();
-                                if s.connection_info.borrow().is_some() {
+
+                                let should_apply_disconnect = checked_connection_id
+                                    .zip(
+                                        crate::db::try_lock_connection(&s.connection)
+                                            .and_then(|guard| {
+                                                guard
+                                                    .get_connection()
+                                                    .as_ref()
+                                                    .map(|conn| std::sync::Arc::as_ptr(conn)
+                                                        as usize)
+                                            }),
+                                    )
+                                    .map(|(checked_id, current_id)| checked_id == current_id)
+                                    .unwrap_or(false);
+
+                                if should_apply_disconnect
+                                    && s.connection_info.borrow().is_some()
+                                {
                                     MainWindow::transition_to_disconnected_state(
                                         &mut s,
                                         Some(&message),
@@ -2747,13 +2771,23 @@ impl MainWindow {
                 let connection = state.borrow().connection.clone();
                 let health_sender = health_sender.clone();
                 thread::spawn(move || {
-                    let disconnect_message =
+                    let (disconnect_message, checked_connection_id) =
                         if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
-                            conn_guard.require_live_connection().err()
+                            let checked_connection_id = conn_guard
+                                .get_connection()
+                                .as_ref()
+                                .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
+                            (
+                                conn_guard.require_live_connection().err(),
+                                checked_connection_id,
+                            )
                         } else {
-                            None
+                            (None, None)
                         };
-                    let _ = health_sender.send(ConnectionHealthResult::Checked(disconnect_message));
+                    let _ = health_sender.send(ConnectionHealthResult::Checked {
+                        disconnect_message,
+                        checked_connection_id,
+                    });
                     app::awake();
                 });
             }
