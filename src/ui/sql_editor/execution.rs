@@ -24,6 +24,7 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, SplitState, ToolCommand,
 };
+use crate::ui::sql_depth::paren_depths;
 use crate::ui::SQL_KEYWORDS;
 
 use super::*;
@@ -2359,9 +2360,9 @@ impl SqlEditorWidget {
 
         let mut seen_table = false;
         let mut ctas = false;
-        let mut depth = 0i32;
         let mut open_idx: Option<usize> = None;
         let mut close_idx: Option<usize> = None;
+        let token_depths = paren_depths(&tokens);
         let mut idx = 0usize;
 
         while idx < tokens.len() {
@@ -2385,14 +2386,19 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    if depth == 0 && seen_table && !ctas && open_idx.is_none() {
+                    if token_depths.get(idx).copied().unwrap_or(0) == 0
+                        && seen_table
+                        && !ctas
+                        && open_idx.is_none()
+                    {
                         open_idx = Some(idx);
                     }
-                    depth += 1;
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
-                    depth -= 1;
-                    if depth == 0 && open_idx.is_some() && close_idx.is_none() {
+                    if token_depths.get(idx).copied().unwrap_or(0) == 1
+                        && open_idx.is_some()
+                        && close_idx.is_none()
+                    {
                         close_idx = Some(idx);
                         break;
                     }
@@ -2413,19 +2419,13 @@ impl SqlEditorWidget {
 
         let mut columns: Vec<Vec<SqlToken>> = Vec::new();
         let mut current: Vec<SqlToken> = Vec::new();
-        let mut col_depth = 0i32;
+        let column_depths = paren_depths(column_tokens);
 
-        for token in column_tokens {
+        for (col_idx, token) in column_tokens.iter().enumerate() {
             match token {
-                SqlToken::Symbol(sym) if sym == "(" => {
-                    col_depth += 1;
-                    current.push(token.clone());
-                }
-                SqlToken::Symbol(sym) if sym == ")" => {
-                    col_depth = col_depth.saturating_sub(1);
-                    current.push(token.clone());
-                }
-                SqlToken::Symbol(sym) if sym == "," && col_depth == 0 => {
+                SqlToken::Symbol(sym)
+                    if sym == "," && column_depths.get(col_idx).copied().unwrap_or(0) == 0 =>
+                {
                     if !current.is_empty() {
                         columns.push(current);
                         current = Vec::new();
@@ -2707,19 +2707,11 @@ impl SqlEditorWidget {
 
         let mut parts: Vec<Vec<SqlToken>> = Vec::new();
         let mut current: Vec<SqlToken> = Vec::new();
-        let mut depth = 0i32;
+        let token_depths = paren_depths(tokens);
 
-        for token in tokens {
+        for (idx, token) in tokens.iter().enumerate() {
             match token {
-                SqlToken::Symbol(sym) if sym == "(" => {
-                    depth += 1;
-                    current.push(token.clone());
-                }
-                SqlToken::Symbol(sym) if sym == ")" => {
-                    depth = depth.saturating_sub(1);
-                    current.push(token.clone());
-                }
-                SqlToken::Word(word) if depth == 0 => {
+                SqlToken::Word(word) if token_depths.get(idx).copied().unwrap_or(0) == 0 => {
                     let upper = word.to_uppercase();
                     if break_keywords.contains(&upper.as_str()) && !current.is_empty() {
                         parts.push(current);
@@ -8180,7 +8172,9 @@ END oqt_mega_pkg;"#;
         let items = vec![ScriptItem::Statement(
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;".to_string(),
         )];
-        assert!(SqlEditorWidget::requires_transaction_first_statement(&items));
+        assert!(SqlEditorWidget::requires_transaction_first_statement(
+            &items
+        ));
     }
 
     #[test]
@@ -8188,7 +8182,9 @@ END oqt_mega_pkg;"#;
         let items = vec![ScriptItem::Statement(
             "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE;".to_string(),
         )];
-        assert!(SqlEditorWidget::requires_transaction_first_statement(&items));
+        assert!(SqlEditorWidget::requires_transaction_first_statement(
+            &items
+        ));
     }
 
     #[test]
