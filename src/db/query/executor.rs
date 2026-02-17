@@ -958,49 +958,70 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
 
+        Ok(Self::summarize_batch_results(
+            sql,
+            statements.len(),
+            execution_time,
+            last_select_result,
+            total_affected,
+            executed_count,
+            error_messages,
+        ))
+    }
+
+    pub(crate) fn summarize_batch_results(
+        sql: &str,
+        statement_count: usize,
+        execution_time: Duration,
+        last_select_result: Option<QueryResult>,
+        total_affected: u64,
+        executed_count: usize,
+        error_messages: Vec<String>,
+    ) -> QueryResult {
+        let had_errors = !error_messages.is_empty();
+
         // If we have a SELECT result, return it with batch info
         if let Some(mut result) = last_select_result {
             result.execution_time = execution_time;
-            if executed_count > 1 {
+            if statement_count > 1 {
                 result.message = format!(
                     "{} (Executed {} of {} statements)",
-                    result.message,
-                    executed_count,
-                    statements.len()
+                    result.message, executed_count, statement_count
                 );
             }
-            if !error_messages.is_empty() {
+            if had_errors {
                 result.message =
                     format!("{} | Errors: {}", result.message, error_messages.join("; "));
+                result.success = false;
             }
-            Ok(result)
-        } else {
-            // Return a summary for DML/DDL batch
-            let message = if error_messages.is_empty() {
-                format!(
-                    "Executed {} statements, {} row(s) affected",
-                    executed_count, total_affected
-                )
-            } else {
-                format!(
-                    "Executed {} of {} statements, {} row(s) affected | Errors: {}",
-                    executed_count,
-                    statements.len(),
-                    total_affected,
-                    error_messages.join("; ")
-                )
-            };
+            return result;
+        }
 
-            Ok(QueryResult {
-                sql: sql.to_string(),
-                columns: vec![],
-                rows: vec![],
-                row_count: total_affected as usize,
-                execution_time,
-                message,
-                is_select: false,
-                success: true,
-            })
+        // Return a summary for DML/DDL batch
+        let message = if had_errors {
+            format!(
+                "Executed {} of {} statements, {} row(s) affected | Errors: {}",
+                executed_count,
+                statement_count,
+                total_affected,
+                error_messages.join("; ")
+            )
+        } else {
+            format!(
+                "Executed {} statements, {} row(s) affected",
+                executed_count, total_affected
+            )
+        };
+
+        QueryResult {
+            sql: sql.to_string(),
+            columns: vec![],
+            rows: vec![],
+            row_count: total_affected as usize,
+            execution_time,
+            message,
+            is_select: false,
+            success: !had_errors,
         }
     }
 

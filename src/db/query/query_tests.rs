@@ -3985,3 +3985,49 @@ fn test_parse_whenever_sqlerror_exit_sql_sqlcode() {
         items.first()
     );
 }
+
+#[test]
+fn test_summarize_batch_results_marks_failure_when_dml_batch_has_errors() {
+    let result = QueryExecutor::summarize_batch_results(
+        "UPDATE t SET c = 1; BAD SQL;",
+        2,
+        std::time::Duration::from_millis(12),
+        None,
+        1,
+        1,
+        vec!["Statement 2: ORA-00900: invalid SQL statement".to_string()],
+    );
+
+    assert!(!result.success, "batch summary should fail when any statement fails");
+    assert!(!result.is_select);
+    assert!(result.message.contains("Executed 1 of 2 statements"));
+    assert!(result.message.contains("Errors:"));
+}
+
+#[test]
+fn test_summarize_batch_results_marks_failure_when_select_batch_has_errors() {
+    let select_result = QueryResult::new_select(
+        "SELECT * FROM dual",
+        vec![ColumnInfo {
+            name: "DUMMY".to_string(),
+            data_type: "VARCHAR2".to_string(),
+        }],
+        vec![vec!["X".to_string()]],
+        std::time::Duration::from_millis(2),
+    );
+
+    let result = QueryExecutor::summarize_batch_results(
+        "SELECT * FROM dual; BAD SQL;",
+        2,
+        std::time::Duration::from_millis(20),
+        Some(select_result),
+        0,
+        1,
+        vec!["Statement 2: ORA-00900: invalid SQL statement".to_string()],
+    );
+
+    assert!(!result.success, "select batch should fail when any statement fails");
+    assert!(result.is_select);
+    assert!(result.message.contains("Errors:"));
+    assert!(result.message.contains("Executed 1 of 2 statements"));
+}
