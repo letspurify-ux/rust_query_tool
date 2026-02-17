@@ -294,14 +294,34 @@ enum SaveTabOutcome {
 
 fn should_apply_disconnect_for_health_check(
     checked_connection_id: Option<usize>,
-    current_connection_id: Option<usize>,
+    current_connection_state: HealthCheckCurrentConnectionState,
 ) -> bool {
+    if matches!(
+        current_connection_state,
+        HealthCheckCurrentConnectionState::Unavailable
+    ) {
+        return false;
+    }
+
+    let current_connection_id = match current_connection_state {
+        HealthCheckCurrentConnectionState::Present(id) => Some(id),
+        HealthCheckCurrentConnectionState::Absent
+        | HealthCheckCurrentConnectionState::Unavailable => None,
+    };
+
     match checked_connection_id {
         Some(checked_id) => current_connection_id
             .map(|current_id| checked_id == current_id)
             .unwrap_or(true),
         None => current_connection_id.is_none(),
     }
+}
+
+#[derive(Clone, Copy)]
+enum HealthCheckCurrentConnectionState {
+    Present(usize),
+    Absent,
+    Unavailable,
 }
 
 impl MainWindow {
@@ -2737,20 +2757,23 @@ impl MainWindow {
                             if let Some(message) = disconnect_message {
                                 let mut s = state.borrow_mut();
 
-                                let current_connection_id = crate::db::try_lock_connection(
-                                    &s.connection,
-                                )
-                                .and_then(|guard| {
-                                    guard
-                                        .get_connection()
-                                        .as_ref()
-                                        .map(|conn| std::sync::Arc::as_ptr(conn) as usize)
-                                });
+                                let current_connection_state = if let Some(guard) =
+                                    crate::db::try_lock_connection(&s.connection)
+                                {
+                                    match guard.get_connection().as_ref() {
+                                        Some(conn) => HealthCheckCurrentConnectionState::Present(
+                                            std::sync::Arc::as_ptr(conn) as usize,
+                                        ),
+                                        None => HealthCheckCurrentConnectionState::Absent,
+                                    }
+                                } else {
+                                    HealthCheckCurrentConnectionState::Unavailable
+                                };
 
                                 let should_apply_disconnect =
                                     should_apply_disconnect_for_health_check(
                                         checked_connection_id,
-                                        current_connection_id,
+                                        current_connection_state,
                                     );
 
                                 if should_apply_disconnect && s.connection_info.borrow().is_some() {
@@ -3061,33 +3084,53 @@ impl Default for MainWindow {
 
 #[cfg(test)]
 mod health_check_tests {
-    use super::should_apply_disconnect_for_health_check;
+    use super::{should_apply_disconnect_for_health_check, HealthCheckCurrentConnectionState};
 
     #[test]
     fn applies_disconnect_when_same_connection_id() {
-        assert!(should_apply_disconnect_for_health_check(Some(10), Some(10)));
+        assert!(should_apply_disconnect_for_health_check(
+            Some(10),
+            HealthCheckCurrentConnectionState::Present(10),
+        ));
     }
 
     #[test]
     fn does_not_apply_disconnect_when_connection_was_replaced() {
         assert!(!should_apply_disconnect_for_health_check(
             Some(10),
-            Some(11)
+            HealthCheckCurrentConnectionState::Present(11),
         ));
     }
 
     #[test]
     fn applies_disconnect_when_checked_connection_was_cleared_by_health_check() {
-        assert!(should_apply_disconnect_for_health_check(Some(10), None));
+        assert!(should_apply_disconnect_for_health_check(
+            Some(10),
+            HealthCheckCurrentConnectionState::Absent,
+        ));
     }
 
     #[test]
     fn applies_disconnect_when_both_connections_are_none() {
-        assert!(should_apply_disconnect_for_health_check(None, None));
+        assert!(should_apply_disconnect_for_health_check(
+            None,
+            HealthCheckCurrentConnectionState::Absent,
+        ));
+    }
+
+    #[test]
+    fn does_not_apply_disconnect_when_current_connection_lock_is_unavailable() {
+        assert!(!should_apply_disconnect_for_health_check(
+            Some(10),
+            HealthCheckCurrentConnectionState::Unavailable,
+        ));
     }
 
     #[test]
     fn does_not_apply_disconnect_when_check_had_no_connection_but_current_exists() {
-        assert!(!should_apply_disconnect_for_health_check(None, Some(7)));
+        assert!(!should_apply_disconnect_for_health_check(
+            None,
+            HealthCheckCurrentConnectionState::Present(7),
+        ));
     }
 }
