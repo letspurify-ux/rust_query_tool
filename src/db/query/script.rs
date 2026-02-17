@@ -1259,10 +1259,165 @@ impl QueryExecutor {
     }
 
     pub fn is_select_statement(sql: &str) -> bool {
-        matches!(
-            Self::leading_keyword(sql).as_deref(),
-            Some("SELECT") | Some("WITH")
-        )
+        match Self::leading_keyword(sql).as_deref() {
+            Some("SELECT") => true,
+            Some("WITH") => Self::with_clause_starts_with_select(sql),
+            _ => false,
+        }
+    }
+
+    fn with_clause_starts_with_select(sql: &str) -> bool {
+        let stripped = Self::strip_leading_comments(sql);
+        let chars: Vec<char> = stripped.chars().collect();
+        let len = chars.len();
+
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut in_q_quote = false;
+        let mut q_quote_end: Option<char> = None;
+
+        while i < len {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_q_quote {
+                if Some(c) == q_quote_end && next == Some('\'') {
+                    in_q_quote = false;
+                    q_quote_end = None;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if (c == 'n' || c == 'N')
+                && matches!(next, Some('q') | Some('Q'))
+                && chars.get(i + 2) == Some(&'\'')
+            {
+                if let Some(&delimiter) = chars.get(i + 3) {
+                    in_q_quote = true;
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
+                    i += 4;
+                    continue;
+                }
+            }
+
+            if (c == 'q' || c == 'Q') && next == Some('\'') {
+                if let Some(&delimiter) = chars.get(i + 2) {
+                    in_q_quote = true;
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
+                    i += 3;
+                    continue;
+                }
+            }
+
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
+                let start = i;
+                i += 1;
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$' || chars[i] == '#') {
+                    i += 1;
+                }
+                let token: String = chars[start..i].iter().collect();
+                if token.eq_ignore_ascii_case("SELECT") {
+                    return true;
+                }
+                if token.eq_ignore_ascii_case("INSERT")
+                    || token.eq_ignore_ascii_case("UPDATE")
+                    || token.eq_ignore_ascii_case("DELETE")
+                    || token.eq_ignore_ascii_case("MERGE")
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            i += 1;
+        }
+
+        false
     }
 
     pub fn split_script_items(sql: &str) -> Vec<ScriptItem> {

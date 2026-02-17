@@ -29,6 +29,42 @@ fn test_multiple_selects() {
 }
 
 #[test]
+fn test_is_select_statement_with_clause_insert_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) INSERT INTO t2(id) SELECT id FROM t";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... INSERT should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_update_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) UPDATE t2 SET id = (SELECT id FROM t)";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... UPDATE should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_delete_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) DELETE FROM t2 WHERE id IN (SELECT id FROM t)";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... DELETE should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_select_is_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) SELECT id FROM t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... SELECT should be treated as SELECT"
+    );
+}
+
+#[test]
 fn test_double_semicolon() {
     let sql = "SELECT 1 FROM DUAL;;";
     let items = QueryExecutor::split_script_items(sql);
