@@ -159,6 +159,18 @@ fn test_normalize_exec_call_handles_leading_comments() {
 }
 
 #[test]
+fn test_check_named_positional_mix_ignores_line_comment_arrow() {
+    let sql = "EXEC test_proc(1, -- p_id => 1\n 2);";
+    assert!(QueryExecutor::check_named_positional_mix(sql).is_ok());
+}
+
+#[test]
+fn test_check_named_positional_mix_ignores_block_comment_arrow() {
+    let sql = "EXEC test_proc(1, /* p_id => 1 */ 2);";
+    assert!(QueryExecutor::check_named_positional_mix(sql).is_ok());
+}
+
+#[test]
 fn test_create_external_function_as_non_plsql_block_followed_by_select() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_fn(
   p_num NUMBER
