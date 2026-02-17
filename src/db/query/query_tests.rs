@@ -247,6 +247,19 @@ fn test_normalize_exec_call_handles_leading_comments() {
 }
 
 #[test]
+fn test_normalize_exec_call_handles_leading_whitespace() {
+    let sql = "  \n\tEXEC test_proc(:v1);";
+    let normalized = QueryExecutor::normalize_exec_call(sql);
+    assert_eq!(normalized.as_deref(), Some("BEGIN test_proc(:v1); END;"));
+}
+
+#[test]
+fn test_check_named_positional_mix_handles_leading_whitespace() {
+    let sql = "\n  EXEC test_proc(p_id => 1, 2);";
+    assert!(QueryExecutor::check_named_positional_mix(sql).is_err());
+}
+
+#[test]
 fn test_check_named_positional_mix_ignores_line_comment_arrow() {
     let sql = "EXEC test_proc(1, -- p_id => 1\n 2);";
     assert!(QueryExecutor::check_named_positional_mix(sql).is_ok());

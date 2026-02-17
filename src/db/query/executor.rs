@@ -458,11 +458,17 @@ impl QueryExecutor {
 
     fn exec_call_body(sql: &str) -> Option<String> {
         let cleaned = Self::strip_leading_comments(sql);
-        let upper = cleaned.to_uppercase();
-        let body = if upper.starts_with("EXECUTE ") {
-            cleaned[8..].to_string()
-        } else if upper.starts_with("EXEC ") || upper.starts_with("CALL ") {
-            cleaned[5..].to_string()
+        let trimmed = cleaned.trim_start();
+        let command_len = trimmed
+            .find(char::is_whitespace)
+            .unwrap_or(trimmed.len());
+        let command = &trimmed[..command_len];
+
+        let body = if command.eq_ignore_ascii_case("EXECUTE")
+            || command.eq_ignore_ascii_case("EXEC")
+            || command.eq_ignore_ascii_case("CALL")
+        {
+            trimmed[command_len..].to_string()
         } else {
             return None;
         };
@@ -477,8 +483,13 @@ impl QueryExecutor {
 
     pub fn normalize_exec_call(sql: &str) -> Option<String> {
         let cleaned = Self::strip_leading_comments(sql);
-        let upper = cleaned.to_uppercase();
-        if upper.starts_with("EXECUTE IMMEDIATE") || upper.starts_with("EXEC IMMEDIATE") {
+        let tokens = cleaned
+            .split_whitespace()
+            .take(2)
+            .map(|token| token.to_uppercase())
+            .collect::<Vec<_>>();
+        if matches!(tokens.as_slice(), [first, second] if (first == "EXECUTE" || first == "EXEC") && second == "IMMEDIATE")
+        {
             let body = cleaned.trim().trim_end_matches(';').trim();
             if body.is_empty() {
                 return None;
