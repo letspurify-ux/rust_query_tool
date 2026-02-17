@@ -1707,7 +1707,8 @@ impl SqlEditorWidget {
             while sep < bytes.len() && bytes[sep].is_ascii_whitespace() {
                 sep += 1;
             }
-            if sep > idx {
+            let whitespace_count = sep.saturating_sub(idx);
+            if whitespace_count >= 2 {
                 return Some(&line[sep..]);
             }
         }
@@ -2280,6 +2281,14 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
         assert_eq!(normalized, "WITH cte AS (SELECT 1 FROM dual)
 SELECT * FROM cte
 ");
+    }
+
+    #[test]
+    fn normalize_intellisense_context_text_keeps_numeric_literal_line_prefixes() {
+        let input = "SELECT\n1 + 2 AS total\nFROM dual";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, input);
     }
 
     #[test]
