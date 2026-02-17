@@ -292,6 +292,18 @@ enum SaveTabOutcome {
     Failed(String),
 }
 
+fn should_apply_disconnect_for_health_check(
+    checked_connection_id: Option<usize>,
+    current_connection_id: Option<usize>,
+) -> bool {
+    match checked_connection_id {
+        Some(checked_id) => current_connection_id
+            .map(|current_id| checked_id == current_id)
+            .unwrap_or(false),
+        None => current_connection_id.is_none(),
+    }
+}
+
 impl MainWindow {
     fn transition_to_disconnected_state(state: &mut AppState, error_message: Option<&str>) {
         *state.connection_info.borrow_mut() = None;
@@ -1573,7 +1585,8 @@ impl MainWindow {
                                     data.views = views;
                                 }
                                 data.rebuild_indices();
-                                highlight_data.columns = MainWindow::collect_highlight_columns(&data);
+                                highlight_data.columns =
+                                    MainWindow::collect_highlight_columns(&data);
                                 let _ = schema_sender.send(SchemaUpdate {
                                     data,
                                     highlight_data,
@@ -1619,17 +1632,15 @@ impl MainWindow {
 
         let weak_state_for_dirty = Rc::downgrade(state);
         let mut buffer_for_dirty = editor.get_buffer();
-        buffer_for_dirty.add_modify_callback2(
-            move |buf, _pos, ins, del, _restyled, _deleted| {
-                let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
-                    return;
-                };
-                match state_for_dirty.try_borrow_mut() {
-                    Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
-                    Err(_) => {}
-                };
-            },
-        );
+        buffer_for_dirty.add_modify_callback2(move |buf, _pos, ins, del, _restyled, _deleted| {
+            let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
+                return;
+            };
+            match state_for_dirty.try_borrow_mut() {
+                Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
+                Err(_) => {}
+            };
+        });
     }
 
     fn attach_file_drop_callback(
@@ -2726,23 +2737,23 @@ impl MainWindow {
                             if let Some(message) = disconnect_message {
                                 let mut s = state.borrow_mut();
 
-                                let should_apply_disconnect = checked_connection_id
-                                    .zip(
-                                        crate::db::try_lock_connection(&s.connection)
-                                            .and_then(|guard| {
-                                                guard
-                                                    .get_connection()
-                                                    .as_ref()
-                                                    .map(|conn| std::sync::Arc::as_ptr(conn)
-                                                        as usize)
-                                            }),
-                                    )
-                                    .map(|(checked_id, current_id)| checked_id == current_id)
-                                    .unwrap_or(false);
+                                let current_connection_id = crate::db::try_lock_connection(
+                                    &s.connection,
+                                )
+                                .and_then(|guard| {
+                                    guard
+                                        .get_connection()
+                                        .as_ref()
+                                        .map(|conn| std::sync::Arc::as_ptr(conn) as usize)
+                                });
 
-                                if should_apply_disconnect
-                                    && s.connection_info.borrow().is_some()
-                                {
+                                let should_apply_disconnect =
+                                    should_apply_disconnect_for_health_check(
+                                        checked_connection_id,
+                                        current_connection_id,
+                                    );
+
+                                if should_apply_disconnect && s.connection_info.borrow().is_some() {
                                     MainWindow::transition_to_disconnected_state(
                                         &mut s,
                                         Some(&message),
@@ -3045,5 +3056,33 @@ impl MainWindow {
 impl Default for MainWindow {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod health_check_tests {
+    use super::should_apply_disconnect_for_health_check;
+
+    #[test]
+    fn applies_disconnect_when_same_connection_id() {
+        assert!(should_apply_disconnect_for_health_check(Some(10), Some(10)));
+    }
+
+    #[test]
+    fn does_not_apply_disconnect_when_connection_was_replaced() {
+        assert!(!should_apply_disconnect_for_health_check(
+            Some(10),
+            Some(11)
+        ));
+    }
+
+    #[test]
+    fn applies_disconnect_when_both_connections_are_none() {
+        assert!(should_apply_disconnect_for_health_check(None, None));
+    }
+
+    #[test]
+    fn does_not_apply_disconnect_when_check_had_no_connection_but_current_exists() {
+        assert!(!should_apply_disconnect_for_health_check(None, Some(7)));
     }
 }
