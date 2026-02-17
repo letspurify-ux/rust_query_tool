@@ -187,6 +187,7 @@ impl SqlEditorWidget {
 
     pub fn format_selected_sql(&self) {
         let mut buffer = self.buffer.clone();
+        let full_text = buffer.text();
         let selection = buffer.selection_position();
         let (start, end, source, select_formatted) = match selection {
             Some((start, end)) if start != end => {
@@ -195,11 +196,16 @@ impl SqlEditorWidget {
                 } else {
                     (end, start)
                 };
-                (start, end, buffer.selection_text(), true)
+                (
+                    Self::normalize_index(&full_text, start),
+                    Self::normalize_index(&full_text, end),
+                    buffer.selection_text(),
+                    true,
+                )
             }
             _ => {
                 let text = buffer.text();
-                let end = buffer.length();
+                let end = Self::normalize_index(&full_text, buffer.length());
                 (0, end, text, false)
             }
         };
@@ -213,21 +219,34 @@ impl SqlEditorWidget {
         }
 
         let mut editor = self.editor.clone();
-        let original_pos = editor.insert_position();
-        buffer.replace(start, end, &formatted);
+        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
+        buffer.replace(start as i32, end as i32, &formatted);
 
         if select_formatted {
-            let original_within_selection = (original_pos - start).clamp(0, source.len() as i32);
+            let original_within_selection =
+                (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
             let mapped_within_selection =
                 Self::map_cursor_after_format(&source, &formatted, original_within_selection, true);
-            buffer.select(start, start + formatted.len() as i32);
-            editor.set_insert_position(start + mapped_within_selection);
+            let selection_end = start
+                + Self::clamp_to_char_boundary(&formatted, formatted.len());
+            let mapped_cursor = start
+                + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
+            buffer.select(start as i32, selection_end as i32);
+            editor.set_insert_position(mapped_cursor as i32);
         } else {
-            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos, false);
+            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos as i32, false);
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
         self.refresh_highlighting();
+    }
+
+    fn normalize_index(text: &str, index: i32) -> usize {
+        if index <= 0 {
+            0
+        } else {
+            Self::clamp_to_char_boundary(text, index as usize)
+        }
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
@@ -529,7 +548,7 @@ impl SqlEditorWidget {
     fn keeps_tight_spacing(current: &FormatItem, next: &FormatItem) -> bool {
         match (current, next) {
             (FormatItem::Statement(left), FormatItem::Statement(right)) => {
-                (left.trim_start().starts_with("--") && right.trim_start().starts_with("--"))
+                (Self::is_sqlplus_comment_line(left) && Self::is_sqlplus_comment_line(right))
                     || (Self::is_create_trigger_statement(left)
                         && Self::is_alter_trigger_statement(right))
             }
@@ -547,6 +566,18 @@ impl SqlEditorWidget {
             ) => true,
             _ => false,
         }
+    }
+
+    fn is_sqlplus_comment_line(statement: &str) -> bool {
+        let trimmed = statement.trim_start();
+        if trimmed.starts_with("--") {
+            return true;
+        }
+
+        matches!(
+            trimmed.split_whitespace().next(),
+            Some(first) if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
+        )
     }
 
     fn is_create_trigger_statement(statement: &str) -> bool {
@@ -581,6 +612,13 @@ impl SqlEditorWidget {
     }
 
     fn statement_has_code(statement: &str) -> bool {
+        let trimmed = statement.trim_start();
+        if let Some(first_word) = trimmed.split_whitespace().next() {
+            if first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK") {
+                return false;
+            }
+        }
+
         let tokens = Self::tokenize_sql(statement);
         tokens
             .iter()
@@ -1769,7 +1807,14 @@ impl SqlEditorWidget {
                         ensure_indent(&mut out, &mut at_line_start, line_indent);
                     }
 
-                    out.push_str(comment_body);
+                    let output_comment = if comment_body.trim_start().starts_with("--") {
+                        comment_body.to_string()
+                    } else if Self::is_sqlplus_comment_line(comment_body) {
+                        comment_body.to_uppercase()
+                    } else {
+                        comment_body.to_string()
+                    };
+                    out.push_str(&output_comment);
 
                     needs_space = true;
                     if comment_body.ends_with('\n') || comment_body.contains('\n') {
@@ -2141,8 +2186,9 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            let is_comment =
-                trimmed.starts_with("--") || trimmed.starts_with("/*") || trimmed == "*/";
+            let is_comment = Self::is_sqlplus_comment_line(trimmed)
+                || trimmed.starts_with("/*")
+                || trimmed == "*/";
             if is_comment {
                 if trimmed.starts_with("/*") {
                     out.push_str(line);
@@ -7817,6 +7863,18 @@ impl SqlEditorWidget {
                 return String::new();
             }
 
+            if matches!(
+                trimmed.split_whitespace().next(),
+                Some(first) if first.eq_ignore_ascii_case("REM")
+                    || first.eq_ignore_ascii_case("REMARK")
+            ) {
+                if let Some(line_end) = trimmed.find('\n') {
+                    remaining = &trimmed[line_end + 1..];
+                    continue;
+                }
+                return String::new();
+            }
+
             return trimmed.to_string();
         }
     }
@@ -8367,6 +8425,14 @@ FROM DUAL"
 {}",
             preserved
         );
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_ignores_sqlplus_remark_comment_text() {
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon("REM only a comment"));
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "REMARK this is a comment with ; semicolon"
+        ));
     }
 
     #[test]

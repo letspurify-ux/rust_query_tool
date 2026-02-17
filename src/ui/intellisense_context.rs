@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::sql_text;
 use crate::ui::sql_depth::{
     apply_paren_token,
     extract_parenthesized_tokens,
@@ -1033,6 +1034,80 @@ fn normalize_identifier_for_lookup(value: &str) -> String {
     strip_identifier_quotes(value).to_uppercase()
 }
 
+fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.trim().chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                current.push(ch);
+                if in_quotes {
+                    if chars.peek().copied() == Some('"') {
+                        current.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                }
+            }
+            '.' if !in_quotes => {
+                let segment = strip_identifier_quotes(current.trim());
+                if !segment.is_empty() {
+                    parts.push(segment);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let segment = strip_identifier_quotes(current.trim());
+    if !segment.is_empty() {
+        parts.push(segment);
+    }
+
+    parts
+}
+
+fn last_identifier_part_for_lookup(value: &str) -> Option<String> {
+    split_identifier_parts_for_lookup(value).into_iter().last()
+}
+
+fn is_quoted_identifier(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')
+}
+
+fn is_identifier_word_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_quoted_identifier(trimmed) {
+        return !strip_identifier_quotes(trimmed).is_empty();
+    }
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(sql_text::is_identifier_start_char)
+}
+
+fn normalize_table_name_part(value: &str) -> String {
+    let trimmed = value.trim();
+    let unquoted = strip_identifier_quotes(trimmed);
+    let is_quoted = is_quoted_identifier(trimmed);
+    if is_quoted && unquoted.contains('.') {
+        trimmed.to_string()
+    } else {
+        unquoted
+    }
+}
+
 /// Parse a table name at the given position (handling schema.table format).
 fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
     match tokens.get(start) {
@@ -1044,12 +1119,18 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
             if !is_quoted && (is_join_keyword(&upper) || is_table_stop_keyword(&upper)) {
                 return None;
             }
-            let mut parts = vec![strip_identifier_quotes(word)];
+            if !is_identifier_word_token(word) {
+                return None;
+            }
+            let mut parts = vec![normalize_table_name_part(word)];
             let mut idx = start + 1;
             // Handle dotted relation names like schema.table.
             while matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
                 if let Some(SqlToken::Word(name)) = tokens.get(idx + 1) {
-                    parts.push(strip_identifier_quotes(name));
+                    if !is_identifier_word_token(name) {
+                        break;
+                    }
+                    parts.push(normalize_table_name_part(name));
                     idx += 2;
                     continue;
                 }
@@ -1070,9 +1151,15 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
             let upper = word.to_uppercase();
             if upper == "AS" {
                 if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
+                    if !is_identifier_word_token(alias) {
+                        return (None, start + 2);
+                    }
                     return (Some(strip_identifier_quotes(alias)), start + 2);
                 }
                 return (None, start + 1);
+            }
+            if !is_identifier_word_token(word) {
+                return (None, start);
             }
             if is_quoted || !is_alias_breaker(&upper) {
                 return (Some(strip_identifier_quotes(word)), start + 1);
@@ -1118,8 +1205,14 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
                     break;
                 }
                 if let Some(SqlToken::Word(alias)) = tokens.get(idx) {
+                    if !is_identifier_word_token(alias) {
+                        return None;
+                    }
                     return Some((strip_identifier_quotes(alias), idx + 1));
                 }
+                return None;
+            }
+            if !is_identifier_word_token(word) {
                 return None;
             }
             if is_quoted || (!is_alias_breaker(&upper) && !is_join_keyword(&upper)) {
@@ -1255,10 +1348,8 @@ pub fn resolve_qualifier_tables(
             continue;
         }
 
-        if name_upper
-            .rsplit('.')
-            .next()
-            .is_some_and(|short| short == qualifier_upper)
+        if last_identifier_part_for_lookup(&table_ref.name)
+            .is_some_and(|short| short.eq_ignore_ascii_case(&qualifier_upper))
             && short_name_match
                 .as_ref()
                 .map_or(true, |(depth, _)| table_ref.depth >= *depth)
@@ -1438,25 +1529,61 @@ fn append_wildcard_item_tables(
         }
     }
 
-    // Qualified wildcard: `alias.*` (or `schema.table.*`; we resolve by the
-    // identifier immediately before the final dot).
+    // Qualified wildcard: `alias.*` or dotted qualifiers like `schema.table.*`.
     if meaningful.len() >= 3 {
         let last = meaningful[meaningful.len() - 1];
         let dot = meaningful[meaningful.len() - 2];
-        let qualifier = meaningful[meaningful.len() - 3];
-        if let (SqlToken::Symbol(star), SqlToken::Symbol(dot_sym), SqlToken::Word(q)) =
-            (last, dot, qualifier)
-        {
+        if let (SqlToken::Symbol(star), SqlToken::Symbol(dot_sym)) = (last, dot) {
             if star == "*" && dot_sym == "." {
-                let normalized = strip_identifier_quotes(q);
-                for table in resolve_qualifier_tables(&normalized, tables_in_scope) {
-                    let key = table.to_uppercase();
-                    if seen.insert(key) {
-                        tables.push(table);
+                if let Some(normalized) =
+                    normalize_dotted_identifier_tokens(&meaningful[..meaningful.len() - 2])
+                {
+                    for table in resolve_qualifier_tables(&normalized, tables_in_scope) {
+                        let key = table.to_uppercase();
+                        if seen.insert(key) {
+                            tables.push(table);
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+fn normalize_dotted_identifier_tokens(tokens: &[&SqlToken]) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut expect_word = true;
+    for token in tokens {
+        if expect_word {
+            if let SqlToken::Word(word) = token {
+                let segment = strip_identifier_quotes(word);
+                if segment.is_empty() {
+                    return None;
+                }
+                parts.push(segment);
+                expect_word = false;
+            } else {
+                return None;
+            }
+        } else if let SqlToken::Symbol(sym) = token {
+            if sym == "." {
+                expect_word = true;
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    if expect_word || parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("."))
     }
 }
 
@@ -1499,6 +1626,9 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
 
     // Case 1: Explicit alias `... AS alias_name`
     if let SqlToken::Word(alias) = last {
+        if !is_identifier_word_token(alias) {
+            return None;
+        }
         if let Some(SqlToken::Word(kw)) = second_last {
             if kw.eq_ignore_ascii_case("AS") {
                 return Some(alias.clone());
@@ -1531,6 +1661,9 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
     // Case 3: Simple column reference (single word)
     if meaningful.len() == 1 {
         if let SqlToken::Word(name) = meaningful[0] {
+            if !is_identifier_word_token(name) {
+                return None;
+            }
             return Some(name.clone());
         }
     }
@@ -1541,6 +1674,9 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
             (meaningful[0], meaningful[1], meaningful[2])
         {
             if dot == "." {
+                if !is_identifier_word_token(col) {
+                    return None;
+                }
                 return Some(col.clone());
             }
         }
@@ -1571,6 +1707,23 @@ fn is_select_item_trailing_keyword(word: &str) -> bool {
             | "START"
             | "BULK"
     )
+}
+
+#[cfg(test)]
+mod wildcard_resolution_tests {
+    use super::*;
+    use crate::ui::sql_editor::SqlEditorWidget;
+
+    #[test]
+    fn dotted_qualified_wildcard_prefers_full_table_name_over_alias_match() {
+        let sql = "SELECT schema_a.emp.* FROM schema_a.emp e JOIN dept emp ON e.deptno = emp.deptno";
+        let tokens = SqlEditorWidget::tokenize_sql(sql);
+        let ctx = analyze_cursor_context(&tokens, &tokens);
+
+        let wildcard_tables = extract_select_list_wildcard_tables(&tokens, &ctx.tables_in_scope);
+
+        assert_eq!(wildcard_tables, vec!["schema_a.emp".to_string()]);
+    }
 }
 
 #[cfg(test)]

@@ -964,10 +964,11 @@ impl SqlEditorWidget {
             }
         };
         let context_alias_suggestions = Self::collect_context_alias_suggestions(&prefix, &deep_ctx);
-        let suggestions = Self::merge_suggestions_with_context_aliases(
+        let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_alias_suggestions,
             matches!(context, SqlContext::TableName),
+            qualifier.is_some(),
         );
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
@@ -1064,16 +1065,20 @@ impl SqlEditorWidget {
             return false;
         }
 
+        fn table_is_loading(data: &IntellisenseData, table: &str) -> bool {
+            SqlEditorWidget::table_lookup_key_candidates(table)
+                .iter()
+                .map(|key| key.to_uppercase())
+                .any(|key| data.columns_loading.contains(&key))
+        }
+
         column_tables.iter().any(|table| {
-            let key = table.to_uppercase();
-            if data.columns_loading.contains(&key) {
+            if table_is_loading(data, table) {
                 return true;
             }
+            let key = table.to_uppercase();
             virtual_wildcard_dependencies.get(&key).is_some_and(|deps| {
-                deps.iter().any(|dep| {
-                    let dep_key = dep.to_uppercase();
-                    data.columns_loading.contains(&dep_key)
-                })
+                deps.iter().any(|dep| table_is_loading(data, dep))
             })
         })
     }
@@ -1150,6 +1155,19 @@ impl SqlEditorWidget {
         };
         merged.truncate(MAX_MERGED_SUGGESTIONS);
         merged
+    }
+
+    fn maybe_merge_suggestions_with_context_aliases(
+        mut base: Vec<String>,
+        aliases: Vec<String>,
+        prefer_aliases: bool,
+        has_qualifier: bool,
+    ) -> Vec<String> {
+        if has_qualifier {
+            base.truncate(MAX_MERGED_SUGGESTIONS);
+            return base;
+        }
+        Self::merge_suggestions_with_context_aliases(base, aliases, prefer_aliases)
     }
 
     fn maybe_prefetch_columns_for_word(
@@ -1252,22 +1270,25 @@ impl SqlEditorWidget {
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {
-        let normalized = Self::normalize_relation_lookup_key(table_name);
+        let segments = Self::relation_name_segments(table_name);
+        let normalized = segments.join(".");
         if normalized.is_empty() {
             return Vec::new();
         }
 
         let mut candidates = vec![normalized.clone()];
-        if let Some(last) = normalized.rsplit('.').next() {
-            if !last.eq_ignore_ascii_case(&normalized) && !last.trim().is_empty() {
-                candidates.push(last.trim().to_string());
+        if Self::has_unquoted_dot(table_name) {
+            if let Some(last) = segments.last() {
+                if !last.eq_ignore_ascii_case(&normalized) && !last.trim().is_empty() {
+                    candidates.push(last.trim().to_string());
+                }
             }
         }
 
         candidates
     }
 
-    fn normalize_relation_lookup_key(value: &str) -> String {
+    fn relation_name_segments(value: &str) -> Vec<String> {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut chars = value.trim().chars().peekable();
@@ -1304,7 +1325,30 @@ impl SqlEditorWidget {
             parts.push(segment);
         }
 
-        parts.join(".")
+        parts
+    }
+
+    fn has_unquoted_dot(value: &str) -> bool {
+        let mut chars = value.trim().chars().peekable();
+        let mut in_quotes = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        if chars.peek().copied() == Some('"') {
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                    }
+                }
+                '.' if !in_quotes => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn word_at_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize, usize) {
@@ -1605,7 +1649,6 @@ impl SqlEditorWidget {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
-        let start = buffer.line_start(start).max(0);
         let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
         let (stmt_start, _) = Self::statement_bounds_in_text(&text, text.len());
         text.get(stmt_start..).unwrap_or("").to_string()
@@ -1619,8 +1662,6 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
         let end = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
-        let start = buffer.line_start(start).max(0);
-        let end = buffer.line_end(end).max(start);
         let Some(text) = buffer.text_range(start, end) else {
             return String::new();
         };
@@ -1630,6 +1671,31 @@ impl SqlEditorWidget {
         }
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
         text.get(stmt_start..stmt_end).unwrap_or("").to_string()
+    }
+
+    #[cfg(test)]
+    fn statement_context_in_text(text: &str, cursor_pos: usize) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let cursor_pos = cursor_pos.min(text.len());
+        let start = cursor_pos.saturating_sub(INTELLISENSE_STATEMENT_WINDOW as usize);
+        let end = cursor_pos
+            .saturating_add(INTELLISENSE_STATEMENT_WINDOW as usize)
+            .min(text.len());
+        let window = text.get(start..end).unwrap_or("");
+        let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
+        let (stmt_start, stmt_end) = Self::statement_bounds_in_text(window, rel_cursor);
+        window.get(stmt_start..stmt_end).unwrap_or("").to_string()
+    }
+
+    #[cfg(test)]
+    fn context_before_cursor_in_text(text: &str, cursor_pos: usize) -> String {
+        let cursor_pos = cursor_pos.min(text.len());
+        let start = cursor_pos.saturating_sub(INTELLISENSE_CONTEXT_WINDOW as usize);
+        let window = text.get(start..cursor_pos).unwrap_or("");
+        let (stmt_start, _) = Self::statement_bounds_in_text(window, window.len());
+        window.get(stmt_start..).unwrap_or("").to_string()
     }
 
     fn normalize_intellisense_context_text(text: &str) -> String {
@@ -1772,21 +1838,26 @@ impl SqlEditorWidget {
         let idx = rel_word_start - 1;
 
         if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
-            let mut pos = idx - 1;
-            while pos > 0 {
-                pos -= 1;
-                if bytes[pos] == b'"' {
-                    if pos > 0 && bytes[pos - 1] == b'"' {
-                        pos = pos.saturating_sub(1);
+            let mut pos = idx as isize - 2;
+            loop {
+                if pos < 0 {
+                    break;
+                }
+                let pos_usize = pos as usize;
+                if bytes[pos_usize] == b'"' {
+                    if pos_usize > 0 && bytes[pos_usize - 1] == b'"' {
+                        // `""` escape sequence inside quoted identifier: skip the pair.
+                        pos -= 2;
                         continue;
                     }
-                    let quoted = text.get(pos..idx)?;
+                    let quoted = text.get(pos_usize..idx)?;
                     let qualifier = Self::strip_identifier_quotes(quoted);
                     if qualifier.is_empty() {
                         return None;
                     }
                     return Some(qualifier);
                 }
+                pos -= 1;
             }
             return None;
         }
@@ -2372,6 +2443,53 @@ FROM d
     }
 
     #[test]
+    fn statement_context_uses_window_slice_for_large_multiline_statement() {
+        let mut sql = String::from("SELECT\n");
+        for _ in 0..3_000 {
+            sql.push_str("col_a, col_b, col_c, col_d, col_e, col_f, col_g,\n");
+        }
+        sql.push_str("dummy_table.col_h,\n");
+        sql.push_str("dummy_table.col_i\n");
+        sql.push_str("FROM dummy_schema.dummy_table\n");
+
+        let cursor = sql.len();
+        let context = SqlEditorWidget::statement_context_in_text(&sql, cursor);
+        assert!(
+            context.contains("dummy_table.col_h"),
+            "statement_context should include the latest select list columns, got {:?}",
+            context.get(0..120).unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn context_before_cursor_uses_window_slice_for_large_multiline_statement() {
+        let mut sql = String::from("SELECT\n");
+        for _ in 0..3_000 {
+            sql.push_str("col_a, col_b, col_c, col_d, col_e, col_f, col_g,\n");
+        }
+        sql.push_str("dummy_table.col_h,\n");
+        sql.push_str("dummy_table.col_i\n");
+        sql.push_str("FROM dummy_schema.dummy_table\n");
+
+        let cursor = sql.len();
+        let context = SqlEditorWidget::context_before_cursor_in_text(&sql, cursor);
+        assert!(
+            context.contains("dummy_table.col_i"),
+            "context_before_cursor should include the latest select list columns, got {:?}",
+            context.get(0..120).unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn qualifier_before_word_in_text_supports_quoted_identifier_at_text_start() {
+        let sql_with_cursor = r#""e".| FROM "Employees" e"#;
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("e"));
+    }
+
+    #[test]
     fn parse_dropped_file_token_decodes_utf8_percent_sequences() {
         let token = "file:///tmp/%ED%95%9C%EA%B8%80.sql";
         let parsed = SqlEditorWidget::parse_dropped_file_token(token);
@@ -2531,6 +2649,42 @@ FROM d
     }
 
     #[test]
+    fn column_loading_scope_detects_schema_qualified_pending_refresh() {
+        let mut data = IntellisenseData::new();
+        data.columns_loading.insert("EMP".to_string());
+        let column_tables = vec!["hr.emp".to_string()];
+        let deps = HashMap::new();
+        assert!(SqlEditorWidget::has_column_loading_for_scope(
+            true,
+            &column_tables,
+            &deps,
+            &data
+        ));
+    }
+
+    #[test]
+    fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier() {
+        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        {
+            let mut guard = data.borrow_mut();
+            guard.tables = vec!["B".to_string()];
+            guard.rebuild_indices();
+        }
+
+        let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let _conn_guard = connection.lock().ok();
+
+        SqlEditorWidget::request_table_columns("\"A.B\"", &data, &sender, &connection);
+
+        let update = receiver.recv_timeout(Duration::from_millis(200));
+        assert!(
+            update.is_err(),
+            "quoted identifier with embedded dot should not fall back to unqualified key"
+        );
+    }
+
+    #[test]
     fn intellisense_data_clears_stale_column_loading_entries() {
         let mut data = IntellisenseData::new();
         assert!(data.mark_columns_loading("EMP"));
@@ -2619,6 +2773,21 @@ FROM d
         let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, vec![], false);
 
         assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
+    }
+
+    #[test]
+    fn maybe_merge_suggestions_with_context_aliases_skips_aliases_when_qualified() {
+        let base = vec!["EMPNO".to_string(), "ENAME".to_string()];
+        let aliases = vec!["e".to_string(), "emp".to_string()];
+
+        let merged = SqlEditorWidget::maybe_merge_suggestions_with_context_aliases(
+            base.clone(),
+            aliases,
+            false,
+            true,
+        );
+
+        assert_eq!(merged, base);
     }
 
     #[test]

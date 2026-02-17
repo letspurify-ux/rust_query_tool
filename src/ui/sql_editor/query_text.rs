@@ -15,11 +15,30 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
     let mut i = 0;
     let mut current = String::new();
     let mut scan_state = SplitState::default();
-    let mut pending_newline = false;
+    let mut pending_newline = true;
 
     let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
         if !current.is_empty() {
             tokens.push(SqlToken::Word(std::mem::take(current)));
+        }
+    };
+
+    let is_sqlplus_line_comment = |chars: &[char], start: usize, keyword: &str| -> bool {
+        if start >= chars.len() {
+            return false;
+        }
+        let keyword_chars = keyword.chars().collect::<Vec<_>>();
+        if start + keyword_chars.len() > chars.len() {
+            return false;
+        }
+        for (idx, kw_char) in keyword_chars.iter().enumerate() {
+            if !chars[start + idx].eq_ignore_ascii_case(kw_char) {
+                return false;
+            }
+        }
+        match chars.get(start + keyword_chars.len()) {
+            None => true,
+            Some(ch) => ch.is_whitespace(),
         }
     };
 
@@ -36,6 +55,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             if c == '\n' {
                 tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
                 scan_state.in_line_comment = false;
+                pending_newline = true;
             }
             i += 1;
             continue;
@@ -111,6 +131,19 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             if c == '\n' {
                 pending_newline = true;
             }
+            i += 1;
+            continue;
+        }
+
+        if pending_newline && (is_sqlplus_line_comment(&chars, i, "REMARK") ||
+            is_sqlplus_line_comment(&chars, i, "REM")) {
+            flush_word(&mut current, &mut tokens);
+            scan_state.in_line_comment = true;
+            if pending_newline {
+                current.push('\n');
+            }
+            current.push(c);
+            pending_newline = false;
             i += 1;
             continue;
         }
@@ -303,6 +336,7 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::has_connection_bootstrap_command;
+    use crate::ui::sql_editor::SqlToken;
 
     #[test]
     fn has_connection_bootstrap_command_detects_connect_and_script_lines() {
@@ -315,6 +349,19 @@ mod tests {
         let sql = "SELECT level FROM dual CONNECT BY level <= 10";
         assert!(!has_connection_bootstrap_command(sql));
     }
+
+    #[test]
+    fn tokenize_sql_treats_sqlplus_rem_comment_as_comment_token() {
+        let tokens = super::tokenize_sql("REM comment line");
+        assert!(matches!(tokens.first(), Some(SqlToken::Comment(_))));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_sqlplus_remark_comment_as_comment_token() {
+        let tokens = super::tokenize_sql("  REMARK line with leading spaces");
+        assert!(matches!(tokens.first(), Some(SqlToken::Comment(_))));
+    }
+
 }
 
 /// SQL*Plus 커맨드 라인인지 판별합니다.

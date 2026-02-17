@@ -18,11 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::{
-    Arc,
-    Condvar,
-    Mutex,
-};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,8 +83,7 @@ pub struct AppState {
 }
 
 struct HealthCheckStopSignal {
-    should_stop: Mutex<bool>,
-    condvar: Condvar,
+    stop_sender: std::sync::mpsc::Sender<()>,
 }
 
 impl AppState {
@@ -332,6 +327,13 @@ fn should_apply_disconnect_for_health_check(
             .unwrap_or(true),
         None => current_connection_id.is_none(),
     }
+}
+
+fn should_restart_health_check_worker(
+    health_channel_disconnected: bool,
+    health_worker_registered: bool,
+) -> bool {
+    health_channel_disconnected && health_worker_registered
 }
 
 #[derive(Clone, Copy)]
@@ -1426,17 +1428,7 @@ impl MainWindow {
     }
 
     fn collect_highlight_columns(data: &IntellisenseData) -> Vec<String> {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut columns = Vec::new();
-        for names in data.columns.values() {
-            for name in names {
-                let upper = name.to_uppercase();
-                if seen.insert(upper) {
-                    columns.push(name.clone());
-                }
-            }
-        }
-        columns
+        data.get_all_columns_for_highlighting()
     }
 
     fn attach_editor_callbacks(
@@ -2521,12 +2513,7 @@ impl MainWindow {
 
     fn stop_health_check_worker(state: &Rc<RefCell<AppState>>) {
         if let Some(stop_signal) = state.borrow_mut().health_stop_signal.take() {
-            let mut should_stop = stop_signal
-                .should_stop
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *should_stop = true;
-            stop_signal.condvar.notify_one();
+            let _ = stop_signal.stop_sender.send(());
         }
     }
 
@@ -2534,41 +2521,27 @@ impl MainWindow {
         connection: SharedConnection,
         health_sender: std::sync::mpsc::Sender<ConnectionHealthResult>,
     ) -> Arc<HealthCheckStopSignal> {
-        let stop_signal = Arc::new(HealthCheckStopSignal {
-            should_stop: Mutex::new(false),
-            condvar: Condvar::new(),
-        });
-        let worker_stop_signal = stop_signal.clone();
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel::<()>();
+        let stop_signal = Arc::new(HealthCheckStopSignal { stop_sender });
         thread::spawn(move || {
             loop {
-                let should_stop = match worker_stop_signal.should_stop.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let (should_stop, timeout_result) = match worker_stop_signal
-                    .condvar
-                    .wait_timeout(should_stop, CONNECTION_HEALTH_CHECK_INTERVAL)
-                {
-                    Ok(wait_result) => wait_result,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if *should_stop {
-                    break;
+                match stop_receiver.recv_timeout(CONNECTION_HEALTH_CHECK_INTERVAL) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                if !timeout_result.timed_out() {
-                    continue;
-                }
-                drop(should_stop);
 
                 let (disconnect_message, checked_connection_id, checked_connection_generation) =
                     if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
-                        let checked_connection_generation = conn_guard.connection_generation();
                         let checked_connection_id = conn_guard
                             .get_connection()
                             .as_ref()
                             .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
+                        let disconnect_message = conn_guard.require_live_connection().err();
+                        // Capture generation after the liveness probe because the probe may
+                        // transition the connection to disconnected and increment generation.
+                        let checked_connection_generation = conn_guard.connection_generation();
                         (
-                            conn_guard.require_live_connection().err(),
+                            disconnect_message,
                             checked_connection_id,
                             checked_connection_generation,
                         )
@@ -2630,6 +2603,7 @@ impl MainWindow {
             let mut schema_disconnected = false;
             let mut conn_disconnected = false;
             let mut file_disconnected = false;
+            let mut health_disconnected = false;
 
             // Check for schema updates
             {
@@ -2872,10 +2846,32 @@ impl MainWindow {
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            health_disconnected = true;
                             break;
                         }
                     }
                 }
+            }
+
+            if should_restart_health_check_worker(
+                health_disconnected,
+                state.borrow().health_stop_signal.is_some(),
+            ) {
+                crate::utils::logging::log_error(
+                    "connection",
+                    "Connection health-check worker stopped unexpectedly; restarting.",
+                );
+
+                MainWindow::stop_health_check_worker(&state);
+
+                let (health_sender, new_health_receiver) =
+                    std::sync::mpsc::channel::<ConnectionHealthResult>();
+                *health_receiver.borrow_mut() = new_health_receiver;
+
+                let health_connection = state.borrow().connection.clone();
+                let stop_flag =
+                    MainWindow::start_health_check_worker(health_connection, health_sender);
+                state.borrow_mut().health_stop_signal = Some(stop_flag);
             }
 
             // Stop polling if all channels are disconnected
@@ -3131,7 +3127,10 @@ impl Default for MainWindow {
 
 #[cfg(test)]
 mod health_check_tests {
-    use super::{should_apply_disconnect_for_health_check, HealthCheckCurrentConnectionState};
+    use super::{
+        should_apply_disconnect_for_health_check, should_restart_health_check_worker,
+        HealthCheckCurrentConnectionState,
+    };
 
     #[test]
     fn applies_disconnect_when_same_connection_id() {
@@ -3166,6 +3165,15 @@ mod health_check_tests {
                 id: 10,
                 generation: 6,
             },
+        ));
+    }
+
+    #[test]
+    fn does_not_apply_disconnect_when_health_check_generation_is_stale_for_absent_connection() {
+        assert!(!should_apply_disconnect_for_health_check(
+            Some(10),
+            5,
+            HealthCheckCurrentConnectionState::Absent { generation: 6 },
         ));
     }
 
@@ -3206,5 +3214,20 @@ mod health_check_tests {
                 generation: 5
             },
         ));
+    }
+
+    #[test]
+    fn restarts_health_worker_when_channel_disconnected_and_worker_registered() {
+        assert!(should_restart_health_check_worker(true, true));
+    }
+
+    #[test]
+    fn does_not_restart_health_worker_when_channel_disconnected_but_worker_not_registered() {
+        assert!(!should_restart_health_check_worker(true, false));
+    }
+
+    #[test]
+    fn does_not_restart_health_worker_when_channel_is_connected() {
+        assert!(!should_restart_health_check_worker(false, true));
     }
 }

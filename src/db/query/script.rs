@@ -707,6 +707,18 @@ impl StatementBuilder {
 }
 
 impl QueryExecutor {
+    fn is_sqlplus_comment_line(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--") {
+            return true;
+        }
+
+        matches!(
+            trimmed.split_whitespace().next(),
+            Some(first) if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
+        )
+    }
+
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
         fn should_pre_dedent(leading_word: &str) -> bool {
             matches!(leading_word, "END" | "ELSE" | "ELSIF" | "EXCEPTION")
@@ -715,6 +727,11 @@ impl QueryExecutor {
             matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
         };
         let leading_keyword_after_comments = |line: &str| -> Option<String> {
+            let trimmed = line.trim_start();
+            if Self::is_sqlplus_comment_line(trimmed) {
+                return None;
+            }
+
             let bytes = line.as_bytes();
             let mut i = 0usize;
 
@@ -788,7 +805,7 @@ impl QueryExecutor {
 
             let trimmed_start = line.trim_start();
             let is_comment_or_blank = trimmed_start.is_empty()
-                || trimmed_start.starts_with("--")
+                || Self::is_sqlplus_comment_line(trimmed_start)
                 || trimmed_start.starts_with("/*")
                 || trimmed_start.starts_with("*/");
 
@@ -1127,7 +1144,7 @@ impl QueryExecutor {
         loop {
             let trimmed = remaining.trim_start();
 
-            if trimmed.starts_with("--") {
+            if Self::is_sqlplus_comment_line(trimmed) {
                 if let Some(line_end) = trimmed.find('\n') {
                     remaining = &trimmed[line_end + 1..];
                     continue;
@@ -1160,14 +1177,13 @@ impl QueryExecutor {
             // Find the last line and check if it's only a comment
             if let Some(last_newline) = trimmed.rfind('\n') {
                 let last_line = trimmed[last_newline + 1..].trim();
-                if last_line.starts_with("--") {
+                if Self::is_sqlplus_comment_line(last_line) {
                     result = trimmed[..last_newline].to_string();
                     continue;
                 }
             } else {
                 // Single line - check if entire thing is a line comment
-                let trimmed_start = trimmed.trim_start();
-                if trimmed_start.starts_with("--") {
+                if Self::is_sqlplus_comment_line(trimmed) {
                     return String::new();
                 }
             }
@@ -1579,6 +1595,7 @@ impl QueryExecutor {
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
             let trimmed_upper = trimmed.to_uppercase();
+            let is_remark_line = Self::is_sqlplus_comment_line(trimmed);
 
             if !sqlblanklines_enabled
                 && trimmed.is_empty()
@@ -1595,6 +1612,10 @@ impl QueryExecutor {
 
             if builder.is_idle() && builder.current_is_empty() {
                 if trimmed.starts_with("--") {
+                    items.push(FormatItem::Statement(line.to_string()));
+                    continue;
+                }
+                if is_remark_line {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }

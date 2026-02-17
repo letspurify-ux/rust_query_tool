@@ -778,6 +778,7 @@ pub struct IntellisenseData {
     procedure_entries: Vec<NameEntry>,
     function_entries: Vec<NameEntry>,
     column_entries_by_table: HashMap<String, Vec<NameEntry>>,
+    virtual_column_entries_by_table: HashMap<String, Vec<NameEntry>>,
     all_columns_entries: Vec<NameEntry>,
     all_columns_dirty: bool,
     relations_upper: HashSet<String>,
@@ -801,6 +802,7 @@ impl IntellisenseData {
             procedure_entries: Vec::new(),
             function_entries: Vec::new(),
             column_entries_by_table: HashMap::new(),
+            virtual_column_entries_by_table: HashMap::new(),
             all_columns_entries: Vec::new(),
             all_columns_dirty: false,
             relations_upper: HashSet::new(),
@@ -842,8 +844,7 @@ impl IntellisenseData {
             match column_tables {
                 Some(tables) if !tables.is_empty() => {
                     for table in tables {
-                        let key = table.to_uppercase();
-                        if let Some(cols) = self.column_entries_by_table.get(&key) {
+                        if let Some(cols) = self.column_entries_for_scope_table(table) {
                             if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen)
                             {
                                 break;
@@ -964,8 +965,7 @@ impl IntellisenseData {
             match column_tables {
                 Some(tables) if !tables.is_empty() => {
                     for table in tables {
-                        let key = table.to_uppercase();
-                        if let Some(cols) = self.column_entries_by_table.get(&key) {
+                        if let Some(cols) = self.column_entries_for_scope_table(table) {
                             if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen)
                             {
                                 break;
@@ -1004,14 +1004,13 @@ impl IntellisenseData {
         let mut seen = HashSet::new();
 
         match column_tables {
-            Some(tables) if !tables.is_empty() => {
-                for table in tables {
-                    let key = table.to_uppercase();
-                    if let Some(cols) = self.column_entries_by_table.get(&key) {
-                        if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
-                            break;
+                Some(tables) if !tables.is_empty() => {
+                    for table in tables {
+                        if let Some(cols) = self.column_entries_for_scope_table(table) {
+                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
+                                break;
+                            }
                         }
-                    }
                 }
             }
             _ => {
@@ -1030,10 +1029,71 @@ impl IntellisenseData {
         suggestions
     }
 
+    fn column_entries_for_scope_table(&self, table: &str) -> Option<&[NameEntry]> {
+        let key = table.to_uppercase();
+        if let Some(entries) = self.column_entries_for_exact_key(&key) {
+            return Some(entries);
+        }
+        if let Some(short) = key.rsplit('.').next() {
+            if short != key {
+                return self.column_entries_for_exact_key(short);
+            }
+        }
+        None
+    }
+
+    fn column_entries_for_exact_key(&self, key: &str) -> Option<&[NameEntry]> {
+        self.virtual_column_entries_by_table
+            .get(key)
+            .map(Vec::as_slice)
+            .or_else(|| self.column_entries_by_table.get(key).map(Vec::as_slice))
+    }
+
     #[allow(dead_code)]
     pub fn get_columns_for_table(&self, table_name: &str) -> Vec<String> {
         let key = table_name.to_uppercase();
-        self.columns.get(&key).cloned().unwrap_or_default()
+        if let Some(columns) = self.virtual_column_entries_by_table.get(&key) {
+            return columns.iter().map(|entry| entry.name.clone()).collect();
+        }
+        if let Some(columns) = self.columns.get(&key) {
+            return columns.clone();
+        }
+        if let Some(short) = key.rsplit('.').next() {
+            if short != key {
+                if let Some(columns) = self.virtual_column_entries_by_table.get(short) {
+                    return columns.iter().map(|entry| entry.name.clone()).collect();
+                }
+                if let Some(columns) = self.columns.get(short) {
+                    return columns.clone();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn get_all_columns_for_highlighting(&self) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut columns = Vec::new();
+
+        for names in self.columns.values() {
+            for name in names {
+                let upper = name.to_uppercase();
+                if seen.insert(upper) {
+                    columns.push(name.clone());
+                }
+            }
+        }
+
+        for names in self.virtual_column_entries_by_table.values() {
+            for entry in names {
+                let upper = entry.upper.clone();
+                if seen.insert(upper) {
+                    columns.push(entry.name.clone());
+                }
+            }
+        }
+
+        columns
     }
 
     pub fn set_columns_for_table(&mut self, table_name: &str, columns: Vec<String>) {
@@ -1110,6 +1170,7 @@ impl IntellisenseData {
             self.column_entries_by_table
                 .insert(table.clone(), Self::build_entries(columns));
         }
+        self.virtual_column_entries_by_table.clear();
         self.all_columns_entries.clear();
         self.all_columns_dirty = true;
         self.virtual_table_keys.clear();
@@ -1119,8 +1180,7 @@ impl IntellisenseData {
     /// These may be stale because the user edited the SQL text.
     pub fn clear_virtual_tables(&mut self) {
         for key in self.virtual_table_keys.drain() {
-            self.columns.remove(&key);
-            self.column_entries_by_table.remove(&key);
+            self.virtual_column_entries_by_table.remove(&key);
         }
         self.all_columns_dirty = true;
     }
@@ -1129,8 +1189,7 @@ impl IntellisenseData {
     /// These are text-derived columns, not loaded from the database.
     pub fn set_virtual_table_columns(&mut self, name: &str, columns: Vec<String>) {
         let key = name.to_uppercase();
-        self.columns.insert(key.clone(), columns.clone());
-        self.column_entries_by_table
+        self.virtual_column_entries_by_table
             .insert(key.clone(), Self::build_entries(&columns));
         self.virtual_table_keys.insert(key);
         self.all_columns_dirty = true;
@@ -1151,7 +1210,12 @@ impl IntellisenseData {
             return;
         }
         let mut all = Vec::new();
-        for entries in self.column_entries_by_table.values() {
+        for (table, entries) in &self.column_entries_by_table {
+            if !self.virtual_column_entries_by_table.contains_key(table) {
+                all.extend(entries.iter().cloned());
+            }
+        }
+        for entries in self.virtual_column_entries_by_table.values() {
             all.extend(entries.iter().cloned());
         }
         all.sort_by(|a, b| a.upper.cmp(&b.upper).then_with(|| a.name.cmp(&b.name)));
@@ -1639,5 +1703,89 @@ mod intellisense_tests {
         let emp_count = suggestions.iter().filter(|value| value.eq_ignore_ascii_case("EMP")).count();
         assert_eq!(emp_count, 1);
         assert!(suggestions.iter().any(|value| value.eq_ignore_ascii_case("EMP")));
+    }
+
+    #[test]
+    fn virtual_table_columns_do_not_remove_real_table_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["REAL_COL".to_string()]);
+        data.set_virtual_table_columns("EMP", vec!["VIRTUAL_COL".to_string()]);
+        data.clear_virtual_tables();
+
+        let columns = data.get_column_suggestions("", Some(&vec!["EMP".to_string()]));
+        assert!(
+            columns.contains(&"REAL_COL".to_string()),
+            "real table columns should remain cached after virtual cache clear"
+        );
+        assert!(
+            !columns.contains(&"VIRTUAL_COL".to_string()),
+            "virtual table columns should be cleared when clear_virtual_tables is called"
+        );
+    }
+
+    #[test]
+    fn virtual_table_columns_take_precedence_before_real_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["REAL_COL".to_string()]);
+        data.set_virtual_table_columns("EMP", vec!["VIRTUAL_COL".to_string()]);
+
+        let columns = data.get_column_suggestions("", Some(&vec!["EMP".to_string()]));
+        assert!(
+            columns.contains(&"VIRTUAL_COL".to_string()),
+            "virtual table columns should be used while virtual entries exist"
+        );
+        assert!(
+            !columns.contains(&"REAL_COL".to_string()),
+            "real table columns should not be included while virtual override exists"
+        );
+    }
+
+    #[test]
+    fn get_columns_for_table_uses_virtual_cache_when_available() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["REAL_COL".to_string()]);
+        data.set_virtual_table_columns("EMP", vec!["VIRTUAL_COL".to_string()]);
+
+        let columns = data.get_columns_for_table("EMP");
+        assert_eq!(columns, vec!["VIRTUAL_COL".to_string()]);
+    }
+
+    #[test]
+    fn get_columns_for_table_falls_back_to_unqualified_cache_key() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["EMPNO".to_string()]);
+
+        let columns = data.get_columns_for_table("SCOTT.EMP");
+        assert_eq!(columns, vec!["EMPNO".to_string()]);
+    }
+
+    #[test]
+    fn get_all_columns_for_highlighting_includes_virtual_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["REAL_COL".to_string()]);
+        data.set_virtual_table_columns("VIRTUAL", vec!["VIRTUAL_COL".to_string()]);
+
+        let columns = data.get_all_columns_for_highlighting();
+        assert!(columns.contains(&"REAL_COL".to_string()));
+        assert!(columns.contains(&"VIRTUAL_COL".to_string()));
+    }
+
+    #[test]
+    fn get_column_suggestions_scope_falls_back_to_unqualified_table_cache_key() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["HELP".to_string()];
+        data.rebuild_indices();
+        data.set_columns_for_table("HELP", vec!["TOPIC".to_string(), "TEXT".to_string()]);
+
+        let scope = vec!["SCOTT.HELP".to_string()];
+        let suggestions = data.get_column_suggestions("", Some(scope.as_slice()));
+
+        assert!(
+            suggestions
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("TOPIC")),
+            "expected schema-qualified scope to reuse unqualified cached columns, got: {:?}",
+            suggestions
+        );
     }
 }

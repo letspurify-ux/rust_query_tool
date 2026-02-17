@@ -88,6 +88,41 @@ fn test_normalize_sql_for_execute_removes_sqlplus_slash_for_plsql_block() {
 }
 
 #[test]
+fn test_split_script_items_ignores_trailing_remark_comment_line() {
+    let sql = "SELECT 1 FROM dual\nREMARK trailing note";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0], "SELECT 1 FROM dual");
+}
+
+#[test]
+fn test_split_script_items_ignores_trailing_rem_comment_with_indented_comment() {
+    let sql = "SELECT 1 FROM dual\n  REM indented note";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0], "SELECT 1 FROM dual");
+}
+
+#[test]
+fn test_split_script_items_splits_before_inline_trailing_comment_after_semicolon() {
+    let sql = "SELECT 1 FROM dual; -- trailing note\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(stmts.len(), 2, "expected two statements, got: {stmts:?}");
+    assert_eq!(stmts[0], "SELECT 1 FROM dual");
+    assert!(
+        stmts[1].contains("SELECT 2 FROM dual"),
+        "second statement should not be merged into first, got: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_keeps_division_operator() {
     let normalized = QueryExecutor::normalize_sql_for_execute("SELECT 10/2 FROM dual");
     assert_eq!(normalized, "SELECT 10/2 FROM dual");
@@ -3684,6 +3719,55 @@ SELECT * FROM cte;"#;
     assert!(
         depths[main_select_idx] <= depths[with_idx],
         "Main SELECT should be dedented to CTE scope"
+    );
+}
+
+#[test]
+fn test_line_block_depths_works_with_sqlplus_comment_between_with_parenthesis_and_select() {
+    let sql = r#"WITH cte AS (
+REM first line of cte is comment
+SELECT 1 AS id
+FROM dual
+)
+SELECT * FROM cte;"#;
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let mut with_idx = None;
+    let mut cte_select_idx = None;
+    let mut main_select_idx = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if with_idx.is_none() && line.trim_start().to_uppercase().starts_with("WITH ") {
+            with_idx = Some(idx);
+        }
+
+        if cte_select_idx.is_none()
+            && line.trim_start().to_uppercase().starts_with("SELECT 1 AS")
+        {
+            cte_select_idx = Some(idx);
+        } else if main_select_idx.is_none()
+            && line.trim_start().to_uppercase().starts_with("SELECT * FROM CTE")
+        {
+            main_select_idx = Some(idx);
+        }
+    }
+
+    let with_idx = with_idx.expect("expected WITH clause line");
+    let cte_select_idx = cte_select_idx.expect("expected CTE SELECT line");
+    let main_select_idx = main_select_idx.expect("expected main SELECT line");
+
+    assert!(
+        depths[cte_select_idx] > depths[with_idx],
+        "CTE SELECT should be indented deeper than WITH line"
+    );
+    assert!(
+        depths[main_select_idx] <= depths[with_idx],
+        "Main SELECT should be dedented back to query scope"
+    );
+    assert!(
+        depths[cte_select_idx] > depths[main_select_idx],
+        "CTE SELECT should be deeper than main SELECT"
     );
 }
 

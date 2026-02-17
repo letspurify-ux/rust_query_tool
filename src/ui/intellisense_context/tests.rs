@@ -250,6 +250,37 @@ fn collect_quoted_table_and_alias() {
 }
 
 #[test]
+fn collect_quoted_table_with_dot_keeps_lookup_safe_form() {
+    let ctx = analyze(r#"SELECT | FROM "A.B" t"#);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"\"A.B\"".to_string()),
+        "quoted dotted table should preserve quoted form to avoid schema fallback ambiguity: {:?}",
+        names
+    );
+}
+
+#[test]
+fn collect_table_ignores_numeric_starting_token() {
+    let ctx = analyze("SELECT | FROM 123abc");
+    let names = table_names(&ctx);
+    assert!(
+        !names.iter().any(|name| name == "123ABC"),
+        "numeric-leading token should not be treated as table identifier: {:?}",
+        names
+    );
+}
+
+#[test]
+fn extract_select_list_columns_ignores_numeric_literals() {
+    let tokens = tokenize("SELECT 1e3, emp1, 42 FROM dual");
+    let columns = extract_select_list_columns(&tokens);
+    assert!(columns.iter().any(|name| name.eq_ignore_ascii_case("emp1")));
+    assert!(!columns.iter().any(|name| name.eq_ignore_ascii_case("1e3")));
+    assert!(!columns.iter().any(|name| name == "42"));
+}
+
+#[test]
 fn collect_multiple_joins() {
     let ctx = analyze(
         "SELECT | FROM employees e \

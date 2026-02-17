@@ -10,7 +10,6 @@ use fltk::{
 };
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1669,17 +1668,7 @@ fn is_word_edit_char(ch: char) -> bool {
 
 
 fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut columns = Vec::new();
-    for names in data.columns.values() {
-        for name in names {
-            let upper = name.to_uppercase();
-            if seen.insert(upper) {
-                columns.push(name.clone());
-            }
-        }
-    }
-    columns
+    data.get_all_columns_for_highlighting()
 }
 
 fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (usize, usize) {

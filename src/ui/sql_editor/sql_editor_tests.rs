@@ -895,6 +895,31 @@ fn format_sql_does_not_insert_blank_line_between_line_comments() {
 }
 
 #[test]
+fn format_sql_keeps_consecutive_sqlplus_comments_together() {
+    let input = "REM first\nREMARK second\nSELECT 1 FROM dual;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = ["REM FIRST", "REMARK SECOND", "", "SELECT 1", "FROM DUAL;"].join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_keeps_statement_boundary_when_semicolon_has_trailing_line_comment() {
+    let input = "SELECT 1 FROM dual; -- trailing note\nSELECT 2 FROM dual;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("SELECT 1\nFROM DUAL;"),
+        "first statement should remain independent, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("SELECT 2\nFROM DUAL;"),
+        "second statement should remain independent, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_does_not_insert_blank_line_between_prompt_commands() {
     let input = "PROMPT one\nPROMPT two\nSELECT 1 FROM dual;";
 
