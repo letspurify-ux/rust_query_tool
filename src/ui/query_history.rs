@@ -35,7 +35,6 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
         thread::spawn(move || {
             let mut history = QueryHistory::load();
-            let mut last_persist_error: Option<String> = None;
             let apply_command = |history: &mut QueryHistory,
                                  command: HistoryCommand,
                                  needs_save: &mut bool,
@@ -70,6 +69,7 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
                     &mut snapshot_replies,
                     &mut flush_replies,
                 );
+                let mut persist_result: Result<(), String> = Ok(());
                 // Drain any pending commands before saving
                 while let Ok(next) = receiver.try_recv() {
                     apply_command(
@@ -83,14 +83,14 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
                 if needs_save {
                     match history.save() {
                         Ok(()) => {
-                            last_persist_error = None;
+                            persist_result = Ok(());
                         }
                         Err(err) => {
                             let msg = format!("Query history save error: {err}");
                             crate::utils::logging::log_error("history", &msg);
                             eprintln!("{msg}");
                             history = previous_state;
-                            last_persist_error = Some(msg);
+                            persist_result = Err(msg);
                         }
                     }
                 }
@@ -99,13 +99,8 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
                     let _ = reply.send(history.queries.clone());
                 }
 
-                let save_result: Result<(), String> = match &last_persist_error {
-                    Some(err) => Err(err.clone()),
-                    None => Ok(()),
-                };
-
                 for reply in flush_replies {
-                    let _ = reply.send(save_result.clone());
+                    let _ = reply.send(persist_result.clone());
                 }
             }
         });

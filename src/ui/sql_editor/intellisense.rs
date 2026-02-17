@@ -1614,53 +1614,12 @@ impl SqlEditorWidget {
     }
 
     fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
-        if trimmed_line == "/" {
-            return true;
-        }
-        if trimmed_line.starts_with("@@") || trimmed_line.starts_with('@') {
-            return true;
-        }
-
-        let mut parts = trimmed_line.split_whitespace();
-        let Some(first) = parts.next() else {
-            return false;
-        };
-
-        let upper = first.to_uppercase();
-        matches!(
-            upper.as_str(),
-            "PROMPT"
-                | "SET"
-                | "SHOW"
-                | "DEFINE"
-                | "UNDEFINE"
-                | "VAR"
-                | "VARIABLE"
-                | "PRINT"
-                | "ACCEPT"
-                | "PAUSE"
-                | "SPOOL"
-                | "COLUMN"
-                | "COL"
-                | "BREAK"
-                | "COMPUTE"
-                | "CLEAR"
-                | "TTITLE"
-                | "BTITLE"
-                | "WHENEVER"
-                | "EXIT"
-                | "QUIT"
-                | "CONNECT"
-                | "CONN"
-                | "DISCONNECT"
-                | "HOST"
-                | "REM"
-                | "REMARK"
-        )
+        crate::ui::sql_editor::query_text::is_sqlplus_command_line(trimmed_line)
     }
 
+    // 문장 경계 계산은 실행/포맷 공통 규칙을 공유하기 위해 `query_text` 유틸을 사용합니다.
     fn statement_bounds_in_text(text: &str, cursor_pos: usize) -> (usize, usize) {
-        QueryExecutor::statement_bounds_at_cursor(text, cursor_pos).unwrap_or((0, text.len()))
+        crate::ui::sql_editor::query_text::statement_bounds_in_text(text, cursor_pos)
     }
 
     fn strip_identifier_quotes(value: &str) -> String {

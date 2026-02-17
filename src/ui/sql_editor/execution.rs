@@ -22,9 +22,16 @@ use std::time::{Duration, Instant};
 
 use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
-    QueryExecutor, QueryResult, ScriptItem, SessionState, SplitState, ToolCommand,
+    QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
-use crate::ui::sql_depth::{paren_depth_after, paren_depths};
+use crate::ui::sql_depth::{
+    is_depth,
+    is_top_level_depth,
+    paren_depth_after,
+    paren_depths,
+    split_top_level_keyword_groups,
+    split_top_level_symbol_groups,
+};
 use crate::ui::SQL_KEYWORDS;
 
 use super::*;
@@ -362,7 +369,7 @@ impl SqlEditorWidget {
 
     pub(crate) fn format_sql_basic(sql: &str) -> String {
         let mut formatted = String::new();
-        let items = QueryExecutor::split_format_items(sql);
+        let items = super::query_text::split_format_items(sql);
         if items.is_empty() {
             return String::new();
         }
@@ -708,14 +715,17 @@ impl SqlEditorWidget {
             }
             ToolCommand::Connect {
                 username,
+                password,
                 host,
                 port,
                 service_name,
-                ..
-            } => format!(
-                "CONNECT {}/****@{}:{}/{}",
-                username, host, port, service_name
-            ),
+            } => {
+                // 자동 포맷팅 결과를 AI(Codex/Claude)가 재마스킹하지 않도록 실제 비밀번호를 그대로 유지한다.
+                format!(
+                    "CONNECT {}/{}@{}:{}/{}",
+                    username, password, host, port, service_name
+                )
+            }
             ToolCommand::Disconnect => "DISCONNECT".to_string(),
             ToolCommand::Unsupported { raw, .. } => raw.clone(),
         }
@@ -2353,7 +2363,7 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    if token_depths.get(idx).copied().unwrap_or(0) == 0
+                    if is_top_level_depth(&token_depths, idx)
                         && seen_table
                         && !ctas
                         && open_idx.is_none()
@@ -2362,7 +2372,7 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
-                    if token_depths.get(idx).copied().unwrap_or(0) == 1
+                    if is_depth(&token_depths, idx, 1)
                         && open_idx.is_some()
                         && close_idx.is_none()
                     {
@@ -2385,24 +2395,8 @@ impl SqlEditorWidget {
         let suffix_tokens = &tokens[close_idx + 1..];
 
         let mut columns: Vec<Vec<SqlToken>> = Vec::new();
-        let mut current: Vec<SqlToken> = Vec::new();
-        let column_depths = paren_depths(column_tokens);
-
-        for (col_idx, token) in column_tokens.iter().enumerate() {
-            match token {
-                SqlToken::Symbol(sym)
-                    if sym == "," && column_depths.get(col_idx).copied().unwrap_or(0) == 0 =>
-                {
-                    if !current.is_empty() {
-                        columns.push(current);
-                        current = Vec::new();
-                    }
-                }
-                _ => current.push(token.clone()),
-            }
-        }
-        if !current.is_empty() {
-            columns.push(current);
+        for group in split_top_level_symbol_groups(column_tokens, ",") {
+            columns.push(group.into_iter().cloned().collect());
         }
 
         if columns.is_empty() {
@@ -2673,24 +2667,9 @@ impl SqlEditorWidget {
         ];
 
         let mut parts: Vec<Vec<SqlToken>> = Vec::new();
-        let mut current: Vec<SqlToken> = Vec::new();
-        let token_depths = paren_depths(tokens);
 
-        for (idx, token) in tokens.iter().enumerate() {
-            match token {
-                SqlToken::Word(word) if token_depths.get(idx).copied().unwrap_or(0) == 0 => {
-                    let upper = word.to_uppercase();
-                    if break_keywords.contains(&upper.as_str()) && !current.is_empty() {
-                        parts.push(current);
-                        current = Vec::new();
-                    }
-                    current.push(token.clone());
-                }
-                _ => current.push(token.clone()),
-            }
-        }
-        if !current.is_empty() {
-            parts.push(current);
+        for part in split_top_level_keyword_groups(tokens, &break_keywords) {
+            parts.push(part.into_iter().cloned().collect());
         }
 
         let mut out = String::new();
@@ -2703,266 +2682,9 @@ impl SqlEditorWidget {
         out.trim().to_string()
     }
 
+    /// 토크나이저는 공통 로직(`query_text`)로 위임합니다.
     pub fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
-        let mut tokens = Vec::new();
-        let chars: Vec<char> = sql.chars().collect();
-        let mut i = 0;
-        let mut current = String::new();
-        let mut scan_state = SplitState::default();
-        let mut pending_newline = false;
-
-        let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
-            if !current.is_empty() {
-                tokens.push(SqlToken::Word(std::mem::take(current)));
-            }
-        };
-
-        while i < chars.len() {
-            let c = chars[i];
-            let next = if i + 1 < chars.len() {
-                Some(chars[i + 1])
-            } else {
-                None
-            };
-
-            if scan_state.in_line_comment {
-                current.push(c);
-                if c == '\n' {
-                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    scan_state.in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if scan_state.in_block_comment {
-                current.push(c);
-                if c == '*' && next == Some('/') {
-                    current.push('/');
-                    if i + 2 < chars.len() && chars[i + 2] == '\n' {
-                        current.push('\n');
-                        i += 1;
-                    }
-                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    scan_state.in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if scan_state.in_q_quote {
-                current.push(c);
-                if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
-                    current.push('\'');
-                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    scan_state.in_q_quote = false;
-                    scan_state.q_quote_end = None;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if scan_state.in_single_quote {
-                current.push(c);
-                if c == '\'' {
-                    if next == Some('\'') {
-                        current.push('\'');
-                        i += 2;
-                        continue;
-                    }
-                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    scan_state.in_single_quote = false;
-                    i += 1;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if scan_state.in_double_quote {
-                current.push(c);
-                if c == '"' {
-                    if next == Some('"') {
-                        current.push('"');
-                        i += 2;
-                        continue;
-                    }
-                    tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-                    scan_state.in_double_quote = false;
-                    i += 1;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c.is_whitespace() {
-                flush_word(&mut current, &mut tokens);
-                if c == '\n' {
-                    pending_newline = true;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                flush_word(&mut current, &mut tokens);
-                scan_state.in_line_comment = true;
-                if pending_newline {
-                    current.push('\n');
-                }
-                current.push('-');
-                current.push('-');
-                pending_newline = false;
-                i += 2;
-                continue;
-            }
-
-            if c == '/' && next == Some('*') {
-                flush_word(&mut current, &mut tokens);
-                scan_state.in_block_comment = true;
-                if pending_newline {
-                    current.push('\n');
-                }
-                current.push('/');
-                current.push('*');
-                pending_newline = false;
-                i += 2;
-                continue;
-            }
-
-            pending_newline = false;
-
-            // Handle nq-quoted strings: nq'[...]', nq'{...}', etc. (National Character Set)
-            if (c == 'n' || c == 'N')
-                && (next == Some('q') || next == Some('Q'))
-                && i + 2 < chars.len()
-                && chars[i + 2] == '\''
-                && i + 3 < chars.len()
-            {
-                let delimiter = chars[i + 3];
-                let closing = match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    _ => delimiter,
-                };
-                flush_word(&mut current, &mut tokens);
-                current.push(c);
-                current.push(chars[i + 1]);
-                current.push('\'');
-                current.push(delimiter);
-                scan_state.start_q_quote(delimiter);
-                debug_assert_eq!(scan_state.q_quote_end(), Some(closing));
-                i += 4;
-                continue;
-            }
-
-            // Handle q-quoted strings: q'[...]', q'{...}', q'(...)', q'<...>', q'!...!'
-            if (c == 'q' || c == 'Q') && next == Some('\'') && i + 2 < chars.len() {
-                let delimiter = chars[i + 2];
-                let closing = match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    _ => delimiter,
-                };
-                flush_word(&mut current, &mut tokens);
-                current.push(c);
-                current.push('\'');
-                current.push(delimiter);
-                scan_state.start_q_quote(delimiter);
-                debug_assert_eq!(scan_state.q_quote_end(), Some(closing));
-                i += 3;
-                continue;
-            }
-
-            if c == '\'' {
-                flush_word(&mut current, &mut tokens);
-                scan_state.in_single_quote = true;
-                current.push('\'');
-                i += 1;
-                continue;
-            }
-
-            if c == '"' {
-                flush_word(&mut current, &mut tokens);
-                scan_state.in_double_quote = true;
-                current.push('"');
-                i += 1;
-                continue;
-            }
-
-            if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#' {
-                current.push(c);
-                i += 1;
-                continue;
-            }
-
-            flush_word(&mut current, &mut tokens);
-
-            // Handle <<label>> (Oracle PL/SQL labels)
-            if c == '<' && next == Some('<') {
-                let mut label = String::from("<<");
-                let mut j = i + 2;
-                while j < chars.len() {
-                    let ch = chars[j];
-                    label.push(ch);
-                    if ch == '>' && j + 1 < chars.len() && chars[j + 1] == '>' {
-                        label.push('>');
-                        j += 2;
-                        break;
-                    }
-                    j += 1;
-                }
-                tokens.push(SqlToken::Word(label));
-                i = j;
-                continue;
-            }
-
-            let sym = match (c, next) {
-                ('<', Some('=')) => Some("<=".to_string()),
-                ('>', Some('=')) => Some(">=".to_string()),
-                ('<', Some('>')) => Some("<>".to_string()),
-                ('!', Some('=')) => Some("!=".to_string()),
-                ('|', Some('|')) => Some("||".to_string()),
-                (':', Some('=')) => Some(":=".to_string()),
-                ('=', Some('>')) => Some("=>".to_string()),
-                _ => None,
-            };
-
-            if let Some(sym) = sym {
-                tokens.push(SqlToken::Symbol(sym));
-                i += 2;
-                continue;
-            }
-
-            tokens.push(SqlToken::Symbol(c.to_string()));
-            i += 1;
-        }
-
-        if scan_state.in_line_comment || scan_state.in_block_comment {
-            if !current.is_empty() {
-                tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-            }
-        } else if scan_state.in_single_quote || scan_state.in_q_quote {
-            if !current.is_empty() {
-                tokens.push(SqlToken::String(std::mem::take(&mut current)));
-            }
-        } else if scan_state.in_double_quote {
-            if !current.is_empty() {
-                tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-            }
-        } else {
-            flush_word(&mut current, &mut tokens);
-        }
-        tokens
+        super::query_text::tokenize_sql(sql)
     }
 
     fn execute_sql(&self, sql: &str, script_mode: bool) {
@@ -2978,14 +2700,7 @@ impl SqlEditorWidget {
         // Check if any line contains a CONNECT, DISCONNECT, or @ command.
         // These commands should work even when not connected, and in script mode
         // they can appear on any line (not just the first).
-        let has_connect_command = sql.lines().any(|line| {
-            let trimmed = line.trim().to_uppercase();
-            trimmed.starts_with("CONNECT")
-                || trimmed.starts_with("CONN ")
-                || trimmed.starts_with("DISCONNECT")
-                || trimmed.starts_with("DISC")
-                || trimmed.starts_with('@')
-        });
+        let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
 
         // Pre-check connection status without holding lock for long
         {

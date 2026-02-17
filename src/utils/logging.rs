@@ -151,30 +151,34 @@ fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
         let (sender, receiver) = mpsc::channel::<LogCommand>();
         thread::spawn(move || {
             let mut log = AppLog::load();
-            let mut last_persist_error: Option<String> = None;
             let apply_command =
                 |log: &mut AppLog,
                  command: LogCommand,
                  needs_save: &mut bool,
                  flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
-                    match command {
-                        LogCommand::Write(entry) => {
-                            log.add_entry(entry);
-                            *needs_save = true;
-                        }
-                        LogCommand::Clear => {
-                            log.entries.clear();
-                            *needs_save = true;
-                        }
-                        LogCommand::Flush(reply) => {
-                            flush_replies.push(reply);
-                        }
+                match command {
+                    LogCommand::Write(entry) => {
+                        log.add_entry(entry);
+                        *needs_save = true;
+                    }
+                    LogCommand::Clear => {
+                        log.entries.clear();
+                        *needs_save = true;
+                    }
+                    LogCommand::Flush(reply) => {
+                        flush_replies.push(reply);
                     }
                 };
-            while let Ok(cmd) = receiver.recv() {
+            };
+            loop {
+                let cmd = match receiver.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                };
                 let previous_state = log.clone();
                 let mut needs_save = false;
                 let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+                let mut persist_result: Result<(), String> = Ok(());
                 apply_command(&mut log, cmd, &mut needs_save, &mut flush_replies);
                 while let Ok(next) = receiver.try_recv() {
                     apply_command(&mut log, next, &mut needs_save, &mut flush_replies);
@@ -182,24 +186,19 @@ fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
                 if needs_save {
                     match log.save() {
                         Ok(()) => {
-                            last_persist_error = None;
+                            persist_result = Ok(());
                         }
                         Err(err) => {
                             let msg = format!("Log save error: {err}");
                             eprintln!("{msg}");
                             log = previous_state;
-                            last_persist_error = Some(msg);
+                            persist_result = Err(msg);
                         }
                     }
                 }
 
-                let save_result: Result<(), String> = match &last_persist_error {
-                    Some(err) => Err(err.clone()),
-                    None => Ok(()),
-                };
-
                 for reply in flush_replies {
-                    let _ = reply.send(save_result.clone());
+                    let _ = reply.send(persist_result.clone());
                 }
             }
         });

@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::db::{
-    ConnectionInfo, QueryExecutor, QueryResult, ScriptItem, SharedConnection, TableColumnDetail,
+    ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
@@ -36,6 +36,8 @@ use oracle::Connection;
 
 mod execution;
 mod intellisense;
+// 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
+mod query_text;
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlToken {
@@ -203,21 +205,12 @@ impl SqlEditorWidget {
     fn statement_at_cursor_text(&self) -> Option<String> {
         let sql = self.buffer.text();
         let cursor_pos = self.editor.insert_position() as usize;
-        QueryExecutor::statement_at_cursor(&sql, cursor_pos)
+        // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
+        query_text::statement_at_cursor(&sql, cursor_pos)
     }
 
     fn normalize_statement_for_single_execution(statement: &str) -> String {
-        let items = QueryExecutor::split_script_items(statement);
-        if items.len() > 1 {
-            if let Some(ScriptItem::Statement(stmt)) = items
-                .into_iter()
-                .find(|item| matches!(item, ScriptItem::Statement(_)))
-            {
-                return stmt;
-            }
-        }
-
-        statement.to_string()
+        query_text::normalize_single_statement(statement)
     }
 
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {

@@ -1,6 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ui::sql_depth::{apply_paren_token, paren_depths};
+use crate::ui::sql_depth::{
+    apply_paren_token,
+    extract_parenthesized_tokens,
+    is_top_level_depth,
+    paren_depths,
+    split_top_level_symbol_groups,
+};
 use crate::ui::sql_editor::SqlToken;
 
 /// SQL clause phase within a query at a specific depth level.
@@ -937,24 +943,17 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         // Check for explicit column list: cte_name(col1, col2)
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
-                idx += 1;
-                let mut paren_depth = 1;
-                while idx < tokens.len() && paren_depth > 0 {
-                    match &tokens[idx] {
-                        SqlToken::Symbol(s) if s == "(" => paren_depth += 1,
-                        SqlToken::Symbol(s) if s == ")" => {
-                            paren_depth -= 1;
-                            if paren_depth == 0 {
-                                idx += 1;
-                                break;
-                            }
+                if let Some((expr_tokens, next_idx)) = extract_parenthesized_tokens(tokens, idx) {
+                    let expr_depths = paren_depths(&expr_tokens);
+                    idx = next_idx;
+                    for (expr_idx, token) in expr_tokens.iter().enumerate() {
+                        if !is_top_level_depth(&expr_depths, expr_idx) {
+                            continue;
                         }
-                        SqlToken::Word(w) if paren_depth == 1 => {
+                        if let SqlToken::Word(w) = token {
                             explicit_columns.push(w.clone());
                         }
-                        _ => {}
                     }
-                    idx += 1;
                 }
             }
         }
@@ -970,25 +969,9 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         let mut body_tokens = Vec::new();
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
-                idx += 1;
-                let mut paren_depth = 1;
-                while idx < tokens.len() && paren_depth > 0 {
-                    match &tokens[idx] {
-                        SqlToken::Symbol(s) if s == "(" => {
-                            paren_depth += 1;
-                            body_tokens.push(tokens[idx].clone());
-                        }
-                        SqlToken::Symbol(s) if s == ")" => {
-                            paren_depth -= 1;
-                            if paren_depth > 0 {
-                                body_tokens.push(tokens[idx].clone());
-                            }
-                        }
-                        _ => {
-                            body_tokens.push(tokens[idx].clone());
-                        }
-                    }
-                    idx += 1;
+                if let Some((tokens_in_parens, next_idx)) = extract_parenthesized_tokens(tokens, idx) {
+                    idx = next_idx;
+                    body_tokens.extend(tokens_in_parens);
                 }
             }
         }
@@ -1321,81 +1304,8 @@ pub fn resolve_all_scope_tables(tables_in_scope: &[ScopedTableRef]) -> Vec<Strin
 /// Items that cannot be resolved (e.g., `*`, expressions without aliases) are omitted.
 pub fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
     let mut columns = Vec::new();
-    let mut idx = 0;
-
-    // Find SELECT keyword
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            SqlToken::Word(w) if w.eq_ignore_ascii_case("SELECT") => {
-                idx += 1;
-                break;
-            }
-            SqlToken::Comment(_) => {
-                idx += 1;
-                continue;
-            }
-            _ => {
-                idx += 1;
-                continue;
-            }
-        }
-    }
-
-    // Skip DISTINCT / ALL / UNIQUE
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            SqlToken::Word(w) => {
-                let u = w.to_uppercase();
-                if matches!(u.as_str(), "DISTINCT" | "ALL" | "UNIQUE") {
-                    idx += 1;
-                    continue;
-                }
-                break;
-            }
-            SqlToken::Comment(_) => {
-                idx += 1;
-                continue;
-            }
-            _ => break,
-        }
-    }
-
-    // Collect tokens for each SELECT item (delimited by comma at depth 0)
-    let token_depths = paren_depths(tokens);
-    let mut item_tokens: Vec<&SqlToken> = Vec::new();
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        let depth = token_depths.get(idx).copied().unwrap_or(0);
-
-        match token {
-            SqlToken::Symbol(s) if s == "," && depth == 0 => {
-                if let Some(col) = resolve_item_column_name(&item_tokens) {
-                    columns.push(col);
-                }
-                item_tokens.clear();
-            }
-            SqlToken::Word(w) if depth == 0 => {
-                let u = w.to_uppercase();
-                if matches!(u.as_str(), "FROM" | "INTO" | "BULK") {
-                    if let Some(col) = resolve_item_column_name(&item_tokens) {
-                        columns.push(col);
-                    }
-                    item_tokens.clear();
-                    break;
-                }
-                item_tokens.push(token);
-            }
-            SqlToken::Comment(_) => { /* skip */ }
-            _ => {
-                item_tokens.push(token);
-            }
-        }
-        idx += 1;
-    }
-
-    // Handle last item if we ran out of tokens (incomplete SQL)
-    if !item_tokens.is_empty() {
+    let select_list_tokens = extract_select_list_tokens(tokens);
+    for item_tokens in split_top_level_symbol_groups(select_list_tokens, ",") {
         if let Some(col) = resolve_item_column_name(&item_tokens) {
             columns.push(col);
         }
@@ -1412,9 +1322,24 @@ pub fn extract_select_list_wildcard_tables(
 ) -> Vec<String> {
     let mut tables = Vec::new();
     let mut seen = HashSet::new();
-    let mut idx = 0;
+    let select_list_tokens = extract_select_list_tokens(tokens);
+    for item_tokens in split_top_level_symbol_groups(select_list_tokens, ",") {
+        append_wildcard_item_tables(&item_tokens, tables_in_scope, &mut tables, &mut seen);
+    }
 
-    // Find SELECT keyword
+    tables
+}
+
+fn extract_select_list_tokens(tokens: &[SqlToken]) -> &[SqlToken] {
+    let start = select_list_start_index(tokens);
+    let end = select_list_end_index(tokens, start);
+    &tokens[start..end]
+}
+
+fn select_list_start_index(tokens: &[SqlToken]) -> usize {
+    let mut idx = 0usize;
+
+    // Find SELECT keyword.
     while idx < tokens.len() {
         match &tokens[idx] {
             SqlToken::Word(w) if w.eq_ignore_ascii_case("SELECT") => {
@@ -1423,74 +1348,53 @@ pub fn extract_select_list_wildcard_tables(
             }
             SqlToken::Comment(_) => {
                 idx += 1;
-                continue;
             }
             _ => {
                 idx += 1;
-                continue;
             }
         }
     }
 
-    // Skip DISTINCT / ALL / UNIQUE
+    // Skip DISTINCT / ALL / UNIQUE.
     while idx < tokens.len() {
         match &tokens[idx] {
             SqlToken::Word(w) => {
-                let u = w.to_uppercase();
-                if matches!(u.as_str(), "DISTINCT" | "ALL" | "UNIQUE") {
+                let upper = w.to_uppercase();
+                if matches!(upper.as_str(), "DISTINCT" | "ALL" | "UNIQUE") {
                     idx += 1;
-                    continue;
+                } else {
+                    break;
                 }
-                break;
             }
             SqlToken::Comment(_) => {
                 idx += 1;
-                continue;
             }
             _ => break,
         }
     }
 
-    // Collect tokens for each SELECT item (delimited by comma at depth 0)
+    idx
+}
+
+fn select_list_end_index(tokens: &[SqlToken], start: usize) -> usize {
     let token_depths = paren_depths(tokens);
-    let mut item_tokens: Vec<&SqlToken> = Vec::new();
+    let mut idx = start;
 
     while idx < tokens.len() {
         let token = &tokens[idx];
-        let depth = token_depths.get(idx).copied().unwrap_or(0);
-
-        match token {
-            SqlToken::Symbol(s) if s == "," && depth == 0 => {
-                append_wildcard_item_tables(&item_tokens, tables_in_scope, &mut tables, &mut seen);
-                item_tokens.clear();
-            }
-            SqlToken::Word(w) if depth == 0 => {
-                let u = w.to_uppercase();
-                if matches!(u.as_str(), "FROM" | "INTO" | "BULK") {
-                    append_wildcard_item_tables(
-                        &item_tokens,
-                        tables_in_scope,
-                        &mut tables,
-                        &mut seen,
-                    );
-                    item_tokens.clear();
+        if is_top_level_depth(&token_depths, idx) {
+            if let SqlToken::Word(w) = token {
+                let upper = w.to_uppercase();
+                if matches!(upper.as_str(), "FROM" | "INTO" | "BULK") {
                     break;
                 }
-                item_tokens.push(token);
-            }
-            SqlToken::Comment(_) => { /* skip */ }
-            _ => {
-                item_tokens.push(token);
             }
         }
+
         idx += 1;
     }
 
-    if !item_tokens.is_empty() {
-        append_wildcard_item_tables(&item_tokens, tables_in_scope, &mut tables, &mut seen);
-    }
-
-    tables
+    idx
 }
 
 fn append_wildcard_item_tables(
