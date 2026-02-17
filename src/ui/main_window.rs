@@ -270,8 +270,10 @@ enum ConnectionResult {
 enum ConnectionHealthResult {
     Checked {
         disconnect_message: Option<String>,
-        checked_connection_id: Option<usize>,
-        checked_connection_generation: u64,
+        checked_connection_id_before: Option<usize>,
+        checked_connection_generation_before: u64,
+        checked_connection_id_after: Option<usize>,
+        checked_connection_generation_after: u64,
     },
 }
 
@@ -294,8 +296,10 @@ enum SaveTabOutcome {
 }
 
 fn should_apply_disconnect_for_health_check(
-    checked_connection_id: Option<usize>,
-    checked_connection_generation: u64,
+    checked_connection_id_before: Option<usize>,
+    checked_connection_generation_before: u64,
+    checked_connection_id_after: Option<usize>,
+    checked_connection_generation_after: u64,
     current_connection_state: HealthCheckCurrentConnectionState,
 ) -> bool {
     if matches!(
@@ -308,18 +312,24 @@ fn should_apply_disconnect_for_health_check(
     let (current_connection_id, current_generation) = match current_connection_state {
         HealthCheckCurrentConnectionState::Present { id, generation } => (Some(id), generation),
         HealthCheckCurrentConnectionState::Absent { generation } => (None, generation),
-        HealthCheckCurrentConnectionState::Unavailable => (None, checked_connection_generation),
+        HealthCheckCurrentConnectionState::Unavailable => {
+            (None, checked_connection_generation_before)
+        }
     };
 
-    if checked_connection_generation != current_generation {
+    if checked_connection_generation_after != current_generation {
         return false;
     }
 
-    match checked_connection_id {
-        Some(checked_id) => current_connection_id
-            .map(|current_id| checked_id == current_id)
+    if current_connection_id != checked_connection_id_after {
+        return false;
+    }
+
+    match checked_connection_id_before {
+        Some(checked_id) => checked_connection_id_after
+            .map(|after_id| checked_id == after_id)
             .unwrap_or(true),
-        None => current_connection_id.is_none(),
+        None => checked_connection_id_after.is_none(),
     }
 }
 
@@ -2756,8 +2766,10 @@ impl MainWindow {
                     match r.try_recv() {
                         Ok(ConnectionHealthResult::Checked {
                             disconnect_message,
-                            checked_connection_id,
-                            checked_connection_generation,
+                            checked_connection_id_before,
+                            checked_connection_generation_before,
+                            checked_connection_id_after,
+                            checked_connection_generation_after,
                         }) => {
                             health_check_in_flight.set(false);
                             // Even when we could not lock the connection, treat this as
@@ -2786,8 +2798,10 @@ impl MainWindow {
 
                                 let should_apply_disconnect =
                                     should_apply_disconnect_for_health_check(
-                                        checked_connection_id,
-                                        checked_connection_generation,
+                                        checked_connection_id_before,
+                                        checked_connection_generation_before,
+                                        checked_connection_id_after,
+                                        checked_connection_generation_after,
                                         current_connection_state,
                                     );
 
@@ -2819,25 +2833,45 @@ impl MainWindow {
                 let connection = state.borrow().connection.clone();
                 let health_sender = health_sender.clone();
                 thread::spawn(move || {
-                    let (disconnect_message, checked_connection_id, checked_connection_generation) =
-                        if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
-                            let checked_connection_generation = conn_guard.connection_generation();
-                            let checked_connection_id = conn_guard
-                                .get_connection()
-                                .as_ref()
-                                .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
-                            (
-                                conn_guard.require_live_connection().err(),
-                                checked_connection_id,
-                                checked_connection_generation,
-                            )
-                        } else {
-                            (None, None, 0)
-                        };
+                    let (
+                        disconnect_message,
+                        checked_connection_id_before,
+                        checked_connection_generation_before,
+                        checked_connection_id_after,
+                        checked_connection_generation_after,
+                    ) = if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
+                        let checked_connection_generation_before =
+                            conn_guard.connection_generation();
+                        let checked_connection_id_before = conn_guard
+                            .get_connection()
+                            .as_ref()
+                            .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
+
+                        let disconnect_message = conn_guard.require_live_connection().err();
+
+                        let checked_connection_generation_after =
+                            conn_guard.connection_generation();
+                        let checked_connection_id_after = conn_guard
+                            .get_connection()
+                            .as_ref()
+                            .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
+
+                        (
+                            disconnect_message,
+                            checked_connection_id_before,
+                            checked_connection_generation_before,
+                            checked_connection_id_after,
+                            checked_connection_generation_after,
+                        )
+                    } else {
+                        (None, None, 0, None, 0)
+                    };
                     let _ = health_sender.send(ConnectionHealthResult::Checked {
                         disconnect_message,
-                        checked_connection_id,
-                        checked_connection_generation,
+                        checked_connection_id_before,
+                        checked_connection_generation_before,
+                        checked_connection_id_after,
+                        checked_connection_generation_after,
                     });
                     app::awake();
                 });
@@ -3108,6 +3142,8 @@ mod health_check_tests {
         assert!(should_apply_disconnect_for_health_check(
             Some(10),
             5,
+            Some(10),
+            5,
             HealthCheckCurrentConnectionState::Present {
                 id: 10,
                 generation: 5
@@ -3118,6 +3154,8 @@ mod health_check_tests {
     #[test]
     fn does_not_apply_disconnect_when_connection_was_replaced() {
         assert!(!should_apply_disconnect_for_health_check(
+            Some(10),
+            5,
             Some(10),
             5,
             HealthCheckCurrentConnectionState::Present {
@@ -3132,6 +3170,8 @@ mod health_check_tests {
         assert!(!should_apply_disconnect_for_health_check(
             Some(10),
             5,
+            Some(10),
+            5,
             HealthCheckCurrentConnectionState::Present {
                 id: 10,
                 generation: 6,
@@ -3144,6 +3184,8 @@ mod health_check_tests {
         assert!(should_apply_disconnect_for_health_check(
             Some(10),
             5,
+            None,
+            5,
             HealthCheckCurrentConnectionState::Absent { generation: 5 },
         ));
     }
@@ -3151,6 +3193,8 @@ mod health_check_tests {
     #[test]
     fn applies_disconnect_when_both_connections_are_none() {
         assert!(should_apply_disconnect_for_health_check(
+            None,
+            5,
             None,
             5,
             HealthCheckCurrentConnectionState::Absent { generation: 5 },
@@ -3162,6 +3206,8 @@ mod health_check_tests {
         assert!(!should_apply_disconnect_for_health_check(
             Some(10),
             5,
+            Some(10),
+            5,
             HealthCheckCurrentConnectionState::Unavailable,
         ));
     }
@@ -3171,9 +3217,24 @@ mod health_check_tests {
         assert!(!should_apply_disconnect_for_health_check(
             None,
             5,
+            None,
+            5,
             HealthCheckCurrentConnectionState::Present {
                 id: 7,
                 generation: 5
+            },
+        ));
+    }
+    #[test]
+    fn does_not_apply_disconnect_when_connection_changed_during_health_check() {
+        assert!(!should_apply_disconnect_for_health_check(
+            Some(10),
+            5,
+            Some(11),
+            6,
+            HealthCheckCurrentConnectionState::Present {
+                id: 11,
+                generation: 6
             },
         ));
     }
