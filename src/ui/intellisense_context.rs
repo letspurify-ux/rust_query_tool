@@ -349,7 +349,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                             phase_stack[depth] = SqlPhase::FromClause;
                         }
                     }
-                    "JOIN" => {
+                    "JOIN" | "APPLY" => {
                         // JOIN resets to FROM context for next table
                         phase_stack[depth] = SqlPhase::FromClause;
                     }
@@ -733,7 +733,7 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                             expect_table = true;
                         }
                     }
-                    "JOIN" => {
+                    "JOIN" | "APPLY" => {
                         phase_stack[depth] = SqlPhase::FromClause;
                         expect_table = true;
                     }
@@ -1134,7 +1134,16 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
 fn is_join_keyword(word: &str) -> bool {
     matches!(
         word,
-        "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "OUTER" | "NATURAL" | "LATERAL"
+        "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "OUTER"
+            | "NATURAL"
+            | "LATERAL"
+            | "APPLY"
     )
 }
 
@@ -1179,6 +1188,7 @@ fn is_alias_breaker(word: &str) -> bool {
             | "CROSS"
             | "OUTER"
             | "NATURAL"
+            | "APPLY"
             | "WHERE"
             | "GROUP"
             | "ORDER"

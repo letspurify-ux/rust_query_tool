@@ -864,6 +864,21 @@ fn lateral_subquery_can_see_outer_table_scope() {
     assert!(names.contains(&"T2".to_string()), "tables: {:?}", names);
 }
 
+#[test]
+fn cross_apply_subquery_exposes_alias_in_outer_scope() {
+    let ctx = analyze("SELECT a.| FROM t1 CROSS APPLY (SELECT id FROM t2) a");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T1".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"A".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn outer_apply_keeps_from_phase_before_right_relation() {
+    let ctx = analyze("SELECT * FROM t1 OUTER APPLY |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
