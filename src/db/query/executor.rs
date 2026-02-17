@@ -1391,18 +1391,25 @@ impl QueryExecutor {
         sql: &str,
     ) -> Result<(QueryResult, Vec<String>), OracleError> {
         // Enable DBMS_OUTPUT before execution
-        let _ = Self::enable_dbms_output(conn, Some(1000000));
+        let dbms_output_was_enabled = Self::enable_dbms_output(conn, Some(1000000)).is_ok();
 
         // Execute the query
         let result = match Self::execute_batch(conn, sql) {
             Ok(result) => result,
             Err(err) => {
+                if dbms_output_was_enabled {
+                    let _ = Self::disable_dbms_output(conn);
+                }
                 eprintln!("Database operation failed: {err}");
                 return Err(err);
             }
         };
 
         let output = Self::get_dbms_output(conn, 10000).unwrap_or_default();
+
+        if dbms_output_was_enabled {
+            let _ = Self::disable_dbms_output(conn);
+        }
 
         Ok((result, output))
     }
