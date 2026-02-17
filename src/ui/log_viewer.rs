@@ -357,13 +357,15 @@ fn populate_browser(
         };
 
         let short_msg = truncate_message(&entry.message, 60);
+        let escaped_source = escape_browser_label(&entry.source);
+        let escaped_msg = escape_browser_label(&short_msg);
         let display = format!(
             "{}{} [{}] [{}] {}",
             color_prefix,
             entry.timestamp,
             entry.level.label(),
-            entry.source,
-            short_msg
+            escaped_source,
+            escaped_msg
         );
         browser.add(&display);
         indices.push(i);
@@ -371,6 +373,10 @@ fn populate_browser(
 
     count_label.set_label(&format!("{} entries", indices.len()));
     *filtered_indices.borrow_mut() = indices;
+}
+
+fn escape_browser_label(text: &str) -> String {
+    text.replace('@', "@@")
 }
 
 fn truncate_message(msg: &str, max_len: usize) -> String {
@@ -431,5 +437,10 @@ mod log_viewer_tests {
         let msg = "가나다라마바사아자차";
         let result = truncate_message(msg, 5);
         assert_eq!(result, "가나다라마...");
+    }
+
+    #[test]
+    fn escape_browser_label_escapes_fltk_format_prefix() {
+        assert_eq!(escape_browser_label("@path/@file"), "@@path/@@file");
     }
 }
