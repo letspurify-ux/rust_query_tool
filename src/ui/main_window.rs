@@ -271,7 +271,6 @@ enum ConnectionHealthResult {
     Checked {
         disconnect_message: Option<String>,
         checked_connection_id: Option<usize>,
-        performed_check: bool,
     },
 }
 
@@ -2752,12 +2751,12 @@ impl MainWindow {
                         Ok(ConnectionHealthResult::Checked {
                             disconnect_message,
                             checked_connection_id,
-                            performed_check,
                         }) => {
                             health_check_in_flight.set(false);
-                            if performed_check {
-                                last_health_check.set(Instant::now());
-                            }
+                            // Even when we could not lock the connection, treat this as
+                            // a completed health-check cycle so we don't spin a new thread
+                            // every poll tick while the lock is contended.
+                            last_health_check.set(Instant::now());
 
                             if let Some(message) = disconnect_message {
                                 let mut s = state.borrow_mut();
@@ -2809,7 +2808,7 @@ impl MainWindow {
                 let connection = state.borrow().connection.clone();
                 let health_sender = health_sender.clone();
                 thread::spawn(move || {
-                    let (disconnect_message, checked_connection_id, performed_check) =
+                    let (disconnect_message, checked_connection_id) =
                         if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
                             let checked_connection_id = conn_guard
                                 .get_connection()
@@ -2818,15 +2817,13 @@ impl MainWindow {
                             (
                                 conn_guard.require_live_connection().err(),
                                 checked_connection_id,
-                                true,
                             )
                         } else {
-                            (None, None, false)
+                            (None, None)
                         };
                     let _ = health_sender.send(ConnectionHealthResult::Checked {
                         disconnect_message,
                         checked_connection_id,
-                        performed_check,
                     });
                     app::awake();
                 });
