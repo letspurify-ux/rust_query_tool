@@ -11,6 +11,40 @@ fn get_statements(items: &[ScriptItem]) -> Vec<&str> {
         .collect()
 }
 
+
+#[test]
+fn test_statement_bounds_at_cursor_ignores_string_literal_with_previous_statement_text() {
+    let sql = "SELECT 1 FROM dual;
+SELECT 'SELECT 1 FROM dual' AS txt FROM dual;";
+    let cursor = sql.rfind("txt").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for second statement");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.contains("AS txt FROM dual"),
+        "expected second statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_ignores_comment_with_previous_statement_text() {
+    let sql = "SELECT 1 FROM dual;
+/* SELECT 1 FROM dual */
+SELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for statement after comment");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("SELECT 2 FROM dual"),
+        "expected final statement, got: {statement}"
+    );
+}
+
 #[test]
 fn test_simple_select() {
     let sql = "SELECT 1 FROM DUAL;";
