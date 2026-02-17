@@ -46,6 +46,24 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
+    assert_eq!(normalized, "SELECT 1 FROM dual");
+}
+
+#[test]
+fn test_normalize_sql_for_execute_keeps_plsql_block_semicolon() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("BEGIN NULL; END;  ");
+    assert_eq!(normalized, "BEGIN NULL; END;");
+}
+
+#[test]
+fn test_normalize_sql_for_execute_empty_input_stays_empty() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("  ;  \n\t ");
+    assert!(normalized.is_empty());
+}
+
+#[test]
 fn test_simple_select() {
     let sql = "SELECT 1 FROM DUAL;";
     let items = QueryExecutor::split_script_items(sql);

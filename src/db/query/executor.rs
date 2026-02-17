@@ -991,19 +991,23 @@ impl QueryExecutor {
 
     /// Execute a single SQL statement
     pub fn execute(conn: &Connection, sql: &str) -> Result<QueryResult, OracleError> {
-        let sql_trimmed = sql.trim();
-        // Remove trailing semicolon if present (but keep for PL/SQL blocks)
-        let sql_clean = if matches!(
-            Self::leading_keyword(sql_trimmed).as_deref(),
-            Some("BEGIN") | Some("DECLARE")
-        ) {
-            sql_trimmed.to_string()
-        } else {
-            sql_trimmed.trim_end_matches(';').trim().to_string()
-        };
-        let sql_upper = Self::strip_leading_comments(&sql_clean).to_uppercase();
-
+        let sql_clean = Self::normalize_sql_for_execute(sql);
         let start = Instant::now();
+
+        if sql_clean.is_empty() {
+            return Ok(QueryResult {
+                sql: sql.to_string(),
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                execution_time: start.elapsed(),
+                message: "No statements to execute".to_string(),
+                is_select: false,
+                success: true,
+            });
+        }
+
+        let sql_upper = Self::strip_leading_comments(&sql_clean).to_uppercase();
 
         // SELECT or WITH (Common Table Expression)
         if Self::is_select_statement(&sql_clean) {
@@ -1084,6 +1088,19 @@ impl QueryExecutor {
         // Everything else - try as DDL/DML
         else {
             Self::execute_ddl(conn, &sql_clean, start)
+        }
+    }
+
+    pub(crate) fn normalize_sql_for_execute(sql: &str) -> String {
+        let sql_trimmed = sql.trim();
+        // Remove trailing semicolon if present (but keep for PL/SQL blocks)
+        if matches!(
+            Self::leading_keyword(sql_trimmed).as_deref(),
+            Some("BEGIN") | Some("DECLARE")
+        ) {
+            sql_trimmed.to_string()
+        } else {
+            sql_trimmed.trim_end_matches(';').trim().to_string()
         }
     }
 
