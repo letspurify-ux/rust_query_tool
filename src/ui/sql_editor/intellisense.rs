@@ -1746,7 +1746,11 @@ impl SqlEditorWidget {
         }
         let qualifier = qualifier_candidate.get(start_byte..)?;
         let qualifier = Self::strip_identifier_quotes(qualifier);
-        if qualifier.is_empty() {
+        let starts_with_valid_ident_char = qualifier
+            .chars()
+            .next()
+            .is_some_and(sql_text::is_identifier_start_char);
+        if qualifier.is_empty() || !starts_with_valid_ident_char {
             None
         } else {
             Some(qualifier)
@@ -2180,6 +2184,24 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
         assert_eq!(qualifier.as_deref(), Some("사용자"));
+    }
+
+    #[test]
+    fn qualifier_before_word_rejects_numeric_identifier_start() {
+        let sql_with_cursor = "SELECT 1emp.| FROM emp";
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier, None);
+    }
+
+    #[test]
+    fn qualifier_before_word_allows_special_identifier_start_chars() {
+        let sql_with_cursor = "SELECT _emp.| FROM emp _emp";
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("_emp"));
     }
 
     #[test]
