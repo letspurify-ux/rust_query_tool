@@ -2,7 +2,7 @@
 //!
 //! 실행, 인텔리센스, 포맷팅에서 공통으로 쓰는 SQL 텍스트 분석 로직을
 //! 한 곳에 모아 중복을 줄입니다.
-use crate::db::{FormatItem, QueryExecutor, ScriptItem, SplitState};
+use crate::db::{FormatItem, QueryExecutor, ScriptItem, SplitState, ToolCommand};
 use crate::sql_text;
 use crate::ui::sql_editor::SqlToken;
 
@@ -281,13 +281,40 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
         if trimmed.is_empty() {
             return false;
         }
-        let upper = trimmed.to_uppercase();
-        upper.starts_with("CONNECT")
-            || upper.starts_with("CONN ")
-            || upper.starts_with("DISCONNECT")
-            || upper.starts_with("DISC")
-            || trimmed.starts_with('@')
+
+        match QueryExecutor::parse_tool_command(trimmed) {
+            Some(ToolCommand::Connect { .. })
+            | Some(ToolCommand::Disconnect)
+            | Some(ToolCommand::RunScript { .. }) => true,
+            Some(ToolCommand::Unsupported { raw, .. }) => {
+                let upper = raw.trim().to_uppercase();
+                upper == "CONNECT"
+                    || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
+                    || upper.starts_with("CONN ")
+                    || upper == "DISCONNECT"
+                    || upper == "DISC"
+                    || raw.trim_start().starts_with('@')
+            }
+            _ => false,
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_connection_bootstrap_command;
+
+    #[test]
+    fn has_connection_bootstrap_command_detects_connect_and_script_lines() {
+        let sql = "SELECT 1 FROM dual;\nCONNECT scott/tiger@localhost:1521/FREE\n@next.sql";
+        assert!(has_connection_bootstrap_command(sql));
+    }
+
+    #[test]
+    fn has_connection_bootstrap_command_ignores_connect_by_clause() {
+        let sql = "SELECT level FROM dual CONNECT BY level <= 10";
+        assert!(!has_connection_bootstrap_command(sql));
+    }
 }
 
 /// SQL*Plus 커맨드 라인인지 판별합니다.
