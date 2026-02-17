@@ -272,7 +272,9 @@ impl SqlEditorWidget {
     }
 
     fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
-        if source.trim_end().ends_with(';') || !formatted.trim_end().ends_with(';') {
+        if Self::statement_ends_with_semicolon(source)
+            || !Self::statement_ends_with_semicolon(&formatted)
+        {
             return formatted;
         }
 
@@ -8228,6 +8230,26 @@ FROM DUAL");
 
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
         assert!(preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_respects_trailing_comment_after_semicolon() {
+        let source = "SELECT 1 FROM dual; -- keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            preserved.trim_end().ends_with("-- keep terminator"),
+            "Trailing comment should be preserved, got:
+{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should remain when selection already ended with semicolon before comment, got:
+{}",
+            preserved
+        );
     }
 
     #[test]
