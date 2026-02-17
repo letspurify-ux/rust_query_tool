@@ -18,3 +18,22 @@ pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
 
     depths
 }
+
+/// Applies parenthesis depth transition for a single token.
+#[inline]
+pub(crate) fn apply_paren_token(depth: &mut usize, token: &SqlToken) {
+    match token {
+        SqlToken::Symbol(sym) if sym == "(" => *depth += 1,
+        SqlToken::Symbol(sym) if sym == ")" => *depth = depth.saturating_sub(1),
+        _ => {}
+    }
+}
+
+/// Returns the final parenthesis depth after all tokens are processed.
+pub(crate) fn paren_depth_after(tokens: &[SqlToken]) -> usize {
+    let mut depth = 0usize;
+    for token in tokens {
+        apply_paren_token(&mut depth, token);
+    }
+    depth
+}
