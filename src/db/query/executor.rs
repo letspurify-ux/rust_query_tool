@@ -570,6 +570,8 @@ impl QueryExecutor {
         let mut current = String::new();
         let mut in_single_quote = false;
         let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
         let mut in_q_quote = false;
         let mut q_quote_end: Option<char> = None;
         let mut depth = 0usize;
@@ -590,6 +592,27 @@ impl QueryExecutor {
             } else {
                 None
             };
+
+            if in_line_comment {
+                current.push(c);
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                current.push(c);
+                if c == '*' && next == Some('/') {
+                    current.push('/');
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
 
             if in_q_quote {
                 current.push(c);
@@ -677,6 +700,22 @@ impl QueryExecutor {
                 continue;
             }
 
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                current.push('-');
+                current.push('-');
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                current.push('/');
+                current.push('*');
+                i += 2;
+                continue;
+            }
+
             if c == '(' {
                 depth += 1;
                 current.push(c);
@@ -712,6 +751,8 @@ impl QueryExecutor {
     fn arg_has_named_arrow(arg: &str) -> bool {
         let mut in_single_quote = false;
         let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
         let mut in_q_quote = false;
         let mut q_quote_end: Option<char> = None;
 
@@ -731,6 +772,24 @@ impl QueryExecutor {
             } else {
                 None
             };
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
 
             if in_q_quote {
                 if Some(c) == q_quote_end && next == Some('\'') {
@@ -800,6 +859,18 @@ impl QueryExecutor {
             if c == '"' {
                 in_double_quote = true;
                 i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
                 continue;
             }
 
