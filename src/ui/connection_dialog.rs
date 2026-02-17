@@ -53,6 +53,10 @@ fn build_connection_info(
         .parse::<u16>()
         .map_err(|_| "Port must be a valid number between 0 and 65535".to_string())?;
 
+    if port == 0 {
+        return Err("Port must be between 1 and 65535".to_string());
+    }
+
     Ok(ConnectionInfo::new(
         name,
         username,
@@ -540,6 +544,9 @@ mod tests {
     #[test]
     fn build_connection_info_rejects_invalid_port() {
         let result = build_connection_info("local", "scott", "tiger", "localhost", "abc", "ORCL");
+        assert!(result.is_err());
+
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "0", "ORCL");
         assert!(result.is_err());
     }
 
