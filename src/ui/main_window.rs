@@ -2749,11 +2749,7 @@ impl MainWindow {
                 thread::spawn(move || {
                     let disconnect_message =
                         if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
-                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
-                                Some(crate::db::NOT_CONNECTED_MESSAGE.to_string())
-                            } else {
-                                conn_guard.require_live_connection().err()
-                            }
+                            conn_guard.require_live_connection().err()
                         } else {
                             None
                         };
