@@ -1891,19 +1891,6 @@ impl SqlEditorWidget {
         Self::apply_parser_depth_indentation(&formatted)
     }
 
-    fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool {
-        if text_upper == keyword {
-            return true;
-        }
-        let Some(rest) = text_upper.strip_prefix(keyword) else {
-            return false;
-        };
-        let Some(next) = rest.chars().next() else {
-            return true;
-        };
-        next.is_whitespace() || matches!(next, ';' | ',' | '(' | ')')
-    }
-
     fn apply_parser_depth_indentation(formatted: &str) -> String {
         if formatted.is_empty() || !Self::is_plsql_like_statement(formatted) {
             return formatted.to_string();
@@ -1982,37 +1969,38 @@ impl SqlEditorWidget {
                 paren_case_expression_depth += 1;
             }
             let in_paren_case_expression = !in_dml_statement && paren_case_expression_depth > 0;
-            let starts_dml = Self::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                || Self::starts_with_keyword_token(&trimmed_upper, "INSERT")
-                || Self::starts_with_keyword_token(&trimmed_upper, "UPDATE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "DELETE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "MERGE");
+            let starts_dml = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
             if starts_dml {
                 in_dml_statement = true;
             }
-            let starts_into = Self::starts_with_keyword_token(&trimmed_upper, "INTO");
-            let starts_into_ender = Self::starts_with_keyword_token(&trimmed_upper, "FROM")
-                || Self::starts_with_keyword_token(&trimmed_upper, "WHERE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "ORDER")
-                || Self::starts_with_keyword_token(&trimmed_upper, "VALUES")
-                || Self::starts_with_keyword_token(&trimmed_upper, "END")
-                || Self::starts_with_keyword_token(&trimmed_upper, "EXCEPTION")
-                || Self::starts_with_keyword_token(&trimmed_upper, "ELSIF")
-                || Self::starts_with_keyword_token(&trimmed_upper, "ELSE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "WHEN")
-                || Self::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                || Self::starts_with_keyword_token(&trimmed_upper, "LOOP")
-                || Self::starts_with_keyword_token(&trimmed_upper, "CASE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                || Self::starts_with_keyword_token(&trimmed_upper, "INSERT")
-                || Self::starts_with_keyword_token(&trimmed_upper, "UPDATE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "DELETE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "MERGE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "FETCH")
-                || Self::starts_with_keyword_token(&trimmed_upper, "OPEN")
-                || Self::starts_with_keyword_token(&trimmed_upper, "CLOSE")
-                || Self::starts_with_keyword_token(&trimmed_upper, "RETURN")
-                || Self::starts_with_keyword_token(&trimmed_upper, "EXIT");
+            let starts_into = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
+            let starts_into_ender =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHERE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXCEPTION")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHEN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "LOOP")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FETCH")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OPEN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CLOSE")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "RETURN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXIT");
             let extra_indent = if into_list_active && !starts_into_ender {
                 1
             } else {
@@ -7831,8 +7819,11 @@ impl SqlEditorWidget {
             return false;
         }
         let upper = trimmed.to_ascii_uppercase();
-        Self::starts_with_keyword_token(&upper, "SET TRANSACTION")
-            || Self::starts_with_keyword_token(&upper, "ALTER SESSION SET ISOLATION_LEVEL")
+        crate::sql_text::starts_with_keyword_token(&upper, "SET TRANSACTION")
+            || crate::sql_text::starts_with_keyword_token(
+                &upper,
+                "ALTER SESSION SET ISOLATION_LEVEL",
+            )
     }
 
     fn sync_serveroutput_with_session(
@@ -8134,14 +8125,14 @@ END oqt_mega_pkg;"#;
 
     #[test]
     fn keyword_token_match_handles_exact_keyword_lines() {
-        assert!(SqlEditorWidget::starts_with_keyword_token(
+        assert!(crate::sql_text::starts_with_keyword_token(
             "SELECT", "SELECT"
         ));
-        assert!(SqlEditorWidget::starts_with_keyword_token("INTO", "INTO"));
-        assert!(SqlEditorWidget::starts_with_keyword_token(
+        assert!(crate::sql_text::starts_with_keyword_token("INTO", "INTO"));
+        assert!(crate::sql_text::starts_with_keyword_token(
             "SELECT x", "SELECT"
         ));
-        assert!(!SqlEditorWidget::starts_with_keyword_token(
+        assert!(!crate::sql_text::starts_with_keyword_token(
             "SELECTED", "SELECT"
         ));
     }

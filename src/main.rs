@@ -5,6 +5,7 @@
 
 mod app;
 mod db;
+mod sql_text;
 mod ui;
 mod utils;
 

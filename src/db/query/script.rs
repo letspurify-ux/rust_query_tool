@@ -1,4 +1,5 @@
 use crate::db::session::{BindDataType, ComputeMode};
+use crate::sql_text;
 
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 
@@ -17,7 +18,7 @@ pub(crate) struct SplitState {
     pub(crate) create_pending: bool,
     create_or_seen: bool,
     pub(crate) after_declare: bool, // Track if we're inside DECLARE block waiting for BEGIN
-    after_as_is: bool,   // Track if we've seen AS/IS in CREATE PL/SQL (for BEGIN handling)
+    after_as_is: bool, // Track if we've seen AS/IS in CREATE PL/SQL (for BEGIN handling)
     nested_subprogram: bool, // Track nested PROCEDURE/FUNCTION inside DECLARE block
     /// Count of nested subprogram declarations awaiting their BEGIN.
     /// In package bodies, nested PROCEDURE/FUNCTION IS increments this,
@@ -655,17 +656,6 @@ impl StatementBuilder {
 
 impl QueryExecutor {
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
-        fn leading_words_upper(line: &str) -> Vec<String> {
-            line.trim_start()
-                .split_whitespace()
-                .map(|w| {
-                    w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                        .to_uppercase()
-                })
-                .filter(|w| !w.is_empty())
-                .collect()
-        }
-
         fn should_pre_dedent(leading_word: &str) -> bool {
             matches!(leading_word, "END" | "ELSE" | "ELSIF" | "EXCEPTION")
         }
@@ -686,7 +676,7 @@ impl QueryExecutor {
 
         for line in sql.lines() {
             let words = if builder.is_idle() {
-                leading_words_upper(line)
+                sql_text::leading_words_upper(line)
             } else {
                 Vec::new()
             };

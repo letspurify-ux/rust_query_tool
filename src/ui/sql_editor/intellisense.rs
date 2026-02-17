@@ -19,6 +19,7 @@ use oracle::Connection;
 use crate::db::{
     ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection, TableColumnDetail,
 };
+use crate::sql_text;
 use crate::ui::intellisense::{
     detect_sql_context, get_word_at_cursor, IntellisenseData, IntellisensePopup, SqlContext,
 };
@@ -1799,11 +1800,11 @@ impl SqlEditorWidget {
     }
 
     fn is_identifier_char(ch: char) -> bool {
-        ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#'
+        sql_text::is_identifier_char(ch)
     }
 
     fn is_identifier_byte(byte: u8) -> bool {
-        byte.is_ascii() && Self::is_identifier_char(byte as char)
+        sql_text::is_identifier_byte(byte)
     }
 
     /// Show quick describe dialog for a table/view structure.

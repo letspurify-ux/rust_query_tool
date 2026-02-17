@@ -1,3 +1,4 @@
+use crate::sql_text;
 use crate::ui::theme;
 use fltk::{browser::HoldBrowser, prelude::*, window::Window};
 use std::any::Any;
@@ -843,7 +844,8 @@ impl IntellisenseData {
                     for table in tables {
                         let key = table.to_uppercase();
                         if let Some(cols) = self.column_entries_by_table.get(&key) {
-                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
+                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen)
+                            {
                                 break;
                             }
                         }
@@ -1493,7 +1495,7 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
 }
 
 fn is_identifier_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#'
+    sql_text::is_identifier_char(ch)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1583,7 +1585,9 @@ mod intellisense_tests {
         let suggestions = data.get_suggestions("ab", false, None, false, false);
 
         assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("ab")));
-        assert!(suggestions.iter().any(|s| s.eq_ignore_ascii_case("abc_table")));
+        assert!(suggestions
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("abc_table")));
     }
 
     #[test]
