@@ -505,6 +505,74 @@ END;"#;
 }
 
 #[test]
+fn format_sql_open_cursor_for_with_clause() {
+    let input = r#"BEGIN
+OPEN p_rc
+FOR
+WITH cte AS (
+    SELECT empno,
+        deptno
+    FROM oqt_t_emp
+)
+SELECT empno,
+    deptno
+FROM cte;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines = formatted.lines().collect::<Vec<_>>();
+
+    let open_idx = lines
+        .iter()
+        .position(|line| line.contains("OPEN P_RC FOR"))
+        .or_else(|| lines.iter().position(|line| line.contains("OPEN p_rc FOR")))
+        .expect("expected OPEN ... FOR line");
+
+    let with_idx = lines
+        .iter()
+        .position(|line| {
+            let upper = line.trim_start().to_ascii_uppercase();
+            upper.starts_with("WITH CTE AS (") || upper.contains("OPEN P_RC FOR WITH CTE AS (")
+        })
+        .expect("expected WITH CTE line");
+
+    let main_from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_ascii_uppercase().starts_with("FROM CTE"))
+        .expect("expected main SELECT FROM line");
+
+    let cte_from_idx = lines
+        .iter()
+        .position(|line| line.to_ascii_uppercase().contains("FROM OQT_T_EMP"))
+        .expect("expected CTE body FROM line");
+
+    let open_indent = lines[open_idx].chars().take_while(|c| c.is_whitespace()).count();
+    let with_indent = lines[with_idx].chars().take_while(|c| c.is_whitespace()).count();
+    let with_line = lines[with_idx].to_ascii_uppercase();
+    let main_from_indent = lines[main_from_idx]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+
+    if with_line.contains("OPEN P_RC FOR") {
+        assert!(with_indent > open_indent, "OPEN ... FOR WITH should still indent WITH");
+    } else {
+        assert_eq!(with_idx, open_idx + 1, "WITH should follow OPEN FOR");
+    }
+
+    assert!(with_line.trim_start().contains("WITH CTE AS ("));
+    assert!(
+        main_from_indent >= with_indent,
+        "FROM CTE should align with/inside main SELECT depth"
+    );
+    assert_eq!(lines[cte_from_idx].trim_start().to_ascii_uppercase(), "FROM OQT_T_EMP");
+    assert!(
+        lines.iter().any(|line| line.contains("OPEN p_rc FOR") || line.contains("OPEN P_RC FOR")),
+        "OPEN ... FOR should remain"
+    );
+}
+
+#[test]
 fn format_sql_fetch_into_list_indentation() {
     let input = r#"BEGIN
 FETCH c

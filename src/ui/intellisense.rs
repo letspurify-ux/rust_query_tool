@@ -832,7 +832,7 @@ impl IntellisenseData {
                 if suggestions.len() >= MAX_SUGGESTIONS {
                     return true;
                 }
-                if seen.insert(value.clone()) {
+                if seen.insert(value.to_uppercase()) {
                     suggestions.push(value);
                 }
                 suggestions.len() >= MAX_SUGGESTIONS
@@ -864,8 +864,7 @@ impl IntellisenseData {
                 }
             }
             if column_only && !suggestions.is_empty() {
-                suggestions.sort_unstable();
-                suggestions.dedup();
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 suggestions.truncate(MAX_SUGGESTIONS);
                 return suggestions;
             }
@@ -879,8 +878,7 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                suggestions.sort_unstable();
-                suggestions.dedup();
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
             if Self::push_entries(
@@ -889,13 +887,11 @@ impl IntellisenseData {
                 &mut suggestions,
                 &mut seen,
             ) {
-                suggestions.sort_unstable();
-                suggestions.dedup();
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 return suggestions;
             }
             if relation_only && !suggestions.is_empty() {
-                suggestions.sort_unstable();
-                suggestions.dedup();
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 suggestions.truncate(MAX_SUGGESTIONS);
                 return suggestions;
             }
@@ -921,27 +917,25 @@ impl IntellisenseData {
 
         // Add tables/views in non-table context after language items.
         if !prefer_relations {
-            if Self::push_entries(
-                &self.table_entries,
-                &prefix_upper,
-                &mut suggestions,
-                &mut seen,
-            ) {
-                suggestions.sort_unstable();
-                suggestions.dedup();
-                return suggestions;
-            }
+        if Self::push_entries(
+            &self.table_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        ) {
+            Self::dedup_suggestions_case_insensitive(&mut suggestions);
+            return suggestions;
+        }
 
-            if Self::push_entries(
-                &self.view_entries,
-                &prefix_upper,
-                &mut suggestions,
-                &mut seen,
-            ) {
-                suggestions.sort_unstable();
-                suggestions.dedup();
-                return suggestions;
-            }
+        if Self::push_entries(
+            &self.view_entries,
+            &prefix_upper,
+            &mut suggestions,
+            &mut seen,
+        ) {
+            Self::dedup_suggestions_case_insensitive(&mut suggestions);
+            return suggestions;
+        }
         }
 
         // Add procedures
@@ -951,8 +945,7 @@ impl IntellisenseData {
             &mut suggestions,
             &mut seen,
         ) {
-            suggestions.sort_unstable();
-            suggestions.dedup();
+            Self::dedup_suggestions_case_insensitive(&mut suggestions);
             return suggestions;
         }
 
@@ -963,8 +956,7 @@ impl IntellisenseData {
             &mut suggestions,
             &mut seen,
         ) {
-            suggestions.sort_unstable();
-            suggestions.dedup();
+            Self::dedup_suggestions_case_insensitive(&mut suggestions);
             return suggestions;
         }
 
@@ -995,8 +987,7 @@ impl IntellisenseData {
             }
         }
 
-        suggestions.sort_unstable();
-        suggestions.dedup();
+        Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -1034,8 +1025,7 @@ impl IntellisenseData {
             }
         }
 
-        suggestions.sort_unstable();
-        suggestions.dedup();
+        Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
         suggestions
     }
@@ -1193,7 +1183,7 @@ impl IntellisenseData {
             if !prefix_upper.is_empty() && entry.upper == prefix_upper {
                 continue;
             }
-            if seen.insert(entry.name.clone()) {
+            if seen.insert(entry.upper.clone()) {
                 suggestions.push(entry.name.clone());
                 if suggestions.len() >= MAX_SUGGESTIONS {
                     return true;
@@ -1201,6 +1191,11 @@ impl IntellisenseData {
             }
         }
         suggestions.len() >= MAX_SUGGESTIONS
+    }
+
+    fn dedup_suggestions_case_insensitive(suggestions: &mut Vec<String>) {
+        suggestions.sort_unstable();
+        suggestions.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     }
 }
 
@@ -1612,5 +1607,31 @@ mod intellisense_tests {
                 func
             );
         }
+    }
+
+    #[test]
+    fn get_suggestions_deduplicates_case_insensitive_columns() {
+        let mut data = IntellisenseData::new();
+        data.set_columns_for_table("EMP", vec!["EmpNo".to_string(), "EMPNO".to_string()]);
+        let column_scope = vec!["emp".to_string()];
+
+        let suggestions = data.get_suggestions("", true, Some(&column_scope), false, true);
+
+        let empno_count = suggestions.iter().filter(|value| value.eq_ignore_ascii_case("EMPNO")).count();
+        assert_eq!(empno_count, 1);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions.iter().any(|value| value.eq_ignore_ascii_case("EMPNO")));
+    }
+
+    #[test]
+    fn get_suggestions_deduplicates_case_insensitive_relations() {
+        let mut data = IntellisenseData::new();
+        data.tables = vec!["Emp".to_string(), "EMP".to_string(), "emp2".to_string()];
+        data.rebuild_indices();
+
+        let suggestions = data.get_suggestions("", false, None, true, false);
+        let emp_count = suggestions.iter().filter(|value| value.eq_ignore_ascii_case("EMP")).count();
+        assert_eq!(emp_count, 1);
+        assert!(suggestions.iter().any(|value| value.eq_ignore_ascii_case("EMP")));
     }
 }

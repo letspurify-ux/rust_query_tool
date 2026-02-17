@@ -25,6 +25,9 @@ pub(crate) struct SplitState {
     /// and BEGIN decrements it. This allows the outer procedure's BEGIN
     /// to still be recognized even after nested procedure's END.
     pub(crate) pending_subprogram_begins: usize,
+    /// Tracks CREATE routine headers opened by AS/IS while waiting for a BEGIN.
+    /// Each tuple is (header_depth, split_on_semicolon).
+    routine_is_stack: Vec<(usize, bool)>,
     /// True when we're creating a PACKAGE (spec or body), not PROCEDURE/FUNCTION/TRIGGER/TYPE
     /// Packages don't have a BEGIN at the AS level, only their contained procedures do.
     is_package: bool,
@@ -70,12 +73,24 @@ impl SplitState {
         }
         let upper = self.token.to_uppercase();
 
+        if matches!(upper.as_str(), "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
+            && self
+                .routine_is_stack
+                .last()
+                .is_some_and(|(depth, _)| *depth == self.block_depth)
+        {
+            if let Some((_, split_on_semicolon)) = self.routine_is_stack.last_mut() {
+                *split_on_semicolon = true;
+            }
+        }
+
         self.track_create_plsql(&upper);
 
         // Check if this is "END CASE" / "END IF" / "END LOOP" before processing pending_end
         let is_end_case = self.pending_end && upper == "CASE";
         let is_end_if = self.pending_end && upper == "IF";
         let is_end_loop = self.pending_end && upper == "LOOP";
+        let is_end_repeat = self.pending_end && upper == "REPEAT";
 
         if self.pending_end {
             if upper == "CASE" {
@@ -92,6 +107,11 @@ impl SplitState {
                 }
             } else if upper == "LOOP" {
                 // END LOOP
+                if self.block_depth > 0 {
+                    self.block_depth -= 1;
+                }
+            } else if upper == "REPEAT" {
+                // END REPEAT
                 if self.block_depth > 0 {
                     self.block_depth -= 1;
                 }
@@ -133,6 +153,10 @@ impl SplitState {
         }
 
         if upper == "LOOP" && !is_end_loop {
+            self.block_depth += 1;
+        }
+
+        if upper == "REPEAT" && !is_end_repeat {
             self.block_depth += 1;
         }
 
@@ -190,6 +214,7 @@ impl SplitState {
 
         if is_block_starting_as_is {
             self.block_depth += 1;
+            let split_on_semicolon = false;
             // Only set after_as_is for TYPE declarations (CREATE TYPE or TYPE inside package)
             // Don't set for package AS (which doesn't need REF/OBJECT/etc handling)
             // Don't set for procedure/function IS (which has BEGIN instead)
@@ -214,6 +239,7 @@ impl SplitState {
                 true // Standalone procedure/function/trigger or COMPOUND TRIGGER timing point
             };
             if needs_begin_tracking {
+                self.routine_is_stack.push((self.block_depth, split_on_semicolon));
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
@@ -227,6 +253,13 @@ impl SplitState {
             } else if self.pending_subprogram_begins > 0 {
                 // AS/IS ... BEGIN - same block for CREATE PL/SQL, don't increase depth
                 // Decrement the pending counter - this BEGIN matches one of the pending subprograms
+                if self
+                    .routine_is_stack
+                    .last()
+                    .is_some_and(|(depth, _)| *depth == self.block_depth)
+                {
+                    let _ = self.routine_is_stack.pop();
+                }
                 self.pending_subprogram_begins -= 1;
             } else {
                 // Standalone BEGIN block
@@ -277,6 +310,14 @@ impl SplitState {
         }
     }
 
+    pub(crate) fn should_split_on_semicolon(&self) -> bool {
+        self.routine_is_stack
+            .last()
+            .is_some_and(|(depth, split_on_semicolon)| {
+                *depth == self.block_depth && *split_on_semicolon
+            })
+    }
+
     pub(crate) fn resolve_pending_end_on_eof(&mut self) {
         if self.pending_end {
             // END at EOF - determine what it closes
@@ -307,6 +348,7 @@ impl SplitState {
         self.after_as_is = false;
         self.nested_subprogram = false;
         self.pending_subprogram_begins = 0;
+        self.routine_is_stack.clear();
         self.is_package = false;
         self.is_trigger = false;
         self.in_compound_trigger = false;
@@ -336,6 +378,12 @@ impl SplitState {
             match upper {
                 "OR" => {
                     self.create_or_seen = true;
+                    return;
+                }
+                "NO" => {
+                    return;
+                }
+                "FORCE" => {
                     return;
                 }
                 "REPLACE" => {
@@ -604,6 +652,15 @@ impl StatementBuilder {
                     // resolve_pending_end_on_terminator가 reset을 호출하지 못한다.
                     // 여기서 명시적으로 초기화하여 다음 문장 파싱이 깨끗하게 시작된다.
                     self.state.reset_create_state();
+                } else if self.state.should_split_on_semicolon() {
+                    self.state.reset_create_state();
+                    self.state.block_depth = 0;
+                    self.state.case_depth_stack.clear();
+                    let trimmed = self.current.trim();
+                    if !trimmed.is_empty() {
+                        self.statements.push(trimmed.to_string());
+                    }
+                    self.current.clear();
                 } else {
                     self.current.push(c);
                 }
@@ -659,6 +716,56 @@ impl QueryExecutor {
         fn should_pre_dedent(leading_word: &str) -> bool {
             matches!(leading_word, "END" | "ELSE" | "ELSIF" | "EXCEPTION")
         }
+        let is_with_main_query_keyword = |word: &str| -> bool {
+            matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        };
+        let leading_keyword_after_comments = |line: &str| -> Option<String> {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+
+            while i < bytes.len() {
+                let b = bytes[i];
+
+                if b.is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+
+                if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    return None;
+                }
+
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#' {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric()
+                            || bytes[i] == b'_'
+                            || bytes[i] == b'$'
+                            || bytes[i] == b'#')
+                    {
+                        i += 1;
+                    }
+                    return Some(line[start..i].to_ascii_uppercase());
+                }
+
+                i += 1;
+            }
+
+            None
+        };
 
         let mut builder = StatementBuilder::new();
         let mut depths = Vec::new();
@@ -680,6 +787,14 @@ impl QueryExecutor {
             } else {
                 Vec::new()
             };
+            let leading_keyword = if builder.is_idle() {
+                leading_keyword_after_comments(line)
+            } else {
+                None
+            };
+            let leading_word = leading_keyword
+                .as_deref()
+                .or_else(|| words.first().map(String::as_str));
 
             let trimmed_start = line.trim_start();
             let is_comment_or_blank = trimmed_start.is_empty()
@@ -688,14 +803,12 @@ impl QueryExecutor {
                 || trimmed_start.starts_with("*/");
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
-                if words.first().is_some_and(|w| w == "SELECT") {
+                if leading_word.is_some_and(|w| w == "SELECT") {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);
                 }
                 pending_subquery_paren = 0;
             }
-
-            let leading_word = words.first().map(String::as_str);
 
             // Eagerly resolve pending_end when the current line does NOT continue an
             // END CASE / END IF / END LOOP / END BEFORE / END AFTER sequence.
@@ -705,7 +818,7 @@ impl QueryExecutor {
             if builder.state.pending_end
                 && !matches!(
                     leading_word,
-                    Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER")
+                    Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")
                 )
             {
                 if builder
@@ -740,6 +853,9 @@ impl QueryExecutor {
             } else {
                 builder.block_depth()
             };
+            if builder.state.pending_end && matches!(leading_word, Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")) {
+                depth = depth.saturating_sub(1);
+            }
 
             if at_case_header_level && matches!(leading_word, Some("WHEN" | "ELSE")) {
                 depth = builder.block_depth();
@@ -785,15 +901,16 @@ impl QueryExecutor {
                 depth = depth.saturating_add(subquery_paren_depth);
             }
 
-            if with_cte_depth > 0 {
-                let starts_main_select =
-                    words.first().is_some_and(|w| w == "SELECT") && with_cte_paren <= 0;
-                if starts_main_select {
-                    depth = depth.saturating_sub(1);
-                } else {
-                    depth = depth.saturating_add(with_cte_depth);
+                if with_cte_depth > 0 {
+                    let starts_main_select =
+                        leading_word.is_some_and(|word| is_with_main_query_keyword(word))
+                            && with_cte_paren <= 0;
+                    if starts_main_select {
+                        depth = depth.saturating_sub(1);
+                    } else {
+                        depth = depth.saturating_add(with_cte_depth);
+                    }
                 }
-            }
 
             // No extra subprogram body depth: declarations and statements share the same level.
 
@@ -805,9 +922,9 @@ impl QueryExecutor {
             // base). process_text runs at the end of each iteration, so at this
             // point builder.state reflects the end of the previous line.
             let raw = line;
-            let upper = raw.to_uppercase();
+            let with_line = matches!(leading_word, Some("WITH"));
 
-            if upper.trim_start().starts_with("WITH ") {
+            if with_line {
                 pending_with = true;
                 with_cte_depth = with_cte_depth.max(1);
                 with_cte_paren = 0;
@@ -984,7 +1101,10 @@ impl QueryExecutor {
                 idx += 1;
             }
 
-            if pending_with && words.first().is_some_and(|w| w == "SELECT") && with_cte_paren <= 0 {
+            if pending_with
+                && leading_word.is_some_and(|word| is_with_main_query_keyword(word))
+                && with_cte_paren <= 0
+            {
                 with_cte_depth = 0;
                 pending_with = false;
             }

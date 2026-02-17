@@ -746,6 +746,7 @@ impl SqlEditorWidget {
             "UNION",
             "INTERSECT",
             "MINUS",
+            "EXCEPT",
             "INSERT",
             "UPDATE",
             "DELETE",
@@ -753,6 +754,16 @@ impl SqlEditorWidget {
             "VALUES",
             "SET",
             "INTO",
+            "OFFSET",
+            "FETCH",
+            "LIMIT",
+            "CONNECT",
+            "START",
+            "RETURNING",
+            "MODEL",
+            "WINDOW",
+            "MATCH_RECOGNIZE",
+            "QUALIFY",
             "WITH",
         ];
         let join_modifiers = ["LEFT", "RIGHT", "FULL", "INNER", "CROSS"];
@@ -762,8 +773,8 @@ impl SqlEditorWidget {
                                                               // BEGIN is handled separately to support DECLARE ... BEGIN ... END blocks
                                                               // CASE is handled separately for SELECT vs PL/SQL context
                                                               // LOOP is handled separately for FOR ... LOOP on same line
-        let block_start_keywords = ["DECLARE", "IF"];
-        let block_end_qualifiers = ["LOOP", "IF", "CASE"]; // END LOOP, END IF, END CASE
+        let block_start_keywords = ["DECLARE", "IF", "REPEAT"];
+        let block_end_qualifiers = ["LOOP", "IF", "CASE", "REPEAT"]; // END LOOP, END IF, END CASE, END REPEAT
 
         let tokens = Self::tokenize_sql(statement);
         let mut out = String::new();
@@ -920,8 +931,57 @@ impl SqlEditorWidget {
                     let is_exit_when = upper == "WHEN" && pending_exit_condition;
                     if upper == "END" {
                         // Check if this is END LOOP, END IF, END CASE, etc.
-                        let qualifier = end_qualifier.as_deref();
-                        let is_qualified_end = matches!(qualifier, Some("LOOP" | "IF" | "CASE"));
+                        let mut end_tail: Vec<String> = Vec::new();
+                        if let Some(qualifier) = end_qualifier.as_deref() {
+                            match qualifier {
+                                "LOOP" | "IF" | "CASE" | "REPEAT" => {
+                                    end_tail.push(qualifier.to_string());
+                                }
+                                "BEFORE" | "AFTER" => {
+                                    end_tail.push(qualifier.to_string());
+                                    let mut lookahead = idx + 1;
+                                    while lookahead < tokens.len() {
+                                        match &tokens[lookahead] {
+                                            SqlToken::Comment(comment) => {
+                                                if !comment.contains('\n') {
+                                                    lookahead += 1;
+                                                    continue;
+                                                }
+                                                break;
+                                            }
+                                            SqlToken::Word(word) => {
+                                                let qualifier_part = word.to_uppercase();
+                                                if end_tail
+                                                    .last()
+                                                    .is_some_and(|value| value == "EACH")
+                                                {
+                                                    if qualifier_part == "ROW" {
+                                                        end_tail.push(qualifier_part);
+                                                    }
+                                                    break;
+                                                }
+                                                if matches!(
+                                                    qualifier_part.as_str(),
+                                                    "EACH" | "STATEMENT"
+                                                ) {
+                                                    end_tail.push(qualifier_part);
+                                                    lookahead += 1;
+                                                    continue;
+                                                }
+                                                break;
+                                            }
+                                            SqlToken::Symbol(sym) if sym == ";" => break,
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let is_qualified_end = matches!(
+                            end_tail.first().map(String::as_str),
+                            Some("LOOP" | "IF" | "CASE" | "REPEAT")
+                        );
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
 
                         let case_expression_end =
@@ -934,7 +994,9 @@ impl SqlEditorWidget {
                                     block_stack.pop();
                                 }
                             }
-                            if qualifier == Some("CASE") && !case_branch_started.is_empty() {
+                            if end_tail.first().is_some_and(|q| q == "CASE")
+                                && !case_branch_started.is_empty()
+                            {
                                 case_branch_started.pop();
                             }
                         } else if case_expression_end {
@@ -979,23 +1041,34 @@ impl SqlEditorWidget {
                         ensure_indent(&mut out, &mut at_line_start, line_indent);
                         out.push_str("END");
 
-                        // If qualified (END LOOP, END IF, etc.), output the qualifier and skip it
-                        if is_qualified_end {
-                            if let Some(q) = qualifier {
-                                out.push(' ');
-                                out.push_str(q);
-                                // Skip the next word token (LOOP, IF, CASE)
-                                idx += 1;
-                                while idx < tokens.len() {
-                                    if let SqlToken::Word(_) = &tokens[idx] {
-                                        break;
-                                    }
-                                    idx += 1;
-                                }
-                            }
+                        // If qualified (END LOOP/IF/CASE/REPEAT/BEFORE/AFTER), output tail and skip it.
+                        let skip_count = end_tail.len();
+                        for qualifier in end_tail.iter() {
+                            out.push(' ');
+                            out.push_str(qualifier);
                         }
                         needs_space = true;
-                        idx += 1;
+                        if skip_count == 0 {
+                            idx += 1;
+                        } else {
+                            let mut lookahead = idx + 1;
+                            let mut words_skipped = 0usize;
+                            while lookahead < tokens.len() && words_skipped < skip_count {
+                                match &tokens[lookahead] {
+                                    SqlToken::Word(_) => {
+                                        words_skipped += 1;
+                                    }
+                                    SqlToken::Comment(comment) => {
+                                        if comment.contains('\n') {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                lookahead += 1;
+                            }
+                            idx = lookahead;
+                        }
                         continue;
                     } else if trigger_header_active
                         && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD")
@@ -1288,6 +1361,20 @@ impl SqlEditorWidget {
                         after_for_while = false;
                         // LOOP always starts a block body on the next line.
                         newline_after_keyword = true;
+                    } else if upper == "REPEAT" {
+                        // REPEAT starts a block body on the next line.
+                        newline_with(
+                            &mut out,
+                            base_indent(
+                                indent_level,
+                                in_open_cursor_sql,
+                                open_cursor_sql_indent,
+                            ),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if upper == "CASE" {
                         // CASE in PL/SQL block vs SELECT context
                         if in_sql_case_clause {
@@ -1432,6 +1519,10 @@ impl SqlEditorWidget {
                     } else if upper == "LOOP" {
                         block_stack.push("LOOP".to_string());
                         indent_level += 1;
+                    } else if upper == "REPEAT" {
+                        block_stack.push("REPEAT".to_string());
+                        indent_level += 1;
+                        in_plsql_block = true;
                     } else if upper == "CASE" {
                         block_stack.push("CASE".to_string());
                         if in_plsql_block && current_clause.is_none() {
@@ -2249,28 +2340,35 @@ impl SqlEditorWidget {
             })
             .collect();
 
+        if let Some(first) = words.first().map(String::as_str) {
+            if matches!(first, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+                return false;
+            }
+            if first == "WITH" {
+                let mut next_index = 1usize;
+                if words.get(next_index).is_some_and(|word| word == "RECURSIVE") {
+                    next_index += 1;
+                }
+                if matches!(
+                    words.get(next_index).map(String::as_str),
+                    Some("FUNCTION" | "PROCEDURE")
+                ) {
+                    return true;
+                }
+                return false;
+            }
+        }
+
         let mut idx = 0usize;
         while idx < words.len() {
             match words[idx].as_str() {
                 "BEGIN" | "DECLARE" => return true,
                 "CREATE" => {
-                    let mut object_idx = idx + 1;
-                    while object_idx < words.len()
-                        && matches!(
-                            words[object_idx].as_str(),
-                            "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE"
-                        )
-                    {
-                        object_idx += 1;
-                    }
-                    if words.get(object_idx).is_some_and(|word| {
-                        matches!(
-                            word.as_str(),
-                            "PACKAGE" | "PROCEDURE" | "FUNCTION" | "TRIGGER"
-                        )
-                    }) {
-                        return true;
-                    }
+                    let object_type = Self::parse_ddl_object_type(statement);
+                    return matches!(
+                        object_type,
+                        "Procedure" | "Function" | "Package" | "Package Body" | "Type" | "Type Body" | "Trigger"
+                    );
                 }
                 _ => {}
             }
@@ -2278,6 +2376,11 @@ impl SqlEditorWidget {
         }
 
         false
+    }
+
+    fn parse_ddl_object_type(statement: &str) -> &'static str {
+        let upper = statement.to_uppercase();
+        QueryExecutor::parse_ddl_object_type(&upper)
     }
 
     fn format_create_table(statement: &str) -> Option<String> {
@@ -7778,6 +7881,46 @@ END;";
     }
 
     #[test]
+    fn keeps_repeat_block_as_single_indented_block() {
+        let sql = r#"BEGIN
+  REPEAT
+    DBMS_OUTPUT.PUT_LINE('start');
+    i := i + 1;
+  UNTIL i >= 3
+  END REPEAT;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("END REPEAT;"),
+            "REPEAT block terminator should stay on a single line, got: {}",
+            formatted
+        );
+
+        let repeat_end_line = formatted
+            .lines()
+            .find(|line| line.trim().starts_with("END REPEAT;"))
+            .expect("formatted output should contain END REPEAT line");
+        let end_line = formatted
+            .lines()
+            .find(|line| line.trim() == "END");
+
+        assert!(end_line.unwrap_or("    ").starts_with("    "), "END should be indented");
+        assert!(
+            formatted.contains("DBMS_OUTPUT.PUT_LINE"),
+            "REPEAT body should remain present, got: {}",
+            formatted
+        );
+        assert!(repeat_end_line.starts_with("    "), "END REPEAT should match block indent");
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(
+            formatted, formatted_again,
+            "Formatting should be idempotent for REPEAT blocks"
+        );
+    }
+
+    #[test]
     fn tab_off_keeps_tab_character_in_script_output() {
         let line = "A\tB";
         let rendered = SqlEditorWidget::format_script_output_line(line, false, false);
@@ -7902,6 +8045,72 @@ END oqt_mega_pkg;"#;
     }
 
     #[test]
+    fn plsql_like_detection_ignores_explain_and_open_for() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "EXPLAIN PLAN FOR SELECT 1 FROM dual;"
+        ));
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "OPEN p_rc FOR SELECT empno FROM oqt_t_emp;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_with_function_factoring() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "WITH FUNCTION format_name(p_name IN VARCHAR2) RETURN VARCHAR2 IS\nBEGIN\n  RETURN INITCAP(p_name);\nEND;\nSELECT * FROM dual;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_or_replace_force_procedure() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE FORCE PROCEDURE test_proc AS\nBEGIN\n  NULL;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_or_replace_editionable_function() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE EDITIONABLE FUNCTION test_fn RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_package_body() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE PACKAGE BODY test_pkg AS\n  PROCEDURE proc IS\n  BEGIN\n    NULL;\n  END;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_supports_no_force_function() {
+        assert!(SqlEditorWidget::is_plsql_like_statement(
+            "CREATE NO FORCE FUNCTION test_fn RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND;"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_materialized_view() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE MATERIALIZED VIEW test_mv AS SELECT 1 FROM dual"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_materialized_view_log() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE MATERIALIZED VIEW LOG ON test_table"
+        ));
+    }
+
+    #[test]
+    fn plsql_like_detection_rejects_create_view() {
+        assert!(!SqlEditorWidget::is_plsql_like_statement(
+            "CREATE OR REPLACE VIEW test_view AS SELECT 1 FROM dual"
+        ));
+    }
+
+    #[test]
     fn trigger_audit_block_keeps_expected_header_and_values_alignment() {
         let sql = r#"create or replace noneditionable trigger "SYSTEM"."OQT_TRG_MEG_CUD" after insert or update or delete on oqt_meg_master for each row begin if inserting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('INSERT', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'key='||:NEW.master_key||', status='||:NEW.status||', amount='||TO_CHAR(:NEW.amount)); elsif updating then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('UPDATE', 'OQT_MEG_MASTER', 'master_id='||:NEW.master_id, 'status:'||:OLD.status||'->'||:NEW.status||', amount:'||TO_CHAR(:OLD.amount)||'->'||TO_CHAR(:NEW.amount)); elsif deleting then insert into oqt_meg_audit(event_type, table_name, pk_text, detail_text) values ('DELETE', 'OQT_MEG_MASTER', 'master_id='||:OLD.master_id, 'key='||:OLD.master_key||', status='||:OLD.status||', amount='||TO_CHAR(:OLD.amount)); end if; end; alter trigger "SYSTEM"."OQT_TRG_MEG_CUD" enable"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
@@ -7925,6 +8134,33 @@ END oqt_mega_pkg;"#;
         assert!(
             formatted.contains("END;\nALTER TRIGGER \"SYSTEM\".\"OQT_TRG_MEG_CUD\" ENABLE;"),
             "CREATE/ALTER trigger pair should not be separated by a blank line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_statement_preserves_compound_trigger_timing_end_qualifier() {
+        let sql = r#"CREATE OR REPLACE TRIGGER test_compound_trg
+  FOR INSERT ON test_table
+  COMPOUND TRIGGER
+    BEFORE EACH ROW IS
+    BEGIN
+      :NEW.status := 'new';
+    END BEFORE EACH ROW;
+    AFTER STATEMENT IS
+    BEGIN
+      NULL;
+    END AFTER STATEMENT;
+  END test_compound_trg;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        assert!(
+            formatted.contains("END BEFORE EACH ROW;"),
+            "Compound trigger BEFORE timing qualifier should be preserved, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("END AFTER STATEMENT;"),
+            "Compound trigger AFTER timing qualifier should be preserved, got:\n{}",
             formatted
         );
     }

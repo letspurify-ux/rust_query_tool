@@ -84,6 +84,40 @@ END;"#;
 }
 
 #[test]
+fn test_create_or_replace_force_procedure() {
+    let sql = r#"CREATE OR REPLACE FORCE PROCEDURE test_proc IS
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('Hello');
+END;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
+    assert!(stmts[0].contains("CREATE OR REPLACE FORCE PROCEDURE"));
+}
+
+#[test]
+fn test_create_external_function_as_non_plsql_block_followed_by_select() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_fn(
+  p_num NUMBER
+) RETURN NUMBER
+IS
+EXTERNAL
+  LANGUAGE C
+  NAME 'ExtNativeFunction';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "External function declaration should split before following SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].contains("CREATE OR REPLACE FUNCTION"));
+    assert!(stmts[1].contains("SELECT 1 FROM"));
+}
+
+#[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS
 BEGIN
@@ -3225,6 +3259,145 @@ END;"#;
 }
 
 #[test]
+    fn test_split_script_items_repeat_block() {
+        let sql = r#"DECLARE
+  v_count NUMBER := 0;
+BEGIN
+  REPEAT
+    v_count := v_count + 1;
+  UNTIL v_count >= 3
+  END REPEAT;
+END;"#;
+        let items = QueryExecutor::split_script_items(sql);
+        let stmts = get_statements(&items);
+        assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
+    }
+
+    #[test]
+    fn test_split_script_items_repeat_block_with_end_repeat_on_next_line() {
+        let sql = r#"DECLARE
+  v_count NUMBER := 0;
+BEGIN
+  REPEAT
+    v_count := v_count + 1;
+  UNTIL v_count >= 3
+  END
+  REPEAT;
+END;"#;
+        let items = QueryExecutor::split_script_items(sql);
+        let stmts = get_statements(&items);
+        assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
+        assert!(stmts[0].contains("END") && stmts[0].contains("REPEAT"));
+    }
+
+#[test]
+fn test_split_script_items_pipelined_function() {
+    let sql = r#"CREATE OR REPLACE FUNCTION stream_numbers(
+  p_limit NUMBER
+) RETURN SYS.ODCINUMBERLIST PIPELINED
+IS
+BEGIN
+  NULL;
+END;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "PIPELINED function should be one statement");
+    assert!(stmts[0].contains("PIPELINED"));
+}
+
+#[test]
+    fn test_line_block_depths_increase_for_repeat_loop() {
+        let sql = r#"BEGIN
+  REPEAT
+    NULL;
+  UNTIL i > 1
+  END REPEAT;
+END;"#;
+        let depths = QueryExecutor::line_block_depths(sql);
+        let expected = vec![0, 1, 2, 2, 1, 0];
+        assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
+    }
+
+    #[test]
+    fn test_line_block_depths_with_split_end_repeat() {
+        let sql = r#"BEGIN
+  REPEAT
+    NULL;
+  UNTIL i > 1
+  END
+  REPEAT;
+END;"#;
+        let depths = QueryExecutor::line_block_depths(sql);
+        let expected = vec![0, 1, 2, 2, 1, 1, 0];
+        assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
+    }
+
+#[test]
+fn test_line_block_depths_with_for_update_clause() {
+    let sql = r#"SELECT id, status
+FROM jobs
+WHERE status = 'PENDING'
+FOR UPDATE SKIP LOCKED;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(depths, vec![0, 0, 0, 0]);
+}
+
+#[test]
+fn test_line_block_depths_with_with_clause_prefixed_by_hint_comment() {
+    let sql = r#"/*+ leading_optimizer_hint */ WITH cte AS (
+  SELECT 1 AS id FROM dual
+)
+SELECT * FROM cte;"#;
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let mut with_idx = None;
+    let mut cte_select_idx = None;
+    let mut main_select_idx = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        if with_idx.is_none() && line.to_uppercase().starts_with("/*") {
+            if line.to_uppercase().contains(" WITH ") {
+                with_idx = Some(idx);
+            }
+        } else if with_idx.is_none()
+            && line.to_uppercase().trim_start().starts_with("WITH ")
+            && !line.trim_start().starts_with("--")
+        {
+            with_idx = Some(idx);
+        }
+
+        if line.to_uppercase().trim_start().starts_with("SELECT ")
+            && cte_select_idx.is_none()
+        {
+            cte_select_idx = Some(idx);
+        } else if line.to_uppercase().trim_start().starts_with("SELECT * FROM CTE")
+            && main_select_idx.is_none()
+        {
+            main_select_idx = Some(idx);
+        }
+    }
+
+    let with_idx = with_idx.expect("expected hint-prefixed WITH line");
+    let cte_select_idx = cte_select_idx.expect("expected CTE SELECT");
+    let main_select_idx = main_select_idx.expect("expected main SELECT after CTE");
+
+    assert!(with_idx + 1 < lines.len(), "WITH line should have body line");
+    assert!(
+        depths[with_idx + 1] > depths[with_idx],
+        "WITH body should be indented deeper than hint+WITH line"
+    );
+    assert!(
+        depths[cte_select_idx] > depths[with_idx],
+        "CTE SELECT should be indented under WITH"
+    );
+    assert!(
+        depths[main_select_idx] <= depths[with_idx],
+        "Main SELECT should be dedented to CTE scope"
+    );
+}
+
+#[test]
 fn test_line_block_depths_increase_for_loop_subquery_with_and_package() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_demo AS
   PROCEDURE run_demo IS
@@ -3268,6 +3441,61 @@ SELECT * FROM cte;"#;
     assert!(
         depths[15] > depths[14],
         "CTE body should be indented under WITH"
+    );
+}
+
+#[test]
+fn test_line_block_depths_with_with_clause_followed_by_update() {
+    let sql = r#"WITH cte AS (
+  SELECT 1 AS id FROM dual
+)
+UPDATE demo_table
+SET id = 1
+WHERE EXISTS (
+  SELECT 1 FROM cte
+);"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let lines: Vec<&str> = sql.lines().collect();
+    let mut with_idx = None;
+    let mut update_idx = None;
+    let mut where_idx = None;
+    let mut exists_select_idx = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let upper = line.trim().to_uppercase();
+        if with_idx.is_none() && upper.starts_with("WITH ") {
+            with_idx = Some(idx);
+        } else if upper.starts_with("UPDATE ") {
+            update_idx = Some(idx);
+        } else if upper.starts_with("WHERE ") {
+            where_idx = Some(idx);
+        } else if idx > 0
+            && lines[idx - 1].trim().to_uppercase().starts_with("WHERE EXISTS (")
+            && upper.starts_with("SELECT ")
+        {
+            exists_select_idx = Some(idx);
+        }
+    }
+
+    let with_idx = with_idx.expect("expected WITH clause line");
+    let update_idx = update_idx.expect("expected UPDATE line");
+    let where_idx = where_idx.expect("expected WHERE line");
+    let exists_select_idx = exists_select_idx.expect("expected nested EXISTS SELECT line");
+
+    assert!(with_idx + 1 < depths.len(), "CTE should have at least two lines");
+    assert!(
+        depths[with_idx + 1] > depths[with_idx],
+        "CTE body SELECT should be deeper than WITH header"
+    );
+    assert!(
+        depths[update_idx] <= depths[with_idx],
+        "Main UPDATE should dedent out of WITH body"
+    );
+    assert!(
+        depths[exists_select_idx] > depths[where_idx],
+        "EXISTS subquery SELECT should be nested"
     );
 }
 
@@ -3370,6 +3598,26 @@ fn test_parse_ddl_object_type_create_or_replace_procedure() {
 }
 
 #[test]
+fn test_parse_ddl_object_type_create_or_replace_force_procedure() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE FORCE PROCEDURE MY_PROC AS BEGIN NULL; END;"
+        ),
+        "Procedure"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_no_force_procedure() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE NO FORCE PROCEDURE MY_PROC AS BEGIN NULL; END;"
+        ),
+        "Procedure"
+    );
+}
+
+#[test]
 fn test_parse_ddl_object_type_create_function() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type(
@@ -3384,6 +3632,16 @@ fn test_parse_ddl_object_type_create_or_replace_function() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type(
             "CREATE OR REPLACE FUNCTION MY_FUNC RETURN NUMBER IS BEGIN RETURN 1; END;"
+        ),
+        "Function"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_or_replace_editionable_force_function() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE EDITIONABLE FORCE FUNCTION MY_FUNC RETURN NUMBER IS BEGIN RETURN 1; END;"
         ),
         "Function"
     );
@@ -3406,6 +3664,16 @@ fn test_parse_ddl_object_type_create_package_body() {
             "CREATE PACKAGE BODY MY_PKG AS PROCEDURE PROC1 IS BEGIN NULL; END; END MY_PKG;"
         ),
         "Package Body"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_or_replace_type_body() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE TYPE BODY MY_TYPE AS MEMBER FUNCTION GET_ID RETURN NUMBER IS BEGIN RETURN ID; END;"
+        ),
+        "Type Body"
     );
 }
 
