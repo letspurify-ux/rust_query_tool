@@ -2332,19 +2332,18 @@ impl QueryExecutor {
             };
         }
 
-        // Split by @ to separate credentials from connection string
-        let parts: Vec<&str> = rest.splitn(2, '@').collect();
-        if parts.len() != 2 {
+        // Split by the last @ so passwords containing @ are preserved.
+        let Some((credentials_raw, conn_str_raw)) = rest.rsplit_once('@') else {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
                 message: "Invalid CONNECT syntax. Expected: user/password@host:port/service_name"
                     .to_string(),
                 is_error: true,
             };
-        }
+        };
 
         // Parse credentials (user/password)
-        let credentials: Vec<&str> = parts[0].splitn(2, '/').collect();
+        let credentials: Vec<&str> = credentials_raw.splitn(2, '/').collect();
         if credentials.len() != 2 {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
@@ -2365,7 +2364,7 @@ impl QueryExecutor {
         }
 
         // Parse connection string (//host:port/service_name or host:port/service_name)
-        let conn_str = parts[1].trim();
+        let conn_str = conn_str_raw.trim();
         let conn_str = conn_str.strip_prefix("//").unwrap_or(conn_str);
 
         // Split by / to separate host:port from service_name

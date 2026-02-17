@@ -2155,6 +2155,35 @@ fn test_connect_tool_command_still_works() {
 }
 
 #[test]
+fn test_connect_tool_command_supports_at_sign_in_password() {
+    let sql = "CONNECT user/p@ss@localhost:1521/ORCL";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let has_expected_connect = items.iter().any(|item| {
+        matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::Connect {
+                username,
+                password,
+                host,
+                port,
+                service_name,
+            }) if username == "user"
+                && password == "p@ss"
+                && host == "localhost"
+                && *port == 1521
+                && service_name == "ORCL"
+        )
+    });
+
+    assert!(
+        has_expected_connect,
+        "CONNECT command with @ in password should parse correctly, got: {:?}",
+        items
+    );
+}
+
+#[test]
 fn test_column_new_value_tool_command_parsed() {
     let sql = "COLUMN col NEW_VALUE var";
     let items = QueryExecutor::split_script_items(sql);
