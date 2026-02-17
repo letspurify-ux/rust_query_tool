@@ -1728,7 +1728,7 @@ impl QueryExecutor {
             return Some(Self::parse_var_command(trimmed));
         }
 
-        if upper.starts_with("PRINT") {
+        if Self::is_word_command(&upper, "PRINT") {
             let rest = trimmed[5..].trim();
             let name = if rest.is_empty() {
                 None
@@ -1758,16 +1758,16 @@ impl QueryExecutor {
             return Some(Self::parse_describe_command(trimmed));
         }
 
-        if upper.starts_with("PROMPT") {
+        if Self::is_word_command(&upper, "PROMPT") {
             let text = trimmed[6..].trim().to_string();
             return Some(ToolCommand::Prompt { text });
         }
 
-        if upper.starts_with("PAUSE") {
+        if Self::is_word_command(&upper, "PAUSE") {
             return Some(Self::parse_pause_command(trimmed));
         }
 
-        if upper.starts_with("ACCEPT") {
+        if Self::is_word_command(&upper, "ACCEPT") {
             return Some(Self::parse_accept_command(trimmed));
         }
 
@@ -1780,7 +1780,7 @@ impl QueryExecutor {
             return Some(Self::parse_define_assign_command(trimmed));
         }
 
-        if upper.starts_with("UNDEFINE") {
+        if Self::is_word_command(&upper, "UNDEFINE") {
             return Some(Self::parse_undefine_command(trimmed));
         }
 
@@ -1788,19 +1788,19 @@ impl QueryExecutor {
             return Some(Self::parse_column_new_value_command(trimmed));
         }
 
-        if upper.starts_with("CLEAR") {
+        if Self::is_word_command(&upper, "CLEAR") {
             return Some(Self::parse_clear_command(trimmed));
         }
 
-        if upper.starts_with("BREAK") {
+        if Self::is_word_command(&upper, "BREAK") {
             return Some(Self::parse_break_command(trimmed));
         }
 
-        if upper.starts_with("COMPUTE") {
+        if Self::is_word_command(&upper, "COMPUTE") {
             return Some(Self::parse_compute_command(trimmed));
         }
 
-        if upper.starts_with("SPOOL") {
+        if Self::is_word_command(&upper, "SPOOL") {
             return Some(Self::parse_spool_command(trimmed));
         }
 

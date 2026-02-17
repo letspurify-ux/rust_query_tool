@@ -2062,6 +2062,40 @@ ORDER SIBLINGS BY node_id;"#;
 }
 
 #[test]
+fn test_print_prefix_word_not_parsed_as_print_tool_command() {
+    let sql = "SELECT printable_col FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert!(
+        tool_commands.is_empty(),
+        "PRINT prefix in SQL identifier should not become tool command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_prompt_prefix_word_not_parsed_as_prompt_tool_command() {
+    let sql = "SELECT prompt_col FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert!(
+        tool_commands.is_empty(),
+        "PROMPT prefix in SQL identifier should not become tool command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
 fn test_json_table_columns_not_parsed_as_column_tool_command() {
     let sql = r#"SELECT
   jt.order_id,
