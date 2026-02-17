@@ -11,7 +11,6 @@ fn get_statements(items: &[ScriptItem]) -> Vec<&str> {
         .collect()
 }
 
-
 #[test]
 fn test_statement_bounds_at_cursor_ignores_string_literal_with_previous_statement_text() {
     let sql = "SELECT 1 FROM dual;
@@ -61,6 +60,19 @@ fn test_normalize_sql_for_execute_keeps_plsql_block_semicolon() {
 fn test_normalize_sql_for_execute_empty_input_stays_empty() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  ;  \n\t ");
     assert!(normalized.is_empty());
+}
+
+#[test]
+fn test_normalize_sql_for_execute_collapses_extra_trailing_semicolons_for_plsql() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("BEGIN NULL; END;;;   ");
+    assert_eq!(normalized, "BEGIN NULL; END;");
+}
+
+#[test]
+fn test_normalize_sql_for_execute_comment_prefixed_plsql_keeps_single_terminator() {
+    let normalized =
+        QueryExecutor::normalize_sql_for_execute("/*x*/ DECLARE v NUMBER:=1; BEGIN NULL; END;;; ");
+    assert_eq!(normalized, "/*x*/ DECLARE v NUMBER:=1; BEGIN NULL; END;");
 }
 
 #[test]
@@ -4149,7 +4161,10 @@ fn test_summarize_batch_results_marks_failure_when_dml_batch_has_errors() {
         vec!["Statement 2: ORA-00900: invalid SQL statement".to_string()],
     );
 
-    assert!(!result.success, "batch summary should fail when any statement fails");
+    assert!(
+        !result.success,
+        "batch summary should fail when any statement fails"
+    );
     assert!(!result.is_select);
     assert!(result.message.contains("Executed 1 of 2 statements"));
     assert!(result.message.contains("Errors:"));
@@ -4177,7 +4192,10 @@ fn test_summarize_batch_results_marks_failure_when_select_batch_has_errors() {
         vec!["Statement 2: ORA-00900: invalid SQL statement".to_string()],
     );
 
-    assert!(!result.success, "select batch should fail when any statement fails");
+    assert!(
+        !result.success,
+        "select batch should fail when any statement fails"
+    );
     assert!(result.is_select);
     assert!(result.message.contains("Errors:"));
     assert!(result.message.contains("Executed 1 of 2 statements"));

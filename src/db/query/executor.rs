@@ -1093,14 +1093,23 @@ impl QueryExecutor {
 
     pub(crate) fn normalize_sql_for_execute(sql: &str) -> String {
         let sql_trimmed = sql.trim();
+        if sql_trimmed.is_empty() {
+            return String::new();
+        }
+
+        let without_trailing_semicolons = sql_trimmed.trim_end_matches(';').trim_end();
+        if without_trailing_semicolons.is_empty() {
+            return String::new();
+        }
+
         // Remove trailing semicolon if present (but keep for PL/SQL blocks)
         if matches!(
             Self::leading_keyword(sql_trimmed).as_deref(),
             Some("BEGIN") | Some("DECLARE")
         ) {
-            sql_trimmed.to_string()
+            format!("{};", without_trailing_semicolons)
         } else {
-            sql_trimmed.trim_end_matches(';').trim().to_string()
+            without_trailing_semicolons.to_string()
         }
     }
 
@@ -1318,7 +1327,10 @@ impl QueryExecutor {
                     .unwrap_or(from);
                 let starts_at_line = sql[line_start..candidate].trim().is_empty();
 
-                if separator.is_none() || matches!(separator, Some(';') | Some('/')) || starts_at_line {
+                if separator.is_none()
+                    || matches!(separator, Some(';') | Some('/'))
+                    || starts_at_line
+                {
                     return Some(candidate);
                 }
             }
