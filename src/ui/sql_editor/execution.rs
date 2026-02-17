@@ -222,12 +222,16 @@ impl SqlEditorWidget {
 
         if select_formatted {
             let original_within_selection = (original_pos - start).clamp(0, source.len() as i32);
-            let mapped_within_selection =
-                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
+            let mapped_within_selection = Self::map_cursor_after_format(
+                &source,
+                &formatted,
+                original_within_selection,
+                true,
+            );
             buffer.select(start, start + formatted.len() as i32);
             editor.set_insert_position(start + mapped_within_selection);
         } else {
-            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos);
+            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos, false);
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
@@ -246,15 +250,23 @@ impl SqlEditorWidget {
             .unwrap_or(0)
     }
 
-    fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
+    fn map_cursor_after_format(
+        source: &str,
+        formatted: &str,
+        original_pos: i32,
+        preserve_selection_terminator: bool,
+    ) -> i32 {
         if original_pos <= 0 {
             return 0;
         }
 
         let source_pos = Self::clamp_to_char_boundary(source, original_pos as usize);
         let source_prefix = &source[..source_pos];
-        let formatted_prefix =
-            Self::preserve_selected_text_terminator(source_prefix, Self::format_sql_basic(source_prefix));
+        let mut formatted_prefix = Self::format_sql_basic(source_prefix);
+        if preserve_selection_terminator {
+            formatted_prefix =
+                Self::preserve_selected_text_terminator(source_prefix, formatted_prefix);
+        }
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -8023,7 +8035,7 @@ END oqt_mega_pkg;"#;
         let source_pos = source
             .find("b FROM")
             .expect("source cursor anchor should exist") as i32;
-        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos);
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos, false);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
@@ -8043,6 +8055,7 @@ END oqt_mega_pkg;"#;
             source,
             &formatted,
             source_pos_within_selection,
+            true,
         );
         let selection_start = 25i32;
         let final_cursor_pos = selection_start + mapped_within_selection;
@@ -8075,6 +8088,7 @@ END oqt_mega_pkg;"#;
             source,
             &formatted,
             source_pos_within_selection,
+            true,
         );
         let formatted_slice = &formatted[mapped_within_selection as usize..];
 
