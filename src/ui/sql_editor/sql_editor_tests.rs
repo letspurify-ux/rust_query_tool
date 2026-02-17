@@ -113,6 +113,28 @@ fn format_sql_preserves_connect_password_with_at_sign() {
 }
 
 #[test]
+fn format_sql_preserves_connect_password_with_slash() {
+    let input = "CONNECT user/pa/ss@localhost:1521/ORCL
+SELECT 1 FROM dual;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("CONNECT user/pa/ss@localhost:1521/ORCL"),
+        "CONNECT password containing / should be preserved, got:
+{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("SELECT 1
+FROM DUAL;"),
+        "SELECT statement should still be formatted normally, got:
+{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_mega_torture_script() {
     let input = load_test_file("mega_torture.txt");
     let formatted = SqlEditorWidget::format_sql_basic(&input);

@@ -208,7 +208,10 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_sql_basic(&source);
+        let mut formatted = Self::format_sql_basic(&source);
+        if select_formatted {
+            formatted = Self::preserve_selected_text_terminator(&source, formatted);
+        }
         if formatted == source {
             return;
         }
@@ -253,6 +256,23 @@ impl SqlEditorWidget {
         let formatted_prefix = Self::format_sql_basic(source_prefix);
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
+    }
+
+    fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
+        if source.trim_end().ends_with(';') || !formatted.trim_end().ends_with(';') {
+            return formatted;
+        }
+
+        let trimmed_len = formatted.trim_end().len();
+        let suffix = &formatted[trimmed_len..];
+        let mut body = formatted[..trimmed_len].to_string();
+        if body.ends_with(';') {
+            body.pop();
+            body.push_str(suffix);
+            body
+        } else {
+            formatted
+        }
     }
 
     pub fn toggle_comment(&self) {
@@ -8144,6 +8164,26 @@ END oqt_mega_pkg;"#;
             "CREATE/ALTER trigger pair should not be separated by a blank line, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_does_not_add_semicolon_when_selection_had_none() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(preserved.trim_end(), "SELECT 1
+FROM DUAL");
+        assert!(!preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {
+        let source = "SELECT 1 FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(preserved.trim_end().ends_with(';'));
     }
 
     #[test]
