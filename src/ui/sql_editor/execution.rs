@@ -153,20 +153,9 @@ impl SqlEditorWidget {
             self.execute_sql(&selected_text, false);
         } else {
             // Execute statement at cursor position
-            let sql = self.buffer.text();
-            let cursor_pos = self.editor.insert_position() as usize;
-            if let Some(statement) = QueryExecutor::statement_at_cursor(&sql, cursor_pos) {
-                let items = QueryExecutor::split_script_items(&statement);
-                if items.len() > 1 {
-                    if let Some(ScriptItem::Statement(stmt)) = items
-                        .iter()
-                        .find(|item| matches!(item, ScriptItem::Statement(_)))
-                    {
-                        self.execute_sql(stmt, false);
-                        return;
-                    }
-                }
-                self.execute_sql(&statement, false);
+            if let Some(statement) = self.statement_at_cursor_text() {
+                let normalized = Self::normalize_statement_for_single_execution(&statement);
+                self.execute_sql(&normalized, false);
             } else {
                 fltk::dialog::alert_default("No SQL at cursor");
             }

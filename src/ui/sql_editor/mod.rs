@@ -19,7 +19,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
+use crate::db::{
+    ConnectionInfo, QueryExecutor, QueryResult, ScriptItem, SharedConnection, TableColumnDetail,
+};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
@@ -198,6 +200,26 @@ pub struct SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
+    fn statement_at_cursor_text(&self) -> Option<String> {
+        let sql = self.buffer.text();
+        let cursor_pos = self.editor.insert_position() as usize;
+        QueryExecutor::statement_at_cursor(&sql, cursor_pos)
+    }
+
+    fn normalize_statement_for_single_execution(statement: &str) -> String {
+        let items = QueryExecutor::split_script_items(statement);
+        if items.len() > 1 {
+            if let Some(ScriptItem::Statement(stmt)) = items
+                .into_iter()
+                .find(|item| matches!(item, ScriptItem::Statement(_)))
+            {
+                return stmt;
+            }
+        }
+
+        statement.to_string()
+    }
+
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
         if let Some(msg) = payload.downcast_ref::<&str>() {
             (*msg).to_string()
@@ -1030,9 +1052,7 @@ impl SqlEditorWidget {
     }
 
     pub fn explain_current(&self) {
-        let sql = self.buffer.text();
-        let cursor_pos = self.editor.insert_position() as usize;
-        let Some(sql) = QueryExecutor::statement_at_cursor(&sql, cursor_pos) else {
+        let Some(sql) = self.statement_at_cursor_text() else {
             fltk::dialog::alert_default("No SQL at cursor");
             return;
         };
