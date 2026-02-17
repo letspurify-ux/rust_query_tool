@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::ui::sql_depth::paren_depths;
 use crate::ui::sql_editor::SqlToken;
 
 /// SQL clause phase within a query at a specific depth level.
@@ -1360,21 +1361,14 @@ pub fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
     }
 
     // Collect tokens for each SELECT item (delimited by comma at depth 0)
-    let mut depth = 0usize;
+    let token_depths = paren_depths(tokens);
     let mut item_tokens: Vec<&SqlToken> = Vec::new();
 
     while idx < tokens.len() {
         let token = &tokens[idx];
+        let depth = token_depths.get(idx).copied().unwrap_or(0);
 
         match token {
-            SqlToken::Symbol(s) if s == "(" => {
-                depth += 1;
-                item_tokens.push(token);
-            }
-            SqlToken::Symbol(s) if s == ")" => {
-                depth = depth.saturating_sub(1);
-                item_tokens.push(token);
-            }
             SqlToken::Symbol(s) if s == "," && depth == 0 => {
                 if let Some(col) = resolve_item_column_name(&item_tokens) {
                     columns.push(col);
@@ -1458,21 +1452,14 @@ pub fn extract_select_list_wildcard_tables(
     }
 
     // Collect tokens for each SELECT item (delimited by comma at depth 0)
-    let mut depth = 0usize;
+    let token_depths = paren_depths(tokens);
     let mut item_tokens: Vec<&SqlToken> = Vec::new();
 
     while idx < tokens.len() {
         let token = &tokens[idx];
+        let depth = token_depths.get(idx).copied().unwrap_or(0);
 
         match token {
-            SqlToken::Symbol(s) if s == "(" => {
-                depth += 1;
-                item_tokens.push(token);
-            }
-            SqlToken::Symbol(s) if s == ")" => {
-                depth = depth.saturating_sub(1);
-                item_tokens.push(token);
-            }
             SqlToken::Symbol(s) if s == "," && depth == 0 => {
                 append_wildcard_item_tables(&item_tokens, tables_in_scope, &mut tables, &mut seen);
                 item_tokens.clear();
