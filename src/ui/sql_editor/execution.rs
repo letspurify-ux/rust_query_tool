@@ -26,11 +26,7 @@ use crate::db::{
 };
 use crate::sql_text;
 use crate::ui::sql_depth::{
-    is_depth,
-    is_top_level_depth,
-    paren_depth_after,
-    paren_depths,
-    split_top_level_keyword_groups,
+    is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
 };
 use crate::ui::SQL_KEYWORDS;
@@ -222,12 +218,8 @@ impl SqlEditorWidget {
 
         if select_formatted {
             let original_within_selection = (original_pos - start).clamp(0, source.len() as i32);
-            let mapped_within_selection = Self::map_cursor_after_format(
-                &source,
-                &formatted,
-                original_within_selection,
-                true,
-            );
+            let mapped_within_selection =
+                Self::map_cursor_after_format(&source, &formatted, original_within_selection, true);
             buffer.select(start, start + formatted.len() as i32);
             editor.set_insert_position(start + mapped_within_selection);
         } else {
@@ -284,22 +276,84 @@ impl SqlEditorWidget {
     }
 
     fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
-        if Self::statement_ends_with_semicolon(source)
-            || !Self::statement_ends_with_semicolon(&formatted)
-        {
+        if Self::statement_ends_with_semicolon(source) {
             return formatted;
         }
 
-        let trimmed_len = formatted.trim_end().len();
-        let suffix = &formatted[trimmed_len..];
-        let mut body = formatted[..trimmed_len].to_string();
-        if body.ends_with(';') {
-            body.pop();
-            body.push_str(suffix);
-            body
-        } else {
-            formatted
+        if Self::statement_ends_with_semicolon(&formatted) {
+            if let Some(without_semicolon) = Self::remove_trailing_statement_semicolon(&formatted) {
+                return without_semicolon;
+            }
         }
+
+        if !source.trim_end().ends_with(';') {
+            if let Some(without_semicolon) = Self::remove_last_non_whitespace_semicolon(&formatted)
+            {
+                return without_semicolon;
+            }
+        }
+
+        formatted
+    }
+
+    fn remove_last_non_whitespace_semicolon(formatted: &str) -> Option<String> {
+        let trimmed_len = formatted.trim_end().len();
+        if trimmed_len == 0 {
+            return None;
+        }
+
+        let semicolon_idx = formatted[..trimmed_len].rfind(';')?;
+        if !formatted[semicolon_idx + 1..trimmed_len].trim().is_empty() {
+            return None;
+        }
+
+        let mut out = String::with_capacity(formatted.len().saturating_sub(1));
+        out.push_str(&formatted[..semicolon_idx]);
+        out.push_str(&formatted[semicolon_idx + 1..]);
+        Some(out)
+    }
+    fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
+        let trimmed_len = formatted.trim_end().len();
+        let trimmed = &formatted[..trimmed_len];
+
+        let mut semicolon_idx = None;
+        let mut idx = 0usize;
+        let bytes = trimmed.as_bytes();
+
+        while idx < bytes.len() {
+            if trimmed[idx..].starts_with("--") {
+                let line_end = trimmed[idx..]
+                    .find('\n')
+                    .map(|offset| idx + offset + 1)
+                    .unwrap_or(trimmed.len());
+                idx = line_end;
+                continue;
+            }
+
+            if trimmed[idx..].starts_with("/*") {
+                let block_end = trimmed[idx + 2..]
+                    .find("*/")
+                    .map(|offset| idx + 2 + offset + 2)
+                    .unwrap_or(trimmed.len());
+                idx = block_end;
+                continue;
+            }
+
+            if bytes[idx] == b';' {
+                semicolon_idx = Some(idx);
+            }
+            idx += 1;
+        }
+
+        let semicolon_idx = semicolon_idx?;
+        if !trimmed[semicolon_idx + 1..].trim().is_empty() {
+            return None;
+        }
+
+        let mut out = String::with_capacity(formatted.len().saturating_sub(1));
+        out.push_str(&formatted[..semicolon_idx]);
+        out.push_str(&formatted[semicolon_idx + 1..]);
+        Some(out)
     }
 
     pub fn toggle_comment(&self) {
@@ -1416,11 +1470,7 @@ impl SqlEditorWidget {
                         // REPEAT starts a block body on the next line.
                         newline_with(
                             &mut out,
-                            base_indent(
-                                indent_level,
-                                in_open_cursor_sql,
-                                open_cursor_sql_indent,
-                            ),
+                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -2383,7 +2433,10 @@ impl SqlEditorWidget {
             }
             if first == "WITH" {
                 let mut next_index = 1usize;
-                if words.get(next_index).is_some_and(|word| word == "RECURSIVE") {
+                if words
+                    .get(next_index)
+                    .is_some_and(|word| word == "RECURSIVE")
+                {
                     next_index += 1;
                 }
                 if matches!(
@@ -2404,7 +2457,13 @@ impl SqlEditorWidget {
                     let object_type = Self::parse_ddl_object_type(statement);
                     return matches!(
                         object_type,
-                        "Procedure" | "Function" | "Package" | "Package Body" | "Type" | "Type Body" | "Trigger"
+                        "Procedure"
+                            | "Function"
+                            | "Package"
+                            | "Package Body"
+                            | "Type"
+                            | "Type Body"
+                            | "Trigger"
                     );
                 }
                 _ => {}
@@ -2512,9 +2571,7 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
-                    if is_depth(&token_depths, idx, 1)
-                        && open_idx.is_some()
-                        && close_idx.is_none()
+                    if is_depth(&token_depths, idx, 1) && open_idx.is_some() && close_idx.is_none()
                     {
                         close_idx = Some(idx);
                         break;
@@ -7928,17 +7985,21 @@ END;"#;
             .lines()
             .find(|line| line.trim().starts_with("END REPEAT;"))
             .expect("formatted output should contain END REPEAT line");
-        let end_line = formatted
-            .lines()
-            .find(|line| line.trim() == "END");
+        let end_line = formatted.lines().find(|line| line.trim() == "END");
 
-        assert!(end_line.unwrap_or("    ").starts_with("    "), "END should be indented");
+        assert!(
+            end_line.unwrap_or("    ").starts_with("    "),
+            "END should be indented"
+        );
         assert!(
             formatted.contains("DBMS_OUTPUT.PUT_LINE"),
             "REPEAT body should remain present, got: {}",
             formatted
         );
-        assert!(repeat_end_line.starts_with("    "), "END REPEAT should match block indent");
+        assert!(
+            repeat_end_line.starts_with("    "),
+            "END REPEAT should match block indent"
+        );
 
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
         assert_eq!(
@@ -8049,7 +8110,8 @@ END oqt_mega_pkg;"#;
         let source_pos = source
             .find("b FROM")
             .expect("source cursor anchor should exist") as i32;
-        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos, false);
+        let mapped =
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos, false);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
@@ -8064,7 +8126,8 @@ END oqt_mega_pkg;"#;
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let source_pos_within_selection = source
             .find("b FROM")
-            .expect("source cursor anchor should exist") as i32;
+            .expect("source cursor anchor should exist")
+            as i32;
         let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
             source,
             &formatted,
@@ -8096,7 +8159,8 @@ END oqt_mega_pkg;"#;
         );
         let source_pos_within_selection = source
             .find("b FROM")
-            .expect("source cursor anchor should exist") as i32;
+            .expect("source cursor anchor should exist")
+            as i32;
 
         let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
             source,
@@ -8124,12 +8188,10 @@ END oqt_mega_pkg;"#;
 
         // Simulate a platform/editor path that reports cursor positions as
         // UTF-8 character offsets (not byte offsets).
-        let char_offset = source
-            .chars()
-            .take_while(|ch| *ch != 'b')
-            .count() as i32;
+        let char_offset = source.chars().take_while(|ch| *ch != 'b').count() as i32;
 
-        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, char_offset, false);
+        let mapped =
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, char_offset, false);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
@@ -8251,11 +8313,33 @@ END oqt_mega_pkg;"#;
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
-        assert_eq!(preserved.trim_end(), "SELECT 1
-FROM DUAL");
+        assert_eq!(
+            preserved.trim_end(),
+            "SELECT 1
+FROM DUAL"
+        );
         assert!(!preserved.trim_end().ends_with(';'));
     }
 
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_comment() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- trailing note"),
+            "Trailing comment should be preserved, got:
+{}",
+            preserved
+        );
+    }
     #[test]
     fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {
         let source = "SELECT 1 FROM dual;";
