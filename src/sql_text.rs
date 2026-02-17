@@ -5,6 +5,15 @@ pub(crate) fn is_identifier_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#'
 }
 
+/// Character-level identifier *start* check.
+///
+/// Unlike [`is_identifier_char`], this rejects numeric starts while still
+/// allowing non-ASCII alphabetic characters.
+#[inline]
+pub(crate) fn is_identifier_start_char(ch: char) -> bool {
+    ch.is_alphabetic() || ch == '_' || ch == '$' || ch == '#'
+}
+
 /// Byte-level identifier check (equivalent to `is_identifier_char` for ASCII).
 ///
 /// Covers alphanumeric, `_`, `$`, `#`.  Used as *continue* predicate by
