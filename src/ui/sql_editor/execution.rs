@@ -6539,17 +6539,21 @@ impl SqlEditorWidget {
             })); // end catch_unwind
 
             if let Err(e) = result {
-                let panic_payload = if let Some(msg) = e.downcast_ref::<&str>() {
-                    (*msg).to_string()
-                } else if let Some(msg) = e.downcast_ref::<String>() {
-                    msg.clone()
-                } else {
-                    "unknown panic payload".to_string()
-                };
+                let panic_payload = SqlEditorWidget::panic_payload_to_string(e.as_ref());
                 crate::utils::logging::log_error(
                     "sql_editor::execution",
                     &format!("Query worker thread panicked: {panic_payload}"),
                 );
+                let _ = sender.send(QueryProgress::StatementFinished {
+                    index: 0,
+                    result: QueryResult::new_error(
+                        &sql_text,
+                        &format!("Query execution thread panicked: {panic_payload}"),
+                    ),
+                    connection_name: String::new(),
+                    timed_out: false,
+                });
+                app::awake();
                 eprintln!("Query thread panicked: {panic_payload}");
             }
         });
