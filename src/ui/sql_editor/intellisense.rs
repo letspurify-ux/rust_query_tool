@@ -79,6 +79,14 @@ impl SqlEditorWidget {
         }
     }
 
+    fn should_consume_popup_confirm_key(key: Key, has_selected: bool) -> bool {
+        if has_selected {
+            return true;
+        }
+
+        matches!(key, Key::Tab)
+    }
+
     pub fn setup_intellisense(&mut self) {
         let buffer = self.buffer.clone();
         let mut editor = self.editor.clone();
@@ -274,6 +282,7 @@ impl SqlEditorWidget {
                                 // Insert selected suggestion, consume event
                                 let selected =
                                     intellisense_popup_for_handle.borrow().get_selected();
+                                let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
                                     let cursor_pos = ed.insert_position().max(0);
                                     let cursor_pos_usize = cursor_pos as usize;
@@ -321,7 +330,10 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                return true;
+                                return Self::should_consume_popup_confirm_key(
+                                    key,
+                                    has_selected,
+                                );
                             }
                             _ => {
                                 // Let other keys pass through to editor
@@ -2514,6 +2526,38 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             "expected SAL_BAND in suggestions: {:?}",
             suggestions
         );
+    }
+
+    #[test]
+    fn popup_confirm_key_without_selection_only_consumes_tab() {
+        assert!(SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::Tab,
+            false,
+        ));
+        assert!(!SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::Enter,
+            false,
+        ));
+        assert!(!SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::KPEnter,
+            false,
+        ));
+    }
+
+    #[test]
+    fn popup_confirm_key_with_selection_consumes_enter_and_tab() {
+        assert!(SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::Tab,
+            true,
+        ));
+        assert!(SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::Enter,
+            true,
+        ));
+        assert!(SqlEditorWidget::should_consume_popup_confirm_key(
+            Key::KPEnter,
+            true,
+        ));
     }
 
     #[test]
