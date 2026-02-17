@@ -253,7 +253,8 @@ impl SqlEditorWidget {
 
         let source_pos = Self::clamp_to_char_boundary(source, original_pos as usize);
         let source_prefix = &source[..source_pos];
-        let formatted_prefix = Self::format_sql_basic(source_prefix);
+        let formatted_prefix =
+            Self::preserve_selected_text_terminator(source_prefix, Self::format_sql_basic(source_prefix));
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -8056,6 +8057,35 @@ END oqt_mega_pkg;"#;
             final_cursor_pos,
             selection_start + mapped_within_selection,
             "Selection-relative mapping should compose with selection offset"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_without_semicolon_keeps_token_anchor() {
+        let source = "SELECT a, b FROM dual";
+        let formatted = SqlEditorWidget::preserve_selected_text_terminator(
+            source,
+            SqlEditorWidget::format_sql_basic(source),
+        );
+        let source_pos_within_selection = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist") as i32;
+
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let formatted_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            formatted_slice.trim_start().starts_with("b\nFROM DUAL"),
+            "Mapped cursor should stay near same token for semicolon-free selection, got: {}",
+            formatted_slice
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Selection-preserved formatted SQL should not end with semicolon"
         );
     }
 
