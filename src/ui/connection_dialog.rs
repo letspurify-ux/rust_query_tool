@@ -22,6 +22,47 @@ use crate::utils::AppConfig;
 
 pub struct ConnectionDialog;
 
+fn build_connection_info(
+    name: &str,
+    username: &str,
+    password: &str,
+    host: &str,
+    port_text: &str,
+    service_name: &str,
+) -> Result<ConnectionInfo, String> {
+    let name = name.trim();
+    let username = username.trim();
+    let host = host.trim();
+    let service_name = service_name.trim();
+    let port_text = port_text.trim();
+
+    if name.is_empty() {
+        return Err("Connection name is required".to_string());
+    }
+    if username.is_empty() {
+        return Err("Username is required".to_string());
+    }
+    if host.is_empty() {
+        return Err("Host is required".to_string());
+    }
+    if service_name.is_empty() {
+        return Err("Service name is required".to_string());
+    }
+
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| "Port must be a valid number between 0 and 65535".to_string())?;
+
+    Ok(ConnectionInfo::new(
+        name,
+        username,
+        password,
+        host,
+        port,
+        service_name,
+    ))
+}
+
 impl ConnectionDialog {
     pub fn show_with_registry(popups: Rc<RefCell<Vec<Window>>>) -> Option<ConnectionInfo> {
         enum DialogMessage {
@@ -289,15 +330,20 @@ impl ConnectionDialog {
         let service_input_save = service_input.clone();
 
         save_btn.set_callback(move |_| {
-            let port: u16 = port_input_save.value().parse().unwrap_or(1521);
-            let info = ConnectionInfo::new(
+            let info = match build_connection_info(
                 &name_input_save.value(),
                 &user_input_save.value(),
                 &pass_input_save.value(),
                 &host_input_save.value(),
-                port,
+                &port_input_save.value(),
                 &service_input_save.value(),
-            );
+            ) {
+                Ok(info) => info,
+                Err(message) => {
+                    fltk::dialog::alert_default(&message);
+                    return;
+                }
+            };
 
             let _ = sender_for_save.send(DialogMessage::Save(info));
             app::awake();
@@ -313,15 +359,20 @@ impl ConnectionDialog {
         let service_input_test = service_input.clone();
 
         test_btn.set_callback(move |_| {
-            let port: u16 = port_input_test.value().parse().unwrap_or(1521);
-            let info = ConnectionInfo::new(
+            let info = match build_connection_info(
                 &name_input_test.value(),
                 &user_input_test.value(),
                 &pass_input_test.value(),
                 &host_input_test.value(),
-                port,
+                &port_input_test.value(),
                 &service_input_test.value(),
-            );
+            ) {
+                Ok(info) => info,
+                Err(message) => {
+                    fltk::dialog::alert_default(&message);
+                    return;
+                }
+            };
 
             let _ = sender_for_test.send(DialogMessage::Test(info));
             app::awake();
@@ -337,15 +388,20 @@ impl ConnectionDialog {
         let service_input_conn = service_input.clone();
 
         connect_btn.set_callback(move |_| {
-            let port: u16 = port_input_conn.value().parse().unwrap_or(1521);
-            let info = ConnectionInfo::new(
+            let info = match build_connection_info(
                 &name_input_conn.value(),
                 &user_input_conn.value(),
                 &pass_input_conn.value(),
                 &host_input_conn.value(),
-                port,
+                &port_input_conn.value(),
                 &service_input_conn.value(),
-            );
+            ) {
+                Ok(info) => info,
+                Err(message) => {
+                    fltk::dialog::alert_default(&message);
+                    return;
+                }
+            };
 
             let _ = sender_for_connect.send(DialogMessage::Connect(info, false));
             app::awake();
@@ -459,5 +515,50 @@ impl ConnectionDialog {
         // (it was already saved to keyring if needed)
         let final_result = result.borrow().clone();
         final_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_connection_info;
+
+    #[test]
+    fn build_connection_info_rejects_empty_required_fields() {
+        let result = build_connection_info(" ", "scott", "tiger", "localhost", "1521", "ORCL");
+        assert!(result.is_err());
+
+        let result = build_connection_info("local", "", "tiger", "localhost", "1521", "ORCL");
+        assert!(result.is_err());
+
+        let result = build_connection_info("local", "scott", "tiger", "", "1521", "ORCL");
+        assert!(result.is_err());
+
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "1521", "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_connection_info_rejects_invalid_port() {
+        let result = build_connection_info("local", "scott", "tiger", "localhost", "abc", "ORCL");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_connection_info_trims_values_and_builds_info() {
+        let info = build_connection_info(
+            " local ",
+            " scott ",
+            "tiger",
+            " localhost ",
+            " 1521 ",
+            " ORCL ",
+        )
+        .expect("should build valid connection info");
+
+        assert_eq!(info.name, "local");
+        assert_eq!(info.username, "scott");
+        assert_eq!(info.host, "localhost");
+        assert_eq!(info.port, 1521);
+        assert_eq!(info.service_name, "ORCL");
     }
 }
