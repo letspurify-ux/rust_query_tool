@@ -1699,10 +1699,11 @@ impl SqlEditorWidget {
         }
 
         let number_start = idx;
+        let had_leading_whitespace = number_start > 0;
         while idx < bytes.len() && bytes[idx].is_ascii_digit() {
             idx += 1;
         }
-        if idx > number_start {
+        if had_leading_whitespace && idx > number_start {
             let mut sep = idx;
             while sep < bytes.len() && bytes[sep].is_ascii_whitespace() {
                 sep += 1;
@@ -2286,6 +2287,14 @@ SELECT * FROM cte
     #[test]
     fn normalize_intellisense_context_text_keeps_numeric_literal_line_prefixes() {
         let input = "SELECT\n1 + 2 AS total\nFROM dual";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, input);
+    }
+
+    #[test]
+    fn normalize_intellisense_context_text_keeps_unindented_numeric_lines_with_wide_spacing() {
+        let input = "SELECT\n1  + 2 AS total\nFROM dual";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
 
         assert_eq!(normalized, input);
