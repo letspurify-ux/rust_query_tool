@@ -1434,7 +1434,7 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         let Some((prev_start, ch)) = text[..start].char_indices().next_back() else {
             break;
         };
-        if is_identifier_char(ch) {
+        if sql_text::is_identifier_char(ch) {
             start = prev_start;
         } else {
             break;
@@ -1447,7 +1447,7 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         let Some(ch) = text[end..].chars().next() else {
             break;
         };
-        if is_identifier_char(ch) {
+        if sql_text::is_identifier_char(ch) {
             end += ch.len_utf8();
         } else {
             break;
@@ -1489,9 +1489,6 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
     }
 }
 
-fn is_identifier_char(ch: char) -> bool {
-    sql_text::is_identifier_char(ch)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]

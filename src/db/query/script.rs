@@ -418,13 +418,7 @@ impl SplitState {
 
     pub(crate) fn start_q_quote(&mut self, delimiter: char) {
         self.in_q_quote = true;
-        self.q_quote_end = Some(match delimiter {
-            '[' => ']',
-            '(' => ')',
-            '{' => '}',
-            '<' => '>',
-            other => other,
-        });
+        self.q_quote_end = Some(sql_text::q_quote_closing(delimiter));
     }
 
     pub(crate) fn q_quote_end(&self) -> Option<char> {
@@ -623,7 +617,7 @@ impl StatementBuilder {
                 continue;
             }
 
-            if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#' {
+            if sql_text::is_identifier_char(c) {
                 self.state.token.push(c);
                 self.current.push(c);
                 i += 1;
@@ -747,15 +741,10 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'#' {
+                if sql_text::is_identifier_byte(b) {
                     let start = i;
                     i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric()
-                            || bytes[i] == b'_'
-                            || bytes[i] == b'$'
-                            || bytes[i] == b'#')
-                    {
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
                         i += 1;
                     }
                     return Some(line[start..i].to_ascii_uppercase());
@@ -1005,30 +994,16 @@ impl QueryExecutor {
                     && chars.get(i + 3).is_some()
                 {
                     let delimiter = chars[i + 3];
-                    let closing = match delimiter {
-                        '[' => ']',
-                        '{' => '}',
-                        '(' => ')',
-                        '<' => '>',
-                        _ => delimiter,
-                    };
                     in_q_quote = true;
-                    q_quote_end = Some(closing);
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 4;
                     continue;
                 }
 
                 if (c == 'q' || c == 'Q') && next == Some('\'') && chars.get(i + 2).is_some() {
                     let delimiter = chars[i + 2];
-                    let closing = match delimiter {
-                        '[' => ']',
-                        '{' => '}',
-                        '(' => ')',
-                        '<' => '>',
-                        _ => delimiter,
-                    };
                     in_q_quote = true;
-                    q_quote_end = Some(closing);
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 3;
                     continue;
                 }

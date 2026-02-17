@@ -597,7 +597,7 @@ impl SqlEditorWidget {
                                 &connection_for_handle,
                                 &pending_intellisense_for_handle,
                             );
-                        } else if Self::is_identifier_char(ch) {
+                        } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
                             if word.len() >= 2 {
                                 Self::trigger_intellisense(
@@ -1295,21 +1295,21 @@ impl SqlEditorWidget {
         }
 
         let rel_pos = (pos - line_start).clamp(0, bytes.len() as i32) as usize;
-        let anchor = if rel_pos < bytes.len() && Self::is_identifier_byte(bytes[rel_pos]) {
+        let anchor = if rel_pos < bytes.len() && sql_text::is_identifier_byte(bytes[rel_pos]) {
             Some(rel_pos)
-        } else if rel_pos > 0 && Self::is_identifier_byte(bytes[rel_pos - 1]) {
+        } else if rel_pos > 0 && sql_text::is_identifier_byte(bytes[rel_pos - 1]) {
             Some(rel_pos - 1)
         } else {
             None
         }?;
 
         let mut start = anchor;
-        while start > 0 && Self::is_identifier_byte(bytes[start - 1]) {
+        while start > 0 && sql_text::is_identifier_byte(bytes[start - 1]) {
             start -= 1;
         }
 
         let mut end = anchor + 1;
-        while end < bytes.len() && Self::is_identifier_byte(bytes[end]) {
+        while end < bytes.len() && sql_text::is_identifier_byte(bytes[end]) {
             end += 1;
         }
 
@@ -1686,7 +1686,7 @@ impl SqlEditorWidget {
         let mut begin = idx;
         while begin > 0 {
             if let Some(&byte) = bytes.get(begin - 1) {
-                if Self::is_identifier_byte(byte) {
+                if sql_text::is_identifier_byte(byte) {
                     begin -= 1;
                 } else {
                     break;
@@ -1756,14 +1756,6 @@ impl SqlEditorWidget {
                 | Key::MetaR
                 | Key::CapsLock
         )
-    }
-
-    fn is_identifier_char(ch: char) -> bool {
-        sql_text::is_identifier_char(ch)
-    }
-
-    fn is_identifier_byte(byte: u8) -> bool {
-        sql_text::is_identifier_byte(byte)
     }
 
     /// Show quick describe dialog for a table/view structure.

@@ -24,6 +24,7 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
+use crate::sql_text;
 use crate::ui::sql_depth::{
     is_depth,
     is_top_level_depth,
@@ -2285,30 +2286,16 @@ impl SqlEditorWidget {
                 && chars.get(i + 3).is_some()
             {
                 let delimiter = chars[i + 3];
-                let closing = match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    _ => delimiter,
-                };
                 in_q_quote = true;
-                q_quote_end = Some(closing);
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                 i += 4;
                 continue;
             }
 
             if (c == 'q' || c == 'Q') && next == Some('\'') && chars.get(i + 2).is_some() {
                 let delimiter = chars[i + 2];
-                let closing = match delimiter {
-                    '[' => ']',
-                    '{' => '}',
-                    '(' => ')',
-                    '<' => '>',
-                    _ => delimiter,
-                };
                 in_q_quote = true;
-                q_quote_end = Some(closing);
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                 i += 3;
                 continue;
             }
@@ -7264,7 +7251,7 @@ impl SqlEditorWidget {
                 let mut j = start;
                 while j < len {
                     let ch = chars[j];
-                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
+                    if sql_text::is_identifier_char(ch) {
                         j += 1;
                     } else {
                         break;
@@ -7379,19 +7366,12 @@ impl SqlEditorWidget {
                 && i + 3 < len
             {
                 let delimiter = chars[i + 3];
-                let closing = match delimiter {
-                    '(' => Some(')'),
-                    '[' => Some(']'),
-                    '{' => Some('}'),
-                    '<' => Some('>'),
-                    _ => Some(delimiter),
-                };
                 result.push(c);
                 result.push(chars[i + 1]);
                 result.push('\'');
                 result.push(delimiter);
                 in_q_quote = true;
-                q_quote_end = closing;
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                 i += 4;
                 continue;
             }
@@ -7399,18 +7379,11 @@ impl SqlEditorWidget {
             // Handle q'[...]' (q-quoted strings)
             if (c == 'q' || c == 'Q') && next == Some('\'') && next2.is_some() {
                 let delimiter = chars[i + 2];
-                let closing = match delimiter {
-                    '(' => Some(')'),
-                    '[' => Some(']'),
-                    '{' => Some('}'),
-                    '<' => Some('>'),
-                    _ => Some(delimiter),
-                };
                 result.push(c);
                 result.push('\'');
                 result.push(delimiter);
                 in_q_quote = true;
-                q_quote_end = closing;
+                q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                 i += 3;
                 continue;
             }
