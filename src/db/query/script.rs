@@ -239,7 +239,8 @@ impl SplitState {
                 true // Standalone procedure/function/trigger or COMPOUND TRIGGER timing point
             };
             if needs_begin_tracking {
-                self.routine_is_stack.push((self.block_depth, split_on_semicolon));
+                self.routine_is_stack
+                    .push((self.block_depth, split_on_semicolon));
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
@@ -842,7 +843,12 @@ impl QueryExecutor {
             } else {
                 builder.block_depth()
             };
-            if builder.state.pending_end && matches!(leading_word, Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")) {
+            if builder.state.pending_end
+                && matches!(
+                    leading_word,
+                    Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")
+                )
+            {
                 depth = depth.saturating_sub(1);
             }
 
@@ -890,16 +896,16 @@ impl QueryExecutor {
                 depth = depth.saturating_add(subquery_paren_depth);
             }
 
-                if with_cte_depth > 0 {
-                    let starts_main_select =
-                        leading_word.is_some_and(|word| is_with_main_query_keyword(word))
-                            && with_cte_paren <= 0;
-                    if starts_main_select {
-                        depth = depth.saturating_sub(1);
-                    } else {
-                        depth = depth.saturating_add(with_cte_depth);
-                    }
+            if with_cte_depth > 0 {
+                let starts_main_select = leading_word
+                    .is_some_and(|word| is_with_main_query_keyword(word))
+                    && with_cte_paren <= 0;
+                if starts_main_select {
+                    depth = depth.saturating_sub(1);
+                } else {
+                    depth = depth.saturating_add(with_cte_depth);
                 }
+            }
 
             // No extra subprogram body depth: declarations and statements share the same level.
 
@@ -1397,7 +1403,12 @@ impl QueryExecutor {
             if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
                 let start = i;
                 i += 1;
-                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$' || chars[i] == '#') {
+                while i < len
+                    && (chars[i].is_ascii_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '$'
+                        || chars[i] == '#')
+                {
                     i += 1;
                 }
                 let token: String = chars[start..i].iter().collect();
