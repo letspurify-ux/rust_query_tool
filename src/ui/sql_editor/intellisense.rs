@@ -80,11 +80,7 @@ impl SqlEditorWidget {
     }
 
     fn should_consume_popup_confirm_key(key: Key, has_selected: bool) -> bool {
-        if has_selected {
-            return true;
-        }
-
-        matches!(key, Key::Tab)
+        has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
     }
 
     pub fn setup_intellisense(&mut self) {
@@ -2629,8 +2625,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
-    fn popup_confirm_key_without_selection_only_consumes_tab() {
-        assert!(SqlEditorWidget::should_consume_popup_confirm_key(
+    fn popup_confirm_key_without_selection_does_not_consume_editor_keys() {
+        assert!(!SqlEditorWidget::should_consume_popup_confirm_key(
             Key::Tab,
             false,
         ));
