@@ -1736,22 +1736,19 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let mut begin = idx;
-        while begin > 0 {
-            if let Some(&byte) = bytes.get(begin - 1) {
-                if sql_text::is_identifier_byte(byte) {
-                    begin -= 1;
-                } else {
-                    break;
-                }
-            } else {
-                break;
+        let qualifier_candidate = text.get(..idx)?;
+        let mut start_byte = qualifier_candidate.len();
+        for (pos, ch) in qualifier_candidate.char_indices().rev() {
+            if sql_text::is_identifier_char(ch) {
+                start_byte = pos;
+                continue;
             }
+            break;
         }
-        if begin == idx {
+        if start_byte == qualifier_candidate.len() {
             return None;
         }
-        let qualifier = text.get(begin..idx)?;
+        let qualifier = qualifier_candidate.get(start_byte..)?;
         let qualifier = Self::strip_identifier_quotes(qualifier);
         if qualifier.is_empty() {
             None
@@ -2178,6 +2175,15 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
         assert_eq!(qualifier, None);
+    }
+
+    #[test]
+    fn qualifier_before_word_supports_unicode_identifier() {
+        let sql_with_cursor = "SELECT 사용자.| FROM emp 사용자";
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("사용자"));
     }
 
     #[test]
