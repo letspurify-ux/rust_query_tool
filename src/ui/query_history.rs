@@ -546,11 +546,16 @@ impl QueryHistoryDialog {
 /// Truncate SQL for display in list
 fn truncate_sql(sql: &str, max_len: usize) -> String {
     let mut normalized = String::with_capacity(sql.len());
+    let mut last_was_whitespace = false;
     for ch in sql.chars() {
         if ch.is_whitespace() {
-            normalized.push(' ');
+            if !last_was_whitespace {
+                normalized.push(' ');
+                last_was_whitespace = true;
+            }
         } else {
             normalized.push(ch);
+            last_was_whitespace = false;
         }
     }
     let trimmed = normalized.trim();
@@ -560,7 +565,7 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 
     if max_len == 0 {
-        return "...".to_string();
+        return String::new();
     }
 
     if trimmed.chars().count() > max_len {
@@ -589,5 +594,16 @@ mod query_history_tests {
     fn truncate_sql_truncates_on_char_boundary_for_multibyte_text() {
         let sql = "가나다라마바사";
         assert_eq!(truncate_sql(sql, 5), "가나다라마...");
+    }
+
+    #[test]
+    fn truncate_sql_collapses_whitespace_runs() {
+        let sql = "SELECT\n\n\t\t*\t\tFROM\t\tdual";
+        assert_eq!(truncate_sql(sql, 100), "SELECT * FROM dual");
+    }
+
+    #[test]
+    fn truncate_sql_returns_empty_for_zero_limit() {
+        assert_eq!(truncate_sql("SELECT 1", 0), "");
     }
 }
