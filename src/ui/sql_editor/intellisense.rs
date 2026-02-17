@@ -1633,6 +1633,7 @@ impl SqlEditorWidget {
     }
 
     fn normalize_intellisense_context_text(text: &str) -> String {
+        let text = Self::strip_sqlplus_prompt_prefixes(text);
         let mut offset = 0usize;
         while offset < text.len() {
             let rest = &text[offset..];
@@ -1656,6 +1657,62 @@ impl SqlEditorWidget {
             break;
         }
         text.get(offset..).unwrap_or("").to_string()
+    }
+
+    fn strip_sqlplus_prompt_prefixes(text: &str) -> String {
+        let mut normalized = String::with_capacity(text.len());
+
+        for segment in text.split_inclusive('\n') {
+            let (line, line_end) = if let Some(stripped) = segment.strip_suffix('\n') {
+                (stripped, "\n")
+            } else {
+                (segment, "")
+            };
+
+            let stripped_line = Self::strip_sqlplus_prompt_prefix(line).unwrap_or(line);
+            normalized.push_str(stripped_line);
+            normalized.push_str(line_end);
+        }
+
+        normalized
+    }
+
+    fn strip_sqlplus_prompt_prefix(line: &str) -> Option<&str> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+
+        if bytes.get(idx..idx + 4).is_some_and(|slice| {
+            slice[0].eq_ignore_ascii_case(&b'S')
+                && slice[1].eq_ignore_ascii_case(&b'Q')
+                && slice[2].eq_ignore_ascii_case(&b'L')
+                && slice[3] == b'>'
+        }) {
+            idx += 4;
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            return Some(&line[idx..]);
+        }
+
+        let number_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx > number_start {
+            let mut sep = idx;
+            while sep < bytes.len() && bytes[sep].is_ascii_whitespace() {
+                sep += 1;
+            }
+            if sep > idx {
+                return Some(&line[sep..]);
+            }
+        }
+
+        None
     }
 
     fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
@@ -2211,6 +2268,18 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
 
         assert!(normalized.starts_with("WITH cte AS"));
         assert!(!normalized.starts_with("PROMPT"));
+    }
+
+    #[test]
+    fn normalize_intellisense_context_text_strips_sqlplus_line_prefixes() {
+        let input = "SQL> WITH cte AS (SELECT 1 FROM dual)
+  2  SELECT * FROM cte
+";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, "WITH cte AS (SELECT 1 FROM dual)
+SELECT * FROM cte
+");
     }
 
     #[test]
