@@ -330,10 +330,7 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                return Self::should_consume_popup_confirm_key(
-                                    key,
-                                    has_selected,
-                                );
+                                return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
                             _ => {
                                 // Let other keys pass through to editor
@@ -1259,7 +1256,7 @@ impl SqlEditorWidget {
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {
-        let normalized = Self::strip_identifier_quotes(table_name.trim());
+        let normalized = Self::normalize_relation_lookup_key(table_name);
         if normalized.is_empty() {
             return Vec::new();
         }
@@ -1272,6 +1269,46 @@ impl SqlEditorWidget {
         }
 
         candidates
+    }
+
+    fn normalize_relation_lookup_key(value: &str) -> String {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut chars = value.trim().chars().peekable();
+        let mut in_quotes = false;
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    current.push(ch);
+                    if in_quotes {
+                        if chars.peek().copied() == Some('"') {
+                            current.push('"');
+                            chars.next();
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                    }
+                }
+                '.' if !in_quotes => {
+                    let segment = Self::strip_identifier_quotes(current.trim());
+                    if !segment.is_empty() {
+                        parts.push(segment);
+                    }
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        let segment = Self::strip_identifier_quotes(current.trim());
+        if !segment.is_empty() {
+            parts.push(segment);
+        }
+
+        parts.join(".")
     }
 
     fn word_at_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize, usize) {
@@ -2298,6 +2335,32 @@ FROM d
         assert!(!update.cache_columns);
     }
 
+    #[test]
+    fn request_table_columns_handles_quoted_schema_and_table_names() {
+        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        {
+            let mut guard = data.borrow_mut();
+            guard.tables = vec!["SCHEMA.TABLE.NAME".to_string()];
+            guard.rebuild_indices();
+        }
+
+        let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let _conn_guard = connection.lock().ok();
+
+        SqlEditorWidget::request_table_columns(
+            "\"SCHEMA\".\"TABLE.NAME\"",
+            &data,
+            &sender,
+            &connection,
+        );
+
+        let update = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("quoted schema/table names should normalize before relation lookup");
+        assert_eq!(update.table, "SCHEMA.TABLE.NAME");
+        assert!(!update.cache_columns);
+    }
     #[test]
     fn request_table_columns_keeps_exact_dotted_relation_name() {
         let data = Rc::new(RefCell::new(IntellisenseData::new()));
