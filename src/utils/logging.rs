@@ -94,11 +94,7 @@ impl AppLog {
                     Ok(content) => match serde_json::from_str::<Self>(&content) {
                         Ok(log) => return log,
                         Err(err) => {
-                            eprintln!(
-                                "Failed to parse app log file {}: {}",
-                                path.display(),
-                                err
-                            );
+                            eprintln!("Failed to parse app log file {}: {}", path.display(), err);
                             Self::preserve_corrupt_log_file(&path);
                         }
                     },
@@ -122,7 +118,7 @@ impl AppLog {
             serde_json::to_writer(&mut writer, self)?;
             use std::io::Write;
             writer.flush()?;
-            fs::rename(&tmp_path, &path)?;
+            rename_overwrite(&tmp_path, &path)?;
         }
         Ok(())
     }
@@ -130,6 +126,20 @@ impl AppLog {
     pub fn add_entry(&mut self, entry: LogEntry) {
         self.entries.insert(0, entry);
         self.entries.truncate(MAX_LOG_ENTRIES);
+    }
+}
+
+fn rename_overwrite(from: &PathBuf, to: &PathBuf) -> Result<(), std::io::Error> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if to.exists() {
+                fs::remove_file(to)?;
+                fs::rename(from, to)
+            } else {
+                Err(rename_err)
+            }
+        }
     }
 }
 
@@ -156,20 +166,20 @@ fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
                  command: LogCommand,
                  needs_save: &mut bool,
                  flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
-                match command {
-                    LogCommand::Write(entry) => {
-                        log.add_entry(entry);
-                        *needs_save = true;
-                    }
-                    LogCommand::Clear => {
-                        log.entries.clear();
-                        *needs_save = true;
-                    }
-                    LogCommand::Flush(reply) => {
-                        flush_replies.push(reply);
-                    }
+                    match command {
+                        LogCommand::Write(entry) => {
+                            log.add_entry(entry);
+                            *needs_save = true;
+                        }
+                        LogCommand::Clear => {
+                            log.entries.clear();
+                            *needs_save = true;
+                        }
+                        LogCommand::Flush(reply) => {
+                            flush_replies.push(reply);
+                        }
+                    };
                 };
-            };
             loop {
                 let cmd = match receiver.recv() {
                     Ok(cmd) => cmd,
@@ -344,6 +354,7 @@ pub fn take_crash_log() -> Option<String> {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn log_level_label_returns_expected_strings() {
@@ -372,5 +383,30 @@ mod logging_tests {
     #[test]
     fn log_level_display_matches_label() {
         assert_eq!(format!("{}", LogLevel::Warning), "WARN");
+    }
+
+    #[test]
+    fn rename_overwrite_replaces_existing_destination_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("space_query_logging_test_{}", unique));
+        fs::create_dir_all(&base).expect("failed to create test directory");
+
+        let from = base.join("from.tmp");
+        let to = base.join("to.log");
+
+        fs::write(&from, "new").expect("failed to write source file");
+        fs::write(&to, "old").expect("failed to write destination file");
+
+        rename_overwrite(&from, &to).expect("rename_overwrite should replace destination");
+
+        let contents = fs::read_to_string(&to).expect("failed to read destination file");
+        assert_eq!(contents, "new");
+        assert!(!from.exists());
+
+        let _ = fs::remove_file(&to);
+        let _ = fs::remove_dir_all(&base);
     }
 }
