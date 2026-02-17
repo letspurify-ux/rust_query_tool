@@ -1115,12 +1115,48 @@ impl QueryExecutor {
             return None;
         }
 
+        Self::statement_bounds_at_cursor(sql, cursor_pos)
+            .and_then(|(start, end)| sql.get(start..end))
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    /// Return the [start, end) byte bounds of the statement containing the cursor.
+    ///
+    /// Bounds are clamped to UTF-8 char boundaries and treat SQL*Plus standalone '/'
+    /// lines as PL/SQL statement delimiters just like split_script_items.
+    pub fn statement_bounds_at_cursor(sql: &str, cursor_pos: usize) -> Option<(usize, usize)> {
+        if sql.trim().is_empty() {
+            return None;
+        }
+
         #[derive(Clone)]
         struct StatementSpan {
             start: usize,
             end: usize,
-            text: String,
         }
+
+        let spans_for_sql = |sql: &str| {
+            let mut spans: Vec<StatementSpan> = Vec::new();
+            let mut search_pos = 0usize;
+            for item in Self::split_script_items(sql) {
+                if let ScriptItem::Statement(stmt) = item {
+                    let stmt = stmt.trim();
+                    if stmt.is_empty() {
+                        continue;
+                    }
+                    let remaining = &sql[search_pos..];
+                    let leading_ws = remaining.len() - remaining.trim_start().len();
+                    if let Some(found) = remaining.trim_start().find(stmt) {
+                        let start = search_pos + leading_ws + found;
+                        let end = start + stmt.len();
+                        spans.push(StatementSpan { start, end });
+                        search_pos = end;
+                    }
+                }
+            }
+            spans
+        };
 
         let cursor_pos = Self::clamp_to_char_boundary(sql, cursor_pos);
         let line_start = sql[..cursor_pos]
@@ -1136,64 +1172,22 @@ impl QueryExecutor {
 
         if !trimmed_line.is_empty() {
             if trimmed_line == "/" {
-                let mut spans: Vec<StatementSpan> = Vec::new();
-                let mut search_pos = 0usize;
-                for item in Self::split_script_items(sql) {
-                    if let ScriptItem::Statement(stmt) = item {
-                        let stmt = stmt.trim();
-                        if stmt.is_empty() {
-                            continue;
-                        }
-                        let remaining = &sql[search_pos..];
-                        let leading_ws = remaining.len() - remaining.trim_start().len();
-                        if let Some(found) = remaining.trim_start().find(stmt) {
-                            let start = search_pos + leading_ws + found;
-                            let end = start + stmt.len();
-                            spans.push(StatementSpan {
-                                start,
-                                end,
-                                text: stmt.to_string(),
-                            });
-                            search_pos = end;
-                        }
-                    }
-                }
+                let spans = spans_for_sql(sql);
                 if let Some(prev) = spans
                     .iter()
                     .filter(|span| span.end <= line_start)
                     .next_back()
                 {
-                    return Some(prev.text.clone());
+                    return Some((prev.start, prev.end));
                 }
             }
 
             if Self::parse_tool_command(trimmed_line).is_some() {
-                return Some(trimmed_line.to_string());
+                return Some((line_start, line_end));
             }
         }
 
-        let mut spans: Vec<StatementSpan> = Vec::new();
-        let mut search_pos = 0usize;
-        for item in Self::split_script_items(sql) {
-            if let ScriptItem::Statement(stmt) = item {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                let remaining = &sql[search_pos..];
-                let leading_ws = remaining.len() - remaining.trim_start().len();
-                if let Some(found) = remaining.trim_start().find(stmt) {
-                    let start = search_pos + leading_ws + found;
-                    let end = start + stmt.len();
-                    spans.push(StatementSpan {
-                        start,
-                        end,
-                        text: stmt.to_string(),
-                    });
-                    search_pos = end;
-                }
-            }
-        }
+        let spans = spans_for_sql(sql);
 
         if spans.is_empty() {
             return None;
@@ -1203,18 +1197,19 @@ impl QueryExecutor {
             .iter()
             .find(|span| cursor_pos >= span.start && cursor_pos <= span.end)
         {
-            return Some(span.text.clone());
+            return Some((span.start, span.end));
         }
 
         let mut previous: Option<&StatementSpan> = None;
         for span in spans.iter() {
             if span.start > cursor_pos {
-                return Some(previous.unwrap_or(span).text.clone());
+                let selected = previous.unwrap_or(span);
+                return Some((selected.start, selected.end));
             }
             previous = Some(span);
         }
 
-        previous.map(|span| span.text.clone())
+        previous.map(|span| (span.start, span.end))
     }
 
     /// Enable DBMS_OUTPUT for the session

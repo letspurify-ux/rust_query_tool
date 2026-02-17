@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use oracle::Connection;
 
-use crate::db::query::SplitState;
 use crate::db::{
     ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection, TableColumnDetail,
 };
@@ -803,8 +802,9 @@ impl SqlEditorWidget {
         let prefix = word;
 
         // Use deep context analyzer for accurate depth-aware analysis
-        let context_text =
-            Self::normalize_intellisense_context_text(&Self::context_before_cursor(buffer, cursor_pos));
+        let context_text = Self::normalize_intellisense_context_text(&Self::context_before_cursor(
+            buffer, cursor_pos,
+        ));
         let statement_text =
             Self::normalize_intellisense_context_text(&Self::statement_context(buffer, cursor_pos));
 
@@ -1659,215 +1659,7 @@ impl SqlEditorWidget {
     }
 
     fn statement_bounds_in_text(text: &str, cursor_pos: usize) -> (usize, usize) {
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let cursor = cursor_pos.min(len);
-        let mut last_terminator = 0usize;
-        let mut next_terminator = len;
-        let mut state = SplitState::default();
-        let mut i = 0usize;
-
-        while i < len {
-            let b = bytes[i];
-            let next = if i + 1 < len {
-                Some(bytes[i + 1])
-            } else {
-                None
-            };
-
-            if state.in_line_comment {
-                if b == b'\n' {
-                    state.in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if state.in_block_comment {
-                if b == b'*' && next == Some(b'/') {
-                    state.in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if state.in_q_quote {
-                if Some(b as char) == state.q_quote_end() && next == Some(b'\'') {
-                    state.in_q_quote = false;
-                    state.q_quote_end = None;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if state.in_single_quote {
-                if b == b'\'' {
-                    if next == Some(b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    state.in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if state.in_double_quote {
-                if b == b'"' {
-                    if next == Some(b'"') {
-                        i += 2;
-                        continue;
-                    }
-                    state.in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if b.is_ascii_whitespace() {
-                state.flush_token();
-                i += 1;
-                continue;
-            }
-
-            if b == b'-' && next == Some(b'-') {
-                state.flush_token();
-                state.in_line_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if b == b'/' && next == Some(b'*') {
-                state.flush_token();
-                state.in_block_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if (b == b'n' || b == b'N')
-                && i + 3 < len
-                && (bytes[i + 1] == b'q' || bytes[i + 1] == b'Q')
-                && bytes[i + 2] == b'\''
-            {
-                state.flush_token();
-                let delimiter = bytes[i + 3] as char;
-                state.start_q_quote(delimiter);
-                i += 4;
-                continue;
-            }
-
-            if (b == b'q' || b == b'Q') && i + 2 < len && bytes[i + 1] == b'\'' {
-                state.flush_token();
-                let delimiter = bytes[i + 2] as char;
-                state.start_q_quote(delimiter);
-                i += 3;
-                continue;
-            }
-
-            if b == b'\'' {
-                state.flush_token();
-                state.in_single_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if b == b'"' {
-                state.flush_token();
-                state.in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if Self::is_identifier_byte(b) {
-                state.token.push(b as char);
-                i += 1;
-                continue;
-            }
-
-            state.flush_token();
-
-            // Handle '/' on its own line as a PL/SQL block terminator.
-            // In Oracle, a standalone '/' terminates CREATE FUNCTION/PROCEDURE/PACKAGE/TRIGGER
-            // blocks and anonymous PL/SQL blocks, acting as a statement boundary.
-            if b == b'/' && next != Some(b'*') {
-                let is_solo_slash = Self::is_solo_slash_at(bytes, i, len);
-                if is_solo_slash {
-                    state.block_depth = 0;
-                    state.reset_create_state();
-                    state.pending_end = false;
-                    state.after_declare = false;
-                    state.case_depth_stack.clear();
-                    state.pending_subprogram_begins = 0;
-                    // Skip to end of line
-                    let mut end_of_line = i + 1;
-                    while end_of_line < len && bytes[end_of_line] != b'\n' {
-                        end_of_line += 1;
-                    }
-                    if end_of_line < len {
-                        end_of_line += 1; // include the newline
-                    }
-                    if i < cursor {
-                        last_terminator = end_of_line;
-                    } else {
-                        next_terminator = i;
-                        break;
-                    }
-                    i = end_of_line;
-                    continue;
-                }
-            }
-
-            if b == b';' {
-                state.resolve_pending_end_on_terminator();
-                if state.block_depth == 0 {
-                    if i < cursor {
-                        last_terminator = i + 1;
-                    } else {
-                        next_terminator = i;
-                        break;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        state.flush_token();
-        (last_terminator.min(len), next_terminator.min(len))
-    }
-
-    /// Check if the '/' at position `pos` is a standalone slash on its own line
-    /// (only whitespace before and after on the same line).
-    fn is_solo_slash_at(bytes: &[u8], pos: usize, len: usize) -> bool {
-        // Check that everything before '/' on this line is whitespace
-        if pos > 0 {
-            let mut j = pos - 1;
-            loop {
-                let ch = bytes[j];
-                if ch == b'\n' {
-                    break;
-                }
-                if !ch.is_ascii_whitespace() {
-                    return false;
-                }
-                if j == 0 {
-                    break;
-                }
-                j -= 1;
-            }
-        }
-        // Check that everything after '/' on this line is whitespace
-        let mut k = pos + 1;
-        while k < len && bytes[k] != b'\n' {
-            if !bytes[k].is_ascii_whitespace() {
-                return false;
-            }
-            k += 1;
-        }
-        true
+        QueryExecutor::statement_bounds_at_cursor(text, cursor_pos).unwrap_or((0, text.len()))
     }
 
     fn strip_identifier_quotes(value: &str) -> String {
@@ -2304,8 +2096,7 @@ PROMPT === final ===\n\
 SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
 
         let cursor = sql.find("sa FROM oqt_emp").unwrap();
-        let (stmt_start, stmt_end) =
-            SqlEditorWidget::statement_bounds_in_text(sql, cursor);
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(sql, cursor);
         let stmt = sql.get(stmt_start..stmt_end).unwrap_or("");
         assert!(
             stmt.contains("oqt_emp"),
@@ -2328,8 +2119,7 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
 
         let before_tokens = SqlEditorWidget::tokenize_sql(&context_text);
         let full_tokens = SqlEditorWidget::tokenize_sql(&statement_text);
-        let deep_ctx =
-            intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
 
         assert_eq!(
             deep_ctx.phase,
@@ -2380,12 +2170,13 @@ SELECT d.|, d.loc
 FROM d
 "#;
 
-        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
         let sql = sql_with_cursor.replace('|', "");
 
-        let context_text = SqlEditorWidget::normalize_intellisense_context_text(
-            sql.get(..cursor).unwrap_or(""),
-        );
+        let context_text =
+            SqlEditorWidget::normalize_intellisense_context_text(sql.get(..cursor).unwrap_or(""));
         let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
         let statement_text = SqlEditorWidget::normalize_intellisense_context_text(
             sql.get(stmt_start..stmt_end).unwrap_or(""),
@@ -2396,7 +2187,10 @@ FROM d
         let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
 
         assert!(
-            deep_ctx.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case("d")),
+            deep_ctx
+                .ctes
+                .iter()
+                .any(|cte| cte.name.eq_ignore_ascii_case("d")),
             "expected CTE d in parsed context: {:?}",
             deep_ctx
                 .ctes
@@ -2426,7 +2220,9 @@ FROM d
 
         let suggestions = data.get_column_suggestions("", Some(&column_tables));
         assert!(
-            suggestions.iter().any(|col| col.eq_ignore_ascii_case("DNAME")),
+            suggestions
+                .iter()
+                .any(|col| col.eq_ignore_ascii_case("DNAME")),
             "expected DNAME suggestion for d.* scope, got: {:?}",
             suggestions
         );
