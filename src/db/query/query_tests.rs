@@ -29,6 +29,62 @@ fn test_multiple_selects() {
 }
 
 #[test]
+fn test_is_select_statement_with_clause_insert_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) INSERT INTO t2(id) SELECT id FROM t";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... INSERT should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_update_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) UPDATE t2 SET id = (SELECT id FROM t)";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... UPDATE should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_delete_is_not_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) DELETE FROM t2 WHERE id IN (SELECT id FROM t)";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... DELETE should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_select_is_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) SELECT id FROM t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... SELECT should be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_merge_is_not_select() {
+    let sql = "WITH src AS (SELECT 1 AS id FROM dual) MERGE INTO t2 d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id";
+    assert!(
+        !QueryExecutor::is_select_statement(sql),
+        "WITH ... MERGE should not be treated as SELECT"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_ignores_comments_and_q_quotes() {
+    let sql = "WITH t AS (SELECT q'[INSERT INTO t2 VALUES(1)]' AS txt FROM dual)
+/* leading DML keyword in comment: DELETE */
+SELECT txt FROM t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... SELECT should remain SELECT even with DML-like text in comments/strings"
+    );
+}
+
+#[test]
 fn test_double_semicolon() {
     let sql = "SELECT 1 FROM DUAL;;";
     let items = QueryExecutor::split_script_items(sql);
@@ -3295,8 +3351,8 @@ END;"#;
 }
 
 #[test]
-    fn test_split_script_items_repeat_block() {
-        let sql = r#"DECLARE
+fn test_split_script_items_repeat_block() {
+    let sql = r#"DECLARE
   v_count NUMBER := 0;
 BEGIN
   REPEAT
@@ -3304,14 +3360,14 @@ BEGIN
   UNTIL v_count >= 3
   END REPEAT;
 END;"#;
-        let items = QueryExecutor::split_script_items(sql);
-        let stmts = get_statements(&items);
-        assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
-    }
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
+}
 
-    #[test]
-    fn test_split_script_items_repeat_block_with_end_repeat_on_next_line() {
-        let sql = r#"DECLARE
+#[test]
+fn test_split_script_items_repeat_block_with_end_repeat_on_next_line() {
+    let sql = r#"DECLARE
   v_count NUMBER := 0;
 BEGIN
   REPEAT
@@ -3320,11 +3376,11 @@ BEGIN
   END
   REPEAT;
 END;"#;
-        let items = QueryExecutor::split_script_items(sql);
-        let stmts = get_statements(&items);
-        assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
-        assert!(stmts[0].contains("END") && stmts[0].contains("REPEAT"));
-    }
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "REPEAT block should be one statement");
+    assert!(stmts[0].contains("END") && stmts[0].contains("REPEAT"));
+}
 
 #[test]
 fn test_split_script_items_pipelined_function() {
@@ -3342,31 +3398,31 @@ END;"#;
 }
 
 #[test]
-    fn test_line_block_depths_increase_for_repeat_loop() {
-        let sql = r#"BEGIN
+fn test_line_block_depths_increase_for_repeat_loop() {
+    let sql = r#"BEGIN
   REPEAT
     NULL;
   UNTIL i > 1
   END REPEAT;
 END;"#;
-        let depths = QueryExecutor::line_block_depths(sql);
-        let expected = vec![0, 1, 2, 2, 1, 0];
-        assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
-    }
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 2, 1, 0];
+    assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
+}
 
-    #[test]
-    fn test_line_block_depths_with_split_end_repeat() {
-        let sql = r#"BEGIN
+#[test]
+fn test_line_block_depths_with_split_end_repeat() {
+    let sql = r#"BEGIN
   REPEAT
     NULL;
   UNTIL i > 1
   END
   REPEAT;
 END;"#;
-        let depths = QueryExecutor::line_block_depths(sql);
-        let expected = vec![0, 1, 2, 2, 1, 1, 0];
-        assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
-    }
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 2, 1, 1, 0];
+    assert_eq!(depths, expected, "REPEAT depth tracking mismatch");
+}
 
 #[test]
 fn test_line_block_depths_with_for_update_clause() {
@@ -3403,11 +3459,12 @@ SELECT * FROM cte;"#;
             with_idx = Some(idx);
         }
 
-        if line.to_uppercase().trim_start().starts_with("SELECT ")
-            && cte_select_idx.is_none()
-        {
+        if line.to_uppercase().trim_start().starts_with("SELECT ") && cte_select_idx.is_none() {
             cte_select_idx = Some(idx);
-        } else if line.to_uppercase().trim_start().starts_with("SELECT * FROM CTE")
+        } else if line
+            .to_uppercase()
+            .trim_start()
+            .starts_with("SELECT * FROM CTE")
             && main_select_idx.is_none()
         {
             main_select_idx = Some(idx);
@@ -3418,7 +3475,10 @@ SELECT * FROM cte;"#;
     let cte_select_idx = cte_select_idx.expect("expected CTE SELECT");
     let main_select_idx = main_select_idx.expect("expected main SELECT after CTE");
 
-    assert!(with_idx + 1 < lines.len(), "WITH line should have body line");
+    assert!(
+        with_idx + 1 < lines.len(),
+        "WITH line should have body line"
+    );
     assert!(
         depths[with_idx + 1] > depths[with_idx],
         "WITH body should be indented deeper than hint+WITH line"
@@ -3508,7 +3568,10 @@ WHERE EXISTS (
         } else if upper.starts_with("WHERE ") {
             where_idx = Some(idx);
         } else if idx > 0
-            && lines[idx - 1].trim().to_uppercase().starts_with("WHERE EXISTS (")
+            && lines[idx - 1]
+                .trim()
+                .to_uppercase()
+                .starts_with("WHERE EXISTS (")
             && upper.starts_with("SELECT ")
         {
             exists_select_idx = Some(idx);
@@ -3520,7 +3583,10 @@ WHERE EXISTS (
     let where_idx = where_idx.expect("expected WHERE line");
     let exists_select_idx = exists_select_idx.expect("expected nested EXISTS SELECT line");
 
-    assert!(with_idx + 1 < depths.len(), "CTE should have at least two lines");
+    assert!(
+        with_idx + 1 < depths.len(),
+        "CTE should have at least two lines"
+    );
     assert!(
         depths[with_idx + 1] > depths[with_idx],
         "CTE body SELECT should be deeper than WITH header"
