@@ -53,4 +53,11 @@ fn main() {
 
     let app = App::new();
     app.run();
+
+    // Best-effort shutdown logging to reduce chances of losing the last entries
+    // when the process exits right after UI teardown.
+    logging::log_info("app", "SPACE Query stopping");
+    if let Err(err) = logging::flush_log_writer() {
+        eprintln!("Failed to flush application log before exit: {err}");
+    }
 }
