@@ -83,6 +83,7 @@ pub struct DatabaseConnection {
     auto_commit: bool,
     session: Arc<Mutex<SessionState>>,
     last_disconnect_reason: Option<String>,
+    connection_generation: u64,
 }
 
 impl DatabaseConnection {
@@ -94,6 +95,7 @@ impl DatabaseConnection {
             auto_commit: false,
             session: Arc::new(Mutex::new(SessionState::default())),
             last_disconnect_reason: None,
+            connection_generation: 0,
         }
     }
 
@@ -117,6 +119,7 @@ impl DatabaseConnection {
         self.info.clear_password();
         self.connected = true;
         self.last_disconnect_reason = None;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
 
         Ok(())
     }
@@ -135,15 +138,23 @@ impl DatabaseConnection {
     }
 
     pub fn disconnect(&mut self) {
+        let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
         self.connected = false;
         self.last_disconnect_reason = None;
+        if had_connection {
+            self.connection_generation = self.connection_generation.wrapping_add(1);
+        }
     }
 
     fn mark_disconnected_with_reason(&mut self, reason: impl Into<String>) {
+        let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
         self.connected = false;
         self.last_disconnect_reason = Some(reason.into());
+        if had_connection {
+            self.connection_generation = self.connection_generation.wrapping_add(1);
+        }
     }
 
     fn disconnect_message(&self) -> String {
@@ -200,6 +211,10 @@ impl DatabaseConnection {
 
     pub fn get_info(&self) -> &ConnectionInfo {
         &self.info
+    }
+
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     pub fn set_auto_commit(&mut self, enabled: bool) {
