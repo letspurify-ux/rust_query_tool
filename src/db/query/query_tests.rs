@@ -119,6 +119,22 @@ SELECT txt FROM t";
 }
 
 #[test]
+fn test_is_plain_commit_allows_only_commit_variants() {
+    assert!(QueryExecutor::is_plain_commit("COMMIT"));
+    assert!(QueryExecutor::is_plain_commit("commit work;"));
+    assert!(!QueryExecutor::is_plain_commit("COMMIT FORCE '1.2.3'"));
+    assert!(!QueryExecutor::is_plain_commit("COMMIT COMMENT 'done'"));
+}
+
+#[test]
+fn test_is_plain_rollback_allows_only_rollback_variants() {
+    assert!(QueryExecutor::is_plain_rollback("ROLLBACK"));
+    assert!(QueryExecutor::is_plain_rollback("rollback work;"));
+    assert!(!QueryExecutor::is_plain_rollback("ROLLBACK TO sp1"));
+    assert!(!QueryExecutor::is_plain_rollback("ROLLBACK FORCE '1.2.3'"));
+}
+
+#[test]
 fn test_double_semicolon() {
     let sql = "SELECT 1 FROM DUAL;;";
     let items = QueryExecutor::split_script_items(sql);

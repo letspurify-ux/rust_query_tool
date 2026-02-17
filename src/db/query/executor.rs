@@ -11,6 +11,27 @@ use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem
 pub struct QueryExecutor;
 
 impl QueryExecutor {
+    fn tokenized_upper(sql: &str) -> Vec<String> {
+        Self::strip_leading_comments(sql)
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .map(|token| token.to_uppercase())
+            .collect()
+    }
+
+    pub(crate) fn is_plain_commit(sql: &str) -> bool {
+        let tokens = Self::tokenized_upper(sql);
+        matches!(tokens.as_slice(), [first] if first == "COMMIT")
+            || matches!(tokens.as_slice(), [first, second] if first == "COMMIT" && second == "WORK")
+    }
+
+    pub(crate) fn is_plain_rollback(sql: &str) -> bool {
+        let tokens = Self::tokenized_upper(sql);
+        matches!(tokens.as_slice(), [first] if first == "ROLLBACK")
+            || matches!(tokens.as_slice(), [first, second] if first == "ROLLBACK" && second == "WORK")
+    }
+
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
         let idx = index.min(text.len());
         if text.is_char_boundary(idx) {
@@ -939,7 +960,7 @@ impl QueryExecutor {
             Self::execute_ddl(conn, &sql_clean, start)
         }
         // Transaction control
-        else if sql_upper.starts_with("COMMIT") {
+        else if Self::is_plain_commit(&sql_clean) {
             match conn.commit() {
                 Ok(()) => {}
                 Err(err) => {
@@ -957,7 +978,7 @@ impl QueryExecutor {
                 is_select: false,
                 success: true,
             })
-        } else if sql_upper.starts_with("ROLLBACK") {
+        } else if Self::is_plain_rollback(&sql_clean) {
             match conn.rollback() {
                 Ok(()) => {}
                 Err(err) => {
