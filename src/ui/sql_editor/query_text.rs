@@ -3,6 +3,7 @@
 //! 실행, 인텔리센스, 포맷팅에서 공통으로 쓰는 SQL 텍스트 분석 로직을
 //! 한 곳에 모아 중복을 줄입니다.
 use crate::db::{FormatItem, QueryExecutor, ScriptItem, SplitState};
+use crate::sql_text;
 use crate::ui::sql_editor::SqlToken;
 
 /// SQL 문자열을 토큰 단위로 분해합니다.
@@ -156,13 +157,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push('\'');
             current.push(delimiter);
             scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(scan_state.q_quote_end(), Some(match delimiter {
-                '[' => ']',
-                '{' => '}',
-                '(' => ')',
-                '<' => '>',
-                _ => delimiter,
-            }));
+            debug_assert_eq!(scan_state.q_quote_end(), Some(sql_text::q_quote_closing(delimiter)));
             i += 4;
             continue;
         }
@@ -175,13 +170,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push('\'');
             current.push(delimiter);
             scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(scan_state.q_quote_end(), Some(match delimiter {
-                '[' => ']',
-                '{' => '}',
-                '(' => ')',
-                '<' => '>',
-                _ => delimiter,
-            }));
+            debug_assert_eq!(scan_state.q_quote_end(), Some(sql_text::q_quote_closing(delimiter)));
             i += 3;
             continue;
         }
@@ -202,7 +191,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             continue;
         }
 
-        if c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '#' {
+        if sql_text::is_identifier_char(c) {
             current.push(c);
             i += 1;
             continue;

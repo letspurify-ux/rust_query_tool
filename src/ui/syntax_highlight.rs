@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashSet;
 
 use super::intellisense::{ORACLE_FUNCTIONS, SQL_KEYWORDS};
+use crate::sql_text;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
 
@@ -339,13 +340,7 @@ impl SqlHighlighter {
                 && bytes.get(idx + 2) == Some(&b'\'')
             {
                 if let Some(&delimiter) = bytes.get(idx + 3) {
-                    let closing = match delimiter {
-                        b'[' => b']',
-                        b'(' => b')',
-                        b'{' => b'}',
-                        b'<' => b'>',
-                        _ => delimiter,
-                    };
+                    let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
                     idx += 4; // Skip nq'[ and find closing delimiter followed by '
                     while idx < bytes.len() {
@@ -367,13 +362,7 @@ impl SqlHighlighter {
             // Check for q-quoted strings: q'[...]', q'{...}', etc.
             if (byte == b'q' || byte == b'Q') && bytes.get(idx + 1) == Some(&b'\'') {
                 if let Some(&delimiter) = bytes.get(idx + 2) {
-                    let closing = match delimiter {
-                        b'[' => b']',
-                        b'(' => b')',
-                        b'{' => b'}',
-                        b'<' => b'>',
-                        _ => delimiter,
-                    };
+                    let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
                     idx += 3; // Skip q'[ and find closing delimiter followed by '
                     while idx < bytes.len() {
@@ -464,12 +453,12 @@ impl SqlHighlighter {
             }
 
             // Check for identifiers/keywords
-            if is_identifier_start_byte(byte) {
+            if sql_text::is_identifier_start_byte(byte) {
                 let start = idx;
                 idx += 1;
                 while bytes
                     .get(idx)
-                    .map_or(false, |&b| is_identifier_continue_byte(b))
+                    .map_or(false, |&b| sql_text::is_identifier_byte(b))
                 {
                     idx += 1;
                 }
@@ -807,14 +796,6 @@ fn is_operator_byte(byte: u8) -> bool {
             | b':'
             | b'.'
     )
-}
-
-fn is_identifier_start_byte(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
-
-fn is_identifier_continue_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 
 fn is_prompt_keyword(bytes: &[u8], start: usize) -> bool {

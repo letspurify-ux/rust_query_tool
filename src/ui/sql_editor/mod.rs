@@ -1656,9 +1656,6 @@ fn is_word_edit_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-fn is_identifier_continue_byte_for_expand(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
-}
 
 fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -1680,11 +1677,11 @@ fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (u
     let mut expanded_start = start.min(bytes.len());
     let mut expanded_end = end.min(bytes.len());
 
-    while expanded_start > 0 && is_identifier_continue_byte_for_expand(bytes[expanded_start - 1]) {
+    while expanded_start > 0 && crate::sql_text::is_identifier_byte(bytes[expanded_start - 1]) {
         expanded_start -= 1;
     }
 
-    while expanded_end < bytes.len() && is_identifier_continue_byte_for_expand(bytes[expanded_end])
+    while expanded_end < bytes.len() && crate::sql_text::is_identifier_byte(bytes[expanded_end])
     {
         expanded_end += 1;
     }

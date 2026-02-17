@@ -5,9 +5,48 @@ pub(crate) fn is_identifier_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#'
 }
 
+/// Byte-level identifier check (equivalent to `is_identifier_char` for ASCII).
+///
+/// Covers alphanumeric, `_`, `$`, `#`.  Used as *continue* predicate by
+/// syntax highlighting, editor word expansion, and script parsing.
 #[inline]
 pub(crate) fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii() && is_identifier_char(byte as char)
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte == b'#'
+}
+
+/// Returns true when `byte` can *start* an SQL identifier token.
+///
+/// Digits are excluded: identifiers may contain digits but cannot begin with one.
+#[inline]
+pub(crate) fn is_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' || byte == b'#'
+}
+
+/// Returns the matching closing delimiter for an Oracle q-quoted string.
+///
+/// `q'[hello]'`  →  `[` opens, `]` closes.
+/// `q'!hello!'`  →  `!` opens and closes.
+#[inline]
+pub(crate) fn q_quote_closing(delimiter: char) -> char {
+    match delimiter {
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        '<' => '>',
+        other => other,
+    }
+}
+
+/// Byte version of [`q_quote_closing`].
+#[inline]
+pub(crate) fn q_quote_closing_byte(delimiter: u8) -> u8 {
+    match delimiter {
+        b'[' => b']',
+        b'(' => b')',
+        b'{' => b'}',
+        b'<' => b'>',
+        other => other,
+    }
 }
 
 /// Returns true when `text_upper` starts with `keyword` as a standalone token.

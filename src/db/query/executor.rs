@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::db::session::{BindDataType, BindValue, CompiledObject, SessionState};
+use crate::sql_text;
 
 use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem};
 
@@ -157,13 +158,7 @@ impl QueryExecutor {
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 4;
                     continue;
                 }
@@ -173,13 +168,7 @@ impl QueryExecutor {
             if (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 3;
                     continue;
                 }
@@ -219,11 +208,11 @@ impl QueryExecutor {
                         continue;
                     }
 
-                    if nc.is_ascii_alphanumeric() || nc == '_' || nc == '$' || nc == '#' {
+                    if sql_text::is_identifier_char(nc) {
                         let mut j = i + 1;
                         while j < len {
                             let ch = chars[j];
-                            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
+                            if sql_text::is_identifier_char(ch) {
                                 j += 1;
                             } else {
                                 break;
@@ -521,13 +510,7 @@ impl QueryExecutor {
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 4;
                     continue;
                 }
@@ -537,13 +520,7 @@ impl QueryExecutor {
             if (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 3;
                     continue;
                 }
@@ -663,13 +640,7 @@ impl QueryExecutor {
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     current.push(c);
                     current.push(chars[i + 1]);
                     current.push('\'');
@@ -683,13 +654,7 @@ impl QueryExecutor {
             if (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     current.push(c);
                     current.push('\'');
                     current.push(delimiter);
@@ -810,13 +775,7 @@ impl QueryExecutor {
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 4;
                     continue;
                 }
@@ -826,13 +785,7 @@ impl QueryExecutor {
             if (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
                     in_q_quote = true;
-                    q_quote_end = Some(match delimiter {
-                        '[' => ']',
-                        '(' => ')',
-                        '{' => '}',
-                        '<' => '>',
-                        other => other,
-                    });
+                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
                     i += 3;
                     continue;
                 }
@@ -2674,12 +2627,12 @@ impl ObjectBrowser {
             };
 
             // Ensure keyword is not part of a larger identifier
-            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            if i > 0 && sql_text::is_identifier_byte(bytes[i - 1]) {
                 i += keyword;
                 continue;
             }
             let after = i + keyword;
-            if after < len && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_') {
+            if after < len && sql_text::is_identifier_byte(bytes[after]) {
                 i += keyword;
                 continue;
             }
