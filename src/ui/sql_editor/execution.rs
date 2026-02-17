@@ -243,6 +243,18 @@ impl SqlEditorWidget {
         if text.is_char_boundary(idx) {
             return idx;
         }
+
+        // Some FLTK builds can report UTF-8 cursor positions as character counts
+        // instead of byte offsets. If the index is not a UTF-8 boundary but still
+        // within the character-count range, reinterpret it as a character index.
+        let char_count = text.chars().count();
+        if idx <= char_count {
+            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
+                return byte_pos;
+            }
+            return text.len();
+        }
+
         text.char_indices()
             .map(|(pos, _)| pos)
             .take_while(|pos| *pos < idx)
@@ -8102,6 +8114,27 @@ END oqt_mega_pkg;"#;
         assert!(
             !formatted.trim_end().ends_with(';'),
             "Selection-preserved formatted SQL should not end with semicolon"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_handles_unicode_character_index_offsets() {
+        let source = "SELECT 한글, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        // Simulate a platform/editor path that reports cursor positions as
+        // UTF-8 character offsets (not byte offsets).
+        let char_offset = source
+            .chars()
+            .take_while(|ch| *ch != 'b')
+            .count() as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, char_offset, false);
+        let mapped_slice = &formatted[mapped as usize..];
+        assert!(
+            mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
+            "Mapped cursor should stay near token after unicode-aware mapping, got: {}",
+            mapped_slice
         );
     }
 
