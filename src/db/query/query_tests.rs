@@ -122,6 +122,10 @@ SELECT txt FROM t";
 fn test_is_plain_commit_allows_only_commit_variants() {
     assert!(QueryExecutor::is_plain_commit("COMMIT"));
     assert!(QueryExecutor::is_plain_commit("commit work;"));
+    assert!(QueryExecutor::is_plain_commit("COMMIT /* trailing */"));
+    assert!(QueryExecutor::is_plain_commit(
+        "COMMIT -- trailing comment\n"
+    ));
     assert!(!QueryExecutor::is_plain_commit("COMMIT FORCE '1.2.3'"));
     assert!(!QueryExecutor::is_plain_commit("COMMIT COMMENT 'done'"));
 }
@@ -130,6 +134,10 @@ fn test_is_plain_commit_allows_only_commit_variants() {
 fn test_is_plain_rollback_allows_only_rollback_variants() {
     assert!(QueryExecutor::is_plain_rollback("ROLLBACK"));
     assert!(QueryExecutor::is_plain_rollback("rollback work;"));
+    assert!(QueryExecutor::is_plain_rollback("ROLLBACK /* trailing */"));
+    assert!(QueryExecutor::is_plain_rollback(
+        "ROLLBACK -- trailing comment\n"
+    ));
     assert!(!QueryExecutor::is_plain_rollback("ROLLBACK TO sp1"));
     assert!(!QueryExecutor::is_plain_rollback("ROLLBACK FORCE '1.2.3'"));
 }

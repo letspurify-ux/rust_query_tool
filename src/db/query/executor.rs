@@ -12,7 +12,91 @@ pub struct QueryExecutor;
 
 impl QueryExecutor {
     fn tokenized_upper(sql: &str) -> Vec<String> {
-        Self::strip_leading_comments(sql)
+        let mut normalized = String::with_capacity(sql.len());
+        let chars: Vec<char> = sql.chars().collect();
+        let mut i = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    normalized.push(' ');
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    normalized.push(' ');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            normalized.push(c);
+            i += 1;
+        }
+
+        normalized
             .trim()
             .trim_end_matches(';')
             .split_whitespace()
