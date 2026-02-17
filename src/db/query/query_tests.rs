@@ -96,6 +96,13 @@ END;"#;
 }
 
 #[test]
+fn test_normalize_exec_call_handles_leading_comments() {
+    let sql = "-- run proc\nEXEC test_proc(:v1);";
+    let normalized = QueryExecutor::normalize_exec_call(sql);
+    assert_eq!(normalized.as_deref(), Some("BEGIN test_proc(:v1); END;"));
+}
+
+#[test]
 fn test_create_external_function_as_non_plsql_block_followed_by_select() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_fn(
   p_num NUMBER

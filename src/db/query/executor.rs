@@ -1917,17 +1917,11 @@ impl QueryExecutor {
         sql: &str,
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
-        // Remove EXEC or EXECUTE keyword and convert to PL/SQL block
-        let sql_trimmed = sql.trim();
-        let proc_call = if sql_trimmed.to_uppercase().starts_with("EXECUTE ") {
-            &sql_trimmed[8..] // Remove "EXECUTE "
-        } else if sql_trimmed.to_uppercase().starts_with("EXEC ") {
-            &sql_trimmed[5..] // Remove "EXEC "
-        } else {
-            sql_trimmed
-        };
-
-        let plsql = format!("BEGIN {}; END;", proc_call.trim().trim_end_matches(';'));
+        // Reuse normalized SQL*Plus EXEC handling to correctly strip leading comments.
+        let plsql = Self::normalize_exec_call(sql).unwrap_or_else(|| {
+            let sql_trimmed = sql.trim().trim_end_matches(';').trim();
+            format!("BEGIN {}; END;", sql_trimmed)
+        });
         match conn.execute(&plsql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
