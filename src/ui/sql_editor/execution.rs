@@ -218,8 +218,11 @@ impl SqlEditorWidget {
         buffer.replace(start, end, &formatted);
 
         if select_formatted {
+            let original_within_selection = (original_pos - start).clamp(0, source.len() as i32);
+            let mapped_within_selection =
+                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
             buffer.select(start, start + formatted.len() as i32);
-            editor.set_insert_position(start + formatted.len() as i32);
+            editor.set_insert_position(start + mapped_within_selection);
         } else {
             let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos);
             editor.set_insert_position(new_pos);
@@ -8001,6 +8004,34 @@ END oqt_mega_pkg;"#;
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
             "Mapped cursor should stay near the same token after reformat, got: {}",
             mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_uses_selection_relative_offset() {
+        let source = "SELECT a, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let source_pos_within_selection = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist") as i32;
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let selection_start = 25i32;
+        let final_cursor_pos = selection_start + mapped_within_selection;
+        let formatted_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            formatted_slice.trim_start().starts_with("b\nFROM DUAL;"),
+            "Mapped cursor inside selection should stay near the same token after reformat, got: {}",
+            formatted_slice
+        );
+        assert_eq!(
+            final_cursor_pos,
+            selection_start + mapped_within_selection,
+            "Selection-relative mapping should compose with selection offset"
         );
     }
 
