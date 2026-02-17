@@ -1181,6 +1181,29 @@ impl QueryExecutor {
             end: usize,
         }
 
+        let find_statement_start = |sql: &str, from: usize, stmt: &str| -> Option<usize> {
+            let haystack = &sql[from..];
+            for (relative_idx, _) in haystack.match_indices(stmt) {
+                let candidate = from + relative_idx;
+                let separator = sql[from..candidate]
+                    .chars()
+                    .rev()
+                    .find(|ch| !ch.is_whitespace());
+
+                let line_start = sql[..candidate]
+                    .rfind('\n')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(from);
+                let starts_at_line = sql[line_start..candidate].trim().is_empty();
+
+                if separator.is_none() || matches!(separator, Some(';') | Some('/')) || starts_at_line {
+                    return Some(candidate);
+                }
+            }
+
+            None
+        };
+
         let spans_for_sql = |sql: &str| {
             let mut spans: Vec<StatementSpan> = Vec::new();
             let mut search_pos = 0usize;
@@ -1190,10 +1213,7 @@ impl QueryExecutor {
                     if stmt.is_empty() {
                         continue;
                     }
-                    let remaining = &sql[search_pos..];
-                    let leading_ws = remaining.len() - remaining.trim_start().len();
-                    if let Some(found) = remaining.trim_start().find(stmt) {
-                        let start = search_pos + leading_ws + found;
+                    if let Some(start) = find_statement_start(sql, search_pos, stmt) {
                         let end = start + stmt.len();
                         spans.push(StatementSpan { start, end });
                         search_pos = end;
