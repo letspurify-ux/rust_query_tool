@@ -1670,32 +1670,17 @@ impl SqlEditorWidget {
             return None;
         }
         let bytes = text.as_bytes();
-        let mut dot_search = rel_word_start;
-        while dot_search > 0 {
-            let byte = *bytes.get(dot_search - 1)?;
-            if byte.is_ascii_whitespace() {
-                dot_search -= 1;
-                continue;
-            }
-            break;
-        }
-        if dot_search == 0 || bytes.get(dot_search.saturating_sub(1)) != Some(&b'.') {
+
+        // IntelliSense qualifier must be strict `qualifier.<cursor>` form.
+        // Do not allow whitespace around `.` so cases like `e .|` / `e. |`
+        // are treated as non-qualified context.
+        if bytes.get(rel_word_start.saturating_sub(1)) != Some(&b'.') {
             return None;
         }
-        let idx = dot_search - 1;
+        let idx = rel_word_start - 1;
 
-        // Allow whitespace before dot in patterns like `alias .` or `"alias" .`.
-        let mut qualifier_end = idx;
-        while qualifier_end > 0 && bytes.get(qualifier_end - 1).is_some_and(u8::is_ascii_whitespace)
-        {
-            qualifier_end -= 1;
-        }
-        if qualifier_end == 0 {
-            return None;
-        }
-
-        if bytes.get(qualifier_end - 1) == Some(&b'"') {
-            let mut pos = qualifier_end - 1;
+        if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
+            let mut pos = idx - 1;
             while pos > 0 {
                 pos -= 1;
                 if bytes[pos] == b'"' {
@@ -1703,7 +1688,7 @@ impl SqlEditorWidget {
                         pos = pos.saturating_sub(1);
                         continue;
                     }
-                    let quoted = text.get(pos..qualifier_end)?;
+                    let quoted = text.get(pos..idx)?;
                     let qualifier = Self::strip_identifier_quotes(quoted);
                     if qualifier.is_empty() {
                         return None;
@@ -1714,7 +1699,7 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let mut begin = qualifier_end;
+        let mut begin = idx;
         while begin > 0 {
             if let Some(&byte) = bytes.get(begin - 1) {
                 if sql_text::is_identifier_byte(byte) {
@@ -1726,10 +1711,10 @@ impl SqlEditorWidget {
                 break;
             }
         }
-        if begin == qualifier_end {
+        if begin == idx {
             return None;
         }
-        let qualifier = text.get(begin..qualifier_end)?;
+        let qualifier = text.get(begin..idx)?;
         let qualifier = Self::strip_identifier_quotes(qualifier);
         if qualifier.is_empty() {
             None
@@ -2132,30 +2117,30 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
     }
 
     #[test]
-    fn qualifier_before_word_allows_whitespace_between_dot_and_cursor() {
+    fn qualifier_before_word_rejects_whitespace_between_dot_and_cursor() {
         let sql_with_cursor = "SELECT e.   | FROM emp e";
         let cursor = sql_with_cursor.find('|').unwrap_or(0);
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
-        assert_eq!(qualifier.as_deref(), Some("e"));
+        assert_eq!(qualifier, None);
     }
 
     #[test]
-    fn qualifier_before_word_allows_whitespace_before_dot() {
+    fn qualifier_before_word_rejects_whitespace_before_dot() {
         let sql_with_cursor = "SELECT e   .| FROM emp e";
         let cursor = sql_with_cursor.find('|').unwrap_or(0);
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
-        assert_eq!(qualifier.as_deref(), Some("e"));
+        assert_eq!(qualifier, None);
     }
 
     #[test]
-    fn qualifier_before_word_allows_whitespace_before_dot_with_quoted_identifier() {
+    fn qualifier_before_word_rejects_whitespace_before_dot_with_quoted_identifier() {
         let sql_with_cursor = r#"SELECT "e"   .| FROM "Emp Table" "e""#;
         let cursor = sql_with_cursor.find('|').unwrap_or(0);
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
-        assert_eq!(qualifier.as_deref(), Some("e"));
+        assert_eq!(qualifier, None);
     }
 
     #[test]
