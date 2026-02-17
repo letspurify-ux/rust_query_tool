@@ -299,7 +299,7 @@ fn should_apply_disconnect_for_health_check(
     match checked_connection_id {
         Some(checked_id) => current_connection_id
             .map(|current_id| checked_id == current_id)
-            .unwrap_or(false),
+            .unwrap_or(true),
         None => current_connection_id.is_none(),
     }
 }
@@ -3074,6 +3074,11 @@ mod health_check_tests {
             Some(10),
             Some(11)
         ));
+    }
+
+    #[test]
+    fn applies_disconnect_when_checked_connection_was_cleared_by_health_check() {
+        assert!(should_apply_disconnect_for_health_check(Some(10), None));
     }
 
     #[test]
