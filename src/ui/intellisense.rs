@@ -826,7 +826,7 @@ impl IntellisenseData {
 
         let push_suggestion =
             |value: String, suggestions: &mut Vec<String>, seen: &mut HashSet<String>| {
-                if !prefix_upper.is_empty() && value.eq_ignore_ascii_case(&prefix_upper) {
+                if !prefix_upper.is_empty() && value.to_uppercase() == prefix_upper {
                     return suggestions.len() >= MAX_SUGGESTIONS;
                 }
                 if suggestions.len() >= MAX_SUGGESTIONS {
@@ -1580,6 +1580,15 @@ mod intellisense_tests {
         assert!(suggestions
             .iter()
             .any(|s| s.eq_ignore_ascii_case("abc_table")));
+    }
+
+    #[test]
+    fn get_suggestions_excludes_exact_prefix_match_for_wrapped_entries() {
+        let mut data = IntellisenseData::new();
+
+        let suggestions = data.get_suggestions("sum()", false, None, false, false);
+
+        assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("sum()")));
     }
 
     #[test]
