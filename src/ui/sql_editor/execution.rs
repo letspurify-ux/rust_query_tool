@@ -24,7 +24,7 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, SplitState, ToolCommand,
 };
-use crate::ui::sql_depth::paren_depths;
+use crate::ui::sql_depth::{paren_depth_after, paren_depths};
 use crate::ui::SQL_KEYWORDS;
 
 use super::*;
@@ -500,17 +500,7 @@ impl SqlEditorWidget {
 
     fn statement_has_unbalanced_paren(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
-        let mut depth = 0usize;
-        for token in tokens {
-            match token {
-                SqlToken::Symbol(sym) if sym == "(" => depth += 1,
-                SqlToken::Symbol(sym) if sym == ")" => {
-                    depth = depth.saturating_sub(1);
-                }
-                _ => {}
-            }
-        }
-        depth > 0
+        paren_depth_after(&tokens) > 0
     }
 
     fn format_tool_command(command: &ToolCommand) -> String {

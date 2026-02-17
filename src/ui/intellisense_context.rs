@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ui::sql_depth::paren_depths;
+use crate::ui::sql_depth::{apply_paren_token, paren_depths};
 use crate::ui::sql_editor::SqlToken;
 
 /// SQL clause phase within a query at a specific depth level.
@@ -876,9 +876,8 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
     let mut depth = 0usize;
     let mut found_with = false;
     while idx < tokens.len() {
-        match &tokens[idx] {
-            SqlToken::Symbol(sym) if sym == "(" => depth += 1,
-            SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
+        let token = &tokens[idx];
+        match token {
             SqlToken::Word(w) if depth == 0 && w.eq_ignore_ascii_case("WITH") => {
                 idx += 1;
                 found_with = true;
@@ -896,6 +895,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             }
             _ => {}
         }
+        apply_paren_token(&mut depth, token);
         idx += 1;
     }
 
