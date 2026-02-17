@@ -18,6 +18,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::{
+    Arc,
+    Condvar,
+    Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,6 +83,12 @@ pub struct AppState {
     pub last_fetch_status_update: Instant,
     schema_sender: Option<std::sync::mpsc::Sender<SchemaUpdate>>,
     file_sender: Option<std::sync::mpsc::Sender<FileActionResult>>,
+    health_stop_signal: Option<Arc<HealthCheckStopSignal>>,
+}
+
+struct HealthCheckStopSignal {
+    should_stop: Mutex<bool>,
+    condvar: Condvar,
 }
 
 impl AppState {
@@ -903,6 +914,7 @@ impl MainWindow {
             last_fetch_status_update: Instant::now(),
             schema_sender: None,
             file_sender: None,
+            health_stop_signal: None,
         }));
 
         let weak_state_for_execute = Rc::downgrade(&state);
@@ -2507,6 +2519,77 @@ impl MainWindow {
         );
     }
 
+    fn stop_health_check_worker(state: &Rc<RefCell<AppState>>) {
+        if let Some(stop_signal) = state.borrow_mut().health_stop_signal.take() {
+            let mut should_stop = stop_signal
+                .should_stop
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *should_stop = true;
+            stop_signal.condvar.notify_one();
+        }
+    }
+
+    fn start_health_check_worker(
+        connection: SharedConnection,
+        health_sender: std::sync::mpsc::Sender<ConnectionHealthResult>,
+    ) -> Arc<HealthCheckStopSignal> {
+        let stop_signal = Arc::new(HealthCheckStopSignal {
+            should_stop: Mutex::new(false),
+            condvar: Condvar::new(),
+        });
+        let worker_stop_signal = stop_signal.clone();
+        thread::spawn(move || {
+            loop {
+                let should_stop = match worker_stop_signal.should_stop.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let (should_stop, timeout_result) = match worker_stop_signal
+                    .condvar
+                    .wait_timeout(should_stop, CONNECTION_HEALTH_CHECK_INTERVAL)
+                {
+                    Ok(wait_result) => wait_result,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if *should_stop {
+                    break;
+                }
+                if !timeout_result.timed_out() {
+                    continue;
+                }
+                drop(should_stop);
+
+                let (disconnect_message, checked_connection_id, checked_connection_generation) =
+                    if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
+                        let checked_connection_generation = conn_guard.connection_generation();
+                        let checked_connection_id = conn_guard
+                            .get_connection()
+                            .as_ref()
+                            .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
+                        (
+                            conn_guard.require_live_connection().err(),
+                            checked_connection_id,
+                            checked_connection_generation,
+                        )
+                    } else {
+                        (None, None, 0)
+                    };
+                if health_sender
+                    .send(ConnectionHealthResult::Checked {
+                        disconnect_message,
+                        checked_connection_id,
+                        checked_connection_generation,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        stop_signal
+    }
+
     fn setup_menu_callbacks(
         &mut self,
         schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
@@ -2528,21 +2611,15 @@ impl MainWindow {
         let (health_sender, health_receiver) = std::sync::mpsc::channel::<ConnectionHealthResult>();
         let health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
             Rc::new(RefCell::new(health_receiver));
-        let health_check_in_flight = Rc::new(Cell::new(false));
-        let last_health_check = Rc::new(Cell::new(
-            Instant::now()
-                .checked_sub(CONNECTION_HEALTH_CHECK_INTERVAL)
-                .unwrap_or_else(Instant::now),
-        ));
+        let health_connection = state.borrow().connection.clone();
+        let stop_flag = MainWindow::start_health_check_worker(health_connection, health_sender);
+        state.borrow_mut().health_stop_signal = Some(stop_flag);
 
         fn schedule_poll(
             schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>>,
             conn_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionResult>>>,
             file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>>,
             health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
-            health_sender: std::sync::mpsc::Sender<ConnectionHealthResult>,
-            health_check_in_flight: Rc<Cell<bool>>,
-            last_health_check: Rc<Cell<Instant>>,
             state_weak: Weak<RefCell<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
@@ -2759,12 +2836,6 @@ impl MainWindow {
                             checked_connection_id,
                             checked_connection_generation,
                         }) => {
-                            health_check_in_flight.set(false);
-                            // Even when we could not lock the connection, treat this as
-                            // a completed health-check cycle so we don't spin a new thread
-                            // every poll tick while the lock is contended.
-                            last_health_check.set(Instant::now());
-
                             if let Some(message) = disconnect_message {
                                 let mut s = state.borrow_mut();
 
@@ -2801,46 +2872,10 @@ impl MainWindow {
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            health_check_in_flight.set(false);
                             break;
                         }
                     }
                 }
-            }
-
-            let should_run_health_check = {
-                let s = state.borrow();
-                s.connection_info.borrow().is_some()
-                    && !health_check_in_flight.get()
-                    && last_health_check.get().elapsed() >= CONNECTION_HEALTH_CHECK_INTERVAL
-            };
-            if should_run_health_check {
-                health_check_in_flight.set(true);
-                let connection = state.borrow().connection.clone();
-                let health_sender = health_sender.clone();
-                thread::spawn(move || {
-                    let (disconnect_message, checked_connection_id, checked_connection_generation) =
-                        if let Some(mut conn_guard) = crate::db::try_lock_connection(&connection) {
-                            let checked_connection_generation = conn_guard.connection_generation();
-                            let checked_connection_id = conn_guard
-                                .get_connection()
-                                .as_ref()
-                                .map(|conn| std::sync::Arc::as_ptr(conn) as usize);
-                            (
-                                conn_guard.require_live_connection().err(),
-                                checked_connection_id,
-                                checked_connection_generation,
-                            )
-                        } else {
-                            (None, None, 0)
-                        };
-                    let _ = health_sender.send(ConnectionHealthResult::Checked {
-                        disconnect_message,
-                        checked_connection_id,
-                        checked_connection_generation,
-                    });
-                    app::awake();
-                });
             }
 
             // Stop polling if all channels are disconnected
@@ -2855,9 +2890,6 @@ impl MainWindow {
                     Rc::clone(&conn_receiver),
                     Rc::clone(&file_receiver),
                     Rc::clone(&health_receiver),
-                    health_sender.clone(),
-                    Rc::clone(&health_check_in_flight),
-                    Rc::clone(&last_health_check),
                     state_weak.clone(),
                     schema_sender.clone(),
                     file_sender.clone(),
@@ -2868,7 +2900,6 @@ impl MainWindow {
         // Start polling
         let weak_state_for_poll = Rc::downgrade(&state);
         let schema_sender_for_poll = schema_sender.clone();
-        let health_sender_for_poll = health_sender.clone();
         {
             let mut s = state.borrow_mut();
             s.schema_sender = Some(schema_sender.clone());
@@ -2879,9 +2910,6 @@ impl MainWindow {
             conn_receiver,
             file_receiver,
             health_receiver,
-            health_sender_for_poll,
-            health_check_in_flight,
-            last_health_check,
             weak_state_for_poll,
             schema_sender_for_poll,
             file_sender.clone(),
@@ -2942,6 +2970,7 @@ impl MainWindow {
                 if !MainWindow::confirm_save_for_all_dirty_tabs(&state) {
                     return;
                 }
+                MainWindow::stop_health_check_worker(&state);
                 let (popups, editor_tabs, mut result_tabs) = {
                     let s = state.borrow();
                     (
@@ -2972,6 +3001,7 @@ impl MainWindow {
         window.show();
         app::flush();
         let _ = app::wait();
+        MainWindow::stop_health_check_worker(&state);
         {
             let mut s = state.borrow_mut();
             MainWindow::adjust_query_layout(&mut s);
