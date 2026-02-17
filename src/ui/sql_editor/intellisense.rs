@@ -1670,10 +1670,19 @@ impl SqlEditorWidget {
             return None;
         }
         let bytes = text.as_bytes();
-        if bytes.get(rel_word_start.saturating_sub(1)) != Some(&b'.') {
+        let mut dot_search = rel_word_start;
+        while dot_search > 0 {
+            let byte = *bytes.get(dot_search - 1)?;
+            if byte.is_ascii_whitespace() {
+                dot_search -= 1;
+                continue;
+            }
+            break;
+        }
+        if dot_search == 0 || bytes.get(dot_search.saturating_sub(1)) != Some(&b'.') {
             return None;
         }
-        let idx = rel_word_start - 1;
+        let idx = dot_search - 1;
 
         if idx > 0 && bytes.get(idx - 1) == Some(&b'"') {
             let mut pos = idx - 1;
@@ -2106,6 +2115,15 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
     #[test]
     fn qualifier_before_word_supports_quoted_identifier() {
         let sql_with_cursor = r#"SELECT "e".| FROM "Emp Table" "e""#;
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn qualifier_before_word_allows_whitespace_between_dot_and_cursor() {
+        let sql_with_cursor = "SELECT e.   | FROM emp e";
         let cursor = sql_with_cursor.find('|').unwrap_or(0);
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
