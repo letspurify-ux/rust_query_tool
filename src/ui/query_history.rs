@@ -514,6 +514,10 @@ impl QueryHistoryDialog {
         success: bool,
         message: &str,
     ) {
+        if sql.trim().is_empty() {
+            return;
+        }
+
         let error_message = if success {
             None
         } else {
