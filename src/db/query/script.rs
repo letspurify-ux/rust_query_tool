@@ -2509,17 +2509,17 @@ impl QueryExecutor {
         };
 
         // Parse credentials (user/password)
-        let credentials: Vec<&str> = credentials_raw.splitn(2, '/').collect();
-        if credentials.len() != 2 {
+        // Split at the first slash so passwords containing / are preserved.
+        let Some((username_raw, password_raw)) = credentials_raw.split_once('/') else {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
                 message: "Invalid credentials. Expected: user/password".to_string(),
                 is_error: true,
             };
-        }
+        };
 
-        let username = credentials[0].trim().to_string();
-        let password = credentials[1].trim().to_string();
+        let username = username_raw.trim().to_string();
+        let password = password_raw.trim().to_string();
 
         if username.is_empty() {
             return ToolCommand::Unsupported {
