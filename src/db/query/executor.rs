@@ -2660,8 +2660,7 @@ impl ObjectBrowser {
     fn parse_package_spec_routines(source: &str) -> Vec<PackageRoutine> {
         let mut routines: Vec<PackageRoutine> = Vec::new();
         let mut seen = HashSet::new();
-        let upper = source.to_uppercase();
-        let bytes = upper.as_bytes();
+        let bytes = source.as_bytes();
         let len = bytes.len();
         let mut i = 0;
 
@@ -2703,9 +2702,9 @@ impl ObjectBrowser {
             // Check for PROCEDURE or FUNCTION keyword
             // Use byte-level comparison to avoid panicking on multi-byte
             // UTF-8 continuation bytes (e.g. Korean characters in comments).
-            let (keyword, routine_type) = if bytes.get(i..i + 9) == Some(b"PROCEDURE" as &[u8]) {
+            let (keyword, routine_type) = if Self::ascii_keyword_at(bytes, i, b"PROCEDURE") {
                 (9, "PROCEDURE")
-            } else if bytes.get(i..i + 8) == Some(b"FUNCTION" as &[u8]) {
+            } else if Self::ascii_keyword_at(bytes, i, b"FUNCTION") {
                 (8, "FUNCTION")
             } else {
                 i += 1;
@@ -2754,7 +2753,11 @@ impl ObjectBrowser {
                     j += 1;
                 }
                 if j > name_start {
-                    let name = upper.get(name_start..j).unwrap_or("").to_string();
+                    let name = source
+                        .get(name_start..j)
+                        .unwrap_or("")
+                        .trim()
+                        .to_uppercase();
                     if !name.is_empty() && seen.insert(name.clone()) {
                         routines.push(PackageRoutine {
                             name,
@@ -2768,6 +2771,13 @@ impl ObjectBrowser {
 
         routines.sort_by(|a, b| a.name.cmp(&b.name));
         routines
+    }
+
+    fn ascii_keyword_at(haystack: &[u8], start: usize, keyword: &[u8]) -> bool {
+        haystack
+            .get(start..start + keyword.len())
+            .map(|slice| slice.eq_ignore_ascii_case(keyword))
+            .unwrap_or(false)
     }
 
     /// Fallback: determine routine types via user_procedures + user_arguments.
