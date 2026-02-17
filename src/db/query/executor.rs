@@ -1108,6 +1108,11 @@ impl QueryExecutor {
             return String::new();
         }
 
+        let sql_trimmed = Self::strip_trailing_sqlplus_slash(sql_trimmed);
+        if sql_trimmed.is_empty() {
+            return String::new();
+        }
+
         let without_trailing_semicolons = sql_trimmed.trim_end_matches(';').trim_end();
         if without_trailing_semicolons.is_empty() {
             return String::new();
@@ -1122,6 +1127,21 @@ impl QueryExecutor {
         } else {
             without_trailing_semicolons.to_string()
         }
+    }
+
+    fn strip_trailing_sqlplus_slash(sql: &str) -> &str {
+        let trimmed = sql.trim_end();
+        if !trimmed.ends_with('/') {
+            return trimmed;
+        }
+
+        let before_slash = &trimmed[..trimmed.len() - 1];
+        let line_start = before_slash.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        if !before_slash[line_start..].trim().is_empty() {
+            return trimmed;
+        }
+
+        before_slash.trim_end()
     }
 
     /// Execute multiple SQL statements separated by semicolons

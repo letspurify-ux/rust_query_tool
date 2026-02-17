@@ -76,6 +76,24 @@ fn test_normalize_sql_for_execute_comment_prefixed_plsql_keeps_single_terminator
 }
 
 #[test]
+fn test_normalize_sql_for_execute_removes_sqlplus_slash_for_single_statement() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("SELECT 1 FROM dual\n/\n");
+    assert_eq!(normalized, "SELECT 1 FROM dual");
+}
+
+#[test]
+fn test_normalize_sql_for_execute_removes_sqlplus_slash_for_plsql_block() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("BEGIN NULL; END;\n/\n");
+    assert_eq!(normalized, "BEGIN NULL; END;");
+}
+
+#[test]
+fn test_normalize_sql_for_execute_keeps_division_operator() {
+    let normalized = QueryExecutor::normalize_sql_for_execute("SELECT 10/2 FROM dual");
+    assert_eq!(normalized, "SELECT 10/2 FROM dual");
+}
+
+#[test]
 fn test_simple_select() {
     let sql = "SELECT 1 FROM DUAL;";
     let items = QueryExecutor::split_script_items(sql);
