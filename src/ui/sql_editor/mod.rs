@@ -198,6 +198,7 @@ pub struct SqlEditorWidget {
     history_cursor: Rc<RefCell<Option<usize>>>,
     history_original: Rc<RefCell<Option<String>>>,
     history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
+    applying_history_navigation: Rc<RefCell<bool>>,
     undo_redo_state: Rc<RefCell<WordUndoRedoState>>,
 }
 
@@ -364,6 +365,7 @@ impl SqlEditorWidget {
         let history_cursor = Rc::new(RefCell::new(None::<usize>));
         let history_original = Rc::new(RefCell::new(None::<String>));
         let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
+        let applying_history_navigation = Rc::new(RefCell::new(false));
         let undo_redo_state = Rc::new(RefCell::new(WordUndoRedoState::new(String::new())));
 
         let mut widget = Self {
@@ -393,6 +395,7 @@ impl SqlEditorWidget {
             history_cursor,
             history_original,
             history_navigation_entries,
+            applying_history_navigation,
             undo_redo_state,
         };
 
@@ -408,13 +411,14 @@ impl SqlEditorWidget {
 
     fn setup_word_undo_redo(&self) {
         let undo_state = self.undo_redo_state.clone();
+        let applying_history_navigation = self.applying_history_navigation.clone();
         let mut buffer = self.buffer.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             let inserted = inserted_text(buf, pos, ins);
             let current_text = buf.text();
             let mut state = undo_state.borrow_mut();
 
-            if state.applying_history {
+            if state.applying_history || *applying_history_navigation.borrow() {
                 return;
             }
 
@@ -1310,6 +1314,7 @@ impl SqlEditorWidget {
         self.history_cursor.borrow_mut().take();
         self.history_original.borrow_mut().take();
         self.history_navigation_entries.borrow_mut().take();
+        *self.applying_history_navigation.borrow_mut() = false;
         Self::reset_word_undo_state(&self.undo_redo_state);
     }
 
@@ -1423,6 +1428,7 @@ impl SqlEditorWidget {
         *self.history_cursor.borrow_mut() = None;
         *self.history_original.borrow_mut() = None;
         self.history_navigation_entries.borrow_mut().take();
+        *self.applying_history_navigation.borrow_mut() = false;
     }
 
     pub fn undo(&self) {
@@ -1495,6 +1501,7 @@ impl SqlEditorWidget {
         let mut cursor = self.history_cursor.borrow_mut();
         let mut original = self.history_original.borrow_mut();
         let mut history_entries = self.history_navigation_entries.borrow_mut();
+        let mut applying_navigation = self.applying_history_navigation.borrow_mut();
 
         if cursor.is_none() {
             // Keep navigation aligned with persisted history while avoiding long UI stalls
@@ -1525,7 +1532,9 @@ impl SqlEditorWidget {
                     Some(index.saturating_add(1))
                 } else if index == 0 {
                     if let Some(saved) = original.take() {
+                        *applying_navigation = true;
                         self.buffer.set_text(&saved);
+                        *applying_navigation = false;
                         self.refresh_highlighting();
                         self.editor.set_insert_position(saved.len() as i32);
                         self.editor.show_insert_position();
@@ -1549,7 +1558,9 @@ impl SqlEditorWidget {
 
         *cursor = Some(next_index);
         let sql = &entries[next_index].sql;
+        *applying_navigation = true;
         self.buffer.set_text(sql);
+        *applying_navigation = false;
         self.refresh_highlighting();
         self.editor.set_insert_position(sql.len() as i32);
         self.editor.show_insert_position();
