@@ -5,7 +5,7 @@ use fltk::{
     prelude::*,
     text::{PositionType, TextBuffer, TextEditor},
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -98,6 +98,7 @@ impl SqlEditorWidget {
         let completion_range = self.completion_range.clone();
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
+        let intellisense_generation = Rc::new(Cell::new(0_u64));
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
@@ -171,6 +172,7 @@ impl SqlEditorWidget {
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
         let pending_intellisense_for_handle = pending_intellisense.clone();
+        let intellisense_generation_for_handle = intellisense_generation.clone();
         let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
 
         editor.handle(move |ed, ev| {
@@ -228,6 +230,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_generation_for_handle
+                                .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         }
                         let direction = if key == Key::Up { -1 } else { 1 };
                         widget_for_shortcuts.select_block_in_direction(direction);
@@ -239,6 +243,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_generation_for_handle
+                                .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         }
                         let direction = if key == Key::Up { 1 } else { -1 };
                         widget_for_shortcuts.navigate_history(direction);
@@ -252,6 +258,8 @@ impl SqlEditorWidget {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_generation_for_handle
+                                    .set(intellisense_generation_for_handle.get().wrapping_add(1));
                                 return true;
                             }
                             Key::Up => {
@@ -335,6 +343,8 @@ impl SqlEditorWidget {
                     }
 
                     if !ed.active() || (!ed.has_focus() && !popup_visible) {
+                        intellisense_generation_for_handle
+                            .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         return false;
                     }
                     // KeyDown fires BEFORE the character is inserted into the buffer.
@@ -510,6 +520,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_generation_for_handle
+                                .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         }
                         return false;
                     }
@@ -575,20 +587,44 @@ impl SqlEditorWidget {
                     if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate
                         if word.len() >= 2 {
-                            Self::trigger_intellisense(
-                                ed,
-                                &buffer_for_handle,
-                                &intellisense_data_for_handle,
-                                &intellisense_popup_for_handle,
-                                &completion_range_for_handle,
-                                &column_sender_for_handle,
-                                &connection_for_handle,
-                                &pending_intellisense_for_handle,
-                            );
+                            let generation = intellisense_generation_for_handle
+                                .get()
+                                .wrapping_add(1);
+                            intellisense_generation_for_handle.set(generation);
+                            let editor_for_debounce = ed.clone();
+                            let buffer_for_debounce = buffer_for_handle.clone();
+                            let intellisense_data_for_debounce =
+                                intellisense_data_for_handle.clone();
+                            let intellisense_popup_for_debounce =
+                                intellisense_popup_for_handle.clone();
+                            let completion_range_for_debounce = completion_range_for_handle.clone();
+                            let column_sender_for_debounce = column_sender_for_handle.clone();
+                            let connection_for_debounce = connection_for_handle.clone();
+                            let pending_intellisense_for_debounce =
+                                pending_intellisense_for_handle.clone();
+                            let intellisense_generation_for_debounce =
+                                intellisense_generation_for_handle.clone();
+                            app::add_timeout3(0.12, move |_| {
+                                if intellisense_generation_for_debounce.get() != generation {
+                                    return;
+                                }
+                                Self::trigger_intellisense(
+                                    &editor_for_debounce,
+                                    &buffer_for_debounce,
+                                    &intellisense_data_for_debounce,
+                                    &intellisense_popup_for_debounce,
+                                    &completion_range_for_debounce,
+                                    &column_sender_for_debounce,
+                                    &connection_for_debounce,
+                                    &pending_intellisense_for_debounce,
+                                );
+                            });
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_generation_for_handle
+                                .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         }
                     } else if let Some(ch) = typed_char {
                         if ch == '.' {
@@ -605,20 +641,45 @@ impl SqlEditorWidget {
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
                             if word.len() >= 2 {
-                                Self::trigger_intellisense(
-                                    ed,
-                                    &buffer_for_handle,
-                                    &intellisense_data_for_handle,
-                                    &intellisense_popup_for_handle,
-                                    &completion_range_for_handle,
-                                    &column_sender_for_handle,
-                                    &connection_for_handle,
-                                    &pending_intellisense_for_handle,
-                                );
+                                let generation = intellisense_generation_for_handle
+                                    .get()
+                                    .wrapping_add(1);
+                                intellisense_generation_for_handle.set(generation);
+                                let editor_for_debounce = ed.clone();
+                                let buffer_for_debounce = buffer_for_handle.clone();
+                                let intellisense_data_for_debounce =
+                                    intellisense_data_for_handle.clone();
+                                let intellisense_popup_for_debounce =
+                                    intellisense_popup_for_handle.clone();
+                                let completion_range_for_debounce =
+                                    completion_range_for_handle.clone();
+                                let column_sender_for_debounce = column_sender_for_handle.clone();
+                                let connection_for_debounce = connection_for_handle.clone();
+                                let pending_intellisense_for_debounce =
+                                    pending_intellisense_for_handle.clone();
+                                let intellisense_generation_for_debounce =
+                                    intellisense_generation_for_handle.clone();
+                                app::add_timeout3(0.12, move |_| {
+                                    if intellisense_generation_for_debounce.get() != generation {
+                                        return;
+                                    }
+                                    Self::trigger_intellisense(
+                                        &editor_for_debounce,
+                                        &buffer_for_debounce,
+                                        &intellisense_data_for_debounce,
+                                        &intellisense_popup_for_debounce,
+                                        &completion_range_for_debounce,
+                                        &column_sender_for_debounce,
+                                        &connection_for_debounce,
+                                        &pending_intellisense_for_debounce,
+                                    );
+                                });
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_generation_for_handle
+                                    .set(intellisense_generation_for_handle.get().wrapping_add(1));
                             }
                         } else {
                             // Non-identifier character (space, punctuation, etc.)
@@ -626,6 +687,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_generation_for_handle
+                                .set(intellisense_generation_for_handle.get().wrapping_add(1));
                         }
                     }
 
@@ -664,6 +727,11 @@ impl SqlEditorWidget {
                         return true;
                     }
 
+                    false
+                }
+                Event::Unfocus => {
+                    intellisense_generation_for_handle
+                        .set(intellisense_generation_for_handle.get().wrapping_add(1));
                     false
                 }
                 Event::Paste => {
