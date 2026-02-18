@@ -84,6 +84,57 @@ impl SqlEditorWidget {
         has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
     }
 
+    fn cancel_keyup_debounce_timer(debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>) {
+        if let Some(handle) = debounce_handle.borrow_mut().take() {
+            app::remove_timeout3(handle);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_keyup_intellisense_debounce(
+        token: u64,
+        generation: Rc<Cell<u64>>,
+        debounce_handle: Rc<RefCell<Option<app::TimeoutHandle>>>,
+        editor: TextEditor,
+        buffer: TextBuffer,
+        intellisense_data: Rc<RefCell<IntellisenseData>>,
+        intellisense_popup: Rc<RefCell<IntellisensePopup>>,
+        completion_range: Rc<RefCell<Option<(usize, usize)>>>,
+        column_sender: mpsc::Sender<ColumnLoadUpdate>,
+        connection: SharedConnection,
+        pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
+    ) {
+        Self::cancel_keyup_debounce_timer(&debounce_handle);
+        let debounce_handle_for_callback = debounce_handle.clone();
+        let handle = app::add_timeout3(
+            KEYUP_INTELLISENSE_DEBOUNCE_MS as f64 / 1000.0,
+            move |fired_handle| {
+                if generation.get() != token {
+                    return;
+                }
+                let mut pending_handle = debounce_handle_for_callback.borrow_mut();
+                if pending_handle
+                    .as_ref()
+                    .is_some_and(|scheduled| *scheduled == fired_handle)
+                {
+                    *pending_handle = None;
+                }
+                drop(pending_handle);
+                Self::trigger_intellisense(
+                    &editor,
+                    &buffer,
+                    &intellisense_data,
+                    &intellisense_popup,
+                    &completion_range,
+                    &column_sender,
+                    &connection,
+                    &pending_intellisense,
+                );
+            },
+        );
+        *debounce_handle.borrow_mut() = Some(handle);
+    }
+
     pub fn setup_intellisense(&mut self) {
         let buffer = self.buffer.clone();
         let mut editor = self.editor.clone();
@@ -100,35 +151,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let (debounce_sender, debounce_receiver) = app::channel::<u64>();
-
-        let debounce_editor = self.editor.clone();
-        let debounce_buffer = self.buffer.clone();
-        let debounce_intellisense_data = self.intellisense_data.clone();
-        let debounce_intellisense_popup = self.intellisense_popup.clone();
-        let debounce_completion_range = self.completion_range.clone();
-        let debounce_column_sender = self.column_sender.clone();
-        let debounce_connection = self.connection.clone();
-        let debounce_pending_intellisense = self.pending_intellisense.clone();
-        let debounce_generation_for_check = keyup_debounce_generation.clone();
-
-        app::add_check(move |_| {
-            while let Some(token) = debounce_receiver.recv() {
-                if debounce_generation_for_check.get() != token {
-                    continue;
-                }
-                Self::trigger_intellisense(
-                    &debounce_editor,
-                    &debounce_buffer,
-                    &debounce_intellisense_data,
-                    &debounce_intellisense_popup,
-                    &debounce_completion_range,
-                    &debounce_column_sender,
-                    &debounce_connection,
-                    &debounce_pending_intellisense,
-                );
-            }
-        });
+        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
@@ -203,7 +226,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
         let pending_intellisense_for_handle = pending_intellisense.clone();
         let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
-        let debounce_sender_for_handle = debounce_sender.clone();
+        let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
         let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
 
         editor.handle(move |ed, ev| {
@@ -261,6 +284,7 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             keyup_debounce_generation_for_handle
                                 .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
@@ -274,6 +298,7 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             keyup_debounce_generation_for_handle
                                 .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
@@ -366,8 +391,9 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                keyup_debounce_generation_for_handle
-                                    .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                                keyup_debounce_generation_for_handle.set(
+                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                );
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
                             _ => {
@@ -552,6 +578,7 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             keyup_debounce_generation_for_handle
                                 .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
@@ -591,6 +618,7 @@ impl SqlEditorWidget {
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
                         }
+                        Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                         keyup_debounce_generation_for_handle
                             .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         return false;
@@ -623,22 +651,30 @@ impl SqlEditorWidget {
                         if word.len() >= 2 {
                             let token = keyup_debounce_generation_for_handle.get().wrapping_add(1);
                             keyup_debounce_generation_for_handle.set(token);
-                            let sender = debounce_sender_for_handle.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(
-                                    KEYUP_INTELLISENSE_DEBOUNCE_MS,
-                                ));
-                                sender.send(token);
-                            });
+                            Self::schedule_keyup_intellisense_debounce(
+                                token,
+                                keyup_debounce_generation_for_handle.clone(),
+                                keyup_debounce_handle_for_handle.clone(),
+                                ed.clone(),
+                                buffer_for_handle.clone(),
+                                intellisense_data_for_handle.clone(),
+                                intellisense_popup_for_handle.clone(),
+                                completion_range_for_handle.clone(),
+                                column_sender_for_handle.clone(),
+                                connection_for_handle.clone(),
+                                pending_intellisense_for_handle.clone(),
+                            );
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             keyup_debounce_generation_for_handle
                                 .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                     } else if let Some(ch) = typed_char {
                         if ch == '.' {
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             Self::trigger_intellisense(
                                 ed,
                                 &buffer_for_handle,
@@ -655,17 +691,26 @@ impl SqlEditorWidget {
                                 let token =
                                     keyup_debounce_generation_for_handle.get().wrapping_add(1);
                                 keyup_debounce_generation_for_handle.set(token);
-                                let sender = debounce_sender_for_handle.clone();
-                                thread::spawn(move || {
-                                    thread::sleep(Duration::from_millis(
-                                        KEYUP_INTELLISENSE_DEBOUNCE_MS,
-                                    ));
-                                    sender.send(token);
-                                });
+                                Self::schedule_keyup_intellisense_debounce(
+                                    token,
+                                    keyup_debounce_generation_for_handle.clone(),
+                                    keyup_debounce_handle_for_handle.clone(),
+                                    ed.clone(),
+                                    buffer_for_handle.clone(),
+                                    intellisense_data_for_handle.clone(),
+                                    intellisense_popup_for_handle.clone(),
+                                    completion_range_for_handle.clone(),
+                                    column_sender_for_handle.clone(),
+                                    connection_for_handle.clone(),
+                                    pending_intellisense_for_handle.clone(),
+                                );
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                Self::cancel_keyup_debounce_timer(
+                                    &keyup_debounce_handle_for_handle,
+                                );
                                 keyup_debounce_generation_for_handle.set(
                                     keyup_debounce_generation_for_handle.get().wrapping_add(1),
                                 );
@@ -676,6 +721,7 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                             keyup_debounce_generation_for_handle
                                 .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
@@ -691,6 +737,7 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Unfocus => {
+                    Self::cancel_keyup_debounce_timer(&keyup_debounce_handle_for_handle);
                     keyup_debounce_generation_for_handle
                         .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                     false
@@ -1134,9 +1181,9 @@ impl SqlEditorWidget {
                 return true;
             }
             let key = table.to_uppercase();
-            virtual_wildcard_dependencies.get(&key).is_some_and(|deps| {
-                deps.iter().any(|dep| table_is_loading(data, dep))
-            })
+            virtual_wildcard_dependencies
+                .get(&key)
+                .is_some_and(|deps| deps.iter().any(|dep| table_is_loading(data, dep)))
         })
     }
 
@@ -2407,9 +2454,12 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
 ";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
 
-        assert_eq!(normalized, "WITH cte AS (SELECT 1 FROM dual)
+        assert_eq!(
+            normalized,
+            "WITH cte AS (SELECT 1 FROM dual)
 SELECT * FROM cte
-");
+"
+        );
     }
 
     #[test]
