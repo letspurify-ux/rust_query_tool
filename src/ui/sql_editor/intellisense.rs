@@ -221,7 +221,7 @@ impl SqlEditorWidget {
     fn schedule_keyup_intellisense_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
         keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
-        cursor_pos: i32,
+        scheduled_cursor_raw: i32,
         buffer_len: i32,
         editor: &TextEditor,
         buffer: &TextBuffer,
@@ -264,11 +264,12 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                if Self::normalize_cursor_position(
-                    &buffer_for_timeout,
+                // Hot-path check: for debounce invalidation we only care whether the
+                // cursor offset changed, not UTF-8 boundary normalization.
+                if !Self::is_same_raw_cursor_offset(
                     editor_for_timeout.insert_position(),
-                ) != cursor_pos
-                {
+                    scheduled_cursor_raw,
+                ) {
                     return;
                 }
 
@@ -290,6 +291,10 @@ impl SqlEditorWidget {
             },
         );
         *keyup_debounce_handle.borrow_mut() = Some(handle);
+    }
+
+    fn is_same_raw_cursor_offset(current_raw: i32, scheduled_raw: i32) -> bool {
+        current_raw == scheduled_raw
     }
 
     pub fn setup_intellisense(&mut self) {
@@ -321,8 +326,10 @@ impl SqlEditorWidget {
         {
             let mut popup = intellisense_popup.borrow_mut();
             popup.set_selected_callback(move |selected| {
-                let cursor_pos =
-                    Self::normalize_cursor_position(&buffer_for_insert, editor_for_insert.insert_position());
+                let cursor_pos = Self::normalize_cursor_position(
+                    &buffer_for_insert,
+                    editor_for_insert.insert_position(),
+                );
                 let cursor_pos_usize = cursor_pos as usize;
                 let context_text = Self::normalize_intellisense_context_text(
                     &Self::context_before_cursor(&buffer_for_insert, cursor_pos),
@@ -509,8 +516,10 @@ impl SqlEditorWidget {
                                     intellisense_popup_for_handle.borrow().get_selected();
                                 let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
-                                    let cursor_pos =
-                                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position());
+                                    let cursor_pos = Self::normalize_cursor_position(
+                                        &buffer_for_handle,
+                                        ed.insert_position(),
+                                    );
                                     let cursor_pos_usize = cursor_pos as usize;
                                     let range = *completion_range_for_handle.borrow();
                                     let (start, end) = if let Some((range_start, range_end)) = range
@@ -543,9 +552,10 @@ impl SqlEditorWidget {
                                     *pending_intellisense_for_handle.borrow_mut() = None;
 
                                     // Update syntax highlighting after insertion
-                                    let cursor_pos =
-                                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position())
-                                            as usize;
+                                    let cursor_pos = Self::normalize_cursor_position(
+                                        &buffer_for_handle,
+                                        ed.insert_position(),
+                                    ) as usize;
                                     highlighter_for_handle.borrow().highlight_buffer_window(
                                         &buffer_for_handle,
                                         &mut style_buffer_for_handle,
@@ -708,8 +718,8 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
-                    let cursor_pos =
-                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position());
+                    // Keep KeyUp lightweight by using raw offsets (no full-buffer clones).
+                    let cursor_pos = ed.insert_position();
                     let char_before_cursor =
                         Self::char_before_cursor(&buffer_for_handle, cursor_pos);
                     let typed_char = Self::typed_char_from_key_event(
@@ -1638,7 +1648,8 @@ impl SqlEditorWidget {
         let start = buffer.line_start(start).max(0);
         let end = buffer.line_end(end).max(start);
         let text = buffer.text_range(start, end).unwrap_or_default();
-        let rel_cursor = (cursor_pos - start).max(0) as usize;
+        let rel_cursor =
+            Self::clamp_to_char_boundary_local(&text, (cursor_pos - start).max(0) as usize);
         let (word, rel_start, rel_end) = get_word_at_cursor(&text, rel_cursor);
         let abs_start = start as usize + rel_start;
         let abs_end = start as usize + rel_end;
@@ -2059,11 +2070,21 @@ impl SqlEditorWidget {
     }
 
     fn normalize_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
-        if pos <= 0 {
-            return 0;
+        let buffer_len = buffer.length().max(0);
+        let pos = pos.clamp(0, buffer_len);
+        if pos == 0 || pos == buffer_len {
+            return pos;
         }
-        let text = buffer.text();
-        Self::clamp_to_char_boundary_local(&text, pos as usize) as i32
+
+        // Avoid cloning the full buffer: clamp against the current line slice only.
+        let line_start = buffer.line_start(pos).clamp(0, buffer_len);
+        let line_end = buffer.line_end(pos).clamp(line_start, buffer_len);
+        let Some(line_text) = buffer.text_range(line_start, line_end) else {
+            return pos;
+        };
+        let rel_pos = (pos - line_start).max(0) as usize;
+        let clamped_rel = Self::clamp_to_char_boundary_local(&line_text, rel_pos);
+        (line_start as usize + clamped_rel) as i32
     }
 
     fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
@@ -2153,7 +2174,8 @@ impl SqlEditorWidget {
                 (segment, "")
             };
 
-            let stripped_line = if let Some(stripped) = Self::strip_sqlplus_sql_prompt_prefix(line) {
+            let stripped_line = if let Some(stripped) = Self::strip_sqlplus_sql_prompt_prefix(line)
+            {
                 saw_sql_prompt = true;
                 stripped
             } else if saw_sql_prompt {
@@ -2538,7 +2560,8 @@ impl SqlEditorWidget {
     }
 
     pub fn quick_describe_at_cursor(&self) {
-        let cursor_pos = Self::normalize_cursor_position(&self.buffer, self.editor.insert_position());
+        let cursor_pos =
+            Self::normalize_cursor_position(&self.buffer, self.editor.insert_position());
         let Some((word, start, _)) = Self::identifier_at_position(&self.buffer, cursor_pos) else {
             return;
         };
@@ -3019,6 +3042,36 @@ FROM d
         let ch =
             SqlEditorWidget::typed_char_from_key_event("", Key::from_char('-'), false, Some('-'));
         assert_eq!(ch, Some('-'));
+    }
+
+    #[test]
+    fn debounce_cursor_comparison_uses_raw_offsets() {
+        assert!(SqlEditorWidget::is_same_raw_cursor_offset(10, 10));
+        assert!(!SqlEditorWidget::is_same_raw_cursor_offset(10, 11));
+    }
+
+    #[test]
+    fn normalize_cursor_position_handles_utf8_without_full_buffer_copy() {
+        let mut buffer = TextBuffer::default();
+        let sql = "SELECT 😀한글🙂 FROM dual";
+        buffer.set_text(sql);
+
+        let assert_safe_boundary = |raw_pos_inside_multibyte: i32| {
+            let normalized =
+                SqlEditorWidget::normalize_cursor_position(&buffer, raw_pos_inside_multibyte);
+            let normalized = normalized.max(0) as usize;
+            assert!(normalized <= sql.len());
+            assert!(sql.is_char_boundary(normalized));
+        };
+
+        // Mid-byte offset inside 😀 (4-byte scalar) should clamp to a safe boundary.
+        let raw_pos_inside_emoji = "SELECT ".len() as i32 + 1;
+        assert_safe_boundary(raw_pos_inside_emoji);
+
+        // Mid-byte offset inside 한 (3-byte scalar) should also clamp safely.
+        let before_korean = "SELECT 😀".len() as i32;
+        let raw_pos_inside_korean = before_korean + 1;
+        assert_safe_boundary(raw_pos_inside_korean);
     }
 
     #[test]
