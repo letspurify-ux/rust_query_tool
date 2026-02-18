@@ -1318,6 +1318,7 @@ pub struct IntellisensePopup {
     window: Window,
     browser: HoldBrowser,
     suggestions: Rc<RefCell<Vec<String>>>,
+    all_suggestions: Rc<RefCell<Vec<String>>>,
     selected_callback: Rc<RefCell<Option<Box<dyn FnMut(String)>>>>,
     visible: Rc<RefCell<bool>>,
 }
@@ -1369,6 +1370,7 @@ impl IntellisensePopup {
         }
 
         let suggestions = Rc::new(RefCell::new(Vec::new()));
+        let all_suggestions = Rc::new(RefCell::new(Vec::new()));
         let selected_callback: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
             Rc::new(RefCell::new(None));
         let visible = Rc::new(RefCell::new(false));
@@ -1379,6 +1381,7 @@ impl IntellisensePopup {
             window,
             browser,
             suggestions,
+            all_suggestions,
             selected_callback,
             visible,
         };
@@ -1433,7 +1436,27 @@ impl IntellisensePopup {
             return;
         }
 
+        *self.all_suggestions.borrow_mut() = suggestions.clone();
+        self.set_suggestions(suggestions, None);
+
+        self.window.set_pos(x, y);
+        if !self.window.shown() {
+            self.window.show();
+        }
+        *self.visible.borrow_mut() = true;
+    }
+
+    fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
         let suggestion_count = suggestions.len();
+        if suggestion_count == 0 {
+            self.hide();
+            return;
+        }
+
+        // Preserve selection when possible.
+        let selected_idx = selected_text
+            .and_then(|selected| suggestions.iter().position(|item| item == selected))
+            .unwrap_or(0);
         let browser_lines: Vec<String> = suggestions
             .iter()
             .map(|suggestion| format!("@C255 {}", suggestion))
@@ -1444,21 +1467,35 @@ impl IntellisensePopup {
             self.browser.add(line);
         }
 
-        // Select first item
         if suggestion_count > 0 {
-            self.browser.select(1);
+            self.browser.select((selected_idx + 1) as i32);
         }
 
         // Calculate popup size
         let height = (suggestion_count.min(10) * 20 + 10) as i32;
         self.window.set_size(320, height);
         self.browser.set_size(320, height);
+    }
 
-        self.window.set_pos(x, y);
-        if !self.window.shown() {
-            self.window.show();
+    pub fn filter_visible_suggestions_by_prefix(&mut self, prefix: &str) {
+        if !self.is_visible() {
+            return;
         }
-        *self.visible.borrow_mut() = true;
+
+        let selected = self.get_selected();
+        let filtered = {
+            let all = self.all_suggestions.borrow();
+            filter_suggestions_by_prefix(all.as_slice(), prefix)
+        };
+
+        if filtered.is_empty() {
+            self.hide();
+            self.browser.clear();
+            self.suggestions.borrow_mut().clear();
+            return;
+        }
+
+        self.set_suggestions(filtered, selected.as_deref());
     }
 
     pub fn hide(&mut self) {
@@ -1471,6 +1508,7 @@ impl IntellisensePopup {
         self.hide();
         self.browser.clear();
         self.suggestions.borrow_mut().clear();
+        self.all_suggestions.borrow_mut().clear();
         *self.selected_callback.borrow_mut() = None;
     }
 
@@ -1519,6 +1557,25 @@ impl IntellisensePopup {
             None
         }
     }
+}
+
+pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec<String> {
+    if prefix.is_empty() {
+        return suggestions.to_vec();
+    }
+
+    suggestions
+        .iter()
+        .filter(|candidate| starts_with_ignore_ascii_case(candidate, prefix))
+        .cloned()
+        .collect()
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    let value_bytes = value.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    value_bytes.len() >= prefix_bytes.len()
+        && value_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
 }
 
 impl Default for IntellisensePopup {
@@ -1731,6 +1788,31 @@ mod intellisense_tests {
         let suggestions = data.get_suggestions("sum()", false, None, false, false);
 
         assert!(!suggestions.iter().any(|s| s.eq_ignore_ascii_case("sum()")));
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_empty_prefix_keeps_all() {
+        let suggestions = vec!["SELECT".to_string(), "FROM".to_string()];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "");
+        assert_eq!(filtered, suggestions);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_case_insensitive_and_underscore() {
+        let suggestions = vec![
+            "TO_CHAR".to_string(),
+            "to_date".to_string(),
+            "TABLE".to_string(),
+        ];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "to_");
+        assert_eq!(filtered, vec!["TO_CHAR".to_string(), "to_date".to_string()]);
+    }
+
+    #[test]
+    fn filter_suggestions_by_prefix_no_match_returns_empty() {
+        let suggestions = vec!["SELECT".to_string(), "FROM".to_string()];
+        let filtered = filter_suggestions_by_prefix(&suggestions, "zz");
+        assert!(filtered.is_empty());
     }
 
     #[test]
