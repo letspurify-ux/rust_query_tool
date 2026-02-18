@@ -197,6 +197,8 @@ impl SqlEditorWidget {
     pub fn format_selected_sql(&self) {
         let mut buffer = self.buffer.clone();
         let full_text = buffer.text();
+        let editor_uses_char_offsets =
+            Self::editor_reports_char_offsets(&full_text, buffer.length());
         let selection = buffer.selection_position();
         let (start, end, source, select_formatted) = match selection {
             Some((start, end)) if start != end => {
@@ -206,15 +208,16 @@ impl SqlEditorWidget {
                     (end, start)
                 };
                 (
-                    Self::normalize_index(&full_text, start),
-                    Self::normalize_index(&full_text, end),
+                    Self::normalize_index(&full_text, start, editor_uses_char_offsets),
+                    Self::normalize_index(&full_text, end, editor_uses_char_offsets),
                     buffer.selection_text(),
                     true,
                 )
             }
             _ => {
                 let text = buffer.text();
-                let end = Self::normalize_index(&full_text, buffer.length());
+                let end =
+                    Self::normalize_index(&full_text, buffer.length(), editor_uses_char_offsets);
                 (0, end, text, false)
             }
         };
@@ -228,7 +231,11 @@ impl SqlEditorWidget {
         }
 
         let mut editor = self.editor.clone();
-        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
+        let original_pos = Self::normalize_index(
+            &full_text,
+            editor.insert_position(),
+            editor_uses_char_offsets,
+        );
         buffer.replace(start as i32, end as i32, &formatted);
 
         if select_formatted {
@@ -250,12 +257,46 @@ impl SqlEditorWidget {
         self.refresh_highlighting();
     }
 
-    fn normalize_index(text: &str, index: i32) -> usize {
+    fn normalize_index(text: &str, index: i32, prefer_char_offsets: bool) -> usize {
         if index <= 0 {
             0
+        } else if prefer_char_offsets {
+            Self::char_index_to_byte_offset(text, index as usize)
         } else {
             Self::clamp_to_char_boundary(text, index as usize)
         }
+    }
+
+    fn editor_reports_char_offsets(text: &str, reported_length: i32) -> bool {
+        if reported_length < 0 {
+            return false;
+        }
+        let reported_length = reported_length as usize;
+        let byte_len = text.len();
+        let char_len = text.chars().count();
+
+        if reported_length == byte_len {
+            return false;
+        }
+        if reported_length == char_len {
+            return byte_len != char_len;
+        }
+
+        // If the reported value cannot be a UTF-8 boundary in byte space but still
+        // falls inside the character-count range, treat it as a character index.
+        reported_length <= char_len && reported_length <= byte_len && !text.is_char_boundary(reported_length)
+    }
+
+    fn char_index_to_byte_offset(text: &str, char_index: usize) -> usize {
+        let char_count = text.chars().count();
+        let char_index = char_index.min(char_count);
+        if char_index == char_count {
+            return text.len();
+        }
+        text.char_indices()
+            .nth(char_index)
+            .map(|(byte_pos, _)| byte_pos)
+            .unwrap_or(text.len())
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
@@ -5006,7 +5047,19 @@ impl SqlEditorWidget {
                                                     Arc::clone(conn),
                                                     previous_timeout,
                                                 );
-                                                let _ = conn.set_call_timeout(query_timeout);
+                                                if let Err(err) = conn.set_call_timeout(query_timeout)
+                                                {
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        &format!(
+                                                            "Error: Failed to apply query timeout after CONNECT: {}",
+                                                            err
+                                                        ),
+                                                    );
+                                                    command_error = true;
+                                                }
                                                 if let Err(err) =
                                                     SqlEditorWidget::sync_serveroutput_with_session(
                                                         conn.as_ref(),
@@ -5516,13 +5569,12 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                        let message = if cancelled {
-                                            SqlEditorWidget::cancel_message()
-                                        } else if timed_out {
-                                            SqlEditorWidget::timeout_message(query_timeout)
-                                        } else {
-                                            err.to_string()
-                                        };
+                                        let message = SqlEditorWidget::choose_execution_error_message(
+                                            cancelled,
+                                            timed_out,
+                                            query_timeout,
+                                            err.to_string(),
+                                        );
                                         if script_mode {
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
@@ -5825,13 +5877,12 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
-                                            let message = if cancelled {
-                                                SqlEditorWidget::cancel_message()
-                                            } else if cursor_timed_out {
-                                                SqlEditorWidget::timeout_message(query_timeout)
-                                            } else {
-                                                err.to_string()
-                                            };
+                                            let message = SqlEditorWidget::choose_execution_error_message(
+                                                cancelled,
+                                                cursor_timed_out,
+                                                query_timeout,
+                                                err.to_string(),
+                                            );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 &[message.clone()],
@@ -5986,13 +6037,12 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
-                                            let message = if cancelled {
-                                                SqlEditorWidget::cancel_message()
-                                            } else if cursor_timed_out {
-                                                SqlEditorWidget::timeout_message(query_timeout)
-                                            } else {
-                                                err.to_string()
-                                            };
+                                            let message = SqlEditorWidget::choose_execution_error_message(
+                                                cancelled,
+                                                cursor_timed_out,
+                                                query_timeout,
+                                                err.to_string(),
+                                            );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 &[message.clone()],
@@ -6335,13 +6385,12 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                            let message = if cancelled {
-                                                SqlEditorWidget::cancel_message()
-                                            } else if timed_out {
-                                                SqlEditorWidget::timeout_message(query_timeout)
-                                            } else {
-                                                err.to_string()
-                                            };
+                                            let message = SqlEditorWidget::choose_execution_error_message(
+                                                cancelled,
+                                                timed_out,
+                                                query_timeout,
+                                                err.to_string(),
+                                            );
                                             let mut error_result =
                                                 QueryResult::new_error(&sql_text, &message);
                                             // Preserve is_select flag so existing streamed data is kept
@@ -6497,13 +6546,12 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                        let message = if cancelled {
-                                            SqlEditorWidget::cancel_message()
-                                        } else if timed_out {
-                                            SqlEditorWidget::timeout_message(query_timeout)
-                                        } else {
-                                            err.to_string()
-                                        };
+                                        let message = SqlEditorWidget::choose_execution_error_message(
+                                            cancelled,
+                                            timed_out,
+                                            query_timeout,
+                                            err.to_string(),
+                                        );
                                         if script_mode {
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
@@ -7975,6 +8023,21 @@ impl SqlEditorWidget {
         "Query cancelled".to_string()
     }
 
+    fn choose_execution_error_message(
+        cancelled: bool,
+        timed_out: bool,
+        timeout: Option<Duration>,
+        fallback: String,
+    ) -> String {
+        if timed_out {
+            Self::timeout_message(timeout)
+        } else if cancelled {
+            Self::cancel_message()
+        } else {
+            fallback
+        }
+    }
+
     fn parse_timeout(value: &str) -> Option<Duration> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -8006,6 +8069,7 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod formatter_regression_tests {
     use super::{ScriptItem, SqlEditorWidget};
+    use std::time::Duration;
 
     #[test]
     fn resets_paren_tracking_after_malformed_statement_before_next_statement() {
@@ -8318,6 +8382,66 @@ END oqt_mega_pkg;"#;
             "Mapped cursor should stay near token after unicode-aware mapping, got: {}",
             mapped_slice
         );
+    }
+
+    #[test]
+    fn normalize_index_handles_ambiguous_utf8_boundary_when_char_offsets_are_reported() {
+        let source = "SELECT éa, b FROM dual";
+        let char_length = source.chars().count() as i32;
+        assert!(SqlEditorWidget::editor_reports_char_offsets(source, char_length));
+
+        let char_offset = source.chars().take_while(|ch| *ch != 'b').count() as i32;
+        let expected_byte_offset = source
+            .find('b')
+            .expect("expected cursor anchor should exist");
+
+        let normalized = SqlEditorWidget::normalize_index(source, char_offset, true);
+        assert_eq!(
+            normalized, expected_byte_offset,
+            "Character offsets that happen to be UTF-8 byte boundaries should map to the same token byte offset"
+        );
+    }
+
+    #[test]
+    fn editor_reports_char_offsets_is_false_when_length_is_byte_count() {
+        let source = "SELECT éa, b FROM dual";
+        assert!(!SqlEditorWidget::editor_reports_char_offsets(
+            source,
+            source.len() as i32
+        ));
+    }
+
+    #[test]
+    fn choose_execution_error_message_prioritizes_timeout_over_cancel() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            true,
+            true,
+            Some(Duration::from_secs(9)),
+            "ORA-01013".to_string(),
+        );
+        assert_eq!(message, "Query timed out after 9 seconds");
+    }
+
+    #[test]
+    fn choose_execution_error_message_uses_cancel_when_not_timed_out() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            true,
+            false,
+            Some(Duration::from_secs(9)),
+            "ORA-01013".to_string(),
+        );
+        assert_eq!(message, "Query cancelled");
+    }
+
+    #[test]
+    fn choose_execution_error_message_falls_back_to_original_error() {
+        let message = SqlEditorWidget::choose_execution_error_message(
+            false,
+            false,
+            Some(Duration::from_secs(9)),
+            "ORA-00001: unique constraint".to_string(),
+        );
+        assert_eq!(message, "ORA-00001: unique constraint");
     }
 
     #[test]

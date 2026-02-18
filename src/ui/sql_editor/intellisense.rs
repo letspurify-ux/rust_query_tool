@@ -2144,6 +2144,7 @@ impl SqlEditorWidget {
 
     fn strip_sqlplus_prompt_prefixes(text: &str) -> String {
         let mut normalized = String::with_capacity(text.len());
+        let mut saw_sql_prompt = false;
 
         for segment in text.split_inclusive('\n') {
             let (line, line_end) = if let Some(stripped) = segment.strip_suffix('\n') {
@@ -2152,7 +2153,14 @@ impl SqlEditorWidget {
                 (segment, "")
             };
 
-            let stripped_line = Self::strip_sqlplus_prompt_prefix(line).unwrap_or(line);
+            let stripped_line = if let Some(stripped) = Self::strip_sqlplus_sql_prompt_prefix(line) {
+                saw_sql_prompt = true;
+                stripped
+            } else if saw_sql_prompt {
+                Self::strip_sqlplus_numbered_prompt_prefix(line).unwrap_or(line)
+            } else {
+                line
+            };
             normalized.push_str(stripped_line);
             normalized.push_str(line_end);
         }
@@ -2160,7 +2168,7 @@ impl SqlEditorWidget {
         normalized
     }
 
-    fn strip_sqlplus_prompt_prefix(line: &str) -> Option<&str> {
+    fn strip_sqlplus_sql_prompt_prefix(line: &str) -> Option<&str> {
         let bytes = line.as_bytes();
         let mut idx = 0usize;
 
@@ -2179,6 +2187,17 @@ impl SqlEditorWidget {
                 idx += 1;
             }
             return Some(&line[idx..]);
+        }
+
+        None
+    }
+
+    fn strip_sqlplus_numbered_prompt_prefix(line: &str) -> Option<&str> {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
         }
 
         let number_start = idx;
@@ -2826,6 +2845,14 @@ SELECT * FROM cte
     #[test]
     fn normalize_intellisense_context_text_keeps_unindented_numeric_lines_with_wide_spacing() {
         let input = "SELECT\n1  + 2 AS total\nFROM dual";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, input);
+    }
+
+    #[test]
+    fn normalize_intellisense_context_text_keeps_indented_numeric_lines_without_sql_prompt() {
+        let input = "SELECT\n  1  + 2 AS total\nFROM dual";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
 
         assert_eq!(normalized, input);

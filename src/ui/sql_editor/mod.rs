@@ -54,17 +54,31 @@ const MAX_WORD_UNDO_HISTORY: usize = 500;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditGranularity {
     Word,
     Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditOperation {
+    Insert,
+    Delete,
+    Replace,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EditGroup {
+    granularity: EditGranularity,
+    operation: EditOperation,
 }
 
 #[derive(Clone)]
 struct WordUndoRedoState {
     history: Vec<String>,
     index: usize,
-    active_group: Option<EditGranularity>,
+    active_group: Option<EditGroup>,
     applying_history: bool,
 }
 
@@ -97,6 +111,37 @@ impl WordUndoRedoState {
             .get(self.index)
             .map(|text| text == current_text)
             .unwrap_or(false)
+    }
+
+    fn record_snapshot(&mut self, current_text: String, edit_group: EditGroup) {
+        self.normalize(&current_text);
+        if self.current_snapshot_matches(&current_text) {
+            return;
+        }
+
+        let current_index = self.index;
+        if current_index + 1 < self.history.len() {
+            self.history.truncate(current_index + 1);
+        }
+
+        if self.active_group == Some(edit_group) {
+            if let Some(snapshot) = self.history.get_mut(current_index) {
+                *snapshot = current_text;
+            } else {
+                self.history.push(current_text);
+                self.index = self.history.len().saturating_sub(1);
+                self.active_group = Some(edit_group);
+            }
+        } else {
+            self.history.push(current_text);
+            if self.history.len() > MAX_WORD_UNDO_HISTORY {
+                self.history.remove(0);
+                self.index = self.history.len().saturating_sub(1);
+            } else {
+                self.index = self.history.len().saturating_sub(1);
+            }
+            self.active_group = Some(edit_group);
+        }
     }
 }
 
@@ -434,31 +479,8 @@ impl SqlEditorWidget {
                 return;
             }
 
-            let granularity = classify_edit_granularity(ins, del, &inserted, deleted_text);
-
-            let current_index = state.index;
-            if current_index + 1 < state.history.len() {
-                state.history.truncate(current_index + 1);
-            }
-
-            if state.active_group == Some(granularity) {
-                if let Some(snapshot) = state.history.get_mut(current_index) {
-                    *snapshot = current_text;
-                } else {
-                    state.history.push(current_text);
-                    state.index = state.history.len().saturating_sub(1);
-                    state.active_group = Some(granularity);
-                }
-            } else {
-                state.history.push(current_text);
-                if state.history.len() > MAX_WORD_UNDO_HISTORY {
-                    state.history.remove(0);
-                    state.index = state.history.len().saturating_sub(1);
-                } else {
-                    state.index = state.history.len().saturating_sub(1);
-                }
-                state.active_group = Some(granularity);
-            }
+            let edit_group = classify_edit_group(ins, del, &inserted, deleted_text);
+            state.record_snapshot(current_text, edit_group);
         });
     }
 
@@ -1687,6 +1709,19 @@ fn classify_edit_granularity(ins: i32, del: i32, inserted: &str, deleted: &str) 
     EditGranularity::Other
 }
 
+fn classify_edit_group(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGroup {
+    let operation = match (ins > 0, del > 0) {
+        (true, false) => EditOperation::Insert,
+        (false, true) => EditOperation::Delete,
+        (true, true) => EditOperation::Replace,
+        _ => EditOperation::Other,
+    };
+    EditGroup {
+        granularity: classify_edit_granularity(ins, del, inserted, deleted),
+        operation,
+    }
+}
+
 fn is_word_edit_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
@@ -1795,7 +1830,9 @@ fn is_string_or_comment_style(style: char) -> bool {
 
 #[cfg(test)]
 mod execution_state_tests {
-    use super::{SqlEditorWidget, WordUndoRedoState};
+    use super::{
+        classify_edit_group, EditGranularity, EditOperation, SqlEditorWidget, WordUndoRedoState,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1838,6 +1875,32 @@ mod execution_state_tests {
 
         assert!(!*query_running.borrow());
         assert!(!cancel_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn classify_edit_group_distinguishes_insert_and_delete_for_word_edits() {
+        let insert_group = classify_edit_group(1, 0, "a", "");
+        let delete_group = classify_edit_group(0, 1, "", "a");
+
+        assert_eq!(insert_group.granularity, EditGranularity::Word);
+        assert_eq!(delete_group.granularity, EditGranularity::Word);
+        assert_eq!(insert_group.operation, EditOperation::Insert);
+        assert_eq!(delete_group.operation, EditOperation::Delete);
+        assert_ne!(insert_group, delete_group);
+    }
+
+    #[test]
+    fn undo_history_keeps_pre_delete_snapshot_after_word_typing() {
+        let mut state = WordUndoRedoState::new(String::new());
+
+        state.record_snapshot("abc".to_string(), classify_edit_group(1, 0, "abc", ""));
+        state.record_snapshot("ab".to_string(), classify_edit_group(0, 1, "", "c"));
+
+        assert_eq!(
+            state.history,
+            vec!["".to_string(), "abc".to_string(), "ab".to_string()]
+        );
+        assert_eq!(state.index, 2);
     }
 }
 
