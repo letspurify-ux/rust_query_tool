@@ -121,7 +121,10 @@ impl AppConfig {
                 match fs::create_dir_all(parent) {
                     Ok(()) => {}
                     Err(err) => {
-                        crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
+                        crate::utils::logging::log_error(
+                            "config",
+                            &format!("Config persistence error: {err}"),
+                        );
                         eprintln!("Config persistence error: {err}");
                         return Err(Box::new(err));
                     }
@@ -130,7 +133,10 @@ impl AppConfig {
             let content = match serde_json::to_string_pretty(self) {
                 Ok(content) => content,
                 Err(err) => {
-                    crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
+                    crate::utils::logging::log_error(
+                        "config",
+                        &format!("Config persistence error: {err}"),
+                    );
                     eprintln!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
@@ -138,7 +144,10 @@ impl AppConfig {
             match fs::write(&path, content) {
                 Ok(()) => {}
                 Err(err) => {
-                    crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
+                    crate::utils::logging::log_error(
+                        "config",
+                        &format!("Config persistence error: {err}"),
+                    );
                     eprintln!("Config persistence error: {err}");
                     return Err(Box::new(err));
                 }
@@ -374,7 +383,10 @@ impl QueryHistory {
         if let Some(path) = Self::history_path() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|err| {
-                    crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                    crate::utils::logging::log_error(
+                        "config",
+                        &format!("History persistence error: {err}"),
+                    );
                     eprintln!("History persistence error: {err}");
                     err
                 })?;
@@ -383,28 +395,52 @@ impl QueryHistory {
             // data loss if the process crashes mid-write.
             let tmp_path = path.with_extension("json.tmp");
             let file = fs::File::create(&tmp_path).map_err(|err| {
-                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("History persistence error: {err}"),
+                );
                 eprintln!("History persistence error: {err}");
                 err
             })?;
             let mut writer = BufWriter::new(file);
             serde_json::to_writer(&mut writer, self).map_err(|err| {
-                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("History persistence error: {err}"),
+                );
                 eprintln!("History persistence error: {err}");
                 err
             })?;
             // Explicit flush so buffered bytes reach disk before rename.
             use std::io::Write;
             writer.flush().map_err(|err| {
-                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("History persistence error: {err}"),
+                );
                 eprintln!("History persistence error: {err}");
                 err
             })?;
             fs::rename(&tmp_path, &path).map_err(|err| {
-                crate::utils::logging::log_error("config", &format!("History persistence error: {err}"));
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("History persistence error: {err}"),
+                );
                 eprintln!("History persistence error: {err}");
                 err
             })?;
+
+            // Restrict file permissions to owner-only (0600) on Unix
+            #[cfg(unix)]
+            {
+                let permissions = fs::Permissions::from_mode(0o600);
+                if let Err(err) = fs::set_permissions(&path, permissions) {
+                    eprintln!(
+                        "Warning: could not set query history file permissions: {}",
+                        err
+                    );
+                }
+            }
         }
         Ok(())
     }

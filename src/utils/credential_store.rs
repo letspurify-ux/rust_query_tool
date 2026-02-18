@@ -3,10 +3,7 @@ use keyring::Entry;
 const SERVICE_NAME: &str = "space_query";
 const LEGACY_SERVICE_NAME: &str = "oracle_query_tool";
 
-fn entry_for_service(
-    service_name: &str,
-    connection_name: &str,
-) -> Result<Entry, keyring::Error> {
+fn entry_for_service(service_name: &str, connection_name: &str) -> Result<Entry, keyring::Error> {
     Entry::new(service_name, connection_name)
 }
 

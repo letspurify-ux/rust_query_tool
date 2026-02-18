@@ -2688,15 +2688,42 @@ impl MainWindow {
                                     });
                                 }
                                 ConnectionResult::Failure(err) => {
-                                    crate::utils::logging::log_error(
-                                        "connection",
-                                        &format!("Connection failed: {}", err),
-                                    );
-                                    s.status_bar.set_label("Connection failed");
-                                    s.result_tabs.append_script_output_lines(&[format!(
-                                        "Connection failed: {}",
-                                        err
-                                    )]);
+                                    let current_connection = s.connection_info.borrow().clone();
+                                    let current_connection_label = current_connection
+                                        .as_ref()
+                                        .map(|info| info.display_string());
+
+                                    if let Some(current_label) = current_connection_label {
+                                        crate::utils::logging::log_error(
+                                            "connection",
+                                            &format!(
+                                                "Connection failed: {} (keeping current connection: {})",
+                                                err, current_label
+                                            ),
+                                        );
+                                        s.status_bar.set_label(&format_status(
+                                            "Connection failed; keeping current connection",
+                                            &current_connection,
+                                        ));
+                                        let lines = vec![
+                                            format!("Connection failed: {}", err),
+                                            format!(
+                                                "Keeping current connection: {}",
+                                                current_label
+                                            ),
+                                        ];
+                                        s.result_tabs.append_script_output_lines(&lines);
+                                    } else {
+                                        crate::utils::logging::log_error(
+                                            "connection",
+                                            &format!("Connection failed: {}", err),
+                                        );
+                                        s.status_bar.set_label("Connection failed");
+                                        s.result_tabs.append_script_output_lines(&[format!(
+                                            "Connection failed: {}",
+                                            err
+                                        )]);
+                                    }
                                     s.result_tabs.select_script_output();
                                 }
                             }

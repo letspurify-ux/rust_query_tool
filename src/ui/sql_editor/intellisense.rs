@@ -131,10 +131,12 @@ impl SqlEditorWidget {
         };
 
         let (columns, cache_columns) = match conn_guard.require_live_connection() {
-            Ok(conn) => match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key) {
-                Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
-                Err(_) => (Vec::new(), false),
-            },
+            Ok(conn) => {
+                match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key) {
+                    Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                    Err(_) => (Vec::new(), false),
+                }
+            }
             Err(_) => (Vec::new(), false),
         };
 
@@ -262,7 +264,11 @@ impl SqlEditorWidget {
                     return;
                 }
 
-                if editor_for_timeout.insert_position().max(0) != cursor_pos {
+                if Self::normalize_cursor_position(
+                    &buffer_for_timeout,
+                    editor_for_timeout.insert_position(),
+                ) != cursor_pos
+                {
                     return;
                 }
 
@@ -315,7 +321,8 @@ impl SqlEditorWidget {
         {
             let mut popup = intellisense_popup.borrow_mut();
             popup.set_selected_callback(move |selected| {
-                let cursor_pos = editor_for_insert.insert_position().max(0);
+                let cursor_pos =
+                    Self::normalize_cursor_position(&buffer_for_insert, editor_for_insert.insert_position());
                 let cursor_pos_usize = cursor_pos as usize;
                 let context_text = Self::normalize_intellisense_context_text(
                     &Self::context_before_cursor(&buffer_for_insert, cursor_pos),
@@ -407,6 +414,7 @@ impl SqlEditorWidget {
                             PositionType::Cursor,
                         );
                         if pos >= 0 {
+                            let pos = Self::normalize_cursor_position(&buffer_for_handle, pos);
                             if let Some((_, start, end)) =
                                 Self::identifier_at_position(&buffer_for_handle, pos)
                             {
@@ -501,7 +509,8 @@ impl SqlEditorWidget {
                                     intellisense_popup_for_handle.borrow().get_selected();
                                 let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
-                                    let cursor_pos = ed.insert_position().max(0);
+                                    let cursor_pos =
+                                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position());
                                     let cursor_pos_usize = cursor_pos as usize;
                                     let range = *completion_range_for_handle.borrow();
                                     let (start, end) = if let Some((range_start, range_end)) = range
@@ -534,7 +543,9 @@ impl SqlEditorWidget {
                                     *pending_intellisense_for_handle.borrow_mut() = None;
 
                                     // Update syntax highlighting after insertion
-                                    let cursor_pos = ed.insert_position().max(0) as usize;
+                                    let cursor_pos =
+                                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position())
+                                            as usize;
                                     highlighter_for_handle.borrow().highlight_buffer_window(
                                         &buffer_for_handle,
                                         &mut style_buffer_for_handle,
@@ -697,7 +708,8 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
-                    let cursor_pos = ed.insert_position().max(0);
+                    let cursor_pos =
+                        Self::normalize_cursor_position(&buffer_for_handle, ed.insert_position());
                     let char_before_cursor =
                         Self::char_before_cursor(&buffer_for_handle, cursor_pos);
                     let typed_char = Self::typed_char_from_key_event(
@@ -1068,7 +1080,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
     ) {
-        let cursor_pos = editor.insert_position().max(0);
+        let cursor_pos = Self::normalize_cursor_position(buffer, editor.insert_position());
         let cursor_pos_usize = cursor_pos as usize;
         let (word, start, _) = Self::word_at_cursor(buffer, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, start);
@@ -1099,8 +1111,7 @@ impl SqlEditorWidget {
                 .get(..cursor_in_statement)
                 .unwrap_or("");
             let context_text = Self::normalize_intellisense_context_text(before_text);
-            let statement_text =
-                Self::normalize_intellisense_context_text(&statement_context_text);
+            let statement_text = Self::normalize_intellisense_context_text(&statement_context_text);
             let full_text = if statement_text.is_empty() {
                 context_text.as_str()
             } else {
@@ -1280,7 +1291,7 @@ impl SqlEditorWidget {
         }
 
         // Get cursor position in editor's local coordinates (already window-relative in FLTK)
-        let (cursor_x, cursor_y) = editor.position_to_xy(editor.insert_position());
+        let (cursor_x, cursor_y) = editor.position_to_xy(cursor_pos);
 
         // Get window's screen coordinates
         let (win_x, win_y) = editor
@@ -1634,6 +1645,129 @@ impl SqlEditorWidget {
         (word, abs_start, abs_end)
     }
 
+    fn quoted_identifier_bounds_at(text: &str, rel_pos: usize) -> Option<(usize, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let rel_pos = Self::clamp_to_char_boundary_local(text, rel_pos.min(text.len()));
+        let mut idx = 0usize;
+
+        while idx < text.len() {
+            let ch = text.get(idx..)?.chars().next()?;
+            if ch != '"' {
+                idx += ch.len_utf8();
+                continue;
+            }
+
+            let start = idx;
+            idx += 1;
+
+            while idx < text.len() {
+                let cur = text.get(idx..)?.chars().next()?;
+                if cur == '"' {
+                    let next_idx = idx + cur.len_utf8();
+                    if next_idx < text.len() && text.get(next_idx..)?.starts_with('"') {
+                        idx = next_idx + 1;
+                        continue;
+                    }
+                    let end = next_idx;
+                    if rel_pos >= start && rel_pos <= end {
+                        return Some((start, end));
+                    }
+                    idx = end;
+                    break;
+                }
+                idx += cur.len_utf8();
+            }
+
+            if idx >= text.len() && rel_pos >= start && rel_pos <= text.len() {
+                return Some((start, text.len()));
+            }
+        }
+
+        None
+    }
+
+    fn identifier_at_position_in_text(
+        text: &str,
+        rel_pos: usize,
+    ) -> Option<(String, usize, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let rel_pos = Self::clamp_to_char_boundary_local(text, rel_pos.min(text.len()));
+
+        if let Some((start, end)) = Self::quoted_identifier_bounds_at(text, rel_pos) {
+            let raw = text.get(start..end)?;
+            let word = Self::strip_identifier_quotes(raw);
+            if !word.is_empty() {
+                return Some((word, start, end));
+            }
+        }
+
+        let anchor = if rel_pos < text.len() {
+            let ch = text.get(rel_pos..)?.chars().next()?;
+            if sql_text::is_identifier_char(ch) {
+                Some(rel_pos)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            if rel_pos == 0 {
+                None
+            } else {
+                text.get(..rel_pos)
+                    .and_then(|prefix| prefix.char_indices().next_back())
+                    .and_then(|(prev_start, ch)| {
+                        if sql_text::is_identifier_char(ch) {
+                            Some(prev_start)
+                        } else {
+                            None
+                        }
+                    })
+            }
+        })?;
+
+        let mut start = anchor;
+        while start > 0 {
+            let Some((prev_start, ch)) = text
+                .get(..start)
+                .and_then(|prefix| prefix.char_indices().next_back())
+            else {
+                break;
+            };
+            if sql_text::is_identifier_char(ch) {
+                start = prev_start;
+            } else {
+                break;
+            }
+        }
+
+        let mut end = anchor;
+        while end < text.len() {
+            let Some(ch) = text.get(end..).and_then(|suffix| suffix.chars().next()) else {
+                break;
+            };
+            if sql_text::is_identifier_char(ch) {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        let word = text.get(start..end)?.to_string();
+        if word.is_empty() {
+            None
+        } else {
+            Some((word, start, end))
+        }
+    }
+
     fn identifier_at_position(buffer: &TextBuffer, pos: i32) -> Option<(String, i32, i32)> {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
@@ -1643,31 +1777,12 @@ impl SqlEditorWidget {
         let line_start = buffer.line_start(pos).max(0);
         let line_end = buffer.line_end(pos).max(line_start);
         let text = buffer.text_range(line_start, line_end).unwrap_or_default();
-        let bytes = text.as_bytes();
-        if bytes.is_empty() {
+        if text.is_empty() {
             return None;
         }
 
-        let rel_pos = (pos - line_start).clamp(0, bytes.len() as i32) as usize;
-        let anchor = if rel_pos < bytes.len() && sql_text::is_identifier_byte(bytes[rel_pos]) {
-            Some(rel_pos)
-        } else if rel_pos > 0 && sql_text::is_identifier_byte(bytes[rel_pos - 1]) {
-            Some(rel_pos - 1)
-        } else {
-            None
-        }?;
-
-        let mut start = anchor;
-        while start > 0 && sql_text::is_identifier_byte(bytes[start - 1]) {
-            start -= 1;
-        }
-
-        let mut end = anchor + 1;
-        while end < bytes.len() && sql_text::is_identifier_byte(bytes[end]) {
-            end += 1;
-        }
-
-        let word = text.get(start..end)?.to_string();
+        let rel_pos = (pos - line_start).max(0) as usize;
+        let (word, start, end) = Self::identifier_at_position_in_text(&text, rel_pos)?;
         Some((word, line_start + start as i32, line_start + end as i32))
     }
 
@@ -1920,11 +2035,35 @@ impl SqlEditorWidget {
     }
 
     fn clamp_to_char_boundary_local(text: &str, idx: usize) -> usize {
-        let mut idx = idx.min(text.len());
-        while idx > 0 && !text.is_char_boundary(idx) {
-            idx -= 1;
+        let idx = idx.min(text.len());
+        if text.is_char_boundary(idx) {
+            return idx;
         }
-        idx
+
+        // Some FLTK builds can report UTF-8 cursor offsets as character counts
+        // instead of byte offsets. If that appears to be the case, reinterpret
+        // the offset as a character index first.
+        let char_count = text.chars().count();
+        if idx <= char_count {
+            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
+                return byte_pos;
+            }
+            return text.len();
+        }
+
+        text.char_indices()
+            .map(|(pos, _)| pos)
+            .take_while(|pos| *pos < idx)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn normalize_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
+        if pos <= 0 {
+            return 0;
+        }
+        let text = buffer.text();
+        Self::clamp_to_char_boundary_local(&text, pos as usize) as i32
     }
 
     fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
@@ -1945,9 +2084,7 @@ impl SqlEditorWidget {
         rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
         let statement = text.get(stmt_start..stmt_end).unwrap_or("").to_string();
-        let cursor_in_statement = rel_cursor
-            .saturating_sub(stmt_start)
-            .min(statement.len());
+        let cursor_in_statement = rel_cursor.saturating_sub(stmt_start).min(statement.len());
         let cursor_in_statement =
             Self::clamp_to_char_boundary_local(&statement, cursor_in_statement);
         (statement, cursor_in_statement)
@@ -2382,7 +2519,7 @@ impl SqlEditorWidget {
     }
 
     pub fn quick_describe_at_cursor(&self) {
-        let cursor_pos = self.editor.insert_position().max(0);
+        let cursor_pos = Self::normalize_cursor_position(&self.buffer, self.editor.insert_position());
         let Some((word, start, _)) = Self::identifier_at_position(&self.buffer, cursor_pos) else {
             return;
         };
@@ -2429,10 +2566,7 @@ impl SqlEditorWidget {
 
         if let Err(err) = spawn_result {
             let message = format!("Failed to start quick describe task: {err}");
-            crate::utils::logging::log_error(
-                "sql_editor::intellisense::quick_describe",
-                &message,
-            );
+            crate::utils::logging::log_error("sql_editor::intellisense::quick_describe", &message);
             let _ = sender.send(UiActionResult::QuickDescribe {
                 object_name,
                 result: Err(message),
@@ -2613,6 +2747,29 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
         let cursor = sql_with_cursor.find('|').unwrap_or(0);
         let sql = sql_with_cursor.replace('|', "");
         let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier.as_deref(), Some("사용자"));
+    }
+
+    #[test]
+    fn identifier_at_position_supports_unicode_identifier() {
+        let sql = "SELECT 사용자 FROM dual";
+        let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
+
+        let (word, start, end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
+            .expect("unicode identifier should be resolved at cursor");
+        assert_eq!(word, "사용자");
+        assert_eq!(sql.get(start..end), Some("사용자"));
+    }
+
+    #[test]
+    fn identifier_at_position_supports_quoted_unicode_identifier() {
+        let sql = r#"SELECT "사용자"."이름" FROM dual"#;
+        let cursor = sql.find(r#""이름""#).unwrap_or(0) + r#""이름""#.len();
+
+        let (word, start, _end) = SqlEditorWidget::identifier_at_position_in_text(sql, cursor)
+            .expect("quoted unicode identifier should be resolved at cursor");
+        assert_eq!(word, "이름");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(sql, start);
         assert_eq!(qualifier.as_deref(), Some("사용자"));
     }
 
@@ -3331,7 +3488,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             }))));
 
         let expected_path = PathBuf::from("/tmp/panic.sql");
-        let invoked = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone());
+        let invoked =
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone());
 
         assert!(invoked);
         assert!(callback_slot.borrow().is_some());

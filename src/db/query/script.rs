@@ -1508,7 +1508,7 @@ impl QueryExecutor {
                 }
             }
 
-            if trimmed == "/" && builder.block_depth() == 0 {
+            if builder.is_idle() && trimmed == "/" && builder.block_depth() == 0 {
                 if !builder.current_is_empty() {
                     builder.force_terminate();
                     for stmt in builder.take_statements() {
@@ -1663,7 +1663,7 @@ impl QueryExecutor {
                 }
             }
 
-            if trimmed == "/" && builder.block_depth() == 0 {
+            if builder.is_idle() && trimmed == "/" && builder.block_depth() == 0 {
                 if !builder.current_is_empty() {
                     builder.force_terminate();
                     for stmt in builder.take_statements() {

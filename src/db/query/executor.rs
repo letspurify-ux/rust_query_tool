@@ -459,9 +459,7 @@ impl QueryExecutor {
     fn exec_call_body(sql: &str) -> Option<String> {
         let cleaned = Self::strip_leading_comments(sql);
         let trimmed = cleaned.trim_start();
-        let command_len = trimmed
-            .find(char::is_whitespace)
-            .unwrap_or(trimmed.len());
+        let command_len = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
         let command = &trimmed[..command_len];
 
         let body = if command.eq_ignore_ascii_case("EXECUTE")

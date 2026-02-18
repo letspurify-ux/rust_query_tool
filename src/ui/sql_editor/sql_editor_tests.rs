@@ -126,8 +126,10 @@ SELECT 1 FROM dual;";
         formatted
     );
     assert!(
-        formatted.contains("SELECT 1
-FROM DUAL;"),
+        formatted.contains(
+            "SELECT 1
+FROM DUAL;"
+        ),
         "SELECT statement should still be formatted normally, got:
 {}",
         formatted
@@ -578,7 +580,11 @@ END;"#;
 
     let main_from_idx = lines
         .iter()
-        .position(|line| line.trim_start().to_ascii_uppercase().starts_with("FROM CTE"))
+        .position(|line| {
+            line.trim_start()
+                .to_ascii_uppercase()
+                .starts_with("FROM CTE")
+        })
         .expect("expected main SELECT FROM line");
 
     let cte_from_idx = lines
@@ -586,8 +592,14 @@ END;"#;
         .position(|line| line.to_ascii_uppercase().contains("FROM OQT_T_EMP"))
         .expect("expected CTE body FROM line");
 
-    let open_indent = lines[open_idx].chars().take_while(|c| c.is_whitespace()).count();
-    let with_indent = lines[with_idx].chars().take_while(|c| c.is_whitespace()).count();
+    let open_indent = lines[open_idx]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    let with_indent = lines[with_idx]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
     let with_line = lines[with_idx].to_ascii_uppercase();
     let main_from_indent = lines[main_from_idx]
         .chars()
@@ -595,7 +607,10 @@ END;"#;
         .count();
 
     if with_line.contains("OPEN P_RC FOR") {
-        assert!(with_indent > open_indent, "OPEN ... FOR WITH should still indent WITH");
+        assert!(
+            with_indent > open_indent,
+            "OPEN ... FOR WITH should still indent WITH"
+        );
     } else {
         assert_eq!(with_idx, open_idx + 1, "WITH should follow OPEN FOR");
     }
@@ -605,9 +620,14 @@ END;"#;
         main_from_indent >= with_indent,
         "FROM CTE should align with/inside main SELECT depth"
     );
-    assert_eq!(lines[cte_from_idx].trim_start().to_ascii_uppercase(), "FROM OQT_T_EMP");
+    assert_eq!(
+        lines[cte_from_idx].trim_start().to_ascii_uppercase(),
+        "FROM OQT_T_EMP"
+    );
     assert!(
-        lines.iter().any(|line| line.contains("OPEN p_rc FOR") || line.contains("OPEN P_RC FOR")),
+        lines
+            .iter()
+            .any(|line| line.contains("OPEN p_rc FOR") || line.contains("OPEN P_RC FOR")),
         "OPEN ... FOR should remain"
     );
 }

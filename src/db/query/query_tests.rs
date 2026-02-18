@@ -88,6 +88,20 @@ fn test_normalize_sql_for_execute_removes_sqlplus_slash_for_plsql_block() {
 }
 
 #[test]
+fn test_is_plain_rollback_rejects_savepoint_clause() {
+    assert!(!QueryExecutor::is_plain_rollback(
+        "ROLLBACK TO SAVEPOINT before_update"
+    ));
+}
+
+#[test]
+fn test_is_plain_commit_rejects_non_plain_commit_variants() {
+    assert!(QueryExecutor::is_plain_commit("COMMIT"));
+    assert!(QueryExecutor::is_plain_commit("COMMIT WORK"));
+    assert!(!QueryExecutor::is_plain_commit("COMMIT FORCE 'txn-id'"));
+}
+
+#[test]
 fn test_split_script_items_ignores_trailing_remark_comment_line() {
     let sql = "SELECT 1 FROM dual\nREMARK trailing note";
     let items = QueryExecutor::split_script_items(sql);
@@ -622,6 +636,57 @@ SELECT 1 FROM DUAL;"#;
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
     assert_eq!(stmts.len(), 2, "Should have 2 statements, got: {:?}", stmts);
+}
+
+#[test]
+fn test_split_script_items_slash_line_inside_q_quote_is_not_terminator() {
+    let sql = "SELECT q'[\n/\n]' AS txt FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "slash line inside q-quote must not split statements: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("q'[\n/\n]'"),
+        "first statement should preserve q-quote slash line, got: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 2 FROM dual");
+}
+
+#[test]
+fn test_split_format_items_slash_line_inside_q_quote_is_not_terminator() {
+    let sql = "SELECT q'[\n/\n]' AS txt FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !items.iter().any(|item| matches!(item, FormatItem::Slash)),
+        "slash line inside q-quote must not be parsed as format slash item"
+    );
+    assert_eq!(
+        statements.len(),
+        2,
+        "expected two format statements, got: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("q'[\n/\n]'"),
+        "first format statement should preserve q-quote slash line, got: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 2 FROM dual");
 }
 
 #[test]
@@ -3742,12 +3807,13 @@ SELECT * FROM cte;"#;
             with_idx = Some(idx);
         }
 
-        if cte_select_idx.is_none()
-            && line.trim_start().to_uppercase().starts_with("SELECT 1 AS")
-        {
+        if cte_select_idx.is_none() && line.trim_start().to_uppercase().starts_with("SELECT 1 AS") {
             cte_select_idx = Some(idx);
         } else if main_select_idx.is_none()
-            && line.trim_start().to_uppercase().starts_with("SELECT * FROM CTE")
+            && line
+                .trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
         {
             main_select_idx = Some(idx);
         }

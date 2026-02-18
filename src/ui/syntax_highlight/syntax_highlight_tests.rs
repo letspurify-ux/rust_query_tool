@@ -576,11 +576,8 @@ fn test_prioritize_ranges_keeps_focus_window_when_truncating() {
         (5000, 5100),
     ];
     let focus_points = vec![5050];
-    let prioritized = prioritize_ranges_for_focus(
-        ranges,
-        &focus_points,
-        MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-    );
+    let prioritized =
+        prioritize_ranges_for_focus(ranges, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
 
     assert_eq!(prioritized.len(), MAX_HIGHLIGHT_WINDOWS_PER_PASS);
     assert!(

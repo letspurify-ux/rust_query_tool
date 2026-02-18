@@ -18,9 +18,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::db::{
-    ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail,
-};
+use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
@@ -1693,7 +1691,6 @@ fn is_word_edit_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
-
 fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
     data.get_all_columns_for_highlighting()
 }
@@ -1708,8 +1705,7 @@ fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (u
         expanded_start -= 1;
     }
 
-    while expanded_end < bytes.len() && crate::sql_text::is_identifier_byte(bytes[expanded_end])
-    {
+    while expanded_end < bytes.len() && crate::sql_text::is_identifier_byte(bytes[expanded_end]) {
         expanded_end += 1;
     }
 

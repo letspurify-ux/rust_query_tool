@@ -918,25 +918,25 @@ impl IntellisenseData {
 
         // Add tables/views in non-table context after language items.
         if !prefer_relations {
-        if Self::push_entries(
-            &self.table_entries,
-            &prefix_upper,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            Self::dedup_suggestions_case_insensitive(&mut suggestions);
-            return suggestions;
-        }
+            if Self::push_entries(
+                &self.table_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
+                return suggestions;
+            }
 
-        if Self::push_entries(
-            &self.view_entries,
-            &prefix_upper,
-            &mut suggestions,
-            &mut seen,
-        ) {
-            Self::dedup_suggestions_case_insensitive(&mut suggestions);
-            return suggestions;
-        }
+            if Self::push_entries(
+                &self.view_entries,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            ) {
+                Self::dedup_suggestions_case_insensitive(&mut suggestions);
+                return suggestions;
+            }
         }
 
         // Add procedures
@@ -1004,13 +1004,13 @@ impl IntellisenseData {
         let mut seen = HashSet::new();
 
         match column_tables {
-                Some(tables) if !tables.is_empty() => {
-                    for table in tables {
-                        if let Some(cols) = self.column_entries_for_scope_table(table) {
-                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
-                                break;
-                            }
+            Some(tables) if !tables.is_empty() => {
+                for table in tables {
+                    if let Some(cols) = self.column_entries_for_scope_table(table) {
+                        if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
+                            break;
                         }
+                    }
                 }
             }
             _ => {
@@ -1199,10 +1199,7 @@ impl IntellisenseData {
 
     /// Replace all inferred virtual table columns with the provided set.
     /// Only marks derived indices dirty when an actual change is detected.
-    pub fn replace_virtual_table_columns(
-        &mut self,
-        virtual_columns: HashMap<String, Vec<String>>,
-    ) {
+    pub fn replace_virtual_table_columns(&mut self, virtual_columns: HashMap<String, Vec<String>>) {
         let mut changed = false;
         let next_keys: HashSet<String> = virtual_columns
             .keys()
@@ -1230,7 +1227,8 @@ impl IntellisenseData {
                 .get(&key)
                 .is_some_and(|existing| existing == &entries);
             if !is_same {
-                self.virtual_column_entries_by_table.insert(key.clone(), entries);
+                self.virtual_column_entries_by_table
+                    .insert(key.clone(), entries);
                 changed = true;
             }
             self.virtual_table_keys.insert(key);
@@ -1536,9 +1534,22 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         return (String::new(), 0, 0);
     }
 
-    let mut pos = cursor_pos.min(text.len());
-    while pos > 0 && !text.is_char_boundary(pos) {
-        pos -= 1;
+    let idx = cursor_pos.min(text.len());
+    let mut pos = idx;
+    if !text.is_char_boundary(pos) {
+        // Some FLTK builds report cursor offsets as character counts.
+        let char_count = text.chars().count();
+        if idx <= char_count {
+            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
+                pos = byte_pos;
+            } else {
+                pos = text.len();
+            }
+        } else {
+            while pos > 0 && !text.is_char_boundary(pos) {
+                pos -= 1;
+            }
+        }
     }
 
     // Find word start by scanning backwards over identifier characters.
@@ -1604,7 +1615,6 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         _ => SqlContext::General,
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
@@ -1685,6 +1695,14 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn get_word_at_cursor_supports_character_index_cursor_offsets() {
+        let sql = "SELECT 한글컬럼 FROM dual";
+        let cursor = "SELECT 한글컬럼".chars().count();
+        let (word, _, _) = get_word_at_cursor(sql, cursor);
+        assert_eq!(word, "한글컬럼");
+    }
+
+    #[test]
     fn detect_sql_context_clamps_non_char_boundary_cursor() {
         let sql = "SELECT 한글컬럼 FROM dual";
         let cursor = sql.find("한").unwrap_or(0) + 1;
@@ -1747,10 +1765,15 @@ mod intellisense_tests {
 
         let suggestions = data.get_suggestions("", true, Some(&column_scope), false, true);
 
-        let empno_count = suggestions.iter().filter(|value| value.eq_ignore_ascii_case("EMPNO")).count();
+        let empno_count = suggestions
+            .iter()
+            .filter(|value| value.eq_ignore_ascii_case("EMPNO"))
+            .count();
         assert_eq!(empno_count, 1);
         assert_eq!(suggestions.len(), 1);
-        assert!(suggestions.iter().any(|value| value.eq_ignore_ascii_case("EMPNO")));
+        assert!(suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("EMPNO")));
     }
 
     #[test]
@@ -1760,9 +1783,14 @@ mod intellisense_tests {
         data.rebuild_indices();
 
         let suggestions = data.get_suggestions("", false, None, true, false);
-        let emp_count = suggestions.iter().filter(|value| value.eq_ignore_ascii_case("EMP")).count();
+        let emp_count = suggestions
+            .iter()
+            .filter(|value| value.eq_ignore_ascii_case("EMP"))
+            .count();
         assert_eq!(emp_count, 1);
-        assert!(suggestions.iter().any(|value| value.eq_ignore_ascii_case("EMP")));
+        assert!(suggestions
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("EMP")));
     }
 
     #[test]

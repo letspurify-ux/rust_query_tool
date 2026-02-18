@@ -725,11 +725,7 @@ fn select_highlight_ranges(
             focus_points.push(edit_start.min(text_len));
             focus_points.push(edit_end.min(text_len));
         }
-        merged = prioritize_ranges_for_focus(
-            merged,
-            &focus_points,
-            MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-        );
+        merged = prioritize_ranges_for_focus(merged, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
     }
 
     merged

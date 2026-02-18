@@ -49,6 +49,15 @@ struct SelectTransformState {
 
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(0);
 const PROGRESS_ROWS_MAX_BATCH: usize = 1;
+const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
+
+#[derive(Clone)]
+struct ScriptExecutionFrame {
+    items: Vec<ScriptItem>,
+    index: usize,
+    base_dir: PathBuf,
+    source_path: Option<PathBuf>,
+}
 
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
@@ -227,14 +236,14 @@ impl SqlEditorWidget {
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
             let mapped_within_selection =
                 Self::map_cursor_after_format(&source, &formatted, original_within_selection, true);
-            let selection_end = start
-                + Self::clamp_to_char_boundary(&formatted, formatted.len());
-            let mapped_cursor = start
-                + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
+            let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
+            let mapped_cursor =
+                start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
             buffer.select(start as i32, selection_end as i32);
             editor.set_insert_position(mapped_cursor as i32);
         } else {
-            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos as i32, false);
+            let new_pos =
+                Self::map_cursor_after_format(&source, &formatted, original_pos as i32, false);
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
@@ -336,25 +345,28 @@ impl SqlEditorWidget {
         let trimmed = &formatted[..trimmed_len];
 
         let mut semicolon_idx = None;
-        let mut idx = 0usize;
         let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
 
         while idx < bytes.len() {
-            if trimmed[idx..].starts_with("--") {
-                let line_end = trimmed[idx..]
-                    .find('\n')
-                    .map(|offset| idx + offset + 1)
-                    .unwrap_or(trimmed.len());
-                idx = line_end;
+            if bytes[idx] == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                idx += 2;
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
                 continue;
             }
 
-            if trimmed[idx..].starts_with("/*") {
-                let block_end = trimmed[idx + 2..]
-                    .find("*/")
-                    .map(|offset| idx + 2 + offset + 2)
-                    .unwrap_or(trimmed.len());
-                idx = block_end;
+            if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                idx += 2;
+                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                    idx += 1;
+                }
+                if idx + 1 < bytes.len() {
+                    idx += 2;
+                } else {
+                    idx = bytes.len();
+                }
                 continue;
             }
 
@@ -2930,6 +2942,39 @@ impl SqlEditorWidget {
         super::query_text::tokenize_sql(sql)
     }
 
+    fn normalize_script_include_path(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn validate_script_include_target(
+        frames: &[ScriptExecutionFrame],
+        target_path: &Path,
+    ) -> Result<(), String> {
+        let nested_depth = frames
+            .iter()
+            .filter(|frame| frame.source_path.is_some())
+            .count();
+        if nested_depth >= MAX_SCRIPT_INCLUDE_DEPTH {
+            return Err(format!(
+                "Maximum nested script depth ({MAX_SCRIPT_INCLUDE_DEPTH}) exceeded."
+            ));
+        }
+
+        if frames.iter().any(|frame| {
+            frame
+                .source_path
+                .as_ref()
+                .is_some_and(|path| path.as_path() == target_path)
+        }) {
+            return Err(format!(
+                "Recursive script include detected: {}",
+                target_path.display()
+            ));
+        }
+
+        Ok(())
+    }
+
     fn execute_sql(&self, sql: &str, script_mode: bool) {
         if sql.trim().is_empty() {
             return;
@@ -2982,12 +3027,6 @@ impl SqlEditorWidget {
 
         thread::spawn(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                struct ScriptFrame {
-                    items: Vec<ScriptItem>,
-                    index: usize,
-                    base_dir: PathBuf,
-                }
-
                 let mut cleanup = QueryExecutionCleanupGuard::new(
                     sender.clone(),
                     current_query_connection.clone(),
@@ -3127,10 +3166,11 @@ impl SqlEditorWidget {
                 };
                 let mut stop_execution = false;
                 let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let mut frames = vec![ScriptFrame {
+                let mut frames = vec![ScriptExecutionFrame {
                     items,
                     index: 0,
                     base_dir: working_dir.clone(),
+                    source_path: None,
                 }];
 
                 while let Some(frame) = frames.last_mut() {
@@ -5049,18 +5089,40 @@ impl SqlEditorWidget {
                                     } else {
                                         base_dir.join(&path)
                                     };
+                                    let normalized_target_path =
+                                        SqlEditorWidget::normalize_script_include_path(
+                                            &target_path,
+                                        );
+                                    if let Err(message) =
+                                        SqlEditorWidget::validate_script_include_target(
+                                            &frames,
+                                            normalized_target_path.as_path(),
+                                        )
+                                    {
+                                        SqlEditorWidget::emit_script_message(
+                                            &sender,
+                                            &session,
+                                            if relative_to_caller { "@@" } else { "@" },
+                                            &format!("Error: {}", message),
+                                        );
+                                        if !continue_on_error {
+                                            stop_execution = true;
+                                        }
+                                        continue;
+                                    }
                                     match fs::read_to_string(&target_path) {
                                         Ok(contents) => {
                                             let script_items =
                                                 QueryExecutor::split_script_items(&contents);
-                                            let script_dir = target_path
+                                            let script_dir = normalized_target_path
                                                 .parent()
                                                 .unwrap_or(&base_dir)
                                                 .to_path_buf();
-                                            frames.push(ScriptFrame {
+                                            frames.push(ScriptExecutionFrame {
                                                 items: script_items,
                                                 index: 0,
                                                 base_dir: script_dir,
+                                                source_path: Some(normalized_target_path.clone()),
                                             });
                                             SqlEditorWidget::emit_script_message(
                                                 &sender,
@@ -5212,7 +5274,7 @@ impl SqlEditorWidget {
                             let cleaned = SqlEditorWidget::strip_leading_comments(&sql_text);
                             let upper = cleaned.to_uppercase();
 
-                            if upper.starts_with("COMMIT") {
+                            if QueryExecutor::is_plain_commit(&sql_text) {
                                 let mut timed_out = false;
                                 let statement_start = Instant::now();
                                 let mut result = match conn.commit() {
@@ -5282,7 +5344,7 @@ impl SqlEditorWidget {
                                 continue;
                             }
 
-                            if upper.starts_with("ROLLBACK") {
+                            if QueryExecutor::is_plain_rollback(&sql_text) {
                                 let mut timed_out = false;
                                 let statement_start = Instant::now();
                                 let mut result = match conn.rollback() {
@@ -8398,6 +8460,16 @@ FROM DUAL"
             preserved
         );
     }
+
+    #[test]
+    fn preserve_selected_text_terminator_handles_multibyte_text_before_comment() {
+        let formatted = "SELECT '한글' FROM dual;".to_string();
+        let without_semicolon =
+            SqlEditorWidget::remove_trailing_statement_semicolon(&formatted)
+                .expect("trailing semicolon should be removable");
+        assert_eq!(without_semicolon, "SELECT '한글' FROM dual");
+    }
+
     #[test]
     fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {
         let source = "SELECT 1 FROM dual;";
@@ -8429,7 +8501,9 @@ FROM DUAL"
 
     #[test]
     fn statement_ends_with_semicolon_ignores_sqlplus_remark_comment_text() {
-        assert!(!SqlEditorWidget::statement_ends_with_semicolon("REM only a comment"));
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "REM only a comment"
+        ));
         assert!(!SqlEditorWidget::statement_ends_with_semicolon(
             "REMARK this is a comment with ; semicolon"
         ));
@@ -8571,5 +8645,49 @@ mod query_execution_cleanup_tests {
             .try_recv()
             .expect("BatchFinished should be emitted");
         assert!(matches!(msg, QueryProgress::BatchFinished));
+    }
+}
+
+#[cfg(test)]
+mod script_include_guard_tests {
+    use super::{ScriptExecutionFrame, SqlEditorWidget, MAX_SCRIPT_INCLUDE_DEPTH};
+    use std::path::PathBuf;
+
+    fn frame_with_source(path: &str) -> ScriptExecutionFrame {
+        ScriptExecutionFrame {
+            items: Vec::new(),
+            index: 0,
+            base_dir: PathBuf::from("."),
+            source_path: Some(PathBuf::from(path)),
+        }
+    }
+
+    #[test]
+    fn validate_script_include_target_rejects_recursive_include() {
+        let frames = vec![frame_with_source("nested.sql")];
+        let candidate = PathBuf::from("nested.sql");
+
+        let err = SqlEditorWidget::validate_script_include_target(&frames, candidate.as_path())
+            .expect_err("recursive include should be rejected");
+        assert!(
+            err.contains("Recursive script include detected"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_script_include_target_rejects_depth_over_limit() {
+        let mut frames = Vec::new();
+        for i in 0..MAX_SCRIPT_INCLUDE_DEPTH {
+            frames.push(frame_with_source(&format!("script_{i}.sql")));
+        }
+
+        let candidate = PathBuf::from("script_overflow.sql");
+        let err = SqlEditorWidget::validate_script_include_target(&frames, candidate.as_path())
+            .expect_err("depth overflow should be rejected");
+        assert!(
+            err.contains("Maximum nested script depth"),
+            "unexpected error message: {err}"
+        );
     }
 }

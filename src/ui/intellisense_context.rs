@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sql_text;
 use crate::ui::sql_depth::{
-    apply_paren_token,
-    extract_parenthesized_tokens,
-    is_top_level_depth,
-    paren_depths,
+    apply_paren_token, extract_parenthesized_tokens, is_top_level_depth, paren_depths,
     split_top_level_symbol_groups,
 };
 use crate::ui::sql_editor::SqlToken;
@@ -970,7 +967,9 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         let mut body_tokens = Vec::new();
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
-                if let Some((tokens_in_parens, next_idx)) = extract_parenthesized_tokens(tokens, idx) {
+                if let Some((tokens_in_parens, next_idx)) =
+                    extract_parenthesized_tokens(tokens, idx)
+                {
                     idx = next_idx;
                     body_tokens.extend(tokens_in_parens);
                 }
@@ -1722,7 +1721,8 @@ mod wildcard_resolution_tests {
 
     #[test]
     fn dotted_qualified_wildcard_prefers_full_table_name_over_alias_match() {
-        let sql = "SELECT schema_a.emp.* FROM schema_a.emp e JOIN dept emp ON e.deptno = emp.deptno";
+        let sql =
+            "SELECT schema_a.emp.* FROM schema_a.emp e JOIN dept emp ON e.deptno = emp.deptno";
         let tokens = SqlEditorWidget::tokenize_sql(sql);
         let ctx = analyze_cursor_context(&tokens, &tokens);
 

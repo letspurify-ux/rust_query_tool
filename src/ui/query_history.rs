@@ -14,6 +14,7 @@ use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use crate::db::{QueryExecutor, ToolCommand};
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
@@ -28,6 +29,7 @@ enum HistoryCommand {
 }
 
 const HISTORY_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const REDACTED_SECRET: &str = "<redacted>";
 
 fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
     static HISTORY_WRITER: OnceLock<mpsc::Sender<HistoryCommand>> = OnceLock::new();
@@ -35,28 +37,29 @@ fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
         let (sender, receiver) = mpsc::channel::<HistoryCommand>();
         thread::spawn(move || {
             let mut history = QueryHistory::load();
-            let apply_command = |history: &mut QueryHistory,
-                                 command: HistoryCommand,
-                                 needs_save: &mut bool,
-                                 snapshot_replies: &mut Vec<mpsc::Sender<Vec<QueryHistoryEntry>>>,
-                                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
-                match command {
-                    HistoryCommand::Add(entry) => {
-                        history.add_entry(entry);
-                        *needs_save = true;
+            let apply_command =
+                |history: &mut QueryHistory,
+                 command: HistoryCommand,
+                 needs_save: &mut bool,
+                 snapshot_replies: &mut Vec<mpsc::Sender<Vec<QueryHistoryEntry>>>,
+                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+                    match command {
+                        HistoryCommand::Add(entry) => {
+                            history.add_entry(entry);
+                            *needs_save = true;
+                        }
+                        HistoryCommand::Clear => {
+                            history.queries.clear();
+                            *needs_save = true;
+                        }
+                        HistoryCommand::Snapshot(reply) => {
+                            snapshot_replies.push(reply);
+                        }
+                        HistoryCommand::Flush(reply) => {
+                            flush_replies.push(reply);
+                        }
                     }
-                    HistoryCommand::Clear => {
-                        history.queries.clear();
-                        *needs_save = true;
-                    }
-                    HistoryCommand::Snapshot(reply) => {
-                        snapshot_replies.push(reply);
-                    }
-                    HistoryCommand::Flush(reply) => {
-                        flush_replies.push(reply);
-                    }
-                }
-            };
+                };
             while let Ok(cmd) = receiver.recv() {
                 let previous_state = history.clone();
                 let mut needs_save = false;
@@ -150,6 +153,258 @@ fn parse_error_line(message: &str) -> Option<usize> {
                     return Some(value);
                 }
             }
+        }
+    }
+    None
+}
+
+fn sanitize_history_sql(sql: &str) -> String {
+    sanitize_sensitive_text(sql)
+}
+
+fn sanitize_history_message(message: &str) -> String {
+    sanitize_sensitive_text(message)
+}
+
+fn sanitize_sensitive_text(text: &str) -> String {
+    let redacted_connect = redact_connect_commands(text);
+    let redacted_identified = redact_identified_by_clause(&redacted_connect);
+    redact_uri_credentials(&redacted_identified)
+}
+
+fn redact_connect_commands(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let line = if has_newline {
+            &segment[..segment.len().saturating_sub(1)]
+        } else {
+            segment
+        };
+        let redacted = redact_connect_command_line(line);
+        output.push_str(&redacted);
+        if has_newline {
+            output.push('\n');
+        }
+    }
+
+    if !text.ends_with('\n') && output.ends_with('\n') {
+        output.pop();
+    }
+
+    output
+}
+
+fn redact_connect_command_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent_len = line.len().saturating_sub(trimmed.len());
+    let indent = &line[..indent_len];
+
+    if let Some(ToolCommand::Connect {
+        username,
+        host,
+        port,
+        service_name,
+        ..
+    }) = QueryExecutor::parse_tool_command(trimmed)
+    {
+        return format!(
+            "{}CONNECT {}/{}@{}:{}/{}",
+            indent, username, REDACTED_SECRET, host, port, service_name
+        );
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    if (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
+        || upper.starts_with("CONN ")
+    {
+        if let Some(masked) = redact_connect_credentials_fallback(trimmed) {
+            return format!("{}{}", indent, masked);
+        }
+    }
+
+    line.to_string()
+}
+
+fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim_start();
+    if command.is_empty() || rest.is_empty() {
+        return None;
+    }
+
+    let slash_idx = rest.find('/')?;
+    let at_idx = rest.rfind('@')?;
+    if slash_idx >= at_idx {
+        return None;
+    }
+
+    Some(format!(
+        "{} {}/{}{}",
+        command,
+        &rest[..slash_idx],
+        REDACTED_SECRET,
+        &rest[at_idx..]
+    ))
+}
+
+fn redact_identified_by_clause(text: &str) -> String {
+    const IDENTIFIED_BY: &str = "IDENTIFIED BY";
+
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(found) = find_ascii_case_insensitive(text, IDENTIFIED_BY, cursor) {
+        let pattern_end = found + IDENTIFIED_BY.len();
+        output.push_str(&text[cursor..pattern_end]);
+
+        let mut value_start = pattern_end;
+        while value_start < text.len() {
+            let ch = text[value_start..]
+                .chars()
+                .next()
+                .expect("value_start is in bounds");
+            if ch.is_whitespace() {
+                output.push(ch);
+                value_start += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if value_start >= text.len() {
+            cursor = value_start;
+            break;
+        }
+
+        let first = text[value_start..]
+            .chars()
+            .next()
+            .expect("value_start is in bounds");
+        if first == '\'' || first == '"' {
+            let quote = first;
+            output.push(quote);
+            let mut value_end = value_start + quote.len_utf8();
+            while value_end < text.len() {
+                let ch = text[value_end..]
+                    .chars()
+                    .next()
+                    .expect("value_end is in bounds");
+                value_end += ch.len_utf8();
+                if ch == quote {
+                    if value_end < text.len() {
+                        let next = text[value_end..]
+                            .chars()
+                            .next()
+                            .expect("value_end is in bounds");
+                        if next == quote {
+                            value_end += next.len_utf8();
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+            output.push_str(REDACTED_SECRET);
+            output.push(quote);
+            cursor = value_end;
+            continue;
+        }
+
+        let mut value_end = value_start;
+        while value_end < text.len() {
+            let ch = text[value_end..]
+                .chars()
+                .next()
+                .expect("value_end is in bounds");
+            if ch.is_whitespace() || matches!(ch, ';' | ')' | ',' | '\n' | '\r') {
+                break;
+            }
+            value_end += ch.len_utf8();
+        }
+        output.push_str(REDACTED_SECRET);
+        cursor = value_end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn redact_uri_credentials(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find("://") {
+        let scheme_sep = cursor + rel;
+        let auth_start = scheme_sep + 3;
+        output.push_str(&text[cursor..auth_start]);
+
+        let authority_end = text[auth_start..]
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                if matches!(
+                    ch,
+                    '/' | '?' | '#' | ' ' | '\t' | '\n' | '\r' | '\'' | '"' | ';' | ')' | '('
+                ) {
+                    Some(auth_start + offset)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(text.len());
+
+        let authority = &text[auth_start..authority_end];
+        if let Some(at_pos) = authority.rfind('@') {
+            let userinfo = &authority[..at_pos];
+            let host = &authority[at_pos..];
+            if let Some(colon_pos) = userinfo.find(':') {
+                output.push_str(&userinfo[..colon_pos + 1]);
+                output.push_str(REDACTED_SECRET);
+                output.push_str(host);
+            } else {
+                output.push_str(authority);
+            }
+        } else {
+            output.push_str(authority);
+        }
+
+        cursor = authority_end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn find_ascii_case_insensitive(text: &str, needle: &str, start: usize) -> Option<usize> {
+    let haystack = text.as_bytes();
+    let pattern = needle.as_bytes();
+    if pattern.is_empty() || start >= haystack.len() || pattern.len() > haystack.len() {
+        return None;
+    }
+
+    for idx in start..=haystack.len().saturating_sub(pattern.len()) {
+        if !text.is_char_boundary(idx) {
+            continue;
+        }
+        if haystack[idx..idx + pattern.len()]
+            .iter()
+            .zip(pattern.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return Some(idx);
         }
     }
     None
@@ -518,14 +773,16 @@ impl QueryHistoryDialog {
             return;
         }
 
+        let sanitized_sql = sanitize_history_sql(sql);
+        let sanitized_message = sanitize_history_message(message);
         let error_message = if success {
             None
         } else {
-            Some(message.to_string())
+            Some(sanitized_message.clone())
         };
         let error_line = error_message.as_deref().and_then(parse_error_line);
         let entry = QueryHistoryEntry {
-            sql: sql.to_string(),
+            sql: sanitized_sql,
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             execution_time_ms,
             row_count,
@@ -586,7 +843,7 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod query_history_tests {
-    use super::truncate_sql;
+    use super::{sanitize_history_message, sanitize_history_sql, truncate_sql, REDACTED_SECRET};
 
     #[test]
     fn truncate_sql_preserves_multibyte_text_while_normalizing_whitespace() {
@@ -609,5 +866,36 @@ mod query_history_tests {
     #[test]
     fn truncate_sql_returns_empty_for_zero_limit() {
         assert_eq!(truncate_sql("SELECT 1", 0), "");
+    }
+
+    #[test]
+    fn sanitize_history_sql_redacts_connect_password() {
+        let sql = "CONNECT scott/tiger@localhost:1521/ORCL";
+        let sanitized = sanitize_history_sql(sql);
+        assert!(sanitized.contains(&format!("scott/{}@", REDACTED_SECRET)));
+        assert!(!sanitized.contains("tiger"));
+    }
+
+    #[test]
+    fn sanitize_history_sql_keeps_connect_by_clause() {
+        let sql = "SELECT * FROM emp CONNECT BY PRIOR empno = mgr";
+        let sanitized = sanitize_history_sql(sql);
+        assert_eq!(sanitized, sql);
+    }
+
+    #[test]
+    fn sanitize_history_sql_redacts_identified_by_secret() {
+        let sql = "CREATE USER app IDENTIFIED BY \"MySecret!\"";
+        let sanitized = sanitize_history_sql(sql);
+        assert!(sanitized.contains(&format!("IDENTIFIED BY \"{}\"", REDACTED_SECRET)));
+        assert!(!sanitized.contains("MySecret!"));
+    }
+
+    #[test]
+    fn sanitize_history_message_redacts_uri_password() {
+        let message = "failed to connect via https://alice:pa55@example.com/path";
+        let sanitized = sanitize_history_message(message);
+        assert!(sanitized.contains(&format!("alice:{}@", REDACTED_SECRET)));
+        assert!(!sanitized.contains("pa55"));
     }
 }

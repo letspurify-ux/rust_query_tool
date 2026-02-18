@@ -350,7 +350,7 @@ fn populate_browser(
         }
 
         let color_prefix = match entry.level {
-            LogLevel::Error => "@C1 ",   // red
+            LogLevel::Error => "@C1 ",    // red
             LogLevel::Warning => "@C95 ", // orange
             LogLevel::Info => "@C255 ",   // white
             LogLevel::Debug => "@C246 ",  // gray
