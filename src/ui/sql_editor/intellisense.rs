@@ -31,13 +31,6 @@ use super::*;
 const MAX_MERGED_SUGGESTIONS: usize = 50;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 
-#[derive(Clone, Copy)]
-struct KeyupDebounceRequest {
-    generation: u64,
-    cursor_pos: i32,
-    buffer_len: i32,
-}
-
 impl SqlEditorWidget {
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
     const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
@@ -55,7 +48,7 @@ impl SqlEditorWidget {
                 *slot = Some(cb);
             }
             if let Err(payload) = result {
-                panic::resume_unwind(payload);
+                Self::log_callback_panic("find/replace callback", payload.as_ref());
             }
             true
         } else {
@@ -79,7 +72,7 @@ impl SqlEditorWidget {
                 *slot = Some(cb);
             }
             if let Err(payload) = result {
-                panic::resume_unwind(payload);
+                Self::log_callback_panic("file drop callback", payload.as_ref());
             }
             true
         } else {
@@ -89,6 +82,94 @@ impl SqlEditorWidget {
 
     fn should_consume_popup_confirm_key(key: Key, has_selected: bool) -> bool {
         has_selected && matches!(key, Key::Tab | Key::Enter | Key::KPEnter)
+    }
+
+    fn cancel_keyup_debounce_timeout(
+        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+    ) {
+        if let Some(handle) = keyup_debounce_handle.borrow_mut().take() {
+            if app::has_timeout3(handle) {
+                app::remove_timeout3(handle);
+            }
+        }
+    }
+
+    fn invalidate_keyup_debounce(
+        keyup_debounce_generation: &Rc<Cell<u64>>,
+        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+    ) -> u64 {
+        Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
+        let generation = keyup_debounce_generation.get().wrapping_add(1);
+        keyup_debounce_generation.set(generation);
+        generation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_keyup_intellisense_debounce(
+        keyup_debounce_generation: &Rc<Cell<u64>>,
+        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+        cursor_pos: i32,
+        buffer_len: i32,
+        editor: &TextEditor,
+        buffer: &TextBuffer,
+        intellisense_data: &Rc<RefCell<IntellisenseData>>,
+        intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
+        completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
+    ) {
+        let generation =
+            Self::invalidate_keyup_debounce(keyup_debounce_generation, keyup_debounce_handle);
+        let keyup_debounce_generation_for_timeout = keyup_debounce_generation.clone();
+        let keyup_debounce_handle_for_timeout = keyup_debounce_handle.clone();
+        let editor_for_timeout = editor.clone();
+        let buffer_for_timeout = buffer.clone();
+        let intellisense_data_for_timeout = intellisense_data.clone();
+        let intellisense_popup_for_timeout = intellisense_popup.clone();
+        let completion_range_for_timeout = completion_range.clone();
+        let column_sender_for_timeout = column_sender.clone();
+        let connection_for_timeout = connection.clone();
+        let pending_intellisense_for_timeout = pending_intellisense.clone();
+        let handle = app::add_timeout3(
+            Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
+            move |timeout_handle| {
+                {
+                    let mut slot = keyup_debounce_handle_for_timeout.borrow_mut();
+                    if slot.as_ref().copied() == Some(timeout_handle) {
+                        *slot = None;
+                    }
+                }
+
+                if keyup_debounce_generation_for_timeout.get() != generation {
+                    return;
+                }
+
+                if editor_for_timeout.was_deleted() {
+                    return;
+                }
+
+                if editor_for_timeout.insert_position().max(0) != cursor_pos {
+                    return;
+                }
+
+                if buffer_for_timeout.length() != buffer_len {
+                    return;
+                }
+
+                Self::trigger_intellisense(
+                    &editor_for_timeout,
+                    &buffer_for_timeout,
+                    &intellisense_data_for_timeout,
+                    &intellisense_popup_for_timeout,
+                    &completion_range_for_timeout,
+                    &column_sender_for_timeout,
+                    &connection_for_timeout,
+                    &pending_intellisense_for_timeout,
+                );
+            },
+        );
+        *keyup_debounce_handle.borrow_mut() = Some(handle);
     }
 
     pub fn setup_intellisense(&mut self) {
@@ -107,44 +188,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let (debounce_sender, debounce_receiver) = app::channel::<KeyupDebounceRequest>();
-
-        let debounce_editor = self.editor.clone();
-        let debounce_buffer = self.buffer.clone();
-        let debounce_intellisense_data = self.intellisense_data.clone();
-        let debounce_intellisense_popup = self.intellisense_popup.clone();
-        let debounce_completion_range = self.completion_range.clone();
-        let debounce_column_sender = self.column_sender.clone();
-        let debounce_connection = self.connection.clone();
-        let debounce_pending_intellisense = self.pending_intellisense.clone();
-        let debounce_generation_for_check = keyup_debounce_generation.clone();
-
-        app::add_check(move |_| {
-            while let Some(request) = debounce_receiver.recv() {
-                if debounce_generation_for_check.get() != request.generation {
-                    continue;
-                }
-
-                if debounce_editor.insert_position().max(0) != request.cursor_pos {
-                    continue;
-                }
-
-                if debounce_buffer.length() != request.buffer_len {
-                    continue;
-                }
-
-                Self::trigger_intellisense(
-                    &debounce_editor,
-                    &debounce_buffer,
-                    &debounce_intellisense_data,
-                    &debounce_intellisense_popup,
-                    &debounce_completion_range,
-                    &debounce_column_sender,
-                    &debounce_connection,
-                    &debounce_pending_intellisense,
-                );
-            }
-        });
+        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
@@ -219,7 +263,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
         let pending_intellisense_for_handle = pending_intellisense.clone();
         let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
-        let debounce_sender_for_handle = debounce_sender.clone();
+        let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
         let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
 
         editor.handle(move |ed, ev| {
@@ -277,8 +321,10 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
-                            keyup_debounce_generation_for_handle
-                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                            Self::invalidate_keyup_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                            );
                         }
                         let direction = if key == Key::Up { -1 } else { 1 };
                         widget_for_shortcuts.select_block_in_direction(direction);
@@ -290,8 +336,10 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
-                            keyup_debounce_generation_for_handle
-                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                            Self::invalidate_keyup_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                            );
                         }
                         let direction = if key == Key::Up { 1 } else { -1 };
                         widget_for_shortcuts.navigate_history(direction);
@@ -305,8 +353,9 @@ impl SqlEditorWidget {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                keyup_debounce_generation_for_handle.set(
-                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                Self::invalidate_keyup_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
                                 );
                                 return true;
                             }
@@ -382,8 +431,9 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                keyup_debounce_generation_for_handle.set(
-                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                Self::invalidate_keyup_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
                                 );
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
@@ -569,8 +619,10 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
-                            keyup_debounce_generation_for_handle
-                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                            Self::invalidate_keyup_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                            );
                         }
                         return false;
                     }
@@ -608,8 +660,10 @@ impl SqlEditorWidget {
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
                         }
-                        keyup_debounce_generation_for_handle
-                            .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                        Self::invalidate_keyup_debounce(
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                        );
                         return false;
                     }
 
@@ -635,66 +689,69 @@ impl SqlEditorWidget {
                     if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
                         if word.len() >= 2 {
-                            let generation =
-                                keyup_debounce_generation_for_handle.get().wrapping_add(1);
-                            keyup_debounce_generation_for_handle.set(generation);
-                            let sender = debounce_sender_for_handle.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(
-                                    KEYUP_INTELLISENSE_DEBOUNCE_MS,
-                                ));
-                                sender.send(KeyupDebounceRequest {
-                                    generation,
-                                    cursor_pos,
-                                    buffer_len,
-                                });
-                            });
+                            Self::schedule_keyup_intellisense_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                                cursor_pos,
+                                buffer_len,
+                                ed,
+                                &buffer_for_handle,
+                                &intellisense_data_for_handle,
+                                &intellisense_popup_for_handle,
+                                &completion_range_for_handle,
+                                &column_sender_for_handle,
+                                &connection_for_handle,
+                                &pending_intellisense_for_handle,
+                            );
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
-                            keyup_debounce_generation_for_handle
-                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                            Self::invalidate_keyup_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                            );
                         }
                     } else if let Some(ch) = typed_char {
                         if ch == '.' {
-                            let generation =
-                                keyup_debounce_generation_for_handle.get().wrapping_add(1);
-                            keyup_debounce_generation_for_handle.set(generation);
-                            let sender = debounce_sender_for_handle.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(
-                                    KEYUP_INTELLISENSE_DEBOUNCE_MS,
-                                ));
-                                sender.send(KeyupDebounceRequest {
-                                    generation,
-                                    cursor_pos,
-                                    buffer_len,
-                                });
-                            });
+                            Self::schedule_keyup_intellisense_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                                cursor_pos,
+                                buffer_len,
+                                ed,
+                                &buffer_for_handle,
+                                &intellisense_data_for_handle,
+                                &intellisense_popup_for_handle,
+                                &completion_range_for_handle,
+                                &column_sender_for_handle,
+                                &connection_for_handle,
+                                &pending_intellisense_for_handle,
+                            );
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
                             if word.len() >= 2 {
-                                let generation =
-                                    keyup_debounce_generation_for_handle.get().wrapping_add(1);
-                                keyup_debounce_generation_for_handle.set(generation);
-                                let sender = debounce_sender_for_handle.clone();
-                                thread::spawn(move || {
-                                    thread::sleep(Duration::from_millis(
-                                        KEYUP_INTELLISENSE_DEBOUNCE_MS,
-                                    ));
-                                    sender.send(KeyupDebounceRequest {
-                                        generation,
-                                        cursor_pos,
-                                        buffer_len,
-                                    });
-                                });
+                                Self::schedule_keyup_intellisense_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
+                                    cursor_pos,
+                                    buffer_len,
+                                    ed,
+                                    &buffer_for_handle,
+                                    &intellisense_data_for_handle,
+                                    &intellisense_popup_for_handle,
+                                    &completion_range_for_handle,
+                                    &column_sender_for_handle,
+                                    &connection_for_handle,
+                                    &pending_intellisense_for_handle,
+                                );
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                keyup_debounce_generation_for_handle.set(
-                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                Self::invalidate_keyup_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
                                 );
                             }
                         } else {
@@ -703,8 +760,10 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
-                            keyup_debounce_generation_for_handle
-                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                            Self::invalidate_keyup_debounce(
+                                &keyup_debounce_generation_for_handle,
+                                &keyup_debounce_handle_for_handle,
+                            );
                         }
                     }
 
@@ -719,8 +778,10 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Unfocus => {
-                    keyup_debounce_generation_for_handle
-                        .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                    Self::invalidate_keyup_debounce(
+                        &keyup_debounce_generation_for_handle,
+                        &keyup_debounce_handle_for_handle,
+                    );
                     false
                 }
                 Event::Shortcut => {
@@ -1303,54 +1364,72 @@ impl SqlEditorWidget {
 
         let connection = connection.clone();
         let sender = column_sender.clone();
+        let sender_for_thread = sender.clone();
         let table_key_for_thread = table_key.clone();
-        thread::spawn(move || {
-            // Try-lock with bounded retries to avoid deadlock while still giving
-            // background column loading a chance when the connection is briefly busy.
-            let mut conn_guard = None;
-            for attempt in 0..Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                if let Some(guard) = crate::db::try_lock_connection_with_activity(
-                    &connection,
-                    format!("Loading columns for {}", table_key_for_thread),
-                ) {
-                    conn_guard = Some(guard);
-                    break;
-                }
-                if attempt + 1 < Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                    thread::sleep(Duration::from_millis(Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS));
-                }
-            }
-
-            let Some(mut conn_guard) = conn_guard else {
-                let _ = sender.send(ColumnLoadUpdate {
-                    table: table_key_for_thread,
-                    columns: Vec::new(),
-                    cache_columns: false,
-                });
-                app::awake();
-                return;
-            };
-
-            let (columns, cache_columns) = match conn_guard.require_live_connection() {
-                Ok(conn) => {
-                    match crate::db::ObjectBrowser::get_table_columns(
-                        conn.as_ref(),
-                        &table_key_for_thread,
+        let spawn_result = thread::Builder::new()
+            .name(format!("intellisense-columns-{}", table_key_for_thread))
+            .spawn(move || {
+                // Try-lock with bounded retries to avoid deadlock while still giving
+                // background column loading a chance when the connection is briefly busy.
+                let mut conn_guard = None;
+                for attempt in 0..Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
+                    if let Some(guard) = crate::db::try_lock_connection_with_activity(
+                        &connection,
+                        format!("Loading columns for {}", table_key_for_thread),
                     ) {
-                        Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
-                        Err(_) => (Vec::new(), false),
+                        conn_guard = Some(guard);
+                        break;
+                    }
+                    if attempt + 1 < Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
+                        thread::sleep(Duration::from_millis(Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS));
                     }
                 }
-                Err(_) => (Vec::new(), false),
-            };
 
+                let Some(mut conn_guard) = conn_guard else {
+                    let _ = sender_for_thread.send(ColumnLoadUpdate {
+                        table: table_key_for_thread,
+                        columns: Vec::new(),
+                        cache_columns: false,
+                    });
+                    app::awake();
+                    return;
+                };
+
+                let (columns, cache_columns) = match conn_guard.require_live_connection() {
+                    Ok(conn) => {
+                        match crate::db::ObjectBrowser::get_table_columns(
+                            conn.as_ref(),
+                            &table_key_for_thread,
+                        ) {
+                            Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                            Err(_) => (Vec::new(), false),
+                        }
+                    }
+                    Err(_) => (Vec::new(), false),
+                };
+
+                let _ = sender_for_thread.send(ColumnLoadUpdate {
+                    table: table_key_for_thread,
+                    columns,
+                    cache_columns,
+                });
+                app::awake();
+            });
+
+        if let Err(err) = spawn_result {
+            crate::utils::logging::log_error(
+                "sql_editor::intellisense::column_loader",
+                &format!(
+                    "failed to spawn column loader thread for {table_key}: {err}"
+                ),
+            );
             let _ = sender.send(ColumnLoadUpdate {
-                table: table_key_for_thread,
-                columns,
-                cache_columns,
+                table: table_key,
+                columns: Vec::new(),
+                cache_columns: false,
             });
             app::awake();
-        });
+        }
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {
@@ -2198,31 +2277,50 @@ impl SqlEditorWidget {
 
         let connection = self.connection.clone();
         let sender = self.ui_action_sender.clone();
+        let sender_for_thread = sender.clone();
         set_cursor(Cursor::Wait);
         app::flush();
-        thread::spawn(move || {
-            // Try to acquire connection lock without blocking
-            let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
-                &connection,
-                format!("Quick describe {}", object_name),
-            ) else {
-                // Query is already running, notify user
-                let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+        let object_name_for_thread = object_name.clone();
+        let spawn_result = thread::Builder::new()
+            .name("quick-describe".to_string())
+            .spawn(move || {
+                // Try to acquire connection lock without blocking
+                let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
+                    &connection,
+                    format!("Quick describe {}", object_name_for_thread),
+                ) else {
+                    // Query is already running, notify user
+                    let _ = sender_for_thread.send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                };
+
+                let result = match conn_guard.require_live_connection() {
+                    Ok(db_conn) => {
+                        Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
+                    }
+                    Err(message) => Err(message.to_string()),
+                };
+
+                let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
+                    object_name: object_name_for_thread,
+                    result,
+                });
                 app::awake();
-                return;
-            };
+            });
 
-            let result = match conn_guard.require_live_connection() {
-                Ok(db_conn) => Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref()),
-                Err(message) => Err(message.to_string()),
-            };
-
+        if let Err(err) = spawn_result {
+            let message = format!("Failed to start quick describe task: {err}");
+            crate::utils::logging::log_error(
+                "sql_editor::intellisense::quick_describe",
+                &message,
+            );
             let _ = sender.send(UiActionResult::QuickDescribe {
                 object_name,
-                result,
+                result: Err(message),
             });
             app::awake();
-        });
+        }
     }
 }
 
@@ -3031,11 +3129,9 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
                 panic!("expected callback panic");
             }))));
 
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_void_callback(&callback_slot)
-        }));
+        let invoked = SqlEditorWidget::invoke_void_callback(&callback_slot);
 
-        assert!(panic_result.is_err());
+        assert!(invoked);
         assert!(callback_slot.borrow().is_some());
         assert_eq!(*calls.borrow(), 1);
     }
@@ -3053,18 +3149,12 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
                 }
             }))));
 
-        let first_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_void_callback(&callback_slot)
-        }));
-
-        assert!(first_panic.is_err());
+        let first_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
+        assert!(first_call);
         assert!(callback_slot.borrow().is_some());
 
-        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_void_callback(&callback_slot)
-        }));
-
-        assert!(second_call.is_ok());
+        let second_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
+        assert!(second_call);
         assert_eq!(*calls.borrow(), 2);
         assert!(callback_slot.borrow().is_some());
     }
@@ -3094,18 +3184,12 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             panic!("expected panic after replacement");
         }));
 
-        let first_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_void_callback(&callback_slot)
-        }));
-
-        assert!(first_call.is_err());
+        let first_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
+        assert!(first_call);
         assert!(callback_slot.borrow().is_some());
 
-        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_void_callback(&callback_slot)
-        }));
-
-        assert!(second_call.is_ok());
+        let second_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
+        assert!(second_call);
         assert!(*replacement_ran.borrow());
     }
 
@@ -3120,11 +3204,9 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             }))));
 
         let expected_path = PathBuf::from("/tmp/panic.sql");
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone())
-        }));
+        let invoked = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone());
 
-        assert!(panic_result.is_err());
+        assert!(invoked);
         assert!(callback_slot.borrow().is_some());
         assert_eq!(calls.borrow().as_slice(), &[expected_path]);
     }
@@ -3146,18 +3228,14 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let first_path = PathBuf::from("/tmp/first.sql");
         let second_path = PathBuf::from("/tmp/second.sql");
 
-        let first_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path.clone())
-        }));
-
-        assert!(first_panic.is_err());
+        let first_call =
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path.clone());
+        assert!(first_call);
         assert!(callback_slot.borrow().is_some());
 
-        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone())
-        }));
-
-        assert!(second_call.is_ok());
+        let second_call =
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone());
+        assert!(second_call);
         assert!(callback_slot.borrow().is_some());
         assert_eq!(calls.borrow().as_slice(), &[first_path, second_path]);
     }
@@ -3193,18 +3271,13 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let first_path = PathBuf::from("/tmp/first-replace.sql");
         let second_path = PathBuf::from("/tmp/second-replace.sql");
 
-        let first_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path)
-        }));
-
-        assert!(first_call.is_err());
+        let first_call = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path);
+        assert!(first_call);
         assert!(callback_slot.borrow().is_some());
 
-        let second_call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone())
-        }));
-
-        assert!(second_call.is_ok());
+        let second_call =
+            SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone());
+        assert!(second_call);
         assert_eq!(captured_paths.borrow().as_slice(), &[second_path]);
     }
 }
