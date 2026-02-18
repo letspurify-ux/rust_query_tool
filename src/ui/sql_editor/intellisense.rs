@@ -326,7 +326,7 @@ impl SqlEditorWidget {
         {
             let mut popup = intellisense_popup.borrow_mut();
             popup.set_selected_callback(move |selected| {
-                let cursor_pos = Self::normalize_cursor_position(
+                let cursor_pos = Self::raw_cursor_position(
                     &buffer_for_insert,
                     editor_for_insert.insert_position(),
                 );
@@ -421,7 +421,7 @@ impl SqlEditorWidget {
                             PositionType::Cursor,
                         );
                         if pos >= 0 {
-                            let pos = Self::normalize_cursor_position(&buffer_for_handle, pos);
+                            let pos = Self::raw_cursor_position(&buffer_for_handle, pos);
                             if let Some((_, start, end)) =
                                 Self::identifier_at_position(&buffer_for_handle, pos)
                             {
@@ -516,7 +516,7 @@ impl SqlEditorWidget {
                                     intellisense_popup_for_handle.borrow().get_selected();
                                 let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
-                                    let cursor_pos = Self::normalize_cursor_position(
+                                    let cursor_pos = Self::raw_cursor_position(
                                         &buffer_for_handle,
                                         ed.insert_position(),
                                     );
@@ -552,7 +552,7 @@ impl SqlEditorWidget {
                                     *pending_intellisense_for_handle.borrow_mut() = None;
 
                                     // Update syntax highlighting after insertion
-                                    let cursor_pos = Self::normalize_cursor_position(
+                                    let cursor_pos = Self::raw_cursor_position(
                                         &buffer_for_handle,
                                         ed.insert_position(),
                                     ) as usize;
@@ -1109,7 +1109,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
     ) {
-        let cursor_pos = Self::normalize_cursor_position(buffer, editor.insert_position());
+        let cursor_pos = Self::raw_cursor_position(buffer, editor.insert_position());
         let cursor_pos_usize = cursor_pos as usize;
         let (word, start, _) = Self::word_at_cursor(buffer, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, start);
@@ -1136,18 +1136,10 @@ impl SqlEditorWidget {
         let deep_ctx = if let Some(context) = cached_context {
             context
         } else {
-            let before_text = statement_context_text
-                .get(..cursor_in_statement)
-                .unwrap_or("");
-            let context_text = Self::normalize_intellisense_context_text(before_text);
             let statement_text = Self::normalize_intellisense_context_text(&statement_context_text);
-            let full_text = if statement_text.is_empty() {
-                context_text.as_str()
-            } else {
-                statement_text.as_str()
-            };
-            let before_tokens = Self::tokenize_sql(&context_text);
-            let full_tokens = Self::tokenize_sql(full_text);
+            let full_tokens = Self::tokenize_sql(&statement_text);
+            let before_tokens =
+                Self::tokens_before_cursor_byte(&statement_text, cursor_in_statement);
             let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
             *intellisense_parse_cache.borrow_mut() = Some(IntellisenseParseCacheEntry {
                 statement_text: statement_context_text.clone(),
@@ -2088,22 +2080,49 @@ impl SqlEditorWidget {
             .unwrap_or(0)
     }
 
-    fn normalize_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
+    fn raw_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
         let buffer_len = buffer.length().max(0);
-        let pos = pos.clamp(0, buffer_len);
-        if pos == 0 || pos == buffer_len {
-            return pos;
+        pos.clamp(0, buffer_len)
+    }
+
+    fn tokens_before_cursor_byte(sql: &str, cursor_byte: usize) -> Vec<SqlToken> {
+        let cursor_byte = cursor_byte.min(sql.len());
+        let mut before = Vec::new();
+        let mut search_from = 0usize;
+
+        for token in Self::tokenize_sql(sql) {
+            let raw = match &token {
+                SqlToken::Word(v)
+                | SqlToken::String(v)
+                | SqlToken::Comment(v)
+                | SqlToken::Symbol(v) => v.as_str(),
+            };
+
+            let needle = if matches!(token, SqlToken::Comment(_)) {
+                raw.strip_prefix('\n').unwrap_or(raw)
+            } else {
+                raw
+            };
+
+            if needle.is_empty() {
+                continue;
+            }
+
+            let Some(found_rel) = sql.get(search_from..).and_then(|rest| rest.find(needle)) else {
+                continue;
+            };
+            let start = search_from + found_rel;
+            let end = start + needle.len();
+            search_from = end;
+
+            if end <= cursor_byte {
+                before.push(token);
+            } else {
+                break;
+            }
         }
 
-        // Avoid cloning the full buffer: clamp against the current line slice only.
-        let line_start = buffer.line_start(pos).clamp(0, buffer_len);
-        let line_end = buffer.line_end(pos).clamp(line_start, buffer_len);
-        let Some(line_text) = buffer.text_range(line_start, line_end) else {
-            return pos;
-        };
-        let rel_pos = (pos - line_start).max(0) as usize;
-        let clamped_rel = Self::clamp_to_char_boundary_local(&line_text, rel_pos);
-        (line_start as usize + clamped_rel) as i32
+        before
     }
 
     fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
@@ -2661,8 +2680,7 @@ impl SqlEditorWidget {
     }
 
     pub fn quick_describe_at_cursor(&self) {
-        let cursor_pos =
-            Self::normalize_cursor_position(&self.buffer, self.editor.insert_position());
+        let cursor_pos = Self::raw_cursor_position(&self.buffer, self.editor.insert_position());
         let Some((word, start, _)) = Self::identifier_at_position(&self.buffer, cursor_pos) else {
             return;
         };
@@ -3152,27 +3170,12 @@ FROM d
     }
 
     #[test]
-    fn normalize_cursor_position_handles_utf8_without_full_buffer_copy() {
-        let mut buffer = TextBuffer::default();
-        let sql = "SELECT 😀한글🙂 FROM dual";
-        buffer.set_text(sql);
-
-        let assert_safe_boundary = |raw_pos_inside_multibyte: i32| {
-            let normalized =
-                SqlEditorWidget::normalize_cursor_position(&buffer, raw_pos_inside_multibyte);
-            let normalized = normalized.max(0) as usize;
-            assert!(normalized <= sql.len());
-            assert!(sql.is_char_boundary(normalized));
-        };
-
-        // Mid-byte offset inside 😀 (4-byte scalar) should clamp to a safe boundary.
-        let raw_pos_inside_emoji = "SELECT ".len() as i32 + 1;
-        assert_safe_boundary(raw_pos_inside_emoji);
-
-        // Mid-byte offset inside 한 (3-byte scalar) should also clamp safely.
-        let before_korean = "SELECT 😀".len() as i32;
-        let raw_pos_inside_korean = before_korean + 1;
-        assert_safe_boundary(raw_pos_inside_korean);
+    fn tokens_before_cursor_byte_handles_utf8_boundaries() {
+        let sql = "SELECT 한글 FROM dual";
+        let cursor = "SELECT 한".len();
+        let tokens = SqlEditorWidget::tokens_before_cursor_byte(sql, cursor);
+        assert_eq!(tokens.len(), 1);
+        assert!(matches!(tokens.first(), Some(SqlToken::Word(word)) if word == "SELECT"));
     }
 
     #[test]
