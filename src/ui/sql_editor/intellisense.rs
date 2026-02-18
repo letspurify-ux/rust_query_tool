@@ -5,7 +5,7 @@ use fltk::{
     prelude::*,
     text::{PositionType, TextBuffer, TextEditor},
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ use crate::ui::FindReplaceDialog;
 use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 50;
+const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 
 impl SqlEditorWidget {
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
@@ -98,6 +99,36 @@ impl SqlEditorWidget {
         let completion_range = self.completion_range.clone();
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
+        let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
+        let (debounce_sender, debounce_receiver) = app::channel::<u64>();
+
+        let debounce_editor = self.editor.clone();
+        let debounce_buffer = self.buffer.clone();
+        let debounce_intellisense_data = self.intellisense_data.clone();
+        let debounce_intellisense_popup = self.intellisense_popup.clone();
+        let debounce_completion_range = self.completion_range.clone();
+        let debounce_column_sender = self.column_sender.clone();
+        let debounce_connection = self.connection.clone();
+        let debounce_pending_intellisense = self.pending_intellisense.clone();
+        let debounce_generation_for_check = keyup_debounce_generation.clone();
+
+        app::add_check(move |_| {
+            while let Some(token) = debounce_receiver.recv() {
+                if debounce_generation_for_check.get() != token {
+                    continue;
+                }
+                Self::trigger_intellisense(
+                    &debounce_editor,
+                    &debounce_buffer,
+                    &debounce_intellisense_data,
+                    &debounce_intellisense_popup,
+                    &debounce_completion_range,
+                    &debounce_column_sender,
+                    &debounce_connection,
+                    &debounce_pending_intellisense,
+                );
+            }
+        });
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
@@ -171,6 +202,8 @@ impl SqlEditorWidget {
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
         let pending_intellisense_for_handle = pending_intellisense.clone();
+        let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
+        let debounce_sender_for_handle = debounce_sender.clone();
         let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
 
         editor.handle(move |ed, ev| {
@@ -228,6 +261,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            keyup_debounce_generation_for_handle
+                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                         let direction = if key == Key::Up { -1 } else { 1 };
                         widget_for_shortcuts.select_block_in_direction(direction);
@@ -239,6 +274,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            keyup_debounce_generation_for_handle
+                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                         let direction = if key == Key::Up { 1 } else { -1 };
                         widget_for_shortcuts.navigate_history(direction);
@@ -252,6 +289,9 @@ impl SqlEditorWidget {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                keyup_debounce_generation_for_handle.set(
+                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                );
                                 return true;
                             }
                             Key::Up => {
@@ -326,6 +366,8 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                keyup_debounce_generation_for_handle
+                                    .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
                             _ => {
@@ -510,6 +552,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            keyup_debounce_generation_for_handle
+                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                         return false;
                     }
@@ -547,6 +591,8 @@ impl SqlEditorWidget {
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
                         }
+                        keyup_debounce_generation_for_handle
+                            .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         return false;
                     }
 
@@ -573,22 +619,23 @@ impl SqlEditorWidget {
                     let context = detect_sql_context(&context_text, context_text.len());
 
                     if key == Key::BackSpace || key == Key::Delete {
-                        // After backspace/delete, re-evaluate
+                        // After backspace/delete, re-evaluate (debounced)
                         if word.len() >= 2 {
-                            Self::trigger_intellisense(
-                                ed,
-                                &buffer_for_handle,
-                                &intellisense_data_for_handle,
-                                &intellisense_popup_for_handle,
-                                &completion_range_for_handle,
-                                &column_sender_for_handle,
-                                &connection_for_handle,
-                                &pending_intellisense_for_handle,
-                            );
+                            let token = keyup_debounce_generation_for_handle.get().wrapping_add(1);
+                            keyup_debounce_generation_for_handle.set(token);
+                            let sender = debounce_sender_for_handle.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(
+                                    KEYUP_INTELLISENSE_DEBOUNCE_MS,
+                                ));
+                                sender.send(token);
+                            });
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            keyup_debounce_generation_for_handle
+                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                     } else if let Some(ch) = typed_char {
                         if ch == '.' {
@@ -605,20 +652,23 @@ impl SqlEditorWidget {
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
                             if word.len() >= 2 {
-                                Self::trigger_intellisense(
-                                    ed,
-                                    &buffer_for_handle,
-                                    &intellisense_data_for_handle,
-                                    &intellisense_popup_for_handle,
-                                    &completion_range_for_handle,
-                                    &column_sender_for_handle,
-                                    &connection_for_handle,
-                                    &pending_intellisense_for_handle,
-                                );
+                                let token =
+                                    keyup_debounce_generation_for_handle.get().wrapping_add(1);
+                                keyup_debounce_generation_for_handle.set(token);
+                                let sender = debounce_sender_for_handle.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(Duration::from_millis(
+                                        KEYUP_INTELLISENSE_DEBOUNCE_MS,
+                                    ));
+                                    sender.send(token);
+                                });
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *completion_range_for_handle.borrow_mut() = None;
                                 *pending_intellisense_for_handle.borrow_mut() = None;
+                                keyup_debounce_generation_for_handle.set(
+                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                );
                             }
                         } else {
                             // Non-identifier character (space, punctuation, etc.)
@@ -626,6 +676,8 @@ impl SqlEditorWidget {
                             intellisense_popup_for_handle.borrow_mut().hide();
                             *completion_range_for_handle.borrow_mut() = None;
                             *pending_intellisense_for_handle.borrow_mut() = None;
+                            keyup_debounce_generation_for_handle
+                                .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                         }
                     }
 
@@ -636,6 +688,11 @@ impl SqlEditorWidget {
                         &column_sender_for_handle,
                         &connection_for_handle,
                     );
+                    false
+                }
+                Event::Unfocus => {
+                    keyup_debounce_generation_for_handle
+                        .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
                     false
                 }
                 Event::Shortcut => {
