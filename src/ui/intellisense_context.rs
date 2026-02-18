@@ -1311,6 +1311,12 @@ fn is_alias_breaker(word: &str) -> bool {
     )
 }
 
+/// Collect top-level tables visible within a standalone statement.
+/// This avoids full cursor-phase analysis when only table scope is needed.
+pub fn collect_tables_in_statement(tokens: &[SqlToken]) -> Vec<ScopedTableRef> {
+    collect_tables_deep(tokens, &[0]).tables
+}
+
 /// Resolve which tables are relevant for a given qualifier (alias or table name).
 pub fn resolve_qualifier_tables(
     qualifier: &str,

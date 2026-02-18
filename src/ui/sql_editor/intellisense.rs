@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -30,10 +31,120 @@ use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 50;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
+const COLUMN_LOAD_WORKER_COUNT: usize = 4;
+
+struct ColumnLoadTask {
+    table_key: String,
+    connection: SharedConnection,
+    sender: mpsc::Sender<ColumnLoadUpdate>,
+}
+
+struct ColumnLoadWorkerPool {
+    worker_senders: Vec<mpsc::Sender<ColumnLoadTask>>,
+    next_worker: AtomicUsize,
+}
+
+impl ColumnLoadWorkerPool {
+    fn enqueue(&self, task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
+        if self.worker_senders.is_empty() {
+            return Err(task);
+        }
+        let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_senders.len();
+        self.worker_senders[index].send(task).map_err(|err| err.0)
+    }
+}
+
+static COLUMN_LOAD_WORKER_POOL: OnceLock<ColumnLoadWorkerPool> = OnceLock::new();
 
 impl SqlEditorWidget {
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
     const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
+
+    fn column_load_worker_pool() -> &'static ColumnLoadWorkerPool {
+        COLUMN_LOAD_WORKER_POOL.get_or_init(Self::build_column_load_worker_pool)
+    }
+
+    fn build_column_load_worker_pool() -> ColumnLoadWorkerPool {
+        let mut worker_senders = Vec::new();
+
+        for idx in 0..COLUMN_LOAD_WORKER_COUNT {
+            let (sender, receiver) = mpsc::channel::<ColumnLoadTask>();
+            let spawn_result = thread::Builder::new()
+                .name(format!("intellisense-column-worker-{idx}"))
+                .spawn(move || {
+                    while let Ok(task) = receiver.recv() {
+                        Self::process_column_load_task(task);
+                    }
+                });
+
+            if spawn_result.is_ok() {
+                worker_senders.push(sender);
+            } else if let Err(err) = spawn_result {
+                crate::utils::logging::log_error(
+                    "sql_editor::intellisense::column_loader",
+                    &format!("failed to spawn column worker {idx}: {err}"),
+                );
+            }
+        }
+
+        ColumnLoadWorkerPool {
+            worker_senders,
+            next_worker: AtomicUsize::new(0),
+        }
+    }
+
+    fn enqueue_column_load_task(task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
+        Self::column_load_worker_pool().enqueue(task)
+    }
+
+    fn process_column_load_task(task: ColumnLoadTask) {
+        let ColumnLoadTask {
+            table_key,
+            connection,
+            sender,
+        } = task;
+
+        // Try-lock with bounded retries to avoid deadlock while still giving
+        // background column loading a chance when the connection is briefly busy.
+        let mut conn_guard = None;
+        for attempt in 0..Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
+            if let Some(guard) = crate::db::try_lock_connection_with_activity(
+                &connection,
+                format!("Loading columns for {}", table_key),
+            ) {
+                conn_guard = Some(guard);
+                break;
+            }
+            if attempt + 1 < Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
+                thread::sleep(Duration::from_millis(Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS));
+            }
+        }
+
+        let Some(mut conn_guard) = conn_guard else {
+            let _ = sender.send(ColumnLoadUpdate {
+                table: table_key,
+                columns: Vec::new(),
+                cache_columns: false,
+            });
+            app::awake();
+            return;
+        };
+
+        let (columns, cache_columns) = match conn_guard.require_live_connection() {
+            Ok(conn) => match crate::db::ObjectBrowser::get_table_columns(conn.as_ref(), &table_key) {
+                Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
+                Err(_) => (Vec::new(), false),
+            },
+            Err(_) => (Vec::new(), false),
+        };
+
+        let _ = sender.send(ColumnLoadUpdate {
+            table: table_key,
+            columns,
+            cache_columns,
+        });
+        app::awake();
+    }
 
     fn invoke_void_callback(callback_slot: &Rc<RefCell<Option<Box<dyn FnMut()>>>>) -> bool {
         let callback = {
@@ -118,6 +229,7 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
         pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let generation =
             Self::invalidate_keyup_debounce(keyup_debounce_generation, keyup_debounce_handle);
@@ -131,6 +243,7 @@ impl SqlEditorWidget {
         let column_sender_for_timeout = column_sender.clone();
         let connection_for_timeout = connection.clone();
         let pending_intellisense_for_timeout = pending_intellisense.clone();
+        let intellisense_parse_cache_for_timeout = intellisense_parse_cache.clone();
         let handle = app::add_timeout3(
             Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
             move |timeout_handle| {
@@ -166,6 +279,7 @@ impl SqlEditorWidget {
                     &column_sender_for_timeout,
                     &connection_for_timeout,
                     &pending_intellisense_for_timeout,
+                    &intellisense_parse_cache_for_timeout,
                 );
             },
         );
@@ -187,6 +301,7 @@ impl SqlEditorWidget {
         let completion_range = self.completion_range.clone();
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
+        let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
         let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
@@ -262,6 +377,7 @@ impl SqlEditorWidget {
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
         let pending_intellisense_for_handle = pending_intellisense.clone();
+        let intellisense_parse_cache_for_handle = intellisense_parse_cache.clone();
         let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
         let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
         let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
@@ -486,6 +602,7 @@ impl SqlEditorWidget {
                                     &column_sender_for_handle,
                                     &connection_for_handle,
                                     &pending_intellisense_for_handle,
+                                    &intellisense_parse_cache_for_handle,
                                 );
                                 return true;
                             }
@@ -702,6 +819,7 @@ impl SqlEditorWidget {
                                 &column_sender_for_handle,
                                 &connection_for_handle,
                                 &pending_intellisense_for_handle,
+                                &intellisense_parse_cache_for_handle,
                             );
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
@@ -727,6 +845,7 @@ impl SqlEditorWidget {
                                 &column_sender_for_handle,
                                 &connection_for_handle,
                                 &pending_intellisense_for_handle,
+                                &intellisense_parse_cache_for_handle,
                             );
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
@@ -744,6 +863,7 @@ impl SqlEditorWidget {
                                     &column_sender_for_handle,
                                     &connection_for_handle,
                                     &pending_intellisense_for_handle,
+                                    &intellisense_parse_cache_for_handle,
                                 );
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
@@ -946,6 +1066,7 @@ impl SqlEditorWidget {
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
         pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let cursor_pos = editor.insert_position().max(0);
         let cursor_pos_usize = cursor_pos as usize;
@@ -953,21 +1074,48 @@ impl SqlEditorWidget {
         let qualifier = Self::qualifier_before_word(buffer, start);
         let prefix = word;
 
-        // Use deep context analyzer for accurate depth-aware analysis
-        let context_text = Self::normalize_intellisense_context_text(&Self::context_before_cursor(
-            buffer, cursor_pos,
-        ));
-        let statement_text =
-            Self::normalize_intellisense_context_text(&Self::statement_context(buffer, cursor_pos));
+        // Extract statement text once and cache parse results for repeated triggers
+        // at the same cursor position (e.g. async column-load refreshes).
+        let (statement_context_text, cursor_in_statement) =
+            Self::statement_context_with_cursor(buffer, cursor_pos);
+        let cursor_in_statement =
+            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement);
 
-        let before_tokens = Self::tokenize_sql(&context_text);
-        let full_text = if statement_text.is_empty() {
-            &context_text
-        } else {
-            &statement_text
+        let cached_context = {
+            let cache = intellisense_parse_cache.borrow();
+            cache
+                .as_ref()
+                .filter(|entry| {
+                    entry.cursor_in_statement == cursor_in_statement
+                        && entry.statement_text.as_str() == statement_context_text.as_str()
+                })
+                .map(|entry| entry.context.clone())
         };
-        let full_tokens = Self::tokenize_sql(full_text);
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        let deep_ctx = if let Some(context) = cached_context {
+            context
+        } else {
+            let before_text = statement_context_text
+                .get(..cursor_in_statement)
+                .unwrap_or("");
+            let context_text = Self::normalize_intellisense_context_text(before_text);
+            let statement_text =
+                Self::normalize_intellisense_context_text(&statement_context_text);
+            let full_text = if statement_text.is_empty() {
+                context_text.as_str()
+            } else {
+                statement_text.as_str()
+            };
+            let before_tokens = Self::tokenize_sql(&context_text);
+            let full_tokens = Self::tokenize_sql(full_text);
+            let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+            *intellisense_parse_cache.borrow_mut() = Some(IntellisenseParseCacheEntry {
+                statement_text: statement_context_text.clone(),
+                cursor_in_statement,
+                context: parsed.clone(),
+            });
+            parsed
+        };
 
         let context = if deep_ctx.phase.is_table_context() {
             SqlContext::TableName
@@ -999,14 +1147,10 @@ impl SqlEditorWidget {
             return;
         }
 
-        // Register CTE and subquery alias columns (text-based, with wildcard
-        // expansion from base table metadata when possible).
+        // Register CTE/subquery alias columns (text-based, with wildcard expansion
+        // from base table metadata when possible).
         let mut virtual_wildcard_dependencies: HashMap<String, Vec<String>> = HashMap::new();
-        {
-            let mut data = intellisense_data.borrow_mut();
-            // Clear stale virtual table columns from previous trigger
-            data.clear_virtual_tables();
-        }
+        let mut virtual_table_columns: HashMap<String, Vec<String>> = HashMap::new();
 
         // Register CTE columns
         for cte in &deep_ctx.ctes {
@@ -1018,8 +1162,11 @@ impl SqlEditorWidget {
                 Vec::new()
             };
             if cte.explicit_columns.is_empty() && !cte.body_tokens.is_empty() {
+                let body_tables_in_scope =
+                    intellisense_context::collect_tables_in_statement(&cte.body_tokens);
                 let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
                     &cte.body_tokens,
+                    &body_tables_in_scope,
                     intellisense_data,
                     column_sender,
                     connection,
@@ -1031,17 +1178,18 @@ impl SqlEditorWidget {
             }
             Self::dedup_column_names_case_insensitive(&mut columns);
             if !columns.is_empty() {
-                intellisense_data
-                    .borrow_mut()
-                    .set_virtual_table_columns(&cte.name, columns);
+                virtual_table_columns.insert(cte.name.clone(), columns);
             }
         }
 
         // Register subquery alias columns
         for subq in &deep_ctx.subqueries {
             let mut columns = intellisense_context::extract_select_list_columns(&subq.body_tokens);
+            let body_tables_in_scope =
+                intellisense_context::collect_tables_in_statement(&subq.body_tokens);
             let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
                 &subq.body_tokens,
+                &body_tables_in_scope,
                 intellisense_data,
                 column_sender,
                 connection,
@@ -1052,11 +1200,12 @@ impl SqlEditorWidget {
             columns.extend(wildcard_columns);
             Self::dedup_column_names_case_insensitive(&mut columns);
             if !columns.is_empty() {
-                intellisense_data
-                    .borrow_mut()
-                    .set_virtual_table_columns(&subq.alias, columns);
+                virtual_table_columns.insert(subq.alias.clone(), columns);
             }
         }
+        intellisense_data
+            .borrow_mut()
+            .replace_virtual_table_columns(virtual_table_columns);
 
         // Load columns from DB for real tables (skip virtual tables)
         if include_columns {
@@ -1170,14 +1319,14 @@ impl SqlEditorWidget {
 
     fn expand_virtual_table_wildcards(
         body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
         intellisense_data: &Rc<RefCell<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) -> (Vec<String>, Vec<String>) {
-        let body_ctx = intellisense_context::analyze_cursor_context(body_tokens, body_tokens);
         let wildcard_tables = intellisense_context::extract_select_list_wildcard_tables(
             body_tokens,
-            &body_ctx.tables_in_scope,
+            body_tables_in_scope,
         );
         if wildcard_tables.is_empty() {
             return (Vec::new(), Vec::new());
@@ -1362,69 +1511,22 @@ impl SqlEditorWidget {
             selected
         };
 
-        let connection = connection.clone();
-        let sender = column_sender.clone();
-        let sender_for_thread = sender.clone();
-        let table_key_for_thread = table_key.clone();
-        let spawn_result = thread::Builder::new()
-            .name(format!("intellisense-columns-{}", table_key_for_thread))
-            .spawn(move || {
-                // Try-lock with bounded retries to avoid deadlock while still giving
-                // background column loading a chance when the connection is briefly busy.
-                let mut conn_guard = None;
-                for attempt in 0..Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                    if let Some(guard) = crate::db::try_lock_connection_with_activity(
-                        &connection,
-                        format!("Loading columns for {}", table_key_for_thread),
-                    ) {
-                        conn_guard = Some(guard);
-                        break;
-                    }
-                    if attempt + 1 < Self::COLUMN_LOAD_LOCK_RETRY_ATTEMPTS {
-                        thread::sleep(Duration::from_millis(Self::COLUMN_LOAD_LOCK_RETRY_DELAY_MS));
-                    }
-                }
+        let task = ColumnLoadTask {
+            table_key: table_key.clone(),
+            connection: connection.clone(),
+            sender: column_sender.clone(),
+        };
 
-                let Some(mut conn_guard) = conn_guard else {
-                    let _ = sender_for_thread.send(ColumnLoadUpdate {
-                        table: table_key_for_thread,
-                        columns: Vec::new(),
-                        cache_columns: false,
-                    });
-                    app::awake();
-                    return;
-                };
-
-                let (columns, cache_columns) = match conn_guard.require_live_connection() {
-                    Ok(conn) => {
-                        match crate::db::ObjectBrowser::get_table_columns(
-                            conn.as_ref(),
-                            &table_key_for_thread,
-                        ) {
-                            Ok(cols) => (cols.into_iter().map(|col| col.name).collect(), true),
-                            Err(_) => (Vec::new(), false),
-                        }
-                    }
-                    Err(_) => (Vec::new(), false),
-                };
-
-                let _ = sender_for_thread.send(ColumnLoadUpdate {
-                    table: table_key_for_thread,
-                    columns,
-                    cache_columns,
-                });
-                app::awake();
-            });
-
-        if let Err(err) = spawn_result {
+        if let Err(task) = Self::enqueue_column_load_task(task) {
             crate::utils::logging::log_error(
                 "sql_editor::intellisense::column_loader",
                 &format!(
-                    "failed to spawn column loader thread for {table_key}: {err}"
+                    "failed to enqueue column loader task for {}",
+                    task.table_key
                 ),
             );
-            let _ = sender.send(ColumnLoadUpdate {
-                table: table_key,
+            let _ = task.sender.send(ColumnLoadUpdate {
+                table: task.table_key,
                 columns: Vec::new(),
                 cache_columns: false,
             });
@@ -1817,23 +1919,38 @@ impl SqlEditorWidget {
         text.get(stmt_start..).unwrap_or("").to_string()
     }
 
-    fn statement_context(buffer: &TextBuffer, cursor_pos: i32) -> String {
+    fn clamp_to_char_boundary_local(text: &str, idx: usize) -> usize {
+        let mut idx = idx.min(text.len());
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
-            return String::new();
+            return (String::new(), 0);
         }
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
         let end = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
         let Some(text) = buffer.text_range(start, end) else {
-            return String::new();
+            return (String::new(), 0);
         };
         let mut rel_cursor = (cursor_pos - start).max(0) as usize;
         if rel_cursor > text.len() {
             rel_cursor = text.len();
         }
+        rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
-        text.get(stmt_start..stmt_end).unwrap_or("").to_string()
+        let statement = text.get(stmt_start..stmt_end).unwrap_or("").to_string();
+        let cursor_in_statement = rel_cursor
+            .saturating_sub(stmt_start)
+            .min(statement.len());
+        let cursor_in_statement =
+            Self::clamp_to_char_boundary_local(&statement, cursor_in_statement);
+        (statement, cursor_in_statement)
     }
 
     #[cfg(test)]
@@ -2260,6 +2377,7 @@ impl SqlEditorWidget {
             &self.column_sender,
             &self.connection,
             &self.pending_intellisense,
+            &self.intellisense_parse_cache,
         );
     }
 
@@ -2893,9 +3011,15 @@ FROM d
         let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let connection = create_shared_connection();
         let tokens = SqlEditorWidget::tokenize_sql("SELECT * FROM help");
+        let tables_in_scope = intellisense_context::collect_tables_in_statement(&tokens);
 
-        let (columns, tables) =
-            SqlEditorWidget::expand_virtual_table_wildcards(&tokens, &data, &sender, &connection);
+        let (columns, tables) = SqlEditorWidget::expand_virtual_table_wildcards(
+            &tokens,
+            &tables_in_scope,
+            &data,
+            &sender,
+            &connection,
+        );
 
         let upper_tables: Vec<String> = tables.into_iter().map(|t| t.to_uppercase()).collect();
         assert_eq!(upper_tables, vec!["HELP"]);
@@ -3049,9 +3173,12 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
                 Vec::new()
             };
             if cte.explicit_columns.is_empty() && !cte.body_tokens.is_empty() {
+                let body_tables_in_scope =
+                    intellisense_context::collect_tables_in_statement(&cte.body_tokens);
                 let (wildcard_columns, _wildcard_tables) =
                     SqlEditorWidget::expand_virtual_table_wildcards(
                         &cte.body_tokens,
+                        &body_tables_in_scope,
                         &data,
                         &sender,
                         &connection,

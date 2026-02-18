@@ -151,6 +151,13 @@ pub(crate) struct PendingIntellisense {
 }
 
 #[derive(Clone)]
+pub(crate) struct IntellisenseParseCacheEntry {
+    statement_text: String,
+    cursor_in_statement: usize,
+    context: crate::ui::intellisense_context::CursorContext,
+}
+
+#[derive(Clone)]
 pub(crate) enum QuickDescribeData {
     TableColumns(Vec<TableColumnDetail>),
     Text { title: String, content: String },
@@ -194,6 +201,7 @@ pub struct SqlEditorWidget {
     file_drop_callback: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>>,
     completion_range: Rc<RefCell<Option<(usize, usize)>>>,
     pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
+    intellisense_parse_cache: Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
     history_cursor: Rc<RefCell<Option<usize>>>,
     history_original: Rc<RefCell<Option<String>>>,
     history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
@@ -361,6 +369,7 @@ impl SqlEditorWidget {
             Rc::new(RefCell::new(None));
         let completion_range = Rc::new(RefCell::new(None::<(usize, usize)>));
         let pending_intellisense = Rc::new(RefCell::new(None::<PendingIntellisense>));
+        let intellisense_parse_cache = Rc::new(RefCell::new(None::<IntellisenseParseCacheEntry>));
         let history_cursor = Rc::new(RefCell::new(None::<usize>));
         let history_original = Rc::new(RefCell::new(None::<String>));
         let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
@@ -391,6 +400,7 @@ impl SqlEditorWidget {
             file_drop_callback,
             completion_range,
             pending_intellisense,
+            intellisense_parse_cache,
             history_cursor,
             history_original,
             history_navigation_entries,
@@ -648,6 +658,7 @@ impl SqlEditorWidget {
         let column_sender = self.column_sender.clone();
         let connection = self.connection.clone();
         let pending_intellisense = self.pending_intellisense.clone();
+        let intellisense_parse_cache = self.intellisense_parse_cache.clone();
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
         let receiver: Rc<RefCell<mpsc::Receiver<ColumnLoadUpdate>>> =
@@ -669,6 +680,7 @@ impl SqlEditorWidget {
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
             connection: SharedConnection,
             pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
+            intellisense_parse_cache: Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -763,6 +775,7 @@ impl SqlEditorWidget {
                             &column_sender,
                             &connection,
                             &pending_intellisense,
+                            &intellisense_parse_cache,
                         );
                     } else {
                         // Cursor moved since async load was requested.
@@ -814,6 +827,7 @@ impl SqlEditorWidget {
                     column_sender.clone(),
                     connection.clone(),
                     Rc::clone(&pending_intellisense),
+                    Rc::clone(&intellisense_parse_cache),
                 );
             });
         }
@@ -831,6 +845,7 @@ impl SqlEditorWidget {
             column_sender,
             connection,
             pending_intellisense,
+            intellisense_parse_cache,
         );
     }
 
@@ -983,7 +998,10 @@ impl SqlEditorWidget {
         let mut style_buffer = self.style_buffer.clone();
         let mut buffer = self.buffer.clone();
         let editor = self.editor.clone();
+        let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
+            intellisense_parse_cache.borrow_mut().take();
+
             // Synchronize style_buffer length with text buffer
             // highlight_buffer_window will reset if lengths differ, but we do incremental
             // updates here to maintain consistency for small edits
@@ -1318,6 +1336,7 @@ impl SqlEditorWidget {
         self.style_buffer.set_text("");
         self.completion_range.borrow_mut().take();
         self.pending_intellisense.borrow_mut().take();
+        self.intellisense_parse_cache.borrow_mut().take();
         self.history_cursor.borrow_mut().take();
         self.history_original.borrow_mut().take();
         self.history_navigation_entries.borrow_mut().take();

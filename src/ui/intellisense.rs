@@ -751,7 +751,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
 
 const MAX_SUGGESTIONS: usize = 50;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct NameEntry {
     name: String,
     upper: String,
@@ -1178,6 +1178,7 @@ impl IntellisenseData {
 
     /// Clear previously inferred virtual table columns (CTEs, subquery aliases).
     /// These may be stale because the user edited the SQL text.
+    #[allow(dead_code)]
     pub fn clear_virtual_tables(&mut self) {
         for key in self.virtual_table_keys.drain() {
             self.virtual_column_entries_by_table.remove(&key);
@@ -1187,12 +1188,57 @@ impl IntellisenseData {
 
     /// Register columns for a virtual table (CTE or subquery alias).
     /// These are text-derived columns, not loaded from the database.
+    #[allow(dead_code)]
     pub fn set_virtual_table_columns(&mut self, name: &str, columns: Vec<String>) {
         let key = name.to_uppercase();
         self.virtual_column_entries_by_table
             .insert(key.clone(), Self::build_entries(&columns));
         self.virtual_table_keys.insert(key);
         self.all_columns_dirty = true;
+    }
+
+    /// Replace all inferred virtual table columns with the provided set.
+    /// Only marks derived indices dirty when an actual change is detected.
+    pub fn replace_virtual_table_columns(
+        &mut self,
+        virtual_columns: HashMap<String, Vec<String>>,
+    ) {
+        let mut changed = false;
+        let next_keys: HashSet<String> = virtual_columns
+            .keys()
+            .map(|name| name.to_uppercase())
+            .collect();
+
+        let stale_keys: Vec<String> = self
+            .virtual_table_keys
+            .iter()
+            .filter(|key| !next_keys.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale_keys {
+            self.virtual_table_keys.remove(&key);
+            if self.virtual_column_entries_by_table.remove(&key).is_some() {
+                changed = true;
+            }
+        }
+
+        for (name, columns) in virtual_columns {
+            let key = name.to_uppercase();
+            let entries = Self::build_entries(&columns);
+            let is_same = self
+                .virtual_column_entries_by_table
+                .get(&key)
+                .is_some_and(|existing| existing == &entries);
+            if !is_same {
+                self.virtual_column_entries_by_table.insert(key.clone(), entries);
+                changed = true;
+            }
+            self.virtual_table_keys.insert(key);
+        }
+
+        if changed {
+            self.all_columns_dirty = true;
+        }
     }
 
     fn ensure_base_indices(&mut self) {
@@ -1389,21 +1435,24 @@ impl IntellisensePopup {
             return;
         }
 
+        let suggestion_count = suggestions.len();
+        let browser_lines: Vec<String> = suggestions
+            .iter()
+            .map(|suggestion| format!("@C255 {}", suggestion))
+            .collect();
         self.browser.clear();
-        *self.suggestions.borrow_mut() = suggestions.clone();
-
-        for suggestion in &suggestions {
-            // Add with color formatting for dark theme
-            self.browser.add(&format!("@C255 {}", suggestion));
+        *self.suggestions.borrow_mut() = suggestions;
+        for line in &browser_lines {
+            self.browser.add(line);
         }
 
         // Select first item
-        if !suggestions.is_empty() {
+        if suggestion_count > 0 {
             self.browser.select(1);
         }
 
         // Calculate popup size
-        let height = (suggestions.len().min(10) * 20 + 10) as i32;
+        let height = (suggestion_count.min(10) * 20 + 10) as i32;
         self.window.set_size(320, height);
         self.browser.set_size(320, height);
 
@@ -1528,7 +1577,10 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
     use crate::ui::intellisense_context::{self, SqlPhase};
     use crate::ui::sql_editor::SqlEditorWidget;
 
-    let end = cursor_pos.min(text.len());
+    let mut end = cursor_pos.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
     let before = &text[..end];
     let tokens = SqlEditorWidget::tokenize_sql(before);
     let full_tokens = SqlEditorWidget::tokenize_sql(text);
@@ -1630,6 +1682,14 @@ mod intellisense_tests {
         let cursor = sql.find(" FROM").unwrap_or(sql.len());
         let (word, _, _) = get_word_at_cursor(sql, cursor);
         assert_eq!(word, "한글컬럼");
+    }
+
+    #[test]
+    fn detect_sql_context_clamps_non_char_boundary_cursor() {
+        let sql = "SELECT 한글컬럼 FROM dual";
+        let cursor = sql.find("한").unwrap_or(0) + 1;
+        let result = std::panic::catch_unwind(|| detect_sql_context(sql, cursor));
+        assert!(result.is_ok());
     }
 
     #[test]
