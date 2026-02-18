@@ -197,8 +197,6 @@ impl SqlEditorWidget {
     pub fn format_selected_sql(&self) {
         let mut buffer = self.buffer.clone();
         let full_text = buffer.text();
-        let editor_uses_char_offsets =
-            Self::editor_reports_char_offsets(&full_text, buffer.length());
         let selection = buffer.selection_position();
         let (start, end, source, select_formatted) = match selection {
             Some((start, end)) if start != end => {
@@ -208,16 +206,15 @@ impl SqlEditorWidget {
                     (end, start)
                 };
                 (
-                    Self::normalize_index(&full_text, start, editor_uses_char_offsets),
-                    Self::normalize_index(&full_text, end, editor_uses_char_offsets),
+                    Self::normalize_index(&full_text, start),
+                    Self::normalize_index(&full_text, end),
                     buffer.selection_text(),
                     true,
                 )
             }
             _ => {
                 let text = buffer.text();
-                let end =
-                    Self::normalize_index(&full_text, buffer.length(), editor_uses_char_offsets);
+                let end = Self::normalize_index(&full_text, buffer.length());
                 (0, end, text, false)
             }
         };
@@ -231,11 +228,7 @@ impl SqlEditorWidget {
         }
 
         let mut editor = self.editor.clone();
-        let original_pos = Self::normalize_index(
-            &full_text,
-            editor.insert_position(),
-            editor_uses_char_offsets,
-        );
+        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
         buffer.replace(start as i32, end as i32, &formatted);
 
         if select_formatted {
@@ -257,63 +250,18 @@ impl SqlEditorWidget {
         self.refresh_highlighting();
     }
 
-    fn normalize_index(text: &str, index: i32, prefer_char_offsets: bool) -> usize {
+    fn normalize_index(text: &str, index: i32) -> usize {
         if index <= 0 {
             0
-        } else if prefer_char_offsets {
-            Self::char_index_to_byte_offset(text, index as usize)
         } else {
             Self::clamp_to_char_boundary(text, index as usize)
         }
-    }
-
-    fn editor_reports_char_offsets(text: &str, reported_length: i32) -> bool {
-        if reported_length < 0 {
-            return false;
-        }
-        let reported_length = reported_length as usize;
-        let byte_len = text.len();
-        let char_len = text.chars().count();
-
-        if reported_length == byte_len {
-            return false;
-        }
-        if reported_length == char_len {
-            return byte_len != char_len;
-        }
-
-        // If the reported value cannot be a UTF-8 boundary in byte space but still
-        // falls inside the character-count range, treat it as a character index.
-        reported_length <= char_len && reported_length <= byte_len && !text.is_char_boundary(reported_length)
-    }
-
-    fn char_index_to_byte_offset(text: &str, char_index: usize) -> usize {
-        let char_count = text.chars().count();
-        let char_index = char_index.min(char_count);
-        if char_index == char_count {
-            return text.len();
-        }
-        text.char_indices()
-            .nth(char_index)
-            .map(|(byte_pos, _)| byte_pos)
-            .unwrap_or(text.len())
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
         let idx = index.min(text.len());
         if text.is_char_boundary(idx) {
             return idx;
-        }
-
-        // Some FLTK builds can report UTF-8 cursor positions as character counts
-        // instead of byte offsets. If the index is not a UTF-8 boundary but still
-        // within the character-count range, reinterpret it as a character index.
-        let char_count = text.chars().count();
-        if idx <= char_count {
-            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
-                return byte_pos;
-            }
-            return text.len();
         }
 
         text.char_indices()
@@ -5047,7 +4995,8 @@ impl SqlEditorWidget {
                                                     Arc::clone(conn),
                                                     previous_timeout,
                                                 );
-                                                if let Err(err) = conn.set_call_timeout(query_timeout)
+                                                if let Err(err) =
+                                                    conn.set_call_timeout(query_timeout)
                                                 {
                                                     SqlEditorWidget::emit_script_message(
                                                         &sender,
@@ -5569,12 +5518,13 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                        let message = SqlEditorWidget::choose_execution_error_message(
-                                            cancelled,
-                                            timed_out,
-                                            query_timeout,
-                                            err.to_string(),
-                                        );
+                                        let message =
+                                            SqlEditorWidget::choose_execution_error_message(
+                                                cancelled,
+                                                timed_out,
+                                                query_timeout,
+                                                err.to_string(),
+                                            );
                                         if script_mode {
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
@@ -5877,12 +5827,13 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
-                                            let message = SqlEditorWidget::choose_execution_error_message(
-                                                cancelled,
-                                                cursor_timed_out,
-                                                query_timeout,
-                                                err.to_string(),
-                                            );
+                                            let message =
+                                                SqlEditorWidget::choose_execution_error_message(
+                                                    cancelled,
+                                                    cursor_timed_out,
+                                                    query_timeout,
+                                                    err.to_string(),
+                                                );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 &[message.clone()],
@@ -6037,12 +5988,13 @@ impl SqlEditorWidget {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             cursor_timed_out =
                                                 SqlEditorWidget::is_timeout_error(&err);
-                                            let message = SqlEditorWidget::choose_execution_error_message(
-                                                cancelled,
-                                                cursor_timed_out,
-                                                query_timeout,
-                                                err.to_string(),
-                                            );
+                                            let message =
+                                                SqlEditorWidget::choose_execution_error_message(
+                                                    cancelled,
+                                                    cursor_timed_out,
+                                                    query_timeout,
+                                                    err.to_string(),
+                                                );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
                                                 &[message.clone()],
@@ -6385,12 +6337,13 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                            let message = SqlEditorWidget::choose_execution_error_message(
-                                                cancelled,
-                                                timed_out,
-                                                query_timeout,
-                                                err.to_string(),
-                                            );
+                                            let message =
+                                                SqlEditorWidget::choose_execution_error_message(
+                                                    cancelled,
+                                                    timed_out,
+                                                    query_timeout,
+                                                    err.to_string(),
+                                                );
                                             let mut error_result =
                                                 QueryResult::new_error(&sql_text, &message);
                                             // Preserve is_select flag so existing streamed data is kept
@@ -6546,12 +6499,13 @@ impl SqlEditorWidget {
                                     Err(err) => {
                                         let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                         timed_out = SqlEditorWidget::is_timeout_error(&err);
-                                        let message = SqlEditorWidget::choose_execution_error_message(
-                                            cancelled,
-                                            timed_out,
-                                            query_timeout,
-                                            err.to_string(),
-                                        );
+                                        let message =
+                                            SqlEditorWidget::choose_execution_error_message(
+                                                cancelled,
+                                                timed_out,
+                                                query_timeout,
+                                                err.to_string(),
+                                            );
                                         if script_mode {
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
@@ -8366,49 +8320,46 @@ END oqt_mega_pkg;"#;
     }
 
     #[test]
-    fn cursor_mapping_handles_unicode_character_index_offsets() {
+    fn cursor_mapping_uses_utf8_byte_offsets() {
         let source = "SELECT 한글, b FROM dual";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
-        // Simulate a platform/editor path that reports cursor positions as
-        // UTF-8 character offsets (not byte offsets).
-        let char_offset = source.chars().take_while(|ch| *ch != 'b').count() as i32;
+        let byte_offset = source
+            .find("b FROM")
+            .expect("source cursor anchor should exist") as i32;
 
         let mapped =
-            SqlEditorWidget::map_cursor_after_format(source, &formatted, char_offset, false);
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, byte_offset, false);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
-            "Mapped cursor should stay near token after unicode-aware mapping, got: {}",
+            "Mapped cursor should stay near token with byte-offset mapping, got: {}",
             mapped_slice
         );
     }
 
     #[test]
-    fn normalize_index_handles_ambiguous_utf8_boundary_when_char_offsets_are_reported() {
+    fn normalize_index_treats_input_as_byte_offset() {
         let source = "SELECT éa, b FROM dual";
-        let char_length = source.chars().count() as i32;
-        assert!(SqlEditorWidget::editor_reports_char_offsets(source, char_length));
-
-        let char_offset = source.chars().take_while(|ch| *ch != 'b').count() as i32;
-        let expected_byte_offset = source
+        let byte_offset = source
             .find('b')
-            .expect("expected cursor anchor should exist");
+            .expect("expected cursor anchor should exist") as i32;
 
-        let normalized = SqlEditorWidget::normalize_index(source, char_offset, true);
+        let normalized = SqlEditorWidget::normalize_index(source, byte_offset);
         assert_eq!(
-            normalized, expected_byte_offset,
-            "Character offsets that happen to be UTF-8 byte boundaries should map to the same token byte offset"
+            normalized, byte_offset as usize,
+            "normalize_index should preserve byte offsets as-is"
         );
     }
 
     #[test]
-    fn editor_reports_char_offsets_is_false_when_length_is_byte_count() {
-        let source = "SELECT éa, b FROM dual";
-        assert!(!SqlEditorWidget::editor_reports_char_offsets(
-            source,
-            source.len() as i32
-        ));
+    fn normalize_index_clamps_invalid_utf8_boundary_without_panic() {
+        let source = "SELECT 한글, b FROM dual";
+        let mid_char_index = source.find("한").expect("expected unicode anchor") + 1;
+
+        let normalized = SqlEditorWidget::normalize_index(source, mid_char_index as i32);
+        assert!(source.is_char_boundary(normalized));
+        assert!(normalized <= source.len());
     }
 
     #[test]
@@ -8588,9 +8539,8 @@ FROM DUAL"
     #[test]
     fn preserve_selected_text_terminator_handles_multibyte_text_before_comment() {
         let formatted = "SELECT '한글' FROM dual;".to_string();
-        let without_semicolon =
-            SqlEditorWidget::remove_trailing_statement_semicolon(&formatted)
-                .expect("trailing semicolon should be removable");
+        let without_semicolon = SqlEditorWidget::remove_trailing_statement_semicolon(&formatted)
+            .expect("trailing semicolon should be removable");
         assert_eq!(without_semicolon, "SELECT '한글' FROM dual");
     }
 
