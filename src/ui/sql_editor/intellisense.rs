@@ -825,7 +825,26 @@ impl SqlEditorWidget {
                     let (word, _, _) = Self::word_at_cursor(&buffer_for_handle, cursor_pos);
                     let buffer_len = buffer_for_handle.length();
 
-                    if key == Key::BackSpace || key == Key::Delete {
+                    let fast_path_applied = if popup_visible {
+                        Self::try_fast_path_intellisense_filter(
+                            &buffer_for_handle,
+                            &intellisense_popup_for_handle,
+                            &completion_range_for_handle,
+                            cursor_pos,
+                            key,
+                            typed_char,
+                        )
+                    } else {
+                        false
+                    };
+
+                    if fast_path_applied {
+                        *pending_intellisense_for_handle.borrow_mut() = None;
+                        Self::invalidate_keyup_debounce(
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                        );
+                    } else if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
                         if word.len() >= 2 {
                             Self::schedule_keyup_intellisense_debounce(
@@ -853,7 +872,7 @@ impl SqlEditorWidget {
                             );
                         }
                     } else if let Some(ch) = typed_char {
-                        if ch == '.' {
+                        if Self::should_force_full_analysis(ch) {
                             Self::schedule_keyup_intellisense_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -2343,6 +2362,88 @@ impl SqlEditorWidget {
         } else {
             Some(qualifier)
         }
+    }
+
+    fn try_fast_path_intellisense_filter(
+        buffer: &TextBuffer,
+        intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
+        completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
+        cursor_pos: i32,
+        key: Key,
+        typed_char: Option<char>,
+    ) -> bool {
+        if !intellisense_popup.borrow().is_visible() {
+            return false;
+        }
+
+        let Some((start, end)) = *completion_range.borrow() else {
+            return false;
+        };
+
+        let cursor = cursor_pos.max(0) as usize;
+        if !Self::is_cursor_within_completion_range(cursor, start, end, key, typed_char) {
+            return false;
+        }
+
+        if !Self::is_fast_filter_key(key, typed_char) {
+            return false;
+        }
+
+        // Fast path: keep existing suggestions and just filter by the current in-range prefix.
+        // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
+        let prefix = Self::prefix_in_completion_range(buffer, start, cursor_pos);
+        {
+            let mut popup = intellisense_popup.borrow_mut();
+            popup.filter_visible_suggestions_by_prefix(&prefix);
+            if !popup.is_visible() {
+                *completion_range.borrow_mut() = None;
+            }
+        }
+        true
+    }
+
+    fn is_cursor_within_completion_range(
+        cursor: usize,
+        start: usize,
+        end: usize,
+        key: Key,
+        typed_char: Option<char>,
+    ) -> bool {
+        if cursor >= start && cursor <= end {
+            return true;
+        }
+
+        // Allow forward typing past the previous end only for identifier-extension input.
+        cursor > end
+            && typed_char.is_some_and(sql_text::is_identifier_char)
+            && !matches!(key, Key::BackSpace | Key::Delete)
+    }
+
+    fn is_fast_filter_key(key: Key, typed_char: Option<char>) -> bool {
+        if matches!(key, Key::BackSpace | Key::Delete) {
+            return true;
+        }
+        typed_char.is_some_and(sql_text::is_identifier_char)
+    }
+
+    fn should_force_full_analysis(ch: char) -> bool {
+        ch == '.'
+            || ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '(' | ')' | '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | ';' | ':'
+            )
+    }
+
+    fn prefix_in_completion_range(buffer: &TextBuffer, start: usize, cursor_pos: i32) -> String {
+        let cursor = cursor_pos.max(0) as usize;
+        let end = cursor.max(start);
+        buffer
+            .text_range(start as i32, end as i32)
+            .unwrap_or_default()
+            .chars()
+            .filter(|ch| sql_text::is_identifier_char(*ch))
+            .collect()
     }
 
     fn char_before_cursor(buffer: &TextBuffer, cursor_pos: i32) -> Option<char> {
