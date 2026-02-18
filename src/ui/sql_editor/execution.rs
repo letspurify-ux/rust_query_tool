@@ -692,7 +692,13 @@ impl SqlEditorWidget {
                 _ => "PAUSE".to_string(),
             },
             ToolCommand::Accept { name, prompt } => match prompt {
-                Some(text) => format!("ACCEPT {} PROMPT '{}'", name, text),
+                Some(text) => {
+                    format!(
+                        "ACCEPT {} PROMPT '{}'",
+                        name,
+                        Self::escape_sql_literal(text)
+                    )
+                }
                 None => format!("ACCEPT {}", name),
             },
             ToolCommand::Define { name, value } => format!("DEFINE {} = {}", name, value),
@@ -8583,6 +8589,16 @@ FROM DUAL"
 {}",
             preserved
         );
+    }
+
+    #[test]
+    fn format_tool_command_accept_escapes_single_quote_prompt() {
+        let rendered = SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::Accept {
+            name: "v_name".to_string(),
+            prompt: Some("Owner's value?".to_string()),
+        });
+
+        assert_eq!(rendered, "ACCEPT v_name PROMPT 'Owner''s value?'");
     }
 
     #[test]

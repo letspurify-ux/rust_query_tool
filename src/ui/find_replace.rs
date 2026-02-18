@@ -668,7 +668,8 @@ mod tests {
         let first = find_next_match(text, "a", 0, false).expect("expected first match");
         assert_eq!(first, (first_ascii, first_ascii + "A".len()));
 
-        let second = find_next_match(text, "A", first.1 as i32, false).expect("expected second match");
+        let second =
+            find_next_match(text, "A", first.1 as i32, false).expect("expected second match");
         assert_eq!(second, (second_ascii, second_ascii + "a".len()));
     }
 }

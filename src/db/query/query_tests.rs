@@ -47,7 +47,9 @@ SELECT 2 FROM dual;";
 #[test]
 fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
     let sql = "SELECT 1 FROM dual;\nSELECT 한글 AS txt FROM dual;";
-    let utf8_start = sql.find('한').expect("expected utf-8 anchor in second statement");
+    let utf8_start = sql
+        .find('한')
+        .expect("expected utf-8 anchor in second statement");
     let mid_char_cursor = utf8_start + 1;
     assert!(
         !sql.is_char_boundary(mid_char_cursor),

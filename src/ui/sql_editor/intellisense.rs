@@ -1146,10 +1146,15 @@ impl SqlEditorWidget {
 
         // Extract statement text once and cache parse results for repeated triggers
         // at the same cursor position (e.g. async column-load refreshes).
-        let (statement_context_text, cursor_in_statement) =
+        let (statement_context_text, cursor_in_statement_raw) =
             Self::statement_context_with_cursor(buffer, cursor_pos);
-        let cursor_in_statement =
-            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement);
+        let cursor_in_statement_raw =
+            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
+        let (statement_text, cursor_in_statement) =
+            Self::normalize_intellisense_context_with_cursor(
+                &statement_context_text,
+                cursor_in_statement_raw,
+            );
 
         let cached_context = {
             let cache = intellisense_parse_cache.borrow();
@@ -1157,7 +1162,7 @@ impl SqlEditorWidget {
                 .as_ref()
                 .filter(|entry| {
                     entry.cursor_in_statement == cursor_in_statement
-                        && entry.statement_text.as_str() == statement_context_text.as_str()
+                        && entry.statement_text.as_str() == statement_text.as_str()
                 })
                 .map(|entry| entry.context.clone())
         };
@@ -1165,13 +1170,12 @@ impl SqlEditorWidget {
         let deep_ctx = if let Some(context) = cached_context {
             context
         } else {
-            let statement_text = Self::normalize_intellisense_context_text(&statement_context_text);
             let full_tokens = Self::tokenize_sql(&statement_text);
             let before_tokens =
                 Self::tokens_before_cursor_byte(&statement_text, cursor_in_statement);
             let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
             *intellisense_parse_cache.borrow_mut() = Some(IntellisenseParseCacheEntry {
-                statement_text: statement_context_text.clone(),
+                statement_text: statement_text.clone(),
                 cursor_in_statement,
                 context: parsed.clone(),
             });
@@ -2175,6 +2179,20 @@ impl SqlEditorWidget {
         text.get(offset..).unwrap_or("").to_string()
     }
 
+    fn normalize_intellisense_context_with_cursor(
+        text: &str,
+        cursor_byte: usize,
+    ) -> (String, usize) {
+        let cursor_byte = Self::clamp_to_char_boundary_local(text, cursor_byte.min(text.len()));
+        let before_cursor = text.get(..cursor_byte).unwrap_or("");
+        let normalized_full = Self::normalize_intellisense_context_text(text);
+        let normalized_before = Self::normalize_intellisense_context_text(before_cursor);
+        let normalized_cursor = normalized_before.len().min(normalized_full.len());
+        let normalized_cursor =
+            Self::clamp_to_char_boundary_local(&normalized_full, normalized_cursor);
+        (normalized_full, normalized_cursor)
+    }
+
     fn strip_sqlplus_prompt_prefixes(text: &str) -> String {
         let mut normalized = String::with_capacity(text.len());
         let mut saw_sql_prompt = false;
@@ -3039,6 +3057,29 @@ SELECT * FROM cte
     }
 
     #[test]
+    fn normalize_intellisense_context_with_cursor_maps_byte_offset_after_prompt_stripping() {
+        let raw = "PROMPT header\nSQL> SELECT e.\n  2  FROM emp e\n";
+        let raw_cursor = raw.find("e.").expect("cursor anchor should exist") + 2;
+        let (normalized, normalized_cursor) =
+            SqlEditorWidget::normalize_intellisense_context_with_cursor(raw, raw_cursor);
+
+        assert_eq!(normalized, "SELECT e.\nFROM emp e\n");
+        assert_eq!(&normalized[..normalized_cursor], "SELECT e.");
+
+        let before_tokens =
+            SqlEditorWidget::tokens_before_cursor_byte(&normalized, normalized_cursor);
+        let full_tokens = SqlEditorWidget::tokenize_sql(&normalized);
+        let ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        assert_eq!(ctx.phase, intellisense_context::SqlPhase::SelectList);
+        assert!(
+            ctx.tables_in_scope
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case("emp")),
+            "emp should remain visible after byte-offset remapping"
+        );
+    }
+
+    #[test]
     fn prompt_line_before_with_does_not_break_cte_qualified_column_resolution() {
         let sql_with_cursor = r#"
 PROMPT [3] WITH basic + multiple CTE + join + scalar subquery + nested expressions
@@ -3247,21 +3288,11 @@ FROM d
     #[test]
     fn auto_trigger_forced_char_requires_qualifier_or_two_chars() {
         assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", None));
-        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
-            "a", None
-        ));
-        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
-            "한", None
-        ));
-        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
-            "ab", None
-        ));
-        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
-            "한글", None
-        ));
-        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
-            "", Some("t")
-        ));
+        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("a", None));
+        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한", None));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("ab", None));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한글", None));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", Some("t")));
     }
 
     #[test]
@@ -3686,7 +3717,9 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     #[test]
     fn non_whitespace_char_before_cursor_in_text_detects_semicolon_before_cursor_marker() {
         let sql_with_cursor = "select * from help;|";
-        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
         let sql = sql_with_cursor.replace('|', "");
 
         let ch = SqlEditorWidget::non_whitespace_char_before_cursor_in_text(&sql, cursor);
@@ -3696,7 +3729,9 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     #[test]
     fn non_whitespace_char_before_cursor_in_text_skips_whitespace_after_semicolon() {
         let sql_with_cursor = "select * from help;   |";
-        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
         let sql = sql_with_cursor.replace('|', "");
 
         let ch = SqlEditorWidget::non_whitespace_char_before_cursor_in_text(&sql, cursor);
