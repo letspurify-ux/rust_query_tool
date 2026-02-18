@@ -59,6 +59,8 @@ static COLUMN_LOAD_WORKER_POOL: OnceLock<ColumnLoadWorkerPool> = OnceLock::new()
 impl SqlEditorWidget {
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
     const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
+    const INTELLISENSE_POPUP_WIDTH: i32 = 320;
+    const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
 
     fn column_load_worker_pool() -> &'static ColumnLoadWorkerPool {
         COLUMN_LOAD_WORKER_POOL.get_or_init(Self::build_column_load_worker_pool)
@@ -822,11 +824,13 @@ impl SqlEditorWidget {
                     }
 
                     // Handle typing - update intellisense filter
-                    let (word, _, _) = Self::word_at_cursor(&buffer_for_handle, cursor_pos);
+                    let (word, word_start, _) =
+                        Self::word_at_cursor(&buffer_for_handle, cursor_pos);
                     let buffer_len = buffer_for_handle.length();
 
                     let fast_path_applied = if popup_visible {
                         Self::try_fast_path_intellisense_filter(
+                            ed,
                             &buffer_for_handle,
                             &intellisense_popup_for_handle,
                             &completion_range_for_handle,
@@ -846,7 +850,7 @@ impl SqlEditorWidget {
                         );
                     } else if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
-                        if word.len() >= 2 {
+                        if Self::has_min_intellisense_prefix(&word) {
                             Self::schedule_keyup_intellisense_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -873,24 +877,39 @@ impl SqlEditorWidget {
                         }
                     } else if let Some(ch) = typed_char {
                         if Self::should_force_full_analysis(ch) {
-                            Self::schedule_keyup_intellisense_debounce(
-                                &keyup_debounce_generation_for_handle,
-                                &keyup_debounce_handle_for_handle,
-                                cursor_pos,
-                                buffer_len,
-                                ed,
-                                &buffer_for_handle,
-                                &intellisense_data_for_handle,
-                                &intellisense_popup_for_handle,
-                                &completion_range_for_handle,
-                                &column_sender_for_handle,
-                                &connection_for_handle,
-                                &pending_intellisense_for_handle,
-                                &intellisense_parse_cache_for_handle,
-                            );
+                            let qualifier =
+                                Self::qualifier_before_word(&buffer_for_handle, word_start);
+                            if Self::should_auto_trigger_intellisense_for_forced_char(
+                                &word,
+                                qualifier.as_deref(),
+                            ) {
+                                Self::schedule_keyup_intellisense_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
+                                    cursor_pos,
+                                    buffer_len,
+                                    ed,
+                                    &buffer_for_handle,
+                                    &intellisense_data_for_handle,
+                                    &intellisense_popup_for_handle,
+                                    &completion_range_for_handle,
+                                    &column_sender_for_handle,
+                                    &connection_for_handle,
+                                    &pending_intellisense_for_handle,
+                                    &intellisense_parse_cache_for_handle,
+                                );
+                            } else {
+                                intellisense_popup_for_handle.borrow_mut().hide();
+                                *completion_range_for_handle.borrow_mut() = None;
+                                *pending_intellisense_for_handle.borrow_mut() = None;
+                                Self::invalidate_keyup_debounce(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
+                                );
+                            }
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
-                            if word.len() >= 2 {
+                            if Self::has_min_intellisense_prefix(&word) {
                                 Self::schedule_keyup_intellisense_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -928,7 +947,7 @@ impl SqlEditorWidget {
                         }
                     }
 
-                    if word.len() >= 2 {
+                    if Self::has_min_intellisense_prefix(&word) {
                         Self::maybe_prefetch_columns_for_word(
                             &word,
                             &intellisense_data_for_handle,
@@ -1114,6 +1133,16 @@ impl SqlEditorWidget {
         let (word, start, _) = Self::word_at_cursor(buffer, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, start);
         let prefix = word;
+        let should_hide_after_statement_terminator = prefix.is_empty()
+            && qualifier.is_none()
+            && Self::non_whitespace_char_before_cursor(buffer, cursor_pos) == Some(';');
+
+        if should_hide_after_statement_terminator {
+            intellisense_popup.borrow_mut().hide();
+            *pending_intellisense.borrow_mut() = None;
+            *completion_range.borrow_mut() = None;
+            return;
+        }
 
         // Extract statement text once and cache parse results for repeated triggers
         // at the same cursor position (e.g. async column-load refreshes).
@@ -1311,30 +1340,10 @@ impl SqlEditorWidget {
             return;
         }
 
-        // Get cursor position in editor's local coordinates (already window-relative in FLTK)
-        let (cursor_x, cursor_y) = editor.position_to_xy(cursor_pos);
-
-        // Get window's screen coordinates
-        let (win_x, win_y) = editor
-            .window()
-            .map(|win| (win.x_root(), win.y_root()))
-            .unwrap_or((0, 0));
-
-        let popup_width = 320;
+        let popup_width = Self::INTELLISENSE_POPUP_WIDTH;
         let popup_height = (suggestions.len().min(10) * 20 + 10) as i32;
-
-        // Calculate absolute screen position
-        let mut popup_x = win_x + cursor_x;
-        let mut popup_y = win_y + cursor_y + 20;
-
-        if let Some(win) = editor.window() {
-            let win_w = win.w();
-            let win_h = win.h();
-            let max_x = (win_x + win_w - popup_width).max(win_x);
-            let max_y = (win_y + win_h - popup_height).max(win_y);
-            popup_x = popup_x.clamp(win_x, max_x);
-            popup_y = popup_y.clamp(win_y, max_y);
-        }
+        let (popup_x, popup_y) =
+            Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
 
         intellisense_popup
             .borrow_mut()
@@ -2057,27 +2066,16 @@ impl SqlEditorWidget {
     }
 
     fn clamp_to_char_boundary_local(text: &str, idx: usize) -> usize {
-        let idx = idx.min(text.len());
+        let mut idx = idx.min(text.len());
         if text.is_char_boundary(idx) {
             return idx;
         }
 
-        // Some FLTK builds can report UTF-8 cursor offsets as character counts
-        // instead of byte offsets. If that appears to be the case, reinterpret
-        // the offset as a character index first.
-        let char_count = text.chars().count();
-        if idx <= char_count {
-            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
-                return byte_pos;
-            }
-            return text.len();
+        // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
         }
-
-        text.char_indices()
-            .map(|(pos, _)| pos)
-            .take_while(|pos| *pos < idx)
-            .last()
-            .unwrap_or(0)
+        idx
     }
 
     fn raw_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
@@ -2350,6 +2348,7 @@ impl SqlEditorWidget {
     }
 
     fn try_fast_path_intellisense_filter(
+        editor: &TextEditor,
         buffer: &TextBuffer,
         intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
         completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
@@ -2382,9 +2381,42 @@ impl SqlEditorWidget {
             popup.filter_visible_suggestions_by_prefix(&prefix);
             if !popup.is_visible() {
                 *completion_range.borrow_mut() = None;
+            } else {
+                let (popup_width, popup_height) = popup.popup_dimensions();
+                let (popup_x, popup_y) =
+                    Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
+                popup.set_position(popup_x, popup_y);
+                *completion_range.borrow_mut() = Some((start, cursor.max(start)));
             }
         }
         true
+    }
+
+    fn popup_screen_position(
+        editor: &TextEditor,
+        cursor_pos: i32,
+        popup_width: i32,
+        popup_height: i32,
+    ) -> (i32, i32) {
+        let (cursor_x, cursor_y) = editor.position_to_xy(cursor_pos);
+        let (win_x, win_y) = editor
+            .window()
+            .map(|win| (win.x_root(), win.y_root()))
+            .unwrap_or((0, 0));
+
+        let mut popup_x = win_x + cursor_x;
+        let mut popup_y = win_y + cursor_y + Self::INTELLISENSE_POPUP_Y_OFFSET;
+
+        if let Some(win) = editor.window() {
+            let win_w = win.w();
+            let win_h = win.h();
+            let max_x = (win_x + win_w - popup_width).max(win_x);
+            let max_y = (win_y + win_h - popup_height).max(win_y);
+            popup_x = popup_x.clamp(win_x, max_x);
+            popup_y = popup_y.clamp(win_y, max_y);
+        }
+
+        (popup_x, popup_y)
     }
 
     fn is_cursor_within_completion_range(
@@ -2420,6 +2452,17 @@ impl SqlEditorWidget {
             )
     }
 
+    fn has_min_intellisense_prefix(word: &str) -> bool {
+        word.chars().count() >= 2
+    }
+
+    fn should_auto_trigger_intellisense_for_forced_char(
+        word: &str,
+        qualifier: Option<&str>,
+    ) -> bool {
+        qualifier.is_some() || Self::has_min_intellisense_prefix(word)
+    }
+
     fn prefix_in_completion_range(buffer: &TextBuffer, start: usize, cursor_pos: i32) -> String {
         let cursor = cursor_pos.max(0) as usize;
         let end = cursor.max(start);
@@ -2438,6 +2481,25 @@ impl SqlEditorWidget {
         let start = (cursor_pos - 4).max(0);
         let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
         text.chars().next_back()
+    }
+
+    fn non_whitespace_char_before_cursor(buffer: &TextBuffer, cursor_pos: i32) -> Option<char> {
+        if cursor_pos <= 0 {
+            return None;
+        }
+        let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
+        let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
+        text.chars().rev().find(|ch| !ch.is_whitespace())
+    }
+
+    #[cfg(test)]
+    fn non_whitespace_char_before_cursor_in_text(text: &str, cursor_pos: usize) -> Option<char> {
+        if text.is_empty() || cursor_pos == 0 {
+            return None;
+        }
+        let cursor_pos = cursor_pos.min(text.len());
+        let text = text.get(..cursor_pos).unwrap_or("");
+        text.chars().rev().find(|ch| !ch.is_whitespace())
     }
 
     fn typed_char_from_key_event(
@@ -3136,6 +3198,35 @@ FROM d
     }
 
     #[test]
+    fn min_intellisense_prefix_uses_character_count() {
+        assert!(!SqlEditorWidget::has_min_intellisense_prefix(""));
+        assert!(!SqlEditorWidget::has_min_intellisense_prefix("a"));
+        assert!(SqlEditorWidget::has_min_intellisense_prefix("ab"));
+        assert!(!SqlEditorWidget::has_min_intellisense_prefix("한"));
+        assert!(SqlEditorWidget::has_min_intellisense_prefix("한글"));
+    }
+
+    #[test]
+    fn auto_trigger_forced_char_requires_qualifier_or_two_chars() {
+        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", None));
+        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
+            "a", None
+        ));
+        assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
+            "한", None
+        ));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
+            "ab", None
+        ));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
+            "한글", None
+        ));
+        assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char(
+            "", Some("t")
+        ));
+    }
+
+    #[test]
     fn tokens_before_cursor_byte_handles_utf8_boundaries() {
         let sql = "SELECT 한글 FROM dual";
         let cursor = "SELECT 한".len();
@@ -3552,6 +3643,26 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             Key::KPEnter,
             true,
         ));
+    }
+
+    #[test]
+    fn non_whitespace_char_before_cursor_in_text_detects_semicolon_before_cursor_marker() {
+        let sql_with_cursor = "select * from help;|";
+        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let ch = SqlEditorWidget::non_whitespace_char_before_cursor_in_text(&sql, cursor);
+        assert_eq!(ch, Some(';'));
+    }
+
+    #[test]
+    fn non_whitespace_char_before_cursor_in_text_skips_whitespace_after_semicolon() {
+        let sql_with_cursor = "select * from help;   |";
+        let cursor = sql_with_cursor.find('|').expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let ch = SqlEditorWidget::non_whitespace_char_before_cursor_in_text(&sql, cursor);
+        assert_eq!(ch, Some(';'));
     }
 
     #[test]

@@ -57,6 +57,37 @@ fn phase_select_list_after_column() {
 }
 
 #[test]
+fn phase_select_list_inside_plsql_for_in_subquery() {
+    let ctx = analyze(
+        r#"CREATE OR REPLACE PACKAGE BODY oqt_demo_pkg AS
+    PROCEDURE proc_fill_result_table (p_run_id IN NUMBER, p_min_sal IN NUMBER) IS
+        v_row_no NUMBER := 0;
+    BEGIN
+        DELETE FROM oqt_tmp_result WHERE run_id = p_run_id;
+        FOR r IN (
+            SELECT emp_id,
+                |,
+                sal
+            FROM oqt_emp
+            WHERE sal >= p_min_sal
+            ORDER BY sal
+        ) LOOP
+            v_row_no := v_row_no + 1;
+        END LOOP;
+    END;
+END oqt_demo_pkg;"#,
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "OQT_EMP"),
+        "expected oqt_emp in scope, got {:?}",
+        names
+    );
+}
+
+#[test]
 fn phase_from_clause() {
     let ctx = analyze("SELECT a FROM |");
     assert_eq!(ctx.phase, SqlPhase::FromClause);

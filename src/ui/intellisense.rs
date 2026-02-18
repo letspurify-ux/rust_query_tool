@@ -1516,6 +1516,14 @@ impl IntellisensePopup {
         *self.visible.borrow()
     }
 
+    pub fn popup_dimensions(&self) -> (i32, i32) {
+        (self.window.w(), self.window.h())
+    }
+
+    pub fn set_position(&mut self, x: i32, y: i32) {
+        self.window.set_pos(x, y);
+    }
+
     pub fn contains_point(&self, x: i32, y: i32) -> bool {
         let left = self.window.x();
         let top = self.window.y();
@@ -1586,31 +1594,53 @@ impl Default for IntellisensePopup {
 
 // Helper function to extract the current word at cursor position (Unicode-aware).
 // cursor_pos is a byte offset from FLTK TextBuffer.
+fn normalize_cursor_pos(text: &str, cursor_pos: usize) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let idx = cursor_pos.min(text.len());
+    if text.is_char_boundary(idx) {
+        return idx;
+    }
+
+    // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
+    let mut clamped = idx;
+    while clamped > 0 && !text.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
+}
+
 pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usize) {
     if text.is_empty() || cursor_pos == 0 {
         return (String::new(), 0, 0);
     }
 
-    let idx = cursor_pos.min(text.len());
-    let mut pos = idx;
-    if !text.is_char_boundary(pos) {
-        // Some FLTK builds report cursor offsets as character counts.
-        let char_count = text.chars().count();
-        if idx <= char_count {
-            if let Some((byte_pos, _)) = text.char_indices().nth(idx) {
-                pos = byte_pos;
+    let raw_pos = cursor_pos.min(text.len());
+    let pos = normalize_cursor_pos(text, raw_pos);
+    let cursor_was_non_boundary = raw_pos < text.len() && raw_pos != pos;
+    let effective_pos = if cursor_was_non_boundary {
+        // If FLTK gives an invalid byte offset in the middle of a UTF-8 character,
+        // advance to the end of the current identifier so prefix extraction remains stable.
+        let mut p = pos;
+        while p < text.len() {
+            let Some(ch) = text[p..].chars().next() else {
+                break;
+            };
+            if sql_text::is_identifier_char(ch) {
+                p += ch.len_utf8();
             } else {
-                pos = text.len();
-            }
-        } else {
-            while pos > 0 && !text.is_char_boundary(pos) {
-                pos -= 1;
+                break;
             }
         }
-    }
+        p
+    } else {
+        pos
+    };
 
     // Find word start by scanning backwards over identifier characters.
-    let mut start = pos;
+    let mut start = effective_pos;
     while start > 0 {
         let Some((prev_start, ch)) = text[..start].char_indices().next_back() else {
             break;
@@ -1623,7 +1653,7 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
     }
 
     // Find word end by scanning forwards over identifier characters.
-    let mut end = pos;
+    let mut end = effective_pos;
     while end < text.len() {
         let Some(ch) = text[end..].chars().next() else {
             break;
@@ -1635,7 +1665,7 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         }
     }
 
-    let word = text.get(start..pos).unwrap_or("").to_string();
+    let word = text.get(start..effective_pos).unwrap_or("").to_string();
     (word, start, end)
 }
 
@@ -1645,10 +1675,7 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
     use crate::ui::intellisense_context::{self, SqlPhase};
     use crate::ui::sql_editor::SqlEditorWidget;
 
-    let mut end = cursor_pos.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = normalize_cursor_pos(text, cursor_pos);
     let before = &text[..end];
     let tokens = SqlEditorWidget::tokenize_sql(before);
     let full_tokens = SqlEditorWidget::tokenize_sql(text);
@@ -1752,9 +1779,9 @@ mod intellisense_tests {
     }
 
     #[test]
-    fn get_word_at_cursor_supports_character_index_cursor_offsets() {
+    fn get_word_at_cursor_clamps_non_boundary_utf8_offset() {
         let sql = "SELECT 한글컬럼 FROM dual";
-        let cursor = "SELECT 한글컬럼".chars().count();
+        let cursor = sql.find('한').expect("expected utf-8 anchor") + 1;
         let (word, _, _) = get_word_at_cursor(sql, cursor);
         assert_eq!(word, "한글컬럼");
     }
@@ -1765,6 +1792,27 @@ mod intellisense_tests {
         let cursor = sql.find("한").unwrap_or(0) + 1;
         let result = std::panic::catch_unwind(|| detect_sql_context(sql, cursor));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn normalize_cursor_pos_clamps_non_boundary_utf8_offset() {
+        let sql = "SELECT 한글컬럼 FROM dual";
+        let utf8_start = sql.find('한').expect("expected utf-8 anchor");
+        let mid_char = utf8_start + 1;
+        assert!(!sql.is_char_boundary(mid_char));
+        assert_eq!(normalize_cursor_pos(sql, mid_char), utf8_start);
+    }
+
+    #[test]
+    fn detect_sql_context_clamps_non_boundary_utf8_offset() {
+        let sql = "SELECT 한글컬럼 FROM dual";
+        let utf8_start = sql.find('한').expect("expected utf-8 anchor");
+        let mid_char = utf8_start + 1;
+        assert!(!sql.is_char_boundary(mid_char));
+        assert_eq!(
+            detect_sql_context(sql, mid_char),
+            detect_sql_context(sql, utf8_start)
+        );
     }
 
     #[test]

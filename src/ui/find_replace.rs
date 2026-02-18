@@ -35,10 +35,12 @@ fn normalize_search_pos(text: &str, pos: i32) -> i32 {
     if text.is_empty() {
         return 0;
     }
-    let mut p = pos.max(0) as usize;
-    if p > text.len() {
-        p = text.len();
+    let mut p = (pos.max(0) as usize).min(text.len());
+    if text.is_char_boundary(p) {
+        return p as i32;
     }
+
+    // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
     while p > 0 && !text.is_char_boundary(p) {
         p -= 1;
     }
@@ -589,7 +591,7 @@ fn find_next_match(
     if search_text.is_empty() || text.is_empty() {
         return None;
     }
-    let start_pos = if start_pos < 0 { 0 } else { start_pos as usize };
+    let start_pos = normalize_search_pos(text, start_pos) as usize;
     let Some(haystack) = text.get(start_pos..) else {
         return None;
     };
@@ -600,10 +602,73 @@ fn find_next_match(
         return Some((match_start, match_end));
     }
 
-    let haystack_lower = haystack.to_ascii_lowercase();
-    let search_lower = search_text.to_ascii_lowercase();
-    let pos = haystack_lower.find(&search_lower)?;
+    let pos = find_ascii_case_insensitive(haystack, search_text)?;
     let match_start = start_pos + pos;
     let match_end = match_start + search_text.len();
     Some((match_start, match_end))
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() || needle_bytes.len() > haystack_bytes.len() {
+        return None;
+    }
+
+    let last = haystack_bytes.len() - needle_bytes.len();
+    for idx in 0..=last {
+        if !haystack.is_char_boundary(idx) {
+            continue;
+        }
+        let end = idx + needle_bytes.len();
+        if !haystack.is_char_boundary(end) {
+            continue;
+        }
+        if haystack_bytes[idx..end]
+            .iter()
+            .zip(needle_bytes.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_next_match, normalize_search_pos};
+
+    #[test]
+    fn normalize_search_pos_clamps_non_boundary_utf8_offset() {
+        let text = "ab한글cd";
+        let mid_char_offset = text.find('한').expect("expected utf-8 anchor") + 1;
+        let normalized = normalize_search_pos(text, mid_char_offset as i32);
+        assert_eq!(normalized as usize, text.find('한').unwrap_or(0));
+    }
+
+    #[test]
+    fn find_next_match_clamps_non_boundary_utf8_offset() {
+        let text = "a한b한c";
+        let second_han = text.rfind('한').expect("expected second utf8 anchor");
+        let mid_second_han = second_han + 1;
+        let (start, end) = find_next_match(text, "한", mid_second_han as i32, true)
+            .expect("expected to find second match");
+        assert_eq!(start, second_han);
+        assert_eq!(end, second_han + "한".len());
+    }
+
+    #[test]
+    fn find_next_match_case_insensitive_handles_utf8_with_byte_scan() {
+        let text = "가A나a";
+        let first_ascii = text.find('A').expect("expected first ascii letter");
+        let second_ascii = text.rfind('a').expect("expected second ascii letter");
+
+        let first = find_next_match(text, "a", 0, false).expect("expected first match");
+        assert_eq!(first, (first_ascii, first_ascii + "A".len()));
+
+        let second = find_next_match(text, "A", first.1 as i32, false).expect("expected second match");
+        assert_eq!(second, (second_ascii, second_ascii + "a".len()));
+    }
 }

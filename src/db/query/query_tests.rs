@@ -45,6 +45,26 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
+    let sql = "SELECT 1 FROM dual;\nSELECT 한글 AS txt FROM dual;";
+    let utf8_start = sql.find('한').expect("expected utf-8 anchor in second statement");
+    let mid_char_cursor = utf8_start + 1;
+    assert!(
+        !sql.is_char_boundary(mid_char_cursor),
+        "test requires a non-byte-boundary cursor to validate clamping"
+    );
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, mid_char_cursor)
+        .expect("expected statement bounds for UTF-8 cursor offset");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.contains("한글 AS txt"),
+        "expected second statement, got: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");
@@ -2264,6 +2284,31 @@ fn test_print_prefix_word_not_parsed_as_print_tool_command() {
 }
 
 #[test]
+fn test_print_command_rejects_unicode_confusable_keyword() {
+    let sql = "PRıNT :b_var";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert!(
+        tool_commands.is_empty(),
+        "Unicode confusable keyword must not be parsed as PRINT tool command: {:?}",
+        tool_commands
+    );
+    assert_eq!(statements, vec![sql]);
+}
+
+#[test]
 fn test_prompt_prefix_word_not_parsed_as_prompt_tool_command() {
     let sql = "SELECT prompt_col FROM dual;";
 
@@ -3014,6 +3059,26 @@ fn test_clear_computes_parsed() {
     assert!(
         has_clear_computes,
         "CLEAR COMPUTES should be recognized, got: {:?}",
+        items
+    );
+}
+
+#[test]
+fn test_accept_prompt_with_utf8_prefix_before_prompt_keyword() {
+    let sql = "ACCEPT v ıprompt '메시지'";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let parsed = items.iter().find_map(|item| match item {
+        ScriptItem::ToolCommand(ToolCommand::Accept { name, prompt }) => {
+            Some((name.as_str(), prompt.as_deref()))
+        }
+        _ => None,
+    });
+
+    assert_eq!(
+        parsed,
+        Some(("v", Some("메시지"))),
+        "UTF-8 text before PROMPT should not break prompt slicing: {:?}",
         items
     );
 }

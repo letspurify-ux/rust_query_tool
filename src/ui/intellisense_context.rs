@@ -130,7 +130,11 @@ pub fn analyze_cursor_context(
     full_statement: &[SqlToken],
 ) -> CursorContext {
     let phase_analysis = analyze_phase(before_cursor);
-    let table_analysis = collect_tables_deep(full_statement, &phase_analysis.visible_scope_chain);
+    let table_analysis = collect_tables_deep(
+        full_statement,
+        &phase_analysis.visible_scope_chain,
+        before_cursor.len(),
+    );
     let ctes = parse_ctes(full_statement);
 
     let mut tables_in_scope = table_analysis.tables;
@@ -433,6 +437,30 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     cte_state = CteState::ExpectName;
                 }
             }
+            SqlToken::Symbol(sym) if sym == ";" => {
+                // Keep scope numbering aligned with collect_tables_deep so
+                // visible_scope_chain matches table scope IDs across PL/SQL.
+                let has_following_statement = tokens[idx + 1..]
+                    .iter()
+                    .any(|t| !matches!(t, SqlToken::Comment(_)));
+                if !has_following_statement {
+                    break;
+                }
+
+                depth = 0;
+                phase_stack = vec![SqlPhase::Initial];
+                paren_func_stack = vec![None];
+                last_word = None;
+                next_scope_id = 1;
+                scope_stack = vec![0usize];
+                visible_parent.clear();
+                visible_parent.insert(0, None);
+                pending_lateral_subquery = false;
+                cte_state = CteState::None;
+                cte_paren_depth = 0;
+                idx += 1;
+                continue;
+            }
             _ => {
                 pending_lateral_subquery = false;
             }
@@ -468,7 +496,11 @@ fn anonymous_subquery_name(start_idx: usize, depth: usize) -> String {
 
 /// Collect all table references from the full statement, tracking depth.
 /// Returns tables visible from the cursor's active scope chain.
-fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> TableAnalysis {
+fn collect_tables_deep(
+    tokens: &[SqlToken],
+    cursor_scope_chain: &[usize],
+    cursor_token_len: usize,
+) -> TableAnalysis {
     struct ParsedTable {
         table: ScopedTableRef,
         scope_id: usize,
@@ -644,6 +676,9 @@ fn collect_tables_deep(tokens: &[SqlToken], cursor_scope_chain: &[usize]) -> Tab
                 continue;
             }
             SqlToken::Symbol(sym) if sym == ";" => {
+                if idx >= cursor_token_len {
+                    break;
+                }
                 // Statement boundary - reset only when another statement follows.
                 // Keep collected state for trailing terminators in the final statement.
                 let has_following_statement = tokens[idx + 1..]
@@ -1313,7 +1348,7 @@ fn is_alias_breaker(word: &str) -> bool {
 /// Collect top-level tables visible within a standalone statement.
 /// This avoids full cursor-phase analysis when only table scope is needed.
 pub fn collect_tables_in_statement(tokens: &[SqlToken]) -> Vec<ScopedTableRef> {
-    collect_tables_deep(tokens, &[0]).tables
+    collect_tables_deep(tokens, &[0], tokens.len()).tables
 }
 
 /// Resolve which tables are relevant for a given qualifier (alias or table name).

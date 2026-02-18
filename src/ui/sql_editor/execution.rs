@@ -259,16 +259,16 @@ impl SqlEditorWidget {
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
-        let idx = index.min(text.len());
+        let mut idx = index.min(text.len());
         if text.is_char_boundary(idx) {
             return idx;
         }
 
-        text.char_indices()
-            .map(|(pos, _)| pos)
-            .take_while(|pos| *pos < idx)
-            .last()
-            .unwrap_or(0)
+        // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
     }
 
     fn map_cursor_after_format(
@@ -8349,6 +8349,18 @@ END oqt_mega_pkg;"#;
         assert_eq!(
             normalized, byte_offset as usize,
             "normalize_index should preserve byte offsets as-is"
+        );
+    }
+
+    #[test]
+    fn normalize_index_clamps_non_boundary_utf8_byte_offset() {
+        let source = "SELECT 한글, b FROM dual";
+        let utf8_start = source.find('한').expect("expected utf-8 anchor");
+        let mid_char_offset = utf8_start + 1;
+        let normalized = SqlEditorWidget::normalize_index(source, mid_char_offset as i32);
+        assert_eq!(
+            normalized, utf8_start,
+            "normalize_index should clamp invalid UTF-8 byte offsets"
         );
     }
 

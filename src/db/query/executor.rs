@@ -117,15 +117,16 @@ impl QueryExecutor {
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
-        let idx = index.min(text.len());
+        let mut idx = index.min(text.len());
         if text.is_char_boundary(idx) {
             return idx;
         }
-        text.char_indices()
-            .map(|(pos, _)| pos)
-            .take_while(|pos| *pos < idx)
-            .last()
-            .unwrap_or(0)
+
+        // Clamp invalid UTF-8 byte offsets to the previous valid boundary.
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
     }
 
     /// Check if the SQL is a CREATE [OR REPLACE] TRIGGER statement.
@@ -1314,7 +1315,7 @@ impl QueryExecutor {
             .collect()
     }
 
-    /// Return the statement containing the cursor position (character index).
+    /// Return the statement containing the cursor position (byte offset).
     pub fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String> {
         if sql.trim().is_empty() {
             return None;

@@ -1463,7 +1463,7 @@ impl QueryExecutor {
 
         for line in sql.lines() {
             let trimmed = line.trim();
-            let trimmed_upper = trimmed.to_uppercase();
+            let trimmed_upper = trimmed.to_ascii_uppercase();
 
             if !sqlblanklines_enabled
                 && trimmed.is_empty()
@@ -1594,7 +1594,7 @@ impl QueryExecutor {
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
-            let trimmed_upper = trimmed.to_uppercase();
+            let trimmed_upper = trimmed.to_ascii_uppercase();
             let is_remark_line = Self::is_sqlplus_comment_line(trimmed);
 
             if !sqlblanklines_enabled
@@ -1743,7 +1743,7 @@ impl QueryExecutor {
             return None;
         }
 
-        let upper = trimmed.to_uppercase();
+        let upper = trimmed.to_ascii_uppercase();
 
         if upper == "VAR" || upper.starts_with("VAR ") || upper.starts_with("VARIABLE ") {
             return Some(Self::parse_var_command(trimmed));
@@ -2128,7 +2128,8 @@ impl QueryExecutor {
         let prompt = if remainder.is_empty() {
             None
         } else {
-            let upper = remainder.to_uppercase();
+            // Keep byte offsets aligned with `remainder` when slicing `prompt_raw`.
+            let upper = remainder.to_ascii_uppercase();
             if let Some(idx) = upper.find("PROMPT") {
                 let prompt_raw = remainder[idx + 6..].trim();
                 let cleaned = prompt_raw.trim_matches('"').trim_matches('\'').to_string();
@@ -2413,7 +2414,7 @@ impl QueryExecutor {
         }
 
         let mut append = false;
-        let path_part = if rest.to_uppercase().ends_with(" APPEND") {
+        let path_part = if rest.to_ascii_uppercase().ends_with(" APPEND") {
             append = true;
             rest[..rest.len() - "APPEND".len()].trim()
         } else {
@@ -2502,9 +2503,10 @@ impl QueryExecutor {
     fn parse_connect_command(raw: &str) -> ToolCommand {
         // CONNECT syntax: CONNECT user/password@host:port/service_name
         // or: CONNECT user/password@//host:port/service_name
-        let rest = if raw.to_uppercase().starts_with("CONNECT") {
+        let raw_upper = raw.to_ascii_uppercase();
+        let rest = if raw_upper.starts_with("CONNECT") {
             raw[7..].trim()
-        } else if raw.to_uppercase().starts_with("CONN") {
+        } else if raw_upper.starts_with("CONN") {
             raw[4..].trim()
         } else {
             raw.trim()
