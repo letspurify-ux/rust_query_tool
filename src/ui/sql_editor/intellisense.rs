@@ -31,6 +31,13 @@ use super::*;
 const MAX_MERGED_SUGGESTIONS: usize = 50;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 
+#[derive(Clone, Copy)]
+struct KeyupDebounceRequest {
+    generation: u64,
+    cursor_pos: i32,
+    buffer_len: i32,
+}
+
 impl SqlEditorWidget {
     const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
     const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
@@ -100,7 +107,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let (debounce_sender, debounce_receiver) = app::channel::<u64>();
+        let (debounce_sender, debounce_receiver) = app::channel::<KeyupDebounceRequest>();
 
         let debounce_editor = self.editor.clone();
         let debounce_buffer = self.buffer.clone();
@@ -113,10 +120,19 @@ impl SqlEditorWidget {
         let debounce_generation_for_check = keyup_debounce_generation.clone();
 
         app::add_check(move |_| {
-            while let Some(token) = debounce_receiver.recv() {
-                if debounce_generation_for_check.get() != token {
+            while let Some(request) = debounce_receiver.recv() {
+                if debounce_generation_for_check.get() != request.generation {
                     continue;
                 }
+
+                if debounce_editor.insert_position().max(0) != request.cursor_pos {
+                    continue;
+                }
+
+                if debounce_buffer.length() != request.buffer_len {
+                    continue;
+                }
+
                 Self::trigger_intellisense(
                     &debounce_editor,
                     &debounce_buffer,
@@ -366,8 +382,9 @@ impl SqlEditorWidget {
                                 }
                                 intellisense_popup_for_handle.borrow_mut().hide();
                                 *pending_intellisense_for_handle.borrow_mut() = None;
-                                keyup_debounce_generation_for_handle
-                                    .set(keyup_debounce_generation_for_handle.get().wrapping_add(1));
+                                keyup_debounce_generation_for_handle.set(
+                                    keyup_debounce_generation_for_handle.get().wrapping_add(1),
+                                );
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
                             _ => {
@@ -613,22 +630,24 @@ impl SqlEditorWidget {
 
                     // Handle typing - update intellisense filter
                     let (word, _, _) = Self::word_at_cursor(&buffer_for_handle, cursor_pos);
-                    let context_text = Self::normalize_intellisense_context_text(
-                        &Self::context_before_cursor(&buffer_for_handle, cursor_pos),
-                    );
-                    let context = detect_sql_context(&context_text, context_text.len());
+                    let buffer_len = buffer_for_handle.length();
 
                     if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
                         if word.len() >= 2 {
-                            let token = keyup_debounce_generation_for_handle.get().wrapping_add(1);
-                            keyup_debounce_generation_for_handle.set(token);
+                            let generation =
+                                keyup_debounce_generation_for_handle.get().wrapping_add(1);
+                            keyup_debounce_generation_for_handle.set(generation);
                             let sender = debounce_sender_for_handle.clone();
                             thread::spawn(move || {
                                 thread::sleep(Duration::from_millis(
                                     KEYUP_INTELLISENSE_DEBOUNCE_MS,
                                 ));
-                                sender.send(token);
+                                sender.send(KeyupDebounceRequest {
+                                    generation,
+                                    cursor_pos,
+                                    buffer_len,
+                                });
                             });
                         } else {
                             intellisense_popup_for_handle.borrow_mut().hide();
@@ -639,28 +658,36 @@ impl SqlEditorWidget {
                         }
                     } else if let Some(ch) = typed_char {
                         if ch == '.' {
-                            Self::trigger_intellisense(
-                                ed,
-                                &buffer_for_handle,
-                                &intellisense_data_for_handle,
-                                &intellisense_popup_for_handle,
-                                &completion_range_for_handle,
-                                &column_sender_for_handle,
-                                &connection_for_handle,
-                                &pending_intellisense_for_handle,
-                            );
+                            let generation =
+                                keyup_debounce_generation_for_handle.get().wrapping_add(1);
+                            keyup_debounce_generation_for_handle.set(generation);
+                            let sender = debounce_sender_for_handle.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(
+                                    KEYUP_INTELLISENSE_DEBOUNCE_MS,
+                                ));
+                                sender.send(KeyupDebounceRequest {
+                                    generation,
+                                    cursor_pos,
+                                    buffer_len,
+                                });
+                            });
                         } else if sql_text::is_identifier_char(ch) {
                             // Alphanumeric typed - show/update popup if word is long enough
                             if word.len() >= 2 {
-                                let token =
+                                let generation =
                                     keyup_debounce_generation_for_handle.get().wrapping_add(1);
-                                keyup_debounce_generation_for_handle.set(token);
+                                keyup_debounce_generation_for_handle.set(generation);
                                 let sender = debounce_sender_for_handle.clone();
                                 thread::spawn(move || {
                                     thread::sleep(Duration::from_millis(
                                         KEYUP_INTELLISENSE_DEBOUNCE_MS,
                                     ));
-                                    sender.send(token);
+                                    sender.send(KeyupDebounceRequest {
+                                        generation,
+                                        cursor_pos,
+                                        buffer_len,
+                                    });
                                 });
                             } else {
                                 intellisense_popup_for_handle.borrow_mut().hide();
@@ -681,13 +708,14 @@ impl SqlEditorWidget {
                         }
                     }
 
-                    Self::maybe_prefetch_columns_for_word(
-                        context,
-                        &word,
-                        &intellisense_data_for_handle,
-                        &column_sender_for_handle,
-                        &connection_for_handle,
-                    );
+                    if word.len() >= 2 {
+                        Self::maybe_prefetch_columns_for_word(
+                            &word,
+                            &intellisense_data_for_handle,
+                            &column_sender_for_handle,
+                            &connection_for_handle,
+                        );
+                    }
                     false
                 }
                 Event::Unfocus => {
@@ -1134,9 +1162,9 @@ impl SqlEditorWidget {
                 return true;
             }
             let key = table.to_uppercase();
-            virtual_wildcard_dependencies.get(&key).is_some_and(|deps| {
-                deps.iter().any(|dep| table_is_loading(data, dep))
-            })
+            virtual_wildcard_dependencies
+                .get(&key)
+                .is_some_and(|deps| deps.iter().any(|dep| table_is_loading(data, dep)))
         })
     }
 
@@ -1228,13 +1256,12 @@ impl SqlEditorWidget {
     }
 
     fn maybe_prefetch_columns_for_word(
-        context: SqlContext,
         word: &str,
         intellisense_data: &Rc<RefCell<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
-        if !matches!(context, SqlContext::TableName) || word.is_empty() {
+        if word.is_empty() {
             return;
         }
 
@@ -2407,9 +2434,12 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
 ";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
 
-        assert_eq!(normalized, "WITH cte AS (SELECT 1 FROM dual)
+        assert_eq!(
+            normalized,
+            "WITH cte AS (SELECT 1 FROM dual)
 SELECT * FROM cte
-");
+"
+        );
     }
 
     #[test]
