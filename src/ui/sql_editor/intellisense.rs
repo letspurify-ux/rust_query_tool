@@ -2086,43 +2086,9 @@ impl SqlEditorWidget {
     }
 
     fn tokens_before_cursor_byte(sql: &str, cursor_byte: usize) -> Vec<SqlToken> {
-        let cursor_byte = cursor_byte.min(sql.len());
-        let mut before = Vec::new();
-        let mut search_from = 0usize;
-
-        for token in Self::tokenize_sql(sql) {
-            let raw = match &token {
-                SqlToken::Word(v)
-                | SqlToken::String(v)
-                | SqlToken::Comment(v)
-                | SqlToken::Symbol(v) => v.as_str(),
-            };
-
-            let needle = if matches!(token, SqlToken::Comment(_)) {
-                raw.strip_prefix('\n').unwrap_or(raw)
-            } else {
-                raw
-            };
-
-            if needle.is_empty() {
-                continue;
-            }
-
-            let Some(found_rel) = sql.get(search_from..).and_then(|rest| rest.find(needle)) else {
-                continue;
-            };
-            let start = search_from + found_rel;
-            let end = start + needle.len();
-            search_from = end;
-
-            if end <= cursor_byte {
-                before.push(token);
-            } else {
-                break;
-            }
-        }
-
-        before
+        let cursor_byte = Self::clamp_to_char_boundary_local(sql, cursor_byte.min(sql.len()));
+        let before = sql.get(..cursor_byte).unwrap_or("");
+        Self::tokenize_sql(before)
     }
 
     fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
@@ -3174,8 +3140,9 @@ FROM d
         let sql = "SELECT 한글 FROM dual";
         let cursor = "SELECT 한".len();
         let tokens = SqlEditorWidget::tokens_before_cursor_byte(sql, cursor);
-        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens.first(), Some(SqlToken::Word(word)) if word == "SELECT"));
+        assert!(matches!(tokens.get(1), Some(SqlToken::Word(word)) if word == "한"));
     }
 
     #[test]
