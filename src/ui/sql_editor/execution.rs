@@ -197,8 +197,6 @@ impl SqlEditorWidget {
     pub fn format_selected_sql(&self) {
         let mut buffer = self.buffer.clone();
         let full_text = buffer.text();
-        let editor_uses_char_offsets =
-            Self::editor_reports_char_offsets(&full_text, buffer.length());
         let selection = buffer.selection_position();
         let (start, end, source, select_formatted) = match selection {
             Some((start, end)) if start != end => {
@@ -208,16 +206,15 @@ impl SqlEditorWidget {
                     (end, start)
                 };
                 (
-                    Self::normalize_index(&full_text, start, editor_uses_char_offsets),
-                    Self::normalize_index(&full_text, end, editor_uses_char_offsets),
+                    Self::normalize_index(&full_text, start),
+                    Self::normalize_index(&full_text, end),
                     buffer.selection_text(),
                     true,
                 )
             }
             _ => {
                 let text = buffer.text();
-                let end =
-                    Self::normalize_index(&full_text, buffer.length(), editor_uses_char_offsets);
+                let end = Self::normalize_index(&full_text, buffer.length());
                 (0, end, text, false)
             }
         };
@@ -231,11 +228,7 @@ impl SqlEditorWidget {
         }
 
         let mut editor = self.editor.clone();
-        let original_pos = Self::normalize_index(
-            &full_text,
-            editor.insert_position(),
-            editor_uses_char_offsets,
-        );
+        let original_pos = Self::normalize_index(&full_text, editor.insert_position());
         buffer.replace(start as i32, end as i32, &formatted);
 
         if select_formatted {
@@ -257,20 +250,12 @@ impl SqlEditorWidget {
         self.refresh_highlighting();
     }
 
-    fn normalize_index(text: &str, index: i32, _prefer_char_offsets: bool) -> usize {
+    fn normalize_index(text: &str, index: i32) -> usize {
         if index <= 0 {
             0
         } else {
             Self::clamp_to_char_boundary(text, index as usize)
         }
-    }
-
-    fn editor_reports_char_offsets(text: &str, reported_length: i32) -> bool {
-        if reported_length < 0 {
-            return false;
-        }
-        let reported_length = reported_length as usize;
-        reported_length != text.len()
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
@@ -8360,20 +8345,21 @@ END oqt_mega_pkg;"#;
             .find('b')
             .expect("expected cursor anchor should exist") as i32;
 
-        let normalized = SqlEditorWidget::normalize_index(source, byte_offset, true);
+        let normalized = SqlEditorWidget::normalize_index(source, byte_offset);
         assert_eq!(
             normalized, byte_offset as usize,
-            "normalize_index should preserve byte offsets regardless of char-offset hint"
+            "normalize_index should preserve byte offsets as-is"
         );
     }
 
     #[test]
-    fn editor_reports_char_offsets_is_false_when_length_is_byte_count() {
-        let source = "SELECT éa, b FROM dual";
-        assert!(!SqlEditorWidget::editor_reports_char_offsets(
-            source,
-            source.len() as i32
-        ));
+    fn normalize_index_clamps_invalid_utf8_boundary_without_panic() {
+        let source = "SELECT 한글, b FROM dual";
+        let mid_char_index = source.find("한").expect("expected unicode anchor") + 1;
+
+        let normalized = SqlEditorWidget::normalize_index(source, mid_char_index as i32);
+        assert!(source.is_char_boundary(normalized));
+        assert!(normalized <= source.len());
     }
 
     #[test]
