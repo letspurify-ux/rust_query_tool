@@ -11,8 +11,7 @@ use crate::ui::sql_editor::SqlToken;
 /// 기존 에디터 토크나이저 동작(문자열, 주석, 라벨, 심벌 처리)을 유지합니다.
 pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
     let mut tokens = Vec::new();
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
+    let mut iter = sql.char_indices().peekable();
     let mut current = String::new();
     let mut scan_state = SplitState::default();
     let mut pending_newline = true;
@@ -23,32 +22,35 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
         }
     };
 
-    let is_sqlplus_line_comment = |chars: &[char], start: usize, keyword: &str| -> bool {
-        if start >= chars.len() {
+    let is_sqlplus_line_comment = |sql: &str, start: usize, keyword: &str| -> bool {
+        if start >= sql.len() {
             return false;
         }
-        let keyword_chars = keyword.chars().collect::<Vec<_>>();
-        if start + keyword_chars.len() > chars.len() {
+        let rest = &sql[start..];
+        if rest.len() < keyword.len() {
             return false;
         }
-        for (idx, kw_char) in keyword_chars.iter().enumerate() {
-            if !chars[start + idx].eq_ignore_ascii_case(kw_char) {
+        for (left, right) in rest.bytes().zip(keyword.bytes()).take(keyword.len()) {
+            if !left.eq_ignore_ascii_case(&right) {
                 return false;
             }
         }
-        match chars.get(start + keyword_chars.len()) {
+        match rest[keyword.len()..].chars().next() {
             None => true,
             Some(ch) => ch.is_whitespace(),
         }
     };
 
-    while i < chars.len() {
-        let c = chars[i];
-        let next = if i + 1 < chars.len() {
-            Some(chars[i + 1])
-        } else {
-            None
-        };
+    let peek_n_char = |iter: &std::iter::Peekable<std::str::CharIndices<'_>>, n: usize| {
+        let mut lookahead = iter.clone();
+        for _ in 0..n {
+            lookahead.next()?;
+        }
+        lookahead.next().map(|(_, ch)| ch)
+    };
+
+    while let Some((idx, c)) = iter.next() {
+        let next = iter.peek().map(|(_, ch)| *ch);
 
         if scan_state.in_line_comment {
             current.push(c);
@@ -57,38 +59,35 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
                 scan_state.in_line_comment = false;
                 pending_newline = true;
             }
-            i += 1;
             continue;
         }
 
         if scan_state.in_block_comment {
             current.push(c);
             if c == '*' && next == Some('/') {
+                iter.next();
                 current.push('/');
-                if i + 2 < chars.len() && chars[i + 2] == '\n' {
+                if iter.peek().map(|(_, ch)| *ch) == Some('\n') {
+                    iter.next();
                     current.push('\n');
-                    i += 1;
                 }
                 tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
                 scan_state.in_block_comment = false;
-                i += 2;
                 continue;
             }
-            i += 1;
             continue;
         }
 
         if scan_state.in_q_quote {
             current.push(c);
             if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
+                iter.next();
                 current.push('\'');
                 tokens.push(SqlToken::String(std::mem::take(&mut current)));
                 scan_state.in_q_quote = false;
                 scan_state.q_quote_end = None;
-                i += 2;
                 continue;
             }
-            i += 1;
             continue;
         }
 
@@ -96,16 +95,14 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push(c);
             if c == '\'' {
                 if next == Some('\'') {
+                    iter.next();
                     current.push('\'');
-                    i += 2;
                     continue;
                 }
                 tokens.push(SqlToken::String(std::mem::take(&mut current)));
                 scan_state.in_single_quote = false;
-                i += 1;
                 continue;
             }
-            i += 1;
             continue;
         }
 
@@ -113,16 +110,14 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push(c);
             if c == '"' {
                 if next == Some('"') {
+                    iter.next();
                     current.push('"');
-                    i += 2;
                     continue;
                 }
                 tokens.push(SqlToken::Word(std::mem::take(&mut current)));
                 scan_state.in_double_quote = false;
-                i += 1;
                 continue;
             }
-            i += 1;
             continue;
         }
 
@@ -131,12 +126,13 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             if c == '\n' {
                 pending_newline = true;
             }
-            i += 1;
             continue;
         }
 
-        if pending_newline && (is_sqlplus_line_comment(&chars, i, "REMARK") ||
-            is_sqlplus_line_comment(&chars, i, "REM")) {
+        if pending_newline
+            && (is_sqlplus_line_comment(sql, idx, "REMARK")
+                || is_sqlplus_line_comment(sql, idx, "REM"))
+        {
             flush_word(&mut current, &mut tokens);
             scan_state.in_line_comment = true;
             if pending_newline {
@@ -144,7 +140,6 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             }
             current.push(c);
             pending_newline = false;
-            i += 1;
             continue;
         }
 
@@ -157,7 +152,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push('-');
             current.push('-');
             pending_newline = false;
-            i += 2;
+            iter.next();
             continue;
         }
 
@@ -170,41 +165,47 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             current.push('/');
             current.push('*');
             pending_newline = false;
-            i += 2;
+            iter.next();
             continue;
         }
 
         pending_newline = false;
 
-        // Handle nq-quoted strings: nq'[...]', nq'{...}', etc. (National Character Set)
         if (c == 'n' || c == 'N')
             && (next == Some('q') || next == Some('Q'))
-            && i + 2 < chars.len()
-            && chars[i + 2] == '\''
-            && i + 3 < chars.len()
+            && peek_n_char(&iter, 1) == Some('\'')
+            && peek_n_char(&iter, 2).is_some()
         {
-            let delimiter = chars[i + 3];
+            let delimiter = peek_n_char(&iter, 2).expect("checked is_some");
             flush_word(&mut current, &mut tokens);
             current.push(c);
-            current.push(chars[i + 1]);
+            current.push(next.expect("checked above"));
             current.push('\'');
             current.push(delimiter);
             scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(scan_state.q_quote_end(), Some(sql_text::q_quote_closing(delimiter)));
-            i += 4;
+            debug_assert_eq!(
+                scan_state.q_quote_end(),
+                Some(sql_text::q_quote_closing(delimiter))
+            );
+            iter.next();
+            iter.next();
+            iter.next();
             continue;
         }
 
-        // Handle q-quoted strings: q'[...]', q'{...}', q'(...)', q'<...>', q'!...!'
-        if (c == 'q' || c == 'Q') && next == Some('\'') && i + 2 < chars.len() {
-            let delimiter = chars[i + 2];
+        if (c == 'q' || c == 'Q') && next == Some('\'') && peek_n_char(&iter, 1).is_some() {
+            let delimiter = peek_n_char(&iter, 1).expect("checked is_some");
             flush_word(&mut current, &mut tokens);
             current.push(c);
             current.push('\'');
             current.push(delimiter);
             scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(scan_state.q_quote_end(), Some(sql_text::q_quote_closing(delimiter)));
-            i += 3;
+            debug_assert_eq!(
+                scan_state.q_quote_end(),
+                Some(sql_text::q_quote_closing(delimiter))
+            );
+            iter.next();
+            iter.next();
             continue;
         }
 
@@ -212,7 +213,6 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             flush_word(&mut current, &mut tokens);
             scan_state.in_single_quote = true;
             current.push('\'');
-            i += 1;
             continue;
         }
 
@@ -220,34 +220,28 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
             flush_word(&mut current, &mut tokens);
             scan_state.in_double_quote = true;
             current.push('"');
-            i += 1;
             continue;
         }
 
         if sql_text::is_identifier_char(c) {
             current.push(c);
-            i += 1;
             continue;
         }
 
         flush_word(&mut current, &mut tokens);
 
-        // Handle <<label>> (Oracle PL/SQL labels)
         if c == '<' && next == Some('<') {
             let mut label = String::from("<<");
-            let mut j = i + 2;
-            while j < chars.len() {
-                let ch = chars[j];
+            iter.next();
+            while let Some((_, ch)) = iter.next() {
                 label.push(ch);
-                if ch == '>' && j + 1 < chars.len() && chars[j + 1] == '>' {
+                if ch == '>' && iter.peek().map(|(_, c)| *c) == Some('>') {
+                    iter.next();
                     label.push('>');
-                    j += 2;
                     break;
                 }
-                j += 1;
             }
             tokens.push(SqlToken::Word(label));
-            i = j;
             continue;
         }
 
@@ -264,12 +258,11 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
 
         if let Some(sym) = sym {
             tokens.push(SqlToken::Symbol(sym));
-            i += 2;
+            iter.next();
             continue;
         }
 
         tokens.push(SqlToken::Symbol(c.to_string()));
-        i += 1;
     }
 
     if scan_state.in_line_comment || scan_state.in_block_comment {
@@ -335,8 +328,297 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_connection_bootstrap_command;
+    use super::{has_connection_bootstrap_command, tokenize_sql};
+    use crate::db::SplitState;
+    use crate::sql_text;
     use crate::ui::sql_editor::SqlToken;
+
+    fn tokenize_sql_reference(sql: &str) -> Vec<SqlToken> {
+        let mut tokens = Vec::new();
+        let chars: Vec<char> = sql.chars().collect();
+        let mut i = 0;
+        let mut current = String::new();
+        let mut scan_state = SplitState::default();
+        let mut pending_newline = true;
+
+        let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
+            if !current.is_empty() {
+                tokens.push(SqlToken::Word(std::mem::take(current)));
+            }
+        };
+
+        let is_sqlplus_line_comment = |chars: &[char], start: usize, keyword: &str| -> bool {
+            if start >= chars.len() {
+                return false;
+            }
+            let keyword_chars = keyword.chars().collect::<Vec<_>>();
+            if start + keyword_chars.len() > chars.len() {
+                return false;
+            }
+            for (idx, kw_char) in keyword_chars.iter().enumerate() {
+                if !chars[start + idx].eq_ignore_ascii_case(kw_char) {
+                    return false;
+                }
+            }
+            match chars.get(start + keyword_chars.len()) {
+                None => true,
+                Some(ch) => ch.is_whitespace(),
+            }
+        };
+
+        while i < chars.len() {
+            let c = chars[i];
+            let next = if i + 1 < chars.len() {
+                Some(chars[i + 1])
+            } else {
+                None
+            };
+
+            if scan_state.in_line_comment {
+                current.push(c);
+                if c == '\n' {
+                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
+                    scan_state.in_line_comment = false;
+                    pending_newline = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            if scan_state.in_block_comment {
+                current.push(c);
+                if c == '*' && next == Some('/') {
+                    current.push('/');
+                    if i + 2 < chars.len() && chars[i + 2] == '\n' {
+                        current.push('\n');
+                        i += 1;
+                    }
+                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
+                    scan_state.in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if scan_state.in_q_quote {
+                current.push(c);
+                if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
+                    current.push('\'');
+                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
+                    scan_state.in_q_quote = false;
+                    scan_state.q_quote_end = None;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if scan_state.in_single_quote {
+                current.push(c);
+                if c == '\'' {
+                    if next == Some('\'') {
+                        current.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
+                    scan_state.in_single_quote = false;
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if scan_state.in_double_quote {
+                current.push(c);
+                if c == '"' {
+                    if next == Some('"') {
+                        current.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    tokens.push(SqlToken::Word(std::mem::take(&mut current)));
+                    scan_state.in_double_quote = false;
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c.is_whitespace() {
+                flush_word(&mut current, &mut tokens);
+                if c == '\n' {
+                    pending_newline = true;
+                }
+                i += 1;
+                continue;
+            }
+
+            if pending_newline
+                && (is_sqlplus_line_comment(&chars, i, "REMARK")
+                    || is_sqlplus_line_comment(&chars, i, "REM"))
+            {
+                flush_word(&mut current, &mut tokens);
+                scan_state.in_line_comment = true;
+                if pending_newline {
+                    current.push('\n');
+                }
+                current.push(c);
+                pending_newline = false;
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                flush_word(&mut current, &mut tokens);
+                scan_state.in_line_comment = true;
+                if pending_newline {
+                    current.push('\n');
+                }
+                current.push('-');
+                current.push('-');
+                pending_newline = false;
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                flush_word(&mut current, &mut tokens);
+                scan_state.in_block_comment = true;
+                if pending_newline {
+                    current.push('\n');
+                }
+                current.push('/');
+                current.push('*');
+                pending_newline = false;
+                i += 2;
+                continue;
+            }
+
+            pending_newline = false;
+
+            if (c == 'n' || c == 'N')
+                && (next == Some('q') || next == Some('Q'))
+                && i + 2 < chars.len()
+                && chars[i + 2] == '\''
+                && i + 3 < chars.len()
+            {
+                let delimiter = chars[i + 3];
+                flush_word(&mut current, &mut tokens);
+                current.push(c);
+                current.push(chars[i + 1]);
+                current.push('\'');
+                current.push(delimiter);
+                scan_state.start_q_quote(delimiter);
+                debug_assert_eq!(
+                    scan_state.q_quote_end(),
+                    Some(sql_text::q_quote_closing(delimiter))
+                );
+                i += 4;
+                continue;
+            }
+
+            if (c == 'q' || c == 'Q') && next == Some('\'') && i + 2 < chars.len() {
+                let delimiter = chars[i + 2];
+                flush_word(&mut current, &mut tokens);
+                current.push(c);
+                current.push('\'');
+                current.push(delimiter);
+                scan_state.start_q_quote(delimiter);
+                debug_assert_eq!(
+                    scan_state.q_quote_end(),
+                    Some(sql_text::q_quote_closing(delimiter))
+                );
+                i += 3;
+                continue;
+            }
+
+            if c == '\'' {
+                flush_word(&mut current, &mut tokens);
+                scan_state.in_single_quote = true;
+                current.push('\'');
+                i += 1;
+                continue;
+            }
+
+            if c == '"' {
+                flush_word(&mut current, &mut tokens);
+                scan_state.in_double_quote = true;
+                current.push('"');
+                i += 1;
+                continue;
+            }
+
+            if sql_text::is_identifier_char(c) {
+                current.push(c);
+                i += 1;
+                continue;
+            }
+
+            flush_word(&mut current, &mut tokens);
+
+            if c == '<' && next == Some('<') {
+                let mut label = String::from("<<");
+                let mut j = i + 2;
+                while j < chars.len() {
+                    let ch = chars[j];
+                    label.push(ch);
+                    if ch == '>' && j + 1 < chars.len() && chars[j + 1] == '>' {
+                        label.push('>');
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                tokens.push(SqlToken::Word(label));
+                i = j;
+                continue;
+            }
+
+            let sym = match (c, next) {
+                ('<', Some('=')) => Some("<=".to_string()),
+                ('>', Some('=')) => Some(">=".to_string()),
+                ('<', Some('>')) => Some("<>".to_string()),
+                ('!', Some('=')) => Some("!=".to_string()),
+                ('|', Some('|')) => Some("||".to_string()),
+                (':', Some('=')) => Some(":=".to_string()),
+                ('=', Some('>')) => Some("=>".to_string()),
+                _ => None,
+            };
+
+            if let Some(sym) = sym {
+                tokens.push(SqlToken::Symbol(sym));
+                i += 2;
+                continue;
+            }
+
+            tokens.push(SqlToken::Symbol(c.to_string()));
+            i += 1;
+        }
+
+        if scan_state.in_line_comment || scan_state.in_block_comment {
+            if !current.is_empty() {
+                tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
+            }
+        } else if scan_state.in_single_quote || scan_state.in_q_quote {
+            if !current.is_empty() {
+                tokens.push(SqlToken::String(std::mem::take(&mut current)));
+            }
+        } else if scan_state.in_double_quote {
+            if !current.is_empty() {
+                tokens.push(SqlToken::Word(std::mem::take(&mut current)));
+            }
+        } else {
+            flush_word(&mut current, &mut tokens);
+        }
+
+        tokens
+    }
 
     #[test]
     fn has_connection_bootstrap_command_detects_connect_and_script_lines() {
@@ -352,16 +634,47 @@ mod tests {
 
     #[test]
     fn tokenize_sql_treats_sqlplus_rem_comment_as_comment_token() {
-        let tokens = super::tokenize_sql("REM comment line");
+        let tokens = tokenize_sql("REM comment line");
         assert!(matches!(tokens.first(), Some(SqlToken::Comment(_))));
     }
 
     #[test]
     fn tokenize_sql_treats_sqlplus_remark_comment_as_comment_token() {
-        let tokens = super::tokenize_sql("  REMARK line with leading spaces");
+        let tokens = tokenize_sql("  REMARK line with leading spaces");
         assert!(matches!(tokens.first(), Some(SqlToken::Comment(_))));
     }
 
+    fn normalize_tokens(tokens: Vec<SqlToken>) -> Vec<(&'static str, String)> {
+        tokens
+            .into_iter()
+            .map(|token| match token {
+                SqlToken::Word(v) => ("word", v),
+                SqlToken::Symbol(v) => ("symbol", v),
+                SqlToken::String(v) => ("string", v),
+                SqlToken::Comment(v) => ("comment", v),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tokenize_sql_matches_reference_for_regression_cases() {
+        let cases = [
+            "REM comment line\nSELECT 1 FROM dual;",
+            "REMARK 한글 코멘트\nSELECT '가나다' FROM dual;",
+            "-- line comment\n/* block comment */\nSELECT q'[한글;테스트]' FROM dual;",
+            "BEGIN\n  <<outer_label>>\n  NULL;\nEND;\n/",
+            "SELECT nq'{문자열 ''보존''}' AS txt, a<=b, a<>b, a!=b, a||b, c:=d, e=>f FROM dual;",
+            "/* 한글 블록\n코멘트 */\nSELECT \"컬럼명\" FROM \"테이블\";",
+        ];
+
+        for sql in cases {
+            assert_eq!(
+                normalize_tokens(tokenize_sql(sql)),
+                normalize_tokens(tokenize_sql_reference(sql)),
+                "sql: {sql}"
+            );
+        }
+    }
 }
 
 /// SQL*Plus 커맨드 라인인지 판별합니다.
@@ -390,9 +703,10 @@ pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
 pub(crate) fn normalize_single_statement(statement: &str) -> String {
     let items = QueryExecutor::split_script_items(statement);
     if items.len() > 1 {
-        if let Some(ScriptItem::Statement(stmt)) = items.into_iter().find(|item| {
-            matches!(item, ScriptItem::Statement(_))
-        }) {
+        if let Some(ScriptItem::Statement(stmt)) = items
+            .into_iter()
+            .find(|item| matches!(item, ScriptItem::Statement(_)))
+        {
             return stmt;
         }
     }
