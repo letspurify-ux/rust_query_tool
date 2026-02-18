@@ -2060,6 +2060,9 @@ impl SqlEditorWidget {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
+        let full_text = buffer.text();
+        let cursor_pos = Self::clamp_to_char_boundary_local(&full_text, cursor_pos as usize) as i32;
+        let start = Self::clamp_to_char_boundary_local(&full_text, start as usize) as i32;
         let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
         let (stmt_start, _) = Self::statement_bounds_in_text(&text, text.len());
         text.get(stmt_start..).unwrap_or("").to_string()
@@ -2097,6 +2100,10 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
         let end = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
+        let full_text = buffer.text();
+        let cursor_pos = Self::clamp_to_char_boundary_local(&full_text, cursor_pos as usize) as i32;
+        let start = Self::clamp_to_char_boundary_local(&full_text, start as usize) as i32;
+        let end = Self::clamp_to_char_boundary_local(&full_text, end as usize) as i32;
         let Some(text) = buffer.text_range(start, end) else {
             return (String::new(), 0);
         };
@@ -2118,11 +2125,13 @@ impl SqlEditorWidget {
         if text.is_empty() {
             return String::new();
         }
-        let cursor_pos = cursor_pos.min(text.len());
+        let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text.len()));
         let start = cursor_pos.saturating_sub(INTELLISENSE_STATEMENT_WINDOW as usize);
         let end = cursor_pos
             .saturating_add(INTELLISENSE_STATEMENT_WINDOW as usize)
             .min(text.len());
+        let start = Self::clamp_to_char_boundary_local(text, start);
+        let end = Self::clamp_to_char_boundary_local(text, end);
         let window = text.get(start..end).unwrap_or("");
         let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(window, rel_cursor);
@@ -2131,8 +2140,9 @@ impl SqlEditorWidget {
 
     #[cfg(test)]
     fn context_before_cursor_in_text(text: &str, cursor_pos: usize) -> String {
-        let cursor_pos = cursor_pos.min(text.len());
+        let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text.len()));
         let start = cursor_pos.saturating_sub(INTELLISENSE_CONTEXT_WINDOW as usize);
+        let start = Self::clamp_to_char_boundary_local(text, start);
         let window = text.get(start..cursor_pos).unwrap_or("");
         let (stmt_start, _) = Self::statement_bounds_in_text(window, window.len());
         window.get(stmt_start..).unwrap_or("").to_string()
@@ -3135,6 +3145,34 @@ FROM d
             "context_before_cursor should include the latest select list columns, got {:?}",
             context.get(0..120).unwrap_or("")
         );
+    }
+
+    #[test]
+    fn statement_context_window_clamps_utf8_start_boundary() {
+        let mut sql = String::from("가");
+        sql.push_str(&"a".repeat(INTELLISENSE_STATEMENT_WINDOW as usize - 1));
+        let cursor = sql.len();
+
+        let context = SqlEditorWidget::statement_context_in_text(&sql, cursor);
+        assert!(
+            !context.is_empty(),
+            "statement_context should not become empty when window starts in UTF-8 middle byte"
+        );
+        assert!(context.contains('가'));
+    }
+
+    #[test]
+    fn context_before_cursor_window_clamps_utf8_start_boundary() {
+        let mut sql = String::from("가");
+        sql.push_str(&"a".repeat(INTELLISENSE_CONTEXT_WINDOW as usize - 1));
+        let cursor = sql.len();
+
+        let context = SqlEditorWidget::context_before_cursor_in_text(&sql, cursor);
+        assert!(
+            !context.is_empty(),
+            "context_before_cursor should not become empty when window starts in UTF-8 middle byte"
+        );
+        assert!(context.contains('가'));
     }
 
     #[test]
