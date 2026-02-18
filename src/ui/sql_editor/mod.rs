@@ -676,6 +676,9 @@ impl SqlEditorWidget {
 
             let mut disconnected = false;
             let mut processed = 0usize;
+            let mut should_refresh_pending = false;
+            let mut should_clear_pending = false;
+            let mut highlight_columns: Option<Vec<String>> = None;
             // Process any pending messages
             {
                 let r = receiver.borrow();
@@ -683,7 +686,7 @@ impl SqlEditorWidget {
                     match r.try_recv() {
                         Ok(update) => {
                             processed += 1;
-                            let (should_refresh_pending, should_clear_pending, highlight_columns) = {
+                            let (refresh_pending, clear_pending, new_highlight_columns) = {
                                 let mut data = intellisense_data.borrow_mut();
                                 if update.cache_columns {
                                     data.set_columns_for_table(&update.table, update.columns);
@@ -699,56 +702,10 @@ impl SqlEditorWidget {
                                     (false, data.columns_loading.is_empty(), None)
                                 }
                             };
-
-                            if let Some(highlight_columns) = highlight_columns {
-                                let should_refresh_highlighting = {
-                                    let mut highlighter = highlighter.borrow_mut();
-                                    let mut highlight_data = highlighter.get_highlight_data();
-                                    if highlight_data.columns == highlight_columns {
-                                        false
-                                    } else {
-                                        highlight_data.columns = highlight_columns;
-                                        highlighter.set_highlight_data(highlight_data);
-                                        true
-                                    }
-                                };
-
-                                if should_refresh_highlighting {
-                                    let cursor_pos = editor.insert_position().max(0) as usize;
-                                    highlighter.borrow().highlight_buffer_window(
-                                        &buffer,
-                                        &mut style_buffer.clone(),
-                                        cursor_pos,
-                                        None,
-                                    );
-                                }
-                            }
-
-                            if should_refresh_pending {
-                                let pending = pending_intellisense.borrow().clone();
-                                if let Some(pending) = pending {
-                                    let cursor_pos = editor.insert_position().max(0);
-                                    if cursor_pos == pending.cursor_pos {
-                                        SqlEditorWidget::trigger_intellisense(
-                                            &editor,
-                                            &buffer,
-                                            &intellisense_data,
-                                            &intellisense_popup,
-                                            &completion_range,
-                                            &column_sender,
-                                            &connection,
-                                            &pending_intellisense,
-                                        );
-                                    } else {
-                                        // Cursor moved since async load was requested.
-                                        // Drop stale pending state so poll loop can idle.
-                                        *pending_intellisense.borrow_mut() = None;
-                                    }
-                                }
-                            }
-
-                            if should_clear_pending {
-                                *pending_intellisense.borrow_mut() = None;
+                            should_refresh_pending |= refresh_pending;
+                            should_clear_pending |= clear_pending;
+                            if new_highlight_columns.is_some() {
+                                highlight_columns = new_highlight_columns;
                             }
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
@@ -762,6 +719,57 @@ impl SqlEditorWidget {
 
             if disconnected {
                 return;
+            }
+
+            if should_clear_pending {
+                *pending_intellisense.borrow_mut() = None;
+            }
+
+            if let Some(highlight_columns) = highlight_columns {
+                let should_refresh_highlighting = {
+                    let mut highlighter = highlighter.borrow_mut();
+                    let mut highlight_data = highlighter.get_highlight_data();
+                    if highlight_data.columns == highlight_columns {
+                        false
+                    } else {
+                        highlight_data.columns = highlight_columns;
+                        highlighter.set_highlight_data(highlight_data);
+                        true
+                    }
+                };
+
+                if should_refresh_highlighting {
+                    let cursor_pos = editor.insert_position().max(0) as usize;
+                    highlighter.borrow().highlight_buffer_window(
+                        &buffer,
+                        &mut style_buffer.clone(),
+                        cursor_pos,
+                        None,
+                    );
+                }
+            }
+
+            if should_refresh_pending {
+                let pending = pending_intellisense.borrow().clone();
+                if let Some(pending) = pending {
+                    let cursor_pos = editor.insert_position().max(0);
+                    if cursor_pos == pending.cursor_pos {
+                        SqlEditorWidget::trigger_intellisense(
+                            &editor,
+                            &buffer,
+                            &intellisense_data,
+                            &intellisense_popup,
+                            &completion_range,
+                            &column_sender,
+                            &connection,
+                            &pending_intellisense,
+                        );
+                    } else {
+                        // Cursor moved since async load was requested.
+                        // Drop stale pending state so poll loop can idle.
+                        *pending_intellisense.borrow_mut() = None;
+                    }
+                }
             }
 
             let stale_cleared = {
