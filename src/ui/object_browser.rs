@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
+use std::rc::Weak;
 use std::thread;
 
 use crate::db::{
@@ -113,6 +114,7 @@ pub struct ObjectBrowserWidget {
     status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Rc<RefCell<ObjectCache>>,
+    poll_lifecycle: Rc<()>,
     refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
 }
@@ -184,6 +186,7 @@ impl ObjectBrowserWidget {
         let sql_callback: SqlExecuteCallback = Rc::new(RefCell::new(None));
         let status_callback: StatusCallback = Rc::new(RefCell::new(None));
         let object_cache = Rc::new(RefCell::new(ObjectCache::default()));
+        let poll_lifecycle = Rc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
         let (action_sender, action_receiver) = std::sync::mpsc::channel::<ObjectActionResult>();
@@ -194,6 +197,7 @@ impl ObjectBrowserWidget {
             connection,
             filter_input,
             object_cache,
+            poll_lifecycle,
             sql_callback,
             status_callback,
             refresh_sender,
@@ -244,6 +248,8 @@ impl ObjectBrowserWidget {
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
 
+        let lifecycle = Rc::downgrade(&self.poll_lifecycle);
+
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
         let receiver: Rc<RefCell<std::sync::mpsc::Receiver<RefreshEvent>>> =
             Rc::new(RefCell::new(refresh_receiver));
@@ -254,7 +260,12 @@ impl ObjectBrowserWidget {
             object_cache: Rc<RefCell<ObjectCache>>,
             filter_input: Input,
             status_callback: StatusCallback,
+            lifecycle: Weak<()>,
         ) {
+            if lifecycle.upgrade().is_none() {
+                return;
+            }
+
             let mut disconnected = false;
             // Process any pending messages
             {
@@ -294,6 +305,7 @@ impl ObjectBrowserWidget {
                     Rc::clone(&object_cache),
                     filter_input.clone(),
                     status_callback.clone(),
+                    lifecycle.clone(),
                 );
             });
         }
@@ -305,6 +317,7 @@ impl ObjectBrowserWidget {
             object_cache,
             filter_input,
             self.status_callback.clone(),
+            lifecycle,
         );
     }
 
@@ -317,6 +330,7 @@ impl ObjectBrowserWidget {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
+        let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
         let receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectActionResult>>> =
             Rc::new(RefCell::new(action_receiver));
@@ -328,7 +342,12 @@ impl ObjectBrowserWidget {
             mut tree: Tree,
             object_cache: Rc<RefCell<ObjectCache>>,
             filter_input: Input,
+            lifecycle: Weak<()>,
         ) {
+            if lifecycle.upgrade().is_none() {
+                return;
+            }
+
             let mut disconnected = false;
             loop {
                 let message = {
@@ -618,6 +637,7 @@ impl ObjectBrowserWidget {
                     tree.clone(),
                     Rc::clone(&object_cache),
                     filter_input.clone(),
+                    lifecycle.clone(),
                 );
             });
         }
@@ -629,6 +649,7 @@ impl ObjectBrowserWidget {
             tree,
             object_cache,
             filter_input,
+            lifecycle,
         );
     }
 
