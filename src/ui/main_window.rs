@@ -1319,11 +1319,11 @@ impl MainWindow {
             };
 
             let was_active = s.active_editor_tab_id == tab_id;
-            s.editor_tabs[index].sql_editor.cleanup_for_close();
             if !s.query_tabs.close_tab(tab_id) {
                 return false;
             }
-            s.editor_tabs.remove(index);
+            let mut closing_tab = s.editor_tabs.remove(index);
+            closing_tab.sql_editor.cleanup_for_close();
 
             let mut created_tab_id = None;
             if s.editor_tabs.is_empty() {
