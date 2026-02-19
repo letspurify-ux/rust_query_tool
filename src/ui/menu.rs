@@ -65,6 +65,9 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     while dialog.shown() {
         app::wait();
     }
+
+    // Explicitly destroy top-level dialog widgets to release native resources.
+    Window::delete(dialog);
 }
 
 impl MenuBarBuilder {

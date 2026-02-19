@@ -113,6 +113,13 @@ src/
 - draw 콜백은 렌더링 전용으로 유지
 - 데이터 변경은 별도 경로에서 처리(재귀 redraw 방지)
 
+### 4.6 Window 수명/해제 (메모리 누수 방지)
+
+- `Window::default()`로 만든 top-level 다이얼로그/팝업은 `hide()`만으로 끝내지 말고, 종료 루프(`while dialog.shown()`) 이후 `Window::delete(dialog)`까지 호출한다.
+- 팝업 레지스트리(`Rc<RefCell<Vec<Window>>>`)를 쓰는 경우, 먼저 `retain(...)`으로 레지스트리에서 제거한 뒤 `Window::delete(...)`를 호출한다.
+- 탭/에디터 종료 시 재사용하지 않는 popup window(예: intellisense)는 콜백/데이터 슬롯 정리 후 명시 삭제한다.
+- 삭제 전에는 필요 시 `was_deleted()`로 중복 삭제를 방지한다.
+
 ---
 
 ## 5) 테스트/검증 원칙
@@ -161,6 +168,7 @@ src/
 - [ ] 문자열 인덱스/커서 로직이 바이트 오프셋 기준인가?
 - [ ] UTF-8 경계 검증(`is_char_boundary`)이 필요한 위치에 있는가?
 - [ ] UI 변경 시 redraw/스레드 경계가 안전한가?
+- [ ] top-level FLTK window/dialog가 `hide` 후 `Window::delete`까지 수행되는가?
 - [ ] 관련 테스트/검증 명령을 실행했는가?
 - [ ] 불필요한 파일/디버그 코드가 제거되었는가?
 - [ ] cargo test 모두 통과했는가?

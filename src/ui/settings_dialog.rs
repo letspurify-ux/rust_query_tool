@@ -414,6 +414,9 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
         app::wait();
     }
 
+    // Explicitly destroy top-level dialog widgets to release native resources.
+    Window::delete(dialog);
+
     let final_result = result.borrow_mut().take();
     final_result
 }

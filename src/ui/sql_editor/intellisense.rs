@@ -2745,6 +2745,9 @@ impl SqlEditorWidget {
                 dialog.hide();
             }
         }
+
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
     }
 
     pub fn show_quick_describe_text_dialog(title: &str, content: &str) {
@@ -2794,6 +2797,9 @@ impl SqlEditorWidget {
                 dialog.hide();
             }
         }
+
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
     }
     pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
         let mut popup = self.intellisense_popup.borrow_mut();

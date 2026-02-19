@@ -7767,6 +7767,9 @@ impl SqlEditorWidget {
             app::wait();
         }
 
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        fltk::window::Window::delete(dialog);
+
         if *cancelled.borrow() {
             None
         } else {

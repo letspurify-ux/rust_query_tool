@@ -780,6 +780,9 @@ impl QueryHistoryDialog {
             .borrow_mut()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
+
         let result = selected_sql.borrow().clone();
         result
     }

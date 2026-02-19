@@ -1190,6 +1190,9 @@ impl SqlEditorWidget {
                 dialog.hide();
             }
         }
+
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
     }
 
     fn emit_status(&self, message: &str) {
@@ -1365,7 +1368,7 @@ impl SqlEditorWidget {
             &self.keyup_debounce_handle,
         );
 
-        self.intellisense_popup.borrow_mut().clear_for_close();
+        self.intellisense_popup.borrow_mut().delete_for_close();
         *self.intellisense_data.borrow_mut() = IntellisenseData::new();
         self.highlighter
             .borrow_mut()

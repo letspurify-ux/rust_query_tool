@@ -145,6 +145,9 @@ impl ResultTableWidget {
         while dialog.shown() {
             app::wait();
         }
+
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
     }
 
     fn should_consume_boundary_arrow(table: &Table, key: Key) -> bool {

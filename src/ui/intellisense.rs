@@ -1513,6 +1513,13 @@ impl IntellisensePopup {
         *self.selected_callback.borrow_mut() = None;
     }
 
+    pub fn delete_for_close(&mut self) {
+        self.clear_for_close();
+        if !self.window.was_deleted() {
+            Window::delete(self.window.clone());
+        }
+    }
+
     pub fn is_visible(&self) -> bool {
         *self.visible.borrow()
     }

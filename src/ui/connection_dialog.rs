@@ -515,6 +515,9 @@ impl ConnectionDialog {
             .borrow_mut()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
+
         // Clear password from the returned ConnectionInfo clone held in config
         // (it was already saved to keyring if needed)
         let final_result = result.borrow().clone();

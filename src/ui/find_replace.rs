@@ -504,6 +504,9 @@ impl FindReplaceDialog {
         popups
             .borrow_mut()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
+
+        // Explicitly destroy top-level dialog widgets to release native resources.
+        Window::delete(dialog);
     }
 
     pub fn find_next_from_session(editor: &mut TextEditor, buffer: &mut TextBuffer) -> bool {
