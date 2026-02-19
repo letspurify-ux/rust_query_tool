@@ -9,7 +9,7 @@ use fltk::{
     text::{TextBuffer, TextEditor, WrapMode},
 };
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -258,6 +258,8 @@ pub struct SqlEditorWidget {
     history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Rc<RefCell<bool>>,
     undo_redo_state: Rc<RefCell<WordUndoRedoState>>,
+    keyup_debounce_generation: Rc<Cell<u64>>,
+    keyup_debounce_handle: Rc<RefCell<Option<app::TimeoutHandle>>>,
 }
 
 impl SqlEditorWidget {
@@ -426,6 +428,8 @@ impl SqlEditorWidget {
         let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Rc::new(RefCell::new(false));
         let undo_redo_state = Rc::new(RefCell::new(WordUndoRedoState::new(String::new())));
+        let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
+        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
         let mut widget = Self {
             group,
@@ -457,6 +461,8 @@ impl SqlEditorWidget {
             history_navigation_entries,
             applying_history_navigation,
             undo_redo_state,
+            keyup_debounce_generation,
+            keyup_debounce_handle,
         };
 
         widget.setup_intellisense();
@@ -1354,6 +1360,11 @@ impl SqlEditorWidget {
         *self.replace_callback.borrow_mut() = None;
         *self.file_drop_callback.borrow_mut() = None;
 
+        Self::invalidate_keyup_debounce(
+            &self.keyup_debounce_generation,
+            &self.keyup_debounce_handle,
+        );
+
         self.intellisense_popup.borrow_mut().clear_for_close();
         *self.intellisense_data.borrow_mut() = IntellisenseData::new();
         self.highlighter
@@ -1847,7 +1858,8 @@ mod execution_state_tests {
     use super::{
         classify_edit_group, EditGranularity, EditOperation, SqlEditorWidget, WordUndoRedoState,
     };
-    use std::cell::RefCell;
+    use fltk::app;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1880,6 +1892,25 @@ mod execution_state_tests {
         assert!(state.active_group.is_none());
         assert!(!state.applying_history);
     }
+
+    #[test]
+    fn invalidate_keyup_debounce_clears_timeout_handle() {
+        let _app = app::App::default();
+        let generation = Rc::new(Cell::new(0_u64));
+        let handle_slot = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
+
+        let handle = app::add_timeout3(5.0, |_| {});
+        *handle_slot.borrow_mut() = Some(handle);
+        assert!(app::has_timeout3(handle));
+
+        let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
+
+        assert_eq!(next, 1);
+        assert_eq!(generation.get(), 1);
+        assert!(handle_slot.borrow().is_none());
+        assert!(!app::has_timeout3(handle));
+    }
+
     #[test]
     fn finalize_execution_state_is_idempotent_when_already_reset() {
         let query_running = Rc::new(RefCell::new(false));
