@@ -50,6 +50,7 @@ struct SelectTransformState {
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(0);
 const PROGRESS_ROWS_MAX_BATCH: usize = 1;
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
+const MAX_STORED_CURSOR_ROWS: usize = 10_000;
 
 #[derive(Clone)]
 struct ScriptExecutionFrame {
@@ -5690,6 +5691,7 @@ impl SqlEditorWidget {
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut cursor_rows: Vec<Vec<String>> = Vec::new();
+                                    let mut cursor_rows_truncated = false;
                                     let mut last_flush = Instant::now();
                                     let cursor_start = Instant::now();
                                     let mut cursor_timed_out = false;
@@ -5734,7 +5736,11 @@ impl SqlEditorWidget {
                                                     return false;
                                                 }
                                             }
-                                            cursor_rows.push(row.clone());
+                                            if cursor_rows.len() < MAX_STORED_CURSOR_ROWS {
+                                                cursor_rows.push(row.clone());
+                                            } else {
+                                                cursor_rows_truncated = true;
+                                            }
                                             let mut display_row = row;
                                             SqlEditorWidget::apply_null_text_to_row(
                                                 &mut display_row,
@@ -5801,6 +5807,16 @@ impl SqlEditorWidget {
                                                 SqlEditorWidget::append_spool_output(
                                                     &session,
                                                     &[query_result.message.clone()],
+                                                );
+                                            }
+
+                                            if cursor_rows_truncated {
+                                                SqlEditorWidget::append_spool_output(
+                                                    &session,
+                                                    &[format!(
+                                                        "Cursor :{} stored rows were truncated to {} to limit memory usage.",
+                                                        cursor_name, MAX_STORED_CURSOR_ROWS
+                                                    )],
                                                 );
                                             }
                                             result_index += 1;
