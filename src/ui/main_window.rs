@@ -736,7 +736,7 @@ impl MainWindow {
 
         let mut clear_tabs_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label("Clear Tabs");
+            .with_label("Close All");
         clear_tabs_btn.set_color(theme::button_subtle());
         clear_tabs_btn.set_label_color(theme::text_secondary());
         clear_tabs_btn.set_frame(FrameType::RFlatBox);
