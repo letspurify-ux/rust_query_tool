@@ -2160,3 +2160,14 @@ impl ObjectBrowserWidget {
             .and_then(|item| item.label())
     }
 }
+
+impl Drop for ObjectBrowserWidget {
+    fn drop(&mut self) {
+        // Release callback closures early so captured state does not outlive
+        // the widget tree unnecessarily.
+        self.filter_input.set_callback(|_| {});
+        self.tree.handle(|_, _| false);
+        *self.sql_callback.borrow_mut() = None;
+        *self.status_callback.borrow_mut() = None;
+    }
+}
