@@ -1884,6 +1884,10 @@ impl ObjectBrowserWidget {
                 dialog.hide();
             }
         }
+
+        // Top-level dialogs created without a parent should be explicitly deleted
+        // to avoid retaining native FLTK resources across repeated opens.
+        Window::delete(dialog);
     }
 
     pub fn set_sql_callback<F>(&mut self, callback: F)
