@@ -3,6 +3,7 @@ use fltk::{
     text::{StyleTableEntry, TextBuffer},
 };
 use once_cell::sync::Lazy;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use super::intellisense::{ORACLE_FUNCTIONS, SQL_KEYWORDS};
@@ -128,6 +129,10 @@ impl TokenType {
             TokenType::Column => STYLE_COLUMN,
         }
     }
+
+    fn to_style_byte(self) -> u8 {
+        self.to_style_char() as u8
+    }
 }
 
 /// Holds additional identifiers for highlighting (tables, views, etc.)
@@ -217,7 +222,7 @@ impl SqlHighlighter {
         }
 
         if style_buffer.length() != text_len as i32 {
-            let default_styles: String = std::iter::repeat(STYLE_DEFAULT).take(text_len).collect();
+            let default_styles = style_bytes_to_string(vec![STYLE_DEFAULT as u8; text_len]);
             style_buffer.set_text(&default_styles);
         }
 
@@ -242,7 +247,7 @@ impl SqlHighlighter {
     /// IMPORTANT: FLTK TextBuffer uses byte-based indexing, so the style buffer
     /// must have one style character per byte.
     fn generate_styles(&self, text: &str) -> String {
-        let mut styles: Vec<char> = vec![STYLE_DEFAULT; text.len()];
+        let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; text.len()];
         let bytes = text.as_bytes();
         let mut idx = 0usize;
 
@@ -262,11 +267,7 @@ impl SqlHighlighter {
                         }
                         end += 1;
                     }
-                    for b in line_start..end {
-                        if let Some(style) = styles.get_mut(b) {
-                            *style = STYLE_COMMENT;
-                        }
-                    }
+                    styles[line_start..end].fill(STYLE_COMMENT as u8);
                     idx = end;
                     continue;
                 }
@@ -274,11 +275,7 @@ impl SqlHighlighter {
                     // SQL*Plus CONNECT lines (e.g. CONNECT user/pass@host:1521/FREE)
                     // contain many punctuation tokens; style only CONNECT keyword.
                     let keyword_end = scan + 7;
-                    for b in scan..keyword_end {
-                        if let Some(style) = styles.get_mut(b) {
-                            *style = STYLE_KEYWORD;
-                        }
-                    }
+                    styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
                     let mut end = scan;
                     while let Some(&b) = bytes.get(end) {
                         if b == b'\n' {
@@ -301,11 +298,7 @@ impl SqlHighlighter {
                     }
                     idx += 1;
                 }
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = STYLE_COMMENT;
-                    }
-                }
+                styles[start..idx].fill(STYLE_COMMENT as u8);
                 continue;
             }
 
@@ -326,11 +319,7 @@ impl SqlHighlighter {
                     }
                 }
                 let style_char = if is_hint { STYLE_HINT } else { STYLE_COMMENT };
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = style_char;
-                    }
-                }
+                styles[start..idx].fill(style_char as u8);
                 continue;
             }
 
@@ -350,11 +339,7 @@ impl SqlHighlighter {
                         }
                         idx += 1;
                     }
-                    for b in start..idx {
-                        if let Some(style) = styles.get_mut(b) {
-                            *style = STYLE_STRING;
-                        }
-                    }
+                    styles[start..idx].fill(STYLE_STRING as u8);
                     continue;
                 }
             }
@@ -372,11 +357,7 @@ impl SqlHighlighter {
                         }
                         idx += 1;
                     }
-                    for b in start..idx {
-                        if let Some(style) = styles.get_mut(b) {
-                            *style = STYLE_STRING;
-                        }
-                    }
+                    styles[start..idx].fill(STYLE_STRING as u8);
                     continue;
                 }
             }
@@ -396,11 +377,7 @@ impl SqlHighlighter {
                     }
                     idx += 1;
                 }
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = STYLE_STRING;
-                    }
-                }
+                styles[start..idx].fill(STYLE_STRING as u8);
                 continue;
             }
 
@@ -419,11 +396,7 @@ impl SqlHighlighter {
                     }
                     idx += 1;
                 }
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = STYLE_IDENTIFIER;
-                    }
-                }
+                styles[start..idx].fill(STYLE_IDENTIFIER as u8);
                 continue;
             }
 
@@ -444,11 +417,7 @@ impl SqlHighlighter {
                         break;
                     }
                 }
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = STYLE_NUMBER;
-                    }
-                }
+                styles[start..idx].fill(STYLE_NUMBER as u8);
                 continue;
             }
 
@@ -491,30 +460,20 @@ impl SqlHighlighter {
                             look_ahead += 1;
                         }
                         // Style the keyword and string as datetime literal
-                        for b in start..look_ahead {
-                            if let Some(style) = styles.get_mut(b) {
-                                *style = STYLE_DATETIME_LITERAL;
-                            }
-                        }
+                        styles[start..look_ahead].fill(STYLE_DATETIME_LITERAL as u8);
                         idx = look_ahead;
                         continue;
                     }
                 }
 
                 let token_type = self.classify_word(word);
-                for b in start..idx {
-                    if let Some(style) = styles.get_mut(b) {
-                        *style = token_type.to_style_char();
-                    }
-                }
+                styles[start..idx].fill(token_type.to_style_byte());
                 continue;
             }
 
             // Check for operators
             if is_operator_byte(byte) {
-                if let Some(style) = styles.get_mut(idx) {
-                    *style = STYLE_OPERATOR;
-                }
+                styles[idx] = STYLE_OPERATOR as u8;
                 idx += 1;
                 continue;
             }
@@ -522,28 +481,33 @@ impl SqlHighlighter {
             idx += 1;
         }
 
-        styles.into_iter().collect()
+        style_bytes_to_string(styles)
     }
 
     /// Classifies a word as keyword, function, identifier, or default
     fn classify_word(&self, word: &str) -> TokenType {
-        let upper = word.to_ascii_uppercase();
+        let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+            Cow::Owned(word.to_ascii_uppercase())
+        } else {
+            Cow::Borrowed(word)
+        };
+        let upper = upper.as_ref();
 
         // Check if it's a SQL keyword
-        if SQL_KEYWORDS_SET.contains(upper.as_str()) {
+        if SQL_KEYWORDS_SET.contains(upper) {
             return TokenType::Keyword;
         }
 
         // Check if it's an Oracle function
-        if ORACLE_FUNCTIONS_SET.contains(upper.as_str()) {
+        if ORACLE_FUNCTIONS_SET.contains(upper) {
             return TokenType::Function;
         }
 
         // Check if it's a known identifier (table, view, column)
-        if self.relation_lookup.contains(&upper) {
+        if self.relation_lookup.contains(upper) {
             return TokenType::Identifier;
         }
-        if self.column_lookup.contains(&upper) {
+        if self.column_lookup.contains(upper) {
             return TokenType::Column;
         }
 
@@ -561,101 +525,12 @@ fn windowed_range_from_buffer(
     buffer: &TextBuffer,
     cursor_pos: usize,
     text_len: usize,
-    full_text: Option<&str>,
 ) -> (usize, usize) {
     let start_candidate = cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS);
     let end_candidate = (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text_len);
 
-    let mut start = buffer.line_start(start_candidate as i32).max(0) as usize;
-    let mut end = buffer.line_end(end_candidate as i32).max(0) as usize;
-
-    let owned_full_text = if full_text.is_none() {
-        buffer.text_range(0, text_len as i32)
-    } else {
-        None
-    };
-    let full_text = full_text.or_else(|| owned_full_text.as_deref());
-
-    if let Some(text) = full_text {
-        let bytes = text.as_bytes();
-        let mut idx = 0usize;
-        let mut last_ws_before_start: Option<usize> = None;
-        let mut first_ws_after_end: Option<usize> = None;
-
-        while idx < bytes.len() {
-            let byte = bytes[idx];
-
-            if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
-                idx += 2;
-                while idx < bytes.len() && bytes[idx] != b'\n' {
-                    idx += 1;
-                }
-                continue;
-            }
-
-            if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
-                idx += 2;
-                while idx + 1 < bytes.len() {
-                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
-                        idx += 2;
-                        break;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-
-            if byte == b'\'' {
-                idx += 1;
-                while idx < bytes.len() {
-                    if bytes[idx] == b'\'' {
-                        if bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            continue;
-                        }
-                        idx += 1;
-                        break;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-
-            if byte == b'"' {
-                idx += 1;
-                while idx < bytes.len() {
-                    if bytes[idx] == b'"' {
-                        if bytes.get(idx + 1) == Some(&b'"') {
-                            idx += 2;
-                            continue;
-                        }
-                        idx += 1;
-                        break;
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-
-            if byte.is_ascii_whitespace() {
-                if idx <= start_candidate {
-                    last_ws_before_start = Some(idx);
-                }
-                if idx >= end_candidate && first_ws_after_end.is_none() {
-                    first_ws_after_end = Some(idx);
-                }
-            }
-
-            idx += 1;
-        }
-
-        if let Some(ws_start) = last_ws_before_start {
-            start = ws_start;
-        }
-        if let Some(ws_end) = first_ws_after_end {
-            end = ws_end.saturating_add(1);
-        }
-    }
+    let start = buffer.line_start(start_candidate as i32).max(0) as usize;
+    let end = buffer.line_end(end_candidate as i32).max(0) as usize;
 
     (start.min(text_len), end.min(text_len))
 }
@@ -694,17 +569,9 @@ fn select_highlight_ranges(
         }
     }
 
-    // For multi-window passes, fetch full text once and reuse it when expanding
-    // lexical boundaries so we don't rescan/clone the full buffer per window.
-    let full_text = if anchors.len() > 1 {
-        buffer.text_range(0, text_len as i32)
-    } else {
-        None
-    };
-
     let mut ranges: Vec<(usize, usize)> = anchors
         .into_iter()
-        .map(|anchor| windowed_range_from_buffer(buffer, anchor, text_len, full_text.as_deref()))
+        .map(|anchor| windowed_range_from_buffer(buffer, anchor, text_len))
         .collect();
 
     ranges.sort_unstable_by_key(|(start, _)| *start);
@@ -832,6 +699,11 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
         bytes.get(end),
         None | Some(b' ') | Some(b'\t') | Some(b'\n')
     )
+}
+
+fn style_bytes_to_string(styles: Vec<u8>) -> String {
+    // Styles use ASCII tags ('A'..'K'), so UTF-8 validation is unnecessary.
+    unsafe { String::from_utf8_unchecked(styles) }
 }
 
 #[cfg(test)]

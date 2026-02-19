@@ -618,3 +618,25 @@ fn test_columns_and_relations_use_different_styles() {
         "relations should use identifier style"
     );
 }
+
+#[test]
+fn test_multibyte_text_preserves_byte_length_styles() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT '한글🙂' AS 이름 FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    assert_eq!(
+        styles.len(),
+        text.len(),
+        "style length must match byte length"
+    );
+
+    let string_start = text.find("'").unwrap();
+    let string_end = text[string_start + 1..].find("'").unwrap() + string_start + 2;
+    assert!(
+        styles[string_start..string_end]
+            .chars()
+            .all(|c| c == STYLE_STRING),
+        "multibyte string literal should be string style"
+    );
+}

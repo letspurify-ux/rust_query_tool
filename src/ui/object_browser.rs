@@ -1329,456 +1329,60 @@ impl ObjectBrowserWidget {
 
                 let handle_choice = || {
                     match (choice_label.as_str(), &item_info) {
-                    ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Preparing SELECT TOP 100 for {}", object_name),
-                        );
-                        let Some(conn_guard) = try_lock_connection_with_activity(
-                            connection,
-                            format!("Preparing SELECT TOP 100 for {}", object_name),
-                        ) else {
-                            let _ = action_sender.send(ObjectActionResult::QueryAlreadyRunning);
-                            app::awake();
-                            return;
-                        };
-                        if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
-                            drop(conn_guard);
-                            fltk::dialog::alert_default("Not connected to database");
-                            return;
-                        }
-                        drop(conn_guard);
-                        let sql = format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name);
-                        ObjectBrowserWidget::emit_sql_callback(
-                            &sql_callback,
-                            SqlAction::Execute(sql),
-                        );
-                    }
-                    (
-                        label @ ("Execute Procedure" | "Execute Function"),
-                        ObjectItem::Simple {
-                            object_name,
-                            object_type,
-                        },
-                    ) if (label == "Execute Procedure" && object_type == "PROCEDURES")
-                        || (label == "Execute Function" && object_type == "FUNCTIONS") =>
-                    {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let object_name = object_name.clone();
-                        let routine_type = if label == "Execute Function" {
-                            "FUNCTION".to_string()
-                        } else {
-                            "PROCEDURE".to_string()
-                        };
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading {} arguments for {}", routine_type, object_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Loading {} arguments for {}", routine_type, object_name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let result = match conn_guard.require_live_connection() {
-                                Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
-                                    db_conn.as_ref(),
-                                    &object_name,
-                                )
-                                .map(|arguments| {
-                                    ObjectBrowserWidget::build_procedure_script(
-                                        &object_name,
-                                        &arguments,
-                                    )
-                                })
-                                .map_err(|err| err.to_string()),
-                                Err(message) => Err(message.to_string()),
-                            };
-
-                            let _ = sender.send(ObjectActionResult::RoutineScript {
-                                qualified_name: object_name,
-                                routine_type,
-                                result,
-                            });
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    (
-                        label @ ("Execute Procedure" | "Execute Function"),
-                        ObjectItem::PackageRoutine {
-                            package_name,
-                            routine_name,
-                            routine_type,
-                        },
-                    ) if (label == "Execute Procedure" && routine_type == "PROCEDURE")
-                        || (label == "Execute Function" && routine_type == "FUNCTION") =>
-                    {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let qualified_name = format!("{}.{}", package_name, routine_name);
-                        let package_name = package_name.clone();
-                        let routine_name = routine_name.clone();
-                        let routine_type = routine_type.clone();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading {} arguments for {}", routine_type, qualified_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!(
-                                    "Loading {} arguments for {}",
-                                    routine_type, qualified_name
-                                ),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let result = match conn_guard.require_live_connection() {
-                                Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
-                                    db_conn.as_ref(),
-                                    &package_name,
-                                    &routine_name,
-                                )
-                                .map(|arguments| {
-                                    ObjectBrowserWidget::build_procedure_script(
-                                        &qualified_name,
-                                        &arguments,
-                                    )
-                                })
-                                .map_err(|err| err.to_string()),
-                                Err(message) => Err(message.to_string()),
-                            };
-
-                            let _ = sender.send(ObjectActionResult::RoutineScript {
-                                qualified_name,
-                                routine_type,
-                                result,
-                            });
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    (
-                        "Check Compilation",
-                        ObjectItem::Simple {
-                            object_type,
-                            object_name,
-                        },
-                    ) => {
-                        let db_object_type = match object_type.as_str() {
-                            "PROCEDURES" => "PROCEDURE",
-                            "FUNCTIONS" => "FUNCTION",
-                            "PACKAGES" => "PACKAGE",
-                            "TRIGGERS" => "TRIGGER",
-                            _ => return,
-                        };
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let object_name = object_name.clone();
-                        let object_type = db_object_type.to_string();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Checking compilation status for {}", object_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Checking compilation status for {}", object_name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            if let Ok(db_conn) = conn_guard.require_live_connection() {
-                                let status = ObjectBrowser::get_object_status(
-                                    db_conn.as_ref(),
-                                    &object_name,
-                                    &object_type,
-                                )
-                                .unwrap_or_else(|_| "UNKNOWN".to_string());
-
-                                // Also check PACKAGE BODY status for packages
-                                let body_status = if object_type == "PACKAGE" {
-                                    ObjectBrowser::get_object_status(
-                                        db_conn.as_ref(),
-                                        &object_name,
-                                        "PACKAGE BODY",
-                                    )
-                                    .ok()
-                                } else {
-                                    None
-                                };
-
-                                let mut errors = ObjectBrowser::get_compilation_errors(
-                                    db_conn.as_ref(),
-                                    &object_name,
-                                    &object_type,
-                                )
-                                .unwrap_or_default();
-
-                                // For packages, also get PACKAGE BODY errors
-                                if object_type == "PACKAGE" {
-                                    if let Ok(body_errors) = ObjectBrowser::get_compilation_errors(
-                                        db_conn.as_ref(),
-                                        &object_name,
-                                        "PACKAGE BODY",
-                                    ) {
-                                        errors.extend(body_errors);
-                                    }
-                                }
-
-                                let combined_status = if let Some(bs) = body_status {
-                                    format!("Spec: {} / Body: {}", status, bs)
-                                } else {
-                                    status
-                                };
-
-                                let _ = sender.send(ObjectActionResult::CompilationErrors {
-                                    object_name,
-                                    object_type,
-                                    status: combined_status,
-                                    result: Ok(errors),
-                                });
-                                app::awake();
-                            } else {
-                                let _ = sender.send(ObjectActionResult::CompilationErrors {
-                                    object_name,
-                                    object_type,
-                                    status: String::new(),
-                                    result: Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
-                                });
-                                app::awake();
-                            }
-
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    ("View Structure", ObjectItem::Simple { object_name, .. }) => {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let table_name = object_name.clone();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading table structure for {}", table_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Loading table structure for {}", table_name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let result = match conn_guard.require_live_connection() {
-                                Ok(db_conn) => ObjectBrowser::get_table_structure(
-                                    db_conn.as_ref(),
-                                    &table_name,
-                                )
-                                .map_err(|err| err.to_string()),
-                                Err(message) => Err(message.to_string()),
-                            };
-                            let _ = sender
-                                .send(ObjectActionResult::TableStructure { table_name, result });
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    ("View Indexes", ObjectItem::Simple { object_name, .. }) => {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let table_name = object_name.clone();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading indexes for {}", table_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Loading indexes for {}", table_name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let result = match conn_guard.require_live_connection() {
-                                Ok(db_conn) => {
-                                    ObjectBrowser::get_table_indexes(db_conn.as_ref(), &table_name)
-                                        .map_err(|err| err.to_string())
-                                }
-                                Err(message) => Err(message.to_string()),
-                            };
-                            let _ = sender
-                                .send(ObjectActionResult::TableIndexes { table_name, result });
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    ("View Constraints", ObjectItem::Simple { object_name, .. }) => {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let table_name = object_name.clone();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading constraints for {}", table_name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Loading constraints for {}", table_name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let result = match conn_guard.require_live_connection() {
-                                Ok(db_conn) => ObjectBrowser::get_table_constraints(
-                                    db_conn.as_ref(),
-                                    &table_name,
-                                )
-                                .map_err(|err| err.to_string()),
-                                Err(message) => Err(message.to_string()),
-                            };
-                            let _ = sender
-                                .send(ObjectActionResult::TableConstraints { table_name, result });
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    (
-                        "View Info",
-                        ObjectItem::Simple {
-                            object_type,
-                            object_name,
-                        },
-                    ) => {
-                        let connection = connection.clone();
-                        let sender = action_sender.clone();
-                        let name = object_name.clone();
-                        let obj_type = object_type.clone();
-                        Self::emit_status_callback(
-                            status_callback,
-                            &format!("Loading {} info for {}", obj_type, name),
-                        );
-                        thread::spawn(move || {
-                            // Try to acquire connection lock without blocking
-                            let Some(mut conn_guard) = try_lock_connection_with_activity(
-                                &connection,
-                                format!("Loading {} info for {}", obj_type, name),
-                            ) else {
-                                // Query is already running, notify user
-                                let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
-                                app::awake();
-                                return;
-                            };
-
-                            let send_err = |sender: &std::sync::mpsc::Sender<
-                                ObjectActionResult,
-                            >,
-                                            obj_type: &str,
-                                            msg: &str| {
-                                match obj_type {
-                                    "SYNONYMS" => {
-                                        let _ = sender.send(ObjectActionResult::SynonymInfo(Err(
-                                            msg.to_string(),
-                                        )));
-                                    }
-                                    "SEQUENCES" => {
-                                        let _ = sender.send(ObjectActionResult::SequenceInfo(Err(
-                                            msg.to_string(),
-                                        )));
-                                    }
-                                    other => {
-                                        eprintln!("Unexpected object type for View Info: {other}");
-                                    }
-                                }
-                            };
-
-                            if let Ok(db_conn) = conn_guard.require_live_connection() {
-                                match obj_type.as_str() {
-                                    "SYNONYMS" => {
-                                        let result = ObjectBrowser::get_synonym_info(
-                                            db_conn.as_ref(),
-                                            &name,
-                                        )
-                                        .map_err(|err| err.to_string());
-                                        let _ =
-                                            sender.send(ObjectActionResult::SynonymInfo(result));
-                                    }
-                                    _ => {
-                                        let result = ObjectBrowser::get_sequence_info(
-                                            db_conn.as_ref(),
-                                            &name,
-                                        )
-                                        .map_err(|err| err.to_string());
-                                        let _ =
-                                            sender.send(ObjectActionResult::SequenceInfo(result));
-                                    }
-                                }
-                            } else {
-                                send_err(&sender, &obj_type, crate::db::NOT_CONNECTED_MESSAGE);
-                            }
-                            app::awake();
-                            // conn_guard drops here, releasing the lock
-                        });
-                    }
-                    (
-                        "Generate DDL",
-                        ObjectItem::Simple {
-                            object_type,
-                            object_name,
-                        },
-                    ) => {
-                        let obj_type = match object_type.as_str() {
-                            "TABLES" => Some("TABLE"),
-                            "VIEWS" => Some("VIEW"),
-                            "PROCEDURES" => Some("PROCEDURE"),
-                            "FUNCTIONS" => Some("FUNCTION"),
-                            "SEQUENCES" => Some("SEQUENCE"),
-                            "TRIGGERS" => Some("TRIGGER"),
-                            "SYNONYMS" => Some("SYNONYM"),
-                            "PACKAGES" => Some("PACKAGE"),
-                            _ => None,
-                        };
-                        if let Some(obj_type) = obj_type {
-                            let connection = connection.clone();
-                            let sender = action_sender.clone();
-                            let object_type = obj_type.to_string();
-                            let object_name = object_name.clone();
+                        ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
                             Self::emit_status_callback(
                                 status_callback,
-                                &format!("Generating {} DDL for {}", object_type, object_name),
+                                &format!("Preparing SELECT TOP 100 for {}", object_name),
+                            );
+                            let Some(conn_guard) = try_lock_connection_with_activity(
+                                connection,
+                                format!("Preparing SELECT TOP 100 for {}", object_name),
+                            ) else {
+                                let _ = action_sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                app::awake();
+                                return;
+                            };
+                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                                drop(conn_guard);
+                                fltk::dialog::alert_default("Not connected to database");
+                                return;
+                            }
+                            drop(conn_guard);
+                            let sql = format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name);
+                            ObjectBrowserWidget::emit_sql_callback(
+                                &sql_callback,
+                                SqlAction::Execute(sql),
+                            );
+                        }
+                        (
+                            label @ ("Execute Procedure" | "Execute Function"),
+                            ObjectItem::Simple {
+                                object_name,
+                                object_type,
+                            },
+                        ) if (label == "Execute Procedure" && object_type == "PROCEDURES")
+                            || (label == "Execute Function" && object_type == "FUNCTIONS") =>
+                        {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let object_name = object_name.clone();
+                            let routine_type = if label == "Execute Function" {
+                                "FUNCTION".to_string()
+                            } else {
+                                "PROCEDURE".to_string()
+                            };
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Loading {} arguments for {}", routine_type, object_name),
                             );
                             thread::spawn(move || {
                                 // Try to acquire connection lock without blocking
                                 let Some(mut conn_guard) = try_lock_connection_with_activity(
                                     &connection,
-                                    format!("Generating {} DDL for {}", object_type, object_name),
+                                    format!(
+                                        "Loading {} arguments for {}",
+                                        routine_type, object_name
+                                    ),
                                 ) else {
                                     // Query is already running, notify user
                                     let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
@@ -1787,53 +1391,469 @@ impl ObjectBrowserWidget {
                                 };
 
                                 let result = match conn_guard.require_live_connection() {
-                                    Ok(db_conn) => match object_type.as_str() {
-                                        "TABLE" => ObjectBrowser::get_table_ddl(
-                                            db_conn.as_ref(),
+                                    Ok(db_conn) => ObjectBrowser::get_procedure_arguments(
+                                        db_conn.as_ref(),
+                                        &object_name,
+                                    )
+                                    .map(|arguments| {
+                                        ObjectBrowserWidget::build_procedure_script(
                                             &object_name,
-                                        ),
-                                        "VIEW" => ObjectBrowser::get_view_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        "PROCEDURE" => ObjectBrowser::get_procedure_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        "FUNCTION" => ObjectBrowser::get_function_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        "SEQUENCE" => ObjectBrowser::get_sequence_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        "TRIGGER" => ObjectBrowser::get_object_ddl(
-                                            db_conn.as_ref(),
-                                            "TRIGGER",
-                                            &object_name,
-                                        ),
-                                        "SYNONYM" => ObjectBrowser::get_synonym_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        "PACKAGE" => ObjectBrowser::get_package_spec_ddl(
-                                            db_conn.as_ref(),
-                                            &object_name,
-                                        ),
-                                        _ => return,
-                                    }
+                                            &arguments,
+                                        )
+                                    })
                                     .map_err(|err| err.to_string()),
                                     Err(message) => Err(message.to_string()),
                                 };
-                                let _ = sender.send(ObjectActionResult::Ddl(result));
+
+                                let _ = sender.send(ObjectActionResult::RoutineScript {
+                                    qualified_name: object_name,
+                                    routine_type,
+                                    result,
+                                });
                                 app::awake();
                                 // conn_guard drops here, releasing the lock
                             });
                         }
+                        (
+                            label @ ("Execute Procedure" | "Execute Function"),
+                            ObjectItem::PackageRoutine {
+                                package_name,
+                                routine_name,
+                                routine_type,
+                            },
+                        ) if (label == "Execute Procedure" && routine_type == "PROCEDURE")
+                            || (label == "Execute Function" && routine_type == "FUNCTION") =>
+                        {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let qualified_name = format!("{}.{}", package_name, routine_name);
+                            let package_name = package_name.clone();
+                            let routine_name = routine_name.clone();
+                            let routine_type = routine_type.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!(
+                                    "Loading {} arguments for {}",
+                                    routine_type, qualified_name
+                                ),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!(
+                                        "Loading {} arguments for {}",
+                                        routine_type, qualified_name
+                                    ),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                let result = match conn_guard.require_live_connection() {
+                                    Ok(db_conn) => ObjectBrowser::get_package_procedure_arguments(
+                                        db_conn.as_ref(),
+                                        &package_name,
+                                        &routine_name,
+                                    )
+                                    .map(|arguments| {
+                                        ObjectBrowserWidget::build_procedure_script(
+                                            &qualified_name,
+                                            &arguments,
+                                        )
+                                    })
+                                    .map_err(|err| err.to_string()),
+                                    Err(message) => Err(message.to_string()),
+                                };
+
+                                let _ = sender.send(ObjectActionResult::RoutineScript {
+                                    qualified_name,
+                                    routine_type,
+                                    result,
+                                });
+                                app::awake();
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        (
+                            "Check Compilation",
+                            ObjectItem::Simple {
+                                object_type,
+                                object_name,
+                            },
+                        ) => {
+                            let db_object_type = match object_type.as_str() {
+                                "PROCEDURES" => "PROCEDURE",
+                                "FUNCTIONS" => "FUNCTION",
+                                "PACKAGES" => "PACKAGE",
+                                "TRIGGERS" => "TRIGGER",
+                                _ => return,
+                            };
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let object_name = object_name.clone();
+                            let object_type = db_object_type.to_string();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Checking compilation status for {}", object_name),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Checking compilation status for {}", object_name),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                    let status = ObjectBrowser::get_object_status(
+                                        db_conn.as_ref(),
+                                        &object_name,
+                                        &object_type,
+                                    )
+                                    .unwrap_or_else(|_| "UNKNOWN".to_string());
+
+                                    // Also check PACKAGE BODY status for packages
+                                    let body_status = if object_type == "PACKAGE" {
+                                        ObjectBrowser::get_object_status(
+                                            db_conn.as_ref(),
+                                            &object_name,
+                                            "PACKAGE BODY",
+                                        )
+                                        .ok()
+                                    } else {
+                                        None
+                                    };
+
+                                    let mut errors = ObjectBrowser::get_compilation_errors(
+                                        db_conn.as_ref(),
+                                        &object_name,
+                                        &object_type,
+                                    )
+                                    .unwrap_or_default();
+
+                                    // For packages, also get PACKAGE BODY errors
+                                    if object_type == "PACKAGE" {
+                                        if let Ok(body_errors) =
+                                            ObjectBrowser::get_compilation_errors(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                                "PACKAGE BODY",
+                                            )
+                                        {
+                                            errors.extend(body_errors);
+                                        }
+                                    }
+
+                                    let combined_status = if let Some(bs) = body_status {
+                                        format!("Spec: {} / Body: {}", status, bs)
+                                    } else {
+                                        status
+                                    };
+
+                                    let _ = sender.send(ObjectActionResult::CompilationErrors {
+                                        object_name,
+                                        object_type,
+                                        status: combined_status,
+                                        result: Ok(errors),
+                                    });
+                                    app::awake();
+                                } else {
+                                    let _ = sender.send(ObjectActionResult::CompilationErrors {
+                                        object_name,
+                                        object_type,
+                                        status: String::new(),
+                                        result: Err(crate::db::NOT_CONNECTED_MESSAGE.to_string()),
+                                    });
+                                    app::awake();
+                                }
+
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        ("View Structure", ObjectItem::Simple { object_name, .. }) => {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let table_name = object_name.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Loading table structure for {}", table_name),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Loading table structure for {}", table_name),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                let result = match conn_guard.require_live_connection() {
+                                    Ok(db_conn) => ObjectBrowser::get_table_structure(
+                                        db_conn.as_ref(),
+                                        &table_name,
+                                    )
+                                    .map_err(|err| err.to_string()),
+                                    Err(message) => Err(message.to_string()),
+                                };
+                                let _ = sender.send(ObjectActionResult::TableStructure {
+                                    table_name,
+                                    result,
+                                });
+                                app::awake();
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        ("View Indexes", ObjectItem::Simple { object_name, .. }) => {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let table_name = object_name.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Loading indexes for {}", table_name),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Loading indexes for {}", table_name),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                let result = match conn_guard.require_live_connection() {
+                                    Ok(db_conn) => ObjectBrowser::get_table_indexes(
+                                        db_conn.as_ref(),
+                                        &table_name,
+                                    )
+                                    .map_err(|err| err.to_string()),
+                                    Err(message) => Err(message.to_string()),
+                                };
+                                let _ = sender
+                                    .send(ObjectActionResult::TableIndexes { table_name, result });
+                                app::awake();
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        ("View Constraints", ObjectItem::Simple { object_name, .. }) => {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let table_name = object_name.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Loading constraints for {}", table_name),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Loading constraints for {}", table_name),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                let result = match conn_guard.require_live_connection() {
+                                    Ok(db_conn) => ObjectBrowser::get_table_constraints(
+                                        db_conn.as_ref(),
+                                        &table_name,
+                                    )
+                                    .map_err(|err| err.to_string()),
+                                    Err(message) => Err(message.to_string()),
+                                };
+                                let _ = sender.send(ObjectActionResult::TableConstraints {
+                                    table_name,
+                                    result,
+                                });
+                                app::awake();
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        (
+                            "View Info",
+                            ObjectItem::Simple {
+                                object_type,
+                                object_name,
+                            },
+                        ) => {
+                            let connection = connection.clone();
+                            let sender = action_sender.clone();
+                            let name = object_name.clone();
+                            let obj_type = object_type.clone();
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Loading {} info for {}", obj_type, name),
+                            );
+                            thread::spawn(move || {
+                                // Try to acquire connection lock without blocking
+                                let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Loading {} info for {}", obj_type, name),
+                                ) else {
+                                    // Query is already running, notify user
+                                    let _ = sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                    app::awake();
+                                    return;
+                                };
+
+                                let send_err =
+                                    |sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+                                     obj_type: &str,
+                                     msg: &str| {
+                                        match obj_type {
+                                            "SYNONYMS" => {
+                                                let _ =
+                                                    sender.send(ObjectActionResult::SynonymInfo(
+                                                        Err(msg.to_string()),
+                                                    ));
+                                            }
+                                            "SEQUENCES" => {
+                                                let _ =
+                                                    sender.send(ObjectActionResult::SequenceInfo(
+                                                        Err(msg.to_string()),
+                                                    ));
+                                            }
+                                            other => {
+                                                eprintln!(
+                                                    "Unexpected object type for View Info: {other}"
+                                                );
+                                            }
+                                        }
+                                    };
+
+                                if let Ok(db_conn) = conn_guard.require_live_connection() {
+                                    match obj_type.as_str() {
+                                        "SYNONYMS" => {
+                                            let result = ObjectBrowser::get_synonym_info(
+                                                db_conn.as_ref(),
+                                                &name,
+                                            )
+                                            .map_err(|err| err.to_string());
+                                            let _ = sender
+                                                .send(ObjectActionResult::SynonymInfo(result));
+                                        }
+                                        _ => {
+                                            let result = ObjectBrowser::get_sequence_info(
+                                                db_conn.as_ref(),
+                                                &name,
+                                            )
+                                            .map_err(|err| err.to_string());
+                                            let _ = sender
+                                                .send(ObjectActionResult::SequenceInfo(result));
+                                        }
+                                    }
+                                } else {
+                                    send_err(&sender, &obj_type, crate::db::NOT_CONNECTED_MESSAGE);
+                                }
+                                app::awake();
+                                // conn_guard drops here, releasing the lock
+                            });
+                        }
+                        (
+                            "Generate DDL",
+                            ObjectItem::Simple {
+                                object_type,
+                                object_name,
+                            },
+                        ) => {
+                            let obj_type = match object_type.as_str() {
+                                "TABLES" => Some("TABLE"),
+                                "VIEWS" => Some("VIEW"),
+                                "PROCEDURES" => Some("PROCEDURE"),
+                                "FUNCTIONS" => Some("FUNCTION"),
+                                "SEQUENCES" => Some("SEQUENCE"),
+                                "TRIGGERS" => Some("TRIGGER"),
+                                "SYNONYMS" => Some("SYNONYM"),
+                                "PACKAGES" => Some("PACKAGE"),
+                                _ => None,
+                            };
+                            if let Some(obj_type) = obj_type {
+                                let connection = connection.clone();
+                                let sender = action_sender.clone();
+                                let object_type = obj_type.to_string();
+                                let object_name = object_name.clone();
+                                Self::emit_status_callback(
+                                    status_callback,
+                                    &format!("Generating {} DDL for {}", object_type, object_name),
+                                );
+                                thread::spawn(move || {
+                                    // Try to acquire connection lock without blocking
+                                    let Some(mut conn_guard) = try_lock_connection_with_activity(
+                                        &connection,
+                                        format!(
+                                            "Generating {} DDL for {}",
+                                            object_type, object_name
+                                        ),
+                                    ) else {
+                                        // Query is already running, notify user
+                                        let _ =
+                                            sender.send(ObjectActionResult::QueryAlreadyRunning);
+                                        app::awake();
+                                        return;
+                                    };
+
+                                    let result = match conn_guard.require_live_connection() {
+                                        Ok(db_conn) => match object_type.as_str() {
+                                            "TABLE" => ObjectBrowser::get_table_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "VIEW" => ObjectBrowser::get_view_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "PROCEDURE" => ObjectBrowser::get_procedure_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "FUNCTION" => ObjectBrowser::get_function_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "SEQUENCE" => ObjectBrowser::get_sequence_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "TRIGGER" => ObjectBrowser::get_object_ddl(
+                                                db_conn.as_ref(),
+                                                "TRIGGER",
+                                                &object_name,
+                                            ),
+                                            "SYNONYM" => ObjectBrowser::get_synonym_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            "PACKAGE" => ObjectBrowser::get_package_spec_ddl(
+                                                db_conn.as_ref(),
+                                                &object_name,
+                                            ),
+                                            _ => return,
+                                        }
+                                        .map_err(|err| err.to_string()),
+                                        Err(message) => Err(message.to_string()),
+                                    };
+                                    let _ = sender.send(ObjectActionResult::Ddl(result));
+                                    app::awake();
+                                    // conn_guard drops here, releasing the lock
+                                });
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
                 };
                 handle_choice();
             }

@@ -690,7 +690,11 @@ fn update_with_alias_qualifier_resolution() {
     assert_eq!(ctx.phase, SqlPhase::SetClause);
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
 
     let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
     assert_eq!(resolved, vec!["employees"]);
@@ -717,7 +721,6 @@ fn delete_with_alias_qualifier_resolution() {
 
 // ─── INSERT statement tests ──────────────────────────────────────────────
 
-
 #[test]
 fn insert_column_list_context_after_target_table() {
     let ctx = analyze("INSERT INTO employees (|) VALUES (1)");
@@ -725,7 +728,11 @@ fn insert_column_list_context_after_target_table() {
     assert!(ctx.phase.is_table_context());
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -734,7 +741,11 @@ fn insert_values_keeps_target_table_in_scope() {
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -743,8 +754,16 @@ fn insert_select_keeps_target_and_source_tables_in_scope() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"AUDIT_EMP".to_string()), "tables: {:?}", names);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"AUDIT_EMP".to_string()),
+        "tables: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
 
     let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
     assert_eq!(resolved, vec!["employees"]);
