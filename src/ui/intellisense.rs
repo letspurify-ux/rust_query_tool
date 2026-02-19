@@ -1506,6 +1506,7 @@ impl IntellisensePopup {
 
     pub fn clear_for_close(&mut self) {
         self.hide();
+        self.browser.set_callback(|_| {});
         self.browser.clear();
         self.suggestions.borrow_mut().clear();
         self.all_suggestions.borrow_mut().clear();
