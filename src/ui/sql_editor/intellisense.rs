@@ -812,6 +812,13 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
+
+                    // Ctrl/Cmd+Space is handled on KeyDown for manual intellisense trigger.
+                    // Ignore the matching KeyUp so the popup is not immediately dismissed.
+                    if Self::should_ignore_keyup_after_manual_trigger(key, ctrl_or_cmd) {
+                        return true;
+                    }
+
                     // Keep KeyUp lightweight by using raw offsets (no full-buffer clones).
                     let cursor_pos = ed.insert_position();
                     let char_before_cursor =
@@ -2573,6 +2580,10 @@ impl SqlEditorWidget {
         word.chars().count() >= 2
     }
 
+    fn should_ignore_keyup_after_manual_trigger(key: Key, ctrl_or_cmd: bool) -> bool {
+        ctrl_or_cmd && key == Key::from_char(' ')
+    }
+
     fn should_auto_trigger_intellisense_for_forced_char(
         word: &str,
         qualifier: Option<&str>,
@@ -3389,6 +3400,22 @@ FROM d
         assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("ab", None));
         assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한글", None));
         assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", Some("t")));
+    }
+
+    #[test]
+    fn keyup_after_manual_ctrl_space_trigger_is_ignored() {
+        assert!(SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
+            Key::from_char(' '),
+            true,
+        ));
+        assert!(!SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
+            Key::from_char(' '),
+            false,
+        ));
+        assert!(!SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
+            Key::from_char('a'),
+            true,
+        ));
     }
 
     #[test]
