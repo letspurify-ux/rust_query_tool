@@ -717,6 +717,17 @@ fn delete_with_alias_qualifier_resolution() {
 
 // ─── INSERT statement tests ──────────────────────────────────────────────
 
+
+#[test]
+fn insert_column_list_context_after_target_table() {
+    let ctx = analyze("INSERT INTO employees (|) VALUES (1)");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+}
+
 #[test]
 fn insert_values_keeps_target_table_in_scope() {
     let ctx = analyze("INSERT INTO employees (id, name) VALUES (1, |)");

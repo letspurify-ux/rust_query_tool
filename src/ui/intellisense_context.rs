@@ -203,7 +203,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 depth += 1;
                 let inherited_phase = if parent_phase.is_column_context()
-                    || matches!(parent_phase, SqlPhase::ValuesClause)
+                    || matches!(parent_phase, SqlPhase::ValuesClause | SqlPhase::IntoClause)
                 {
                     parent_phase
                 } else {
