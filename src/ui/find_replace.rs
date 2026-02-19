@@ -281,62 +281,56 @@ impl FindReplaceDialog {
 
         // Replace callback
         if let Some(mut replace_btn) = replace_btn {
-            let sender_for_replace = sender.clone();
-            let find_input_clone = find_input.clone();
-            let replace_input_clone = match replace_input.clone() {
-                Some(input) => input,
-                None => {
-                    eprintln!("Replace input not available for replace action.");
-                    return;
-                }
-            };
-            let case_check_clone = case_check.clone();
+            if let Some(replace_input_clone) = replace_input.clone() {
+                let sender_for_replace = sender.clone();
+                let find_input_clone = find_input.clone();
+                let case_check_clone = case_check.clone();
 
-            replace_btn.set_callback(move |_| {
-                let search_text = find_input_clone.value();
-                let replace_text = replace_input_clone.value();
+                replace_btn.set_callback(move |_| {
+                    let search_text = find_input_clone.value();
+                    let replace_text = replace_input_clone.value();
 
-                if search_text.is_empty() {
-                    return;
-                }
+                    if search_text.is_empty() {
+                        return;
+                    }
 
-                let _ = sender_for_replace.send(DialogMessage::Replace {
-                    search_text,
-                    replace_text,
-                    case_sensitive: case_check_clone.value(),
+                    let _ = sender_for_replace.send(DialogMessage::Replace {
+                        search_text,
+                        replace_text,
+                        case_sensitive: case_check_clone.value(),
+                    });
+                    app::awake();
                 });
-                app::awake();
-            });
+            } else {
+                eprintln!("Replace input not available for replace action.");
+            }
         }
 
         // Replace All callback
         if let Some(mut replace_all_btn) = replace_all_btn {
-            let sender_for_replace_all = sender.clone();
-            let find_input_clone = find_input.clone();
-            let replace_input_clone = match replace_input.clone() {
-                Some(input) => input,
-                None => {
-                    eprintln!("Replace input not available for replace-all action.");
-                    return;
-                }
-            };
-            let case_check_clone = case_check.clone();
+            if let Some(replace_input_clone) = replace_input.clone() {
+                let sender_for_replace_all = sender.clone();
+                let find_input_clone = find_input.clone();
+                let case_check_clone = case_check.clone();
 
-            replace_all_btn.set_callback(move |_| {
-                let search_text = find_input_clone.value();
-                let replace_text = replace_input_clone.value();
+                replace_all_btn.set_callback(move |_| {
+                    let search_text = find_input_clone.value();
+                    let replace_text = replace_input_clone.value();
 
-                if search_text.is_empty() {
-                    return;
-                }
+                    if search_text.is_empty() {
+                        return;
+                    }
 
-                let _ = sender_for_replace_all.send(DialogMessage::ReplaceAll {
-                    search_text,
-                    replace_text,
-                    case_sensitive: case_check_clone.value(),
+                    let _ = sender_for_replace_all.send(DialogMessage::ReplaceAll {
+                        search_text,
+                        replace_text,
+                        case_sensitive: case_check_clone.value(),
+                    });
+                    app::awake();
                 });
-                app::awake();
-            });
+            } else {
+                eprintln!("Replace input not available for replace-all action.");
+            }
         }
 
         // Close callback
