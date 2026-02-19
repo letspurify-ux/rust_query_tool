@@ -294,11 +294,17 @@ impl SqlEditorWidget {
     fn cancel_keyup_debounce_timeout(
         keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
     ) {
-        if let Some(handle) = keyup_debounce_handle.borrow_mut().take() {
+        if let Some(handle) = Self::take_keyup_debounce_timeout_handle(keyup_debounce_handle) {
             if app::has_timeout3(handle) {
                 app::remove_timeout3(handle);
             }
         }
+    }
+
+    pub(super) fn take_keyup_debounce_timeout_handle(
+        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+    ) -> Option<app::TimeoutHandle> {
+        keyup_debounce_handle.borrow_mut().take()
     }
 
     pub(crate) fn invalidate_keyup_debounce(

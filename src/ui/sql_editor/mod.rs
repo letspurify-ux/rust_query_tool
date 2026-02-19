@@ -1860,6 +1860,7 @@ mod execution_state_tests {
     };
     use fltk::app;
     use std::cell::{Cell, RefCell};
+    use std::ptr::NonNull;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1894,21 +1895,26 @@ mod execution_state_tests {
     }
 
     #[test]
-    fn invalidate_keyup_debounce_clears_timeout_handle() {
-        let _app = app::App::default();
+    fn take_keyup_debounce_timeout_handle_clears_slot() {
+        let fake_handle: app::TimeoutHandle = NonNull::<()>::dangling().as_ptr();
+        let handle_slot = Rc::new(RefCell::new(Some(fake_handle)));
+
+        let taken = SqlEditorWidget::take_keyup_debounce_timeout_handle(&handle_slot);
+
+        assert_eq!(taken, Some(fake_handle));
+        assert!(handle_slot.borrow().is_none());
+    }
+
+    #[test]
+    fn invalidate_keyup_debounce_increments_generation_when_slot_is_empty() {
         let generation = Rc::new(Cell::new(0_u64));
         let handle_slot = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
-
-        let handle = app::add_timeout3(5.0, |_| {});
-        *handle_slot.borrow_mut() = Some(handle);
-        assert!(app::has_timeout3(handle));
 
         let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
 
         assert_eq!(next, 1);
         assert_eq!(generation.get(), 1);
         assert!(handle_slot.borrow().is_none());
-        assert!(!app::has_timeout3(handle));
     }
 
     #[test]

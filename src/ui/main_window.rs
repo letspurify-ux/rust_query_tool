@@ -2235,6 +2235,13 @@ impl MainWindow {
                 Some("File/Exit")
             }
             k if ctrl_or_cmd
+                && shift
+                && (k == fltk::enums::Key::from_char('z')
+                    || k == fltk::enums::Key::from_char('Z')) =>
+            {
+                Some("Edit/Redo")
+            }
+            k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('z')
                     || k == fltk::enums::Key::from_char('Z')) =>
             {
@@ -2440,10 +2447,6 @@ impl MainWindow {
             {
                 let mut s = state_for_browser.borrow_mut();
                 match action {
-                    SqlAction::Set(sql) => {
-                        s.sql_buffer.set_text(&sql);
-                        s.sql_editor.refresh_highlighting();
-                    }
                     SqlAction::Insert(text) => {
                         let mut editor = s.sql_editor.get_editor();
                         let insert_pos = editor.insert_position();

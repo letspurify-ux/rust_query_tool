@@ -27,7 +27,6 @@ use crate::ui::{configured_editor_profile, configured_ui_font_size};
 
 #[derive(Clone)]
 pub enum SqlAction {
-    Set(String),
     Insert(String),
     Append(String),
     OpenInNewTab(String),
@@ -791,8 +790,9 @@ impl ObjectBrowserWidget {
                     false
                 }
                 Event::KeyUp => {
-                    // Enter key to generate SELECT - only if tree has focus
-                    if fltk::app::event_key() == Key::Enter && t.has_focus() {
+                    // Enter/KPEnter key to generate SELECT - only if tree has focus
+                    if matches!(fltk::app::event_key(), Key::Enter | Key::KPEnter) && t.has_focus()
+                    {
                         if let Some(item) = t.first_selected_item() {
                             if let Some(ObjectItem::Simple {
                                 object_type,
@@ -806,7 +806,7 @@ impl ObjectBrowserWidget {
                                     );
                                     ObjectBrowserWidget::emit_sql_callback(
                                         &sql_callback,
-                                        SqlAction::Set(sql),
+                                        SqlAction::OpenInNewTab(sql),
                                     );
                                 }
                             }

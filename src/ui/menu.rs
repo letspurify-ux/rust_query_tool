@@ -395,6 +395,7 @@ impl MenuBarBuilder {
                     Edit (SQL Editor):\n\
                     Ctrl+Z - Undo\n\
                     Ctrl+Y - Redo\n\
+                    Ctrl+Shift+Z - Redo (Alt)\n\
                     Ctrl+X - Cut\n\
                     Ctrl+C - Copy\n\
                     Ctrl+Shift+C - Copy with Headers\n\
@@ -407,10 +408,13 @@ impl MenuBarBuilder {
                     Ctrl+/ - Toggle Comment\n\
                     Ctrl+U - Uppercase Selection\n\
                     Ctrl+L - Lowercase Selection\n\
-                    Ctrl+Space - Intellisense\n\n\
+                    Ctrl+Space - Intellisense\n\
+                    Ctrl+Shift+Up/Down - Select SQL Block\n\
+                    Alt+Up/Down - Query History Prev/Next\n\
+                    Ctrl+Click - Quick Describe at Cursor\n\n\
                     Query:\n\
-                    Cmd/Ctrl+T - New Query Tab\n\
-                    Cmd/Ctrl+W - Close Query Tab\n\
+                    Ctrl+T - New Query Tab\n\
+                    Ctrl+W - Close Query Tab\n\
                     Ctrl+Enter - Execute Statement\n\
                     F5 - Execute Script\n\
                     F9 - Execute Statement\n\
