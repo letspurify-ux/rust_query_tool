@@ -294,6 +294,7 @@ fn redact_identified_by_clause(text: &str) -> String {
             let quote = first;
             output.push(quote);
             let mut value_end = value_start + quote.len_utf8();
+            let mut closed_quote = false;
             while value_end < text.len() {
                 let ch = text[value_end..]
                     .chars()
@@ -311,11 +312,14 @@ fn redact_identified_by_clause(text: &str) -> String {
                             continue;
                         }
                     }
+                    closed_quote = true;
                     break;
                 }
             }
             output.push_str(REDACTED_SECRET);
-            output.push(quote);
+            if closed_quote {
+                output.push(quote);
+            }
             cursor = value_end;
             continue;
         }
@@ -888,6 +892,17 @@ mod query_history_tests {
         let sql = "CREATE USER app IDENTIFIED BY \"MySecret!\"";
         let sanitized = sanitize_history_sql(sql);
         assert!(sanitized.contains(&format!("IDENTIFIED BY \"{}\"", REDACTED_SECRET)));
+        assert!(!sanitized.contains("MySecret!"));
+    }
+
+    #[test]
+    fn sanitize_history_sql_redacts_unterminated_identified_by_quote_without_appending_quote() {
+        let sql = "CREATE USER app IDENTIFIED BY 'MySecret!";
+        let sanitized = sanitize_history_sql(sql);
+        assert_eq!(
+            sanitized,
+            format!("CREATE USER app IDENTIFIED BY '{}", REDACTED_SECRET)
+        );
         assert!(!sanitized.contains("MySecret!"));
     }
 
