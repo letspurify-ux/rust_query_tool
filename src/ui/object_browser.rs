@@ -1327,7 +1327,8 @@ impl ObjectBrowserWidget {
             if let Some(choice_item) = menu.popup() {
                 let choice_label = choice_item.label().unwrap_or_default();
 
-                match (choice_label.as_str(), &item_info) {
+                let handle_choice = || {
+                    match (choice_label.as_str(), &item_info) {
                     ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
                         Self::emit_status_callback(
                             status_callback,
@@ -1833,6 +1834,8 @@ impl ObjectBrowserWidget {
                     }
                     _ => {}
                 }
+                };
+                handle_choice();
             }
 
             // FLTK memory management: widgets created without a parent must be deleted.

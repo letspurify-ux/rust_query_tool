@@ -3049,10 +3049,14 @@ impl MainWindow {
                 };
                 let mut popups = popups.borrow_mut();
                 for mut popup in popups.drain(..) {
+                    if popup.was_deleted() {
+                        continue;
+                    }
                     popup.hide();
+                    Window::delete(popup);
                 }
-                for tab in editor_tabs {
-                    tab.sql_editor.hide_intellisense();
+                for mut tab in editor_tabs {
+                    tab.sql_editor.cleanup_for_close();
                 }
                 // Clean up result tabs to release FLTK widget callbacks and data buffers
                 result_tabs.clear();

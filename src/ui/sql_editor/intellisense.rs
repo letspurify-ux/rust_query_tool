@@ -2814,15 +2814,6 @@ impl SqlEditorWidget {
         *self.pending_intellisense.borrow_mut() = None;
     }
 
-    pub fn hide_intellisense(&self) {
-        let mut popup = self.intellisense_popup.borrow_mut();
-        if popup.is_visible() {
-            popup.hide();
-        }
-        *self.completion_range.borrow_mut() = None;
-        *self.pending_intellisense.borrow_mut() = None;
-    }
-
     #[allow(dead_code)]
     pub fn update_intellisense_data(&mut self, data: IntellisenseData) {
         let mut data = data;

@@ -119,6 +119,10 @@ src/
 - 팝업 레지스트리(`Rc<RefCell<Vec<Window>>>`)를 쓰는 경우, 먼저 `retain(...)`으로 레지스트리에서 제거한 뒤 `Window::delete(...)`를 호출한다.
 - 탭/에디터 종료 시 재사용하지 않는 popup window(예: intellisense)는 콜백/데이터 슬롯 정리 후 명시 삭제한다.
 - 삭제 전에는 필요 시 `was_deleted()`로 중복 삭제를 방지한다.
+- `MenuButton::new(...)` 등 부모 없는 임시 위젯을 만들었으면 같은 스코프에서 반드시 `MenuButton::delete(...)`/`Widget::delete(...)`를 보장한다.
+- 임시 위젯 생성 이후 함수 본문에서 조기 `return`으로 delete 경로를 건너뛰지 않는다. 필요하면:
+  1) 선택 처리 로직을 클로저/내부 함수로 분리해 내부 `return`이 바깥 함수를 종료하지 않게 한다.
+  2) 또는 정리 코드(delete)가 항상 실행되는 단일 종료 지점으로 제어 흐름을 구성한다.
 
 ---
 
@@ -169,6 +173,7 @@ src/
 - [ ] UTF-8 경계 검증(`is_char_boundary`)이 필요한 위치에 있는가?
 - [ ] UI 변경 시 redraw/스레드 경계가 안전한가?
 - [ ] top-level FLTK window/dialog가 `hide` 후 `Window::delete`까지 수행되는가?
+- [ ] `MenuButton`/부모 없는 임시 위젯이 조기 `return` 경로 없이 `delete`까지 항상 도달하는가?
 - [ ] 관련 테스트/검증 명령을 실행했는가?
 - [ ] 불필요한 파일/디버그 코드가 제거되었는가?
 - [ ] cargo test 모두 통과했는가?
