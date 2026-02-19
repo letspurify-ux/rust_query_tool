@@ -1,6 +1,6 @@
 # CLAUDE.md - AI Assistant Guide for SPACE Query
 
-> 최종 업데이트: 2026-02-17
+> 최종 업데이트: 2026-02-19
 
 이 문서는 SPACE Query 코드베이스에서 작업할 때 AI 어시스턴트가 빠르게 현재 구조를 파악할 수 있도록 정리한 가이드입니다.
 
@@ -45,6 +45,7 @@ src/
 │   │   ├── mod.rs
 │   │   ├── execution.rs        # 실행 버튼/단축키 처리 및 결과 전달
 │   │   ├── intellisense.rs     # 에디터 IntelliSense 훅
+│   │   ├── query_text.rs       # 에디터 텍스트/커서 위치 유틸
 │   │   └── sql_editor_tests.rs
 │   ├── sql_depth.rs            # SQL 토큰 괄호 depth 계산 유틸
 │   ├── object_browser.rs       # DB 오브젝트 트리
@@ -72,6 +73,19 @@ src/
     ├── credential_store.rs     # keyring 연동
     └── logging.rs             # 앱 로그 저장/조회(비동기 파일 쓰기)
 ```
+
+## Rust String Policy (Mandatory)
+
+All string processing MUST use byte offsets.
+
+- Treat all indices and cursor positions as byte offsets.
+- Token spans must store `start` and `end` as byte indices.
+- Never use character-based indexing for cursor math.
+- Do NOT use `.chars()` or character counts for slicing or position logic.
+- Always validate with `is_char_boundary()` before slicing.
+- No full-buffer cloning in hot paths.
+
+If a change introduces character-based offset logic, it must be rejected.
 
 ## 3) 핵심 동작 포인트
 
