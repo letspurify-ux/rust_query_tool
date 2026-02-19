@@ -1025,7 +1025,6 @@ impl SqlEditorWidget {
         let highlighter = self.highlighter.clone();
         let mut style_buffer = self.style_buffer.clone();
         let mut buffer = self.buffer.clone();
-        let editor = self.editor.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             intellisense_parse_cache.borrow_mut().take();
@@ -1078,8 +1077,8 @@ impl SqlEditorWidget {
                 // This can happen with complex multi-byte character operations
             }
 
-            let cursor_pos = editor.insert_position().max(0) as usize;
             let text_len = buf.length().max(0) as usize;
+            let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
             let mut edited_range = compute_edited_range(pos, ins, del, text_len);
 
             if needs_full_rehighlight(buf, pos, ins, deleted_text) {
@@ -1100,6 +1099,7 @@ impl SqlEditorWidget {
         });
         self.refresh_highlighting();
     }
+
 
     pub fn explain_current(&self) {
         let Some(sql) = self.statement_at_cursor_text() else {
@@ -1753,6 +1753,12 @@ fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (u
     }
 
     (expanded_start, expanded_end)
+}
+
+fn infer_cursor_after_edit(pos: i32, ins: i32, text_len: usize) -> usize {
+    let base = pos.max(0) as usize;
+    let inserted = ins.max(0) as usize;
+    base.saturating_add(inserted).min(text_len)
 }
 
 fn compute_edited_range(pos: i32, ins: i32, del: i32, text_len: usize) -> Option<(usize, usize)> {
