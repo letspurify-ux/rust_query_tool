@@ -684,6 +684,18 @@ fn update_with_where() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
+#[test]
+fn update_with_alias_qualifier_resolution() {
+    let ctx = analyze("UPDATE employees e SET e.| = 1000");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees"]);
+}
+
 // ─── DELETE statement tests ──────────────────────────────────────────────
 
 #[test]
@@ -692,6 +704,39 @@ fn delete_from() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     let names = table_names(&ctx);
     assert!(names.contains(&"EMPLOYEES".to_string()));
+}
+
+#[test]
+fn delete_with_alias_qualifier_resolution() {
+    let ctx = analyze("DELETE FROM employees e WHERE e.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees"]);
+}
+
+// ─── INSERT statement tests ──────────────────────────────────────────────
+
+#[test]
+fn insert_values_keeps_target_table_in_scope() {
+    let ctx = analyze("INSERT INTO employees (id, name) VALUES (1, |)");
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn insert_select_keeps_target_and_source_tables_in_scope() {
+    let ctx = analyze("INSERT INTO audit_emp (emp_id) SELECT e.| FROM employees e");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"AUDIT_EMP".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees"]);
 }
 
 // ─── Complex real-world query tests ─────────────────────────────────────
