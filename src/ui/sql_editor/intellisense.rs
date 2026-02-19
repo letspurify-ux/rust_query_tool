@@ -1170,9 +1170,17 @@ impl SqlEditorWidget {
         let deep_ctx = if let Some(context) = cached_context {
             context
         } else {
-            let full_tokens = Self::tokenize_sql(&statement_text);
-            let before_tokens =
-                Self::tokens_before_cursor_byte(&statement_text, cursor_in_statement);
+            let full_token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
+            let split_idx =
+                full_token_spans.partition_point(|span| span.end <= cursor_in_statement);
+            let full_tokens: Vec<SqlToken> = full_token_spans
+                .iter()
+                .map(|span| span.token.clone())
+                .collect();
+            let before_tokens: Vec<SqlToken> = full_token_spans[..split_idx]
+                .iter()
+                .map(|span| span.token.clone())
+                .collect();
             let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
             *intellisense_parse_cache.borrow_mut() = Some(IntellisenseParseCacheEntry {
                 statement_text: statement_text.clone(),
@@ -2088,12 +2096,6 @@ impl SqlEditorWidget {
     fn raw_cursor_position(buffer: &TextBuffer, pos: i32) -> i32 {
         let buffer_len = buffer.length().max(0);
         pos.clamp(0, buffer_len)
-    }
-
-    fn tokens_before_cursor_byte(sql: &str, cursor_byte: usize) -> Vec<SqlToken> {
-        let cursor_byte = Self::clamp_to_char_boundary_local(sql, cursor_byte.min(sql.len()));
-        let before = sql.get(..cursor_byte).unwrap_or("");
-        Self::tokenize_sql(before)
     }
 
     fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
@@ -3070,9 +3072,16 @@ SELECT * FROM cte
         assert_eq!(normalized, "SELECT e.\nFROM emp e\n");
         assert_eq!(&normalized[..normalized_cursor], "SELECT e.");
 
-        let before_tokens =
-            SqlEditorWidget::tokens_before_cursor_byte(&normalized, normalized_cursor);
-        let full_tokens = SqlEditorWidget::tokenize_sql(&normalized);
+        let full_token_spans = super::query_text::tokenize_sql_spanned(&normalized);
+        let split_idx = full_token_spans.partition_point(|span| span.end <= normalized_cursor);
+        let before_tokens: Vec<SqlToken> = full_token_spans[..split_idx]
+            .iter()
+            .map(|span| span.token.clone())
+            .collect();
+        let full_tokens: Vec<SqlToken> = full_token_spans
+            .iter()
+            .map(|span| span.token.clone())
+            .collect();
         let ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
         assert_eq!(ctx.phase, intellisense_context::SqlPhase::SelectList);
         assert!(
@@ -3300,13 +3309,17 @@ FROM d
     }
 
     #[test]
-    fn tokens_before_cursor_byte_handles_utf8_boundaries() {
+    fn token_spans_partition_handles_utf8_boundaries() {
         let sql = "SELECT 한글 FROM dual";
         let cursor = "SELECT 한".len();
-        let tokens = SqlEditorWidget::tokens_before_cursor_byte(sql, cursor);
-        assert_eq!(tokens.len(), 2);
+        let spans = super::query_text::tokenize_sql_spanned(sql);
+        let split_idx = spans.partition_point(|span| span.end <= cursor);
+        let tokens: Vec<SqlToken> = spans[..split_idx]
+            .iter()
+            .map(|span| span.token.clone())
+            .collect();
+        assert_eq!(tokens.len(), 1);
         assert!(matches!(tokens.first(), Some(SqlToken::Word(word)) if word == "SELECT"));
-        assert!(matches!(tokens.get(1), Some(SqlToken::Word(word)) if word == "한"));
     }
 
     #[test]

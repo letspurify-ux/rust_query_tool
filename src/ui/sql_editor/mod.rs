@@ -44,6 +44,14 @@ pub(crate) enum SqlToken {
     Symbol(String),
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct SqlTokenSpan {
+    pub token: SqlToken,
+    pub start: usize,
+    pub end: usize,
+}
+
 const INTELLISENSE_WORD_WINDOW: i32 = 256;
 const INTELLISENSE_CONTEXT_WINDOW: i32 = 120_000;
 const INTELLISENSE_QUALIFIER_WINDOW: i32 = 256;
