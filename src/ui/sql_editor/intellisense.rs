@@ -301,7 +301,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn invalidate_keyup_debounce(
+    pub(crate) fn invalidate_keyup_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
         keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
     ) -> u64 {
@@ -407,8 +407,8 @@ impl SqlEditorWidget {
         let ctrl_enter_handled = Rc::new(RefCell::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
-        let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
+        let keyup_debounce_generation = self.keyup_debounce_generation.clone();
+        let keyup_debounce_handle = self.keyup_debounce_handle.clone();
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
