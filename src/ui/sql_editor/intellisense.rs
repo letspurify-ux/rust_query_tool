@@ -2102,12 +2102,10 @@ impl SqlEditorWidget {
             return (String::new(), 0);
         }
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
-        let start = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
-        let end = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
-        let full_text = buffer.text();
-        let cursor_pos = Self::clamp_to_char_boundary_local(&full_text, cursor_pos as usize) as i32;
-        let start = Self::clamp_to_char_boundary_local(&full_text, start as usize) as i32;
-        let end = Self::clamp_to_char_boundary_local(&full_text, end as usize) as i32;
+        let start_candidate = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
+        let end_candidate = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
+        let start = buffer.line_start(start_candidate).max(0);
+        let end = buffer.line_end(end_candidate).max(start);
         let Some(text) = buffer.text_range(start, end) else {
             return (String::new(), 0);
         };
@@ -2115,12 +2113,9 @@ impl SqlEditorWidget {
         if rel_cursor > text.len() {
             rel_cursor = text.len();
         }
-        rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
         let statement = text.get(stmt_start..stmt_end).unwrap_or("").to_string();
         let cursor_in_statement = rel_cursor.saturating_sub(stmt_start).min(statement.len());
-        let cursor_in_statement =
-            Self::clamp_to_char_boundary_local(&statement, cursor_in_statement);
         (statement, cursor_in_statement)
     }
 
@@ -2129,13 +2124,22 @@ impl SqlEditorWidget {
         if text.is_empty() {
             return String::new();
         }
-        let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text.len()));
-        let start = cursor_pos.saturating_sub(INTELLISENSE_STATEMENT_WINDOW as usize);
-        let end = cursor_pos
+        let cursor_pos = cursor_pos.min(text.len());
+        let start_candidate = cursor_pos.saturating_sub(INTELLISENSE_STATEMENT_WINDOW as usize);
+        let end_candidate = cursor_pos
             .saturating_add(INTELLISENSE_STATEMENT_WINDOW as usize)
             .min(text.len());
-        let start = Self::clamp_to_char_boundary_local(text, start);
-        let end = Self::clamp_to_char_boundary_local(text, end);
+        let bytes = text.as_bytes();
+        let start = bytes[..start_candidate]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let end = bytes[end_candidate..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|idx| end_candidate + idx)
+            .unwrap_or(text.len());
         let window = text.get(start..end).unwrap_or("");
         let rel_cursor = cursor_pos.saturating_sub(start).min(window.len());
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(window, rel_cursor);
