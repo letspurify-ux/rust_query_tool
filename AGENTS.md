@@ -1,23 +1,49 @@
-# AGENTS.md - SPACE Query 작업 가이드
+# AGENTS.md — SPACE Query 에이전트 작업 표준
 
-> 최종 업데이트: 2026-02-19
+> 최종 업데이트: 2026-02-19  
+> 적용 범위: 이 파일이 위치한 디렉터리(저장소 루트) 전체
 
-이 문서는 SPACE Query 저장소에서 작업하는 에이전트를 위한 기준 문서입니다.
+이 문서는 SPACE Query 저장소에서 작업하는 에이전트의 **실행 기준**입니다.  
+목표는 다음 3가지입니다.
 
-## Rust String Policy (Mandatory)
+1. 사용자 요구사항을 정확히 반영한다.
+2. UTF-8/바이트 오프셋 관련 버그를 방지한다.
+3. FLTK UI 변경 시 회귀를 최소화한다.
 
-All string processing MUST use byte offsets.
+---
 
-- Treat all indices and cursor positions as byte offsets.
-- Token spans must store `start` and `end` as byte indices.
-- Never use character-based indexing for cursor math.
-- Do NOT use `.chars()` or character counts for slicing or position logic.
-- Always validate with `is_char_boundary()` before slicing.
-- No full-buffer cloning in hot paths.
+## 1) 작업 우선순위
 
-If a change introduces character-based offset logic, it must be rejected.
+충돌 시 아래 우선순위를 따른다.
 
-## 프로젝트 구조
+1. 시스템 / 개발자 / 사용자의 현재 지시
+2. 하위 경로에 있는 더 구체적인 `AGENTS.md`
+3. 이 문서
+4. 일반적인 관례
+
+---
+
+## 2) Rust 문자열 처리 정책 (필수)
+
+문자열/커서/토큰 위치 계산은 **항상 바이트 오프셋 기준**으로 처리한다.
+
+- 모든 인덱스(`start`, `end`, cursor, selection)는 byte offset으로 저장/전달한다.
+- 문자열 슬라이스 전에는 `is_char_boundary()`를 검증한다.
+- 잘못된 오프셋은 panic 대신 가장 가까운 유효 경계로 보정(clamp)한다.
+- 토큰 span은 `start..end`를 바이트 기준으로 유지한다.
+- 성능 민감 경로에서 전체 버퍼 복제(`to_string`, `clone`)를 피한다.
+
+금지 사항:
+
+- 커서/범위 계산에 `.chars()` 기반 인덱싱 사용
+- "글자 수" 기반으로 슬라이스 경계 계산
+- UTF-8 경계 미검증 슬라이싱
+
+위 규칙을 위반하는 변경은 반려 대상이다.
+
+---
+
+## 3) 코드베이스 빠른 맵
 
 ```text
 src/
@@ -25,62 +51,116 @@ src/
 ├── main.rs
 ├── sql_text.rs
 ├── db/
-│   ├── mod.rs
 │   ├── connection.rs
 │   ├── session.rs
 │   └── query/
-│       ├── mod.rs
 │       ├── executor.rs
-│       ├── query_tests.rs
 │       ├── script.rs
 │       └── types.rs
 ├── ui/
-│   ├── mod.rs
-│   ├── connection_dialog.rs
-│   ├── constants.rs
-│   ├── find_replace.rs
-│   ├── font_settings.rs
-│   ├── intellisense.rs
-│   ├── intellisense_context.rs
-│   ├── intellisense_context/
-│   │   └── tests.rs
-│   ├── log_viewer.rs
 │   ├── main_window.rs
-│   ├── menu.rs
-│   ├── object_browser.rs
-│   ├── query_history.rs
 │   ├── query_tabs.rs
 │   ├── result_table.rs
-│   ├── result_tabs.rs
-│   ├── settings_dialog.rs
-│   ├── sql_depth.rs
 │   ├── sql_editor/
-│   │   ├── mod.rs
 │   │   ├── execution.rs
 │   │   ├── intellisense.rs
-│   │   ├── query_text.rs
-│   │   └── sql_editor_tests.rs
-│   ├── syntax_highlight.rs
-│   ├── syntax_highlight/
-│   │   └── syntax_highlight_tests.rs
-│   └── theme.rs
+│   │   └── query_text.rs
+│   └── ...
 └── utils/
-    ├── mod.rs
     ├── config.rs
     ├── credential_store.rs
     └── logging.rs
 ```
 
-## FLTK 작업 노하우
+팁:
 
-- UI 상태 변경 후 화면이 갱신되지 않으면 `widget.redraw()` 또는 필요 시 `app::redraw()` 호출 여부를 먼저 확인합니다.
-- 콜백 내부에서 공유 상태를 다룰 때는 `Rc<RefCell<T>>` 패턴을 기본으로 사용하고, 중첩 borrow가 길어지지 않도록 지역 변수로 분리합니다.
-- 긴 작업(쿼리 실행, 파일 I/O 등)은 UI 스레드를 블로킹하지 않도록 워커 스레드에서 처리하고, UI 반영은 `app::awake()`/채널 기반 메시지로 메인 루프에서 수행합니다.
-- `TableRow`, `TextEditor` 같은 위젯 커스터마이징 시 draw 콜백에서는 그리기만 수행하고, 데이터 변경 로직은 별도 경로로 분리해 재귀 redraw를 피합니다.
-- 키 이벤트(`Event::KeyDown`) 처리 시 기본 핸들러와 충돌하지 않도록 필요한 키만 선별적으로 consume하고, 나머지는 `false`를 반환해 기본 동작을 유지합니다.
-- 다이얼로그/모달 창은 생성 직후 `set_modal()`과 `show()` 호출 순서를 일관되게 유지하고, 닫힘 시점에 콜백/핸들러 캡처를 정리해 누수성 참조를 방지합니다.
-- **위젯 생성 전 current group 분리/복구를 습관화**: 팝업/다이얼로그/임시 위젯 생성 시 `Group::try_current()`로 기존 parent를 저장하고, `Group::set_current(None)`으로 분리한 뒤 생성이 끝나면 반드시 원복합니다. 부모가 암묵적으로 잘못 잡히면 레이아웃 깨짐/생명주기 버그가 자주 납니다.
-- **`Tabs` 오프셋은 overflow 재적용으로 안정화**: 탭 닫기나 휠 스크롤 이후 탭 스트립 위치가 틀어질 수 있어 `handle_overflow(TabsOverflow::Pulldown)` 재호출로 내부 오프셋을 리셋하는 패턴이 유효합니다.
-- **`TextBuffer` 인덱스는 UTF-8 문자 인덱스가 아니라 바이트 오프셋**: 커서/선택 범위를 문자열 인덱스로 바로 쓰지 말고, 항상 바이트 경계를 검증하고 잘못된 중간 바이트는 이전 유효 경계로 clamp 합니다.
-- **레이아웃/폰트 변경 직후에는 FLTK 재계산을 강제**: 테이블/에디터/폰트 설정 변경 후 즉시 반영이 필요하면 redraw와 이벤트 처리(예: pending redraw flush)를 통해 내부 메트릭 재계산 타이밍을 맞춥니다.
-- **수동 생성한 FLTK 위젯은 정리 순서까지 고려**: parent 없는 위젯, 탭 내부 동적 위젯, 콜백이 걸린 컨트롤은 close/삭제 시 데이터 정리 후 위젯 삭제 순서를 명확히 지켜 use-after-free 성격의 문제를 피합니다.
+- SQL 실행 플로우: `ui/sql_editor/execution.rs` ↔ `db/query/executor.rs`
+- 에디터 텍스트/선택 관련: `ui/sql_editor/query_text.rs`
+- 자동완성 컨텍스트: `ui/intellisense*`, `ui/sql_editor/intellisense.rs`
+
+---
+
+## 4) FLTK 작업 규칙
+
+### 4.1 UI 갱신/스레드
+
+- 상태 변경 후 UI 미반영 시 `widget.redraw()` → 필요 시 `app::redraw()` 점검
+- 긴 작업(DB, 파일 I/O, 파싱)은 워커 스레드에서 수행
+- UI 반영은 메인 루프(`app::awake()` 또는 채널)에서만 수행
+
+### 4.2 콜백/상태 공유
+
+- 기본 패턴은 `Rc<RefCell<T>>`
+- 중첩 borrow는 짧게 유지하고 지역 변수로 분리
+- 콜백 캡처가 위젯 수명주기를 넘지 않도록 close 시 정리
+
+### 4.3 위젯 생성/레이아웃
+
+- 임시 위젯/팝업 생성 전:
+  1) `Group::try_current()`로 기존 그룹 저장
+  2) `Group::set_current(None)`로 분리
+  3) 생성 후 반드시 원복
+- 탭 스크롤/닫기 후 위치 이상 시 `handle_overflow(TabsOverflow::Pulldown)` 재적용 고려
+- 폰트/레이아웃 변경 직후 redraw 및 이벤트 flush로 메트릭 재계산 유도
+
+### 4.4 이벤트 처리
+
+- `Event::KeyDown`에서는 필요한 키만 consume
+- 나머지 이벤트는 `false` 반환으로 기본 동작 보존
+
+### 4.5 그리기 콜백
+
+- draw 콜백은 렌더링 전용으로 유지
+- 데이터 변경은 별도 경로에서 처리(재귀 redraw 방지)
+
+---
+
+## 5) 테스트/검증 원칙
+
+- 변경 범위와 가장 가까운 테스트부터 실행한다.
+- 문자열/커서 로직 수정 시:
+  - UTF-8 다국어 문자열
+  - 경계값(0, len, len-1, invalid mid-byte)
+  - 선택 범위 역전/빈 범위
+  를 최소 케이스로 검증한다.
+- UI 변경 시 재현 가능한 수동 검증 절차를 커밋/PR 설명에 남긴다.
+
+---
+
+## 6) 변경 작성 원칙
+
+- 작은 단위로 수정하고, 의도/이유가 드러나는 이름을 사용한다.
+- 기존 스타일을 우선 존중하고, 대규모 리포맷은 목적이 있을 때만 수행한다.
+- 핫패스에서 불필요한 할당/복제를 만들지 않는다.
+- 패닉 유발 가능 코드(`unwrap`, 인덱스 슬라이싱)는 경계 검증으로 대체한다.
+
+---
+
+## 7) 커밋/PR 작성 가이드
+
+- 커밋 메시지는 "무엇을/왜"가 드러나도록 작성한다.
+- PR 본문에는 최소 다음을 포함한다.
+  - 배경(문제 상황)
+  - 변경 요약
+  - 검증 방법(실행 명령)
+  - 리스크/후속 과제
+
+권장 프리픽스 예시:
+
+- `fix:` 버그 수정
+- `refactor:` 동작 변경 없는 구조 개선
+- `feat:` 기능 추가
+- `test:` 테스트 추가/수정
+- `docs:` 문서 수정
+
+---
+
+## 8) 체크리스트 (작업 종료 전)
+
+- [ ] 사용자 요구사항이 모두 반영되었는가?
+- [ ] 문자열 인덱스/커서 로직이 바이트 오프셋 기준인가?
+- [ ] UTF-8 경계 검증(`is_char_boundary`)이 필요한 위치에 있는가?
+- [ ] UI 변경 시 redraw/스레드 경계가 안전한가?
+- [ ] 관련 테스트/검증 명령을 실행했는가?
+- [ ] 불필요한 파일/디버그 코드가 제거되었는가?
+
