@@ -62,6 +62,98 @@ impl SqlEditorWidget {
     const INTELLISENSE_POPUP_WIDTH: i32 = 320;
     const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
 
+    fn is_insert_column_list_context(statement_text: &str, cursor_in_statement: usize) -> bool {
+        let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+
+        let mut seen_insert = false;
+        let mut seen_into = false;
+        let mut seen_target = false;
+        let mut seen_values = false;
+        let mut depth = 0usize;
+        let mut column_list_depth: Option<usize> = None;
+
+        for span in &token_spans[..split_idx] {
+            match &span.token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Word(word) => {
+                    let upper = word.to_uppercase();
+                    if upper == "INSERT" {
+                        seen_insert = true;
+                        seen_into = false;
+                        seen_target = false;
+                        seen_values = false;
+                        column_list_depth = None;
+                        depth = 0;
+                        continue;
+                    }
+
+                    if !seen_insert {
+                        continue;
+                    }
+
+                    if upper == "INTO" && !seen_into {
+                        seen_into = true;
+                        continue;
+                    }
+
+                    if upper == "VALUES" {
+                        seen_values = true;
+                        continue;
+                    }
+
+                    if seen_into && !seen_target {
+                        seen_target = true;
+                    }
+                }
+                SqlToken::Symbol(sym) if sym == "(" => {
+                    if seen_insert
+                        && seen_into
+                        && seen_target
+                        && !seen_values
+                        && column_list_depth.is_none()
+                    {
+                        column_list_depth = Some(depth + 1);
+                    }
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(sym) if sym == ")" => {
+                    if depth > 0 {
+                        if column_list_depth == Some(depth) {
+                            column_list_depth = None;
+                        }
+                        depth -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        !seen_values && column_list_depth.is_some()
+    }
+
+    fn classify_intellisense_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        statement_text: &str,
+        cursor_in_statement: usize,
+    ) -> SqlContext {
+        let insert_column_list_context =
+            matches!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause)
+                && Self::is_insert_column_list_context(statement_text, cursor_in_statement);
+
+        if deep_ctx.phase.is_table_context() && !insert_column_list_context {
+            SqlContext::TableName
+        } else if deep_ctx.phase.is_column_context() || insert_column_list_context {
+            if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
+                SqlContext::ColumnOrAll
+            } else {
+                SqlContext::ColumnName
+            }
+        } else {
+            SqlContext::General
+        }
+    }
+
     fn column_load_worker_pool() -> &'static ColumnLoadWorkerPool {
         COLUMN_LOAD_WORKER_POOL.get_or_init(Self::build_column_load_worker_pool)
     }
@@ -1190,17 +1282,8 @@ impl SqlEditorWidget {
             parsed
         };
 
-        let context = if deep_ctx.phase.is_table_context() {
-            SqlContext::TableName
-        } else if deep_ctx.phase.is_column_context() {
-            if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
-                SqlContext::ColumnOrAll
-            } else {
-                SqlContext::ColumnName
-            }
-        } else {
-            SqlContext::General
-        };
+        let context =
+            Self::classify_intellisense_context(&deep_ctx, &statement_text, cursor_in_statement);
 
         // Resolve column tables using deep context
         let column_tables = if let Some(ref q) = qualifier {
@@ -3916,5 +3999,57 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone());
         assert!(second_call);
         assert_eq!(captured_paths.borrow().as_slice(), &[second_path]);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_insert_column_list_as_column_context() {
+        let sql_with_cursor = "INSERT INTO employees (|) VALUES (1)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let before_tokens: Vec<SqlToken> = token_spans[..split_idx]
+            .iter()
+            .map(|span| span.token.clone())
+            .collect();
+        let full_tokens: Vec<SqlToken> =
+            token_spans.iter().map(|span| span.token.clone()).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(SqlEditorWidget::is_insert_column_list_context(&sql, cursor));
+
+        let context = SqlEditorWidget::classify_intellisense_context(&deep_ctx, &sql, cursor);
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_keeps_insert_into_target_as_table_context() {
+        let sql_with_cursor = "INSERT INTO |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let before_tokens: Vec<SqlToken> = token_spans[..split_idx]
+            .iter()
+            .map(|span| span.token.clone())
+            .collect();
+        let full_tokens: Vec<SqlToken> =
+            token_spans.iter().map(|span| span.token.clone()).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(!SqlEditorWidget::is_insert_column_list_context(
+            &sql, cursor
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(&deep_ctx, &sql, cursor);
+        assert_eq!(context, SqlContext::TableName);
     }
 }
