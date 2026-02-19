@@ -1,6 +1,6 @@
 use fltk::{
-    enums::Event,
     enums::Align,
+    enums::Event,
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
 };
@@ -69,6 +69,16 @@ impl QueryTabsWidget {
         // Re-applying overflow mode resets FLTK's internal tab offset,
         // keeping the visible strip anchored from the left.
         self.tabs.handle_overflow(TabsOverflow::Pulldown);
+    }
+
+    fn maybe_shrink_entry_storage(entries: &mut Vec<TabEntry>) {
+        // Closing many tabs can leave tab metadata capacity heavily over-allocated.
+        // Shrink only when substantially over-provisioned to avoid churn.
+        let len = entries.len();
+        let capacity = entries.capacity();
+        if len == 0 || (capacity > 0 && len.saturating_mul(2) < capacity) {
+            entries.shrink_to_fit();
+        }
     }
 
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
@@ -207,7 +217,9 @@ impl QueryTabsWidget {
             let Some(index) = entries.iter().position(|entry| entry.id == tab_id) else {
                 return false;
             };
-            entries.remove(index).group
+            let group = entries.remove(index).group;
+            Self::maybe_shrink_entry_storage(&mut entries);
+            group
         };
 
         let _suppress_guard =
