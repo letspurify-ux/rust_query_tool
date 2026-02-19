@@ -64,6 +64,8 @@ pub struct AppState {
     next_editor_tab_number: usize,
     pub sql_editor: SqlEditorWidget,
     pub sql_buffer: TextBuffer,
+    schema_intellisense_data: IntellisenseData,
+    schema_highlight_data: HighlightData,
     query_timeout_input: IntInput,
     pub result_tabs: ResultTabsWidget,
     pub result_tab_offset: usize,
@@ -901,6 +903,8 @@ impl MainWindow {
             next_editor_tab_number: 2,
             sql_editor: sql_editor.clone(),
             sql_buffer,
+            schema_intellisense_data: IntellisenseData::new(),
+            schema_highlight_data: HighlightData::new(),
             query_timeout_input: timeout_input.clone(),
             result_tabs,
             result_tab_offset: 0,
@@ -1268,13 +1272,9 @@ impl MainWindow {
         editor_group.layout();
         group.resizable(&editor_group);
         group.end();
-        let inherited_intellisense = state.sql_editor.get_intellisense_data().borrow().clone();
+        let inherited_intellisense = state.schema_intellisense_data.clone();
         *editor.get_intellisense_data().borrow_mut() = inherited_intellisense;
-        let inherited_highlight = state
-            .sql_editor
-            .get_highlighter()
-            .borrow()
-            .get_highlight_data();
+        let inherited_highlight = state.schema_highlight_data.clone();
         editor
             .get_highlighter()
             .borrow_mut()
@@ -1417,6 +1417,9 @@ impl MainWindow {
                 }
             }
         }
+
+        state.schema_intellisense_data = data.clone();
+        state.schema_highlight_data = combined_highlight.clone();
 
         for tab in &mut state.editor_tabs {
             *tab.sql_editor.get_intellisense_data().borrow_mut() = data.clone();
