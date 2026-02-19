@@ -1319,20 +1319,19 @@ impl MainWindow {
             };
 
             let was_active = s.active_editor_tab_id == tab_id;
-
-            let mut created_tab_id = None;
-            if s.editor_tabs.len() == 1 {
-                let Some(new_tab_id) = MainWindow::create_query_editor_tab(&mut s) else {
-                    return false;
-                };
-                created_tab_id = Some(new_tab_id);
-            }
-
             if !s.query_tabs.close_tab(tab_id) {
                 return false;
             }
             let mut closing_tab = s.editor_tabs.remove(index);
             closing_tab.sql_editor.cleanup_for_close();
+
+            let mut created_tab_id = None;
+            if s.editor_tabs.is_empty() {
+                let Some(new_tab_id) = MainWindow::create_query_editor_tab(&mut s) else {
+                    return false;
+                };
+                created_tab_id = Some(new_tab_id);
+            }
 
             let next_tab_id = s
                 .query_tabs
