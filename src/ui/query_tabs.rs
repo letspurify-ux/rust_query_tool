@@ -1,4 +1,5 @@
 use fltk::{
+    enums::Event,
     enums::Align,
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
@@ -83,6 +84,13 @@ impl QueryTabsWidget {
         // `Compress` dynamically shrinks/expands tab buttons as width changes,
         // which causes distracting header size jumps during splitter drags.
         tabs.handle_overflow(TabsOverflow::Pulldown);
+        tabs.handle(move |tabs, ev| {
+            if matches!(ev, Event::MouseWheel) {
+                tabs.handle_overflow(TabsOverflow::Pulldown);
+                return true;
+            }
+            false
+        });
 
         let entries = Rc::new(RefCell::new(Vec::<TabEntry>::new()));
         let next_id = Rc::new(RefCell::new(1u64));

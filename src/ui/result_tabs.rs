@@ -175,11 +175,12 @@ impl ResultTabsWidget {
         });
 
         let tabs_for_key = tabs.clone();
-        tabs.handle(move |_, ev| {
+        tabs.handle(move |tabs, ev| {
             if matches!(ev, Event::MouseWheel) {
                 // Prevent FLTK Tabs from applying wheel-based strip offset changes.
                 // Wheel events can bubble down from nearby panes and cause the
                 // result-tab header to snap right unexpectedly.
+                tabs.handle_overflow(TabsOverflow::Pulldown);
                 return true;
             }
 
