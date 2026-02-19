@@ -39,6 +39,7 @@ use crate::utils::{AppConfig, QueryHistory};
 struct SchemaUpdate {
     data: IntellisenseData,
     highlight_data: HighlightData,
+    connection_generation: u64,
 }
 
 #[derive(Clone)]
@@ -1431,6 +1432,58 @@ impl MainWindow {
         data.get_all_columns_for_highlighting()
     }
 
+    fn current_connection_generation(state: &AppState) -> u64 {
+        lock_connection_with_activity(&state.connection, "Checking schema update generation")
+            .connection_generation()
+    }
+
+    fn load_schema_update_for_current_connection(
+        connection: &SharedConnection,
+    ) -> Option<SchemaUpdate> {
+        let mut conn_guard = lock_connection_with_activity(connection, "Loading schema metadata");
+        let connection_generation = conn_guard.connection_generation();
+        let Ok(conn) = conn_guard.require_live_connection() else {
+            return None;
+        };
+
+        let tables = match ObjectBrowser::get_tables(conn.as_ref()) {
+            Ok(tables) => tables,
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    "schema",
+                    &format!("failed to load tables for intellisense schema update: {err}"),
+                );
+                return None;
+            }
+        };
+
+        let views = match ObjectBrowser::get_views(conn.as_ref()) {
+            Ok(views) => views,
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    "schema",
+                    &format!("failed to load views for intellisense schema update: {err}"),
+                );
+                Vec::new()
+            }
+        };
+
+        let mut data = IntellisenseData::new();
+        let mut highlight_data = HighlightData::new();
+        highlight_data.tables = tables.clone();
+        data.tables = tables;
+        highlight_data.views = views.clone();
+        data.views = views;
+        data.rebuild_indices();
+        highlight_data.columns = MainWindow::collect_highlight_columns(&data);
+
+        Some(SchemaUpdate {
+            data,
+            highlight_data,
+            connection_generation,
+        })
+    }
+
     fn attach_editor_callbacks(
         state: &Rc<RefCell<AppState>>,
         tab_id: QueryTabId,
@@ -1596,31 +1649,10 @@ impl MainWindow {
                         let schema_sender = schema_sender_for_progress.clone();
                         let connection = s.connection.clone();
                         thread::spawn(move || {
-                            let conn = {
-                                let mut conn_guard = lock_connection_with_activity(
-                                    &connection,
-                                    "Loading schema metadata",
-                                );
-                                conn_guard.require_live_connection().ok()
-                            };
-                            if let Some(conn) = conn {
-                                let mut data = IntellisenseData::new();
-                                let mut highlight_data = HighlightData::new();
-                                if let Ok(tables) = ObjectBrowser::get_tables(conn.as_ref()) {
-                                    highlight_data.tables = tables.clone();
-                                    data.tables = tables;
-                                }
-                                if let Ok(views) = ObjectBrowser::get_views(conn.as_ref()) {
-                                    highlight_data.views = views.clone();
-                                    data.views = views;
-                                }
-                                data.rebuild_indices();
-                                highlight_data.columns =
-                                    MainWindow::collect_highlight_columns(&data);
-                                let _ = schema_sender.send(SchemaUpdate {
-                                    data,
-                                    highlight_data,
-                                });
+                            if let Some(update) =
+                                MainWindow::load_schema_update_for_current_connection(&connection)
+                            {
+                                let _ = schema_sender.send(update);
                                 app::awake();
                             }
                         });
@@ -2353,19 +2385,45 @@ impl MainWindow {
 
         // Setup object browser callback
         let weak_state_for_browser_status = Rc::downgrade(&state);
+        let schema_sender_for_browser_status = schema_sender.clone();
         state_borrow
             .object_browser
             .set_status_callback(move |message| {
                 let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
                     return;
                 };
+
+                let mut should_retry_schema_sync = false;
+                let mut connection_for_retry: Option<SharedConnection> = None;
+
                 match state_for_status.try_borrow_mut() {
                     Ok(mut s) => {
                         let conn_info = s.connection_info.borrow().clone();
                         s.status_bar.set_label(&format_status(message, &conn_info));
+
+                        if message == "Object browser metadata refresh completed"
+                            && conn_info.is_some()
+                        {
+                            should_retry_schema_sync = true;
+                            connection_for_retry = Some(s.connection.clone());
+                        }
                     }
                     Err(_) => {}
                 };
+
+                if should_retry_schema_sync {
+                    if let Some(connection) = connection_for_retry {
+                        let schema_sender = schema_sender_for_browser_status.clone();
+                        thread::spawn(move || {
+                            if let Some(update) =
+                                MainWindow::load_schema_update_for_current_connection(&connection)
+                            {
+                                let _ = schema_sender.send(update);
+                                app::awake();
+                            }
+                        });
+                    }
+                }
             });
 
         let weak_state_for_browser = Rc::downgrade(&state);
@@ -2612,6 +2670,10 @@ impl MainWindow {
                     match r.try_recv() {
                         Ok(update) => {
                             let mut s = state.borrow_mut();
+                            let current_generation = MainWindow::current_connection_generation(&s);
+                            if update.connection_generation != current_generation {
+                                continue;
+                            }
                             let mut data = update.data;
                             data.rebuild_indices();
                             MainWindow::apply_schema_to_all_editors(
@@ -2654,35 +2716,12 @@ impl MainWindow {
                                     let schema_sender = schema_sender.clone();
                                     let connection = s.connection.clone();
                                     thread::spawn(move || {
-                                        let conn = {
-                                            let mut conn_guard = lock_connection_with_activity(
+                                        if let Some(update) =
+                                            MainWindow::load_schema_update_for_current_connection(
                                                 &connection,
-                                                "Loading schema metadata",
-                                            );
-                                            conn_guard.require_live_connection().ok()
-                                        };
-                                        if let Some(conn) = conn {
-                                            let mut data = IntellisenseData::new();
-                                            let mut highlight_data = HighlightData::new();
-                                            if let Ok(tables) =
-                                                ObjectBrowser::get_tables(conn.as_ref())
-                                            {
-                                                highlight_data.tables = tables.clone();
-                                                data.tables = tables;
-                                            }
-                                            if let Ok(views) =
-                                                ObjectBrowser::get_views(conn.as_ref())
-                                            {
-                                                highlight_data.views = views.clone();
-                                                data.views = views;
-                                            }
-                                            data.rebuild_indices();
-                                            highlight_data.columns =
-                                                MainWindow::collect_highlight_columns(&data);
-                                            let _ = schema_sender.send(SchemaUpdate {
-                                                data,
-                                                highlight_data,
-                                            });
+                                            )
+                                        {
+                                            let _ = schema_sender.send(update);
                                             app::awake();
                                         }
                                     });

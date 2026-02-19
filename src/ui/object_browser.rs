@@ -65,6 +65,11 @@ struct ObjectCache {
 }
 
 #[derive(Clone)]
+enum RefreshEvent {
+    Cache(ObjectCache),
+    Completed,
+}
+
 enum ObjectActionResult {
     TableStructure {
         table_name: String,
@@ -108,7 +113,7 @@ pub struct ObjectBrowserWidget {
     status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Rc<RefCell<ObjectCache>>,
-    refresh_sender: std::sync::mpsc::Sender<ObjectCache>,
+    refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
 }
 
@@ -180,7 +185,7 @@ impl ObjectBrowserWidget {
         let status_callback: StatusCallback = Rc::new(RefCell::new(None));
         let object_cache = Rc::new(RefCell::new(ObjectCache::default()));
 
-        let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<ObjectCache>();
+        let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
         let (action_sender, action_receiver) = std::sync::mpsc::channel::<ObjectActionResult>();
 
         let mut widget = Self {
@@ -234,20 +239,21 @@ impl ObjectBrowserWidget {
         });
     }
 
-    fn setup_refresh_handler(&mut self, refresh_receiver: std::sync::mpsc::Receiver<ObjectCache>) {
+    fn setup_refresh_handler(&mut self, refresh_receiver: std::sync::mpsc::Receiver<RefreshEvent>) {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
-        let receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectCache>>> =
+        let receiver: Rc<RefCell<std::sync::mpsc::Receiver<RefreshEvent>>> =
             Rc::new(RefCell::new(refresh_receiver));
 
         fn schedule_poll(
-            receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectCache>>>,
+            receiver: Rc<RefCell<std::sync::mpsc::Receiver<RefreshEvent>>>,
             mut tree: Tree,
             object_cache: Rc<RefCell<ObjectCache>>,
             filter_input: Input,
+            status_callback: StatusCallback,
         ) {
             let mut disconnected = false;
             // Process any pending messages
@@ -255,11 +261,17 @@ impl ObjectBrowserWidget {
                 let r = receiver.borrow();
                 loop {
                     match r.try_recv() {
-                        Ok(cache) => {
+                        Ok(RefreshEvent::Cache(cache)) => {
                             *object_cache.borrow_mut() = cache.clone();
                             let filter_text = filter_input.value().to_lowercase();
                             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
                             tree.redraw();
+                        }
+                        Ok(RefreshEvent::Completed) => {
+                            ObjectBrowserWidget::emit_status_callback(
+                                &status_callback,
+                                "Object browser metadata refresh completed",
+                            );
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -281,12 +293,19 @@ impl ObjectBrowserWidget {
                     tree.clone(),
                     Rc::clone(&object_cache),
                     filter_input.clone(),
+                    status_callback.clone(),
                 );
             });
         }
 
         // Start polling
-        schedule_poll(receiver, tree, object_cache, filter_input);
+        schedule_poll(
+            receiver,
+            tree,
+            object_cache,
+            filter_input,
+            self.status_callback.clone(),
+        );
     }
 
     fn setup_action_handler(
@@ -1928,9 +1947,9 @@ impl ObjectBrowserWidget {
             // Keep conn_guard alive (don't drop it) so the lock is held during execution
 
             let mut cache = ObjectCache::default();
-            let send_update = |sender: &std::sync::mpsc::Sender<ObjectCache>,
+            let send_update = |sender: &std::sync::mpsc::Sender<RefreshEvent>,
                                cache: &ObjectCache| {
-                let _ = sender.send(cache.clone());
+                let _ = sender.send(RefreshEvent::Cache(cache.clone()));
                 app::awake();
             };
 
@@ -1973,6 +1992,9 @@ impl ObjectBrowserWidget {
                 cache.packages = packages;
                 send_update(&sender, &cache);
             }
+
+            let _ = sender.send(RefreshEvent::Completed);
+            app::awake();
 
             // conn_guard drops here, releasing the lock
         });
