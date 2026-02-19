@@ -269,14 +269,14 @@ fn redact_identified_by_clause(text: &str) -> String {
 
         let mut value_start = pattern_end;
         while value_start < text.len() {
-            let ch = text[value_start..]
-                .chars()
-                .next()
-                .expect("value_start is in bounds");
+            let Some((ch, next)) = next_char_with_clamped_boundary(text, value_start) else {
+                break;
+            };
             if ch.is_whitespace() {
                 output.push(ch);
-                value_start += ch.len_utf8();
+                value_start = next;
             } else {
+                value_start = next_char_boundary(text, value_start);
                 break;
             }
         }
@@ -286,29 +286,31 @@ fn redact_identified_by_clause(text: &str) -> String {
             break;
         }
 
-        let first = text[value_start..]
-            .chars()
-            .next()
-            .expect("value_start is in bounds");
+        let Some((first, _)) = next_char_with_clamped_boundary(text, value_start) else {
+            cursor = text.len();
+            break;
+        };
         if first == '\'' || first == '"' {
             let quote = first;
             output.push(quote);
             let mut value_end = value_start + quote.len_utf8();
             let mut closed_quote = false;
             while value_end < text.len() {
-                let ch = text[value_end..]
-                    .chars()
-                    .next()
-                    .expect("value_end is in bounds");
-                value_end += ch.len_utf8();
+                let Some((ch, next)) = next_char_with_clamped_boundary(text, value_end) else {
+                    value_end = text.len();
+                    break;
+                };
+                value_end = next;
                 if ch == quote {
                     if value_end < text.len() {
-                        let next = text[value_end..]
-                            .chars()
-                            .next()
-                            .expect("value_end is in bounds");
-                        if next == quote {
-                            value_end += next.len_utf8();
+                        let Some((next_ch, next_boundary)) =
+                            next_char_with_clamped_boundary(text, value_end)
+                        else {
+                            value_end = text.len();
+                            break;
+                        };
+                        if next_ch == quote {
+                            value_end = next_boundary;
                             continue;
                         }
                     }
@@ -326,14 +328,14 @@ fn redact_identified_by_clause(text: &str) -> String {
 
         let mut value_end = value_start;
         while value_end < text.len() {
-            let ch = text[value_end..]
-                .chars()
-                .next()
-                .expect("value_end is in bounds");
+            let Some((ch, next)) = next_char_with_clamped_boundary(text, value_end) else {
+                value_end = text.len();
+                break;
+            };
             if ch.is_whitespace() || matches!(ch, ';' | ')' | ',' | '\n' | '\r') {
                 break;
             }
-            value_end += ch.len_utf8();
+            value_end = next;
         }
         output.push_str(REDACTED_SECRET);
         cursor = value_end;
@@ -341,6 +343,24 @@ fn redact_identified_by_clause(text: &str) -> String {
 
     output.push_str(&text[cursor..]);
     output
+}
+
+fn next_char_boundary(text: &str, idx: usize) -> usize {
+    let mut boundary = idx.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn next_char_with_clamped_boundary(text: &str, idx: usize) -> Option<(char, usize)> {
+    let start = next_char_boundary(text, idx);
+    if start >= text.len() {
+        return None;
+    }
+
+    let ch = text[start..].chars().next()?;
+    Some((ch, start + ch.len_utf8()))
 }
 
 fn redact_uri_credentials(text: &str) -> String {
