@@ -266,6 +266,10 @@ impl ObjectBrowserWidget {
                 return;
             }
 
+            if tree.was_deleted() || filter_input.was_deleted() {
+                return;
+            }
+
             let mut disconnected = false;
             // Process any pending messages
             {
@@ -273,8 +277,11 @@ impl ObjectBrowserWidget {
                 loop {
                     match r.try_recv() {
                         Ok(RefreshEvent::Cache(cache)) => {
-                            *object_cache.borrow_mut() = cache.clone();
+                            {
+                                *object_cache.borrow_mut() = cache;
+                            }
                             let filter_text = filter_input.value().to_lowercase();
+                            let cache = object_cache.borrow();
                             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
                             tree.redraw();
                         }
@@ -345,6 +352,10 @@ impl ObjectBrowserWidget {
             lifecycle: Weak<()>,
         ) {
             if lifecycle.upgrade().is_none() {
+                return;
+            }
+
+            if tree.was_deleted() || filter_input.was_deleted() {
                 return;
             }
 
