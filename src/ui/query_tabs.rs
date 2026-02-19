@@ -194,16 +194,32 @@ impl QueryTabsWidget {
     }
 
     pub fn close_tab(&mut self, tab_id: QueryTabId) -> bool {
-        let group = {
+        let (group, replacement_group) = {
             let mut entries = self.entries.borrow_mut();
             let Some(index) = entries.iter().position(|entry| entry.id == tab_id) else {
                 return false;
             };
-            entries.remove(index).group
+            let replacement = if entries.len() > 1 {
+                let fallback_index = if index > 0 { index - 1 } else { 1 };
+                entries.get(fallback_index).map(|entry| entry.group.clone())
+            } else {
+                None
+            };
+            (entries.remove(index).group, replacement)
         };
 
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
+        let closing_selected = self
+            .tabs
+            .value()
+            .map(|selected| selected.as_widget_ptr() == group.as_widget_ptr())
+            .unwrap_or(false);
+        if closing_selected {
+            if let Some(replacement) = replacement_group {
+                let _ = self.tabs.set_value(&replacement);
+            }
+        }
         if self.tabs.find(&group) >= 0 {
             self.tabs.remove(&group);
         }
