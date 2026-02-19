@@ -258,7 +258,6 @@ pub struct SqlEditorWidget {
     history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Rc<RefCell<bool>>,
     undo_redo_state: Rc<RefCell<WordUndoRedoState>>,
-    keyup_debounce_handle: Rc<RefCell<Option<app::TimeoutHandle>>>,
 }
 
 impl SqlEditorWidget {
@@ -427,7 +426,6 @@ impl SqlEditorWidget {
         let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Rc::new(RefCell::new(false));
         let undo_redo_state = Rc::new(RefCell::new(WordUndoRedoState::new(String::new())));
-        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
         let mut widget = Self {
             group,
@@ -459,7 +457,6 @@ impl SqlEditorWidget {
             history_navigation_entries,
             applying_history_navigation,
             undo_redo_state,
-            keyup_debounce_handle,
         };
 
         widget.setup_intellisense();
@@ -1347,7 +1344,6 @@ impl SqlEditorWidget {
 
     /// Releases callback/data references so a closing tab can be dropped promptly.
     pub fn cleanup_for_close(&mut self) {
-        Self::clear_timeout_handle(&self.keyup_debounce_handle);
         Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
         Self::set_current_query_connection(&self.current_query_connection, None);
 
@@ -1364,7 +1360,8 @@ impl SqlEditorWidget {
             .borrow_mut()
             .set_highlight_data(HighlightData::new());
 
-        Self::recreate_editor_buffers(&mut self.editor, &mut self.buffer, &mut self.style_buffer);
+        self.buffer.set_text("");
+        self.style_buffer.set_text("");
         self.completion_range.borrow_mut().take();
         self.pending_intellisense.borrow_mut().take();
         self.intellisense_parse_cache.borrow_mut().take();
@@ -1373,29 +1370,6 @@ impl SqlEditorWidget {
         self.history_navigation_entries.borrow_mut().take();
         *self.applying_history_navigation.borrow_mut() = false;
         Self::reset_word_undo_state(&self.undo_redo_state);
-    }
-
-    fn clear_timeout_handle(timeout_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>) {
-        if let Some(handle) = timeout_handle.borrow_mut().take() {
-            app::remove_timeout3(handle);
-        }
-    }
-
-    fn recreate_editor_buffers(
-        editor: &mut TextEditor,
-        buffer: &mut TextBuffer,
-        style_buffer: &mut TextBuffer,
-    ) {
-        // Recreate buffers so large retained capacities are dropped immediately
-        // when a tab closes, instead of waiting for allocator reuse.
-        let mut new_buffer = TextBuffer::default();
-        new_buffer.set_text("");
-        editor.set_buffer(new_buffer.clone());
-        *buffer = new_buffer;
-
-        let mut new_style_buffer = TextBuffer::default();
-        new_style_buffer.set_text("");
-        *style_buffer = new_style_buffer;
     }
 
     fn reset_word_undo_state(undo_redo_state: &Rc<RefCell<WordUndoRedoState>>) {
