@@ -316,7 +316,7 @@ impl SqlEditorWidget {
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let keyup_debounce_handle = self.keyup_debounce_handle.clone();
+        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
 
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
