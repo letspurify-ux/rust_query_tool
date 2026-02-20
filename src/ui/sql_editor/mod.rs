@@ -9,7 +9,7 @@ use fltk::{
     text::{TextBuffer, TextEditor, WrapMode},
 };
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -459,32 +459,32 @@ pub struct SqlEditorWidget {
     buffer: TextBuffer,
     style_buffer: TextBuffer,
     connection: SharedConnection,
-    execute_callback: Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>>,
-    progress_callback: Rc<RefCell<Option<Box<dyn FnMut(QueryProgress)>>>>,
+    execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
+    progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
     progress_sender: mpsc::Sender<QueryProgress>,
     column_sender: mpsc::Sender<ColumnLoadUpdate>,
     ui_action_sender: mpsc::Sender<UiActionResult>,
-    query_running: Rc<RefCell<bool>>,
+    query_running: Rc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     cancel_flag: Arc<AtomicBool>,
-    intellisense_data: Rc<RefCell<IntellisenseData>>,
-    intellisense_popup: Rc<RefCell<IntellisensePopup>>,
-    highlighter: Rc<RefCell<SqlHighlighter>>,
+    intellisense_data: Rc<Mutex<IntellisenseData>>,
+    intellisense_popup: Rc<Mutex<IntellisensePopup>>,
+    highlighter: Rc<Mutex<SqlHighlighter>>,
     timeout_input: IntInput,
-    status_callback: Rc<RefCell<Option<Box<dyn FnMut(&str)>>>>,
-    find_callback: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
-    replace_callback: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
-    file_drop_callback: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>>,
-    completion_range: Rc<RefCell<Option<(usize, usize)>>>,
-    pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
-    intellisense_parse_cache: Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
-    history_cursor: Rc<RefCell<Option<usize>>>,
-    history_original: Rc<RefCell<Option<String>>>,
-    history_navigation_entries: Rc<RefCell<Option<Vec<QueryHistoryEntry>>>>,
-    applying_history_navigation: Rc<RefCell<bool>>,
-    undo_redo_state: Rc<RefCell<WordUndoRedoState>>,
+    status_callback: Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
+    find_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>>,
+    replace_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>>,
+    file_drop_callback: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
+    completion_range: Rc<Mutex<Option<(usize, usize)>>>,
+    pending_intellisense: Rc<Mutex<Option<PendingIntellisense>>>,
+    intellisense_parse_cache: Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+    history_cursor: Rc<Mutex<Option<usize>>>,
+    history_original: Rc<Mutex<Option<String>>>,
+    history_navigation_entries: Rc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
+    applying_history_navigation: Rc<Mutex<bool>>,
+    undo_redo_state: Rc<Mutex<WordUndoRedoState>>,
     keyup_debounce_generation: Rc<Cell<u64>>,
-    keyup_debounce_handle: Rc<RefCell<Option<app::TimeoutHandle>>>,
+    keyup_debounce_handle: Rc<Mutex<Option<app::TimeoutHandle>>>,
 }
 
 impl SqlEditorWidget {
@@ -519,17 +519,17 @@ impl SqlEditorWidget {
     }
 
     fn invoke_query_result_callback(
-        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>>,
+        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
         result: &QueryResult,
     ) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(result)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -540,17 +540,17 @@ impl SqlEditorWidget {
     }
 
     fn invoke_progress_callback(
-        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(QueryProgress)>>>>,
+        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
         message: QueryProgress,
     ) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -561,17 +561,17 @@ impl SqlEditorWidget {
     }
 
     fn invoke_status_callback(
-        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(&str)>>>>,
+        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
         message: &str,
     ) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -625,36 +625,35 @@ impl SqlEditorWidget {
         group.resizable(&editor);
         group.end();
 
-        let execute_callback: Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>> =
-            Rc::new(RefCell::new(None));
-        let progress_callback: Rc<RefCell<Option<Box<dyn FnMut(QueryProgress)>>>> =
-            Rc::new(RefCell::new(None));
+        let execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>> =
+            Rc::new(Mutex::new(None));
+        let progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
+            Rc::new(Mutex::new(None));
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
         let (column_sender, column_receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
-        let query_running = Rc::new(RefCell::new(false));
+        let query_running = Rc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        let intellisense_data = Rc::new(RefCell::new(IntellisenseData::new()));
-        let intellisense_popup = Rc::new(RefCell::new(IntellisensePopup::new()));
-        let highlighter = Rc::new(RefCell::new(SqlHighlighter::new()));
-        let status_callback: Rc<RefCell<Option<Box<dyn FnMut(&str)>>>> =
-            Rc::new(RefCell::new(None));
-        let find_callback: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-        let replace_callback: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-        let file_drop_callback: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(RefCell::new(None));
-        let completion_range = Rc::new(RefCell::new(None::<(usize, usize)>));
-        let pending_intellisense = Rc::new(RefCell::new(None::<PendingIntellisense>));
-        let intellisense_parse_cache = Rc::new(RefCell::new(None::<IntellisenseParseCacheEntry>));
-        let history_cursor = Rc::new(RefCell::new(None::<usize>));
-        let history_original = Rc::new(RefCell::new(None::<String>));
-        let history_navigation_entries = Rc::new(RefCell::new(None::<Vec<QueryHistoryEntry>>));
-        let applying_history_navigation = Rc::new(RefCell::new(false));
-        let undo_redo_state = Rc::new(RefCell::new(WordUndoRedoState::new(String::new())));
+        let intellisense_data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let intellisense_popup = Rc::new(Mutex::new(IntellisensePopup::new()));
+        let highlighter = Rc::new(Mutex::new(SqlHighlighter::new()));
+        let status_callback: Rc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Rc::new(Mutex::new(None));
+        let find_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
+        let replace_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
+        let file_drop_callback: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(Mutex::new(None));
+        let completion_range = Rc::new(Mutex::new(None::<(usize, usize)>));
+        let pending_intellisense = Rc::new(Mutex::new(None::<PendingIntellisense>));
+        let intellisense_parse_cache = Rc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
+        let history_cursor = Rc::new(Mutex::new(None::<usize>));
+        let history_original = Rc::new(Mutex::new(None::<String>));
+        let history_navigation_entries = Rc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
+        let applying_history_navigation = Rc::new(Mutex::new(false));
+        let undo_redo_state = Rc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let keyup_debounce_handle = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
+        let keyup_debounce_handle = Rc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let mut widget = Self {
             group,
@@ -709,9 +708,9 @@ impl SqlEditorWidget {
                 return;
             }
             let inserted = inserted_text(buf, pos, ins);
-            let mut state = undo_state.borrow_mut();
+            let mut state = undo_state.lock().unwrap();
 
-            if state.applying_history || *applying_history_navigation.borrow() {
+            if state.applying_history || *applying_history_navigation.lock().unwrap() {
                 return;
             }
 
@@ -728,22 +727,22 @@ impl SqlEditorWidget {
     fn setup_progress_handler(
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
-        progress_callback: Rc<RefCell<Option<Box<dyn FnMut(QueryProgress)>>>>,
-        query_running: Rc<RefCell<bool>>,
+        progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+        query_running: Rc<Mutex<bool>>,
     ) {
         let execute_callback = self.execute_callback.clone();
         let cancel_flag = self.cancel_flag.clone();
         let lifecycle_group = self.group.clone();
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
-        let receiver: Rc<RefCell<mpsc::Receiver<QueryProgress>>> =
-            Rc::new(RefCell::new(progress_receiver));
+        let receiver: Rc<Mutex<mpsc::Receiver<QueryProgress>>> =
+            Rc::new(Mutex::new(progress_receiver));
 
         fn schedule_poll(
-            receiver: Rc<RefCell<mpsc::Receiver<QueryProgress>>>,
-            progress_callback: Rc<RefCell<Option<Box<dyn FnMut(QueryProgress)>>>>,
-            query_running: Rc<RefCell<bool>>,
-            execute_callback: Rc<RefCell<Option<Box<dyn FnMut(&QueryResult)>>>>,
+            receiver: Rc<Mutex<mpsc::Receiver<QueryProgress>>>,
+            progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+            query_running: Rc<Mutex<bool>>,
+            execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
             cancel_flag: Arc<AtomicBool>,
             lifecycle_group: Flex,
         ) {
@@ -781,7 +780,7 @@ impl SqlEditorWidget {
                 }
 
                 let message = {
-                    let r = receiver.borrow();
+                    let r = receiver.lock().unwrap();
                     r.try_recv()
                 };
 
@@ -903,8 +902,8 @@ impl SqlEditorWidget {
         );
     }
 
-    fn finalize_execution_state(query_running: &Rc<RefCell<bool>>, cancel_flag: &Arc<AtomicBool>) {
-        *query_running.borrow_mut() = false;
+    fn finalize_execution_state(query_running: &Rc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
+        *query_running.lock().unwrap() = false;
         cancel_flag.store(false, Ordering::SeqCst);
     }
 
@@ -922,26 +921,26 @@ impl SqlEditorWidget {
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
-        let receiver: Rc<RefCell<mpsc::Receiver<ColumnLoadUpdate>>> =
-            Rc::new(RefCell::new(column_receiver));
+        let receiver: Rc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
+            Rc::new(Mutex::new(column_receiver));
 
         const COLUMN_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
         const COLUMN_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.5;
         const COLUMN_LOADING_STALE_TIMEOUT: Duration = Duration::from_secs(8);
 
         fn schedule_poll(
-            receiver: Rc<RefCell<mpsc::Receiver<ColumnLoadUpdate>>>,
-            intellisense_data: Rc<RefCell<IntellisenseData>>,
+            receiver: Rc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>>,
+            intellisense_data: Rc<Mutex<IntellisenseData>>,
             editor: TextEditor,
             buffer: TextBuffer,
             style_buffer: TextBuffer,
-            highlighter: Rc<RefCell<SqlHighlighter>>,
-            intellisense_popup: Rc<RefCell<IntellisensePopup>>,
-            completion_range: Rc<RefCell<Option<(usize, usize)>>>,
+            highlighter: Rc<Mutex<SqlHighlighter>>,
+            intellisense_popup: Rc<Mutex<IntellisensePopup>>,
+            completion_range: Rc<Mutex<Option<(usize, usize)>>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
             connection: SharedConnection,
-            pending_intellisense: Rc<RefCell<Option<PendingIntellisense>>>,
-            intellisense_parse_cache: Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
+            pending_intellisense: Rc<Mutex<Option<PendingIntellisense>>>,
+            intellisense_parse_cache: Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -954,13 +953,13 @@ impl SqlEditorWidget {
             let mut highlight_columns: Option<Vec<String>> = None;
             // Process any pending messages
             {
-                let r = receiver.borrow();
+                let r = receiver.lock().unwrap();
                 loop {
                     match r.try_recv() {
                         Ok(update) => {
                             processed += 1;
                             let (refresh_pending, clear_pending, new_highlight_columns) = {
-                                let mut data = intellisense_data.borrow_mut();
+                                let mut data = intellisense_data.lock().unwrap();
                                 if update.cache_columns {
                                     data.set_columns_for_table(&update.table, update.columns);
                                     (
@@ -995,12 +994,12 @@ impl SqlEditorWidget {
             }
 
             if should_clear_pending {
-                *pending_intellisense.borrow_mut() = None;
+                *pending_intellisense.lock().unwrap() = None;
             }
 
             if let Some(highlight_columns) = highlight_columns {
                 let should_refresh_highlighting = {
-                    let mut highlighter = highlighter.borrow_mut();
+                    let mut highlighter = highlighter.lock().unwrap();
                     let mut highlight_data = highlighter.get_highlight_data();
                     if highlight_data.columns == highlight_columns {
                         false
@@ -1013,7 +1012,7 @@ impl SqlEditorWidget {
 
                 if should_refresh_highlighting {
                     let cursor_pos = editor.insert_position().max(0) as usize;
-                    highlighter.borrow().highlight_buffer_window(
+                    highlighter.lock().unwrap().highlight_buffer_window(
                         &buffer,
                         &mut style_buffer.clone(),
                         cursor_pos,
@@ -1023,7 +1022,7 @@ impl SqlEditorWidget {
             }
 
             if should_refresh_pending {
-                let pending = pending_intellisense.borrow().clone();
+                let pending = pending_intellisense.lock().unwrap().clone();
                 if let Some(pending) = pending {
                     let cursor_pos = editor.insert_position().max(0);
                     if cursor_pos == pending.cursor_pos {
@@ -1041,30 +1040,30 @@ impl SqlEditorWidget {
                     } else {
                         // Cursor moved since async load was requested.
                         // Drop stale pending state so poll loop can idle.
-                        *pending_intellisense.borrow_mut() = None;
+                        *pending_intellisense.lock().unwrap() = None;
                     }
                 }
             }
 
             let stale_cleared = {
-                let mut data = intellisense_data.borrow_mut();
+                let mut data = intellisense_data.lock().unwrap();
                 data.clear_stale_columns_loading(COLUMN_LOADING_STALE_TIMEOUT)
             };
             if stale_cleared > 0 {
                 processed += stale_cleared;
                 let no_columns_loading = {
-                    let data = intellisense_data.borrow();
+                    let data = intellisense_data.lock().unwrap();
                     data.columns_loading.is_empty()
                 };
                 if no_columns_loading {
-                    *pending_intellisense.borrow_mut() = None;
+                    *pending_intellisense.lock().unwrap() = None;
                 }
             }
 
             let has_pending_column_work = {
-                let data = intellisense_data.borrow();
+                let data = intellisense_data.lock().unwrap();
                 !data.columns_loading.is_empty()
-            } || pending_intellisense.borrow().is_some();
+            } || pending_intellisense.lock().unwrap().is_some();
 
             // Reschedule with adaptive backoff to reduce idle CPU usage.
             let delay = if processed > 0 {
@@ -1113,11 +1112,11 @@ impl SqlEditorWidget {
     fn setup_ui_action_handler(&self, ui_action_receiver: mpsc::Receiver<UiActionResult>) {
         let widget = self.clone();
 
-        let receiver: Rc<RefCell<mpsc::Receiver<UiActionResult>>> =
-            Rc::new(RefCell::new(ui_action_receiver));
+        let receiver: Rc<Mutex<mpsc::Receiver<UiActionResult>>> =
+            Rc::new(Mutex::new(ui_action_receiver));
 
         fn schedule_poll(
-            receiver: Rc<RefCell<mpsc::Receiver<UiActionResult>>>,
+            receiver: Rc<Mutex<mpsc::Receiver<UiActionResult>>>,
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
@@ -1127,7 +1126,7 @@ impl SqlEditorWidget {
             let mut disconnected = false;
             loop {
                 let message = {
-                    let r = receiver.borrow();
+                    let r = receiver.lock().unwrap();
                     r.try_recv()
                 };
 
@@ -1260,7 +1259,7 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
-            intellisense_parse_cache.borrow_mut().take();
+            intellisense_parse_cache.lock().unwrap().take();
 
             // Synchronize style_buffer length with text buffer
             // highlight_buffer_window will reset if lengths differ, but we do incremental
@@ -1323,7 +1322,7 @@ impl SqlEditorWidget {
                 }
             }
 
-            highlighter.borrow().highlight_buffer_window(
+            highlighter.lock().unwrap().highlight_buffer_window(
                 buf,
                 &mut style_buffer,
                 cursor_pos,
@@ -1490,7 +1489,7 @@ impl SqlEditorWidget {
     }
 
     pub fn cancel_current(&self) {
-        if !*self.query_running.borrow() {
+        if !*self.query_running.lock().unwrap() {
             fltk::dialog::alert_default("No query is running");
             return;
         }
@@ -1546,35 +1545,35 @@ impl SqlEditorWidget {
     where
         F: FnMut(&QueryResult) + 'static,
     {
-        *self.execute_callback.borrow_mut() = Some(Box::new(callback));
+        *self.execute_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn set_status_callback<F>(&mut self, callback: F)
     where
         F: FnMut(&str) + 'static,
     {
-        *self.status_callback.borrow_mut() = Some(Box::new(callback));
+        *self.status_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn set_find_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
     {
-        *self.find_callback.borrow_mut() = Some(Box::new(callback));
+        *self.find_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn set_replace_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
     {
-        *self.replace_callback.borrow_mut() = Some(Box::new(callback));
+        *self.replace_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn set_file_drop_callback<F>(&mut self, callback: F)
     where
         F: FnMut(PathBuf) + 'static,
     {
-        *self.file_drop_callback.borrow_mut() = Some(Box::new(callback));
+        *self.file_drop_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     /// Releases callback/data references so a closing tab can be dropped promptly.
@@ -1582,38 +1581,39 @@ impl SqlEditorWidget {
         Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
         Self::set_current_query_connection(&self.current_query_connection, None);
 
-        *self.execute_callback.borrow_mut() = None;
-        *self.progress_callback.borrow_mut() = None;
-        *self.status_callback.borrow_mut() = None;
-        *self.find_callback.borrow_mut() = None;
-        *self.replace_callback.borrow_mut() = None;
-        *self.file_drop_callback.borrow_mut() = None;
+        *self.execute_callback.lock().unwrap() = None;
+        *self.progress_callback.lock().unwrap() = None;
+        *self.status_callback.lock().unwrap() = None;
+        *self.find_callback.lock().unwrap() = None;
+        *self.replace_callback.lock().unwrap() = None;
+        *self.file_drop_callback.lock().unwrap() = None;
 
         Self::invalidate_keyup_debounce(
             &self.keyup_debounce_generation,
             &self.keyup_debounce_handle,
         );
 
-        self.intellisense_popup.borrow_mut().delete_for_close();
-        *self.intellisense_data.borrow_mut() = IntellisenseData::new();
+        self.intellisense_popup.lock().unwrap().delete_for_close();
+        *self.intellisense_data.lock().unwrap() = IntellisenseData::new();
         self.highlighter
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .set_highlight_data(HighlightData::new());
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");
-        self.completion_range.borrow_mut().take();
-        self.pending_intellisense.borrow_mut().take();
-        self.intellisense_parse_cache.borrow_mut().take();
-        self.history_cursor.borrow_mut().take();
-        self.history_original.borrow_mut().take();
-        self.history_navigation_entries.borrow_mut().take();
-        *self.applying_history_navigation.borrow_mut() = false;
+        self.completion_range.lock().unwrap().take();
+        self.pending_intellisense.lock().unwrap().take();
+        self.intellisense_parse_cache.lock().unwrap().take();
+        self.history_cursor.lock().unwrap().take();
+        self.history_original.lock().unwrap().take();
+        self.history_navigation_entries.lock().unwrap().take();
+        *self.applying_history_navigation.lock().unwrap() = false;
         Self::reset_word_undo_state(&self.undo_redo_state);
     }
 
-    fn reset_word_undo_state(undo_redo_state: &Rc<RefCell<WordUndoRedoState>>) {
-        let mut state = undo_redo_state.borrow_mut();
+    fn reset_word_undo_state(undo_redo_state: &Rc<Mutex<WordUndoRedoState>>) {
+        let mut state = undo_redo_state.lock().unwrap();
         let mut fresh_history = Vec::with_capacity(1);
         fresh_history.push(UndoSnapshot::new(String::new(), 0));
         state.history = fresh_history;
@@ -1624,10 +1624,10 @@ impl SqlEditorWidget {
 
     #[allow(dead_code)]
     pub fn update_highlight_data(&mut self, data: HighlightData) {
-        self.highlighter.borrow_mut().set_highlight_data(data);
+        self.highlighter.lock().unwrap().set_highlight_data(data);
         // Re-highlight current text
         let mut style_buffer = self.style_buffer.clone();
-        self.highlighter.borrow().highlight_buffer_window(
+        self.highlighter.lock().unwrap().highlight_buffer_window(
             &self.buffer,
             &mut style_buffer,
             self.editor.insert_position().max(0) as usize,
@@ -1635,7 +1635,7 @@ impl SqlEditorWidget {
         );
     }
 
-    pub fn get_highlighter(&self) -> Rc<RefCell<SqlHighlighter>> {
+    pub fn get_highlighter(&self) -> Rc<Mutex<SqlHighlighter>> {
         self.highlighter.clone()
     }
 
@@ -1687,7 +1687,7 @@ impl SqlEditorWidget {
 
     #[allow(dead_code)]
     pub fn refresh_highlighting(&self) {
-        self.highlighter.borrow().highlight_buffer_window(
+        self.highlighter.lock().unwrap().highlight_buffer_window(
             &self.buffer,
             &mut self.style_buffer.clone(),
             self.editor.insert_position().max(0) as usize,
@@ -1719,22 +1719,22 @@ impl SqlEditorWidget {
         );
         let snapshot = UndoSnapshot::new(current_text, clamped_cursor);
         {
-            let mut state = self.undo_redo_state.borrow_mut();
+            let mut state = self.undo_redo_state.lock().unwrap();
             state.history.clear();
             state.history.push(snapshot);
             state.index = 0;
             state.active_group = None;
             state.applying_history = false;
         }
-        *self.history_cursor.borrow_mut() = None;
-        *self.history_original.borrow_mut() = None;
-        self.history_navigation_entries.borrow_mut().take();
-        *self.applying_history_navigation.borrow_mut() = false;
+        *self.history_cursor.lock().unwrap() = None;
+        *self.history_original.lock().unwrap() = None;
+        self.history_navigation_entries.lock().unwrap().take();
+        *self.applying_history_navigation.lock().unwrap() = false;
     }
 
     pub fn undo(&self) {
         let next_snapshot = {
-            let mut state = self.undo_redo_state.borrow_mut();
+            let mut state = self.undo_redo_state.lock().unwrap();
             state.normalize_index();
             if state.index == 0 {
                 return;
@@ -1764,12 +1764,12 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state.borrow_mut().applying_history = false;
+        self.undo_redo_state.lock().unwrap().applying_history = false;
     }
 
     pub fn redo(&self) {
         let next_snapshot = {
-            let mut state = self.undo_redo_state.borrow_mut();
+            let mut state = self.undo_redo_state.lock().unwrap();
             state.normalize_index();
             let next_index = state.index.saturating_add(1);
             if next_index >= state.history.len() {
@@ -1799,18 +1799,18 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state.borrow_mut().applying_history = false;
+        self.undo_redo_state.lock().unwrap().applying_history = false;
     }
 
     pub fn is_query_running(&self) -> bool {
-        *self.query_running.borrow()
+        *self.query_running.lock().unwrap()
     }
 
     pub fn navigate_history(&mut self, direction: i32) {
-        let mut cursor = self.history_cursor.borrow_mut();
-        let mut original = self.history_original.borrow_mut();
-        let mut history_entries = self.history_navigation_entries.borrow_mut();
-        let mut applying_navigation = self.applying_history_navigation.borrow_mut();
+        let mut cursor = self.history_cursor.lock().unwrap();
+        let mut original = self.history_original.lock().unwrap();
+        let mut history_entries = self.history_navigation_entries.lock().unwrap();
+        let mut applying_navigation = self.applying_history_navigation.lock().unwrap();
 
         if cursor.is_none() {
             // Keep navigation aligned with persisted history while avoiding long UI stalls
@@ -2122,26 +2122,27 @@ mod execution_state_tests {
         UndoSnapshot, WordUndoRedoState,
     };
     use fltk::app;
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::ptr::NonNull;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     #[test]
     fn finalize_execution_state_clears_running_and_cancel_flags() {
-        let query_running = Rc::new(RefCell::new(true));
+        let query_running = Rc::new(Mutex::new(true));
         let cancel_flag = Arc::new(AtomicBool::new(true));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running.borrow());
+        assert!(!*query_running.lock().unwrap());
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 
     #[test]
     fn reset_word_undo_state_reinitializes_history_safely() {
-        let undo_state = Rc::new(RefCell::new(WordUndoRedoState {
+        let undo_state = Rc::new(Mutex::new(WordUndoRedoState {
             history: vec![
                 UndoSnapshot::new("SELECT 1".to_string(), 8),
                 UndoSnapshot::new("SELECT 2".to_string(), 8),
@@ -2153,7 +2154,7 @@ mod execution_state_tests {
 
         SqlEditorWidget::reset_word_undo_state(&undo_state);
 
-        let state = undo_state.borrow();
+        let state = undo_state.lock().unwrap();
         assert_eq!(state.history, vec![UndoSnapshot::new(String::new(), 0)]);
         assert_eq!(state.index, 0);
         assert!(state.active_group.is_none());
@@ -2163,34 +2164,34 @@ mod execution_state_tests {
     #[test]
     fn take_keyup_debounce_timeout_handle_clears_slot() {
         let fake_handle: app::TimeoutHandle = NonNull::<()>::dangling().as_ptr();
-        let handle_slot = Rc::new(RefCell::new(Some(fake_handle)));
+        let handle_slot = Rc::new(Mutex::new(Some(fake_handle)));
 
         let taken = SqlEditorWidget::take_keyup_debounce_timeout_handle(&handle_slot);
 
         assert_eq!(taken, Some(fake_handle));
-        assert!(handle_slot.borrow().is_none());
+        assert!(handle_slot.lock().unwrap().is_none());
     }
 
     #[test]
     fn invalidate_keyup_debounce_increments_generation_when_slot_is_empty() {
         let generation = Rc::new(Cell::new(0_u64));
-        let handle_slot = Rc::new(RefCell::new(None::<app::TimeoutHandle>));
+        let handle_slot = Rc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
 
         assert_eq!(next, 1);
         assert_eq!(generation.get(), 1);
-        assert!(handle_slot.borrow().is_none());
+        assert!(handle_slot.lock().unwrap().is_none());
     }
 
     #[test]
     fn finalize_execution_state_is_idempotent_when_already_reset() {
-        let query_running = Rc::new(RefCell::new(false));
+        let query_running = Rc::new(Mutex::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running.borrow());
+        assert!(!*query_running.lock().unwrap());
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 

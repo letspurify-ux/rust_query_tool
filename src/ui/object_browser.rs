@@ -7,11 +7,11 @@ use fltk::{
     tree::{Tree, TreeItem, TreeSelect},
 };
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::rc::Weak;
+use std::sync::Mutex;
 use std::thread;
 
 use crate::db::{
@@ -33,8 +33,8 @@ pub enum SqlAction {
 }
 
 /// Callback type for executing SQL from object browser
-pub type SqlExecuteCallback = Rc<RefCell<Option<Box<dyn FnMut(SqlAction)>>>>;
-type StatusCallback = Rc<RefCell<Option<Box<dyn FnMut(&str)>>>>;
+pub type SqlExecuteCallback = Rc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
+type StatusCallback = Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
 
 #[derive(Clone)]
 enum ObjectItem {
@@ -111,7 +111,7 @@ pub struct ObjectBrowserWidget {
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
     filter_input: Input,
-    object_cache: Rc<RefCell<ObjectCache>>,
+    object_cache: Rc<Mutex<ObjectCache>>,
     poll_lifecycle: Rc<()>,
     refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
@@ -181,9 +181,9 @@ impl ObjectBrowserWidget {
             item.close();
         }
 
-        let sql_callback: SqlExecuteCallback = Rc::new(RefCell::new(None));
-        let status_callback: StatusCallback = Rc::new(RefCell::new(None));
-        let object_cache = Rc::new(RefCell::new(ObjectCache::default()));
+        let sql_callback: SqlExecuteCallback = Rc::new(Mutex::new(None));
+        let status_callback: StatusCallback = Rc::new(Mutex::new(None));
+        let object_cache = Rc::new(Mutex::new(ObjectCache::default()));
         let poll_lifecycle = Rc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
@@ -218,7 +218,7 @@ impl ObjectBrowserWidget {
         self.tree.set_item_label_font(profile.normal);
         self.tree.set_item_label_size(ui_size);
         let filter_text = self.filter_input.value().to_lowercase();
-        let cache_snapshot = self.object_cache.borrow().clone();
+        let cache_snapshot = self.object_cache.lock().unwrap().clone();
         Self::rebuild_root_categories(&mut self.tree);
         Self::populate_tree(&mut self.tree, &cache_snapshot, &filter_text);
         // Force layout recalculation so new font metrics take effect immediately.
@@ -235,7 +235,7 @@ impl ObjectBrowserWidget {
 
         self.filter_input.set_callback(move |input| {
             let filter_text = input.value().to_lowercase();
-            let cache = object_cache.borrow();
+            let cache = object_cache.lock().unwrap();
             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
             tree.redraw();
         });
@@ -249,13 +249,13 @@ impl ObjectBrowserWidget {
         let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
         // Wrap receiver in Rc<RefCell> to share across timeout callbacks
-        let receiver: Rc<RefCell<std::sync::mpsc::Receiver<RefreshEvent>>> =
-            Rc::new(RefCell::new(refresh_receiver));
+        let receiver: Rc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>> =
+            Rc::new(Mutex::new(refresh_receiver));
 
         fn schedule_poll(
-            receiver: Rc<RefCell<std::sync::mpsc::Receiver<RefreshEvent>>>,
+            receiver: Rc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>>,
             mut tree: Tree,
-            object_cache: Rc<RefCell<ObjectCache>>,
+            object_cache: Rc<Mutex<ObjectCache>>,
             filter_input: Input,
             status_callback: StatusCallback,
             lifecycle: Weak<()>,
@@ -271,15 +271,15 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             // Process any pending messages
             {
-                let r = receiver.borrow();
+                let r = receiver.lock().unwrap();
                 loop {
                     match r.try_recv() {
                         Ok(RefreshEvent::Cache(cache)) => {
                             {
-                                *object_cache.borrow_mut() = cache;
+                                *object_cache.lock().unwrap() = cache;
                             }
                             let filter_text = filter_input.value().to_lowercase();
-                            let cache = object_cache.borrow();
+                            let cache = object_cache.lock().unwrap();
                             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
                             tree.redraw();
                         }
@@ -337,15 +337,15 @@ impl ObjectBrowserWidget {
         let filter_input = self.filter_input.clone();
         let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
-        let receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectActionResult>>> =
-            Rc::new(RefCell::new(action_receiver));
+        let receiver: Rc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>> =
+            Rc::new(Mutex::new(action_receiver));
 
         fn schedule_poll(
-            receiver: Rc<RefCell<std::sync::mpsc::Receiver<ObjectActionResult>>>,
+            receiver: Rc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>>,
             sql_callback: SqlExecuteCallback,
             status_callback: StatusCallback,
             mut tree: Tree,
-            object_cache: Rc<RefCell<ObjectCache>>,
+            object_cache: Rc<Mutex<ObjectCache>>,
             filter_input: Input,
             lifecycle: Weak<()>,
         ) {
@@ -360,7 +360,7 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             loop {
                 let message = {
-                    let r = receiver.borrow();
+                    let r = receiver.lock().unwrap();
                     r.try_recv()
                 };
 
@@ -559,7 +559,7 @@ impl ObjectBrowserWidget {
                             result,
                         } => match result {
                             Ok(routines) => {
-                                let mut cache = object_cache.borrow_mut();
+                                let mut cache = object_cache.lock().unwrap();
                                 cache.package_routines.insert(package_name, routines);
                                 let filter_text = filter_input.value().to_lowercase();
                                 ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
@@ -727,7 +727,7 @@ impl ObjectBrowserWidget {
                                     if object_type == "PACKAGES" {
                                         let package_name = object_name.clone();
                                         let should_fetch = {
-                                            let cache = object_cache.borrow();
+                                            let cache = object_cache.lock().unwrap();
                                             !cache.package_routines.contains_key(&package_name)
                                         };
                                         if should_fetch {
@@ -1927,7 +1927,7 @@ impl ObjectBrowserWidget {
     where
         F: FnMut(SqlAction) + 'static,
     {
-        *self.sql_callback.borrow_mut() = Some(Box::new(callback));
+        *self.sql_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -1951,13 +1951,13 @@ impl ObjectBrowserWidget {
 
     fn emit_sql_callback(callback_slot: &SqlExecuteCallback, action: SqlAction) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(action)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1969,13 +1969,13 @@ impl ObjectBrowserWidget {
 
     fn emit_status_callback(callback_slot: &StatusCallback, message: &str) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1993,14 +1993,14 @@ impl ObjectBrowserWidget {
     where
         F: FnMut(&str) + 'static,
     {
-        *self.status_callback.borrow_mut() = Some(Box::new(callback));
+        *self.status_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn refresh(&mut self) {
         // First clear items and filter
         self.clear_items();
         self.filter_input.set_value("");
-        *self.object_cache.borrow_mut() = ObjectCache::default();
+        *self.object_cache.lock().unwrap() = ObjectCache::default();
         self.emit_status("Refreshing object browser metadata");
 
         let sender = self.refresh_sender.clone();
@@ -2204,7 +2204,7 @@ impl Drop for ObjectBrowserWidget {
         // the widget tree unnecessarily.
         self.filter_input.set_callback(|_| {});
         self.tree.handle(|_, _| false);
-        *self.sql_callback.borrow_mut() = None;
-        *self.status_callback.borrow_mut() = None;
+        *self.sql_callback.lock().unwrap() = None;
+        *self.status_callback.lock().unwrap() = None;
     }
 }

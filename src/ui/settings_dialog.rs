@@ -9,8 +9,8 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
@@ -319,12 +319,12 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     fltk::group::Group::set_current(current_group.as_ref());
 
     let all_fonts = Rc::new(font_names);
-    let selected_font = Rc::new(RefCell::new(current_font));
-    let filtered_fonts = Rc::new(RefCell::new(Vec::<String>::new()));
+    let selected_font = Rc::new(Mutex::new(current_font));
+    let filtered_fonts = Rc::new(Mutex::new(Vec::<String>::new()));
 
     {
-        let mut filtered = filtered_fonts.borrow_mut();
-        let mut selected = selected_font.borrow_mut();
+        let mut filtered = filtered_fonts.lock().unwrap();
+        let mut selected = selected_font.lock().unwrap();
         refill_font_list(
             &mut font_browser,
             all_fonts.as_ref(),
@@ -341,8 +341,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let selected_font_for_search = selected_font.clone();
     let mut selected_value_for_search = selected_value.clone();
     search_input.set_callback(move |input| {
-        let mut filtered = filtered_fonts_for_search.borrow_mut();
-        let mut selected = selected_font_for_search.borrow_mut();
+        let mut filtered = filtered_fonts_for_search.lock().unwrap();
+        let mut selected = selected_font_for_search.lock().unwrap();
         refill_font_list(
             &mut font_browser_for_search,
             all_fonts_for_search.as_ref(),
@@ -357,12 +357,12 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut selected_value_for_browser = selected_value.clone();
     font_browser.set_callback(move |browser| {
         if let Some(name) = browser.selected_text() {
-            *selected_font_for_browser.borrow_mut() = name.clone();
+            *selected_font_for_browser.lock().unwrap() = name.clone();
             selected_value_for_browser.set_label(&name);
         }
     });
 
-    let result = Rc::new(RefCell::new(None::<FontSettings>));
+    let result = Rc::new(Mutex::new(None::<FontSettings>));
     let result_for_ok = result.clone();
     let mut dialog_handle = dialog.clone();
     let editor_size_input_ok = editor_size_input.clone();
@@ -388,12 +388,12 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
                 Some(size) => size,
                 None => return,
             };
-        let font = selected_font_ok.borrow().trim().to_string();
+        let font = selected_font_ok.lock().unwrap().trim().to_string();
         if font.is_empty() {
             fltk::dialog::alert_default("Please select a font.");
             return;
         }
-        *result_for_ok.borrow_mut() = Some(FontSettings {
+        *result_for_ok.lock().unwrap() = Some(FontSettings {
             font,
             ui_size,
             editor_size,
@@ -417,6 +417,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     // Explicitly destroy top-level dialog widgets to release native resources.
     Window::delete(dialog);
 
-    let final_result = result.borrow_mut().take();
+    let final_result = result.lock().unwrap().take();
     final_result
 }

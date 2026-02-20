@@ -2,10 +2,10 @@ use crate::sql_text;
 use crate::ui::theme;
 use fltk::{browser::HoldBrowser, prelude::*, window::Window};
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // SQL Keywords for autocomplete
@@ -1317,10 +1317,10 @@ impl Default for IntellisenseData {
 pub struct IntellisensePopup {
     window: Window,
     browser: HoldBrowser,
-    suggestions: Rc<RefCell<Vec<String>>>,
-    all_suggestions: Rc<RefCell<Vec<String>>>,
-    selected_callback: Rc<RefCell<Option<Box<dyn FnMut(String)>>>>,
-    visible: Rc<RefCell<bool>>,
+    suggestions: Rc<Mutex<Vec<String>>>,
+    all_suggestions: Rc<Mutex<Vec<String>>>,
+    selected_callback: Rc<Mutex<Option<Box<dyn FnMut(String)>>>>,
+    visible: Rc<Mutex<bool>>,
 }
 
 impl IntellisensePopup {
@@ -1344,17 +1344,17 @@ impl IntellisensePopup {
     }
 
     fn invoke_selected_callback(
-        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(String)>>>>,
+        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(String)>>>>,
         selected_text: String,
     ) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(selected_text)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1390,11 +1390,11 @@ impl IntellisensePopup {
             fltk::group::Group::set_current(Some(group));
         }
 
-        let suggestions = Rc::new(RefCell::new(Vec::new()));
-        let all_suggestions = Rc::new(RefCell::new(Vec::new()));
-        let selected_callback: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
-            Rc::new(RefCell::new(None));
-        let visible = Rc::new(RefCell::new(false));
+        let suggestions = Rc::new(Mutex::new(Vec::new()));
+        let all_suggestions = Rc::new(Mutex::new(Vec::new()));
+        let selected_callback: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> =
+            Rc::new(Mutex::new(None));
+        let visible = Rc::new(Mutex::new(false));
 
         window.hide();
 
@@ -1423,7 +1423,7 @@ impl IntellisensePopup {
             if selected > 0 {
                 // First, get the text with suggestions borrow, then release it
                 let text = {
-                    let suggestions = suggestions.borrow();
+                    let suggestions = suggestions.lock().unwrap();
                     suggestions.get((selected - 1) as usize).cloned()
                 };
                 if let Some(text) = text {
@@ -1432,7 +1432,7 @@ impl IntellisensePopup {
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();
-                    *visible.borrow_mut() = false;
+                    *visible.lock().unwrap() = false;
                 }
             }
         });
@@ -1448,14 +1448,14 @@ impl IntellisensePopup {
             return;
         }
 
-        *self.all_suggestions.borrow_mut() = suggestions.clone();
+        *self.all_suggestions.lock().unwrap() = suggestions.clone();
         self.set_suggestions(suggestions, None);
 
         self.window.set_pos(x, y);
         if !self.window.shown() {
             self.window.show();
         }
-        *self.visible.borrow_mut() = true;
+        *self.visible.lock().unwrap() = true;
     }
 
     fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
@@ -1474,7 +1474,7 @@ impl IntellisensePopup {
             .map(|suggestion| format!("@C255 {}", suggestion))
             .collect();
         self.browser.clear();
-        *self.suggestions.borrow_mut() = suggestions;
+        *self.suggestions.lock().unwrap() = suggestions;
         for line in &browser_lines {
             self.browser.add(line);
         }
@@ -1496,14 +1496,14 @@ impl IntellisensePopup {
 
         let selected = self.get_selected();
         let filtered = {
-            let all = self.all_suggestions.borrow();
+            let all = self.all_suggestions.lock().unwrap();
             filter_suggestions_by_prefix(all.as_slice(), prefix)
         };
 
         if filtered.is_empty() {
             self.hide();
             self.browser.clear();
-            self.suggestions.borrow_mut().clear();
+            self.suggestions.lock().unwrap().clear();
             return;
         }
 
@@ -1513,16 +1513,16 @@ impl IntellisensePopup {
     pub fn hide(&mut self) {
         self.window.hide();
         self.window.resize(0, 0, 0, 0);
-        *self.visible.borrow_mut() = false;
+        *self.visible.lock().unwrap() = false;
     }
 
     pub fn clear_for_close(&mut self) {
         self.hide();
         self.browser.set_callback(|_| {});
         self.browser.clear();
-        self.suggestions.borrow_mut().clear();
-        self.all_suggestions.borrow_mut().clear();
-        *self.selected_callback.borrow_mut() = None;
+        self.suggestions.lock().unwrap().clear();
+        self.all_suggestions.lock().unwrap().clear();
+        *self.selected_callback.lock().unwrap() = None;
     }
 
     pub fn delete_for_close(&mut self) {
@@ -1533,7 +1533,7 @@ impl IntellisensePopup {
     }
 
     pub fn is_visible(&self) -> bool {
-        *self.visible.borrow()
+        *self.visible.lock().unwrap()
     }
 
     pub fn popup_dimensions(&self) -> (i32, i32) {
@@ -1556,7 +1556,7 @@ impl IntellisensePopup {
     where
         F: FnMut(String) + 'static,
     {
-        *self.selected_callback.borrow_mut() = Some(Box::new(callback));
+        *self.selected_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn select_next(&mut self) {
@@ -1578,7 +1578,8 @@ impl IntellisensePopup {
         let selected = self.browser.value();
         if selected > 0 {
             self.suggestions
-                .borrow()
+                .lock()
+                .unwrap()
                 .get((selected - 1) as usize)
                 .cloned()
         } else {
@@ -2029,17 +2030,22 @@ mod intellisense_tests {
 
     #[test]
     fn invoke_selected_callback_preserves_replaced_callback() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
-            Rc::new(RefCell::new(None));
-        let calls = Rc::new(RefCell::new(Vec::new()));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> = Rc::new(Mutex::new(None));
+        let calls = Rc::new(Mutex::new(Vec::new()));
 
         let callback_slot_for_first = callback_slot.clone();
         let calls_for_first = calls.clone();
-        *callback_slot.borrow_mut() = Some(Box::new(move |value: String| {
-            calls_for_first.borrow_mut().push(format!("first:{value}"));
+        *callback_slot.lock().unwrap() = Some(Box::new(move |value: String| {
+            calls_for_first
+                .lock()
+                .unwrap()
+                .push(format!("first:{value}"));
             let calls_for_second = calls_for_first.clone();
-            *callback_slot_for_first.borrow_mut() = Some(Box::new(move |next: String| {
-                calls_for_second.borrow_mut().push(format!("second:{next}"));
+            *callback_slot_for_first.lock().unwrap() = Some(Box::new(move |next: String| {
+                calls_for_second
+                    .lock()
+                    .unwrap()
+                    .push(format!("second:{next}"));
             }));
         }));
 
@@ -2047,20 +2053,19 @@ mod intellisense_tests {
         IntellisensePopup::invoke_selected_callback(&callback_slot, "beta".to_string());
 
         assert_eq!(
-            calls.borrow().as_slice(),
+            calls.lock().unwrap().as_slice(),
             ["first:alpha".to_string(), "second:beta".to_string()]
         );
     }
 
     #[test]
     fn invoke_selected_callback_restores_original_after_panic() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
-            Rc::new(RefCell::new(None));
-        let calls = Rc::new(RefCell::new(Vec::new()));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> = Rc::new(Mutex::new(None));
+        let calls = Rc::new(Mutex::new(Vec::new()));
 
         let calls_for_cb = calls.clone();
-        *callback_slot.borrow_mut() = Some(Box::new(move |value: String| {
-            calls_for_cb.borrow_mut().push(value.clone());
+        *callback_slot.lock().unwrap() = Some(Box::new(move |value: String| {
+            calls_for_cb.lock().unwrap().push(value.clone());
             if value == "panic" {
                 panic!("expected test panic");
             }
@@ -2070,7 +2075,7 @@ mod intellisense_tests {
         IntellisensePopup::invoke_selected_callback(&callback_slot, "ok".to_string());
 
         assert_eq!(
-            calls.borrow().as_slice(),
+            calls.lock().unwrap().as_slice(),
             ["panic".to_string(), "ok".to_string()]
         );
     }

@@ -5,8 +5,9 @@ use fltk::{
     prelude::*,
     text::{TextBuffer, TextDisplay},
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -16,9 +17,9 @@ use crate::ui::ResultTableWidget;
 #[derive(Clone)]
 pub struct ResultTabsWidget {
     tabs: Tabs,
-    data: Rc<RefCell<Vec<ResultTab>>>,
-    active_index: Rc<RefCell<Option<usize>>>,
-    script_output: Rc<RefCell<ScriptOutputTab>>,
+    data: Rc<Mutex<Vec<ResultTab>>>,
+    active_index: Rc<Mutex<Option<usize>>>,
+    script_output: Rc<Mutex<ScriptOutputTab>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
     max_cell_display_chars: Rc<Cell<usize>>,
@@ -118,8 +119,8 @@ impl ResultTabsWidget {
         // which causes distracting header size jumps during splitter drags.
         tabs.handle_overflow(TabsOverflow::Pulldown);
 
-        let data = Rc::new(RefCell::new(Vec::<ResultTab>::new()));
-        let active_index = Rc::new(RefCell::new(None));
+        let data = Rc::new(Mutex::new(Vec::<ResultTab>::new()));
+        let active_index = Rc::new(Mutex::new(None));
         let font_profile = Rc::new(Cell::new(configured_editor_profile()));
         let font_size = Rc::new(Cell::new(constants::DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars = Rc::new(Cell::new(
@@ -151,7 +152,7 @@ impl ResultTabsWidget {
         script_group.end();
         tabs.end();
 
-        let script_output = Rc::new(RefCell::new(ScriptOutputTab {
+        let script_output = Rc::new(Mutex::new(ScriptOutputTab {
             group: script_group,
             display: script_display,
             buffer: script_buffer,
@@ -163,14 +164,14 @@ impl ResultTabsWidget {
         tabs.set_callback(move |t| {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
-                let script_ptr = script_for_cb.borrow().group.as_widget_ptr();
+                let script_ptr = script_for_cb.lock().unwrap().group.as_widget_ptr();
                 if ptr == script_ptr {
-                    *active_for_cb.borrow_mut() = None;
+                    *active_for_cb.lock().unwrap() = None;
                     return;
                 }
-                let data = data_for_cb.borrow();
+                let data = data_for_cb.lock().unwrap();
                 let index = data.iter().position(|tab| tab.group.as_widget_ptr() == ptr);
-                *active_for_cb.borrow_mut() = index;
+                *active_for_cb.lock().unwrap() = index;
             }
         });
 
@@ -237,7 +238,7 @@ impl ResultTabsWidget {
         self.font_profile.set(profile);
         self.font_size.set(size);
         {
-            let mut script_output = self.script_output.borrow_mut();
+            let mut script_output = self.script_output.lock().unwrap();
             script_output.display.set_text_font(profile.normal);
             script_output.display.set_text_size(size as i32);
             script_output.display.redraw();
@@ -249,24 +250,24 @@ impl ResultTabsWidget {
     }
 
     pub fn clear(&mut self) {
-        let tabs_to_delete: Vec<_> = self.data.borrow_mut().drain(..).collect();
+        let tabs_to_delete: Vec<_> = self.data.lock().unwrap().drain(..).collect();
         for tab in tabs_to_delete {
             self.delete_tab(tab);
         }
         {
-            let mut data = self.data.borrow_mut();
+            let mut data = self.data.lock().unwrap();
             Self::maybe_shrink_tab_storage(&mut data);
         }
         self.clear_script_output();
-        *self.active_index.borrow_mut() = None;
+        *self.active_index.lock().unwrap() = None;
         let script_group = {
-            let script_output = self.script_output.borrow();
+            let script_output = self.script_output.lock().unwrap();
             script_output.group.clone()
         };
         let _ = self.tabs.set_value(&script_group);
         self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
-        let script_output = self.script_output.borrow();
+        let script_output = self.script_output.lock().unwrap();
         let mut script_group = script_output.group.clone();
         let mut script_display = script_output.display.clone();
         script_group.redraw();
@@ -274,11 +275,11 @@ impl ResultTabsWidget {
     }
 
     pub fn tab_count(&self) -> usize {
-        self.data.borrow().len()
+        self.data.lock().unwrap().len()
     }
 
     pub fn append_script_output_lines(&mut self, lines: &[String]) {
-        let mut script_output = self.script_output.borrow_mut();
+        let mut script_output = self.script_output.lock().unwrap();
         let mut buffer = script_output.buffer.clone();
         if lines.is_empty() {
             return;
@@ -299,13 +300,13 @@ impl ResultTabsWidget {
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
-        let current_len = self.data.borrow().len();
+        let current_len = self.data.lock().unwrap().len();
         if index < current_len {
             // Extract the group before calling set_value to avoid re-entrant borrow
             // when the tabs callback fires
-            let group = self.data.borrow()[index].group.clone();
+            let group = self.data.lock().unwrap()[index].group.clone();
             let _ = self.tabs.set_value(&group);
-            *self.active_index.borrow_mut() = Some(index);
+            *self.active_index.lock().unwrap() = Some(index);
             return;
         }
 
@@ -326,39 +327,39 @@ impl ResultTabsWidget {
         group.end();
         self.tabs.end();
 
-        self.data.borrow_mut().push(ResultTab { group, table });
-        let new_index = self.data.borrow().len().saturating_sub(1);
+        self.data.lock().unwrap().push(ResultTab { group, table });
+        let new_index = self.data.lock().unwrap().len().saturating_sub(1);
         // Extract the group before calling set_value to avoid re-entrant borrow
         // when the tabs callback fires
-        let group = self.data.borrow()[new_index].group.clone();
+        let group = self.data.lock().unwrap()[new_index].group.clone();
         let _ = self.tabs.set_value(&group);
         self.reset_tab_strip_left_anchor();
-        *self.active_index.borrow_mut() = Some(new_index);
+        *self.active_index.lock().unwrap() = Some(new_index);
     }
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String]) {
-        if let Some(tab) = self.data.borrow().get(index) {
+        if let Some(tab) = self.data.lock().unwrap().get(index) {
             let mut table = tab.table.clone();
             table.start_streaming(columns);
         }
     }
 
     pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
-        if let Some(tab) = self.data.borrow().get(index) {
+        if let Some(tab) = self.data.lock().unwrap().get(index) {
             let mut table = tab.table.clone();
             table.append_rows(rows);
         }
     }
 
     pub fn finish_streaming(&mut self, index: usize) {
-        if let Some(tab) = self.data.borrow().get(index) {
+        if let Some(tab) = self.data.lock().unwrap().get(index) {
             let mut table = tab.table.clone();
             table.finish_streaming();
         }
     }
 
     pub fn finish_all_streaming(&mut self) {
-        let tables = self.data.borrow();
+        let tables = self.data.lock().unwrap();
         for tab in tables.iter() {
             let mut table = tab.table.clone();
             table.finish_streaming();
@@ -371,7 +372,7 @@ impl ResultTabsWidget {
     }
 
     pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
-        if let Some(tab) = self.data.borrow().get(index) {
+        if let Some(tab) = self.data.lock().unwrap().get(index) {
             let mut table = tab.table.clone();
             table.display_result(result);
         }
@@ -396,9 +397,9 @@ impl ResultTabsWidget {
     }
 
     fn current_table(&self) -> Option<ResultTableWidget> {
-        let index = *self.active_index.borrow();
+        let index = *self.active_index.lock().unwrap();
         index
-            .and_then(|idx| self.data.borrow().get(idx).cloned())
+            .and_then(|idx| self.data.lock().unwrap().get(idx).cloned())
             .map(|tab| tab.table)
     }
 
@@ -424,7 +425,7 @@ impl ResultTabsWidget {
 
     fn delete_tab(&mut self, mut tab: ResultTab) {
         // FLTK memory management: proper cleanup order is critical
-        // 1. Clear callbacks on child widgets to release captured Rc<RefCell<T>> references
+        // 1. Clear callbacks on child widgets to release captured Rc<Mutex<T>> references
         // 2. Remove child widgets from parent before deletion
         // 3. Delete child widgets
         // 4. Delete parent container
@@ -453,13 +454,13 @@ impl ResultTabsWidget {
     /// Close the currently active result tab, freeing its data and FLTK resources.
     /// Returns true if a tab was closed.
     pub fn close_current_tab(&mut self) -> bool {
-        let index = match *self.active_index.borrow() {
+        let index = match *self.active_index.lock().unwrap() {
             Some(idx) => idx,
             None => return false, // Script Output tab cannot be closed
         };
 
         let tab = {
-            let mut data = self.data.borrow_mut();
+            let mut data = self.data.lock().unwrap();
             if index >= data.len() {
                 return false;
             }
@@ -469,15 +470,15 @@ impl ResultTabsWidget {
         self.delete_tab(tab);
 
         {
-            let mut data = self.data.borrow_mut();
+            let mut data = self.data.lock().unwrap();
             Self::maybe_shrink_tab_storage(&mut data);
         }
 
         // Update active index to nearest remaining tab
-        let remaining = self.data.borrow().len();
+        let remaining = self.data.lock().unwrap().len();
         if remaining == 0 {
-            *self.active_index.borrow_mut() = None;
-            let script_group = self.script_output.borrow().group.clone();
+            *self.active_index.lock().unwrap() = None;
+            let script_group = self.script_output.lock().unwrap().group.clone();
             let _ = self.tabs.set_value(&script_group);
         } else {
             let new_index = if index >= remaining {
@@ -485,8 +486,8 @@ impl ResultTabsWidget {
             } else {
                 index
             };
-            *self.active_index.borrow_mut() = Some(new_index);
-            let group = self.data.borrow()[new_index].group.clone();
+            *self.active_index.lock().unwrap() = Some(new_index);
+            let group = self.data.lock().unwrap()[new_index].group.clone();
             let _ = self.tabs.set_value(&group);
         }
 
@@ -495,13 +496,13 @@ impl ResultTabsWidget {
     }
 
     pub fn select_script_output(&mut self) {
-        let script_group = self.script_output.borrow().group.clone();
+        let script_group = self.script_output.lock().unwrap().group.clone();
         let _ = self.tabs.set_value(&script_group);
-        *self.active_index.borrow_mut() = None;
+        *self.active_index.lock().unwrap() = None;
     }
 
     fn clear_script_output(&self) {
-        let mut script_output = self.script_output.borrow_mut();
+        let mut script_output = self.script_output.lock().unwrap();
         // Recreate the buffer to drop retained capacity after very large script outputs.
         let mut new_buffer = TextBuffer::default();
         new_buffer.set_text("");

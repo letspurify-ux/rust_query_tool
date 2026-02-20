@@ -5,9 +5,10 @@ use fltk::{
     prelude::*,
 };
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use crate::ui::constants::TAB_HEADER_HEIGHT;
 use crate::ui::theme;
@@ -18,9 +19,9 @@ type TabSelectCallback = Box<dyn FnMut(QueryTabId)>;
 #[derive(Clone)]
 pub struct QueryTabsWidget {
     tabs: Tabs,
-    entries: Rc<RefCell<Vec<TabEntry>>>,
-    next_id: Rc<RefCell<QueryTabId>>,
-    on_select: Rc<RefCell<Option<TabSelectCallback>>>,
+    entries: Rc<Mutex<Vec<TabEntry>>>,
+    next_id: Rc<Mutex<QueryTabId>>,
+    on_select: Rc<Mutex<Option<TabSelectCallback>>>,
     suppress_select_callback_depth: Rc<Cell<u32>>,
 }
 
@@ -59,17 +60,17 @@ impl QueryTabsWidget {
     }
 
     fn invoke_on_select_callback(
-        callback_slot: &Rc<RefCell<Option<TabSelectCallback>>>,
+        callback_slot: &Rc<Mutex<Option<TabSelectCallback>>>,
         tab_id: QueryTabId,
     ) {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let callback_result = panic::catch_unwind(AssertUnwindSafe(|| cb(tab_id)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = callback_slot.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -140,9 +141,9 @@ impl QueryTabsWidget {
             false
         });
 
-        let entries = Rc::new(RefCell::new(Vec::<TabEntry>::new()));
-        let next_id = Rc::new(RefCell::new(1u64));
-        let on_select = Rc::new(RefCell::new(None::<TabSelectCallback>));
+        let entries = Rc::new(Mutex::new(Vec::<TabEntry>::new()));
+        let next_id = Rc::new(Mutex::new(1u64));
+        let on_select = Rc::new(Mutex::new(None::<TabSelectCallback>));
         let suppress_select_callback_depth = Rc::new(Cell::new(0u32));
 
         let entries_for_cb = entries.clone();
@@ -157,7 +158,8 @@ impl QueryTabsWidget {
             };
             let selected_ptr = selected.as_widget_ptr();
             let selected_id = entries_for_cb
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
                 .map(|entry| entry.id);
@@ -182,7 +184,7 @@ impl QueryTabsWidget {
     where
         F: FnMut(QueryTabId) + 'static,
     {
-        *self.on_select.borrow_mut() = Some(Box::new(callback));
+        *self.on_select.lock().unwrap() = Some(Box::new(callback));
     }
 
     pub fn get_widget(&self) -> Tabs {
@@ -191,7 +193,7 @@ impl QueryTabsWidget {
 
     pub fn add_tab(&mut self, label: &str) -> QueryTabId {
         let tab_id = {
-            let mut next = self.next_id.borrow_mut();
+            let mut next = self.next_id.lock().unwrap();
             let id = *next;
             *next = next.saturating_add(1);
             id
@@ -205,7 +207,7 @@ impl QueryTabsWidget {
         group.end();
         self.tabs.end();
 
-        self.entries.borrow_mut().push(TabEntry {
+        self.entries.lock().unwrap().push(TabEntry {
             id: tab_id,
             group: group.clone(),
         });
@@ -232,7 +234,8 @@ impl QueryTabsWidget {
         let selected = self.tabs.value()?;
         let selected_ptr = selected.as_widget_ptr();
         self.entries
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
             .map(|entry| entry.id)
@@ -249,7 +252,7 @@ impl QueryTabsWidget {
 
     pub fn close_tab(&mut self, tab_id: QueryTabId) -> bool {
         let group = {
-            let mut entries = self.entries.borrow_mut();
+            let mut entries = self.entries.lock().unwrap();
             let Some(index) = entries.iter().position(|entry| entry.id == tab_id) else {
                 return false;
             };
@@ -272,14 +275,20 @@ impl QueryTabsWidget {
 
     pub fn tab_group(&self, tab_id: QueryTabId) -> Option<Group> {
         self.entries
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .find(|entry| entry.id == tab_id)
             .map(|entry| entry.group.clone())
     }
 
     pub fn tab_ids(&self) -> Vec<QueryTabId> {
-        self.entries.borrow().iter().map(|entry| entry.id).collect()
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
     }
 
     fn display_label(label: &str) -> String {

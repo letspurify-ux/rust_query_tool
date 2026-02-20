@@ -1,12 +1,12 @@
 use super::*;
 use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_KEYWORD, STYLE_STRING};
 
-use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 fn load_test_file(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1764,11 +1764,11 @@ END;"#;
 
 #[test]
 fn finalize_execution_state_clears_running_and_cancel_flags() {
-    let query_running = Rc::new(RefCell::new(true));
+    let query_running = Rc::new(Mutex::new(true));
     let cancel_flag = Arc::new(AtomicBool::new(true));
 
     SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-    assert!(!*query_running.borrow());
+    assert!(!*query_running.lock().unwrap());
     assert!(!cancel_flag.load(Ordering::SeqCst));
 }
