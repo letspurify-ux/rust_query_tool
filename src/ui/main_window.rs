@@ -976,7 +976,11 @@ impl MainWindow {
                 return;
             }
             let mut s = state_for_result_close.borrow_mut();
-            s.result_tabs.close_current_tab();
+            if s.result_tabs.close_current_tab() {
+                // A result tab drop can release large row buffers.
+                // Ask allocator to return free pages promptly.
+                malloc_trim_process();
+            }
             app::redraw();
         });
 
@@ -990,7 +994,11 @@ impl MainWindow {
                 return;
             }
             let mut s = state_for_result_clear.borrow_mut();
+            let had_tabs = s.result_tabs.tab_count() > 0;
             s.result_tabs.clear();
+            if had_tabs {
+                malloc_trim_process();
+            }
             app::redraw();
         });
 
@@ -1686,6 +1694,9 @@ impl MainWindow {
                     s.result_tabs.finish_all_streaming();
                     s.result_tabs.align_tab_strip_left();
                     s.fetch_row_counts.clear();
+                    // Query execution completed and large temporary buffers may
+                    // have been released during result materialization.
+                    malloc_trim_process();
                     let current_status = s.status_bar.label().to_ascii_lowercase();
                     let needs_reset = current_status.contains("executing query")
                         || current_status.contains("fetching rows")
