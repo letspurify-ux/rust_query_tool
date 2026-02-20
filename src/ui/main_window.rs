@@ -2361,6 +2361,15 @@ impl MainWindow {
         }
     }
 
+    fn resolve_window_shortcut_action(
+        event_key: fltk::enums::Key,
+        event_original_key: fltk::enums::Key,
+        event_state: fltk::enums::Shortcut,
+    ) -> Option<&'static str> {
+        Self::menu_shortcut_for_key(event_key, event_state)
+            .or_else(|| Self::menu_shortcut_for_key(event_original_key, event_state))
+    }
+
     fn handle_window_shortcut(
         state: &Rc<RefCell<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
@@ -2368,8 +2377,11 @@ impl MainWindow {
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
     ) -> bool {
         let event_key = app::event_key();
+        let event_original_key = app::event_original_key();
         let event_state = app::event_state();
-        let Some(action) = Self::menu_shortcut_for_key(event_key, event_state) else {
+        let Some(action) =
+            Self::resolve_window_shortcut_action(event_key, event_original_key, event_state)
+        else {
             return false;
         };
         Self::execute_menu_action(state, schema_sender, conn_sender, file_sender, action)
@@ -3192,6 +3204,34 @@ impl MainWindow {
         }
 
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fltk::enums::{Key, Shortcut};
+
+    #[test]
+    fn resolve_window_shortcut_prefers_current_key_match() {
+        let action = MainWindow::resolve_window_shortcut_action(
+            Key::from_char('f'),
+            Key::from_char('x'),
+            Shortcut::Ctrl,
+        );
+
+        assert_eq!(action, Some("Edit/Find..."));
+    }
+
+    #[test]
+    fn resolve_window_shortcut_uses_original_key_for_non_ascii_layout() {
+        let action = MainWindow::resolve_window_shortcut_action(
+            Key::from_char('ㄹ'),
+            Key::from_char('f'),
+            Shortcut::Ctrl,
+        );
+
+        assert_eq!(action, Some("Edit/Find..."));
     }
 }
 

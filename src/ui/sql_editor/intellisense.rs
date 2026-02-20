@@ -540,6 +540,8 @@ impl SqlEditorWidget {
                 }
                 Event::KeyDown => {
                     let key = fltk::app::event_key();
+                    let original_key = fltk::app::event_original_key();
+                    let shortcut_key = Self::shortcut_key_for_layout(key, original_key);
                     let popup_visible = intellisense_popup_for_handle.borrow().is_visible();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
@@ -578,7 +580,7 @@ impl SqlEditorWidget {
                     }
 
                     if popup_visible {
-                        match key {
+                        match shortcut_key {
                             Key::Escape => {
                                 // Close popup, consume event
                                 intellisense_popup_for_handle.borrow_mut().hide();
@@ -693,22 +695,22 @@ impl SqlEditorWidget {
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
 
                     if ctrl_or_cmd {
-                        if shift && (key == Key::from_char('f') || key == Key::from_char('F')) {
+                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'f') {
                             widget_for_shortcuts.format_selected_sql();
                             return true;
                         }
 
-                        if shift && (key == Key::from_char('z') || key == Key::from_char('Z')) {
+                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'z') {
                             widget_for_shortcuts.redo();
                             return true;
                         }
 
                         match key {
-                            k if k == Key::from_char('z') || k == Key::from_char('Z') => {
+                            k if Self::matches_alpha_shortcut(k, 'z') => {
                                 widget_for_shortcuts.undo();
                                 return true;
                             }
-                            k if k == Key::from_char('y') || k == Key::from_char('Y') => {
+                            k if Self::matches_alpha_shortcut(k, 'y') => {
                                 widget_for_shortcuts.redo();
                                 return true;
                             }
@@ -735,7 +737,7 @@ impl SqlEditorWidget {
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
-                            k if k == Key::from_char('f') || k == Key::from_char('F') => {
+                            k if Self::matches_alpha_shortcut(k, 'f') => {
                                 Self::invoke_void_callback(&find_callback_for_handle);
                                 return true;
                             }
@@ -743,15 +745,15 @@ impl SqlEditorWidget {
                                 widget_for_shortcuts.toggle_comment();
                                 return true;
                             }
-                            k if k == Key::from_char('u') || k == Key::from_char('U') => {
+                            k if Self::matches_alpha_shortcut(k, 'u') => {
                                 widget_for_shortcuts.convert_selection_case(true);
                                 return true;
                             }
-                            k if k == Key::from_char('l') || k == Key::from_char('L') => {
+                            k if Self::matches_alpha_shortcut(k, 'l') => {
                                 widget_for_shortcuts.convert_selection_case(false);
                                 return true;
                             }
-                            k if k == Key::from_char('h') || k == Key::from_char('H') => {
+                            k if Self::matches_alpha_shortcut(k, 'h') => {
                                 Self::invoke_void_callback(&replace_callback_for_handle);
                                 return true;
                             }
@@ -812,6 +814,7 @@ impl SqlEditorWidget {
                     // KeyUp fires AFTER the character is inserted into the buffer.
                     // Filter/show intellisense here.
                     let key = fltk::app::event_key();
+                    let original_key = fltk::app::event_original_key();
                     let event_text = fltk::app::event_text();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
@@ -821,7 +824,11 @@ impl SqlEditorWidget {
 
                     // Ctrl/Cmd+Space is handled on KeyDown for manual intellisense trigger.
                     // Ignore the matching KeyUp so the popup is not immediately dismissed.
-                    if Self::should_ignore_keyup_after_manual_trigger(key, ctrl_or_cmd) {
+                    if Self::should_ignore_keyup_after_manual_trigger(
+                        key,
+                        original_key,
+                        ctrl_or_cmd,
+                    ) {
                         return true;
                     }
 
@@ -2586,8 +2593,25 @@ impl SqlEditorWidget {
         word.chars().count() >= 2
     }
 
-    fn should_ignore_keyup_after_manual_trigger(key: Key, ctrl_or_cmd: bool) -> bool {
-        ctrl_or_cmd && key == Key::from_char(' ')
+    fn should_ignore_keyup_after_manual_trigger(
+        key: Key,
+        original_key: Key,
+        ctrl_or_cmd: bool,
+    ) -> bool {
+        ctrl_or_cmd && Self::shortcut_key_for_layout(key, original_key) == Key::from_char(' ')
+    }
+
+    fn shortcut_key_for_layout(key: Key, original_key: Key) -> Key {
+        if (0..=0x7f).contains(&key.bits()) {
+            key
+        } else {
+            original_key
+        }
+    }
+
+    fn matches_alpha_shortcut(key: Key, ascii: char) -> bool {
+        key == Key::from_char(ascii.to_ascii_lowercase())
+            || key == Key::from_char(ascii.to_ascii_uppercase())
     }
 
     fn should_auto_trigger_intellisense_for_forced_char(
@@ -3409,15 +3433,42 @@ FROM d
     fn keyup_after_manual_ctrl_space_trigger_is_ignored() {
         assert!(SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
             Key::from_char(' '),
+            Key::from_char(' '),
             true,
         ));
         assert!(!SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
+            Key::from_char(' '),
             Key::from_char(' '),
             false,
         ));
         assert!(!SqlEditorWidget::should_ignore_keyup_after_manual_trigger(
             Key::from_char('a'),
+            Key::from_char('a'),
             true,
+        ));
+    }
+
+    #[test]
+    fn shortcut_key_for_layout_falls_back_to_original_for_non_ascii_key() {
+        assert_eq!(
+            SqlEditorWidget::shortcut_key_for_layout(Key::from_char('ㄹ'), Key::from_char('f')),
+            Key::from_char('f')
+        );
+    }
+
+    #[test]
+    fn matches_alpha_shortcut_accepts_upper_and_lower_case() {
+        assert!(SqlEditorWidget::matches_alpha_shortcut(
+            Key::from_char('f'),
+            'f'
+        ));
+        assert!(SqlEditorWidget::matches_alpha_shortcut(
+            Key::from_char('F'),
+            'f'
+        ));
+        assert!(!SqlEditorWidget::matches_alpha_shortcut(
+            Key::from_char('g'),
+            'f'
         ));
     }
 

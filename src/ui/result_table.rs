@@ -532,6 +532,7 @@ impl ResultTableWidget {
                 }
                 Event::KeyDown => {
                     let key = app::event_key();
+                    let original_key = app::event_original_key();
                     let state = app::event_state();
                     let ctrl_or_cmd =
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
@@ -542,50 +543,43 @@ impl ResultTableWidget {
                     }
 
                     if ctrl_or_cmd {
-                        match key {
-                            k if (k == Key::from_char('c') || k == Key::from_char('C'))
-                                && shift =>
-                            {
-                                Self::copy_selected_with_headers(
-                                    &table_for_handle,
-                                    &headers_for_handle,
-                                    &full_data_for_handle,
-                                );
-                                return true;
+                        if shift && Self::matches_shortcut_key(key, original_key, 'c') {
+                            Self::copy_selected_with_headers(
+                                &table_for_handle,
+                                &headers_for_handle,
+                                &full_data_for_handle,
+                            );
+                            return true;
+                        }
+                        if Self::matches_shortcut_key(key, original_key, 'a') {
+                            let rows = table_for_handle.rows();
+                            let cols = table_for_handle.cols();
+                            if rows > 0 && cols > 0 {
+                                table_for_handle.set_selection(0, 0, rows - 1, cols - 1);
+                                table_for_handle.redraw();
                             }
-                            k if k == Key::from_char('a') || k == Key::from_char('A') => {
-                                let rows = table_for_handle.rows();
-                                let cols = table_for_handle.cols();
-                                if rows > 0 && cols > 0 {
-                                    table_for_handle.set_selection(0, 0, rows - 1, cols - 1);
-                                    table_for_handle.redraw();
-                                }
-                                return true;
-                            }
-                            k if k == Key::from_char('c') || k == Key::from_char('C') => {
-                                Self::copy_selected_to_clipboard(
-                                    &table_for_handle,
-                                    &headers_for_handle,
-                                    &full_data_for_handle,
-                                );
-                                return true;
-                            }
-                            _ => {}
+                            return true;
+                        }
+                        if Self::matches_shortcut_key(key, original_key, 'c') {
+                            Self::copy_selected_to_clipboard(
+                                &table_for_handle,
+                                &headers_for_handle,
+                                &full_data_for_handle,
+                            );
+                            return true;
                         }
                     }
                     false
                 }
                 Event::Shortcut => {
                     let key = app::event_key();
+                    let original_key = app::event_original_key();
                     let state = app::event_state();
                     let ctrl_or_cmd =
                         state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
                     let shift = state.contains(Shortcut::Shift);
 
-                    if ctrl_or_cmd
-                        && shift
-                        && (key == Key::from_char('c') || key == Key::from_char('C'))
-                    {
+                    if ctrl_or_cmd && shift && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_with_headers(
                             &table_for_handle,
                             &headers_for_handle,
@@ -593,7 +587,7 @@ impl ResultTableWidget {
                         );
                         return true;
                     }
-                    if ctrl_or_cmd && (key == Key::from_char('c') || key == Key::from_char('C')) {
+                    if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_to_clipboard(
                             &table_for_handle,
                             &headers_for_handle,
@@ -601,7 +595,7 @@ impl ResultTableWidget {
                         );
                         return true;
                     }
-                    if ctrl_or_cmd && (key == Key::from_char('a') || key == Key::from_char('A')) {
+                    if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'a') {
                         let rows = table_for_handle.rows();
                         let cols = table_for_handle.cols();
                         if rows > 0 && cols > 0 {
@@ -628,6 +622,12 @@ impl ResultTableWidget {
             font_profile,
             font_size,
         }
+    }
+
+    fn matches_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
+        let lower = Key::from_char(ascii.to_ascii_lowercase());
+        let upper = Key::from_char(ascii.to_ascii_uppercase());
+        key == lower || key == upper || original_key == lower || original_key == upper
     }
 
     /// Get cell at mouse position (returns None if outside cells)
@@ -1321,5 +1321,28 @@ impl ResultTableWidget {
 impl Default for ResultTableWidget {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_shortcut_key_accepts_current_ascii_key() {
+        assert!(ResultTableWidget::matches_shortcut_key(
+            Key::from_char('c'),
+            Key::from_char('x'),
+            'c',
+        ));
+    }
+
+    #[test]
+    fn matches_shortcut_key_accepts_original_ascii_key() {
+        assert!(ResultTableWidget::matches_shortcut_key(
+            Key::from_char('ㅊ'),
+            Key::from_char('c'),
+            'c',
+        ));
     }
 }
