@@ -2746,7 +2746,7 @@ impl MainWindow {
     ) {
         let state = self.state.clone();
 
-        // Wrap receivers in Rc<RefCell> to share across timeout callbacks
+        // Wrap receivers in Rc<Mutex> to share across timeout callbacks
         let schema_receiver: Rc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>> =
             Rc::new(Mutex::new(schema_receiver));
         let conn_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>> =

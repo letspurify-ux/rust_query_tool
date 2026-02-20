@@ -734,7 +734,7 @@ impl SqlEditorWidget {
         let cancel_flag = self.cancel_flag.clone();
         let lifecycle_group = self.group.clone();
 
-        // Wrap receiver in Rc<RefCell> to share across timeout callbacks
+        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
         let receiver: Rc<Mutex<mpsc::Receiver<QueryProgress>>> =
             Rc::new(Mutex::new(progress_receiver));
 
@@ -920,7 +920,7 @@ impl SqlEditorWidget {
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
 
-        // Wrap receiver in Rc<RefCell> to share across timeout callbacks
+        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
         let receiver: Rc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
             Rc::new(Mutex::new(column_receiver));
 
