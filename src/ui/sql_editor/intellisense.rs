@@ -3457,6 +3457,26 @@ FROM d
     }
 
     #[test]
+    fn resolved_shortcut_key_matches_all_editor_ctrl_alpha_shortcuts() {
+        for ascii in ['f', 'u', 'l', 'h', 'z', 'y'] {
+            let resolved =
+                SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char(ascii));
+            assert!(SqlEditorWidget::matches_alpha_shortcut(resolved, ascii));
+        }
+    }
+
+    #[test]
+    fn resolved_shortcut_key_preserves_ctrl_space_and_ctrl_slash() {
+        let space =
+            SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char(' '));
+        assert_eq!(space, Key::from_char(' '));
+
+        let slash =
+            SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char('/'));
+        assert_eq!(slash, Key::from_char('/'));
+    }
+
+    #[test]
     fn matches_alpha_shortcut_accepts_upper_and_lower_case() {
         assert!(SqlEditorWidget::matches_alpha_shortcut(
             Key::from_char('f'),
