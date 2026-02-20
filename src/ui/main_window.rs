@@ -33,7 +33,7 @@ use crate::ui::{
     IntellisenseData, MenuBarBuilder, ObjectBrowserWidget, QueryHistoryDialog, QueryProgress,
     QueryTabId, QueryTabsWidget, ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
-use crate::utils::{AppConfig, QueryHistory};
+use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
 
 #[derive(Clone)]
 struct SchemaUpdate {
@@ -1375,6 +1375,10 @@ impl MainWindow {
 
             s.right_tile.redraw();
             app::redraw();
+
+            // Large SQL buffers are dropped above. Ask allocator to release
+            // free pages proactively so RSS reflects the close action sooner.
+            malloc_trim_process();
             (
                 created_tab_id,
                 s.schema_sender.clone(),
