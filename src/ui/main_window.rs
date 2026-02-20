@@ -3248,11 +3248,18 @@ impl MainWindow {
                 "app",
                 "Previous session ended with a crash. Crash report was shown to user.",
             );
-            let msg = format!(
-                "The previous session ended unexpectedly.\n\n{}\n\nThe crash has been recorded in the application log.",
+            let crash_message = format!(
+                "The previous session ended unexpectedly.
+
+{}
+
+The crash has been recorded in the application log.",
                 crash_report
             );
-            fltk::dialog::alert_default(&msg);
+            SqlEditorWidget::show_quick_describe_text_dialog(
+                "Previous Session Crash Report",
+                &crash_message,
+            );
         }
 
         match app.run() {
