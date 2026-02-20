@@ -705,7 +705,7 @@ impl SqlEditorWidget {
                             return true;
                         }
 
-                        match key {
+                        match shortcut_key {
                             k if Self::matches_alpha_shortcut(k, 'z') => {
                                 widget_for_shortcuts.undo();
                                 return true;
@@ -3454,6 +3454,26 @@ FROM d
             SqlEditorWidget::shortcut_key_for_layout(Key::from_char('ㄹ'), Key::from_char('f')),
             Key::from_char('f')
         );
+    }
+
+    #[test]
+    fn resolved_shortcut_key_matches_all_editor_ctrl_alpha_shortcuts() {
+        for ascii in ['f', 'u', 'l', 'h', 'z', 'y'] {
+            let resolved =
+                SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char(ascii));
+            assert!(SqlEditorWidget::matches_alpha_shortcut(resolved, ascii));
+        }
+    }
+
+    #[test]
+    fn resolved_shortcut_key_preserves_ctrl_space_and_ctrl_slash() {
+        let space =
+            SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char(' '));
+        assert_eq!(space, Key::from_char(' '));
+
+        let slash =
+            SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char('/'));
+        assert_eq!(slash, Key::from_char('/'));
     }
 
     #[test]
