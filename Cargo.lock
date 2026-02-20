@@ -1279,11 +1279,13 @@ dependencies = [
  "dirs",
  "fltk",
  "keyring",
+ "libc",
  "libdbus-sys",
  "once_cell",
  "oracle",
  "serde",
  "serde_json",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
