@@ -4,8 +4,7 @@ use fltk::{browser::HoldBrowser, prelude::*, window::Window};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // SQL Keywords for autocomplete
@@ -1317,10 +1316,10 @@ impl Default for IntellisenseData {
 pub struct IntellisensePopup {
     window: Window,
     browser: HoldBrowser,
-    suggestions: Rc<Mutex<Vec<String>>>,
-    all_suggestions: Rc<Mutex<Vec<String>>>,
-    selected_callback: Rc<Mutex<Option<Box<dyn FnMut(String)>>>>,
-    visible: Rc<Mutex<bool>>,
+    suggestions: Arc<Mutex<Vec<String>>>,
+    all_suggestions: Arc<Mutex<Vec<String>>>,
+    selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
+    visible: Arc<Mutex<bool>>,
 }
 
 impl IntellisensePopup {
@@ -1344,7 +1343,7 @@ impl IntellisensePopup {
     }
 
     fn invoke_selected_callback(
-        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(String)>>>>,
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
         selected_text: String,
     ) {
         let callback = {
@@ -1390,11 +1389,11 @@ impl IntellisensePopup {
             fltk::group::Group::set_current(Some(group));
         }
 
-        let suggestions = Rc::new(Mutex::new(Vec::new()));
-        let all_suggestions = Rc::new(Mutex::new(Vec::new()));
-        let selected_callback: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> =
-            Rc::new(Mutex::new(None));
-        let visible = Rc::new(Mutex::new(false));
+        let suggestions = Arc::new(Mutex::new(Vec::new()));
+        let all_suggestions = Arc::new(Mutex::new(Vec::new()));
+        let selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> =
+            Arc::new(Mutex::new(None));
+        let visible = Arc::new(Mutex::new(false));
 
         window.hide();
 
@@ -2030,8 +2029,8 @@ mod intellisense_tests {
 
     #[test]
     fn invoke_selected_callback_preserves_replaced_callback() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> = Rc::new(Mutex::new(None));
-        let calls = Rc::new(Mutex::new(Vec::new()));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> = Arc::new(Mutex::new(None));
+        let calls = Arc::new(Mutex::new(Vec::new()));
 
         let callback_slot_for_first = callback_slot.clone();
         let calls_for_first = calls.clone();
@@ -2060,8 +2059,8 @@ mod intellisense_tests {
 
     #[test]
     fn invoke_selected_callback_restores_original_after_panic() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(String)>>>> = Rc::new(Mutex::new(None));
-        let calls = Rc::new(Mutex::new(Vec::new()));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> = Arc::new(Mutex::new(None));
+        let calls = Arc::new(Mutex::new(Vec::new()));
 
         let calls_for_cb = calls.clone();
         *callback_slot.lock().unwrap() = Some(Box::new(move |value: String| {

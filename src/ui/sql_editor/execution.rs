@@ -7725,8 +7725,8 @@ impl SqlEditorWidget {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        let result: Rc<Mutex<Option<String>>> = Rc::new(Mutex::new(None));
-        let cancelled = Rc::new(Mutex::new(false));
+        let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(Mutex::new(false));
 
         {
             let result = result.clone();
@@ -8737,7 +8737,7 @@ mod query_execution_cleanup_tests {
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
-        let poison_target = Arc::clone(&current_query_connection);
+        let poison_target = current_query_connection.clone();
         let _ = panic::catch_unwind(AssertUnwindSafe(move || {
             let _lock = poison_target
                 .lock()

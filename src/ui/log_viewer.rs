@@ -9,9 +9,8 @@ use fltk::{
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::rc::Rc;
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
@@ -30,7 +29,7 @@ enum DialogMessage {
 pub struct LogViewerDialog;
 
 impl LogViewerDialog {
-    pub fn show(popups: Rc<Mutex<Vec<Window>>>) {
+    pub fn show(popups: Arc<Mutex<Vec<Window>>>) {
         let all_entries = logging::get_log_entries();
 
         let current_group = fltk::group::Group::try_current();
@@ -154,8 +153,8 @@ impl LogViewerDialog {
 
         popups.lock().unwrap().push(dialog.clone());
 
-        let entries: Rc<Mutex<Vec<LogEntry>>> = Rc::new(Mutex::new(all_entries));
-        let filtered_indices: Rc<Mutex<Vec<usize>>> = Rc::new(Mutex::new(Vec::new()));
+        let entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(all_entries));
+        let filtered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
@@ -339,7 +338,7 @@ fn selected_filter(choice: &Choice) -> Option<LogLevel> {
 fn populate_browser(
     entries: &[LogEntry],
     browser: &mut HoldBrowser,
-    filtered_indices: &Rc<Mutex<Vec<usize>>>,
+    filtered_indices: &Arc<Mutex<Vec<usize>>>,
     count_label: &mut fltk::frame::Frame,
     filter: Option<LogLevel>,
 ) {

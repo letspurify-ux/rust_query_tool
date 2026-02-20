@@ -12,7 +12,7 @@ use fltk::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::db::QueryResult;
@@ -68,20 +68,20 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 #[derive(Clone)]
 pub struct ResultTableWidget {
     table: Table,
-    headers: Rc<Mutex<Vec<String>>>,
+    headers: Arc<Mutex<Vec<String>>>,
     /// Buffer for pending rows during streaming
-    pending_rows: Rc<Mutex<Vec<Vec<String>>>>,
+    pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
-    pending_widths: Rc<Mutex<Vec<i32>>>,
+    pending_widths: Arc<Mutex<Vec<i32>>>,
     /// Last UI update time
-    last_flush: Rc<Mutex<Instant>>,
+    last_flush: Arc<Mutex<Instant>>,
     /// The sole data store: full original data (non-truncated).
     /// draw_cell reads from here on demand — no data duplication.
-    full_data: Rc<Mutex<Vec<Vec<String>>>>,
+    full_data: Arc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
     max_cell_display_chars: Rc<Cell<usize>>,
     /// How many rows have been sampled for column width calculation
-    width_sampled_rows: Rc<Mutex<usize>>,
+    width_sampled_rows: Arc<Mutex<usize>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
 }
@@ -314,8 +314,8 @@ impl ResultTableWidget {
     }
 
     pub fn with_size(x: i32, y: i32, w: i32, h: i32) -> Self {
-        let headers: Rc<Mutex<Vec<String>>> = Rc::new(Mutex::new(Vec::new()));
-        let full_data: Rc<Mutex<Vec<Vec<String>>>> = Rc::new(Mutex::new(Vec::new()));
+        let headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let full_data: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let font_profile = Rc::new(Cell::new(configured_editor_profile()));
         let font_size = Rc::new(Cell::new(DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars =
@@ -449,7 +449,7 @@ impl ResultTableWidget {
 
         // Setup event handler for mouse selection and keyboard shortcuts
         let headers_for_handle = headers.clone();
-        let drag_state_for_handle = Rc::new(Mutex::new(DragState::default()));
+        let drag_state_for_handle = Arc::new(Mutex::new(DragState::default()));
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
@@ -614,12 +614,12 @@ impl ResultTableWidget {
         Self {
             table,
             headers,
-            pending_rows: Rc::new(Mutex::new(Vec::new())),
-            pending_widths: Rc::new(Mutex::new(Vec::new())),
-            last_flush: Rc::new(Mutex::new(Instant::now())),
+            pending_rows: Arc::new(Mutex::new(Vec::new())),
+            pending_widths: Arc::new(Mutex::new(Vec::new())),
+            last_flush: Arc::new(Mutex::new(Instant::now())),
             full_data,
             max_cell_display_chars,
-            width_sampled_rows: Rc::new(Mutex::new(0)),
+            width_sampled_rows: Arc::new(Mutex::new(0)),
             font_profile,
             font_size,
         }
@@ -777,8 +777,8 @@ impl ResultTableWidget {
 
     fn show_context_menu(
         table: &Table,
-        headers: &Rc<Mutex<Vec<String>>>,
-        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -827,8 +827,8 @@ impl ResultTableWidget {
 
     fn copy_selected_to_clipboard(
         table: &Table,
-        _headers: &Rc<Mutex<Vec<String>>>,
-        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
+        _headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
         let (row_top, col_left, row_bot, col_right) = table.get_selection();
         if row_top < 0 || col_left < 0 {
@@ -868,8 +868,8 @@ impl ResultTableWidget {
 
     fn copy_selected_with_headers(
         table: &Table,
-        headers: &Rc<Mutex<Vec<String>>>,
-        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
         let (row_top, col_left, row_bot, col_right) = table.get_selection();
         if row_top < 0 || col_left < 0 {
@@ -920,8 +920,8 @@ impl ResultTableWidget {
     }
 
     fn copy_all_to_clipboard(
-        headers: &Rc<Mutex<Vec<String>>>,
-        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) {
         let headers = headers.lock().unwrap();
         let full_data = full_data.lock().unwrap();
@@ -1284,7 +1284,7 @@ impl ResultTableWidget {
 
     /// Cleanup method to release resources before the widget is deleted.
     pub fn cleanup(&mut self) {
-        // Clear the event handler callback to release captured Rc<Mutex<T>> references.
+        // Clear the event handler callback to release captured Arc<Mutex<T>> references.
         self.table.handle(|_, _| false);
 
         // Set an empty draw_cell to release captured Rc references
