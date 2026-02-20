@@ -140,9 +140,9 @@ impl ResultTabsWidget {
         let mut script_display = TextDisplay::new(display_x, display_y, display_w, display_h, None);
         script_display.set_color(theme::panel_bg());
         script_display.set_text_color(theme::text_primary());
-        let script_profile = *font_profile.lock().unwrap();
+        let script_profile = *font_profile.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         script_display.set_text_font(script_profile.normal);
-        script_display.set_text_size(*font_size.lock().unwrap() as i32);
+        script_display.set_text_size(*font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) as i32);
         let mut script_buffer = TextBuffer::default();
         script_buffer.set_text("");
         script_display.set_buffer(script_buffer.clone());
@@ -162,14 +162,14 @@ impl ResultTabsWidget {
         tabs.set_callback(move |t| {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
-                let script_ptr = script_for_cb.lock().unwrap().group.as_widget_ptr();
+                let script_ptr = script_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).group.as_widget_ptr();
                 if ptr == script_ptr {
-                    *active_for_cb.lock().unwrap() = None;
+                    *active_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     return;
                 }
-                let data = data_for_cb.lock().unwrap();
+                let data = data_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let index = data.iter().position(|tab| tab.group.as_widget_ptr() == ptr);
-                *active_for_cb.lock().unwrap() = index;
+                *active_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = index;
             }
         });
 
@@ -233,10 +233,10 @@ impl ResultTabsWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        *self.font_profile.lock().unwrap() = profile;
-        *self.font_size.lock().unwrap() = size;
+        *self.font_profile.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = profile;
+        *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
         {
-            let mut script_output = self.script_output.lock().unwrap();
+            let mut script_output = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             script_output.display.set_text_font(profile.normal);
             script_output.display.set_text_size(size as i32);
             script_output.display.redraw();
@@ -244,28 +244,28 @@ impl ResultTabsWidget {
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
-        *self.max_cell_display_chars.lock().unwrap() = max_chars;
+        *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = max_chars;
     }
 
     pub fn clear(&mut self) {
-        let tabs_to_delete: Vec<_> = self.data.lock().unwrap().drain(..).collect();
+        let tabs_to_delete: Vec<_> = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..).collect();
         for tab in tabs_to_delete {
             self.delete_tab(tab);
         }
         {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::maybe_shrink_tab_storage(&mut data);
         }
         self.clear_script_output();
-        *self.active_index.lock().unwrap() = None;
+        *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let script_group = {
-            let script_output = self.script_output.lock().unwrap();
+            let script_output = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             script_output.group.clone()
         };
         let _ = self.tabs.set_value(&script_group);
         self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
-        let script_output = self.script_output.lock().unwrap();
+        let script_output = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut script_group = script_output.group.clone();
         let mut script_display = script_output.display.clone();
         script_group.redraw();
@@ -273,11 +273,11 @@ impl ResultTabsWidget {
     }
 
     pub fn tab_count(&self) -> usize {
-        self.data.lock().unwrap().len()
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
     pub fn append_script_output_lines(&mut self, lines: &[String]) {
-        let mut script_output = self.script_output.lock().unwrap();
+        let mut script_output = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut buffer = script_output.buffer.clone();
         if lines.is_empty() {
             return;
@@ -298,13 +298,13 @@ impl ResultTabsWidget {
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
-        let current_len = self.data.lock().unwrap().len();
+        let current_len = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
         if index < current_len {
             // Extract the group before calling set_value to avoid re-entrant borrow
             // when the tabs callback fires
-            let group = self.data.lock().unwrap()[index].group.clone();
+            let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[index].group.clone();
             let _ = self.tabs.set_value(&group);
-            *self.active_index.lock().unwrap() = Some(index);
+            *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
             return;
         }
 
@@ -319,48 +319,48 @@ impl ResultTabsWidget {
         group.begin();
         let mut table = ResultTableWidget::with_size(x, y, w, h);
         table.apply_font_settings(
-            *self.font_profile.lock().unwrap(),
-            *self.font_size.lock().unwrap(),
+            *self.font_profile.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
-        table.set_max_cell_display_chars(*self.max_cell_display_chars.lock().unwrap());
+        table.set_max_cell_display_chars(*self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         let widget = table.get_widget();
         group.resizable(&widget);
         group.end();
         self.tabs.end();
 
-        self.data.lock().unwrap().push(ResultTab { group, table });
-        let new_index = self.data.lock().unwrap().len().saturating_sub(1);
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(ResultTab { group, table });
+        let new_index = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len().saturating_sub(1);
         // Extract the group before calling set_value to avoid re-entrant borrow
         // when the tabs callback fires
-        let group = self.data.lock().unwrap()[new_index].group.clone();
+        let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[new_index].group.clone();
         let _ = self.tabs.set_value(&group);
         self.reset_tab_strip_left_anchor();
-        *self.active_index.lock().unwrap() = Some(new_index);
+        *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
     }
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String]) {
-        if let Some(tab) = self.data.lock().unwrap().get(index) {
+        if let Some(tab) = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(index) {
             let mut table = tab.table.clone();
             table.start_streaming(columns);
         }
     }
 
     pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
-        if let Some(tab) = self.data.lock().unwrap().get(index) {
+        if let Some(tab) = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(index) {
             let mut table = tab.table.clone();
             table.append_rows(rows);
         }
     }
 
     pub fn finish_streaming(&mut self, index: usize) {
-        if let Some(tab) = self.data.lock().unwrap().get(index) {
+        if let Some(tab) = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(index) {
             let mut table = tab.table.clone();
             table.finish_streaming();
         }
     }
 
     pub fn finish_all_streaming(&mut self) {
-        let tables = self.data.lock().unwrap();
+        let tables = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for tab in tables.iter() {
             let mut table = tab.table.clone();
             table.finish_streaming();
@@ -373,7 +373,7 @@ impl ResultTabsWidget {
     }
 
     pub fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
-        if let Some(tab) = self.data.lock().unwrap().get(index) {
+        if let Some(tab) = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(index) {
             let mut table = tab.table.clone();
             table.display_result(result);
         }
@@ -398,9 +398,9 @@ impl ResultTabsWidget {
     }
 
     fn current_table(&self) -> Option<ResultTableWidget> {
-        let index = *self.active_index.lock().unwrap();
+        let index = *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         index
-            .and_then(|idx| self.data.lock().unwrap().get(idx).cloned())
+            .and_then(|idx| self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(idx).cloned())
             .map(|tab| tab.table)
     }
 
@@ -455,13 +455,13 @@ impl ResultTabsWidget {
     /// Close the currently active result tab, freeing its data and FLTK resources.
     /// Returns true if a tab was closed.
     pub fn close_current_tab(&mut self) -> bool {
-        let index = match *self.active_index.lock().unwrap() {
+        let index = match *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             Some(idx) => idx,
             None => return false, // Script Output tab cannot be closed
         };
 
         let tab = {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if index >= data.len() {
                 return false;
             }
@@ -471,15 +471,15 @@ impl ResultTabsWidget {
         self.delete_tab(tab);
 
         {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::maybe_shrink_tab_storage(&mut data);
         }
 
         // Update active index to nearest remaining tab
-        let remaining = self.data.lock().unwrap().len();
+        let remaining = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
         if remaining == 0 {
-            *self.active_index.lock().unwrap() = None;
-            let script_group = self.script_output.lock().unwrap().group.clone();
+            *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            let script_group = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).group.clone();
             let _ = self.tabs.set_value(&script_group);
         } else {
             let new_index = if index >= remaining {
@@ -487,8 +487,8 @@ impl ResultTabsWidget {
             } else {
                 index
             };
-            *self.active_index.lock().unwrap() = Some(new_index);
-            let group = self.data.lock().unwrap()[new_index].group.clone();
+            *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
+            let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[new_index].group.clone();
             let _ = self.tabs.set_value(&group);
         }
 
@@ -497,13 +497,13 @@ impl ResultTabsWidget {
     }
 
     pub fn select_script_output(&mut self) {
-        let script_group = self.script_output.lock().unwrap().group.clone();
+        let script_group = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).group.clone();
         let _ = self.tabs.set_value(&script_group);
-        *self.active_index.lock().unwrap() = None;
+        *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     fn clear_script_output(&self) {
-        let mut script_output = self.script_output.lock().unwrap();
+        let mut script_output = self.script_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Recreate the buffer to drop retained capacity after very large script outputs.
         let mut new_buffer = TextBuffer::default();
         new_buffer.set_text("");

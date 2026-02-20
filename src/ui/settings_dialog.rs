@@ -322,8 +322,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let filtered_fonts = Arc::new(Mutex::new(Vec::<String>::new()));
 
     {
-        let mut filtered = filtered_fonts.lock().unwrap();
-        let mut selected = selected_font.lock().unwrap();
+        let mut filtered = filtered_fonts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut selected = selected_font.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         refill_font_list(
             &mut font_browser,
             all_fonts.as_ref(),
@@ -340,8 +340,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let selected_font_for_search = selected_font.clone();
     let mut selected_value_for_search = selected_value.clone();
     search_input.set_callback(move |input| {
-        let mut filtered = filtered_fonts_for_search.lock().unwrap();
-        let mut selected = selected_font_for_search.lock().unwrap();
+        let mut filtered = filtered_fonts_for_search.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut selected = selected_font_for_search.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         refill_font_list(
             &mut font_browser_for_search,
             all_fonts_for_search.as_ref(),
@@ -356,7 +356,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut selected_value_for_browser = selected_value.clone();
     font_browser.set_callback(move |browser| {
         if let Some(name) = browser.selected_text() {
-            *selected_font_for_browser.lock().unwrap() = name.clone();
+            *selected_font_for_browser.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = name.clone();
             selected_value_for_browser.set_label(&name);
         }
     });
@@ -387,12 +387,12 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
                 Some(size) => size,
                 None => return,
             };
-        let font = selected_font_ok.lock().unwrap().trim().to_string();
+        let font = selected_font_ok.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).trim().to_string();
         if font.is_empty() {
             fltk::dialog::alert_default("Please select a font.");
             return;
         }
-        *result_for_ok.lock().unwrap() = Some(FontSettings {
+        *result_for_ok.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(FontSettings {
             font,
             ui_size,
             editor_size,
@@ -416,6 +416,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     // Explicitly destroy top-level dialog widgets to release native resources.
     Window::delete(dialog);
 
-    let final_result = result.lock().unwrap().take();
+    let final_result = result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     final_result
 }

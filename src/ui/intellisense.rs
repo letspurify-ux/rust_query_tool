@@ -1347,13 +1347,13 @@ impl IntellisensePopup {
         selected_text: String,
     ) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(selected_text)));
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1422,7 +1422,7 @@ impl IntellisensePopup {
             if selected > 0 {
                 // First, get the text with suggestions borrow, then release it
                 let text = {
-                    let suggestions = suggestions.lock().unwrap();
+                    let suggestions = suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     suggestions.get((selected - 1) as usize).cloned()
                 };
                 if let Some(text) = text {
@@ -1431,7 +1431,7 @@ impl IntellisensePopup {
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();
-                    *visible.lock().unwrap() = false;
+                    *visible.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                 }
             }
         });
@@ -1447,14 +1447,14 @@ impl IntellisensePopup {
             return;
         }
 
-        *self.all_suggestions.lock().unwrap() = suggestions.clone();
+        *self.all_suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions.clone();
         self.set_suggestions(suggestions, None);
 
         self.window.set_pos(x, y);
         if !self.window.shown() {
             self.window.show();
         }
-        *self.visible.lock().unwrap() = true;
+        *self.visible.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
     }
 
     fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
@@ -1473,7 +1473,7 @@ impl IntellisensePopup {
             .map(|suggestion| format!("@C255 {}", suggestion))
             .collect();
         self.browser.clear();
-        *self.suggestions.lock().unwrap() = suggestions;
+        *self.suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions;
         for line in &browser_lines {
             self.browser.add(line);
         }
@@ -1495,14 +1495,14 @@ impl IntellisensePopup {
 
         let selected = self.get_selected();
         let filtered = {
-            let all = self.all_suggestions.lock().unwrap();
+            let all = self.all_suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             filter_suggestions_by_prefix(all.as_slice(), prefix)
         };
 
         if filtered.is_empty() {
             self.hide();
             self.browser.clear();
-            self.suggestions.lock().unwrap().clear();
+            self.suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
             return;
         }
 
@@ -1512,16 +1512,16 @@ impl IntellisensePopup {
     pub fn hide(&mut self) {
         self.window.hide();
         self.window.resize(0, 0, 0, 0);
-        *self.visible.lock().unwrap() = false;
+        *self.visible.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     }
 
     pub fn clear_for_close(&mut self) {
         self.hide();
         self.browser.set_callback(|_| {});
         self.browser.clear();
-        self.suggestions.lock().unwrap().clear();
-        self.all_suggestions.lock().unwrap().clear();
-        *self.selected_callback.lock().unwrap() = None;
+        self.suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        self.all_suggestions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        *self.selected_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn delete_for_close(&mut self) {
@@ -1532,7 +1532,7 @@ impl IntellisensePopup {
     }
 
     pub fn is_visible(&self) -> bool {
-        *self.visible.lock().unwrap()
+        *self.visible.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn popup_dimensions(&self) -> (i32, i32) {
@@ -1555,7 +1555,7 @@ impl IntellisensePopup {
     where
         F: FnMut(String) + 'static,
     {
-        *self.selected_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.selected_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn select_next(&mut self) {
@@ -1577,8 +1577,7 @@ impl IntellisensePopup {
         let selected = self.browser.value();
         if selected > 0 {
             self.suggestions
-                .lock()
-                .unwrap()
+                .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get((selected - 1) as usize)
                 .cloned()
         } else {
@@ -2034,16 +2033,14 @@ mod intellisense_tests {
 
         let callback_slot_for_first = callback_slot.clone();
         let calls_for_first = calls.clone();
-        *callback_slot.lock().unwrap() = Some(Box::new(move |value: String| {
+        *callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move |value: String| {
             calls_for_first
-                .lock()
-                .unwrap()
+                .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(format!("first:{value}"));
             let calls_for_second = calls_for_first.clone();
-            *callback_slot_for_first.lock().unwrap() = Some(Box::new(move |next: String| {
+            *callback_slot_for_first.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move |next: String| {
                 calls_for_second
-                    .lock()
-                    .unwrap()
+                    .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(format!("second:{next}"));
             }));
         }));
@@ -2052,7 +2049,7 @@ mod intellisense_tests {
         IntellisensePopup::invoke_selected_callback(&callback_slot, "beta".to_string());
 
         assert_eq!(
-            calls.lock().unwrap().as_slice(),
+            calls.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_slice(),
             ["first:alpha".to_string(), "second:beta".to_string()]
         );
     }
@@ -2063,8 +2060,8 @@ mod intellisense_tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
 
         let calls_for_cb = calls.clone();
-        *callback_slot.lock().unwrap() = Some(Box::new(move |value: String| {
-            calls_for_cb.lock().unwrap().push(value.clone());
+        *callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move |value: String| {
+            calls_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(value.clone());
             if value == "panic" {
                 panic!("expected test panic");
             }
@@ -2074,7 +2071,7 @@ mod intellisense_tests {
         IntellisensePopup::invoke_selected_callback(&callback_slot, "ok".to_string());
 
         assert_eq!(
-            calls.lock().unwrap().as_slice(),
+            calls.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_slice(),
             ["panic".to_string(), "ok".to_string()]
         );
     }

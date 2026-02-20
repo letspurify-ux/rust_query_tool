@@ -10,22 +10,23 @@ fn has_system_lib_via_pkg_config(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_empty_stub(out_dir: &Path, lib_name: &str) {
+fn build_empty_stub(out_dir: &Path, lib_name: &str) -> std::io::Result<()> {
     let src = out_dir.join(format!("{}_stub.c", lib_name));
-    std::fs::write(&src, "void space_query_x11_stub(void) {}\n").expect("write stub source");
+    std::fs::write(&src, "void space_query_x11_stub(void) {}\n")?;
 
     let mut build = cc::Build::new();
     build.file(&src);
     build.warnings(false);
     build.compile(lib_name);
+    Ok(())
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("linux") {
-        return;
+        return Ok(());
     }
 
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
+    let out_dir = env::var("OUT_DIR")?;
     let out_path = Path::new(&out_dir);
 
     let missing_xinerama = !has_system_lib_via_pkg_config("xinerama");
@@ -34,20 +35,21 @@ fn main() {
     let missing_xft = !has_system_lib_via_pkg_config("xft");
 
     if missing_xinerama {
-        build_empty_stub(out_path, "Xinerama");
+        build_empty_stub(out_path, "Xinerama")?;
     }
     if missing_xcursor {
-        build_empty_stub(out_path, "Xcursor");
+        build_empty_stub(out_path, "Xcursor")?;
     }
     if missing_xfixes {
-        build_empty_stub(out_path, "Xfixes");
+        build_empty_stub(out_path, "Xfixes")?;
     }
     if missing_xft {
-        build_empty_stub(out_path, "Xft");
+        build_empty_stub(out_path, "Xft")?;
     }
 
     if missing_xinerama || missing_xcursor || missing_xfixes || missing_xft {
         println!("cargo:warning=Missing X11 dev libs detected; linking local stubs for test/build in this environment.");
         println!("cargo:rustc-link-search=native={}", out_path.display());
     }
+    Ok(())
 }

@@ -521,13 +521,13 @@ impl SqlEditorWidget {
         result: &QueryResult,
     ) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(result)));
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -542,13 +542,13 @@ impl SqlEditorWidget {
         message: QueryProgress,
     ) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -563,13 +563,13 @@ impl SqlEditorWidget {
         message: &str,
     ) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.lock().unwrap();
+            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -706,9 +706,9 @@ impl SqlEditorWidget {
                 return;
             }
             let inserted = inserted_text(buf, pos, ins);
-            let mut state = undo_state.lock().unwrap();
+            let mut state = undo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            if state.applying_history || *applying_history_navigation.lock().unwrap() {
+            if state.applying_history || *applying_history_navigation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
                 return;
             }
 
@@ -778,7 +778,7 @@ impl SqlEditorWidget {
                 }
 
                 let message = {
-                    let r = receiver.lock().unwrap();
+                    let r = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     r.try_recv()
                 };
 
@@ -901,7 +901,7 @@ impl SqlEditorWidget {
     }
 
     fn finalize_execution_state(query_running: &Arc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
-        *query_running.lock().unwrap() = false;
+        *query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         cancel_flag.store(false, Ordering::SeqCst);
     }
 
@@ -951,13 +951,13 @@ impl SqlEditorWidget {
             let mut highlight_columns: Option<Vec<String>> = None;
             // Process any pending messages
             {
-                let r = receiver.lock().unwrap();
+                let r = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
                         Ok(update) => {
                             processed += 1;
                             let (refresh_pending, clear_pending, new_highlight_columns) = {
-                                let mut data = intellisense_data.lock().unwrap();
+                                let mut data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                 if update.cache_columns {
                                     data.set_columns_for_table(&update.table, update.columns);
                                     (
@@ -992,12 +992,12 @@ impl SqlEditorWidget {
             }
 
             if should_clear_pending {
-                *pending_intellisense.lock().unwrap() = None;
+                *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             }
 
             if let Some(highlight_columns) = highlight_columns {
                 let should_refresh_highlighting = {
-                    let mut highlighter = highlighter.lock().unwrap();
+                    let mut highlighter = highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let mut highlight_data = highlighter.get_highlight_data();
                     if highlight_data.columns == highlight_columns {
                         false
@@ -1010,7 +1010,7 @@ impl SqlEditorWidget {
 
                 if should_refresh_highlighting {
                     let cursor_pos = editor.insert_position().max(0) as usize;
-                    highlighter.lock().unwrap().highlight_buffer_window(
+                    highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).highlight_buffer_window(
                         &buffer,
                         &mut style_buffer.clone(),
                         cursor_pos,
@@ -1020,7 +1020,7 @@ impl SqlEditorWidget {
             }
 
             if should_refresh_pending {
-                let pending = pending_intellisense.lock().unwrap().clone();
+                let pending = pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                 if let Some(pending) = pending {
                     let cursor_pos = editor.insert_position().max(0);
                     if cursor_pos == pending.cursor_pos {
@@ -1038,30 +1038,30 @@ impl SqlEditorWidget {
                     } else {
                         // Cursor moved since async load was requested.
                         // Drop stale pending state so poll loop can idle.
-                        *pending_intellisense.lock().unwrap() = None;
+                        *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     }
                 }
             }
 
             let stale_cleared = {
-                let mut data = intellisense_data.lock().unwrap();
+                let mut data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 data.clear_stale_columns_loading(COLUMN_LOADING_STALE_TIMEOUT)
             };
             if stale_cleared > 0 {
                 processed += stale_cleared;
                 let no_columns_loading = {
-                    let data = intellisense_data.lock().unwrap();
+                    let data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     data.columns_loading.is_empty()
                 };
                 if no_columns_loading {
-                    *pending_intellisense.lock().unwrap() = None;
+                    *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 }
             }
 
             let has_pending_column_work = {
-                let data = intellisense_data.lock().unwrap();
+                let data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 !data.columns_loading.is_empty()
-            } || pending_intellisense.lock().unwrap().is_some();
+            } || pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some();
 
             // Reschedule with adaptive backoff to reduce idle CPU usage.
             let delay = if processed > 0 {
@@ -1124,7 +1124,7 @@ impl SqlEditorWidget {
             let mut disconnected = false;
             loop {
                 let message = {
-                    let r = receiver.lock().unwrap();
+                    let r = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     r.try_recv()
                 };
 
@@ -1257,7 +1257,7 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
-            intellisense_parse_cache.lock().unwrap().take();
+            intellisense_parse_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
 
             // Synchronize style_buffer length with text buffer
             // highlight_buffer_window will reset if lengths differ, but we do incremental
@@ -1320,7 +1320,7 @@ impl SqlEditorWidget {
                 }
             }
 
-            highlighter.lock().unwrap().highlight_buffer_window(
+            highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).highlight_buffer_window(
                 buf,
                 &mut style_buffer,
                 cursor_pos,
@@ -1487,7 +1487,7 @@ impl SqlEditorWidget {
     }
 
     pub fn cancel_current(&self) {
-        if !*self.query_running.lock().unwrap() {
+        if !*self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             fltk::dialog::alert_default("No query is running");
             return;
         }
@@ -1543,35 +1543,35 @@ impl SqlEditorWidget {
     where
         F: FnMut(&QueryResult) + 'static,
     {
-        *self.execute_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.execute_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn set_status_callback<F>(&mut self, callback: F)
     where
         F: FnMut(&str) + 'static,
     {
-        *self.status_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.status_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn set_find_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
     {
-        *self.find_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.find_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn set_replace_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
     {
-        *self.replace_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.replace_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn set_file_drop_callback<F>(&mut self, callback: F)
     where
         F: FnMut(PathBuf) + 'static,
     {
-        *self.file_drop_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.file_drop_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     /// Releases callback/data references so a closing tab can be dropped promptly.
@@ -1579,39 +1579,38 @@ impl SqlEditorWidget {
         Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
         Self::set_current_query_connection(&self.current_query_connection, None);
 
-        *self.execute_callback.lock().unwrap() = None;
-        *self.progress_callback.lock().unwrap() = None;
-        *self.status_callback.lock().unwrap() = None;
-        *self.find_callback.lock().unwrap() = None;
-        *self.replace_callback.lock().unwrap() = None;
-        *self.file_drop_callback.lock().unwrap() = None;
+        *self.execute_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.progress_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.status_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.find_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.replace_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.file_drop_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         Self::invalidate_keyup_debounce(
             &self.keyup_debounce_generation,
             &self.keyup_debounce_handle,
         );
 
-        self.intellisense_popup.lock().unwrap().delete_for_close();
-        *self.intellisense_data.lock().unwrap() = IntellisenseData::new();
+        self.intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).delete_for_close();
+        *self.intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = IntellisenseData::new();
         self.highlighter
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(HighlightData::new());
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");
-        self.completion_range.lock().unwrap().take();
-        self.pending_intellisense.lock().unwrap().take();
-        self.intellisense_parse_cache.lock().unwrap().take();
-        self.history_cursor.lock().unwrap().take();
-        self.history_original.lock().unwrap().take();
-        self.history_navigation_entries.lock().unwrap().take();
-        *self.applying_history_navigation.lock().unwrap() = false;
+        self.completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.intellisense_parse_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.history_cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.history_original.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        self.history_navigation_entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        *self.applying_history_navigation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         Self::reset_word_undo_state(&self.undo_redo_state);
     }
 
     fn reset_word_undo_state(undo_redo_state: &Arc<Mutex<WordUndoRedoState>>) {
-        let mut state = undo_redo_state.lock().unwrap();
+        let mut state = undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut fresh_history = Vec::with_capacity(1);
         fresh_history.push(UndoSnapshot::new(String::new(), 0));
         state.history = fresh_history;
@@ -1622,10 +1621,10 @@ impl SqlEditorWidget {
 
     #[allow(dead_code)]
     pub fn update_highlight_data(&mut self, data: HighlightData) {
-        self.highlighter.lock().unwrap().set_highlight_data(data);
+        self.highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).set_highlight_data(data);
         // Re-highlight current text
         let mut style_buffer = self.style_buffer.clone();
-        self.highlighter.lock().unwrap().highlight_buffer_window(
+        self.highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).highlight_buffer_window(
             &self.buffer,
             &mut style_buffer,
             self.editor.insert_position().max(0) as usize,
@@ -1685,7 +1684,7 @@ impl SqlEditorWidget {
 
     #[allow(dead_code)]
     pub fn refresh_highlighting(&self) {
-        self.highlighter.lock().unwrap().highlight_buffer_window(
+        self.highlighter.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).highlight_buffer_window(
             &self.buffer,
             &mut self.style_buffer.clone(),
             self.editor.insert_position().max(0) as usize,
@@ -1717,22 +1716,22 @@ impl SqlEditorWidget {
         );
         let snapshot = UndoSnapshot::new(current_text, clamped_cursor);
         {
-            let mut state = self.undo_redo_state.lock().unwrap();
+            let mut state = self.undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.history.clear();
             state.history.push(snapshot);
             state.index = 0;
             state.active_group = None;
             state.applying_history = false;
         }
-        *self.history_cursor.lock().unwrap() = None;
-        *self.history_original.lock().unwrap() = None;
-        self.history_navigation_entries.lock().unwrap().take();
-        *self.applying_history_navigation.lock().unwrap() = false;
+        *self.history_cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self.history_original.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.history_navigation_entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        *self.applying_history_navigation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     }
 
     pub fn undo(&self) {
         let next_snapshot = {
-            let mut state = self.undo_redo_state.lock().unwrap();
+            let mut state = self.undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.normalize_index();
             if state.index == 0 {
                 return;
@@ -1762,12 +1761,12 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state.lock().unwrap().applying_history = false;
+        self.undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).applying_history = false;
     }
 
     pub fn redo(&self) {
         let next_snapshot = {
-            let mut state = self.undo_redo_state.lock().unwrap();
+            let mut state = self.undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.normalize_index();
             let next_index = state.index.saturating_add(1);
             if next_index >= state.history.len() {
@@ -1797,18 +1796,18 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state.lock().unwrap().applying_history = false;
+        self.undo_redo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).applying_history = false;
     }
 
     pub fn is_query_running(&self) -> bool {
-        *self.query_running.lock().unwrap()
+        *self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn navigate_history(&mut self, direction: i32) {
-        let mut cursor = self.history_cursor.lock().unwrap();
-        let mut original = self.history_original.lock().unwrap();
-        let mut history_entries = self.history_navigation_entries.lock().unwrap();
-        let mut applying_navigation = self.applying_history_navigation.lock().unwrap();
+        let mut cursor = self.history_cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut original = self.history_original.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut history_entries = self.history_navigation_entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut applying_navigation = self.applying_history_navigation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if cursor.is_none() {
             // Keep navigation aligned with persisted history while avoiding long UI stalls
@@ -2132,7 +2131,7 @@ mod execution_state_tests {
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running.lock().unwrap());
+        assert!(!*query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 
@@ -2150,7 +2149,7 @@ mod execution_state_tests {
 
         SqlEditorWidget::reset_word_undo_state(&undo_state);
 
-        let state = undo_state.lock().unwrap();
+        let state = undo_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(state.history, vec![UndoSnapshot::new(String::new(), 0)]);
         assert_eq!(state.index, 0);
         assert!(state.active_group.is_none());
@@ -2165,7 +2164,7 @@ mod execution_state_tests {
         let taken = SqlEditorWidget::take_keyup_debounce_timeout_handle(&handle_slot);
 
         assert_eq!(taken, Some(fake_handle));
-        assert!(handle_slot.lock().unwrap().is_none());
+        assert!(handle_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none());
     }
 
     #[test]
@@ -2176,8 +2175,8 @@ mod execution_state_tests {
         let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
 
         assert_eq!(next, 1);
-        assert_eq!(*generation.lock().unwrap(), 1);
-        assert!(handle_slot.lock().unwrap().is_none());
+        assert_eq!(*generation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), 1);
+        assert!(handle_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none());
     }
 
     #[test]
@@ -2187,7 +2186,7 @@ mod execution_state_tests {
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running.lock().unwrap());
+        assert!(!*query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 

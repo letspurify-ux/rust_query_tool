@@ -178,7 +178,7 @@ impl ResultTableWidget {
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
-        let font_size = *self.font_size.lock().unwrap();
+        let font_size = *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         self.table
             .set_row_height_all(Self::row_height_for_font(font_size));
         self.table
@@ -274,13 +274,13 @@ impl ResultTableWidget {
     }
 
     fn recalculate_widths_for_current_font(&mut self) {
-        let headers = self.headers.lock().unwrap().clone();
+        let headers = self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         if headers.is_empty() {
             return;
         }
 
-        let font_size = *self.font_size.lock().unwrap();
-        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
+        let font_size = *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut widths: Vec<i32> = headers
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
@@ -288,7 +288,7 @@ impl ResultTableWidget {
 
         let mut sampled = 0usize;
         {
-            let full_data = self.full_data.lock().unwrap();
+            let full_data = self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             for row in full_data.iter().take(WIDTH_SAMPLE_ROWS) {
                 Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
                 sampled += 1;
@@ -296,14 +296,14 @@ impl ResultTableWidget {
         }
 
         if sampled < WIDTH_SAMPLE_ROWS {
-            let pending = self.pending_rows.lock().unwrap();
+            let pending = self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let remaining = WIDTH_SAMPLE_ROWS - sampled;
             for row in pending.iter().take(remaining) {
                 Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
             }
         }
 
-        *self.pending_widths.lock().unwrap() = widths.clone();
+        *self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = widths.clone();
         self.apply_widths_to_table(&widths);
     }
 
@@ -350,8 +350,8 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
-            let font_profile = *font_profile_for_draw.lock().unwrap();
-            let font_size = *font_size_for_draw.lock().unwrap() as i32;
+            let font_profile = *font_profile_for_draw.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let font_size = *font_size_for_draw.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) as i32;
             match ctx {
                 TableContext::StartPage => {
                     draw::set_font(font_profile.normal, font_size);
@@ -399,7 +399,7 @@ impl ResultTableWidget {
                     if let Ok(data) = full_data_for_draw.try_lock() {
                         if let Some(row_data) = data.get(row as usize) {
                             if let Some(cell_val) = row_data.get(col as usize) {
-                                let max_chars = *max_cell_display_chars_for_draw.lock().unwrap();
+                                let max_chars = *max_cell_display_chars_for_draw.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                 if let Some(truncated_end) =
                                     truncated_content_end(cell_val, max_chars)
                                 {
@@ -485,13 +485,13 @@ impl ResultTableWidget {
                                 if let Some(cell_val) = cell_val_owned {
                                     Self::show_cell_text_dialog(
                                         &cell_val,
-                                        *font_profile_for_handle.lock().unwrap(),
-                                        *font_size_for_handle.lock().unwrap(),
+                                        *font_profile_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                        *font_size_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                                     );
                                     return true;
                                 }
                             }
-                            let mut state = drag_state_for_handle.lock().unwrap();
+                            let mut state = drag_state_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.is_dragging = true;
                             state.start_row = row;
                             state.start_col = col;
@@ -503,12 +503,12 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
-                    let is_dragging = drag_state_for_handle.lock().unwrap().is_dragging;
+                    let is_dragging = drag_state_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_dragging;
                     if is_dragging {
                         if let Some((row, col)) =
                             Self::get_cell_at_mouse_for_drag(&table_for_handle)
                         {
-                            let state = drag_state_for_handle.lock().unwrap();
+                            let state = drag_state_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             let r1 = state.start_row.min(row);
                             let r2 = state.start_row.max(row);
                             let c1 = state.start_col.min(col);
@@ -522,7 +522,7 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Released => {
-                    let mut state = drag_state_for_handle.lock().unwrap();
+                    let mut state = drag_state_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.is_dragging {
                         state.is_dragging = false;
                         return true;
@@ -837,7 +837,7 @@ impl ResultTableWidget {
         let cols = (col_right - col_left + 1) as usize;
         let cell_count = rows * cols;
 
-        let full_data = full_data.lock().unwrap();
+        let full_data = full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut result = String::with_capacity(rows * cols * 16);
         for row in row_top..=row_bot {
             if row > row_top {
@@ -878,8 +878,8 @@ impl ResultTableWidget {
         let cols = (col_right - col_left + 1) as usize;
         let cell_count = rows * cols;
 
-        let headers = headers.lock().unwrap();
-        let full_data = full_data.lock().unwrap();
+        let headers = headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let full_data = full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut result = String::with_capacity((rows + 1) * cols * 16);
 
         // Add headers
@@ -921,8 +921,8 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) {
-        let headers = headers.lock().unwrap();
-        let full_data = full_data.lock().unwrap();
+        let headers = headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let full_data = full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let row_count = full_data.len();
         let col_count = headers.len();
         let mut result = String::with_capacity((row_count + 1) * col_count * 16);
@@ -949,8 +949,8 @@ impl ResultTableWidget {
 
     pub fn display_result(&mut self, result: &QueryResult) {
         if !result.is_select {
-            let font_size = *self.font_size.lock().unwrap();
-            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
+            let font_size = *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             self.table.set_rows(1);
             self.table.set_cols(1);
             self.apply_table_metrics_for_current_font();
@@ -959,8 +959,8 @@ impl ResultTableWidget {
                     .max(200)
                     .min(1200);
             self.table.set_col_width(0, message_width);
-            *self.headers.lock().unwrap() = vec!["Result".to_string()];
-            *self.full_data.lock().unwrap() = vec![vec![result.message.clone()]];
+            *self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["Result".to_string()];
+            *self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![vec![result.message.clone()]];
             self.table.redraw();
             return;
         }
@@ -972,7 +972,7 @@ impl ResultTableWidget {
                 self.table.set_cols(col_count);
             }
             self.apply_table_metrics_for_current_font();
-            *self.headers.lock().unwrap() = col_names;
+            *self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
             self.table.redraw();
             return;
         }
@@ -986,8 +986,8 @@ impl ResultTableWidget {
         self.table.set_cols(col_count);
         self.apply_table_metrics_for_current_font();
 
-        let font_size = *self.font_size.lock().unwrap();
-        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
+        let font_size = *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let widths = Self::compute_column_widths(
             &col_names,
             &result.rows,
@@ -995,12 +995,12 @@ impl ResultTableWidget {
             max_cell_display_chars,
         );
         self.apply_widths_to_table(&widths);
-        *self.pending_widths.lock().unwrap() = widths;
+        *self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = widths;
 
         // Store data directly — draw_cell reads from full_data on demand.
         // No per-cell set_cell_value calls needed!
-        *self.full_data.lock().unwrap() = result.rows.clone();
-        *self.headers.lock().unwrap() = col_names;
+        *self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = result.rows.clone();
+        *self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
         self.table.redraw();
     }
 
@@ -1008,19 +1008,19 @@ impl ResultTableWidget {
         let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
-        self.pending_rows.lock().unwrap().clear();
-        self.pending_widths.lock().unwrap().clear();
-        self.full_data.lock().unwrap().clear();
-        *self.last_flush.lock().unwrap() = Instant::now();
-        *self.width_sampled_rows.lock().unwrap() = 0;
+        self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        *self.last_flush.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        *self.width_sampled_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
 
         // Initialize pending widths based on headers
-        let font_size = *self.font_size.lock().unwrap();
+        let font_size = *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let initial_widths: Vec<i32> = headers
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
             .collect();
-        *self.pending_widths.lock().unwrap() = initial_widths.clone();
+        *self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = initial_widths.clone();
 
         self.table.set_rows(0);
         self.table.set_cols(col_count);
@@ -1030,19 +1030,19 @@ impl ResultTableWidget {
             self.table.set_col_width(i as i32, initial_widths[i]);
         }
 
-        *self.headers.lock().unwrap() = headers.to_vec();
+        *self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = headers.to_vec();
         self.table.redraw();
     }
 
     /// Append rows to the buffer. UI is updated periodically for performance.
     pub fn append_rows(&mut self, rows: Vec<Vec<String>>) {
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
-        let sampled = *self.width_sampled_rows.lock().unwrap();
+        let sampled = *self.width_sampled_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if sampled < WIDTH_SAMPLE_ROWS {
             let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
-            let mut widths = self.pending_widths.lock().unwrap();
-            let min_width = Self::min_col_width_for_font(*self.font_size.lock().unwrap());
-            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
+            let mut widths = self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let min_width = Self::min_col_width_for_font(*self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if widths.len() < max_cols {
                 widths.resize(max_cols, min_width);
             }
@@ -1052,21 +1052,21 @@ impl ResultTableWidget {
                 Self::update_widths_with_row(
                     &mut widths,
                     row,
-                    *self.font_size.lock().unwrap(),
+                    *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                     max_cell_display_chars,
                 );
             }
             drop(widths);
-            *self.width_sampled_rows.lock().unwrap() = sampled + sample_count;
+            *self.width_sampled_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = sampled + sample_count;
         }
 
         // Add rows to pending buffer
-        self.pending_rows.lock().unwrap().extend(rows);
+        self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend(rows);
 
         // Check if we should flush to UI
         let should_flush = {
-            let elapsed = self.last_flush.lock().unwrap().elapsed();
-            let buffered_count = self.pending_rows.lock().unwrap().len();
+            let elapsed = self.last_flush.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).elapsed();
+            let buffered_count = self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
             elapsed >= UI_UPDATE_INTERVAL || buffered_count >= MAX_BUFFERED_ROWS
         };
 
@@ -1079,7 +1079,7 @@ impl ResultTableWidget {
     /// Data is moved (not cloned) from pending_rows into full_data.
     /// Only the table row count is updated — draw_cell handles rendering on demand.
     pub fn flush_pending(&mut self) {
-        let rows_to_add: Vec<Vec<String>> = self.pending_rows.lock().unwrap().drain(..).collect();
+        let rows_to_add: Vec<Vec<String>> = self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..).collect();
         if rows_to_add.is_empty() {
             return;
         }
@@ -1090,7 +1090,7 @@ impl ResultTableWidget {
 
         // Update column widths
         {
-            let widths = self.pending_widths.lock().unwrap();
+            let widths = self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let max_cols = widths.len().max(self.table.cols() as usize);
             if max_cols as i32 > self.table.cols() {
                 self.table.set_cols(max_cols as i32);
@@ -1106,13 +1106,13 @@ impl ResultTableWidget {
         }
 
         // Move data into full_data — zero-copy, no clone!
-        self.full_data.lock().unwrap().extend(rows_to_add);
+        self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend(rows_to_add);
 
         // Just update row count — draw_cell reads from full_data on demand
         self.table.set_rows(new_total);
         self.apply_table_metrics_for_current_font();
 
-        *self.last_flush.lock().unwrap() = Instant::now();
+        *self.last_flush.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
         self.table.redraw();
     }
 
@@ -1127,27 +1127,27 @@ impl ResultTableWidget {
         self.table.set_rows(0);
         self.table.set_cols(0);
         {
-            let mut headers = self.headers.lock().unwrap();
+            let mut headers = self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             headers.clear();
             headers.shrink_to_fit();
         }
         {
-            let mut pending_rows = self.pending_rows.lock().unwrap();
+            let mut pending_rows = self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_rows.clear();
             pending_rows.shrink_to_fit();
         }
         {
-            let mut pending_widths = self.pending_widths.lock().unwrap();
+            let mut pending_widths = self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_widths.clear();
             pending_widths.shrink_to_fit();
         }
         {
-            let mut full_data = self.full_data.lock().unwrap();
+            let mut full_data = self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             full_data.clear();
             full_data.shrink_to_fit();
         }
-        *self.width_sampled_rows.lock().unwrap() = 0;
-        *self.last_flush.lock().unwrap() = Instant::now();
+        *self.width_sampled_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        *self.last_flush.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
         self.table.redraw();
     }
 
@@ -1182,7 +1182,7 @@ impl ResultTableWidget {
             return None;
         }
 
-        let full_data = self.full_data.lock().unwrap();
+        let full_data = self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let rows = (row_bot - row_top + 1) as usize;
         let cols = (col_right - col_left + 1) as usize;
         let mut result = String::with_capacity(rows * cols * 16);
@@ -1212,8 +1212,8 @@ impl ResultTableWidget {
 
     /// Export all data to CSV format
     pub fn export_to_csv(&self) -> String {
-        let headers = self.headers.lock().unwrap();
-        let full_data = self.full_data.lock().unwrap();
+        let headers = self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let full_data = self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let row_count = full_data.len();
         let col_count = headers.len();
         let mut csv = String::with_capacity((row_count + 1) * col_count * 20);
@@ -1258,8 +1258,8 @@ impl ResultTableWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        *self.font_profile.lock().unwrap() = profile;
-        *self.font_size.lock().unwrap() = size;
+        *self.font_profile.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = profile;
+        *self.font_size.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
         self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
         // Force FLTK to recalculate the table's internal layout after
@@ -1275,7 +1275,7 @@ impl ResultTableWidget {
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
-        *self.max_cell_display_chars.lock().unwrap() = max_chars.max(1);
+        *self.max_cell_display_chars.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = max_chars.max(1);
         self.recalculate_widths_for_current_font();
         self.table.redraw();
     }
@@ -1295,22 +1295,22 @@ impl ResultTableWidget {
 
         // Clear all data buffers to release memory
         {
-            let mut headers = self.headers.lock().unwrap();
+            let mut headers = self.headers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             headers.clear();
             headers.shrink_to_fit();
         }
         {
-            let mut pending_rows = self.pending_rows.lock().unwrap();
+            let mut pending_rows = self.pending_rows.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_rows.clear();
             pending_rows.shrink_to_fit();
         }
         {
-            let mut pending_widths = self.pending_widths.lock().unwrap();
+            let mut pending_widths = self.pending_widths.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pending_widths.clear();
             pending_widths.shrink_to_fit();
         }
         {
-            let mut full_data = self.full_data.lock().unwrap();
+            let mut full_data = self.full_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             full_data.clear();
             full_data.shrink_to_fit();
         }

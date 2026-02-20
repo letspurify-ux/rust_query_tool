@@ -216,11 +216,16 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             && peek_n_char(&iter, 1) == Some('\'')
             && peek_n_char(&iter, 2).is_some()
         {
-            let delimiter = peek_n_char(&iter, 2).expect("checked is_some");
+            let Some(delimiter) = peek_n_char(&iter, 2) else {
+                continue;
+            };
+            let Some(next_char) = next else {
+                continue;
+            };
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
             current.push(c);
-            current.push(next.expect("checked above"));
+            current.push(next_char);
             current.push('\'');
             current.push(delimiter);
             scan_state.start_q_quote(delimiter);
@@ -235,7 +240,9 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         }
 
         if (c == 'q' || c == 'Q') && next == Some('\'') && peek_n_char(&iter, 1).is_some() {
-            let delimiter = peek_n_char(&iter, 1).expect("checked is_some");
+            let Some(delimiter) = peek_n_char(&iter, 1) else {
+                continue;
+            };
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
             current.push(c);

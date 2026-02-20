@@ -151,7 +151,7 @@ impl LogViewerDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.lock().unwrap().push(dialog.clone());
+        popups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(dialog.clone());
 
         let entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(all_entries));
         let filtered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
@@ -160,7 +160,7 @@ impl LogViewerDialog {
 
         // Initial population
         populate_browser(
-            &entries.lock().unwrap(),
+            &entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             &mut browser,
             &filtered_indices,
             &mut count_label,
@@ -219,9 +219,9 @@ impl LogViewerDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(browser_index) => {
-                        let fi = filtered_indices.lock().unwrap();
+                        let fi = filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         if let Some(&entry_index) = fi.get(browser_index) {
-                            let ents = entries.lock().unwrap();
+                            let ents = entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             if let Some(entry) = ents.get(entry_index) {
                                 let detail = format!(
                                     "Timestamp: {}\nLevel: {}\nSource: {}\n\n{}",
@@ -237,7 +237,7 @@ impl LogViewerDialog {
                     DialogMessage::FilterChanged => {
                         let filter = selected_filter(&level_choice);
                         populate_browser(
-                            &entries.lock().unwrap(),
+                            &entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
                             &mut browser,
                             &filtered_indices,
                             &mut count_label,
@@ -255,8 +255,8 @@ impl LogViewerDialog {
                         if choice == Some(1) {
                             match logging::clear_log() {
                                 Ok(()) => {
-                                    entries.lock().unwrap().clear();
-                                    filtered_indices.lock().unwrap().clear();
+                                    entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+                                    filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
                                     browser.clear();
                                     detail_buffer.set_text("");
                                     count_label.set_label("0 entries");
@@ -278,8 +278,8 @@ impl LogViewerDialog {
                         dlg.show();
                         let path = dlg.filename();
                         if !path.as_os_str().is_empty() {
-                            let ents = entries.lock().unwrap();
-                            let fi = filtered_indices.lock().unwrap();
+                            let ents = entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let fi = filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             let mut output = String::new();
                             for &idx in fi.iter() {
                                 if let Some(entry) = ents.get(idx) {
@@ -316,8 +316,7 @@ impl LogViewerDialog {
         }
 
         popups
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
@@ -375,7 +374,7 @@ fn populate_browser(
     }
 
     count_label.set_label(&format!("{} entries", indices.len()));
-    *filtered_indices.lock().unwrap() = indices;
+    *filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = indices;
 }
 
 fn escape_browser_label(text: &str) -> String {

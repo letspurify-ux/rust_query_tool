@@ -31,7 +31,7 @@
 - 공유 상태는 반드시 `Arc<Mutex<T>>` 또는 동등한 스레드-안전 동기화 타입(`Arc<RwLock<T>>` 등)으로 관리한다.
 - 중첩 lock 구간은 짧게 유지하고 지역 변수로 분리한다.
 
-- 패닉 유발 가능 코드(`unwrap`, `expect`, `panic!`)는 사용하지 않는다.
+- 패닉 유발 가능 코드(`unwrap`, `expect`, `panic!`)는 사용하지 않는다. (테스트 코드는 예외)
 - 인덱스 슬라이싱은 `is_char_boundary()` 등 명시적 경계 검증이 선행된 경우에만 허용한다.
 - 오류 가능 경로는 `Result`/`Option` 전파(`?`, `ok_or_else`, `unwrap_or_else` 등)와 명시적 경계 검증으로 처리한다.
 

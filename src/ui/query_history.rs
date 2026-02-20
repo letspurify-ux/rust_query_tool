@@ -649,7 +649,7 @@ impl QueryHistoryDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.lock().unwrap().push(dialog.clone());
+        popups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(dialog.clone());
         // State for selected query
         let selected_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let queries: Arc<Mutex<Vec<QueryHistoryEntry>>> = Arc::new(Mutex::new(snapshot));
@@ -703,7 +703,7 @@ impl QueryHistoryDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(index) => {
-                        let queries = queries.lock().unwrap();
+                        let queries = queries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         if let Some(entry) = queries.get(index) {
                             preview_buffer.set_text(&entry.sql);
                             let styles = build_preview_styles(&entry.sql, entry.error_line);
@@ -728,9 +728,9 @@ impl QueryHistoryDialog {
                         let selected = browser.value();
                         if selected > 0 {
                             if let Ok(idx) = usize::try_from(selected - 1) {
-                                let queries = queries.lock().unwrap();
+                                let queries = queries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                 if let Some(entry) = queries.get(idx) {
-                                    *selected_sql.lock().unwrap() = Some(entry.sql.clone());
+                                    *selected_sql.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry.sql.clone());
                                     dialog.hide();
                                 }
                             }
@@ -749,7 +749,7 @@ impl QueryHistoryDialog {
                             match clear_history() {
                                 Ok(()) => {
                                     app::awake();
-                                    queries.lock().unwrap().clear();
+                                    queries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
                                     browser.clear();
                                     preview_buffer.set_text("");
                                     preview_style_buffer.set_text("");
@@ -776,14 +776,13 @@ impl QueryHistoryDialog {
 
         // Remove dialog from popups to prevent memory leak
         popups
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
 
-        let result = selected_sql.lock().unwrap().clone();
+        let result = selected_sql.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         result
     }
 

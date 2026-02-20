@@ -2975,7 +2975,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if *self.query_running.lock().unwrap() {
+        if *self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             self.emit_status("A query is already running. Please wait for it to finish.");
             return;
         }
@@ -3015,7 +3015,7 @@ impl SqlEditorWidget {
         // Reset cancel flag before starting new execution
         cancel_flag.store(false, Ordering::SeqCst);
 
-        *query_running.lock().unwrap() = true;
+        *query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
 
         set_cursor(Cursor::Wait);
         app::flush();
@@ -6129,7 +6129,7 @@ impl SqlEditorWidget {
                                             select_column_names = names.clone();
                                             select_column_count.set(names.len());
                                             {
-                                                let mut state = transform_state.lock().unwrap();
+                                                let mut state = transform_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                                 state.break_index =
                                                     break_column.as_ref().and_then(|target| {
                                                         let target_key =
@@ -6222,7 +6222,7 @@ impl SqlEditorWidget {
                                             let mut row = row;
                                             last_select_row = Some(row.clone());
                                             {
-                                                let mut state = transform_state.lock().unwrap();
+                                                let mut state = transform_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                                 if let Some(config) = compute_config.as_ref() {
                                                     let grouped_compute =
                                                         config.of_column.is_some()
@@ -7733,7 +7733,7 @@ impl SqlEditorWidget {
             let mut dialog = dialog.clone();
             let input = input.clone();
             ok_btn.set_callback(move |_| {
-                *result.lock().unwrap() = Some(input.value());
+                *result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input.value());
                 dialog.hide();
             });
         }
@@ -7742,7 +7742,7 @@ impl SqlEditorWidget {
             let cancelled = cancelled.clone();
             let mut dialog = dialog.clone();
             cancel_btn.set_callback(move |_| {
-                *cancelled.lock().unwrap() = true;
+                *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                 dialog.hide();
             });
         }
@@ -7753,7 +7753,7 @@ impl SqlEditorWidget {
             let input_value = input.clone();
             let mut dialog_cb = dialog.clone();
             input_cb.set_callback(move |_| {
-                *result.lock().unwrap() = Some(input_value.value());
+                *result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input_value.value());
                 dialog_cb.hide();
             });
         }
@@ -7763,7 +7763,7 @@ impl SqlEditorWidget {
             let mut dialog_cb = dialog.clone();
             let mut dialog_handle = dialog.clone();
             dialog_cb.set_callback(move |_| {
-                *cancelled.lock().unwrap() = true;
+                *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                 dialog_handle.hide();
             });
         }
@@ -7778,10 +7778,10 @@ impl SqlEditorWidget {
         // Explicitly destroy top-level dialog widgets to release native resources.
         fltk::window::Window::delete(dialog);
 
-        if *cancelled.lock().unwrap() {
+        if *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             None
         } else {
-            result.lock().unwrap().clone()
+            result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
         }
     }
 
@@ -8033,7 +8033,7 @@ impl SqlEditorWidget {
     where
         F: FnMut(QueryProgress) + 'static,
     {
-        *self.progress_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.progress_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 }
 
