@@ -4,7 +4,9 @@ use fltk::{
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
 };
+use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::ui::constants::TAB_HEADER_HEIGHT;
@@ -46,6 +48,42 @@ impl Drop for CallbackSuppressGuard {
 }
 
 impl QueryTabsWidget {
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn invoke_on_select_callback(
+        callback_slot: &Rc<RefCell<Option<TabSelectCallback>>>,
+        tab_id: QueryTabId,
+    ) {
+        let callback = {
+            let mut slot = callback_slot.borrow_mut();
+            slot.take()
+        };
+
+        if let Some(mut cb) = callback {
+            let callback_result = panic::catch_unwind(AssertUnwindSafe(|| cb(tab_id)));
+            let mut slot = callback_slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+            if let Err(payload) = callback_result {
+                let panic_payload = Self::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "query_tabs::callback",
+                    &format!("tab select callback panicked: {panic_payload}"),
+                );
+                eprintln!("tab select callback panicked: {panic_payload}");
+            }
+        }
+    }
+
     fn content_bounds(tabs: &Tabs) -> (i32, i32, i32, i32) {
         // Keep a stable tab-header height regardless of surrounding splitter drags.
         // This avoids top/bottom header bar height jitter while panes are resized.
@@ -124,9 +162,7 @@ impl QueryTabsWidget {
                 .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
                 .map(|entry| entry.id);
             if let Some(tab_id) = selected_id {
-                if let Some(callback) = on_select_for_cb.borrow_mut().as_mut() {
-                    callback(tab_id);
-                }
+                Self::invoke_on_select_callback(&on_select_for_cb, tab_id);
             }
         });
         tabs.resize_callback(move |t, _, _, _, _| {
