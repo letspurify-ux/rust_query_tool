@@ -1343,6 +1343,27 @@ impl IntellisensePopup {
         eprintln!("{context} panicked: {panic_payload}");
     }
 
+    fn invoke_selected_callback(
+        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(String)>>>>,
+        selected_text: String,
+    ) {
+        let callback = {
+            let mut slot = callback_slot.borrow_mut();
+            slot.take()
+        };
+
+        if let Some(mut cb) = callback {
+            let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(selected_text)));
+            let mut slot = callback_slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(cb);
+            }
+            if let Err(payload) = call_result {
+                Self::log_callback_panic("intellisense selected callback", payload.as_ref());
+            }
+        }
+    }
+
     pub fn new() -> Self {
         // Temporarily suspend current group to prevent popup window from being
         // added to the parent container (which causes layout issues)
@@ -1406,19 +1427,10 @@ impl IntellisensePopup {
                     suggestions.get((selected - 1) as usize).cloned()
                 };
                 if let Some(text) = text {
-                    // Take the callback out, call it, then put it back
+                    // Take the callback out, call it, then put it back if needed.
                     // This ensures the RefCell is not borrowed during callback execution
-                    let cb_opt = callback.borrow_mut().take();
-                    if let Some(mut cb) = cb_opt {
-                        let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(text)));
-                        *callback.borrow_mut() = Some(cb);
-                        if let Err(payload) = call_result {
-                            Self::log_callback_panic(
-                                "intellisense selected callback",
-                                payload.as_ref(),
-                            );
-                        }
-                    }
+                    // while preserving callbacks that were replaced during invocation.
+                    Self::invoke_selected_callback(&callback, text);
                     window.hide();
                     *visible.borrow_mut() = false;
                 }
@@ -2012,6 +2024,54 @@ mod intellisense_tests {
                 .any(|name| name.eq_ignore_ascii_case("TOPIC")),
             "expected schema-qualified scope to reuse unqualified cached columns, got: {:?}",
             suggestions
+        );
+    }
+
+    #[test]
+    fn invoke_selected_callback_preserves_replaced_callback() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
+            Rc::new(RefCell::new(None));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+
+        let callback_slot_for_first = callback_slot.clone();
+        let calls_for_first = calls.clone();
+        *callback_slot.borrow_mut() = Some(Box::new(move |value: String| {
+            calls_for_first.borrow_mut().push(format!("first:{value}"));
+            let calls_for_second = calls_for_first.clone();
+            *callback_slot_for_first.borrow_mut() = Some(Box::new(move |next: String| {
+                calls_for_second.borrow_mut().push(format!("second:{next}"));
+            }));
+        }));
+
+        IntellisensePopup::invoke_selected_callback(&callback_slot, "alpha".to_string());
+        IntellisensePopup::invoke_selected_callback(&callback_slot, "beta".to_string());
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["first:alpha".to_string(), "second:beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn invoke_selected_callback_restores_original_after_panic() {
+        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(String)>>>> =
+            Rc::new(RefCell::new(None));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+
+        let calls_for_cb = calls.clone();
+        *callback_slot.borrow_mut() = Some(Box::new(move |value: String| {
+            calls_for_cb.borrow_mut().push(value.clone());
+            if value == "panic" {
+                panic!("expected test panic");
+            }
+        }));
+
+        IntellisensePopup::invoke_selected_callback(&callback_slot, "panic".to_string());
+        IntellisensePopup::invoke_selected_callback(&callback_slot, "ok".to_string());
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["panic".to_string(), "ok".to_string()]
         );
     }
 }
