@@ -2023,7 +2023,7 @@ impl SqlEditorWidget {
                                         || (matches!(current_clause.as_deref(), Some("WHERE"))
                                             && matches!(
                                                 prev_word_upper.as_deref(),
-                                                Some("EXISTS")
+                                                Some("EXISTS" | "IN")
                                             ));
                                 if is_subquery && deep_subquery_indent {
                                     2
@@ -8116,6 +8116,18 @@ END;";
             formatted.contains("START WITH"),
             "START WITH should stay on the same line, got: {}",
             formatted
+        );
+    }
+
+    #[test]
+    fn formats_where_in_subquery_with_deep_indent_and_alias() {
+        let source = "select a.topic, a.TOPIC from help a where a.SEQ in (select seq from help) b";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert_eq!(
+            preserved.trim_end(),
+            "SELECT a.topic,\n    a.TOPIC\nFROM help a\nWHERE a.SEQ IN (\n        SELECT seq\n        FROM help\n    ) b"
         );
     }
 
