@@ -1428,7 +1428,7 @@ impl IntellisensePopup {
                 };
                 if let Some(text) = text {
                     // Take the callback out, call it, then put it back if needed.
-                    // This ensures the RefCell is not borrowed during callback execution
+                    // This ensures the callback slot mutex is not held during callback execution
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();

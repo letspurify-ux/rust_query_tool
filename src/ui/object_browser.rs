@@ -248,7 +248,7 @@ impl ObjectBrowserWidget {
 
         let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
-        // Wrap receiver in Rc<RefCell> to share across timeout callbacks
+        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
         let receiver: Rc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>> =
             Rc::new(Mutex::new(refresh_receiver));
 
