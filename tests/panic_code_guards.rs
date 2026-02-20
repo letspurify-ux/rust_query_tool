@@ -120,14 +120,36 @@ fn find_matching_brace_end(content: &str, open_index: usize) -> Option<usize> {
     None
 }
 
+fn find_banned_patterns(content: &str) -> Vec<&'static str> {
+    const BANNED_PATTERNS: [&str; 8] = [
+        "panic!(",
+        ".unwrap(",
+        ".expect(",
+        ".unwrap_err(",
+        ".unwrap_unchecked(",
+        "Option::unwrap",
+        "Result::unwrap",
+        "Result::expect",
+    ];
+
+    BANNED_PATTERNS
+        .iter()
+        .filter(|pattern| content.contains(**pattern))
+        .copied()
+        .collect()
+}
+
 #[test]
-fn non_test_source_does_not_use_panic_unwrap_expect() {
+fn non_test_source_does_not_use_panic_prone_calls() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
 
     for file in collect_rust_files(&src_root) {
         let path_str = file.to_string_lossy();
-        if path_str.ends_with("/tests.rs") || path_str.contains("/tests/") || path_str.ends_with("_tests.rs") {
+        if path_str.ends_with("/tests.rs")
+            || path_str.contains("/tests/")
+            || path_str.ends_with("_tests.rs")
+        {
             continue;
         }
 
@@ -137,12 +159,10 @@ fn non_test_source_does_not_use_panic_unwrap_expect() {
         };
 
         let non_test_code = strip_test_blocks(&content);
+        let matched_patterns = find_banned_patterns(&non_test_code);
 
-        if non_test_code.contains("panic!(")
-            || non_test_code.contains(".unwrap(")
-            || non_test_code.contains(".expect(")
-        {
-            offenders.push(file);
+        if !matched_patterns.is_empty() {
+            offenders.push((file, matched_patterns));
         }
     }
 
