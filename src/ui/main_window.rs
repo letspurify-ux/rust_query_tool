@@ -80,6 +80,9 @@ pub struct AppState {
     pub connection_info: Rc<RefCell<Option<crate::db::ConnectionInfo>>>,
     pub config: Rc<RefCell<AppConfig>>,
     pub last_fetch_status_update: Instant,
+    status_animation_running: bool,
+    status_animation_message: String,
+    status_animation_frame: usize,
     schema_sender: Option<std::sync::mpsc::Sender<SchemaUpdate>>,
     file_sender: Option<std::sync::mpsc::Sender<FileActionResult>>,
     health_stop_signal: Option<Arc<HealthCheckStopSignal>>,
@@ -90,6 +93,9 @@ struct HealthCheckStopSignal {
 }
 
 impl AppState {
+    const STATUS_SPINNER_FRAMES: [&'static str; 10] =
+        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
     fn tab_display_label(tab: &QueryEditorTab) -> String {
         let mut label = match &tab.current_file {
             Some(path) => path
@@ -253,10 +259,59 @@ impl AppState {
             false
         }
     }
+
+    fn set_status_message(&mut self, message: &str) {
+        self.status_animation_running = false;
+        self.status_animation_message.clear();
+        self.status_animation_frame = 0;
+        let conn_info = self.connection_info.borrow().clone();
+        self.status_bar
+            .set_label(&format_status(message, &conn_info));
+    }
+
+    fn start_status_animation(&mut self, message: &str) {
+        self.status_animation_running = true;
+        self.status_animation_message.clear();
+        self.status_animation_message.push_str(message);
+        self.status_animation_frame = 0;
+        self.render_status_animation_frame();
+    }
+
+    fn update_status_animation(&mut self, message: &str) {
+        if !self.status_animation_running {
+            self.start_status_animation(message);
+            return;
+        }
+        self.status_animation_message.clear();
+        self.status_animation_message.push_str(message);
+        self.render_status_animation_frame();
+    }
+
+    fn tick_status_animation(&mut self) {
+        if !self.status_animation_running {
+            return;
+        }
+        self.status_animation_frame =
+            (self.status_animation_frame + 1) % Self::STATUS_SPINNER_FRAMES.len();
+        self.render_status_animation_frame();
+    }
+
+    fn render_status_animation_frame(&mut self) {
+        if !self.status_animation_running {
+            return;
+        }
+        let frame = Self::STATUS_SPINNER_FRAMES[self.status_animation_frame];
+        let conn_info = self.connection_info.borrow().clone();
+        self.status_bar.set_label(&format_status(
+            &format!("{} {}", frame, self.status_animation_message),
+            &conn_info,
+        ));
+    }
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const STATUS_ANIMATION_INTERVAL: f64 = 0.08;
 
 /// 접속 정보를 상태 표시줄 메시지 끝에 붙는 헬퍼
 fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> String {
@@ -347,9 +402,26 @@ enum HealthCheckCurrentConnectionState {
 }
 
 impl MainWindow {
+    fn start_status_animation_timer(state: &Rc<RefCell<AppState>>) {
+        let weak_state = Rc::downgrade(state);
+        app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
+            let Some(state_for_tick) = weak_state.upgrade() else {
+                return;
+            };
+            let should_reschedule = {
+                let mut s = state_for_tick.borrow_mut();
+                s.tick_status_animation();
+                s.status_animation_running
+            };
+            if should_reschedule {
+                MainWindow::start_status_animation_timer(&state_for_tick);
+            }
+        });
+    }
+
     fn transition_to_disconnected_state(state: &mut AppState, error_message: Option<&str>) {
         *state.connection_info.borrow_mut() = None;
-        state.status_bar.set_label("Disconnected");
+        state.set_status_message("Disconnected");
         let reset_data = IntellisenseData::new();
         let reset_highlight = HighlightData::new();
         Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
@@ -385,9 +457,7 @@ impl MainWindow {
         }
 
         if let Ok(mut s) = state.try_borrow_mut() {
-            let conn_info = s.connection_info.borrow().clone();
-            s.status_bar
-                .set_label(&format_status("Cancelling running queries...", &conn_info));
+            s.set_status_message("Cancelling running queries...");
         }
     }
 
@@ -404,10 +474,9 @@ impl MainWindow {
         if !state.activate_editor_tab(tab_id) {
             return false;
         }
-        let conn_info = state.connection_info.borrow().clone();
-        state.status_bar.set_label(&format_status(
-            &format!("{} is already open. Switched to existing tab", file_name),
-            &conn_info,
+        state.set_status_message(&format!(
+            "{} is already open. Switched to existing tab",
+            file_name
         ));
         true
     }
@@ -449,9 +518,7 @@ impl MainWindow {
         s.set_tab_file_path(tab_id, Some(path.clone()));
         s.set_tab_pristine_text(tab_id, sql_text);
         let file_label = path.file_name().unwrap_or_default().to_string_lossy();
-        let conn_info = s.connection_info.borrow().clone();
-        s.status_bar
-            .set_label(&format_status(&format!("Saved {}", file_label), &conn_info));
+        s.set_status_message(&format!("Saved {}", file_label));
         SaveTabOutcome::Saved
     }
 
@@ -919,6 +986,9 @@ impl MainWindow {
             connection_info: Rc::new(RefCell::new(None)),
             config: Rc::new(RefCell::new(config)),
             last_fetch_status_update: Instant::now(),
+            status_animation_running: false,
+            status_animation_message: String::new(),
+            status_animation_frame: 0,
             schema_sender: None,
             file_sender: None,
             health_stop_signal: None,
@@ -1520,7 +1590,6 @@ impl MainWindow {
                 return;
             };
             let mut s = state_for_execute.borrow_mut();
-            let conn_info = s.connection_info.borrow().clone();
             let base_msg = if query_result.success {
                 format!(
                     "{} | Time: {:.3}s",
@@ -1533,8 +1602,7 @@ impl MainWindow {
                     query_result.execution_time.as_secs_f64()
                 )
             };
-            s.status_bar
-                .set_label(&format_status(&base_msg, &conn_info));
+            s.set_status_message(&base_msg);
         });
 
         let weak_state_for_status = Rc::downgrade(state);
@@ -1544,8 +1612,7 @@ impl MainWindow {
             };
             match state_for_status.try_borrow_mut() {
                 Ok(mut s) => {
-                    let conn_info = s.connection_info.borrow().clone();
-                    s.status_bar.set_label(&format_status(message, &conn_info));
+                    s.set_status_message(message);
                 }
                 Err(_) => {}
             };
@@ -1600,18 +1667,22 @@ impl MainWindow {
                     s.result_tabs
                         .start_statement(tab_index, &format!("Result {}", tab_index + 1));
                     s.fetch_row_counts.remove(&index);
-                    let conn_info = s.connection_info.borrow().clone();
-                    s.status_bar
-                        .set_label(&format_status("Executing query...", &conn_info));
+                    let was_running = s.status_animation_running;
+                    s.start_status_animation("Executing query...");
+                    if !was_running {
+                        MainWindow::start_status_animation_timer(&state_for_progress);
+                    }
                 }
                 QueryProgress::SelectStart { index, columns } => {
                     let tab_index = s.result_tab_offset + index;
                     s.result_tabs.start_streaming(tab_index, &columns);
                     s.fetch_row_counts.insert(index, 0);
                     s.last_fetch_status_update = Instant::now();
-                    let conn_info = s.connection_info.borrow().clone();
-                    s.status_bar
-                        .set_label(&format_status("Fetching rows: 0", &conn_info));
+                    let was_running = s.status_animation_running;
+                    s.start_status_animation("Fetching rows: 0");
+                    if !was_running {
+                        MainWindow::start_status_animation_timer(&state_for_progress);
+                    }
                 }
                 QueryProgress::Rows { index, rows } => {
                     let tab_index = s.result_tab_offset + index;
@@ -1623,11 +1694,7 @@ impl MainWindow {
                         *count
                     };
                     if s.last_fetch_status_update.elapsed() >= FETCH_STATUS_UPDATE_INTERVAL {
-                        let conn_info = s.connection_info.borrow().clone();
-                        s.status_bar.set_label(&format_status(
-                            &format!("Fetching rows: {}", new_count),
-                            &conn_info,
-                        ));
+                        s.update_status_animation(&format!("Fetching rows: {}", new_count));
                         s.last_fetch_status_update = Instant::now();
                     }
                 }
@@ -1650,14 +1717,12 @@ impl MainWindow {
                     } else {
                         "Auto-commit disabled"
                     };
-                    let conn_info = s.connection_info.borrow().clone();
-                    s.status_bar.set_label(&format_status(status, &conn_info));
+                    s.set_status_message(status);
                 }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
                         *s.connection_info.borrow_mut() = Some(info.clone());
-                        s.status_bar
-                            .set_label(&format!("Connected | {}", info.display_string()));
+                        s.set_status_message(&format!("Connected | {}", info.display_string()));
                         s.object_browser.refresh();
                         s.sql_editor.focus();
 
@@ -1703,8 +1768,7 @@ impl MainWindow {
                         || current_status.contains("connection is busy")
                         || current_status.contains("query is already running");
                     if needs_reset {
-                        let conn_info = s.connection_info.borrow().clone();
-                        s.status_bar.set_label(&format_status("Ready", &conn_info));
+                        s.set_status_message("Ready");
                     }
                 }
             }
