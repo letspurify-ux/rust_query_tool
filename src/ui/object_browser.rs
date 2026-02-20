@@ -28,7 +28,6 @@ use crate::ui::{configured_editor_profile, configured_ui_font_size};
 #[derive(Clone)]
 pub enum SqlAction {
     Insert(String),
-    Append(String),
     OpenInNewTab(String),
     Execute(String),
 }
@@ -552,7 +551,7 @@ impl ObjectBrowserWidget {
                             };
                             ObjectBrowserWidget::emit_sql_callback(
                                 &sql_callback,
-                                SqlAction::Append(sql),
+                                SqlAction::OpenInNewTab(sql),
                             );
                         }
                         ObjectActionResult::PackageRoutines {
