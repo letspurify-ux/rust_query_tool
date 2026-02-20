@@ -9,9 +9,7 @@ use fltk::{
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::rc::Rc;
-use std::rc::Weak;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 use crate::db::{
@@ -112,7 +110,7 @@ pub struct ObjectBrowserWidget {
     status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
-    poll_lifecycle: Rc<()>,
+    poll_lifecycle: Arc<()>,
     refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
 }
@@ -184,7 +182,7 @@ impl ObjectBrowserWidget {
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
-        let poll_lifecycle = Rc::new(());
+        let poll_lifecycle = Arc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
         let (action_sender, action_receiver) = std::sync::mpsc::channel::<ObjectActionResult>();
@@ -246,7 +244,7 @@ impl ObjectBrowserWidget {
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
 
-        let lifecycle = Rc::downgrade(&self.poll_lifecycle);
+        let lifecycle = Arc::downgrade(&self.poll_lifecycle);
 
         // Wrap receiver in Arc<Mutex> to share across timeout callbacks
         let receiver: Arc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>> =
@@ -335,7 +333,7 @@ impl ObjectBrowserWidget {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
-        let lifecycle = Rc::downgrade(&self.poll_lifecycle);
+        let lifecycle = Arc::downgrade(&self.poll_lifecycle);
 
         let receiver: Arc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>> =
             Arc::new(Mutex::new(action_receiver));

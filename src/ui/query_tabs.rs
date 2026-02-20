@@ -5,9 +5,7 @@ use fltk::{
     prelude::*,
 };
 use std::any::Any;
-use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants::TAB_HEADER_HEIGHT;
@@ -22,7 +20,7 @@ pub struct QueryTabsWidget {
     entries: Arc<Mutex<Vec<TabEntry>>>,
     next_id: Arc<Mutex<QueryTabId>>,
     on_select: Arc<Mutex<Option<TabSelectCallback>>>,
-    suppress_select_callback_depth: Rc<Cell<u32>>,
+    suppress_select_callback_depth: Arc<Mutex<u32>>,
 }
 
 #[derive(Clone)]
@@ -32,19 +30,23 @@ struct TabEntry {
 }
 
 struct CallbackSuppressGuard {
-    counter: Rc<Cell<u32>>,
+    counter: Arc<Mutex<u32>>,
 }
 
 impl CallbackSuppressGuard {
-    fn new(counter: Rc<Cell<u32>>) -> Self {
-        counter.set(counter.get().saturating_add(1));
+    fn new(counter: Arc<Mutex<u32>>) -> Self {
+        {
+            let mut guard = counter.lock().unwrap();
+            *guard = guard.saturating_add(1);
+        }
         Self { counter }
     }
 }
 
 impl Drop for CallbackSuppressGuard {
     fn drop(&mut self) {
-        self.counter.set(self.counter.get().saturating_sub(1));
+        let mut guard = self.counter.lock().unwrap();
+        *guard = guard.saturating_sub(1);
     }
 }
 
@@ -144,13 +146,13 @@ impl QueryTabsWidget {
         let entries = Arc::new(Mutex::new(Vec::<TabEntry>::new()));
         let next_id = Arc::new(Mutex::new(1u64));
         let on_select = Arc::new(Mutex::new(None::<TabSelectCallback>));
-        let suppress_select_callback_depth = Rc::new(Cell::new(0u32));
+        let suppress_select_callback_depth = Arc::new(Mutex::new(0u32));
 
         let entries_for_cb = entries.clone();
         let on_select_for_cb = on_select.clone();
         let suppress_for_cb = suppress_select_callback_depth.clone();
         tabs.set_callback(move |tabs| {
-            if suppress_for_cb.get() > 0 {
+            if *suppress_for_cb.lock().unwrap() > 0 {
                 return;
             }
             let Some(selected) = tabs.value() else {

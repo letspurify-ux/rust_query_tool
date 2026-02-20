@@ -10,8 +10,6 @@ use fltk::{
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,11 +77,11 @@ pub struct ResultTableWidget {
     /// draw_cell reads from here on demand — no data duplication.
     full_data: Arc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
-    max_cell_display_chars: Rc<Cell<usize>>,
+    max_cell_display_chars: Arc<Mutex<usize>>,
     /// How many rows have been sampled for column width calculation
     width_sampled_rows: Arc<Mutex<usize>>,
-    font_profile: Rc<Cell<FontProfile>>,
-    font_size: Rc<Cell<u32>>,
+    font_profile: Arc<Mutex<FontProfile>>,
+    font_size: Arc<Mutex<u32>>,
 }
 
 #[derive(Default)]
@@ -180,7 +178,7 @@ impl ResultTableWidget {
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
-        let font_size = self.font_size.get();
+        let font_size = *self.font_size.lock().unwrap();
         self.table
             .set_row_height_all(Self::row_height_for_font(font_size));
         self.table
@@ -281,8 +279,8 @@ impl ResultTableWidget {
             return;
         }
 
-        let font_size = self.font_size.get();
-        let max_cell_display_chars = self.max_cell_display_chars.get();
+        let font_size = *self.font_size.lock().unwrap();
+        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
         let mut widths: Vec<i32> = headers
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
@@ -316,10 +314,10 @@ impl ResultTableWidget {
     pub fn with_size(x: i32, y: i32, w: i32, h: i32) -> Self {
         let headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let full_data: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let font_profile = Rc::new(Cell::new(configured_editor_profile()));
-        let font_size = Rc::new(Cell::new(DEFAULT_FONT_SIZE as u32));
+        let font_profile = Arc::new(Mutex::new(configured_editor_profile()));
+        let font_size = Arc::new(Mutex::new(DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars =
-            Rc::new(Cell::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
+            Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -352,8 +350,8 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
-            let font_profile = font_profile_for_draw.get();
-            let font_size = font_size_for_draw.get() as i32;
+            let font_profile = *font_profile_for_draw.lock().unwrap();
+            let font_size = *font_size_for_draw.lock().unwrap() as i32;
             match ctx {
                 TableContext::StartPage => {
                     draw::set_font(font_profile.normal, font_size);
@@ -401,7 +399,7 @@ impl ResultTableWidget {
                     if let Ok(data) = full_data_for_draw.try_lock() {
                         if let Some(row_data) = data.get(row as usize) {
                             if let Some(cell_val) = row_data.get(col as usize) {
-                                let max_chars = max_cell_display_chars_for_draw.get();
+                                let max_chars = *max_cell_display_chars_for_draw.lock().unwrap();
                                 if let Some(truncated_end) =
                                     truncated_content_end(cell_val, max_chars)
                                 {
@@ -487,8 +485,8 @@ impl ResultTableWidget {
                                 if let Some(cell_val) = cell_val_owned {
                                     Self::show_cell_text_dialog(
                                         &cell_val,
-                                        font_profile_for_handle.get(),
-                                        font_size_for_handle.get(),
+                                        *font_profile_for_handle.lock().unwrap(),
+                                        *font_size_for_handle.lock().unwrap(),
                                     );
                                     return true;
                                 }
@@ -951,8 +949,8 @@ impl ResultTableWidget {
 
     pub fn display_result(&mut self, result: &QueryResult) {
         if !result.is_select {
-            let font_size = self.font_size.get();
-            let max_cell_display_chars = self.max_cell_display_chars.get();
+            let font_size = *self.font_size.lock().unwrap();
+            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
             self.table.set_rows(1);
             self.table.set_cols(1);
             self.apply_table_metrics_for_current_font();
@@ -988,8 +986,8 @@ impl ResultTableWidget {
         self.table.set_cols(col_count);
         self.apply_table_metrics_for_current_font();
 
-        let font_size = self.font_size.get();
-        let max_cell_display_chars = self.max_cell_display_chars.get();
+        let font_size = *self.font_size.lock().unwrap();
+        let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
         let widths = Self::compute_column_widths(
             &col_names,
             &result.rows,
@@ -1017,7 +1015,7 @@ impl ResultTableWidget {
         *self.width_sampled_rows.lock().unwrap() = 0;
 
         // Initialize pending widths based on headers
-        let font_size = self.font_size.get();
+        let font_size = *self.font_size.lock().unwrap();
         let initial_widths: Vec<i32> = headers
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
@@ -1043,8 +1041,8 @@ impl ResultTableWidget {
         if sampled < WIDTH_SAMPLE_ROWS {
             let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
             let mut widths = self.pending_widths.lock().unwrap();
-            let min_width = Self::min_col_width_for_font(self.font_size.get());
-            let max_cell_display_chars = self.max_cell_display_chars.get();
+            let min_width = Self::min_col_width_for_font(*self.font_size.lock().unwrap());
+            let max_cell_display_chars = *self.max_cell_display_chars.lock().unwrap();
             if widths.len() < max_cols {
                 widths.resize(max_cols, min_width);
             }
@@ -1054,7 +1052,7 @@ impl ResultTableWidget {
                 Self::update_widths_with_row(
                     &mut widths,
                     row,
-                    self.font_size.get(),
+                    *self.font_size.lock().unwrap(),
                     max_cell_display_chars,
                 );
             }
@@ -1260,8 +1258,8 @@ impl ResultTableWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        self.font_profile.set(profile);
-        self.font_size.set(size);
+        *self.font_profile.lock().unwrap() = profile;
+        *self.font_size.lock().unwrap() = size;
         self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
         // Force FLTK to recalculate the table's internal layout after
@@ -1277,7 +1275,7 @@ impl ResultTableWidget {
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
-        self.max_cell_display_chars.set(max_chars.max(1));
+        *self.max_cell_display_chars.lock().unwrap() = max_chars.max(1);
         self.recalculate_widths_for_current_font();
         self.table.redraw();
     }
@@ -1287,7 +1285,7 @@ impl ResultTableWidget {
         // Clear the event handler callback to release captured Arc<Mutex<T>> references.
         self.table.handle(|_, _| false);
 
-        // Set an empty draw_cell to release captured Rc references
+        // Set an empty draw_cell to release captured Arc<Mutex<...>> references
         // from the virtual rendering callback.
         self.table.draw_cell(|_, _, _, _, _, _, _, _| {});
 

@@ -9,10 +9,8 @@ use fltk::{
     text::{TextBuffer, TextEditor, WrapMode},
 };
 use std::any::Any;
-use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -483,7 +481,7 @@ pub struct SqlEditorWidget {
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
-    keyup_debounce_generation: Rc<Cell<u64>>,
+    keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
 }
 
@@ -652,7 +650,7 @@ impl SqlEditorWidget {
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
-        let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
+        let keyup_debounce_generation = Arc::new(Mutex::new(0_u64));
         let keyup_debounce_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let mut widget = Self {
@@ -2122,9 +2120,7 @@ mod execution_state_tests {
         UndoSnapshot, WordUndoRedoState,
     };
     use fltk::app;
-    use std::cell::Cell;
     use std::ptr::NonNull;
-    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2174,13 +2170,13 @@ mod execution_state_tests {
 
     #[test]
     fn invalidate_keyup_debounce_increments_generation_when_slot_is_empty() {
-        let generation = Rc::new(Cell::new(0_u64));
+        let generation = Arc::new(Mutex::new(0_u64));
         let handle_slot = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
 
         assert_eq!(next, 1);
-        assert_eq!(generation.get(), 1);
+        assert_eq!(*generation.lock().unwrap(), 1);
         assert!(handle_slot.lock().unwrap().is_none());
     }
 

@@ -5,8 +5,6 @@ use fltk::{
     prelude::*,
     text::{TextBuffer, TextDisplay},
 };
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
@@ -20,9 +18,9 @@ pub struct ResultTabsWidget {
     data: Arc<Mutex<Vec<ResultTab>>>,
     active_index: Arc<Mutex<Option<usize>>>,
     script_output: Arc<Mutex<ScriptOutputTab>>,
-    font_profile: Rc<Cell<FontProfile>>,
-    font_size: Rc<Cell<u32>>,
-    max_cell_display_chars: Rc<Cell<usize>>,
+    font_profile: Arc<Mutex<FontProfile>>,
+    font_size: Arc<Mutex<u32>>,
+    max_cell_display_chars: Arc<Mutex<usize>>,
 }
 
 #[derive(Clone)]
@@ -121,9 +119,9 @@ impl ResultTabsWidget {
 
         let data = Arc::new(Mutex::new(Vec::<ResultTab>::new()));
         let active_index = Arc::new(Mutex::new(None));
-        let font_profile = Rc::new(Cell::new(configured_editor_profile()));
-        let font_size = Rc::new(Cell::new(constants::DEFAULT_FONT_SIZE as u32));
-        let max_cell_display_chars = Rc::new(Cell::new(
+        let font_profile = Arc::new(Mutex::new(configured_editor_profile()));
+        let font_size = Arc::new(Mutex::new(constants::DEFAULT_FONT_SIZE as u32));
+        let max_cell_display_chars = Arc::new(Mutex::new(
             constants::RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
 
@@ -142,9 +140,9 @@ impl ResultTabsWidget {
         let mut script_display = TextDisplay::new(display_x, display_y, display_w, display_h, None);
         script_display.set_color(theme::panel_bg());
         script_display.set_text_color(theme::text_primary());
-        let script_profile = font_profile.get();
+        let script_profile = *font_profile.lock().unwrap();
         script_display.set_text_font(script_profile.normal);
-        script_display.set_text_size(font_size.get() as i32);
+        script_display.set_text_size(*font_size.lock().unwrap() as i32);
         let mut script_buffer = TextBuffer::default();
         script_buffer.set_text("");
         script_display.set_buffer(script_buffer.clone());
@@ -235,8 +233,8 @@ impl ResultTabsWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        self.font_profile.set(profile);
-        self.font_size.set(size);
+        *self.font_profile.lock().unwrap() = profile;
+        *self.font_size.lock().unwrap() = size;
         {
             let mut script_output = self.script_output.lock().unwrap();
             script_output.display.set_text_font(profile.normal);
@@ -246,7 +244,7 @@ impl ResultTabsWidget {
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
-        self.max_cell_display_chars.set(max_chars);
+        *self.max_cell_display_chars.lock().unwrap() = max_chars;
     }
 
     pub fn clear(&mut self) {
@@ -320,8 +318,11 @@ impl ResultTabsWidget {
 
         group.begin();
         let mut table = ResultTableWidget::with_size(x, y, w, h);
-        table.apply_font_settings(self.font_profile.get(), self.font_size.get());
-        table.set_max_cell_display_chars(self.max_cell_display_chars.get());
+        table.apply_font_settings(
+            *self.font_profile.lock().unwrap(),
+            *self.font_size.lock().unwrap(),
+        );
+        table.set_max_cell_display_chars(*self.max_cell_display_chars.lock().unwrap());
         let widget = table.get_widget();
         group.resizable(&widget);
         group.end();
