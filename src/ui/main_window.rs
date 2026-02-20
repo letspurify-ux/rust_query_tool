@@ -408,10 +408,12 @@ impl MainWindow {
             let Some(state_for_tick) = weak_state.upgrade() else {
                 return;
             };
-            let should_reschedule = {
-                let mut s = state_for_tick.borrow_mut();
-                s.tick_status_animation();
-                s.status_animation_running
+            let should_reschedule = match state_for_tick.try_borrow_mut() {
+                Ok(mut s) => {
+                    s.tick_status_animation();
+                    s.status_animation_running
+                }
+                Err(_) => true,
             };
             if should_reschedule {
                 MainWindow::start_status_animation_timer(&state_for_tick);
@@ -2736,14 +2738,18 @@ impl MainWindow {
             let mut conn_disconnected = false;
             let mut file_disconnected = false;
             let mut health_disconnected = false;
+            let mut deferred_by_borrow_conflict = false;
 
             // Check for schema updates
             {
                 let r = schema_receiver.borrow();
                 loop {
+                    let Ok(mut s) = state.try_borrow_mut() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(update) => {
-                            let mut s = state.borrow_mut();
                             let current_generation = MainWindow::current_connection_generation(&s);
                             if update.connection_generation != current_generation {
                                 continue;
@@ -2769,9 +2775,12 @@ impl MainWindow {
             {
                 let r = conn_receiver.borrow();
                 loop {
+                    let Ok(mut s) = state.try_borrow_mut() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(result) => {
-                            let mut s = state.borrow_mut();
                             match result {
                                 ConnectionResult::Success(info) => {
                                     crate::utils::logging::log_info(
@@ -2854,68 +2863,68 @@ impl MainWindow {
             {
                 let r = file_receiver.borrow();
                 loop {
+                    let Ok(mut s) = state.try_borrow_mut() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(result) => {
                             let mut created_tab_for_open: Option<QueryTabId> = None;
-                            {
-                                let mut s = state.borrow_mut();
-                                match result {
-                                    FileActionResult::OpenInNewTab { path, result } => match result
-                                    {
-                                        Ok(content) => {
-                                            if MainWindow::focus_existing_tab_with_same_file_name(
-                                                &mut s, &path,
-                                            ) {
-                                                continue;
-                                            }
-                                            if let Some(tab_id) =
-                                                MainWindow::create_query_editor_tab(&mut s)
-                                            {
-                                                s.sql_buffer.set_text(&content);
-                                                s.sql_editor.reset_undo_redo_history();
-                                                s.set_tab_file_path(tab_id, Some(path.clone()));
-                                                s.set_tab_pristine_text(tab_id, content);
-                                                s.sql_editor.refresh_highlighting();
-                                                s.sql_editor.focus();
-                                                s.right_tile.redraw();
-                                                created_tab_for_open = Some(tab_id);
-                                            }
+                            match result {
+                                FileActionResult::OpenInNewTab { path, result } => match result {
+                                    Ok(content) => {
+                                        if MainWindow::focus_existing_tab_with_same_file_name(
+                                            &mut s, &path,
+                                        ) {
+                                            continue;
                                         }
-                                        Err(err) => {
-                                            fltk::dialog::alert_default(&format!(
-                                                "Failed to open SQL file: {}",
-                                                err
-                                            ));
+                                        if let Some(tab_id) =
+                                            MainWindow::create_query_editor_tab(&mut s)
+                                        {
+                                            s.sql_buffer.set_text(&content);
+                                            s.sql_editor.reset_undo_redo_history();
+                                            s.set_tab_file_path(tab_id, Some(path.clone()));
+                                            s.set_tab_pristine_text(tab_id, content);
+                                            s.sql_editor.refresh_highlighting();
+                                            s.sql_editor.focus();
+                                            s.right_tile.redraw();
+                                            created_tab_for_open = Some(tab_id);
                                         }
-                                    },
-                                    FileActionResult::Export {
-                                        path,
-                                        row_count,
-                                        result,
-                                    } => match result {
-                                        Ok(()) => {
-                                            let file_label = path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy();
-                                            let conn_info = s.connection_info.borrow().clone();
-                                            s.status_bar.set_label(&format_status(
-                                                &format!(
-                                                    "Exported {} rows to {}",
-                                                    row_count, file_label
-                                                ),
-                                                &conn_info,
-                                            ));
-                                        }
-                                        Err(err) => {
-                                            fltk::dialog::alert_default(&format!(
-                                                "Failed to export CSV: {}",
-                                                err
-                                            ));
-                                        }
-                                    },
-                                }
+                                    }
+                                    Err(err) => {
+                                        fltk::dialog::alert_default(&format!(
+                                            "Failed to open SQL file: {}",
+                                            err
+                                        ));
+                                    }
+                                },
+                                FileActionResult::Export {
+                                    path,
+                                    row_count,
+                                    result,
+                                } => match result {
+                                    Ok(()) => {
+                                        let file_label =
+                                            path.file_name().unwrap_or_default().to_string_lossy();
+                                        let conn_info = s.connection_info.borrow().clone();
+                                        s.status_bar.set_label(&format_status(
+                                            &format!(
+                                                "Exported {} rows to {}",
+                                                row_count, file_label
+                                            ),
+                                            &conn_info,
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        fltk::dialog::alert_default(&format!(
+                                            "Failed to export CSV: {}",
+                                            err
+                                        ));
+                                    }
+                                },
                             }
+
+                            drop(s);
 
                             if let Some(tab_id) = created_tab_for_open {
                                 MainWindow::attach_editor_callbacks(
@@ -2944,6 +2953,10 @@ impl MainWindow {
             {
                 let r = health_receiver.borrow();
                 loop {
+                    let Ok(mut s) = state.try_borrow_mut() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(ConnectionHealthResult::Checked {
                             disconnect_message,
@@ -2951,8 +2964,6 @@ impl MainWindow {
                             checked_connection_generation,
                         }) => {
                             if let Some(message) = disconnect_message {
-                                let mut s = state.borrow_mut();
-
                                 let current_connection_state = if let Some(guard) =
                                     crate::db::try_lock_connection(&s.connection)
                                 {
@@ -2993,10 +3004,26 @@ impl MainWindow {
                 }
             }
 
-            if should_restart_health_check_worker(
-                health_disconnected,
-                state.borrow().health_stop_signal.is_some(),
-            ) {
+            if deferred_by_borrow_conflict {
+                app::add_timeout3(0.05, move |_| {
+                    schedule_poll(
+                        Rc::clone(&schema_receiver),
+                        Rc::clone(&conn_receiver),
+                        Rc::clone(&file_receiver),
+                        Rc::clone(&health_receiver),
+                        state_weak.clone(),
+                        schema_sender.clone(),
+                        file_sender.clone(),
+                    );
+                });
+                return;
+            }
+
+            let health_worker_registered = state
+                .try_borrow()
+                .map(|s| s.health_stop_signal.is_some())
+                .unwrap_or(true);
+            if should_restart_health_check_worker(health_disconnected, health_worker_registered) {
                 crate::utils::logging::log_error(
                     "connection",
                     "Connection health-check worker stopped unexpectedly; restarting.",
@@ -3011,7 +3038,9 @@ impl MainWindow {
                 let health_connection = state.borrow().connection.clone();
                 let stop_flag =
                     MainWindow::start_health_check_worker(health_connection, health_sender);
-                state.borrow_mut().health_stop_signal = Some(stop_flag);
+                if let Ok(mut s) = state.try_borrow_mut() {
+                    s.health_stop_signal = Some(stop_flag);
+                }
             }
 
             // Stop polling if all channels are disconnected
