@@ -1,6 +1,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const NON_THREAD_SAFE_PATTERNS: [&str; 11] = [
+    "Rc<",
+    "Rc::new",
+    "Rc::clone",
+    "std::rc::Rc",
+    "Rc<RefCell<",
+    "Rc<Cell<",
+    "Rc<UnsafeCell<",
+    "RefCell",
+    "std::cell::RefCell",
+    "rc::Weak<",
+    "std::rc::Weak",
+];
+
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -38,10 +52,9 @@ fn source_does_not_use_rc_or_refcell() {
         let content = fs::read_to_string(&file)
             .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
-        if content.contains("Rc<")
-            || content.contains("std::rc::Rc")
-            || content.contains("RefCell")
-            || content.contains("std::cell::RefCell")
+        if NON_THREAD_SAFE_PATTERNS
+            .iter()
+            .any(|pattern| content.contains(pattern))
         {
             offenders.push(file);
         }
