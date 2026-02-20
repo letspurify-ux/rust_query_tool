@@ -706,7 +706,18 @@ impl ObjectBrowserWidget {
 
                     if mouse_button == fltk::app::MouseButton::Left {
                         if fltk::app::event_clicks() {
-                            if let Some(item) = t.first_selected_item() {
+                            let clicked_item = t
+                                .find_clicked(false)
+                                .or_else(|| t.find_clicked(true))
+                                .or_else(|| Self::item_at_mouse(t));
+
+                            if let (Some(item), Some(selected_item)) =
+                                (clicked_item, t.first_selected_item())
+                            {
+                                if item != selected_item {
+                                    return false;
+                                }
+
                                 // Double-click on a package node: load sub-items
                                 if let Some(ObjectItem::Simple {
                                     object_type,
