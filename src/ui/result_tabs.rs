@@ -298,11 +298,16 @@ impl ResultTabsWidget {
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
-        let current_len = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
-        if index < current_len {
+        let existing_group = {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .map(|tab| tab.group.clone())
+        };
+        if let Some(group) = existing_group {
             // Extract the group before calling set_value to avoid re-entrant borrow
             // when the tabs callback fires
-            let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[index].group.clone();
             let _ = self.tabs.set_value(&group);
             *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
             return;
@@ -328,12 +333,18 @@ impl ResultTabsWidget {
         group.end();
         self.tabs.end();
 
-        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(ResultTab { group, table });
-        let new_index = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len().saturating_sub(1);
+        let (new_index, new_group) = {
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.push(ResultTab { group, table });
+            let idx = data.len().saturating_sub(1);
+            let group = data.get(idx).map(|tab| tab.group.clone());
+            (idx, group)
+        };
         // Extract the group before calling set_value to avoid re-entrant borrow
         // when the tabs callback fires
-        let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[new_index].group.clone();
-        let _ = self.tabs.set_value(&group);
+        if let Some(group) = new_group {
+            let _ = self.tabs.set_value(&group);
+        }
         self.reset_tab_strip_left_anchor();
         *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
     }
@@ -488,8 +499,16 @@ impl ResultTabsWidget {
                 index
             };
             *self.active_index.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
-            let group = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())[new_index].group.clone();
-            let _ = self.tabs.set_value(&group);
+            let group = {
+                self.data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(new_index)
+                    .map(|tab| tab.group.clone())
+            };
+            if let Some(group) = group {
+                let _ = self.tabs.set_value(&group);
+            }
         }
 
         self.tabs.redraw();
