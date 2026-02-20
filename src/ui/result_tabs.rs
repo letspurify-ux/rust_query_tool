@@ -7,7 +7,7 @@ use fltk::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
@@ -17,9 +17,9 @@ use crate::ui::ResultTableWidget;
 #[derive(Clone)]
 pub struct ResultTabsWidget {
     tabs: Tabs,
-    data: Rc<Mutex<Vec<ResultTab>>>,
-    active_index: Rc<Mutex<Option<usize>>>,
-    script_output: Rc<Mutex<ScriptOutputTab>>,
+    data: Arc<Mutex<Vec<ResultTab>>>,
+    active_index: Arc<Mutex<Option<usize>>>,
+    script_output: Arc<Mutex<ScriptOutputTab>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
     max_cell_display_chars: Rc<Cell<usize>>,
@@ -119,8 +119,8 @@ impl ResultTabsWidget {
         // which causes distracting header size jumps during splitter drags.
         tabs.handle_overflow(TabsOverflow::Pulldown);
 
-        let data = Rc::new(Mutex::new(Vec::<ResultTab>::new()));
-        let active_index = Rc::new(Mutex::new(None));
+        let data = Arc::new(Mutex::new(Vec::<ResultTab>::new()));
+        let active_index = Arc::new(Mutex::new(None));
         let font_profile = Rc::new(Cell::new(configured_editor_profile()));
         let font_size = Rc::new(Cell::new(constants::DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars = Rc::new(Cell::new(
@@ -152,7 +152,7 @@ impl ResultTabsWidget {
         script_group.end();
         tabs.end();
 
-        let script_output = Rc::new(Mutex::new(ScriptOutputTab {
+        let script_output = Arc::new(Mutex::new(ScriptOutputTab {
             group: script_group,
             display: script_display,
             buffer: script_buffer,
@@ -425,7 +425,7 @@ impl ResultTabsWidget {
 
     fn delete_tab(&mut self, mut tab: ResultTab) {
         // FLTK memory management: proper cleanup order is critical
-        // 1. Clear callbacks on child widgets to release captured Rc<Mutex<T>> references
+        // 1. Clear callbacks on child widgets to release captured Arc<Mutex<T>> references
         // 2. Remove child widgets from parent before deletion
         // 3. Delete child widgets
         // 4. Delete parent container

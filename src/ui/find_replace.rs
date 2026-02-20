@@ -11,8 +11,7 @@ use fltk::{
     text::{TextBuffer, TextEditor},
     window::Window,
 };
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Find/Replace dialog
 pub struct FindReplaceDialog;
@@ -74,7 +73,7 @@ impl FindReplaceDialog {
     pub fn show_find_with_registry(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
-        popups: Rc<Mutex<Vec<Window>>>,
+        popups: Arc<Mutex<Vec<Window>>>,
     ) {
         Self::show_dialog(editor, buffer, false, popups);
     }
@@ -83,7 +82,7 @@ impl FindReplaceDialog {
     pub fn show_replace_with_registry(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
-        popups: Rc<Mutex<Vec<Window>>>,
+        popups: Arc<Mutex<Vec<Window>>>,
     ) {
         Self::show_dialog(editor, buffer, true, popups);
     }
@@ -92,7 +91,7 @@ impl FindReplaceDialog {
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
         show_replace: bool,
-        popups: Rc<Mutex<Vec<Window>>>,
+        popups: Arc<Mutex<Vec<Window>>>,
     ) {
         enum DialogMessage {
             FindNext {
@@ -241,8 +240,8 @@ impl FindReplaceDialog {
 
         // State for search
         let initial_search_pos = normalize_search_pos(&buffer.text(), session_snapshot.search_pos);
-        let search_pos = Rc::new(Mutex::new(initial_search_pos));
-        let last_search_text = Rc::new(Mutex::new(session_snapshot.last_search_text));
+        let search_pos = Arc::new(Mutex::new(initial_search_pos));
+        let last_search_text = Arc::new(Mutex::new(session_snapshot.last_search_text));
 
         let (sender, receiver) = std::sync::mpsc::channel::<DialogMessage>();
 

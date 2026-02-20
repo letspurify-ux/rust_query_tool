@@ -9,9 +9,8 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::rc::Rc;
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::db::{ConnectionInfo, DatabaseConnection};
@@ -68,7 +67,7 @@ fn build_connection_info(
 }
 
 impl ConnectionDialog {
-    pub fn show_with_registry(popups: Rc<Mutex<Vec<Window>>>) -> Option<ConnectionInfo> {
+    pub fn show_with_registry(popups: Arc<Mutex<Vec<Window>>>) -> Option<ConnectionInfo> {
         enum DialogMessage {
             DeleteSelected,
             Test(ConnectionInfo),
@@ -80,8 +79,8 @@ impl ConnectionDialog {
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
-        let result: Rc<Mutex<Option<ConnectionInfo>>> = Rc::new(Mutex::new(None));
-        let config = Rc::new(Mutex::new(AppConfig::load()));
+        let result: Arc<Mutex<Option<ConnectionInfo>>> = Arc::new(Mutex::new(None));
+        let config = Arc::new(Mutex::new(AppConfig::load()));
 
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);

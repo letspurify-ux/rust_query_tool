@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 use std::rc::Weak;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::db::{
@@ -33,8 +33,8 @@ pub enum SqlAction {
 }
 
 /// Callback type for executing SQL from object browser
-pub type SqlExecuteCallback = Rc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
-type StatusCallback = Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
+pub type SqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
+type StatusCallback = Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
 
 #[derive(Clone)]
 enum ObjectItem {
@@ -111,7 +111,7 @@ pub struct ObjectBrowserWidget {
     sql_callback: SqlExecuteCallback,
     status_callback: StatusCallback,
     filter_input: Input,
-    object_cache: Rc<Mutex<ObjectCache>>,
+    object_cache: Arc<Mutex<ObjectCache>>,
     poll_lifecycle: Rc<()>,
     refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
@@ -181,9 +181,9 @@ impl ObjectBrowserWidget {
             item.close();
         }
 
-        let sql_callback: SqlExecuteCallback = Rc::new(Mutex::new(None));
-        let status_callback: StatusCallback = Rc::new(Mutex::new(None));
-        let object_cache = Rc::new(Mutex::new(ObjectCache::default()));
+        let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
+        let status_callback: StatusCallback = Arc::new(Mutex::new(None));
+        let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
         let poll_lifecycle = Rc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
@@ -248,14 +248,14 @@ impl ObjectBrowserWidget {
 
         let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
-        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
-        let receiver: Rc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>> =
-            Rc::new(Mutex::new(refresh_receiver));
+        // Wrap receiver in Arc<Mutex> to share across timeout callbacks
+        let receiver: Arc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>> =
+            Arc::new(Mutex::new(refresh_receiver));
 
         fn schedule_poll(
-            receiver: Rc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>>,
+            receiver: Arc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>>,
             mut tree: Tree,
-            object_cache: Rc<Mutex<ObjectCache>>,
+            object_cache: Arc<Mutex<ObjectCache>>,
             filter_input: Input,
             status_callback: StatusCallback,
             lifecycle: Weak<()>,
@@ -305,9 +305,9 @@ impl ObjectBrowserWidget {
             // Reschedule for next poll
             app::add_timeout3(0.05, move |_| {
                 schedule_poll(
-                    Rc::clone(&receiver),
+                    receiver.clone(),
                     tree.clone(),
-                    Rc::clone(&object_cache),
+                    object_cache.clone(),
                     filter_input.clone(),
                     status_callback.clone(),
                     lifecycle.clone(),
@@ -337,15 +337,15 @@ impl ObjectBrowserWidget {
         let filter_input = self.filter_input.clone();
         let lifecycle = Rc::downgrade(&self.poll_lifecycle);
 
-        let receiver: Rc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>> =
-            Rc::new(Mutex::new(action_receiver));
+        let receiver: Arc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>> =
+            Arc::new(Mutex::new(action_receiver));
 
         fn schedule_poll(
-            receiver: Rc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>>,
+            receiver: Arc<Mutex<std::sync::mpsc::Receiver<ObjectActionResult>>>,
             sql_callback: SqlExecuteCallback,
             status_callback: StatusCallback,
             mut tree: Tree,
-            object_cache: Rc<Mutex<ObjectCache>>,
+            object_cache: Arc<Mutex<ObjectCache>>,
             filter_input: Input,
             lifecycle: Weak<()>,
         ) {
@@ -640,11 +640,11 @@ impl ObjectBrowserWidget {
 
             app::add_timeout3(0.05, move |_| {
                 schedule_poll(
-                    Rc::clone(&receiver),
+                    receiver.clone(),
                     sql_callback.clone(),
                     status_callback.clone(),
                     tree.clone(),
-                    Rc::clone(&object_cache),
+                    object_cache.clone(),
                     filter_input.clone(),
                     lifecycle.clone(),
                 );

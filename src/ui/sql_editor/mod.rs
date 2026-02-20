@@ -459,32 +459,32 @@ pub struct SqlEditorWidget {
     buffer: TextBuffer,
     style_buffer: TextBuffer,
     connection: SharedConnection,
-    execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
-    progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+    execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
+    progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
     progress_sender: mpsc::Sender<QueryProgress>,
     column_sender: mpsc::Sender<ColumnLoadUpdate>,
     ui_action_sender: mpsc::Sender<UiActionResult>,
-    query_running: Rc<Mutex<bool>>,
+    query_running: Arc<Mutex<bool>>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     cancel_flag: Arc<AtomicBool>,
-    intellisense_data: Rc<Mutex<IntellisenseData>>,
-    intellisense_popup: Rc<Mutex<IntellisensePopup>>,
-    highlighter: Rc<Mutex<SqlHighlighter>>,
+    intellisense_data: Arc<Mutex<IntellisenseData>>,
+    intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+    highlighter: Arc<Mutex<SqlHighlighter>>,
     timeout_input: IntInput,
-    status_callback: Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
-    find_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>>,
-    replace_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>>,
-    file_drop_callback: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
-    completion_range: Rc<Mutex<Option<(usize, usize)>>>,
-    pending_intellisense: Rc<Mutex<Option<PendingIntellisense>>>,
-    intellisense_parse_cache: Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
-    history_cursor: Rc<Mutex<Option<usize>>>,
-    history_original: Rc<Mutex<Option<String>>>,
-    history_navigation_entries: Rc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
-    applying_history_navigation: Rc<Mutex<bool>>,
-    undo_redo_state: Rc<Mutex<WordUndoRedoState>>,
+    status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
+    find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
+    replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
+    file_drop_callback: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
+    completion_range: Arc<Mutex<Option<(usize, usize)>>>,
+    pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
+    intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+    history_cursor: Arc<Mutex<Option<usize>>>,
+    history_original: Arc<Mutex<Option<String>>>,
+    history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
+    applying_history_navigation: Arc<Mutex<bool>>,
+    undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     keyup_debounce_generation: Rc<Cell<u64>>,
-    keyup_debounce_handle: Rc<Mutex<Option<app::TimeoutHandle>>>,
+    keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
 }
 
 impl SqlEditorWidget {
@@ -519,7 +519,7 @@ impl SqlEditorWidget {
     }
 
     fn invoke_query_result_callback(
-        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
         result: &QueryResult,
     ) {
         let callback = {
@@ -540,7 +540,7 @@ impl SqlEditorWidget {
     }
 
     fn invoke_progress_callback(
-        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
         message: QueryProgress,
     ) {
         let callback = {
@@ -561,7 +561,7 @@ impl SqlEditorWidget {
     }
 
     fn invoke_status_callback(
-        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
         message: &str,
     ) {
         let callback = {
@@ -625,35 +625,35 @@ impl SqlEditorWidget {
         group.resizable(&editor);
         group.end();
 
-        let execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>> =
-            Rc::new(Mutex::new(None));
-        let progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
-            Rc::new(Mutex::new(None));
+        let execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>> =
+            Arc::new(Mutex::new(None));
+        let progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
+            Arc::new(Mutex::new(None));
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
         let (column_sender, column_receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
-        let query_running = Rc::new(Mutex::new(false));
+        let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        let intellisense_data = Rc::new(Mutex::new(IntellisenseData::new()));
-        let intellisense_popup = Rc::new(Mutex::new(IntellisensePopup::new()));
-        let highlighter = Rc::new(Mutex::new(SqlHighlighter::new()));
-        let status_callback: Rc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Rc::new(Mutex::new(None));
-        let find_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
-        let replace_callback: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
-        let file_drop_callback: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(Mutex::new(None));
-        let completion_range = Rc::new(Mutex::new(None::<(usize, usize)>));
-        let pending_intellisense = Rc::new(Mutex::new(None::<PendingIntellisense>));
-        let intellisense_parse_cache = Rc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
-        let history_cursor = Rc::new(Mutex::new(None::<usize>));
-        let history_original = Rc::new(Mutex::new(None::<String>));
-        let history_navigation_entries = Rc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
-        let applying_history_navigation = Rc::new(Mutex::new(false));
-        let undo_redo_state = Rc::new(Mutex::new(WordUndoRedoState::new(String::new())));
+        let intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let intellisense_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
+        let highlighter = Arc::new(Mutex::new(SqlHighlighter::new()));
+        let status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Arc::new(Mutex::new(None));
+        let find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
+        let replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
+        let file_drop_callback: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Arc::new(Mutex::new(None));
+        let completion_range = Arc::new(Mutex::new(None::<(usize, usize)>));
+        let pending_intellisense = Arc::new(Mutex::new(None::<PendingIntellisense>));
+        let intellisense_parse_cache = Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
+        let history_cursor = Arc::new(Mutex::new(None::<usize>));
+        let history_original = Arc::new(Mutex::new(None::<String>));
+        let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
+        let applying_history_navigation = Arc::new(Mutex::new(false));
+        let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let keyup_debounce_generation = Rc::new(Cell::new(0_u64));
-        let keyup_debounce_handle = Rc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let keyup_debounce_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let mut widget = Self {
             group,
@@ -727,22 +727,22 @@ impl SqlEditorWidget {
     fn setup_progress_handler(
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
-        progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
-        query_running: Rc<Mutex<bool>>,
+        progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+        query_running: Arc<Mutex<bool>>,
     ) {
         let execute_callback = self.execute_callback.clone();
         let cancel_flag = self.cancel_flag.clone();
         let lifecycle_group = self.group.clone();
 
-        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
-        let receiver: Rc<Mutex<mpsc::Receiver<QueryProgress>>> =
-            Rc::new(Mutex::new(progress_receiver));
+        // Wrap receiver in Arc<Mutex> to share across timeout callbacks
+        let receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>> =
+            Arc::new(Mutex::new(progress_receiver));
 
         fn schedule_poll(
-            receiver: Rc<Mutex<mpsc::Receiver<QueryProgress>>>,
-            progress_callback: Rc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
-            query_running: Rc<Mutex<bool>>,
-            execute_callback: Rc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
+            receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>>,
+            progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+            query_running: Arc<Mutex<bool>>,
+            execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
             cancel_flag: Arc<AtomicBool>,
             lifecycle_group: Flex,
         ) {
@@ -881,11 +881,11 @@ impl SqlEditorWidget {
             };
             app::add_timeout3(delay, move |_| {
                 schedule_poll(
-                    Rc::clone(&receiver),
-                    Rc::clone(&progress_callback),
-                    Rc::clone(&query_running),
-                    Rc::clone(&execute_callback),
-                    Arc::clone(&cancel_flag),
+                    receiver.clone(),
+                    progress_callback.clone(),
+                    query_running.clone(),
+                    execute_callback.clone(),
+                    cancel_flag.clone(),
                     lifecycle_group.clone(),
                 );
             });
@@ -902,7 +902,7 @@ impl SqlEditorWidget {
         );
     }
 
-    fn finalize_execution_state(query_running: &Rc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
+    fn finalize_execution_state(query_running: &Arc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
         *query_running.lock().unwrap() = false;
         cancel_flag.store(false, Ordering::SeqCst);
     }
@@ -920,27 +920,27 @@ impl SqlEditorWidget {
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
 
-        // Wrap receiver in Rc<Mutex> to share across timeout callbacks
-        let receiver: Rc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
-            Rc::new(Mutex::new(column_receiver));
+        // Wrap receiver in Arc<Mutex> to share across timeout callbacks
+        let receiver: Arc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
+            Arc::new(Mutex::new(column_receiver));
 
         const COLUMN_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
         const COLUMN_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.5;
         const COLUMN_LOADING_STALE_TIMEOUT: Duration = Duration::from_secs(8);
 
         fn schedule_poll(
-            receiver: Rc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>>,
-            intellisense_data: Rc<Mutex<IntellisenseData>>,
+            receiver: Arc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>>,
+            intellisense_data: Arc<Mutex<IntellisenseData>>,
             editor: TextEditor,
             buffer: TextBuffer,
             style_buffer: TextBuffer,
-            highlighter: Rc<Mutex<SqlHighlighter>>,
-            intellisense_popup: Rc<Mutex<IntellisensePopup>>,
-            completion_range: Rc<Mutex<Option<(usize, usize)>>>,
+            highlighter: Arc<Mutex<SqlHighlighter>>,
+            intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+            completion_range: Arc<Mutex<Option<(usize, usize)>>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
             connection: SharedConnection,
-            pending_intellisense: Rc<Mutex<Option<PendingIntellisense>>>,
-            intellisense_parse_cache: Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+            pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
+            intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -1076,18 +1076,18 @@ impl SqlEditorWidget {
 
             app::add_timeout3(delay, move |_| {
                 schedule_poll(
-                    Rc::clone(&receiver),
-                    Rc::clone(&intellisense_data),
+                    receiver.clone(),
+                    intellisense_data.clone(),
                     editor.clone(),
                     buffer.clone(),
                     style_buffer.clone(),
-                    Rc::clone(&highlighter),
-                    Rc::clone(&intellisense_popup),
-                    Rc::clone(&completion_range),
+                    highlighter.clone(),
+                    intellisense_popup.clone(),
+                    completion_range.clone(),
                     column_sender.clone(),
                     connection.clone(),
-                    Rc::clone(&pending_intellisense),
-                    Rc::clone(&intellisense_parse_cache),
+                    pending_intellisense.clone(),
+                    intellisense_parse_cache.clone(),
                 );
             });
         }
@@ -1112,11 +1112,11 @@ impl SqlEditorWidget {
     fn setup_ui_action_handler(&self, ui_action_receiver: mpsc::Receiver<UiActionResult>) {
         let widget = self.clone();
 
-        let receiver: Rc<Mutex<mpsc::Receiver<UiActionResult>>> =
-            Rc::new(Mutex::new(ui_action_receiver));
+        let receiver: Arc<Mutex<mpsc::Receiver<UiActionResult>>> =
+            Arc::new(Mutex::new(ui_action_receiver));
 
         fn schedule_poll(
-            receiver: Rc<Mutex<mpsc::Receiver<UiActionResult>>>,
+            receiver: Arc<Mutex<mpsc::Receiver<UiActionResult>>>,
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
@@ -1246,7 +1246,7 @@ impl SqlEditorWidget {
             }
 
             app::add_timeout3(0.05, move |_| {
-                schedule_poll(Rc::clone(&receiver), widget.clone());
+                schedule_poll(receiver.clone(), widget.clone());
             });
         }
 
@@ -1612,7 +1612,7 @@ impl SqlEditorWidget {
         Self::reset_word_undo_state(&self.undo_redo_state);
     }
 
-    fn reset_word_undo_state(undo_redo_state: &Rc<Mutex<WordUndoRedoState>>) {
+    fn reset_word_undo_state(undo_redo_state: &Arc<Mutex<WordUndoRedoState>>) {
         let mut state = undo_redo_state.lock().unwrap();
         let mut fresh_history = Vec::with_capacity(1);
         fresh_history.push(UndoSnapshot::new(String::new(), 0));
@@ -1635,7 +1635,7 @@ impl SqlEditorWidget {
         );
     }
 
-    pub fn get_highlighter(&self) -> Rc<Mutex<SqlHighlighter>> {
+    pub fn get_highlighter(&self) -> Arc<Mutex<SqlHighlighter>> {
         self.highlighter.clone()
     }
 
@@ -2131,7 +2131,7 @@ mod execution_state_tests {
 
     #[test]
     fn finalize_execution_state_clears_running_and_cancel_flags() {
-        let query_running = Rc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
         let cancel_flag = Arc::new(AtomicBool::new(true));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
@@ -2142,7 +2142,7 @@ mod execution_state_tests {
 
     #[test]
     fn reset_word_undo_state_reinitializes_history_safely() {
-        let undo_state = Rc::new(Mutex::new(WordUndoRedoState {
+        let undo_state = Arc::new(Mutex::new(WordUndoRedoState {
             history: vec![
                 UndoSnapshot::new("SELECT 1".to_string(), 8),
                 UndoSnapshot::new("SELECT 2".to_string(), 8),
@@ -2164,7 +2164,7 @@ mod execution_state_tests {
     #[test]
     fn take_keyup_debounce_timeout_handle_clears_slot() {
         let fake_handle: app::TimeoutHandle = NonNull::<()>::dangling().as_ptr();
-        let handle_slot = Rc::new(Mutex::new(Some(fake_handle)));
+        let handle_slot = Arc::new(Mutex::new(Some(fake_handle)));
 
         let taken = SqlEditorWidget::take_keyup_debounce_timeout_handle(&handle_slot);
 
@@ -2175,7 +2175,7 @@ mod execution_state_tests {
     #[test]
     fn invalidate_keyup_debounce_increments_generation_when_slot_is_empty() {
         let generation = Rc::new(Cell::new(0_u64));
-        let handle_slot = Rc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let handle_slot = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
 
         let next = SqlEditorWidget::invalidate_keyup_debounce(&generation, &handle_slot);
 
@@ -2186,7 +2186,7 @@ mod execution_state_tests {
 
     #[test]
     fn finalize_execution_state_is_idempotent_when_already_reset() {
-        let query_running = Rc::new(Mutex::new(false));
+        let query_running = Arc::new(Mutex::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);

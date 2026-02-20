@@ -8,8 +8,7 @@ use fltk::{
     text::{StyleTableEntry, TextBuffer, TextDisplay},
     window::Window,
 };
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -510,7 +509,7 @@ pub fn clear_history() -> Result<(), String> {
 pub struct QueryHistoryDialog;
 
 impl QueryHistoryDialog {
-    pub fn show_with_registry(popups: Rc<Mutex<Vec<Window>>>) -> Option<String> {
+    pub fn show_with_registry(popups: Arc<Mutex<Vec<Window>>>) -> Option<String> {
         enum DialogMessage {
             UpdatePreview(usize),
             UseSelected,
@@ -652,8 +651,8 @@ impl QueryHistoryDialog {
 
         popups.lock().unwrap().push(dialog.clone());
         // State for selected query
-        let selected_sql: Rc<Mutex<Option<String>>> = Rc::new(Mutex::new(None));
-        let queries: Rc<Mutex<Vec<QueryHistoryEntry>>> = Rc::new(Mutex::new(snapshot));
+        let selected_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let queries: Arc<Mutex<Vec<QueryHistoryEntry>>> = Arc::new(Mutex::new(snapshot));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 

@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -73,13 +73,13 @@ pub struct AppState {
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
     pub fetch_row_counts: HashMap<usize, usize>,
-    pub current_file: Rc<Mutex<Option<PathBuf>>>,
-    pub popups: Rc<Mutex<Vec<Window>>>,
+    pub current_file: Arc<Mutex<Option<PathBuf>>>,
+    pub popups: Arc<Mutex<Vec<Window>>>,
     pub window: Window,
     pub right_tile: Tile,
     pub query_split_adjusted: Rc<Cell<bool>>,
-    pub connection_info: Rc<Mutex<Option<crate::db::ConnectionInfo>>>,
-    pub config: Rc<Mutex<AppConfig>>,
+    pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
+    pub config: Arc<Mutex<AppConfig>>,
     pub last_fetch_status_update: Instant,
     status_animation_running: bool,
     status_animation_message: String,
@@ -323,7 +323,7 @@ fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> St
 }
 
 pub struct MainWindow {
-    state: Rc<Mutex<AppState>>,
+    state: Arc<Mutex<AppState>>,
 }
 
 #[derive(Clone)]
@@ -403,8 +403,8 @@ enum HealthCheckCurrentConnectionState {
 }
 
 impl MainWindow {
-    fn start_status_animation_timer(state: &Rc<Mutex<AppState>>) {
-        let weak_state = Rc::downgrade(state);
+    fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
+        let weak_state = Arc::downgrade(state);
         app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
             let Some(state_for_tick) = weak_state.upgrade() else {
                 return;
@@ -438,7 +438,7 @@ impl MainWindow {
         }
     }
 
-    fn cancel_all_running_queries(state: &Rc<Mutex<AppState>>) {
+    fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
         let (running_editors, fallback_editor) = {
             let s = state.lock().unwrap();
             let running_editors = s
@@ -485,7 +485,7 @@ impl MainWindow {
     }
 
     fn save_tab(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         force_save_as: bool,
     ) -> SaveTabOutcome {
@@ -526,7 +526,7 @@ impl MainWindow {
     }
 
     fn confirm_save_if_dirty(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         action_verb: &str,
     ) -> bool {
@@ -563,7 +563,7 @@ impl MainWindow {
         }
     }
 
-    fn confirm_save_for_all_dirty_tabs(state: &Rc<Mutex<AppState>>) -> bool {
+    fn confirm_save_for_all_dirty_tabs(state: &Arc<Mutex<AppState>>) -> bool {
         let tab_ids = state.lock().unwrap().query_tabs.tab_ids();
         for tab_id in tab_ids {
             if !Self::confirm_save_if_dirty(state, tab_id, "exiting") {
@@ -679,7 +679,7 @@ impl MainWindow {
         split_bar.set_color(theme::border());
         split_bar.set_tooltip("Drag to resize panels");
 
-        let drag_state = Rc::new(Mutex::new(None::<(i32, i32)>));
+        let drag_state = Arc::new(Mutex::new(None::<(i32, i32)>));
         let mut content_flex_for_split = content_flex.clone();
         let obj_browser_for_split = obj_browser_widget.clone();
         let drag_state_for_split = drag_state.clone();
@@ -963,7 +963,7 @@ impl MainWindow {
         window.end();
         window.make_resizable(true);
 
-        let state = Rc::new(Mutex::new(AppState {
+        let state = Arc::new(Mutex::new(AppState {
             connection,
             query_tabs: query_tabs.clone(),
             query_top_group: query_top_group.clone(),
@@ -981,13 +981,13 @@ impl MainWindow {
             object_browser,
             status_bar,
             fetch_row_counts: HashMap::new(),
-            current_file: Rc::new(Mutex::new(None)),
-            popups: Rc::new(Mutex::new(Vec::new())),
+            current_file: Arc::new(Mutex::new(None)),
+            popups: Arc::new(Mutex::new(Vec::new())),
             window,
             right_tile: right_tile.clone(),
             query_split_adjusted: query_split_adjusted.clone(),
-            connection_info: Rc::new(Mutex::new(None)),
-            config: Rc::new(Mutex::new(config)),
+            connection_info: Arc::new(Mutex::new(None)),
+            config: Arc::new(Mutex::new(config)),
             last_fetch_status_update: Instant::now(),
             status_animation_running: false,
             status_animation_message: String::new(),
@@ -997,7 +997,7 @@ impl MainWindow {
             health_stop_signal: None,
         }));
 
-        let weak_state_for_execute = Rc::downgrade(&state);
+        let weak_state_for_execute = Arc::downgrade(&state);
         execute_btn.set_callback(move |_| {
             if let Some(state_for_execute) = weak_state_for_execute.upgrade() {
                 state_for_execute
@@ -1008,14 +1008,14 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_cancel = Rc::downgrade(&state);
+        let weak_state_for_cancel = Arc::downgrade(&state);
         cancel_btn.set_callback(move |_| {
             if let Some(state_for_cancel) = weak_state_for_cancel.upgrade() {
                 MainWindow::cancel_all_running_queries(&state_for_cancel);
             }
         });
 
-        let weak_state_for_explain = Rc::downgrade(&state);
+        let weak_state_for_explain = Arc::downgrade(&state);
         explain_btn.set_callback(move |_| {
             if let Some(state_for_explain) = weak_state_for_explain.upgrade() {
                 state_for_explain
@@ -1026,28 +1026,28 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_clear_btn = Rc::downgrade(&state);
+        let weak_state_for_clear_btn = Arc::downgrade(&state);
         clear_btn.set_callback(move |_| {
             if let Some(state_for_clear_btn) = weak_state_for_clear_btn.upgrade() {
                 state_for_clear_btn.lock().unwrap().sql_editor.clear();
             }
         });
 
-        let weak_state_for_commit = Rc::downgrade(&state);
+        let weak_state_for_commit = Arc::downgrade(&state);
         commit_btn.set_callback(move |_| {
             if let Some(state_for_commit) = weak_state_for_commit.upgrade() {
                 state_for_commit.lock().unwrap().sql_editor.commit();
             }
         });
 
-        let weak_state_for_rollback = Rc::downgrade(&state);
+        let weak_state_for_rollback = Arc::downgrade(&state);
         rollback_btn.set_callback(move |_| {
             if let Some(state_for_rollback) = weak_state_for_rollback.upgrade() {
                 state_for_rollback.lock().unwrap().sql_editor.rollback();
             }
         });
 
-        let weak_state_for_result_close = Rc::downgrade(&state);
+        let weak_state_for_result_close = Arc::downgrade(&state);
         close_tab_btn.set_callback(move |_| {
             let Some(state_for_result_close) = weak_state_for_result_close.upgrade() else {
                 return;
@@ -1069,7 +1069,7 @@ impl MainWindow {
             app::redraw();
         });
 
-        let weak_state_for_result_clear = Rc::downgrade(&state);
+        let weak_state_for_result_clear = Arc::downgrade(&state);
         clear_tabs_btn.set_callback(move |_| {
             let Some(state_for_result_clear) = weak_state_for_result_clear.upgrade() else {
                 return;
@@ -1091,7 +1091,7 @@ impl MainWindow {
             app::redraw();
         });
 
-        let weak_state_for_query_close = Rc::downgrade(&state);
+        let weak_state_for_query_close = Arc::downgrade(&state);
         query_close_tab_btn.set_callback(move |_| {
             let Some(state_for_query_close) = weak_state_for_query_close.upgrade() else {
                 return;
@@ -1101,7 +1101,7 @@ impl MainWindow {
             app::redraw();
         });
 
-        let weak_state_for_tab_select = Rc::downgrade(&state);
+        let weak_state_for_tab_select = Arc::downgrade(&state);
         query_tabs.set_on_select(move |tab_id| {
             if let Some(state_for_tab_select) = weak_state_for_tab_select.upgrade() {
                 if let Ok(mut s) = state_for_tab_select.try_lock() {
@@ -1118,7 +1118,7 @@ impl MainWindow {
             Self::apply_font_settings(&mut state_borrow);
         }
 
-        let weak_state_for_history_btn = Rc::downgrade(&state);
+        let weak_state_for_history_btn = Arc::downgrade(&state);
         query_history_btn.set_callback(move |_| {
             if let Some(state_for_history) = weak_state_for_history_btn.upgrade() {
                 MainWindow::open_query_history_dialog(&state_for_history);
@@ -1133,7 +1133,7 @@ impl MainWindow {
         Self { state }
     }
 
-    fn open_query_history_dialog(state: &Rc<Mutex<AppState>>) {
+    fn open_query_history_dialog(state: &Arc<Mutex<AppState>>) {
         let (mut buffer, mut editor, popups) = {
             let s = state.lock().unwrap();
             (
@@ -1393,7 +1393,7 @@ impl MainWindow {
         Some(tab_id)
     }
 
-    fn close_query_editor_tab(state: &Rc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
+    fn close_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
         {
             let s = state.lock().unwrap();
             let Some(index) = s.find_tab_index(tab_id) else {
@@ -1591,7 +1591,7 @@ impl MainWindow {
     }
 
     fn attach_editor_callbacks(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
     ) {
@@ -1606,7 +1606,7 @@ impl MainWindow {
             return;
         };
 
-        let weak_state_for_execute = Rc::downgrade(state);
+        let weak_state_for_execute = Arc::downgrade(state);
         editor.set_execute_callback(move |query_result| {
             let Some(state_for_execute) = weak_state_for_execute.upgrade() else {
                 return;
@@ -1627,7 +1627,7 @@ impl MainWindow {
             s.set_status_message(&base_msg);
         });
 
-        let weak_state_for_status = Rc::downgrade(state);
+        let weak_state_for_status = Arc::downgrade(state);
         editor.set_status_callback(move |message| {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
                 return;
@@ -1640,7 +1640,7 @@ impl MainWindow {
             };
         });
 
-        let weak_state_for_find = Rc::downgrade(state);
+        let weak_state_for_find = Arc::downgrade(state);
         editor.set_find_callback(move || {
             let Some(state_for_find) = weak_state_for_find.upgrade() else {
                 return;
@@ -1656,7 +1656,7 @@ impl MainWindow {
             FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
         });
 
-        let weak_state_for_replace = Rc::downgrade(state);
+        let weak_state_for_replace = Arc::downgrade(state);
         editor.set_replace_callback(move || {
             let Some(state_for_replace) = weak_state_for_replace.upgrade() else {
                 return;
@@ -1672,7 +1672,7 @@ impl MainWindow {
             FindReplaceDialog::show_replace_with_registry(&mut editor, &mut buffer, popups);
         });
 
-        let weak_state_for_progress = Rc::downgrade(state);
+        let weak_state_for_progress = Arc::downgrade(state);
         let schema_sender_for_progress = schema_sender.clone();
         editor.set_progress_callback(move |progress| {
             let Some(state_for_progress) = weak_state_for_progress.upgrade() else {
@@ -1796,7 +1796,7 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_dirty = Rc::downgrade(state);
+        let weak_state_for_dirty = Arc::downgrade(state);
         let mut buffer_for_dirty = editor.get_buffer();
         buffer_for_dirty.add_modify_callback2(move |buf, _pos, ins, del, _restyled, _deleted| {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
@@ -1810,7 +1810,7 @@ impl MainWindow {
     }
 
     fn attach_file_drop_callback(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         file_sender: std::sync::mpsc::Sender<FileActionResult>,
     ) {
@@ -1824,7 +1824,7 @@ impl MainWindow {
         else {
             return;
         };
-        let weak_state_for_file_drop = Rc::downgrade(state);
+        let weak_state_for_file_drop = Arc::downgrade(state);
         let file_sender_for_drop = file_sender.clone();
         editor.set_file_drop_callback(move |path| {
             if let Some(state_for_drop) = weak_state_for_file_drop.upgrade() {
@@ -1850,7 +1850,7 @@ impl MainWindow {
     }
 
     fn execute_menu_action(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
         conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -2489,7 +2489,7 @@ impl MainWindow {
     }
 
     fn handle_window_shortcut(
-        state: &Rc<Mutex<AppState>>,
+        state: &Arc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
         conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -2525,7 +2525,7 @@ impl MainWindow {
         let mut state_borrow = state.lock().unwrap();
 
         // Setup object browser callback
-        let weak_state_for_browser_status = Rc::downgrade(&state);
+        let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
         state_borrow
             .object_browser
@@ -2567,7 +2567,7 @@ impl MainWindow {
                 }
             });
 
-        let weak_state_for_browser = Rc::downgrade(&state);
+        let weak_state_for_browser = Arc::downgrade(&state);
         let schema_sender_for_browser = schema_sender.clone();
         let file_sender_for_browser = file_sender.clone();
         state_borrow.object_browser.set_sql_callback(move |action| {
@@ -2619,7 +2619,7 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_window = Rc::downgrade(&state);
+        let weak_state_for_window = Arc::downgrade(&state);
         let schema_sender_for_window = schema_sender.clone();
         let conn_sender_for_window = conn_sender.clone();
         let file_sender_for_window = file_sender.clone();
@@ -2683,7 +2683,7 @@ impl MainWindow {
         );
     }
 
-    fn stop_health_check_worker(state: &Rc<Mutex<AppState>>) {
+    fn stop_health_check_worker(state: &Arc<Mutex<AppState>>) {
         if let Some(stop_signal) = state.lock().unwrap().health_stop_signal.take() {
             let _ = stop_signal.stop_sender.send(());
         }
@@ -2746,26 +2746,26 @@ impl MainWindow {
     ) {
         let state = self.state.clone();
 
-        // Wrap receivers in Rc<Mutex> to share across timeout callbacks
-        let schema_receiver: Rc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>> =
-            Rc::new(Mutex::new(schema_receiver));
-        let conn_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>> =
-            Rc::new(Mutex::new(conn_receiver));
-        let file_receiver: Rc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
-            Rc::new(Mutex::new(file_receiver));
+        // Wrap receivers in Arc<Mutex> to share across timeout callbacks
+        let schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>> =
+            Arc::new(Mutex::new(schema_receiver));
+        let conn_receiver: Arc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>> =
+            Arc::new(Mutex::new(conn_receiver));
+        let file_receiver: Arc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
+            Arc::new(Mutex::new(file_receiver));
         let (health_sender, health_receiver) = std::sync::mpsc::channel::<ConnectionHealthResult>();
-        let health_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
-            Rc::new(Mutex::new(health_receiver));
+        let health_receiver: Arc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
+            Arc::new(Mutex::new(health_receiver));
         let health_connection = state.lock().unwrap().connection.clone();
         let stop_flag = MainWindow::start_health_check_worker(health_connection, health_sender);
         state.lock().unwrap().health_stop_signal = Some(stop_flag);
 
         fn schedule_poll(
-            schema_receiver: Rc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
-            conn_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>>,
-            file_receiver: Rc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>>,
-            health_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
-            state_weak: Weak<Mutex<AppState>>,
+            schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
+            conn_receiver: Arc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>>,
+            file_receiver: Arc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>>,
+            health_receiver: Arc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
+            state_weak: std::sync::Weak<Mutex<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
         ) {
@@ -3048,10 +3048,10 @@ impl MainWindow {
             if deferred_by_borrow_conflict {
                 app::add_timeout3(0.05, move |_| {
                     schedule_poll(
-                        Rc::clone(&schema_receiver),
-                        Rc::clone(&conn_receiver),
-                        Rc::clone(&file_receiver),
-                        Rc::clone(&health_receiver),
+                        schema_receiver.clone(),
+                        conn_receiver.clone(),
+                        file_receiver.clone(),
+                        health_receiver.clone(),
                         state_weak.clone(),
                         schema_sender.clone(),
                         file_sender.clone(),
@@ -3092,10 +3092,10 @@ impl MainWindow {
             // Reschedule for next poll
             app::add_timeout3(0.05, move |_| {
                 schedule_poll(
-                    Rc::clone(&schema_receiver),
-                    Rc::clone(&conn_receiver),
-                    Rc::clone(&file_receiver),
-                    Rc::clone(&health_receiver),
+                    schema_receiver.clone(),
+                    conn_receiver.clone(),
+                    file_receiver.clone(),
+                    health_receiver.clone(),
                     state_weak.clone(),
                     schema_sender.clone(),
                     file_sender.clone(),
@@ -3104,7 +3104,7 @@ impl MainWindow {
         }
 
         // Start polling
-        let weak_state_for_poll = Rc::downgrade(&state);
+        let weak_state_for_poll = Arc::downgrade(&state);
         let schema_sender_for_poll = schema_sender.clone();
         {
             let mut s = state.lock().unwrap();
@@ -3133,7 +3133,7 @@ impl MainWindow {
         }
 
         if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
-            let weak_state_for_menu = Rc::downgrade(&state);
+            let weak_state_for_menu = Arc::downgrade(&state);
             let schema_sender_for_menu = schema_sender.clone();
             let conn_sender_for_menu = conn_sender.clone();
             let file_sender_for_menu = file_sender.clone();
@@ -3171,7 +3171,7 @@ impl MainWindow {
             let s = state.lock().unwrap();
             s.window.clone()
         };
-        let weak_state_for_close = Rc::downgrade(&state);
+        let weak_state_for_close = Arc::downgrade(&state);
         window.set_callback(move |w| {
             if let Some(state) = weak_state_for_close.upgrade() {
                 if !MainWindow::confirm_save_for_all_dirty_tabs(&state) {

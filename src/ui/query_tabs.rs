@@ -8,7 +8,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::ui::constants::TAB_HEADER_HEIGHT;
 use crate::ui::theme;
@@ -19,9 +19,9 @@ type TabSelectCallback = Box<dyn FnMut(QueryTabId)>;
 #[derive(Clone)]
 pub struct QueryTabsWidget {
     tabs: Tabs,
-    entries: Rc<Mutex<Vec<TabEntry>>>,
-    next_id: Rc<Mutex<QueryTabId>>,
-    on_select: Rc<Mutex<Option<TabSelectCallback>>>,
+    entries: Arc<Mutex<Vec<TabEntry>>>,
+    next_id: Arc<Mutex<QueryTabId>>,
+    on_select: Arc<Mutex<Option<TabSelectCallback>>>,
     suppress_select_callback_depth: Rc<Cell<u32>>,
 }
 
@@ -60,7 +60,7 @@ impl QueryTabsWidget {
     }
 
     fn invoke_on_select_callback(
-        callback_slot: &Rc<Mutex<Option<TabSelectCallback>>>,
+        callback_slot: &Arc<Mutex<Option<TabSelectCallback>>>,
         tab_id: QueryTabId,
     ) {
         let callback = {
@@ -141,9 +141,9 @@ impl QueryTabsWidget {
             false
         });
 
-        let entries = Rc::new(Mutex::new(Vec::<TabEntry>::new()));
-        let next_id = Rc::new(Mutex::new(1u64));
-        let on_select = Rc::new(Mutex::new(None::<TabSelectCallback>));
+        let entries = Arc::new(Mutex::new(Vec::<TabEntry>::new()));
+        let next_id = Arc::new(Mutex::new(1u64));
+        let on_select = Arc::new(Mutex::new(None::<TabSelectCallback>));
         let suppress_select_callback_depth = Rc::new(Cell::new(0u32));
 
         let entries_for_cb = entries.clone();

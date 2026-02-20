@@ -11,7 +11,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -243,7 +243,7 @@ impl SqlEditorWidget {
         app::awake();
     }
 
-    fn invoke_void_callback(callback_slot: &Rc<Mutex<Option<Box<dyn FnMut()>>>>) -> bool {
+    fn invoke_void_callback(callback_slot: &Arc<Mutex<Option<Box<dyn FnMut()>>>>) -> bool {
         let callback = {
             let mut slot = match callback_slot.lock() {
                 Ok(guard) => guard,
@@ -277,7 +277,7 @@ impl SqlEditorWidget {
     }
 
     fn invoke_file_drop_callback(
-        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
         path: PathBuf,
     ) -> bool {
         let callback = {
@@ -317,7 +317,7 @@ impl SqlEditorWidget {
     }
 
     fn cancel_keyup_debounce_timeout(
-        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) {
         if let Some(handle) = Self::take_keyup_debounce_timeout_handle(keyup_debounce_handle) {
             if app::has_timeout3(handle) {
@@ -327,14 +327,14 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn take_keyup_debounce_timeout_handle(
-        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> Option<app::TimeoutHandle> {
         keyup_debounce_handle.lock().unwrap().take()
     }
 
     pub(crate) fn invalidate_keyup_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
-        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> u64 {
         Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
         let generation = keyup_debounce_generation.get().wrapping_add(1);
@@ -345,18 +345,18 @@ impl SqlEditorWidget {
     #[allow(clippy::too_many_arguments)]
     fn schedule_keyup_intellisense_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
-        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
         scheduled_cursor_raw: i32,
         buffer_len: i32,
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_data: &Rc<Mutex<IntellisenseData>>,
-        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
-        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
-        pending_intellisense: &Rc<Mutex<Option<PendingIntellisense>>>,
-        intellisense_parse_cache: &Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let generation =
             Self::invalidate_keyup_debounce(keyup_debounce_generation, keyup_debounce_handle);
@@ -431,11 +431,11 @@ impl SqlEditorWidget {
         let column_sender = self.column_sender.clone();
         let highlighter = self.highlighter.clone();
         let style_buffer = self.style_buffer.clone();
-        let suppress_enter = Rc::new(Mutex::new(false));
-        let suppress_nav = Rc::new(Mutex::new(false));
-        let nav_anchor = Rc::new(Mutex::new(None::<i32>));
+        let suppress_enter = Arc::new(Mutex::new(false));
+        let suppress_nav = Arc::new(Mutex::new(false));
+        let nav_anchor = Arc::new(Mutex::new(None::<i32>));
         let completion_range = self.completion_range.clone();
-        let ctrl_enter_handled = Rc::new(Mutex::new(false));
+        let ctrl_enter_handled = Arc::new(Mutex::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let keyup_debounce_generation = self.keyup_debounce_generation.clone();
@@ -519,7 +519,7 @@ impl SqlEditorWidget {
         let intellisense_parse_cache_for_handle = intellisense_parse_cache.clone();
         let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
         let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
-        let dnd_file_drop_pending_for_handle = Rc::new(Mutex::new(false));
+        let dnd_file_drop_pending_for_handle = Arc::new(Mutex::new(false));
 
         editor.handle(move |ed, ev| {
             match ev {
@@ -1262,13 +1262,13 @@ impl SqlEditorWidget {
     pub fn trigger_intellisense(
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_data: &Rc<Mutex<IntellisenseData>>,
-        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
-        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
-        pending_intellisense: &Rc<Mutex<Option<PendingIntellisense>>>,
-        intellisense_parse_cache: &Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let cursor_pos = Self::raw_cursor_position(buffer, editor.insert_position());
         let cursor_pos_usize = cursor_pos as usize;
@@ -1508,7 +1508,7 @@ impl SqlEditorWidget {
     fn expand_virtual_table_wildcards(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
-        intellisense_data: &Rc<Mutex<IntellisenseData>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) -> (Vec<String>, Vec<String>) {
@@ -1655,7 +1655,7 @@ impl SqlEditorWidget {
 
     fn maybe_prefetch_columns_for_word(
         word: &str,
-        intellisense_data: &Rc<Mutex<IntellisenseData>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
@@ -1675,7 +1675,7 @@ impl SqlEditorWidget {
 
     fn request_table_columns(
         table_name: &str,
-        intellisense_data: &Rc<Mutex<IntellisenseData>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
@@ -2519,8 +2519,8 @@ impl SqlEditorWidget {
     fn try_fast_path_intellisense_filter(
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
-        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
         cursor_pos: i32,
         key: Key,
         typed_char: Option<char>,
@@ -2877,7 +2877,7 @@ impl SqlEditorWidget {
         *self.intellisense_data.lock().unwrap() = data;
     }
 
-    pub fn get_intellisense_data(&self) -> Rc<Mutex<IntellisenseData>> {
+    pub fn get_intellisense_data(&self) -> Arc<Mutex<IntellisenseData>> {
         self.intellisense_data.clone()
     }
     pub fn show_intellisense(&self) {
@@ -3556,7 +3556,7 @@ FROM d
 
     #[test]
     fn request_table_columns_releases_loading_when_connection_busy() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["EMP".to_string()];
@@ -3579,7 +3579,7 @@ FROM d
 
     #[test]
     fn request_table_columns_handles_quoted_schema_and_table_names() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["SCHEMA.TABLE.NAME".to_string()];
@@ -3605,7 +3605,7 @@ FROM d
     }
     #[test]
     fn request_table_columns_keeps_exact_dotted_relation_name() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["A.B".to_string()];
@@ -3627,7 +3627,7 @@ FROM d
 
     #[test]
     fn request_table_columns_falls_back_to_unqualified_name() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["EMP".to_string()];
@@ -3677,7 +3677,7 @@ FROM d
 
     #[test]
     fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["B".to_string()];
@@ -3710,7 +3710,7 @@ FROM d
 
     #[test]
     fn expand_virtual_table_wildcards_uses_loaded_base_table_columns() {
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         {
             let mut guard = lock_or_recover(&data);
             guard.tables = vec!["HELP".to_string()];
@@ -3870,7 +3870,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             "qualifier should resolve to filtered CTE alias"
         );
 
-        let data = Rc::new(Mutex::new(IntellisenseData::new()));
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
         let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let connection = create_shared_connection();
 
@@ -3981,10 +3981,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_void_callback_restores_slot_even_when_callback_panics() {
-        let calls = Rc::new(Mutex::new(0usize));
+        let calls = Arc::new(Mutex::new(0usize));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> =
-            Rc::new(Mutex::new(Some(Box::new(move || {
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut()>>>> =
+            Arc::new(Mutex::new(Some(Box::new(move || {
                 *lock_or_recover(&calls_for_cb) += 1;
                 panic!("expected callback panic");
             }))));
@@ -3998,10 +3998,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_void_callback_can_run_again_after_panic() {
-        let calls = Rc::new(Mutex::new(0usize));
+        let calls = Arc::new(Mutex::new(0usize));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> =
-            Rc::new(Mutex::new(Some(Box::new(move || {
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut()>>>> =
+            Arc::new(Mutex::new(Some(Box::new(move || {
                 let mut count = lock_or_recover(&calls_for_cb);
                 *count += 1;
                 if *count == 1 {
@@ -4021,7 +4021,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_void_callback_returns_false_when_slot_is_empty() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
 
         let invoked = SqlEditorWidget::invoke_void_callback(&callback_slot);
 
@@ -4031,8 +4031,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_void_callback_keeps_replaced_callback_when_original_panics() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
-        let replacement_ran = Rc::new(Mutex::new(false));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
+        let replacement_ran = Arc::new(Mutex::new(false));
         let replacement_ran_for_cb = replacement_ran.clone();
         let callback_slot_for_cb = callback_slot.clone();
 
@@ -4055,10 +4055,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
-        let calls = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let calls = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
                 lock_or_recover(&calls_for_cb).push(path);
                 panic!("expected callback panic");
             }))));
@@ -4074,10 +4074,10 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_file_drop_callback_can_run_again_after_panic() {
-        let calls = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let calls = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
                 let mut events = lock_or_recover(&calls_for_cb);
                 let should_panic = events.is_empty();
                 events.push(path);
@@ -4106,7 +4106,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_file_drop_callback_returns_false_when_slot_is_empty() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Rc::new(Mutex::new(None));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Arc::new(Mutex::new(None));
         let path = PathBuf::from("/tmp/ignored.sql");
 
         let invoked = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, path);
@@ -4117,8 +4117,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_file_drop_callback_keeps_replaced_callback_when_original_panics() {
-        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Rc::new(Mutex::new(None));
-        let captured_paths = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let callback_slot: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Arc::new(Mutex::new(None));
+        let captured_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
         let captured_paths_for_cb = captured_paths.clone();
         let callback_slot_for_cb = callback_slot.clone();
 
