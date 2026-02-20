@@ -705,7 +705,7 @@ impl SqlEditorWidget {
                             return true;
                         }
 
-                        match key {
+                        match shortcut_key {
                             k if Self::matches_alpha_shortcut(k, 'z') => {
                                 widget_for_shortcuts.undo();
                                 return true;
