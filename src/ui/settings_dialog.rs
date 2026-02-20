@@ -9,7 +9,6 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants::*;
@@ -318,7 +317,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     dialog.show();
     fltk::group::Group::set_current(current_group.as_ref());
 
-    let all_fonts = Rc::new(font_names);
+    let all_fonts = Arc::new(font_names);
     let selected_font = Arc::new(Mutex::new(current_font));
     let filtered_fonts = Arc::new(Mutex::new(Vec::<String>::new()));
 

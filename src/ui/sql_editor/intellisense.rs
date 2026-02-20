@@ -5,14 +5,12 @@ use fltk::{
     prelude::*,
     text::{PositionType, TextBuffer, TextEditor},
 };
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::{mpsc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -333,18 +331,19 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn invalidate_keyup_debounce(
-        keyup_debounce_generation: &Rc<Cell<u64>>,
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> u64 {
         Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
-        let generation = keyup_debounce_generation.get().wrapping_add(1);
-        keyup_debounce_generation.set(generation);
+        let mut generation_guard = keyup_debounce_generation.lock().unwrap();
+        let generation = (*generation_guard).wrapping_add(1);
+        *generation_guard = generation;
         generation
     }
 
     #[allow(clippy::too_many_arguments)]
     fn schedule_keyup_intellisense_debounce(
-        keyup_debounce_generation: &Rc<Cell<u64>>,
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
         scheduled_cursor_raw: i32,
         buffer_len: i32,
@@ -381,7 +380,7 @@ impl SqlEditorWidget {
                     }
                 }
 
-                if keyup_debounce_generation_for_timeout.get() != generation {
+                if *keyup_debounce_generation_for_timeout.lock().unwrap() != generation {
                     return;
                 }
 

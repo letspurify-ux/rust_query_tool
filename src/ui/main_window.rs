@@ -13,11 +13,9 @@ use fltk::{
     widget::Widget,
     window::Window,
 };
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -77,7 +75,7 @@ pub struct AppState {
     pub popups: Arc<Mutex<Vec<Window>>>,
     pub window: Window,
     pub right_tile: Tile,
-    pub query_split_adjusted: Rc<Cell<bool>>,
+    pub query_split_adjusted: Arc<Mutex<bool>>,
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
     pub config: Arc<Mutex<AppConfig>>,
     pub last_fetch_status_update: Instant,
@@ -728,7 +726,7 @@ impl MainWindow {
         let mut right_flex = Flex::default();
         right_flex.set_type(FlexType::Column);
 
-        let query_split_adjusted = Rc::new(Cell::new(false));
+        let query_split_adjusted = Arc::new(Mutex::new(false));
         let mut right_tile = Tile::new(0, 0, 900, 600, None);
         right_tile.set_frame(FrameType::FlatBox);
         right_tile.set_color(theme::panel_bg());
@@ -847,7 +845,7 @@ impl MainWindow {
         let query_split_adjusted_for_tile = query_split_adjusted.clone();
         let mut query_top_group_for_tile = query_top_group.clone();
         let mut query_split_bar_for_tile = query_split_bar.clone();
-        let split_drag_active = Rc::new(Cell::new(false));
+        let split_drag_active = Arc::new(Mutex::new(false));
         let split_drag_active_for_tile = split_drag_active.clone();
         right_tile.handle(move |tile, ev| {
             const SPLIT_GRAB_MARGIN: i32 = 6;
@@ -859,16 +857,16 @@ impl MainWindow {
                         let near_split = (app::event_y() >= split_top - SPLIT_GRAB_MARGIN)
                             && (app::event_y() <= split_bottom + SPLIT_GRAB_MARGIN);
                         if near_split {
-                            split_drag_active_for_tile.set(true);
-                            query_split_adjusted_for_tile.set(true);
+                            *split_drag_active_for_tile.lock().unwrap() = true;
+                            *query_split_adjusted_for_tile.lock().unwrap() = true;
                             return true;
                         }
                     }
                     false
                 }
                 fltk::enums::Event::Drag => {
-                    if split_drag_active_for_tile.get() {
-                        query_split_adjusted_for_tile.set(true);
+                    if *split_drag_active_for_tile.lock().unwrap() {
+                        *query_split_adjusted_for_tile.lock().unwrap() = true;
                         let right_height = tile.h();
                         if right_height > 0 {
                             let max_query_height =
@@ -894,7 +892,7 @@ impl MainWindow {
                     false
                 }
                 fltk::enums::Event::Released => {
-                    if split_drag_active_for_tile.replace(false) {
+                    if std::mem::replace(&mut *split_drag_active_for_tile.lock().unwrap(), false) {
                         MainWindow::clamp_query_split_with(
                             tile,
                             &mut query_top_group_for_tile,
@@ -1163,7 +1161,7 @@ impl MainWindow {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
-        if state.query_split_adjusted.get() {
+        if *state.query_split_adjusted.lock().unwrap() {
             Self::clamp_query_split_with(
                 &mut right_tile,
                 &mut query_top_group,
@@ -1341,7 +1339,7 @@ impl MainWindow {
         let mut right_tile = state.right_tile.clone();
         let mut query_top_group = state.query_top_group.clone();
         let mut query_split_bar = state.query_split_bar.clone();
-        if state.query_split_adjusted.get() {
+        if *state.query_split_adjusted.lock().unwrap() {
             Self::clamp_query_split_with(
                 &mut right_tile,
                 &mut query_top_group,

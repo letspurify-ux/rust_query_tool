@@ -1,6 +1,6 @@
 # AGENTS.md — SPACE Query 에이전트 작업 표준
 
-> 최종 업데이트: 2026-02-20  
+> 최종 업데이트: 2026-02-21  
 > 적용 범위: 이 파일이 위치한 디렉터리(저장소 루트) 전체
 
 이 문서는 SPACE Query 저장소에서 작업하는 에이전트의 **실행 기준**입니다.  
@@ -90,8 +90,8 @@ src/
 
 ### 4.2 콜백/상태 공유
 
-- 기본 패턴은 `Rc<RefCell<T>>`
-- 중첩 borrow는 짧게 유지하고 지역 변수로 분리
+- `RefCell`은 사용하지 않는다. 상태 공유는 **항상 `Arc<Mutex<T>>`** 패턴으로 통일한다. 이 규칙은 워커 스레드/메인 스레드 경계에서 데이터 레이스와 수명주기 이슈를 줄이기 위해 필요하다.
+- 중첩 lock 구간은 짧게 유지하고 지역 변수로 분리
 - 콜백 캡처가 위젯 수명주기를 넘지 않도록 close 시 정리
 
 ### 4.3 위젯 생성/레이아웃
@@ -116,7 +116,7 @@ src/
 ### 4.6 Window 수명/해제 (메모리 누수 방지)
 
 - `Window::default()`로 만든 top-level 다이얼로그/팝업은 `hide()`만으로 끝내지 말고, 종료 루프(`while dialog.shown()`) 이후 `Window::delete(dialog)`까지 호출한다.
-- 팝업 레지스트리(`Rc<RefCell<Vec<Window>>>`)를 쓰는 경우, 먼저 `retain(...)`으로 레지스트리에서 제거한 뒤 `Window::delete(...)`를 호출한다.
+- 팝업 레지스트리(`Arc<Mutex<Vec<Window>>>`)를 쓰는 경우, 먼저 `retain(...)`으로 레지스트리에서 제거한 뒤 `Window::delete(...)`를 호출한다.
 - 탭/에디터 종료 시 재사용하지 않는 popup window(예: intellisense)는 콜백/데이터 슬롯 정리 후 명시 삭제한다.
 - 삭제 전에는 필요 시 `was_deleted()`로 중복 삭제를 방지한다.
 - `MenuButton::new(...)` 등 부모 없는 임시 위젯을 만들었으면 같은 스코프에서 반드시 `MenuButton::delete(...)`/`Widget::delete(...)`를 보장한다.
