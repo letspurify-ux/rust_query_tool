@@ -1,4 +1,5 @@
 use std::fs;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
@@ -139,17 +140,27 @@ fn find_banned_patterns(content: &str) -> Vec<&'static str> {
         .collect()
 }
 
+fn is_test_source_file(path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if matches!(file_name, Some("tests.rs")) {
+        return true;
+    }
+
+    if file_name.is_some_and(|name| name.ends_with("_tests.rs")) {
+        return true;
+    }
+
+    path.components()
+        .any(|component| component.as_os_str() == OsStr::new("tests"))
+}
+
 #[test]
 fn non_test_source_does_not_use_panic_prone_calls() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
 
     for file in collect_rust_files(&src_root) {
-        let path_str = file.to_string_lossy();
-        if path_str.ends_with("/tests.rs")
-            || path_str.contains("/tests/")
-            || path_str.ends_with("_tests.rs")
-        {
+        if is_test_source_file(&file) {
             continue;
         }
 
