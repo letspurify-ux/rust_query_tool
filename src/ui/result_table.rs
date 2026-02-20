@@ -10,8 +10,9 @@ use fltk::{
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::db::QueryResult;
@@ -67,20 +68,20 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 #[derive(Clone)]
 pub struct ResultTableWidget {
     table: Table,
-    headers: Rc<RefCell<Vec<String>>>,
+    headers: Rc<Mutex<Vec<String>>>,
     /// Buffer for pending rows during streaming
-    pending_rows: Rc<RefCell<Vec<Vec<String>>>>,
+    pending_rows: Rc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
-    pending_widths: Rc<RefCell<Vec<i32>>>,
+    pending_widths: Rc<Mutex<Vec<i32>>>,
     /// Last UI update time
-    last_flush: Rc<RefCell<Instant>>,
+    last_flush: Rc<Mutex<Instant>>,
     /// The sole data store: full original data (non-truncated).
     /// draw_cell reads from here on demand — no data duplication.
-    full_data: Rc<RefCell<Vec<Vec<String>>>>,
+    full_data: Rc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
     max_cell_display_chars: Rc<Cell<usize>>,
     /// How many rows have been sampled for column width calculation
-    width_sampled_rows: Rc<RefCell<usize>>,
+    width_sampled_rows: Rc<Mutex<usize>>,
     font_profile: Rc<Cell<FontProfile>>,
     font_size: Rc<Cell<u32>>,
 }
@@ -275,7 +276,7 @@ impl ResultTableWidget {
     }
 
     fn recalculate_widths_for_current_font(&mut self) {
-        let headers = self.headers.borrow().clone();
+        let headers = self.headers.lock().unwrap().clone();
         if headers.is_empty() {
             return;
         }
@@ -289,7 +290,7 @@ impl ResultTableWidget {
 
         let mut sampled = 0usize;
         {
-            let full_data = self.full_data.borrow();
+            let full_data = self.full_data.lock().unwrap();
             for row in full_data.iter().take(WIDTH_SAMPLE_ROWS) {
                 Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
                 sampled += 1;
@@ -297,14 +298,14 @@ impl ResultTableWidget {
         }
 
         if sampled < WIDTH_SAMPLE_ROWS {
-            let pending = self.pending_rows.borrow();
+            let pending = self.pending_rows.lock().unwrap();
             let remaining = WIDTH_SAMPLE_ROWS - sampled;
             for row in pending.iter().take(remaining) {
                 Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
             }
         }
 
-        *self.pending_widths.borrow_mut() = widths.clone();
+        *self.pending_widths.lock().unwrap() = widths.clone();
         self.apply_widths_to_table(&widths);
     }
 
@@ -313,8 +314,8 @@ impl ResultTableWidget {
     }
 
     pub fn with_size(x: i32, y: i32, w: i32, h: i32) -> Self {
-        let headers: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let full_data: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let headers: Rc<Mutex<Vec<String>>> = Rc::new(Mutex::new(Vec::new()));
+        let full_data: Rc<Mutex<Vec<Vec<String>>>> = Rc::new(Mutex::new(Vec::new()));
         let font_profile = Rc::new(Cell::new(configured_editor_profile()));
         let font_size = Rc::new(Cell::new(DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars =
@@ -362,7 +363,7 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(font_profile.bold, font_size);
-                    if let Ok(hdrs) = headers_for_draw.try_borrow() {
+                    if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
                                 text,
@@ -397,7 +398,7 @@ impl ResultTableWidget {
                     draw::set_draw_color(cell_fg);
                     draw::set_font(font_profile.normal, font_size);
 
-                    if let Ok(data) = full_data_for_draw.try_borrow() {
+                    if let Ok(data) = full_data_for_draw.try_lock() {
                         if let Some(row_data) = data.get(row as usize) {
                             if let Some(cell_val) = row_data.get(col as usize) {
                                 let max_chars = max_cell_display_chars_for_draw.get();
@@ -448,7 +449,7 @@ impl ResultTableWidget {
 
         // Setup event handler for mouse selection and keyboard shortcuts
         let headers_for_handle = headers.clone();
-        let drag_state_for_handle = Rc::new(RefCell::new(DragState::default()));
+        let drag_state_for_handle = Rc::new(Mutex::new(DragState::default()));
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
@@ -478,7 +479,7 @@ impl ResultTableWidget {
                                 // borrow across app::wait() would panic if flush_pending
                                 // tries to borrow_mut full_data during the nested loop.
                                 let cell_val_owned =
-                                    full_data_for_handle.try_borrow().ok().and_then(|data| {
+                                    full_data_for_handle.try_lock().ok().and_then(|data| {
                                         data.get(row as usize)
                                             .and_then(|r| r.get(col as usize))
                                             .cloned()
@@ -492,7 +493,7 @@ impl ResultTableWidget {
                                     return true;
                                 }
                             }
-                            let mut state = drag_state_for_handle.borrow_mut();
+                            let mut state = drag_state_for_handle.lock().unwrap();
                             state.is_dragging = true;
                             state.start_row = row;
                             state.start_col = col;
@@ -504,12 +505,12 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
-                    let is_dragging = drag_state_for_handle.borrow().is_dragging;
+                    let is_dragging = drag_state_for_handle.lock().unwrap().is_dragging;
                     if is_dragging {
                         if let Some((row, col)) =
                             Self::get_cell_at_mouse_for_drag(&table_for_handle)
                         {
-                            let state = drag_state_for_handle.borrow();
+                            let state = drag_state_for_handle.lock().unwrap();
                             let r1 = state.start_row.min(row);
                             let r2 = state.start_row.max(row);
                             let c1 = state.start_col.min(col);
@@ -523,7 +524,7 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Released => {
-                    let mut state = drag_state_for_handle.borrow_mut();
+                    let mut state = drag_state_for_handle.lock().unwrap();
                     if state.is_dragging {
                         state.is_dragging = false;
                         return true;
@@ -613,12 +614,12 @@ impl ResultTableWidget {
         Self {
             table,
             headers,
-            pending_rows: Rc::new(RefCell::new(Vec::new())),
-            pending_widths: Rc::new(RefCell::new(Vec::new())),
-            last_flush: Rc::new(RefCell::new(Instant::now())),
+            pending_rows: Rc::new(Mutex::new(Vec::new())),
+            pending_widths: Rc::new(Mutex::new(Vec::new())),
+            last_flush: Rc::new(Mutex::new(Instant::now())),
             full_data,
             max_cell_display_chars,
-            width_sampled_rows: Rc::new(RefCell::new(0)),
+            width_sampled_rows: Rc::new(Mutex::new(0)),
             font_profile,
             font_size,
         }
@@ -776,8 +777,8 @@ impl ResultTableWidget {
 
     fn show_context_menu(
         table: &Table,
-        headers: &Rc<RefCell<Vec<String>>>,
-        full_data: &Rc<RefCell<Vec<Vec<String>>>>,
+        headers: &Rc<Mutex<Vec<String>>>,
+        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -826,8 +827,8 @@ impl ResultTableWidget {
 
     fn copy_selected_to_clipboard(
         table: &Table,
-        _headers: &Rc<RefCell<Vec<String>>>,
-        full_data: &Rc<RefCell<Vec<Vec<String>>>>,
+        _headers: &Rc<Mutex<Vec<String>>>,
+        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
         let (row_top, col_left, row_bot, col_right) = table.get_selection();
         if row_top < 0 || col_left < 0 {
@@ -838,7 +839,7 @@ impl ResultTableWidget {
         let cols = (col_right - col_left + 1) as usize;
         let cell_count = rows * cols;
 
-        let full_data = full_data.borrow();
+        let full_data = full_data.lock().unwrap();
         let mut result = String::with_capacity(rows * cols * 16);
         for row in row_top..=row_bot {
             if row > row_top {
@@ -867,8 +868,8 @@ impl ResultTableWidget {
 
     fn copy_selected_with_headers(
         table: &Table,
-        headers: &Rc<RefCell<Vec<String>>>,
-        full_data: &Rc<RefCell<Vec<Vec<String>>>>,
+        headers: &Rc<Mutex<Vec<String>>>,
+        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
         let (row_top, col_left, row_bot, col_right) = table.get_selection();
         if row_top < 0 || col_left < 0 {
@@ -879,8 +880,8 @@ impl ResultTableWidget {
         let cols = (col_right - col_left + 1) as usize;
         let cell_count = rows * cols;
 
-        let headers = headers.borrow();
-        let full_data = full_data.borrow();
+        let headers = headers.lock().unwrap();
+        let full_data = full_data.lock().unwrap();
         let mut result = String::with_capacity((rows + 1) * cols * 16);
 
         // Add headers
@@ -919,11 +920,11 @@ impl ResultTableWidget {
     }
 
     fn copy_all_to_clipboard(
-        headers: &Rc<RefCell<Vec<String>>>,
-        full_data: &Rc<RefCell<Vec<Vec<String>>>>,
+        headers: &Rc<Mutex<Vec<String>>>,
+        full_data: &Rc<Mutex<Vec<Vec<String>>>>,
     ) {
-        let headers = headers.borrow();
-        let full_data = full_data.borrow();
+        let headers = headers.lock().unwrap();
+        let full_data = full_data.lock().unwrap();
         let row_count = full_data.len();
         let col_count = headers.len();
         let mut result = String::with_capacity((row_count + 1) * col_count * 16);
@@ -960,8 +961,8 @@ impl ResultTableWidget {
                     .max(200)
                     .min(1200);
             self.table.set_col_width(0, message_width);
-            *self.headers.borrow_mut() = vec!["Result".to_string()];
-            *self.full_data.borrow_mut() = vec![vec![result.message.clone()]];
+            *self.headers.lock().unwrap() = vec!["Result".to_string()];
+            *self.full_data.lock().unwrap() = vec![vec![result.message.clone()]];
             self.table.redraw();
             return;
         }
@@ -973,7 +974,7 @@ impl ResultTableWidget {
                 self.table.set_cols(col_count);
             }
             self.apply_table_metrics_for_current_font();
-            *self.headers.borrow_mut() = col_names;
+            *self.headers.lock().unwrap() = col_names;
             self.table.redraw();
             return;
         }
@@ -996,12 +997,12 @@ impl ResultTableWidget {
             max_cell_display_chars,
         );
         self.apply_widths_to_table(&widths);
-        *self.pending_widths.borrow_mut() = widths;
+        *self.pending_widths.lock().unwrap() = widths;
 
         // Store data directly — draw_cell reads from full_data on demand.
         // No per-cell set_cell_value calls needed!
-        *self.full_data.borrow_mut() = result.rows.clone();
-        *self.headers.borrow_mut() = col_names;
+        *self.full_data.lock().unwrap() = result.rows.clone();
+        *self.headers.lock().unwrap() = col_names;
         self.table.redraw();
     }
 
@@ -1009,11 +1010,11 @@ impl ResultTableWidget {
         let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
-        self.pending_rows.borrow_mut().clear();
-        self.pending_widths.borrow_mut().clear();
-        self.full_data.borrow_mut().clear();
-        *self.last_flush.borrow_mut() = Instant::now();
-        *self.width_sampled_rows.borrow_mut() = 0;
+        self.pending_rows.lock().unwrap().clear();
+        self.pending_widths.lock().unwrap().clear();
+        self.full_data.lock().unwrap().clear();
+        *self.last_flush.lock().unwrap() = Instant::now();
+        *self.width_sampled_rows.lock().unwrap() = 0;
 
         // Initialize pending widths based on headers
         let font_size = self.font_size.get();
@@ -1021,7 +1022,7 @@ impl ResultTableWidget {
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
             .collect();
-        *self.pending_widths.borrow_mut() = initial_widths.clone();
+        *self.pending_widths.lock().unwrap() = initial_widths.clone();
 
         self.table.set_rows(0);
         self.table.set_cols(col_count);
@@ -1031,17 +1032,17 @@ impl ResultTableWidget {
             self.table.set_col_width(i as i32, initial_widths[i]);
         }
 
-        *self.headers.borrow_mut() = headers.to_vec();
+        *self.headers.lock().unwrap() = headers.to_vec();
         self.table.redraw();
     }
 
     /// Append rows to the buffer. UI is updated periodically for performance.
     pub fn append_rows(&mut self, rows: Vec<Vec<String>>) {
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
-        let sampled = *self.width_sampled_rows.borrow();
+        let sampled = *self.width_sampled_rows.lock().unwrap();
         if sampled < WIDTH_SAMPLE_ROWS {
             let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
-            let mut widths = self.pending_widths.borrow_mut();
+            let mut widths = self.pending_widths.lock().unwrap();
             let min_width = Self::min_col_width_for_font(self.font_size.get());
             let max_cell_display_chars = self.max_cell_display_chars.get();
             if widths.len() < max_cols {
@@ -1058,16 +1059,16 @@ impl ResultTableWidget {
                 );
             }
             drop(widths);
-            *self.width_sampled_rows.borrow_mut() = sampled + sample_count;
+            *self.width_sampled_rows.lock().unwrap() = sampled + sample_count;
         }
 
         // Add rows to pending buffer
-        self.pending_rows.borrow_mut().extend(rows);
+        self.pending_rows.lock().unwrap().extend(rows);
 
         // Check if we should flush to UI
         let should_flush = {
-            let elapsed = self.last_flush.borrow().elapsed();
-            let buffered_count = self.pending_rows.borrow().len();
+            let elapsed = self.last_flush.lock().unwrap().elapsed();
+            let buffered_count = self.pending_rows.lock().unwrap().len();
             elapsed >= UI_UPDATE_INTERVAL || buffered_count >= MAX_BUFFERED_ROWS
         };
 
@@ -1080,7 +1081,7 @@ impl ResultTableWidget {
     /// Data is moved (not cloned) from pending_rows into full_data.
     /// Only the table row count is updated — draw_cell handles rendering on demand.
     pub fn flush_pending(&mut self) {
-        let rows_to_add: Vec<Vec<String>> = self.pending_rows.borrow_mut().drain(..).collect();
+        let rows_to_add: Vec<Vec<String>> = self.pending_rows.lock().unwrap().drain(..).collect();
         if rows_to_add.is_empty() {
             return;
         }
@@ -1091,7 +1092,7 @@ impl ResultTableWidget {
 
         // Update column widths
         {
-            let widths = self.pending_widths.borrow();
+            let widths = self.pending_widths.lock().unwrap();
             let max_cols = widths.len().max(self.table.cols() as usize);
             if max_cols as i32 > self.table.cols() {
                 self.table.set_cols(max_cols as i32);
@@ -1107,13 +1108,13 @@ impl ResultTableWidget {
         }
 
         // Move data into full_data — zero-copy, no clone!
-        self.full_data.borrow_mut().extend(rows_to_add);
+        self.full_data.lock().unwrap().extend(rows_to_add);
 
         // Just update row count — draw_cell reads from full_data on demand
         self.table.set_rows(new_total);
         self.apply_table_metrics_for_current_font();
 
-        *self.last_flush.borrow_mut() = Instant::now();
+        *self.last_flush.lock().unwrap() = Instant::now();
         self.table.redraw();
     }
 
@@ -1128,27 +1129,27 @@ impl ResultTableWidget {
         self.table.set_rows(0);
         self.table.set_cols(0);
         {
-            let mut headers = self.headers.borrow_mut();
+            let mut headers = self.headers.lock().unwrap();
             headers.clear();
             headers.shrink_to_fit();
         }
         {
-            let mut pending_rows = self.pending_rows.borrow_mut();
+            let mut pending_rows = self.pending_rows.lock().unwrap();
             pending_rows.clear();
             pending_rows.shrink_to_fit();
         }
         {
-            let mut pending_widths = self.pending_widths.borrow_mut();
+            let mut pending_widths = self.pending_widths.lock().unwrap();
             pending_widths.clear();
             pending_widths.shrink_to_fit();
         }
         {
-            let mut full_data = self.full_data.borrow_mut();
+            let mut full_data = self.full_data.lock().unwrap();
             full_data.clear();
             full_data.shrink_to_fit();
         }
-        *self.width_sampled_rows.borrow_mut() = 0;
-        *self.last_flush.borrow_mut() = Instant::now();
+        *self.width_sampled_rows.lock().unwrap() = 0;
+        *self.last_flush.lock().unwrap() = Instant::now();
         self.table.redraw();
     }
 
@@ -1183,7 +1184,7 @@ impl ResultTableWidget {
             return None;
         }
 
-        let full_data = self.full_data.borrow();
+        let full_data = self.full_data.lock().unwrap();
         let rows = (row_bot - row_top + 1) as usize;
         let cols = (col_right - col_left + 1) as usize;
         let mut result = String::with_capacity(rows * cols * 16);
@@ -1213,8 +1214,8 @@ impl ResultTableWidget {
 
     /// Export all data to CSV format
     pub fn export_to_csv(&self) -> String {
-        let headers = self.headers.borrow();
-        let full_data = self.full_data.borrow();
+        let headers = self.headers.lock().unwrap();
+        let full_data = self.full_data.lock().unwrap();
         let row_count = full_data.len();
         let col_count = headers.len();
         let mut csv = String::with_capacity((row_count + 1) * col_count * 20);
@@ -1283,7 +1284,7 @@ impl ResultTableWidget {
 
     /// Cleanup method to release resources before the widget is deleted.
     pub fn cleanup(&mut self) {
-        // Clear the event handler callback to release captured Rc<RefCell<T>> references.
+        // Clear the event handler callback to release captured Rc<Mutex<T>> references.
         self.table.handle(|_, _| false);
 
         // Set an empty draw_cell to release captured Rc references
@@ -1296,22 +1297,22 @@ impl ResultTableWidget {
 
         // Clear all data buffers to release memory
         {
-            let mut headers = self.headers.borrow_mut();
+            let mut headers = self.headers.lock().unwrap();
             headers.clear();
             headers.shrink_to_fit();
         }
         {
-            let mut pending_rows = self.pending_rows.borrow_mut();
+            let mut pending_rows = self.pending_rows.lock().unwrap();
             pending_rows.clear();
             pending_rows.shrink_to_fit();
         }
         {
-            let mut pending_widths = self.pending_widths.borrow_mut();
+            let mut pending_widths = self.pending_widths.lock().unwrap();
             pending_widths.clear();
             pending_widths.shrink_to_fit();
         }
         {
-            let mut full_data = self.full_data.borrow_mut();
+            let mut full_data = self.full_data.lock().unwrap();
             full_data.clear();
             full_data.shrink_to_fit();
         }

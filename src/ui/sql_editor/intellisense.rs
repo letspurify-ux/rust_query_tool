@@ -5,12 +5,13 @@ use fltk::{
     prelude::*,
     text::{PositionType, TextBuffer, TextEditor},
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -242,15 +243,27 @@ impl SqlEditorWidget {
         app::awake();
     }
 
-    fn invoke_void_callback(callback_slot: &Rc<RefCell<Option<Box<dyn FnMut()>>>>) -> bool {
+    fn invoke_void_callback(callback_slot: &Rc<Mutex<Option<Box<dyn FnMut()>>>>) -> bool {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = match callback_slot.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
+                    poisoned.into_inner()
+                }
+            };
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let result = panic::catch_unwind(AssertUnwindSafe(|| cb()));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = match callback_slot.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
+                    poisoned.into_inner()
+                }
+            };
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -264,17 +277,29 @@ impl SqlEditorWidget {
     }
 
     fn invoke_file_drop_callback(
-        callback_slot: &Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>>,
+        callback_slot: &Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
         path: PathBuf,
     ) -> bool {
         let callback = {
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = match callback_slot.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
+                    poisoned.into_inner()
+                }
+            };
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let result = panic::catch_unwind(AssertUnwindSafe(|| cb(path)));
-            let mut slot = callback_slot.borrow_mut();
+            let mut slot = match callback_slot.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
+                    poisoned.into_inner()
+                }
+            };
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -292,7 +317,7 @@ impl SqlEditorWidget {
     }
 
     fn cancel_keyup_debounce_timeout(
-        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
     ) {
         if let Some(handle) = Self::take_keyup_debounce_timeout_handle(keyup_debounce_handle) {
             if app::has_timeout3(handle) {
@@ -302,14 +327,14 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn take_keyup_debounce_timeout_handle(
-        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> Option<app::TimeoutHandle> {
-        keyup_debounce_handle.borrow_mut().take()
+        keyup_debounce_handle.lock().unwrap().take()
     }
 
     pub(crate) fn invalidate_keyup_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
-        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> u64 {
         Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
         let generation = keyup_debounce_generation.get().wrapping_add(1);
@@ -320,18 +345,18 @@ impl SqlEditorWidget {
     #[allow(clippy::too_many_arguments)]
     fn schedule_keyup_intellisense_debounce(
         keyup_debounce_generation: &Rc<Cell<u64>>,
-        keyup_debounce_handle: &Rc<RefCell<Option<app::TimeoutHandle>>>,
+        keyup_debounce_handle: &Rc<Mutex<Option<app::TimeoutHandle>>>,
         scheduled_cursor_raw: i32,
         buffer_len: i32,
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_data: &Rc<RefCell<IntellisenseData>>,
-        intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
-        completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
+        intellisense_data: &Rc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
+        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
-        pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
-        intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
+        pending_intellisense: &Rc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let generation =
             Self::invalidate_keyup_debounce(keyup_debounce_generation, keyup_debounce_handle);
@@ -350,7 +375,7 @@ impl SqlEditorWidget {
             Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
             move |timeout_handle| {
                 {
-                    let mut slot = keyup_debounce_handle_for_timeout.borrow_mut();
+                    let mut slot = keyup_debounce_handle_for_timeout.lock().unwrap();
                     if slot.as_ref().copied() == Some(timeout_handle) {
                         *slot = None;
                     }
@@ -390,7 +415,7 @@ impl SqlEditorWidget {
                 );
             },
         );
-        *keyup_debounce_handle.borrow_mut() = Some(handle);
+        *keyup_debounce_handle.lock().unwrap() = Some(handle);
     }
 
     fn is_same_raw_cursor_offset(current_raw: i32, scheduled_raw: i32) -> bool {
@@ -406,11 +431,11 @@ impl SqlEditorWidget {
         let column_sender = self.column_sender.clone();
         let highlighter = self.highlighter.clone();
         let style_buffer = self.style_buffer.clone();
-        let suppress_enter = Rc::new(RefCell::new(false));
-        let suppress_nav = Rc::new(RefCell::new(false));
-        let nav_anchor = Rc::new(RefCell::new(None::<i32>));
+        let suppress_enter = Rc::new(Mutex::new(false));
+        let suppress_nav = Rc::new(Mutex::new(false));
+        let nav_anchor = Rc::new(Mutex::new(None::<i32>));
         let completion_range = self.completion_range.clone();
-        let ctrl_enter_handled = Rc::new(RefCell::new(false));
+        let ctrl_enter_handled = Rc::new(Mutex::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let keyup_debounce_generation = self.keyup_debounce_generation.clone();
@@ -424,7 +449,7 @@ impl SqlEditorWidget {
         let column_sender_for_insert = column_sender.clone();
         let connection_for_insert = connection.clone();
         {
-            let mut popup = intellisense_popup.borrow_mut();
+            let mut popup = intellisense_popup.lock().unwrap();
             popup.set_selected_callback(move |selected| {
                 let cursor_pos = Self::raw_cursor_position(
                     &buffer_for_insert,
@@ -437,7 +462,7 @@ impl SqlEditorWidget {
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
                     let should_prefetch = {
-                        let data = intellisense_data_for_insert.borrow();
+                        let data = intellisense_data_for_insert.lock().unwrap();
                         data.is_known_relation(&selected)
                     };
                     if should_prefetch {
@@ -449,7 +474,7 @@ impl SqlEditorWidget {
                         );
                     }
                 }
-                let range = *completion_range_for_insert.borrow();
+                let range = *completion_range_for_insert.lock().unwrap();
                 let (start, end) = if let Some((range_start, range_end)) = range {
                     (range_start, range_end)
                 } else {
@@ -469,7 +494,7 @@ impl SqlEditorWidget {
                     editor_for_insert
                         .set_insert_position((cursor_pos_usize + selected.len()) as i32);
                 }
-                *completion_range_for_insert.borrow_mut() = None;
+                *completion_range_for_insert.lock().unwrap() = None;
             });
         }
 
@@ -494,20 +519,20 @@ impl SqlEditorWidget {
         let intellisense_parse_cache_for_handle = intellisense_parse_cache.clone();
         let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
         let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
-        let dnd_file_drop_pending_for_handle = Rc::new(RefCell::new(false));
+        let dnd_file_drop_pending_for_handle = Rc::new(Mutex::new(false));
 
         editor.handle(move |ed, ev| {
             match ev {
                 Event::DndEnter | Event::DndDrag => {
-                    *dnd_file_drop_pending_for_handle.borrow_mut() = true;
+                    *dnd_file_drop_pending_for_handle.lock().unwrap() = true;
                     true
                 }
                 Event::DndLeave => {
-                    *dnd_file_drop_pending_for_handle.borrow_mut() = false;
+                    *dnd_file_drop_pending_for_handle.lock().unwrap() = false;
                     true
                 }
                 Event::DndRelease => {
-                    *dnd_file_drop_pending_for_handle.borrow_mut() = true;
+                    *dnd_file_drop_pending_for_handle.lock().unwrap() = true;
                     true
                 }
                 Event::Push => {
@@ -542,7 +567,7 @@ impl SqlEditorWidget {
                     let key = fltk::app::event_key();
                     let original_key = fltk::app::event_original_key();
                     let shortcut_key = Self::shortcut_key_for_layout(key, original_key);
-                    let popup_visible = intellisense_popup_for_handle.borrow().is_visible();
+                    let popup_visible = intellisense_popup_for_handle.lock().unwrap().is_visible();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
                         || state.contains(fltk::enums::Shortcut::Command);
@@ -551,9 +576,9 @@ impl SqlEditorWidget {
 
                     if ctrl_or_cmd && shift && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -566,9 +591,9 @@ impl SqlEditorWidget {
 
                     if alt && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -583,9 +608,9 @@ impl SqlEditorWidget {
                         match shortcut_key {
                             Key::Escape => {
                                 // Close popup, consume event
-                                intellisense_popup_for_handle.borrow_mut().hide();
-                                *completion_range_for_handle.borrow_mut() = None;
-                                *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_popup_for_handle.lock().unwrap().hide();
+                                *completion_range_for_handle.lock().unwrap() = None;
+                                *pending_intellisense_for_handle.lock().unwrap() = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -595,27 +620,27 @@ impl SqlEditorWidget {
                             Key::Up => {
                                 // Navigate popup up, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle.borrow_mut() = Some(pos);
-                                intellisense_popup_for_handle.borrow_mut().select_prev();
+                                *nav_anchor_for_handle.lock().unwrap() = Some(pos);
+                                intellisense_popup_for_handle.lock().unwrap().select_prev();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle.borrow_mut() = true;
+                                *suppress_nav_for_handle.lock().unwrap() = true;
                                 return true;
                             }
                             Key::Down => {
                                 // Navigate popup down, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle.borrow_mut() = Some(pos);
-                                intellisense_popup_for_handle.borrow_mut().select_next();
+                                *nav_anchor_for_handle.lock().unwrap() = Some(pos);
+                                intellisense_popup_for_handle.lock().unwrap().select_next();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle.borrow_mut() = true;
+                                *suppress_nav_for_handle.lock().unwrap() = true;
                                 return true;
                             }
                             Key::Enter | Key::KPEnter | Key::Tab => {
                                 // Insert selected suggestion, consume event
                                 let selected =
-                                    intellisense_popup_for_handle.borrow().get_selected();
+                                    intellisense_popup_for_handle.lock().unwrap().get_selected();
                                 let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
                                     let cursor_pos = Self::raw_cursor_position(
@@ -623,7 +648,7 @@ impl SqlEditorWidget {
                                         ed.insert_position(),
                                     );
                                     let cursor_pos_usize = cursor_pos as usize;
-                                    let range = *completion_range_for_handle.borrow();
+                                    let range = *completion_range_for_handle.lock().unwrap();
                                     let (start, end) = if let Some((range_start, range_end)) = range
                                     {
                                         (range_start, range_end)
@@ -650,26 +675,29 @@ impl SqlEditorWidget {
                                             (cursor_pos_usize + selected.len()) as i32,
                                         );
                                     }
-                                    *completion_range_for_handle.borrow_mut() = None;
-                                    *pending_intellisense_for_handle.borrow_mut() = None;
+                                    *completion_range_for_handle.lock().unwrap() = None;
+                                    *pending_intellisense_for_handle.lock().unwrap() = None;
 
                                     // Update syntax highlighting after insertion
                                     let cursor_pos = Self::raw_cursor_position(
                                         &buffer_for_handle,
                                         ed.insert_position(),
                                     ) as usize;
-                                    highlighter_for_handle.borrow().highlight_buffer_window(
-                                        &buffer_for_handle,
-                                        &mut style_buffer_for_handle,
-                                        cursor_pos,
-                                        None,
-                                    );
+                                    highlighter_for_handle
+                                        .lock()
+                                        .unwrap()
+                                        .highlight_buffer_window(
+                                            &buffer_for_handle,
+                                            &mut style_buffer_for_handle,
+                                            cursor_pos,
+                                            None,
+                                        );
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
-                                    *suppress_enter_for_handle.borrow_mut() = true;
+                                    *suppress_enter_for_handle.lock().unwrap() = true;
                                 }
-                                intellisense_popup_for_handle.borrow_mut().hide();
-                                *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_popup_for_handle.lock().unwrap().hide();
+                                *pending_intellisense_for_handle.lock().unwrap() = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -730,10 +758,10 @@ impl SqlEditorWidget {
                                 return true;
                             }
                             Key::Enter | Key::KPEnter => {
-                                if *ctrl_enter_handled_for_handle.borrow() {
+                                if *ctrl_enter_handled_for_handle.lock().unwrap() {
                                     return true;
                                 }
-                                *ctrl_enter_handled_for_handle.borrow_mut() = true;
+                                *ctrl_enter_handled_for_handle.lock().unwrap() = true;
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
@@ -807,7 +835,7 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::KeyUp => {
-                    let popup_visible = intellisense_popup_for_handle.borrow().is_visible();
+                    let popup_visible = intellisense_popup_for_handle.lock().unwrap().is_visible();
                     if !ed.active() || (!ed.has_focus() && !popup_visible) {
                         return false;
                     }
@@ -869,9 +897,9 @@ impl SqlEditorWidget {
                         )
                     {
                         if popup_visible {
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -880,26 +908,28 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    if matches!(key, Key::Up | Key::Down) && *suppress_nav_for_handle.borrow() {
-                        if let Some(pos) = *nav_anchor_for_handle.borrow() {
+                    if matches!(key, Key::Up | Key::Down)
+                        && *suppress_nav_for_handle.lock().unwrap()
+                    {
+                        if let Some(pos) = *nav_anchor_for_handle.lock().unwrap() {
                             ed.set_insert_position(pos);
                             ed.show_insert_position();
                         }
-                        *nav_anchor_for_handle.borrow_mut() = None;
-                        *suppress_nav_for_handle.borrow_mut() = false;
+                        *nav_anchor_for_handle.lock().unwrap() = None;
+                        *suppress_nav_for_handle.lock().unwrap() = false;
                         return true;
                     }
 
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *suppress_enter_for_handle.borrow()
+                        && *suppress_enter_for_handle.lock().unwrap()
                     {
-                        *suppress_enter_for_handle.borrow_mut() = false;
+                        *suppress_enter_for_handle.lock().unwrap() = false;
                         return true;
                     }
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *ctrl_enter_handled_for_handle.borrow()
+                        && *ctrl_enter_handled_for_handle.lock().unwrap()
                     {
-                        *ctrl_enter_handled_for_handle.borrow_mut() = false;
+                        *ctrl_enter_handled_for_handle.lock().unwrap() = false;
                         return true;
                     }
 
@@ -909,9 +939,9 @@ impl SqlEditorWidget {
                         Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown
                     ) {
                         if popup_visible {
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                         }
                         Self::invalidate_keyup_debounce(
                             &keyup_debounce_generation_for_handle,
@@ -955,7 +985,7 @@ impl SqlEditorWidget {
                     };
 
                     if fast_path_applied {
-                        *pending_intellisense_for_handle.borrow_mut() = None;
+                        *pending_intellisense_for_handle.lock().unwrap() = None;
                         Self::invalidate_keyup_debounce(
                             &keyup_debounce_generation_for_handle,
                             &keyup_debounce_handle_for_handle,
@@ -979,9 +1009,9 @@ impl SqlEditorWidget {
                                 &intellisense_parse_cache_for_handle,
                             );
                         } else {
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -1011,9 +1041,9 @@ impl SqlEditorWidget {
                                     &intellisense_parse_cache_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle.borrow_mut().hide();
-                                *completion_range_for_handle.borrow_mut() = None;
-                                *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_popup_for_handle.lock().unwrap().hide();
+                                *completion_range_for_handle.lock().unwrap() = None;
+                                *pending_intellisense_for_handle.lock().unwrap() = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -1038,9 +1068,9 @@ impl SqlEditorWidget {
                                     &intellisense_parse_cache_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle.borrow_mut().hide();
-                                *completion_range_for_handle.borrow_mut() = None;
-                                *pending_intellisense_for_handle.borrow_mut() = None;
+                                intellisense_popup_for_handle.lock().unwrap().hide();
+                                *completion_range_for_handle.lock().unwrap() = None;
+                                *pending_intellisense_for_handle.lock().unwrap() = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -1049,9 +1079,9 @@ impl SqlEditorWidget {
                         } else {
                             // Non-identifier character (space, punctuation, etc.)
                             // Close popup - user is done with this word
-                            intellisense_popup_for_handle.borrow_mut().hide();
-                            *completion_range_for_handle.borrow_mut() = None;
-                            *pending_intellisense_for_handle.borrow_mut() = None;
+                            intellisense_popup_for_handle.lock().unwrap().hide();
+                            *completion_range_for_handle.lock().unwrap() = None;
+                            *pending_intellisense_for_handle.lock().unwrap() = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -1078,7 +1108,7 @@ impl SqlEditorWidget {
                 }
                 Event::Shortcut => {
                     let key = fltk::app::event_key();
-                    let popup_visible = intellisense_popup_for_handle.borrow().is_visible();
+                    let popup_visible = intellisense_popup_for_handle.lock().unwrap().is_visible();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
                         || state.contains(fltk::enums::Shortcut::Command);
@@ -1094,10 +1124,10 @@ impl SqlEditorWidget {
                     }
 
                     if ctrl_or_cmd && matches!(key, Key::Enter | Key::KPEnter) {
-                        if *ctrl_enter_handled_for_handle.borrow() {
+                        if *ctrl_enter_handled_for_handle.lock().unwrap() {
                             return true;
                         }
-                        *ctrl_enter_handled_for_handle.borrow_mut() = true;
+                        *ctrl_enter_handled_for_handle.lock().unwrap() = true;
                         widget_for_shortcuts.execute_statement_at_cursor();
                         return true;
                     }
@@ -1106,7 +1136,7 @@ impl SqlEditorWidget {
                 }
                 Event::Paste => {
                     let from_drop = {
-                        let mut pending = dnd_file_drop_pending_for_handle.borrow_mut();
+                        let mut pending = dnd_file_drop_pending_for_handle.lock().unwrap();
                         let was_pending = *pending;
                         *pending = false;
                         was_pending
@@ -1232,13 +1262,13 @@ impl SqlEditorWidget {
     pub fn trigger_intellisense(
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_data: &Rc<RefCell<IntellisenseData>>,
-        intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
-        completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
+        intellisense_data: &Rc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
+        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
-        pending_intellisense: &Rc<RefCell<Option<PendingIntellisense>>>,
-        intellisense_parse_cache: &Rc<RefCell<Option<IntellisenseParseCacheEntry>>>,
+        pending_intellisense: &Rc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Rc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     ) {
         let cursor_pos = Self::raw_cursor_position(buffer, editor.insert_position());
         let cursor_pos_usize = cursor_pos as usize;
@@ -1250,9 +1280,9 @@ impl SqlEditorWidget {
             && Self::non_whitespace_char_before_cursor(buffer, cursor_pos) == Some(';');
 
         if should_hide_after_statement_terminator {
-            intellisense_popup.borrow_mut().hide();
-            *pending_intellisense.borrow_mut() = None;
-            *completion_range.borrow_mut() = None;
+            intellisense_popup.lock().unwrap().hide();
+            *pending_intellisense.lock().unwrap() = None;
+            *completion_range.lock().unwrap() = None;
             return;
         }
 
@@ -1269,7 +1299,7 @@ impl SqlEditorWidget {
             );
 
         let cached_context = {
-            let cache = intellisense_parse_cache.borrow();
+            let cache = intellisense_parse_cache.lock().unwrap();
             cache
                 .as_ref()
                 .filter(|entry| {
@@ -1294,7 +1324,7 @@ impl SqlEditorWidget {
                 .map(|span| span.token.clone())
                 .collect();
             let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
-            *intellisense_parse_cache.borrow_mut() = Some(IntellisenseParseCacheEntry {
+            *intellisense_parse_cache.lock().unwrap() = Some(IntellisenseParseCacheEntry {
                 statement_text: statement_text.clone(),
                 cursor_in_statement,
                 context: parsed.clone(),
@@ -1318,8 +1348,8 @@ impl SqlEditorWidget {
         let allow_empty_prefix =
             qualifier.is_some() || include_columns || matches!(context, SqlContext::TableName);
         if prefix.is_empty() && !allow_empty_prefix {
-            *pending_intellisense.borrow_mut() = None;
-            *completion_range.borrow_mut() = None;
+            *pending_intellisense.lock().unwrap() = None;
+            *completion_range.lock().unwrap() = None;
             return;
         }
 
@@ -1380,7 +1410,8 @@ impl SqlEditorWidget {
             }
         }
         intellisense_data
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .replace_virtual_table_columns(virtual_table_columns);
 
         // Load columns from DB for real tables (skip virtual tables)
@@ -1406,7 +1437,7 @@ impl SqlEditorWidget {
         }
 
         let columns_loading = {
-            let data = intellisense_data.borrow();
+            let data = intellisense_data.lock().unwrap();
             Self::has_column_loading_for_scope(
                 include_columns,
                 &column_tables,
@@ -1416,7 +1447,7 @@ impl SqlEditorWidget {
         };
 
         let suggestions = {
-            let mut data = intellisense_data.borrow_mut();
+            let mut data = intellisense_data.lock().unwrap();
             let column_scope = if !column_tables.is_empty() {
                 Some(column_tables.as_slice())
             } else {
@@ -1444,14 +1475,14 @@ impl SqlEditorWidget {
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
         if should_refresh_when_columns_ready {
-            *pending_intellisense.borrow_mut() = Some(PendingIntellisense { cursor_pos });
+            *pending_intellisense.lock().unwrap() = Some(PendingIntellisense { cursor_pos });
         } else {
-            *pending_intellisense.borrow_mut() = None;
+            *pending_intellisense.lock().unwrap() = None;
         }
 
         if suggestions.is_empty() {
-            intellisense_popup.borrow_mut().hide();
-            *completion_range.borrow_mut() = None;
+            intellisense_popup.lock().unwrap().hide();
+            *completion_range.lock().unwrap() = None;
             return;
         }
 
@@ -1461,14 +1492,15 @@ impl SqlEditorWidget {
             Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
 
         intellisense_popup
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .show_suggestions(suggestions, popup_x, popup_y);
         let completion_start = if prefix.is_empty() {
             cursor_pos_usize
         } else {
             start
         };
-        *completion_range.borrow_mut() = Some((completion_start, cursor_pos_usize));
+        *completion_range.lock().unwrap() = Some((completion_start, cursor_pos_usize));
         let mut editor = editor.clone();
         let _ = editor.take_focus();
     }
@@ -1476,7 +1508,7 @@ impl SqlEditorWidget {
     fn expand_virtual_table_wildcards(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
-        intellisense_data: &Rc<RefCell<IntellisenseData>>,
+        intellisense_data: &Rc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) -> (Vec<String>, Vec<String>) {
@@ -1492,7 +1524,7 @@ impl SqlEditorWidget {
         for table in &wildcard_tables {
             Self::request_table_columns(table, intellisense_data, column_sender, connection);
             let columns = {
-                let data = intellisense_data.borrow();
+                let data = intellisense_data.lock().unwrap();
                 data.get_columns_for_table(table)
             };
             wildcard_columns.extend(columns);
@@ -1623,7 +1655,7 @@ impl SqlEditorWidget {
 
     fn maybe_prefetch_columns_for_word(
         word: &str,
-        intellisense_data: &Rc<RefCell<IntellisenseData>>,
+        intellisense_data: &Rc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
@@ -1632,7 +1664,7 @@ impl SqlEditorWidget {
         }
 
         let should_prefetch = {
-            let data = intellisense_data.borrow();
+            let data = intellisense_data.lock().unwrap();
             data.is_known_relation(word)
         };
 
@@ -1643,7 +1675,7 @@ impl SqlEditorWidget {
 
     fn request_table_columns(
         table_name: &str,
-        intellisense_data: &Rc<RefCell<IntellisenseData>>,
+        intellisense_data: &Rc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
     ) {
@@ -1653,7 +1685,7 @@ impl SqlEditorWidget {
         }
 
         let table_key = {
-            let mut data = intellisense_data.borrow_mut();
+            let mut data = intellisense_data.lock().unwrap();
             let selected = table_key_candidates
                 .iter()
                 .find(|candidate| data.is_known_relation(candidate))
@@ -2487,17 +2519,17 @@ impl SqlEditorWidget {
     fn try_fast_path_intellisense_filter(
         editor: &TextEditor,
         buffer: &TextBuffer,
-        intellisense_popup: &Rc<RefCell<IntellisensePopup>>,
-        completion_range: &Rc<RefCell<Option<(usize, usize)>>>,
+        intellisense_popup: &Rc<Mutex<IntellisensePopup>>,
+        completion_range: &Rc<Mutex<Option<(usize, usize)>>>,
         cursor_pos: i32,
         key: Key,
         typed_char: Option<char>,
     ) -> bool {
-        if !intellisense_popup.borrow().is_visible() {
+        if !intellisense_popup.lock().unwrap().is_visible() {
             return false;
         }
 
-        let Some((start, end)) = *completion_range.borrow() else {
+        let Some((start, end)) = *completion_range.lock().unwrap() else {
             return false;
         };
 
@@ -2514,16 +2546,16 @@ impl SqlEditorWidget {
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
         let prefix = Self::prefix_in_completion_range(buffer, start, cursor_pos);
         {
-            let mut popup = intellisense_popup.borrow_mut();
+            let mut popup = intellisense_popup.lock().unwrap();
             popup.filter_visible_suggestions_by_prefix(&prefix);
             if !popup.is_visible() {
-                *completion_range.borrow_mut() = None;
+                *completion_range.lock().unwrap() = None;
             } else {
                 let (popup_width, popup_height) = popup.popup_dimensions();
                 let (popup_x, popup_y) =
                     Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
                 popup.set_position(popup_x, popup_y);
-                *completion_range.borrow_mut() = Some((start, cursor.max(start)));
+                *completion_range.lock().unwrap() = Some((start, cursor.max(start)));
             }
         }
         true
@@ -2826,7 +2858,7 @@ impl SqlEditorWidget {
         Window::delete(dialog);
     }
     pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
-        let mut popup = self.intellisense_popup.borrow_mut();
+        let mut popup = self.intellisense_popup.lock().unwrap();
         if !popup.is_visible() {
             return;
         }
@@ -2834,18 +2866,18 @@ impl SqlEditorWidget {
             return;
         }
         popup.hide();
-        *self.completion_range.borrow_mut() = None;
-        *self.pending_intellisense.borrow_mut() = None;
+        *self.completion_range.lock().unwrap() = None;
+        *self.pending_intellisense.lock().unwrap() = None;
     }
 
     #[allow(dead_code)]
     pub fn update_intellisense_data(&mut self, data: IntellisenseData) {
         let mut data = data;
         data.rebuild_indices();
-        *self.intellisense_data.borrow_mut() = data;
+        *self.intellisense_data.lock().unwrap() = data;
     }
 
-    pub fn get_intellisense_data(&self) -> Rc<RefCell<IntellisenseData>> {
+    pub fn get_intellisense_data(&self) -> Rc<Mutex<IntellisenseData>> {
         self.intellisense_data.clone()
     }
     pub fn show_intellisense(&self) {
@@ -2927,6 +2959,13 @@ mod intellisense_regression_tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn statement_bounds_ignore_semicolon_in_string_literal() {
@@ -3459,8 +3498,10 @@ FROM d
     #[test]
     fn resolved_shortcut_key_matches_all_editor_ctrl_alpha_shortcuts() {
         for ascii in ['f', 'u', 'l', 'h', 'z', 'y'] {
-            let resolved =
-                SqlEditorWidget::shortcut_key_for_layout(Key::from_char('한'), Key::from_char(ascii));
+            let resolved = SqlEditorWidget::shortcut_key_for_layout(
+                Key::from_char('한'),
+                Key::from_char(ascii),
+            );
             assert!(SqlEditorWidget::matches_alpha_shortcut(resolved, ascii));
         }
     }
@@ -3515,9 +3556,9 @@ FROM d
 
     #[test]
     fn request_table_columns_releases_loading_when_connection_busy() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["EMP".to_string()];
             guard.rebuild_indices();
         }
@@ -3538,9 +3579,9 @@ FROM d
 
     #[test]
     fn request_table_columns_handles_quoted_schema_and_table_names() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["SCHEMA.TABLE.NAME".to_string()];
             guard.rebuild_indices();
         }
@@ -3564,9 +3605,9 @@ FROM d
     }
     #[test]
     fn request_table_columns_keeps_exact_dotted_relation_name() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["A.B".to_string()];
             guard.rebuild_indices();
         }
@@ -3586,9 +3627,9 @@ FROM d
 
     #[test]
     fn request_table_columns_falls_back_to_unqualified_name() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["EMP".to_string()];
             guard.rebuild_indices();
         }
@@ -3636,9 +3677,9 @@ FROM d
 
     #[test]
     fn request_table_columns_does_not_fallback_when_dot_is_inside_quoted_identifier() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["B".to_string()];
             guard.rebuild_indices();
         }
@@ -3669,9 +3710,9 @@ FROM d
 
     #[test]
     fn expand_virtual_table_wildcards_uses_loaded_base_table_columns() {
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         {
-            let mut guard = data.borrow_mut();
+            let mut guard = lock_or_recover(&data);
             guard.tables = vec!["HELP".to_string()];
             guard.rebuild_indices();
             guard.set_columns_for_table("HELP", vec!["TOPIC".to_string(), "TEXT".to_string()]);
@@ -3829,7 +3870,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             "qualifier should resolve to filtered CTE alias"
         );
 
-        let data = Rc::new(RefCell::new(IntellisenseData::new()));
+        let data = Rc::new(Mutex::new(IntellisenseData::new()));
         let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let connection = create_shared_connection();
 
@@ -3856,12 +3897,11 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             }
             SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
             if !columns.is_empty() {
-                data.borrow_mut()
-                    .set_virtual_table_columns(&cte.name, columns);
+                lock_or_recover(&data).set_virtual_table_columns(&cte.name, columns);
             }
         }
 
-        let mut guard = data.borrow_mut();
+        let mut guard = lock_or_recover(&data);
         let suggestions = guard.get_column_suggestions("", Some(&column_tables));
 
         assert!(
@@ -3941,28 +3981,28 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn invoke_void_callback_restores_slot_even_when_callback_panics() {
-        let calls = Rc::new(RefCell::new(0usize));
+        let calls = Rc::new(Mutex::new(0usize));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> =
-            Rc::new(RefCell::new(Some(Box::new(move || {
-                *calls_for_cb.borrow_mut() += 1;
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> =
+            Rc::new(Mutex::new(Some(Box::new(move || {
+                *lock_or_recover(&calls_for_cb) += 1;
                 panic!("expected callback panic");
             }))));
 
         let invoked = SqlEditorWidget::invoke_void_callback(&callback_slot);
 
         assert!(invoked);
-        assert!(callback_slot.borrow().is_some());
-        assert_eq!(*calls.borrow(), 1);
+        assert!(lock_or_recover(&callback_slot).is_some());
+        assert_eq!(*lock_or_recover(&calls), 1);
     }
 
     #[test]
     fn invoke_void_callback_can_run_again_after_panic() {
-        let calls = Rc::new(RefCell::new(0usize));
+        let calls = Rc::new(Mutex::new(0usize));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> =
-            Rc::new(RefCell::new(Some(Box::new(move || {
-                let mut count = calls_for_cb.borrow_mut();
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> =
+            Rc::new(Mutex::new(Some(Box::new(move || {
+                let mut count = lock_or_recover(&calls_for_cb);
                 *count += 1;
                 if *count == 1 {
                     panic!("expected first callback panic");
@@ -3971,55 +4011,55 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
         let first_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
         assert!(first_call);
-        assert!(callback_slot.borrow().is_some());
+        assert!(lock_or_recover(&callback_slot).is_some());
 
         let second_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
         assert!(second_call);
-        assert_eq!(*calls.borrow(), 2);
-        assert!(callback_slot.borrow().is_some());
+        assert_eq!(*lock_or_recover(&calls), 2);
+        assert!(lock_or_recover(&callback_slot).is_some());
     }
 
     #[test]
     fn invoke_void_callback_returns_false_when_slot_is_empty() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
 
         let invoked = SqlEditorWidget::invoke_void_callback(&callback_slot);
 
         assert!(!invoked);
-        assert!(callback_slot.borrow().is_none());
+        assert!(lock_or_recover(&callback_slot).is_none());
     }
 
     #[test]
     fn invoke_void_callback_keeps_replaced_callback_when_original_panics() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
-        let replacement_ran = Rc::new(RefCell::new(false));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut()>>>> = Rc::new(Mutex::new(None));
+        let replacement_ran = Rc::new(Mutex::new(false));
         let replacement_ran_for_cb = replacement_ran.clone();
         let callback_slot_for_cb = callback_slot.clone();
 
-        *callback_slot.borrow_mut() = Some(Box::new(move || {
+        *lock_or_recover(&callback_slot) = Some(Box::new(move || {
             let replacement_ran_for_replacement = replacement_ran_for_cb.clone();
-            *callback_slot_for_cb.borrow_mut() = Some(Box::new(move || {
-                *replacement_ran_for_replacement.borrow_mut() = true;
+            *lock_or_recover(&callback_slot_for_cb) = Some(Box::new(move || {
+                *lock_or_recover(&replacement_ran_for_replacement) = true;
             }));
             panic!("expected panic after replacement");
         }));
 
         let first_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
         assert!(first_call);
-        assert!(callback_slot.borrow().is_some());
+        assert!(lock_or_recover(&callback_slot).is_some());
 
         let second_call = SqlEditorWidget::invoke_void_callback(&callback_slot);
         assert!(second_call);
-        assert!(*replacement_ran.borrow());
+        assert!(*lock_or_recover(&replacement_ran));
     }
 
     #[test]
     fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
-        let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let calls = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(RefCell::new(Some(Box::new(move |path: PathBuf| {
-                calls_for_cb.borrow_mut().push(path);
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
+                lock_or_recover(&calls_for_cb).push(path);
                 panic!("expected callback panic");
             }))));
 
@@ -4028,17 +4068,17 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             SqlEditorWidget::invoke_file_drop_callback(&callback_slot, expected_path.clone());
 
         assert!(invoked);
-        assert!(callback_slot.borrow().is_some());
-        assert_eq!(calls.borrow().as_slice(), &[expected_path]);
+        assert!(lock_or_recover(&callback_slot).is_some());
+        assert_eq!(lock_or_recover(&calls).as_slice(), &[expected_path]);
     }
 
     #[test]
     fn invoke_file_drop_callback_can_run_again_after_panic() {
-        let calls = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let calls = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
         let calls_for_cb = calls.clone();
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(RefCell::new(Some(Box::new(move |path: PathBuf| {
-                let mut events = calls_for_cb.borrow_mut();
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
+            Rc::new(Mutex::new(Some(Box::new(move |path: PathBuf| {
+                let mut events = lock_or_recover(&calls_for_cb);
                 let should_panic = events.is_empty();
                 events.push(path);
                 if should_panic {
@@ -4052,39 +4092,40 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let first_call =
             SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path.clone());
         assert!(first_call);
-        assert!(callback_slot.borrow().is_some());
+        assert!(lock_or_recover(&callback_slot).is_some());
 
         let second_call =
             SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone());
         assert!(second_call);
-        assert!(callback_slot.borrow().is_some());
-        assert_eq!(calls.borrow().as_slice(), &[first_path, second_path]);
+        assert!(lock_or_recover(&callback_slot).is_some());
+        assert_eq!(
+            lock_or_recover(&calls).as_slice(),
+            &[first_path, second_path]
+        );
     }
 
     #[test]
     fn invoke_file_drop_callback_returns_false_when_slot_is_empty() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(RefCell::new(None));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Rc::new(Mutex::new(None));
         let path = PathBuf::from("/tmp/ignored.sql");
 
         let invoked = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, path);
 
         assert!(!invoked);
-        assert!(callback_slot.borrow().is_none());
+        assert!(lock_or_recover(&callback_slot).is_none());
     }
 
     #[test]
     fn invoke_file_drop_callback_keeps_replaced_callback_when_original_panics() {
-        let callback_slot: Rc<RefCell<Option<Box<dyn FnMut(PathBuf)>>>> =
-            Rc::new(RefCell::new(None));
-        let captured_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let callback_slot: Rc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> = Rc::new(Mutex::new(None));
+        let captured_paths = Rc::new(Mutex::new(Vec::<PathBuf>::new()));
         let captured_paths_for_cb = captured_paths.clone();
         let callback_slot_for_cb = callback_slot.clone();
 
-        *callback_slot.borrow_mut() = Some(Box::new(move |_path: PathBuf| {
+        *lock_or_recover(&callback_slot) = Some(Box::new(move |_path: PathBuf| {
             let captured_paths_for_replacement = captured_paths_for_cb.clone();
-            *callback_slot_for_cb.borrow_mut() = Some(Box::new(move |path: PathBuf| {
-                captured_paths_for_replacement.borrow_mut().push(path);
+            *lock_or_recover(&callback_slot_for_cb) = Some(Box::new(move |path: PathBuf| {
+                lock_or_recover(&captured_paths_for_replacement).push(path);
             }));
             panic!("expected panic after replacement");
         }));
@@ -4094,12 +4135,12 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
         let first_call = SqlEditorWidget::invoke_file_drop_callback(&callback_slot, first_path);
         assert!(first_call);
-        assert!(callback_slot.borrow().is_some());
+        assert!(lock_or_recover(&callback_slot).is_some());
 
         let second_call =
             SqlEditorWidget::invoke_file_drop_callback(&callback_slot, second_path.clone());
         assert!(second_call);
-        assert_eq!(captured_paths.borrow().as_slice(), &[second_path]);
+        assert_eq!(lock_or_recover(&captured_paths).as_slice(), &[second_path]);
     }
 
     #[test]

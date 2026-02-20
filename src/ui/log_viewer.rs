@@ -9,9 +9,9 @@ use fltk::{
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::sync::Mutex;
 
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
@@ -30,7 +30,7 @@ enum DialogMessage {
 pub struct LogViewerDialog;
 
 impl LogViewerDialog {
-    pub fn show(popups: Rc<RefCell<Vec<Window>>>) {
+    pub fn show(popups: Rc<Mutex<Vec<Window>>>) {
         let all_entries = logging::get_log_entries();
 
         let current_group = fltk::group::Group::try_current();
@@ -152,16 +152,16 @@ impl LogViewerDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.borrow_mut().push(dialog.clone());
+        popups.lock().unwrap().push(dialog.clone());
 
-        let entries: Rc<RefCell<Vec<LogEntry>>> = Rc::new(RefCell::new(all_entries));
-        let filtered_indices: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let entries: Rc<Mutex<Vec<LogEntry>>> = Rc::new(Mutex::new(all_entries));
+        let filtered_indices: Rc<Mutex<Vec<usize>>> = Rc::new(Mutex::new(Vec::new()));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
         // Initial population
         populate_browser(
-            &entries.borrow(),
+            &entries.lock().unwrap(),
             &mut browser,
             &filtered_indices,
             &mut count_label,
@@ -220,9 +220,9 @@ impl LogViewerDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(browser_index) => {
-                        let fi = filtered_indices.borrow();
+                        let fi = filtered_indices.lock().unwrap();
                         if let Some(&entry_index) = fi.get(browser_index) {
-                            let ents = entries.borrow();
+                            let ents = entries.lock().unwrap();
                             if let Some(entry) = ents.get(entry_index) {
                                 let detail = format!(
                                     "Timestamp: {}\nLevel: {}\nSource: {}\n\n{}",
@@ -238,7 +238,7 @@ impl LogViewerDialog {
                     DialogMessage::FilterChanged => {
                         let filter = selected_filter(&level_choice);
                         populate_browser(
-                            &entries.borrow(),
+                            &entries.lock().unwrap(),
                             &mut browser,
                             &filtered_indices,
                             &mut count_label,
@@ -256,8 +256,8 @@ impl LogViewerDialog {
                         if choice == Some(1) {
                             match logging::clear_log() {
                                 Ok(()) => {
-                                    entries.borrow_mut().clear();
-                                    filtered_indices.borrow_mut().clear();
+                                    entries.lock().unwrap().clear();
+                                    filtered_indices.lock().unwrap().clear();
                                     browser.clear();
                                     detail_buffer.set_text("");
                                     count_label.set_label("0 entries");
@@ -279,8 +279,8 @@ impl LogViewerDialog {
                         dlg.show();
                         let path = dlg.filename();
                         if !path.as_os_str().is_empty() {
-                            let ents = entries.borrow();
-                            let fi = filtered_indices.borrow();
+                            let ents = entries.lock().unwrap();
+                            let fi = filtered_indices.lock().unwrap();
                             let mut output = String::new();
                             for &idx in fi.iter() {
                                 if let Some(entry) = ents.get(idx) {
@@ -317,7 +317,8 @@ impl LogViewerDialog {
         }
 
         popups
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
@@ -338,7 +339,7 @@ fn selected_filter(choice: &Choice) -> Option<LogLevel> {
 fn populate_browser(
     entries: &[LogEntry],
     browser: &mut HoldBrowser,
-    filtered_indices: &Rc<RefCell<Vec<usize>>>,
+    filtered_indices: &Rc<Mutex<Vec<usize>>>,
     count_label: &mut fltk::frame::Frame,
     filter: Option<LogLevel>,
 ) {
@@ -375,7 +376,7 @@ fn populate_browser(
     }
 
     count_label.set_label(&format!("{} entries", indices.len()));
-    *filtered_indices.borrow_mut() = indices;
+    *filtered_indices.lock().unwrap() = indices;
 }
 
 fn escape_browser_label(text: &str) -> String {

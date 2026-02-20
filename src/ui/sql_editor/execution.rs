@@ -2975,7 +2975,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if *self.query_running.borrow() {
+        if *self.query_running.lock().unwrap() {
             self.emit_status("A query is already running. Please wait for it to finish.");
             return;
         }
@@ -3015,7 +3015,7 @@ impl SqlEditorWidget {
         // Reset cancel flag before starting new execution
         cancel_flag.store(false, Ordering::SeqCst);
 
-        *query_running.borrow_mut() = true;
+        *query_running.lock().unwrap() = true;
 
         set_cursor(Cursor::Wait);
         app::flush();
@@ -6114,7 +6114,7 @@ impl SqlEditorWidget {
                                     }
                                 };
                                 let transform_state =
-                                    std::cell::RefCell::new(SelectTransformState::default());
+                                    std::sync::Mutex::new(SelectTransformState::default());
 
                                 let result =
                                     match QueryExecutor::execute_select_streaming_with_binds(
@@ -6129,7 +6129,7 @@ impl SqlEditorWidget {
                                             select_column_names = names.clone();
                                             select_column_count.set(names.len());
                                             {
-                                                let mut state = transform_state.borrow_mut();
+                                                let mut state = transform_state.lock().unwrap();
                                                 state.break_index =
                                                     break_column.as_ref().and_then(|target| {
                                                         let target_key =
@@ -6222,7 +6222,7 @@ impl SqlEditorWidget {
                                             let mut row = row;
                                             last_select_row = Some(row.clone());
                                             {
-                                                let mut state = transform_state.borrow_mut();
+                                                let mut state = transform_state.lock().unwrap();
                                                 if let Some(config) = compute_config.as_ref() {
                                                     let grouped_compute =
                                                         config.of_column.is_some()
@@ -6357,7 +6357,15 @@ impl SqlEditorWidget {
                                             error_result
                                         }
                                     };
-                                let transform_state = transform_state.into_inner();
+                                let transform_state = match transform_state.into_inner() {
+                                    Ok(state) => state,
+                                    Err(poisoned) => {
+                                        eprintln!(
+                                            "Warning: transform state lock was poisoned; recovering."
+                                        );
+                                        poisoned.into_inner()
+                                    }
+                                };
 
                                 if !buffered_rows.is_empty() {
                                     let rows = std::mem::take(&mut buffered_rows);
@@ -7717,15 +7725,15 @@ impl SqlEditorWidget {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        let result: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let cancelled = Rc::new(RefCell::new(false));
+        let result: Rc<Mutex<Option<String>>> = Rc::new(Mutex::new(None));
+        let cancelled = Rc::new(Mutex::new(false));
 
         {
             let result = result.clone();
             let mut dialog = dialog.clone();
             let input = input.clone();
             ok_btn.set_callback(move |_| {
-                *result.borrow_mut() = Some(input.value());
+                *result.lock().unwrap() = Some(input.value());
                 dialog.hide();
             });
         }
@@ -7734,7 +7742,7 @@ impl SqlEditorWidget {
             let cancelled = cancelled.clone();
             let mut dialog = dialog.clone();
             cancel_btn.set_callback(move |_| {
-                *cancelled.borrow_mut() = true;
+                *cancelled.lock().unwrap() = true;
                 dialog.hide();
             });
         }
@@ -7745,7 +7753,7 @@ impl SqlEditorWidget {
             let input_value = input.clone();
             let mut dialog_cb = dialog.clone();
             input_cb.set_callback(move |_| {
-                *result.borrow_mut() = Some(input_value.value());
+                *result.lock().unwrap() = Some(input_value.value());
                 dialog_cb.hide();
             });
         }
@@ -7755,7 +7763,7 @@ impl SqlEditorWidget {
             let mut dialog_cb = dialog.clone();
             let mut dialog_handle = dialog.clone();
             dialog_cb.set_callback(move |_| {
-                *cancelled.borrow_mut() = true;
+                *cancelled.lock().unwrap() = true;
                 dialog_handle.hide();
             });
         }
@@ -7770,10 +7778,10 @@ impl SqlEditorWidget {
         // Explicitly destroy top-level dialog widgets to release native resources.
         fltk::window::Window::delete(dialog);
 
-        if *cancelled.borrow() {
+        if *cancelled.lock().unwrap() {
             None
         } else {
-            result.borrow().clone()
+            result.lock().unwrap().clone()
         }
     }
 
@@ -8025,7 +8033,7 @@ impl SqlEditorWidget {
     where
         F: FnMut(QueryProgress) + 'static,
     {
-        *self.progress_callback.borrow_mut() = Some(Box::new(callback));
+        *self.progress_callback.lock().unwrap() = Some(Box::new(callback));
     }
 }
 

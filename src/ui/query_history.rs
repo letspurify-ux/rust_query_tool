@@ -8,8 +8,8 @@ use fltk::{
     text::{StyleTableEntry, TextBuffer, TextDisplay},
     window::Window,
 };
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -510,7 +510,7 @@ pub fn clear_history() -> Result<(), String> {
 pub struct QueryHistoryDialog;
 
 impl QueryHistoryDialog {
-    pub fn show_with_registry(popups: Rc<RefCell<Vec<Window>>>) -> Option<String> {
+    pub fn show_with_registry(popups: Rc<Mutex<Vec<Window>>>) -> Option<String> {
         enum DialogMessage {
             UpdatePreview(usize),
             UseSelected,
@@ -650,10 +650,10 @@ impl QueryHistoryDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.borrow_mut().push(dialog.clone());
+        popups.lock().unwrap().push(dialog.clone());
         // State for selected query
-        let selected_sql: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let queries: Rc<RefCell<Vec<QueryHistoryEntry>>> = Rc::new(RefCell::new(snapshot));
+        let selected_sql: Rc<Mutex<Option<String>>> = Rc::new(Mutex::new(None));
+        let queries: Rc<Mutex<Vec<QueryHistoryEntry>>> = Rc::new(Mutex::new(snapshot));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
@@ -704,7 +704,7 @@ impl QueryHistoryDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(index) => {
-                        let queries = queries.borrow();
+                        let queries = queries.lock().unwrap();
                         if let Some(entry) = queries.get(index) {
                             preview_buffer.set_text(&entry.sql);
                             let styles = build_preview_styles(&entry.sql, entry.error_line);
@@ -729,9 +729,9 @@ impl QueryHistoryDialog {
                         let selected = browser.value();
                         if selected > 0 {
                             if let Ok(idx) = usize::try_from(selected - 1) {
-                                let queries = queries.borrow();
+                                let queries = queries.lock().unwrap();
                                 if let Some(entry) = queries.get(idx) {
-                                    *selected_sql.borrow_mut() = Some(entry.sql.clone());
+                                    *selected_sql.lock().unwrap() = Some(entry.sql.clone());
                                     dialog.hide();
                                 }
                             }
@@ -750,7 +750,7 @@ impl QueryHistoryDialog {
                             match clear_history() {
                                 Ok(()) => {
                                     app::awake();
-                                    queries.borrow_mut().clear();
+                                    queries.lock().unwrap().clear();
                                     browser.clear();
                                     preview_buffer.set_text("");
                                     preview_style_buffer.set_text("");
@@ -777,13 +777,14 @@ impl QueryHistoryDialog {
 
         // Remove dialog from popups to prevent memory leak
         popups
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
 
-        let result = selected_sql.borrow().clone();
+        let result = selected_sql.lock().unwrap().clone();
         result
     }
 

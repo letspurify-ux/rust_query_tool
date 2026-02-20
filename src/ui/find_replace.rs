@@ -11,8 +11,8 @@ use fltk::{
     text::{TextBuffer, TextEditor},
     window::Window,
 };
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 /// Find/Replace dialog
 pub struct FindReplaceDialog;
@@ -27,8 +27,8 @@ struct FindReplaceSessionState {
 }
 
 thread_local! {
-    static FIND_REPLACE_SESSION: RefCell<FindReplaceSessionState> =
-        RefCell::new(FindReplaceSessionState::default());
+    static FIND_REPLACE_SESSION: Mutex<FindReplaceSessionState> =
+        Mutex::new(FindReplaceSessionState::default());
 }
 
 fn normalize_search_pos(text: &str, pos: i32) -> i32 {
@@ -55,7 +55,7 @@ fn save_find_replace_state(
     last_search_text: &str,
 ) {
     FIND_REPLACE_SESSION.with(|state| {
-        let mut state = state.borrow_mut();
+        let mut state = state.lock().unwrap();
         state.find_text = find_input.value();
         if let Some(replace_input) = replace_input {
             state.replace_text = replace_input.value();
@@ -68,13 +68,13 @@ fn save_find_replace_state(
 
 impl FindReplaceDialog {
     pub fn has_search_text() -> bool {
-        FIND_REPLACE_SESSION.with(|state| !state.borrow().find_text.is_empty())
+        FIND_REPLACE_SESSION.with(|state| !state.lock().unwrap().find_text.is_empty())
     }
 
     pub fn show_find_with_registry(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
-        popups: Rc<RefCell<Vec<Window>>>,
+        popups: Rc<Mutex<Vec<Window>>>,
     ) {
         Self::show_dialog(editor, buffer, false, popups);
     }
@@ -83,7 +83,7 @@ impl FindReplaceDialog {
     pub fn show_replace_with_registry(
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
-        popups: Rc<RefCell<Vec<Window>>>,
+        popups: Rc<Mutex<Vec<Window>>>,
     ) {
         Self::show_dialog(editor, buffer, true, popups);
     }
@@ -92,7 +92,7 @@ impl FindReplaceDialog {
         editor: &mut TextEditor,
         buffer: &mut TextBuffer,
         show_replace: bool,
-        popups: Rc<RefCell<Vec<Window>>>,
+        popups: Rc<Mutex<Vec<Window>>>,
     ) {
         enum DialogMessage {
             FindNext {
@@ -225,8 +225,8 @@ impl FindReplaceDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.borrow_mut().push(dialog.clone());
-        let session_snapshot = FIND_REPLACE_SESSION.with(|state| state.borrow().clone());
+        popups.lock().unwrap().push(dialog.clone());
+        let session_snapshot = FIND_REPLACE_SESSION.with(|state| state.lock().unwrap().clone());
 
         if !session_snapshot.find_text.is_empty() {
             find_input.set_value(&session_snapshot.find_text);
@@ -241,8 +241,8 @@ impl FindReplaceDialog {
 
         // State for search
         let initial_search_pos = normalize_search_pos(&buffer.text(), session_snapshot.search_pos);
-        let search_pos = Rc::new(RefCell::new(initial_search_pos));
-        let last_search_text = Rc::new(RefCell::new(session_snapshot.last_search_text));
+        let search_pos = Rc::new(Mutex::new(initial_search_pos));
+        let last_search_text = Rc::new(Mutex::new(session_snapshot.last_search_text));
 
         let (sender, receiver) = std::sync::mpsc::channel::<DialogMessage>();
 
@@ -358,13 +358,13 @@ impl FindReplaceDialog {
                         search_text,
                         case_sensitive,
                     } => {
-                        if *last_search_text.borrow() != search_text {
-                            *search_pos.borrow_mut() = 0;
-                            *last_search_text.borrow_mut() = search_text.clone();
+                        if *last_search_text.lock().unwrap() != search_text {
+                            *search_pos.lock().unwrap() = 0;
+                            *last_search_text.lock().unwrap() = search_text.clone();
                         }
                         let text = buffer.text();
-                        let start_pos = normalize_search_pos(&text, *search_pos.borrow());
-                        *search_pos.borrow_mut() = start_pos;
+                        let start_pos = normalize_search_pos(&text, *search_pos.lock().unwrap());
+                        *search_pos.lock().unwrap() = start_pos;
 
                         if let Some((match_start, match_end)) =
                             find_next_match(&text, &search_text, start_pos, case_sensitive)
@@ -373,9 +373,9 @@ impl FindReplaceDialog {
                             editor.set_insert_position(match_end as i32);
                             editor.show_insert_position();
                             // Use match_end instead of match_start + 1 to avoid UTF-8 boundary issues
-                            *search_pos.borrow_mut() = match_end.min(text.len()) as i32;
+                            *search_pos.lock().unwrap() = match_end.min(text.len()) as i32;
                         } else if start_pos > 0 {
-                            *search_pos.borrow_mut() = 0;
+                            *search_pos.lock().unwrap() = 0;
                             fltk::dialog::message_default(
                                 "Reached end, searching from beginning...",
                             );
@@ -388,8 +388,8 @@ impl FindReplaceDialog {
                         replace_text,
                         case_sensitive,
                     } => {
-                        if *last_search_text.borrow() != search_text {
-                            *last_search_text.borrow_mut() = search_text.clone();
+                        if *last_search_text.lock().unwrap() != search_text {
+                            *last_search_text.lock().unwrap() = search_text.clone();
                         }
                         if let Some((start, end)) = buffer.selection_position() {
                             let selected = buffer.text_range(start, end).unwrap_or_default();
@@ -404,7 +404,7 @@ impl FindReplaceDialog {
                                 buffer.insert(start, &replace_text);
                                 let next_pos = start + replace_text.len() as i32;
                                 editor.set_insert_position(next_pos);
-                                *search_pos.borrow_mut() =
+                                *search_pos.lock().unwrap() =
                                     normalize_search_pos(&buffer.text(), next_pos);
                             }
                         }
@@ -414,8 +414,8 @@ impl FindReplaceDialog {
                         replace_text,
                         case_sensitive,
                     } => {
-                        if *last_search_text.borrow() != search_text {
-                            *last_search_text.borrow_mut() = search_text.clone();
+                        if *last_search_text.lock().unwrap() != search_text {
+                            *last_search_text.lock().unwrap() = search_text.clone();
                         }
                         if search_text.is_empty() {
                             fltk::dialog::message_default("Search text is empty");
@@ -459,7 +459,7 @@ impl FindReplaceDialog {
                         };
 
                         buffer.set_text(&new_text);
-                        *search_pos.borrow_mut() = 0;
+                        *search_pos.lock().unwrap() = 0;
                         fltk::dialog::message_default(&format!("Replaced {} occurrences", count));
                     }
                     DialogMessage::Close => {
@@ -467,8 +467,8 @@ impl FindReplaceDialog {
                             &find_input_state,
                             replace_input_state.as_ref(),
                             &case_check_state,
-                            *search_pos_state.borrow(),
-                            &last_search_text_state.borrow(),
+                            *search_pos_state.lock().unwrap(),
+                            &last_search_text_state.lock().unwrap(),
                         );
                         dialog.hide();
                     }
@@ -479,8 +479,8 @@ impl FindReplaceDialog {
                         &find_input_state,
                         replace_input_state.as_ref(),
                         &case_check_state,
-                        *search_pos_state.borrow(),
-                        &last_search_text_state.borrow(),
+                        *search_pos_state.lock().unwrap(),
+                        &last_search_text_state.lock().unwrap(),
                     );
                 }
             }
@@ -490,13 +490,14 @@ impl FindReplaceDialog {
             &find_input_state,
             replace_input_state.as_ref(),
             &case_check_state,
-            *search_pos_state.borrow(),
-            &last_search_text_state.borrow(),
+            *search_pos_state.lock().unwrap(),
+            &last_search_text_state.lock().unwrap(),
         );
 
         // Remove dialog from popups to prevent memory leak
         popups
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
@@ -504,7 +505,7 @@ impl FindReplaceDialog {
     }
 
     pub fn find_next_from_session(editor: &mut TextEditor, buffer: &mut TextBuffer) -> bool {
-        let session = FIND_REPLACE_SESSION.with(|state| state.borrow().clone());
+        let session = FIND_REPLACE_SESSION.with(|state| state.lock().unwrap().clone());
         if session.find_text.is_empty() {
             return false;
         }
@@ -530,7 +531,7 @@ impl FindReplaceDialog {
             editor.set_insert_position(match_end as i32);
             editor.show_insert_position();
             FIND_REPLACE_SESSION.with(|state| {
-                let mut state = state.borrow_mut();
+                let mut state = state.lock().unwrap();
                 state.last_search_text = session.find_text.clone();
                 state.search_pos = match_end as i32;
             });

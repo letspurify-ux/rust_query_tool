@@ -13,12 +13,13 @@ use fltk::{
     widget::Widget,
     window::Window,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,13 +73,13 @@ pub struct AppState {
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
     pub fetch_row_counts: HashMap<usize, usize>,
-    pub current_file: Rc<RefCell<Option<PathBuf>>>,
-    pub popups: Rc<RefCell<Vec<Window>>>,
+    pub current_file: Rc<Mutex<Option<PathBuf>>>,
+    pub popups: Rc<Mutex<Vec<Window>>>,
     pub window: Window,
     pub right_tile: Tile,
     pub query_split_adjusted: Rc<Cell<bool>>,
-    pub connection_info: Rc<RefCell<Option<crate::db::ConnectionInfo>>>,
-    pub config: Rc<RefCell<AppConfig>>,
+    pub connection_info: Rc<Mutex<Option<crate::db::ConnectionInfo>>>,
+    pub config: Rc<Mutex<AppConfig>>,
     pub last_fetch_status_update: Instant,
     status_animation_running: bool,
     status_animation_message: String,
@@ -132,7 +133,7 @@ impl AppState {
         self.active_editor_tab_id = tab_id;
         self.sql_editor = tab.sql_editor;
         self.sql_buffer = tab.sql_buffer;
-        *self.current_file.borrow_mut() = tab.current_file;
+        *self.current_file.lock().unwrap() = tab.current_file;
         self.refresh_window_title();
         true
     }
@@ -226,7 +227,7 @@ impl AppState {
         let label = Self::tab_display_label(&self.editor_tabs[index]);
         self.query_tabs.set_tab_label(tab_id, &label);
         if self.active_editor_tab_id == tab_id {
-            *self.current_file.borrow_mut() = path;
+            *self.current_file.lock().unwrap() = path;
             self.refresh_window_title();
         }
     }
@@ -264,7 +265,7 @@ impl AppState {
         self.status_animation_running = false;
         self.status_animation_message.clear();
         self.status_animation_frame = 0;
-        let conn_info = self.connection_info.borrow().clone();
+        let conn_info = self.connection_info.lock().unwrap().clone();
         self.status_bar
             .set_label(&format_status(message, &conn_info));
     }
@@ -301,7 +302,7 @@ impl AppState {
             return;
         }
         let frame = Self::STATUS_SPINNER_FRAMES[self.status_animation_frame];
-        let conn_info = self.connection_info.borrow().clone();
+        let conn_info = self.connection_info.lock().unwrap().clone();
         self.status_bar.set_label(&format_status(
             &format!("{} {}", frame, self.status_animation_message),
             &conn_info,
@@ -322,7 +323,7 @@ fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> St
 }
 
 pub struct MainWindow {
-    state: Rc<RefCell<AppState>>,
+    state: Rc<Mutex<AppState>>,
 }
 
 #[derive(Clone)]
@@ -402,13 +403,13 @@ enum HealthCheckCurrentConnectionState {
 }
 
 impl MainWindow {
-    fn start_status_animation_timer(state: &Rc<RefCell<AppState>>) {
+    fn start_status_animation_timer(state: &Rc<Mutex<AppState>>) {
         let weak_state = Rc::downgrade(state);
         app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
             let Some(state_for_tick) = weak_state.upgrade() else {
                 return;
             };
-            let should_reschedule = match state_for_tick.try_borrow_mut() {
+            let should_reschedule = match state_for_tick.try_lock() {
                 Ok(mut s) => {
                     s.tick_status_animation();
                     s.status_animation_running
@@ -422,7 +423,7 @@ impl MainWindow {
     }
 
     fn transition_to_disconnected_state(state: &mut AppState, error_message: Option<&str>) {
-        *state.connection_info.borrow_mut() = None;
+        *state.connection_info.lock().unwrap() = None;
         state.set_status_message("Disconnected");
         let reset_data = IntellisenseData::new();
         let reset_highlight = HighlightData::new();
@@ -437,9 +438,9 @@ impl MainWindow {
         }
     }
 
-    fn cancel_all_running_queries(state: &Rc<RefCell<AppState>>) {
+    fn cancel_all_running_queries(state: &Rc<Mutex<AppState>>) {
         let (running_editors, fallback_editor) = {
-            let s = state.borrow();
+            let s = state.lock().unwrap();
             let running_editors = s
                 .editor_tabs
                 .iter()
@@ -458,7 +459,7 @@ impl MainWindow {
             editor.cancel_current();
         }
 
-        if let Ok(mut s) = state.try_borrow_mut() {
+        if let Ok(mut s) = state.try_lock() {
             s.set_status_message("Cancelling running queries...");
         }
     }
@@ -484,12 +485,12 @@ impl MainWindow {
     }
 
     fn save_tab(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         tab_id: QueryTabId,
         force_save_as: bool,
     ) -> SaveTabOutcome {
         let (current_file, sql_text) = {
-            let s = state.borrow();
+            let s = state.lock().unwrap();
             let Some(sql_text) = s.tab_sql_text(tab_id) else {
                 return SaveTabOutcome::Cancelled;
             };
@@ -516,7 +517,7 @@ impl MainWindow {
             return SaveTabOutcome::Failed(err.to_string());
         }
 
-        let mut s = state.borrow_mut();
+        let mut s = state.lock().unwrap();
         s.set_tab_file_path(tab_id, Some(path.clone()));
         s.set_tab_pristine_text(tab_id, sql_text);
         let file_label = path.file_name().unwrap_or_default().to_string_lossy();
@@ -525,12 +526,12 @@ impl MainWindow {
     }
 
     fn confirm_save_if_dirty(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         tab_id: QueryTabId,
         action_verb: &str,
     ) -> bool {
         let (is_dirty, tab_label) = {
-            let s = state.borrow();
+            let s = state.lock().unwrap();
             (s.is_tab_dirty(tab_id), s.tab_display_name(tab_id))
         };
         if !is_dirty {
@@ -562,8 +563,8 @@ impl MainWindow {
         }
     }
 
-    fn confirm_save_for_all_dirty_tabs(state: &Rc<RefCell<AppState>>) -> bool {
-        let tab_ids = state.borrow().query_tabs.tab_ids();
+    fn confirm_save_for_all_dirty_tabs(state: &Rc<Mutex<AppState>>) -> bool {
+        let tab_ids = state.lock().unwrap().query_tabs.tab_ids();
         for tab_id in tab_ids {
             if !Self::confirm_save_if_dirty(state, tab_id, "exiting") {
                 return false;
@@ -678,7 +679,7 @@ impl MainWindow {
         split_bar.set_color(theme::border());
         split_bar.set_tooltip("Drag to resize panels");
 
-        let drag_state = Rc::new(RefCell::new(None::<(i32, i32)>));
+        let drag_state = Rc::new(Mutex::new(None::<(i32, i32)>));
         let mut content_flex_for_split = content_flex.clone();
         let obj_browser_for_split = obj_browser_widget.clone();
         let drag_state_for_split = drag_state.clone();
@@ -688,12 +689,12 @@ impl MainWindow {
                 true
             }
             fltk::enums::Event::Push => {
-                *drag_state_for_split.borrow_mut() =
+                *drag_state_for_split.lock().unwrap() =
                     Some((app::event_x(), obj_browser_for_split.w()));
                 true
             }
             fltk::enums::Event::Drag => {
-                if let Some((start_x, start_w)) = *drag_state_for_split.borrow() {
+                if let Some((start_x, start_w)) = *drag_state_for_split.lock().unwrap() {
                     let delta = app::event_x() - start_x;
                     let min_left = 180;
                     let min_right = 320;
@@ -712,7 +713,7 @@ impl MainWindow {
                 true
             }
             fltk::enums::Event::Released => {
-                *drag_state_for_split.borrow_mut() = None;
+                *drag_state_for_split.lock().unwrap() = None;
                 set_cursor(Cursor::WE);
                 true
             }
@@ -962,7 +963,7 @@ impl MainWindow {
         window.end();
         window.make_resizable(true);
 
-        let state = Rc::new(RefCell::new(AppState {
+        let state = Rc::new(Mutex::new(AppState {
             connection,
             query_tabs: query_tabs.clone(),
             query_top_group: query_top_group.clone(),
@@ -980,13 +981,13 @@ impl MainWindow {
             object_browser,
             status_bar,
             fetch_row_counts: HashMap::new(),
-            current_file: Rc::new(RefCell::new(None)),
-            popups: Rc::new(RefCell::new(Vec::new())),
+            current_file: Rc::new(Mutex::new(None)),
+            popups: Rc::new(Mutex::new(Vec::new())),
             window,
             right_tile: right_tile.clone(),
             query_split_adjusted: query_split_adjusted.clone(),
-            connection_info: Rc::new(RefCell::new(None)),
-            config: Rc::new(RefCell::new(config)),
+            connection_info: Rc::new(Mutex::new(None)),
+            config: Rc::new(Mutex::new(config)),
             last_fetch_status_update: Instant::now(),
             status_animation_running: false,
             status_animation_message: String::new(),
@@ -999,7 +1000,11 @@ impl MainWindow {
         let weak_state_for_execute = Rc::downgrade(&state);
         execute_btn.set_callback(move |_| {
             if let Some(state_for_execute) = weak_state_for_execute.upgrade() {
-                state_for_execute.borrow().sql_editor.execute_current();
+                state_for_execute
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .execute_current();
             }
         });
 
@@ -1013,28 +1018,32 @@ impl MainWindow {
         let weak_state_for_explain = Rc::downgrade(&state);
         explain_btn.set_callback(move |_| {
             if let Some(state_for_explain) = weak_state_for_explain.upgrade() {
-                state_for_explain.borrow().sql_editor.explain_current();
+                state_for_explain
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .explain_current();
             }
         });
 
         let weak_state_for_clear_btn = Rc::downgrade(&state);
         clear_btn.set_callback(move |_| {
             if let Some(state_for_clear_btn) = weak_state_for_clear_btn.upgrade() {
-                state_for_clear_btn.borrow().sql_editor.clear();
+                state_for_clear_btn.lock().unwrap().sql_editor.clear();
             }
         });
 
         let weak_state_for_commit = Rc::downgrade(&state);
         commit_btn.set_callback(move |_| {
             if let Some(state_for_commit) = weak_state_for_commit.upgrade() {
-                state_for_commit.borrow().sql_editor.commit();
+                state_for_commit.lock().unwrap().sql_editor.commit();
             }
         });
 
         let weak_state_for_rollback = Rc::downgrade(&state);
         rollback_btn.set_callback(move |_| {
             if let Some(state_for_rollback) = weak_state_for_rollback.upgrade() {
-                state_for_rollback.borrow().sql_editor.rollback();
+                state_for_rollback.lock().unwrap().sql_editor.rollback();
             }
         });
 
@@ -1043,11 +1052,15 @@ impl MainWindow {
             let Some(state_for_result_close) = weak_state_for_result_close.upgrade() else {
                 return;
             };
-            if state_for_result_close.borrow().is_any_query_running() {
+            if state_for_result_close
+                .lock()
+                .unwrap()
+                .is_any_query_running()
+            {
                 fltk::dialog::alert_default("A query is running. Stop it before closing tabs.");
                 return;
             }
-            let mut s = state_for_result_close.borrow_mut();
+            let mut s = state_for_result_close.lock().unwrap();
             if s.result_tabs.close_current_tab() {
                 // A result tab drop can release large row buffers.
                 // Ask allocator to return free pages promptly.
@@ -1061,11 +1074,15 @@ impl MainWindow {
             let Some(state_for_result_clear) = weak_state_for_result_clear.upgrade() else {
                 return;
             };
-            if state_for_result_clear.borrow().is_any_query_running() {
+            if state_for_result_clear
+                .lock()
+                .unwrap()
+                .is_any_query_running()
+            {
                 fltk::dialog::alert_default("A query is running. Stop it before clearing tabs.");
                 return;
             }
-            let mut s = state_for_result_clear.borrow_mut();
+            let mut s = state_for_result_clear.lock().unwrap();
             let had_tabs = s.result_tabs.tab_count() > 0;
             s.result_tabs.clear();
             if had_tabs {
@@ -1079,7 +1096,7 @@ impl MainWindow {
             let Some(state_for_query_close) = weak_state_for_query_close.upgrade() else {
                 return;
             };
-            let tab_id = state_for_query_close.borrow().active_editor_tab_id;
+            let tab_id = state_for_query_close.lock().unwrap().active_editor_tab_id;
             MainWindow::close_query_editor_tab(&state_for_query_close, tab_id);
             app::redraw();
         });
@@ -1087,7 +1104,7 @@ impl MainWindow {
         let weak_state_for_tab_select = Rc::downgrade(&state);
         query_tabs.set_on_select(move |tab_id| {
             if let Some(state_for_tab_select) = weak_state_for_tab_select.upgrade() {
-                if let Ok(mut s) = state_for_tab_select.try_borrow_mut() {
+                if let Ok(mut s) = state_for_tab_select.try_lock() {
                     if s.set_active_editor_tab(tab_id) {
                         s.sql_editor.focus();
                     }
@@ -1096,7 +1113,7 @@ impl MainWindow {
         });
 
         {
-            let mut state_borrow = state.borrow_mut();
+            let mut state_borrow = state.lock().unwrap();
             Self::adjust_query_layout(&mut state_borrow);
             Self::apply_font_settings(&mut state_borrow);
         }
@@ -1116,9 +1133,9 @@ impl MainWindow {
         Self { state }
     }
 
-    fn open_query_history_dialog(state: &Rc<RefCell<AppState>>) {
+    fn open_query_history_dialog(state: &Rc<Mutex<AppState>>) {
         let (mut buffer, mut editor, popups) = {
-            let s = state.borrow_mut();
+            let s = state.lock().unwrap();
             (
                 s.sql_buffer.clone(),
                 s.sql_editor.get_editor(),
@@ -1138,7 +1155,7 @@ impl MainWindow {
             editor.set_insert_position(new_length);
             editor.show_insert_position();
 
-            state.borrow().sql_editor.refresh_highlighting();
+            state.lock().unwrap().sql_editor.refresh_highlighting();
         }
     }
 
@@ -1163,7 +1180,7 @@ impl MainWindow {
 
     fn apply_font_settings(state: &mut AppState) {
         let (unified_profile, ui_size, editor_size, result_size, result_cell_max_chars) = {
-            let config = state.config.borrow();
+            let config = state.config.lock().unwrap();
             (
                 font_settings::profile_by_name(&config.editor_font),
                 config.ui_font_size.clamp(8, 24) as i32,
@@ -1227,7 +1244,7 @@ impl MainWindow {
             menu.set_text_size(ui_size);
         }
 
-        for popup in state.popups.borrow_mut().iter_mut() {
+        for popup in state.popups.lock().unwrap().iter_mut() {
             popup.set_label_font(font);
             popup.set_label_size(ui_size);
             for mut child in popup.clone().into_iter() {
@@ -1353,11 +1370,12 @@ impl MainWindow {
         group.resizable(&editor_group);
         group.end();
         let inherited_intellisense = state.schema_intellisense_data.clone();
-        *editor.get_intellisense_data().borrow_mut() = inherited_intellisense;
+        *editor.get_intellisense_data().lock().unwrap() = inherited_intellisense;
         let inherited_highlight = state.schema_highlight_data.clone();
         editor
             .get_highlighter()
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .set_highlight_data(inherited_highlight);
         let buffer = editor.get_buffer();
         state.editor_tabs.push(QueryEditorTab {
@@ -1375,9 +1393,9 @@ impl MainWindow {
         Some(tab_id)
     }
 
-    fn close_query_editor_tab(state: &Rc<RefCell<AppState>>, tab_id: QueryTabId) -> bool {
+    fn close_query_editor_tab(state: &Rc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
         {
-            let s = state.borrow();
+            let s = state.lock().unwrap();
             let Some(index) = s.find_tab_index(tab_id) else {
                 return false;
             };
@@ -1394,7 +1412,7 @@ impl MainWindow {
         }
 
         let (created_tab_id, schema_sender, file_sender) = {
-            let mut s = state.borrow_mut();
+            let mut s = state.lock().unwrap();
             let Some(index) = s.find_tab_index(tab_id) else {
                 return false;
             };
@@ -1434,7 +1452,7 @@ impl MainWindow {
                 s.active_editor_tab_id = fallback_tab.tab_id;
                 s.sql_editor = fallback_tab.sql_editor;
                 s.sql_buffer = fallback_tab.sql_buffer;
-                *s.current_file.borrow_mut() = fallback_tab.current_file;
+                *s.current_file.lock().unwrap() = fallback_tab.current_file;
                 s.query_tabs.select(fallback_tab.tab_id);
                 s.refresh_window_title();
                 if was_active {
@@ -1449,7 +1467,7 @@ impl MainWindow {
                 s.active_editor_tab_id = 0;
                 s.sql_buffer = detached_editor.get_buffer();
                 s.sql_editor = detached_editor;
-                *s.current_file.borrow_mut() = None;
+                *s.current_file.lock().unwrap() = None;
                 s.refresh_window_title();
             }
 
@@ -1473,7 +1491,7 @@ impl MainWindow {
             if let Some(file_sender) = file_sender {
                 Self::attach_file_drop_callback(state, tab_id, file_sender);
             }
-            if let Ok(mut s) = state.try_borrow_mut() {
+            if let Ok(mut s) = state.try_lock() {
                 s.sql_editor.focus();
             }
         }
@@ -1506,10 +1524,11 @@ impl MainWindow {
         state.schema_highlight_data = combined_highlight.clone();
 
         for tab in &mut state.editor_tabs {
-            *tab.sql_editor.get_intellisense_data().borrow_mut() = data.clone();
+            *tab.sql_editor.get_intellisense_data().lock().unwrap() = data.clone();
             tab.sql_editor
                 .get_highlighter()
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .set_highlight_data(combined_highlight.clone());
             tab.sql_editor.refresh_highlighting();
         }
@@ -1572,12 +1591,13 @@ impl MainWindow {
     }
 
     fn attach_editor_callbacks(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         tab_id: QueryTabId,
         schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
     ) {
         let Some(mut editor) = state
-            .borrow()
+            .lock()
+            .unwrap()
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == tab_id)
@@ -1591,7 +1611,7 @@ impl MainWindow {
             let Some(state_for_execute) = weak_state_for_execute.upgrade() else {
                 return;
             };
-            let mut s = state_for_execute.borrow_mut();
+            let mut s = state_for_execute.lock().unwrap();
             let base_msg = if query_result.success {
                 format!(
                     "{} | Time: {:.3}s",
@@ -1612,7 +1632,7 @@ impl MainWindow {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
                 return;
             };
-            match state_for_status.try_borrow_mut() {
+            match state_for_status.try_lock() {
                 Ok(mut s) => {
                     s.set_status_message(message);
                 }
@@ -1626,7 +1646,7 @@ impl MainWindow {
                 return;
             };
             let (mut editor, mut buffer, popups) = {
-                let s = state_for_find.borrow();
+                let s = state_for_find.lock().unwrap();
                 (
                     s.sql_editor.get_editor(),
                     s.sql_buffer.clone(),
@@ -1642,7 +1662,7 @@ impl MainWindow {
                 return;
             };
             let (mut editor, mut buffer, popups) = {
-                let s = state_for_replace.borrow();
+                let s = state_for_replace.lock().unwrap();
                 (
                     s.sql_editor.get_editor(),
                     s.sql_buffer.clone(),
@@ -1658,7 +1678,7 @@ impl MainWindow {
             let Some(state_for_progress) = weak_state_for_progress.upgrade() else {
                 return;
             };
-            let mut s = state_for_progress.borrow_mut();
+            let mut s = state_for_progress.lock().unwrap();
             match progress {
                 QueryProgress::BatchStart => {
                     s.result_tab_offset = s.result_tabs.tab_count();
@@ -1723,7 +1743,7 @@ impl MainWindow {
                 }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
-                        *s.connection_info.borrow_mut() = Some(info.clone());
+                        *s.connection_info.lock().unwrap() = Some(info.clone());
                         s.set_status_message(&format!("Connected | {}", info.display_string()));
                         s.object_browser.refresh();
                         s.sql_editor.focus();
@@ -1782,7 +1802,7 @@ impl MainWindow {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                 return;
             };
-            match state_for_dirty.try_borrow_mut() {
+            match state_for_dirty.try_lock() {
                 Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
                 Err(_) => {}
             };
@@ -1790,12 +1810,13 @@ impl MainWindow {
     }
 
     fn attach_file_drop_callback(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         tab_id: QueryTabId,
         file_sender: std::sync::mpsc::Sender<FileActionResult>,
     ) {
         let Some(mut editor) = state
-            .borrow()
+            .lock()
+            .unwrap()
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == tab_id)
@@ -1807,11 +1828,11 @@ impl MainWindow {
         let file_sender_for_drop = file_sender.clone();
         editor.set_file_drop_callback(move |path| {
             if let Some(state_for_drop) = weak_state_for_file_drop.upgrade() {
-                let mut s = state_for_drop.borrow_mut();
+                let mut s = state_for_drop.lock().unwrap();
                 if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &path) {
                     return;
                 }
-                let conn_info = s.connection_info.borrow().clone();
+                let conn_info = s.connection_info.lock().unwrap().clone();
                 let file_label = path.file_name().unwrap_or_default().to_string_lossy();
                 s.status_bar.set_label(&format_status(
                     &format!("Opening {} in new tab", file_label),
@@ -1829,7 +1850,7 @@ impl MainWindow {
     }
 
     fn execute_menu_action(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
         conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -1838,13 +1859,13 @@ impl MainWindow {
         match choice {
             "File/Connect..." => {
                 let (popups, connection) = {
-                    let s = state.borrow();
+                    let s = state.lock().unwrap();
                     (s.popups.clone(), s.connection.clone())
                 };
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
                     let conn_sender = conn_sender.clone();
                     {
-                        let mut s = state.borrow_mut();
+                        let mut s = state.lock().unwrap();
                         s.status_bar
                             .set_label(&format!("Connecting to {}...", info.display_string()));
                     }
@@ -1881,14 +1902,14 @@ impl MainWindow {
                 true
             }
             "File/Disconnect" => {
-                let connection = state.borrow().connection.clone();
+                let connection = state.lock().unwrap().connection.clone();
                 let Some(mut db_conn) =
                     try_lock_connection_with_activity(&connection, "Disconnecting session")
                 else {
                     let busy_message = format_connection_busy_message();
                     fltk::dialog::alert_default(&busy_message);
-                    let mut s = state.borrow_mut();
-                    let conn_info = s.connection_info.borrow().clone();
+                    let mut s = state.lock().unwrap();
+                    let conn_info = s.connection_info.lock().unwrap().clone();
                     s.status_bar
                         .set_label(&format_status(&busy_message, &conn_info));
                     return true;
@@ -1905,7 +1926,7 @@ impl MainWindow {
                     }
                 }
 
-                let mut s = state.borrow_mut();
+                let mut s = state.lock().unwrap();
                 MainWindow::transition_to_disconnected_state(&mut s, None);
                 true
             }
@@ -1916,7 +1937,7 @@ impl MainWindow {
                 let filename = dialog.filename();
                 if !filename.as_os_str().is_empty() {
                     {
-                        let mut s = state.borrow_mut();
+                        let mut s = state.lock().unwrap();
                         if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &filename) {
                             return true;
                         }
@@ -1934,38 +1955,38 @@ impl MainWindow {
                 true
             }
             "File/Save SQL File..." => {
-                let tab_id = state.borrow().active_editor_tab_id;
+                let tab_id = state.lock().unwrap().active_editor_tab_id;
                 if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, false) {
                     fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
                 }
                 true
             }
             "File/Save SQL File As..." => {
-                let tab_id = state.borrow().active_editor_tab_id;
+                let tab_id = state.lock().unwrap().active_editor_tab_id;
                 if let SaveTabOutcome::Failed(err) = MainWindow::save_tab(state, tab_id, true) {
                     fltk::dialog::alert_default(&format!("Failed to save SQL file: {}", err));
                 }
                 true
             }
             "File/Exit" => {
-                let mut window = state.borrow().window.clone();
+                let mut window = state.lock().unwrap().window.clone();
                 window.do_callback();
                 true
             }
             "Edit/Undo" => {
-                state.borrow().sql_editor.undo();
+                state.lock().unwrap().sql_editor.undo();
                 true
             }
             "Edit/Redo" => {
-                state.borrow().sql_editor.redo();
+                state.lock().unwrap().sql_editor.redo();
                 true
             }
             "Edit/Cut" => {
-                state.borrow_mut().sql_editor.get_editor().cut();
+                state.lock().unwrap().sql_editor.get_editor().cut();
                 true
             }
             "Edit/Copy" => {
-                let mut s = state.borrow_mut();
+                let mut s = state.lock().unwrap();
                 let result_tabs_widget = s.result_tabs.get_widget();
                 let focus_in_results = if let Some(focus) = app::focus() {
                     focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
@@ -1976,7 +1997,7 @@ impl MainWindow {
 
                 if focus_in_results {
                     let cell_count = s.result_tabs.copy();
-                    let conn_info = s.connection_info.borrow().clone();
+                    let conn_info = s.connection_info.lock().unwrap().clone();
                     if cell_count > 0 {
                         s.status_bar.set_label(&format_status(
                             &format!("Copied {} cells to clipboard", cell_count),
@@ -1992,7 +2013,7 @@ impl MainWindow {
                 true
             }
             "Edit/Copy with Headers" => {
-                let mut s = state.borrow_mut();
+                let mut s = state.lock().unwrap();
                 let result_tabs_widget = s.result_tabs.get_widget();
                 let focus_in_results = if let Some(focus) = app::focus() {
                     focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
@@ -2003,7 +2024,7 @@ impl MainWindow {
 
                 if focus_in_results {
                     s.result_tabs.copy_with_headers();
-                    let conn_info = s.connection_info.borrow().clone();
+                    let conn_info = s.connection_info.lock().unwrap().clone();
                     s.status_bar
                         .set_label(&format_status("Copied selection with headers", &conn_info));
                 } else {
@@ -2012,11 +2033,11 @@ impl MainWindow {
                 true
             }
             "Edit/Paste" => {
-                state.borrow_mut().sql_editor.get_editor().paste();
+                state.lock().unwrap().sql_editor.get_editor().paste();
                 true
             }
             "Edit/Select All" => {
-                let mut s = state.borrow_mut();
+                let mut s = state.lock().unwrap();
                 let result_tabs_widget = s.result_tabs.get_widget();
                 let focus_in_results = if let Some(focus) = app::focus() {
                     focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
@@ -2034,12 +2055,12 @@ impl MainWindow {
                 true
             }
             "Query/Execute" => {
-                state.borrow_mut().sql_editor.execute_current();
+                state.lock().unwrap().sql_editor.execute_current();
                 true
             }
             "Query/New Tab" => {
                 let created_tab_id = {
-                    let mut s = state.borrow_mut();
+                    let mut s = state.lock().unwrap();
                     let created = MainWindow::create_query_editor_tab(&mut s);
                     s.right_tile.redraw();
                     created
@@ -2047,50 +2068,58 @@ impl MainWindow {
                 if let Some(tab_id) = created_tab_id {
                     MainWindow::attach_editor_callbacks(state, tab_id, schema_sender.clone());
                     MainWindow::attach_file_drop_callback(state, tab_id, file_sender.clone());
-                    state.borrow_mut().sql_editor.focus();
+                    state.lock().unwrap().sql_editor.focus();
                     app::redraw();
                 }
                 true
             }
             "Query/Close Tab" => {
-                let tab_id = state.borrow().active_editor_tab_id;
+                let tab_id = state.lock().unwrap().active_editor_tab_id;
                 MainWindow::close_query_editor_tab(state, tab_id);
                 true
             }
             "Query/Execute Statement" => {
-                state.borrow_mut().sql_editor.execute_statement_at_cursor();
+                state
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .execute_statement_at_cursor();
                 true
             }
             "Query/Execute Statement (F9)" => {
-                state.borrow_mut().sql_editor.execute_statement_at_cursor();
+                state
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .execute_statement_at_cursor();
                 true
             }
             "Query/Execute Selected" => {
-                state.borrow_mut().sql_editor.execute_selected();
+                state.lock().unwrap().sql_editor.execute_selected();
                 true
             }
             "Query/Quick Describe" => {
-                state.borrow_mut().sql_editor.quick_describe_at_cursor();
+                state.lock().unwrap().sql_editor.quick_describe_at_cursor();
                 true
             }
             "Query/Explain Plan" => {
-                state.borrow_mut().sql_editor.explain_current();
+                state.lock().unwrap().sql_editor.explain_current();
                 true
             }
             "Query/Commit" => {
-                state.borrow_mut().sql_editor.commit();
+                state.lock().unwrap().sql_editor.commit();
                 true
             }
             "Query/Rollback" => {
-                state.borrow_mut().sql_editor.rollback();
+                state.lock().unwrap().sql_editor.rollback();
                 true
             }
             "Tools/Refresh Objects" => {
-                state.borrow_mut().object_browser.refresh();
+                state.lock().unwrap().object_browser.refresh();
                 true
             }
             "Tools/Export Results..." => {
-                let has_data = state.borrow().result_tabs.has_data();
+                let has_data = state.lock().unwrap().result_tabs.has_data();
                 if !has_data {
                     fltk::dialog::alert_default("No results to export");
                     return true;
@@ -2104,8 +2133,8 @@ impl MainWindow {
                     return true;
                 }
 
-                let csv = state.borrow().result_tabs.export_to_csv();
-                let row_count = state.borrow().result_tabs.row_count();
+                let csv = state.lock().unwrap().result_tabs.export_to_csv();
+                let row_count = state.lock().unwrap().result_tabs.row_count();
                 let sender = file_sender.clone();
                 thread::spawn(move || {
                     let result = fs::write(&filename, csv).map_err(|err| err.to_string());
@@ -2120,7 +2149,7 @@ impl MainWindow {
             }
             "Edit/Find..." => {
                 let (mut editor, mut buffer, popups) = {
-                    let s = state.borrow_mut();
+                    let s = state.lock().unwrap();
                     (
                         s.sql_editor.get_editor(),
                         s.sql_buffer.clone(),
@@ -2132,7 +2161,7 @@ impl MainWindow {
             }
             "Edit/Find Next" => {
                 let (mut editor, mut buffer, popups) = {
-                    let s = state.borrow_mut();
+                    let s = state.lock().unwrap();
                     (
                         s.sql_editor.get_editor(),
                         s.sql_buffer.clone(),
@@ -2148,7 +2177,7 @@ impl MainWindow {
             }
             "Edit/Replace..." => {
                 let (mut editor, mut buffer, popups) = {
-                    let s = state.borrow_mut();
+                    let s = state.lock().unwrap();
                     (
                         s.sql_editor.get_editor(),
                         s.sql_buffer.clone(),
@@ -2159,23 +2188,31 @@ impl MainWindow {
                 true
             }
             "Edit/Format SQL" => {
-                state.borrow_mut().sql_editor.format_selected_sql();
+                state.lock().unwrap().sql_editor.format_selected_sql();
                 true
             }
             "Edit/Toggle Comment" => {
-                state.borrow_mut().sql_editor.toggle_comment();
+                state.lock().unwrap().sql_editor.toggle_comment();
                 true
             }
             "Edit/Uppercase Selection" => {
-                state.borrow_mut().sql_editor.convert_selection_case(true);
+                state
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .convert_selection_case(true);
                 true
             }
             "Edit/Lowercase Selection" => {
-                state.borrow_mut().sql_editor.convert_selection_case(false);
+                state
+                    .lock()
+                    .unwrap()
+                    .sql_editor
+                    .convert_selection_case(false);
                 true
             }
             "Edit/Intellisense" => {
-                state.borrow().sql_editor.show_intellisense();
+                state.lock().unwrap().sql_editor.show_intellisense();
                 true
             }
             "Tools/Query History..." => {
@@ -2183,7 +2220,7 @@ impl MainWindow {
                 true
             }
             "Tools/Application Log..." => {
-                let popups = state.borrow().popups.clone();
+                let popups = state.lock().unwrap().popups.clone();
                 crate::ui::log_viewer::LogViewerDialog::show(popups);
                 true
             }
@@ -2197,7 +2234,7 @@ impl MainWindow {
                     "Auto-commit disabled"
                 };
                 let connection = {
-                    let s = state.borrow();
+                    let s = state.lock().unwrap();
                     s.connection.clone()
                 };
                 if let Some(mut connection) =
@@ -2207,8 +2244,8 @@ impl MainWindow {
                 } else {
                     let busy_message = format_connection_busy_message();
                     fltk::dialog::alert_default(&busy_message);
-                    let mut s = state.borrow_mut();
-                    let conn_info = s.connection_info.borrow().clone();
+                    let mut s = state.lock().unwrap();
+                    let conn_info = s.connection_info.lock().unwrap().clone();
                     s.status_bar
                         .set_label(&format_status(&busy_message, &conn_info));
                     if let Some(mut item) = item.take() {
@@ -2220,21 +2257,21 @@ impl MainWindow {
                     }
                     return true;
                 }
-                let mut s = state.borrow_mut();
-                let conn_info = s.connection_info.borrow().clone();
+                let mut s = state.lock().unwrap();
+                let conn_info = s.connection_info.lock().unwrap().clone();
                 s.status_bar.set_label(&format_status(status, &conn_info));
                 true
             }
             "Settings/Preferences..." => {
                 let config_snapshot = {
-                    let s = state.borrow();
-                    let config_snapshot = s.config.borrow().clone();
+                    let s = state.lock().unwrap();
+                    let config_snapshot = s.config.lock().unwrap().clone();
                     config_snapshot
                 };
                 if let Some(settings) = show_settings_dialog(&config_snapshot) {
-                    let mut s = state.borrow_mut();
+                    let mut s = state.lock().unwrap();
                     let save_result = {
-                        let mut config = s.config.borrow_mut();
+                        let mut config = s.config.lock().unwrap();
                         config.editor_font = settings.font.clone();
                         config.ui_font_size = settings.ui_size;
                         config.editor_font_size = settings.editor_size;
@@ -2452,7 +2489,7 @@ impl MainWindow {
     }
 
     fn handle_window_shortcut(
-        state: &Rc<RefCell<AppState>>,
+        state: &Rc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
         conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -2475,7 +2512,8 @@ impl MainWindow {
         let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
 
         let tab_ids: Vec<QueryTabId> = state
-            .borrow()
+            .lock()
+            .unwrap()
             .editor_tabs
             .iter()
             .map(|tab| tab.tab_id)
@@ -2484,7 +2522,7 @@ impl MainWindow {
             Self::attach_editor_callbacks(&state, tab_id, schema_sender.clone());
         }
 
-        let mut state_borrow = state.borrow_mut();
+        let mut state_borrow = state.lock().unwrap();
 
         // Setup object browser callback
         let weak_state_for_browser_status = Rc::downgrade(&state);
@@ -2499,9 +2537,9 @@ impl MainWindow {
                 let mut should_retry_schema_sync = false;
                 let mut connection_for_retry: Option<SharedConnection> = None;
 
-                match state_for_status.try_borrow_mut() {
+                match state_for_status.try_lock() {
                     Ok(mut s) => {
-                        let conn_info = s.connection_info.borrow().clone();
+                        let conn_info = s.connection_info.lock().unwrap().clone();
                         s.status_bar.set_label(&format_status(message, &conn_info));
 
                         if message == "Object browser metadata refresh completed"
@@ -2538,7 +2576,7 @@ impl MainWindow {
             };
             let mut created_tab_for_generated_sql: Option<QueryTabId> = None;
             {
-                let mut s = state_for_browser.borrow_mut();
+                let mut s = state_for_browser.lock().unwrap();
                 match action {
                     SqlAction::Insert(text) => {
                         let mut editor = s.sql_editor.get_editor();
@@ -2576,7 +2614,7 @@ impl MainWindow {
                     tab_id,
                     file_sender_for_browser.clone(),
                 );
-                state_for_browser.borrow_mut().sql_editor.focus();
+                state_for_browser.lock().unwrap().sql_editor.focus();
                 app::redraw();
             }
         });
@@ -2617,7 +2655,7 @@ impl MainWindow {
                 }
                 fltk::enums::Event::Push => {
                     let sql_editor = {
-                        let s = state_for_window.borrow();
+                        let s = state_for_window.lock().unwrap();
                         s.sql_editor.clone()
                     };
                     sql_editor
@@ -2625,7 +2663,7 @@ impl MainWindow {
                     false
                 }
                 fltk::enums::Event::Resize => {
-                    if let Ok(s) = state_for_window.try_borrow() {
+                    if let Ok(s) = state_for_window.try_lock() {
                         MainWindow::adjust_query_layout_on_resize(&s);
                     }
                     false
@@ -2645,8 +2683,8 @@ impl MainWindow {
         );
     }
 
-    fn stop_health_check_worker(state: &Rc<RefCell<AppState>>) {
-        if let Some(stop_signal) = state.borrow_mut().health_stop_signal.take() {
+    fn stop_health_check_worker(state: &Rc<Mutex<AppState>>) {
+        if let Some(stop_signal) = state.lock().unwrap().health_stop_signal.take() {
             let _ = stop_signal.stop_sender.send(());
         }
     }
@@ -2709,25 +2747,25 @@ impl MainWindow {
         let state = self.state.clone();
 
         // Wrap receivers in Rc<RefCell> to share across timeout callbacks
-        let schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>> =
-            Rc::new(RefCell::new(schema_receiver));
-        let conn_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionResult>>> =
-            Rc::new(RefCell::new(conn_receiver));
-        let file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>> =
-            Rc::new(RefCell::new(file_receiver));
+        let schema_receiver: Rc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>> =
+            Rc::new(Mutex::new(schema_receiver));
+        let conn_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>> =
+            Rc::new(Mutex::new(conn_receiver));
+        let file_receiver: Rc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
+            Rc::new(Mutex::new(file_receiver));
         let (health_sender, health_receiver) = std::sync::mpsc::channel::<ConnectionHealthResult>();
-        let health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
-            Rc::new(RefCell::new(health_receiver));
-        let health_connection = state.borrow().connection.clone();
+        let health_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>> =
+            Rc::new(Mutex::new(health_receiver));
+        let health_connection = state.lock().unwrap().connection.clone();
         let stop_flag = MainWindow::start_health_check_worker(health_connection, health_sender);
-        state.borrow_mut().health_stop_signal = Some(stop_flag);
+        state.lock().unwrap().health_stop_signal = Some(stop_flag);
 
         fn schedule_poll(
-            schema_receiver: Rc<RefCell<std::sync::mpsc::Receiver<SchemaUpdate>>>,
-            conn_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionResult>>>,
-            file_receiver: Rc<RefCell<std::sync::mpsc::Receiver<FileActionResult>>>,
-            health_receiver: Rc<RefCell<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
-            state_weak: Weak<RefCell<AppState>>,
+            schema_receiver: Rc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
+            conn_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>>,
+            file_receiver: Rc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>>,
+            health_receiver: Rc<Mutex<std::sync::mpsc::Receiver<ConnectionHealthResult>>>,
+            state_weak: Weak<Mutex<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
         ) {
@@ -2742,9 +2780,9 @@ impl MainWindow {
 
             // Check for schema updates
             {
-                let r = schema_receiver.borrow();
+                let r = schema_receiver.lock().unwrap();
                 loop {
-                    let Ok(mut s) = state.try_borrow_mut() else {
+                    let Ok(mut s) = state.try_lock() else {
                         deferred_by_borrow_conflict = true;
                         break;
                     };
@@ -2773,9 +2811,9 @@ impl MainWindow {
 
             // Check for connection results
             {
-                let r = conn_receiver.borrow();
+                let r = conn_receiver.lock().unwrap();
                 loop {
-                    let Ok(mut s) = state.try_borrow_mut() else {
+                    let Ok(mut s) = state.try_lock() else {
                         deferred_by_borrow_conflict = true;
                         break;
                     };
@@ -2787,7 +2825,7 @@ impl MainWindow {
                                         "connection",
                                         &format!("Connected to {}", info.display_string()),
                                     );
-                                    *s.connection_info.borrow_mut() = Some(info.clone());
+                                    *s.connection_info.lock().unwrap() = Some(info.clone());
                                     s.status_bar.set_label(&format!(
                                         "Connected | {}",
                                         info.display_string()
@@ -2810,7 +2848,8 @@ impl MainWindow {
                                     });
                                 }
                                 ConnectionResult::Failure(err) => {
-                                    let current_connection = s.connection_info.borrow().clone();
+                                    let current_connection =
+                                        s.connection_info.lock().unwrap().clone();
                                     let current_connection_label = current_connection
                                         .as_ref()
                                         .map(|info| info.display_string());
@@ -2861,9 +2900,9 @@ impl MainWindow {
 
             // Check for file operations
             {
-                let r = file_receiver.borrow();
+                let r = file_receiver.lock().unwrap();
                 loop {
-                    let Ok(mut s) = state.try_borrow_mut() else {
+                    let Ok(mut s) = state.try_lock() else {
                         deferred_by_borrow_conflict = true;
                         break;
                     };
@@ -2906,7 +2945,7 @@ impl MainWindow {
                                     Ok(()) => {
                                         let file_label =
                                             path.file_name().unwrap_or_default().to_string_lossy();
-                                        let conn_info = s.connection_info.borrow().clone();
+                                        let conn_info = s.connection_info.lock().unwrap().clone();
                                         s.status_bar.set_label(&format_status(
                                             &format!(
                                                 "Exported {} rows to {}",
@@ -2937,7 +2976,7 @@ impl MainWindow {
                                     tab_id,
                                     file_sender.clone(),
                                 );
-                                state.borrow_mut().sql_editor.focus();
+                                state.lock().unwrap().sql_editor.focus();
                                 app::redraw();
                             }
                         }
@@ -2951,9 +2990,9 @@ impl MainWindow {
             }
 
             {
-                let r = health_receiver.borrow();
+                let r = health_receiver.lock().unwrap();
                 loop {
-                    let Ok(mut s) = state.try_borrow_mut() else {
+                    let Ok(mut s) = state.try_lock() else {
                         deferred_by_borrow_conflict = true;
                         break;
                     };
@@ -2987,7 +3026,9 @@ impl MainWindow {
                                         current_connection_state,
                                     );
 
-                                if should_apply_disconnect && s.connection_info.borrow().is_some() {
+                                if should_apply_disconnect
+                                    && s.connection_info.lock().unwrap().is_some()
+                                {
                                     MainWindow::transition_to_disconnected_state(
                                         &mut s,
                                         Some(&message),
@@ -3020,7 +3061,7 @@ impl MainWindow {
             }
 
             let health_worker_registered = state
-                .try_borrow()
+                .try_lock()
                 .map(|s| s.health_stop_signal.is_some())
                 .unwrap_or(true);
             if should_restart_health_check_worker(health_disconnected, health_worker_registered) {
@@ -3033,12 +3074,12 @@ impl MainWindow {
 
                 let (health_sender, new_health_receiver) =
                     std::sync::mpsc::channel::<ConnectionHealthResult>();
-                *health_receiver.borrow_mut() = new_health_receiver;
+                *health_receiver.lock().unwrap() = new_health_receiver;
 
-                let health_connection = state.borrow().connection.clone();
+                let health_connection = state.lock().unwrap().connection.clone();
                 let stop_flag =
                     MainWindow::start_health_check_worker(health_connection, health_sender);
-                if let Ok(mut s) = state.try_borrow_mut() {
+                if let Ok(mut s) = state.try_lock() {
                     s.health_stop_signal = Some(stop_flag);
                 }
             }
@@ -3066,7 +3107,7 @@ impl MainWindow {
         let weak_state_for_poll = Rc::downgrade(&state);
         let schema_sender_for_poll = schema_sender.clone();
         {
-            let mut s = state.borrow_mut();
+            let mut s = state.lock().unwrap();
             s.schema_sender = Some(schema_sender.clone());
             s.file_sender = Some(file_sender.clone());
         }
@@ -3081,7 +3122,8 @@ impl MainWindow {
         );
 
         let tab_ids_for_drop: Vec<QueryTabId> = state
-            .borrow()
+            .lock()
+            .unwrap()
             .editor_tabs
             .iter()
             .map(|tab| tab.tab_id)
@@ -3126,7 +3168,7 @@ impl MainWindow {
     pub fn show(&mut self) {
         let state = self.state.clone();
         let mut window = {
-            let s = state.borrow();
+            let s = state.lock().unwrap();
             s.window.clone()
         };
         let weak_state_for_close = Rc::downgrade(&state);
@@ -3137,14 +3179,14 @@ impl MainWindow {
                 }
                 MainWindow::stop_health_check_worker(&state);
                 let (popups, editor_tabs, mut result_tabs) = {
-                    let s = state.borrow();
+                    let s = state.lock().unwrap();
                     (
                         s.popups.clone(),
                         s.editor_tabs.clone(),
                         s.result_tabs.clone(),
                     )
                 };
-                let mut popups = popups.borrow_mut();
+                let mut popups = popups.lock().unwrap();
                 for mut popup in popups.drain(..) {
                     if popup.was_deleted() {
                         continue;
@@ -3172,7 +3214,7 @@ impl MainWindow {
         let _ = app::wait();
         MainWindow::stop_health_check_worker(&state);
         {
-            let mut s = state.borrow_mut();
+            let mut s = state.lock().unwrap();
             MainWindow::adjust_query_layout(&mut s);
             s.window.redraw();
             s.sql_editor.focus();
