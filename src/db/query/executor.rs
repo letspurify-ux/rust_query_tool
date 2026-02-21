@@ -4343,6 +4343,37 @@ FROM dual
         Ok(())
     }
 
+    pub fn start_dataguard_apply(conn: &Connection) -> Result<(), OracleError> {
+        conn.execute(
+            "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION",
+            &[],
+        )?;
+        Ok(())
+    }
+
+    pub fn stop_dataguard_apply(conn: &Connection) -> Result<(), OracleError> {
+        conn.execute("ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL", &[])?;
+        Ok(())
+    }
+
+    pub fn switchover_dataguard(
+        conn: &Connection,
+        target_db_unique_name: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_dataguard_switchover_sql(target_db_unique_name)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn failover_dataguard(
+        conn: &Connection,
+        target_db_unique_name: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_dataguard_failover_sql(target_db_unique_name)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
     pub fn get_tablespace_usage_snapshot(
         conn: &Connection,
         warn_pct: u32,
@@ -4765,6 +4796,147 @@ ORDER BY
         Ok(normalized_tokens.join(" "))
     }
 
+    fn normalize_required_password(value: &str) -> Result<String, OracleError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Self::invalid_security_input_error("Password is required"));
+        }
+        if trimmed.chars().any(|ch| ch.is_control() || ch == '"' || ch == '\'') {
+            return Err(Self::invalid_security_input_error(
+                "Password cannot contain control characters, single quote, or double quote",
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn normalize_scheduler_job_type(value: &str) -> Result<String, OracleError> {
+        let normalized = value.trim().to_uppercase();
+        if normalized.is_empty() {
+            return Err(Self::invalid_security_input_error("Job type is required"));
+        }
+        if !matches!(
+            normalized.as_str(),
+            "PLSQL_BLOCK" | "STORED_PROCEDURE" | "EXECUTABLE"
+        ) {
+            return Err(Self::invalid_security_input_error(
+                "Job type must be one of: PLSQL_BLOCK, STORED_PROCEDURE, EXECUTABLE",
+            ));
+        }
+        Ok(normalized)
+    }
+
+    fn normalize_required_non_empty_text(
+        value: &str,
+        field_name: &str,
+        max_len: usize,
+    ) -> Result<String, OracleError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} is required",
+                field_name
+            )));
+        }
+        if trimmed.len() > max_len {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be {} characters or less",
+                field_name, max_len
+            )));
+        }
+        if trimmed.chars().any(|ch| ch.is_control()) {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} cannot contain control characters",
+                field_name
+            )));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    fn normalize_optional_non_empty_text(
+        value: Option<&str>,
+        field_name: &str,
+        max_len: usize,
+    ) -> Result<Option<String>, OracleError> {
+        let Some(raw) = value else {
+            return Ok(None);
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        Self::normalize_required_non_empty_text(raw, field_name, max_len).map(Some)
+    }
+
+    fn normalized_optional_text_or_empty(
+        value: Option<&str>,
+        field_name: &str,
+        max_len: usize,
+    ) -> Result<String, OracleError> {
+        Ok(Self::normalize_optional_non_empty_text(value, field_name, max_len)?
+            .unwrap_or_default())
+    }
+
+    fn build_create_user_sql(
+        username: &str,
+        password: &str,
+        default_tablespace: Option<&str>,
+        temporary_tablespace: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let normalized_password = Self::normalize_required_password(password)?;
+        let normalized_default_tablespace =
+            Self::normalize_optional_security_identifier(default_tablespace, "Default tablespace")?;
+        let normalized_temporary_tablespace = Self::normalize_optional_security_identifier(
+            temporary_tablespace,
+            "Temporary tablespace",
+        )?;
+        let normalized_profile =
+            Self::normalize_optional_security_identifier(profile, "Profile")?;
+
+        let mut sql = format!("CREATE USER {normalized_user} IDENTIFIED BY \"{normalized_password}\"");
+        if let Some(default_ts) = normalized_default_tablespace.as_deref() {
+            sql.push_str(&format!(" DEFAULT TABLESPACE {default_ts}"));
+        }
+        if let Some(temp_ts) = normalized_temporary_tablespace.as_deref() {
+            sql.push_str(&format!(" TEMPORARY TABLESPACE {temp_ts}"));
+        }
+        if let Some(profile_name) = normalized_profile.as_deref() {
+            sql.push_str(&format!(" PROFILE {profile_name}"));
+        }
+        Ok(sql)
+    }
+
+    fn build_drop_user_sql(username: &str, cascade: bool) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        if cascade {
+            Ok(format!("DROP USER {normalized_user} CASCADE"))
+        } else {
+            Ok(format!("DROP USER {normalized_user}"))
+        }
+    }
+
+    fn build_create_role_sql(role_name: &str) -> Result<String, OracleError> {
+        let normalized_role = Self::normalize_required_security_identifier(role_name, "Role")?;
+        Ok(format!("CREATE ROLE {normalized_role}"))
+    }
+
+    fn build_drop_role_sql(role_name: &str) -> Result<String, OracleError> {
+        let normalized_role = Self::normalize_required_security_identifier(role_name, "Role")?;
+        Ok(format!("DROP ROLE {normalized_role}"))
+    }
+
+    fn build_dataguard_switchover_sql(target_db_unique_name: &str) -> Result<String, OracleError> {
+        let normalized_target =
+            Self::normalize_required_security_identifier(target_db_unique_name, "Target")?;
+        Ok(format!("ALTER DATABASE SWITCHOVER TO {normalized_target}"))
+    }
+
+    fn build_dataguard_failover_sql(target_db_unique_name: &str) -> Result<String, OracleError> {
+        let normalized_target =
+            Self::normalize_required_security_identifier(target_db_unique_name, "Target")?;
+        Ok(format!("ALTER DATABASE FAILOVER TO {normalized_target}"))
+    }
+
     pub fn get_scheduler_jobs_snapshot(
         conn: &Connection,
         owner_filter: Option<&str>,
@@ -5016,6 +5188,369 @@ WHERE ROWNUM <= 200
         let force_number: i64 = if force { 1 } else { 0 };
         stmt.bind("job_name", &qualified_name)?;
         stmt.bind("force", &force_number)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn create_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        job_type: &str,
+        job_action: &str,
+        repeat_interval: Option<&str>,
+        comments: Option<&str>,
+        enabled: bool,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
+        let normalized_job_type = Self::normalize_scheduler_job_type(job_type)?;
+        let normalized_job_action =
+            Self::normalize_required_non_empty_text(job_action, "Job action", 4000)?;
+        let normalized_repeat_interval =
+            Self::normalized_optional_text_or_empty(repeat_interval, "Repeat interval", 4000)?;
+        let normalized_comments =
+            Self::normalized_optional_text_or_empty(comments, "Comments", 4000)?;
+        let enabled_literal = if enabled { "TRUE" } else { "FALSE" };
+        let block = format!(
+            "BEGIN \
+DBMS_SCHEDULER.CREATE_JOB(\
+job_name => :job_name,\
+job_type => :job_type,\
+job_action => :job_action,\
+repeat_interval => NULLIF(:repeat_interval, ''),\
+enabled => {enabled_literal},\
+comments => NULLIF(:comments, '')\
+); \
+END;"
+        );
+        let mut stmt = conn.statement(&block).build()?;
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.bind("job_type", &normalized_job_type)?;
+        stmt.bind("job_action", &normalized_job_action)?;
+        stmt.bind("repeat_interval", &normalized_repeat_interval)?;
+        stmt.bind("comments", &normalized_comments)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn alter_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        job_action: Option<&str>,
+        repeat_interval: Option<&str>,
+        comments: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
+        let normalized_job_action =
+            Self::normalize_optional_non_empty_text(job_action, "Job action", 4000)?;
+        let normalized_repeat_interval =
+            Self::normalize_optional_non_empty_text(repeat_interval, "Repeat interval", 4000)?;
+        let normalized_comments = Self::normalize_optional_non_empty_text(comments, "Comments", 4000)?;
+        if normalized_job_action.is_none()
+            && normalized_repeat_interval.is_none()
+            && normalized_comments.is_none()
+            && enabled.is_none()
+        {
+            return Err(Self::invalid_security_input_error(
+                "At least one scheduler job attribute must be provided",
+            ));
+        }
+
+        if let Some(job_action_value) = normalized_job_action.as_deref() {
+            let mut stmt = conn
+                .statement(
+                    "BEGIN DBMS_SCHEDULER.SET_ATTRIBUTE(name => :job_name, attribute => 'job_action', value => :value); END;",
+                )
+                .build()?;
+            stmt.bind("job_name", &qualified_name)?;
+            stmt.bind("value", &job_action_value)?;
+            stmt.execute(&[])?;
+        }
+
+        if let Some(repeat_interval_value) = normalized_repeat_interval.as_deref() {
+            let mut stmt = conn
+                .statement(
+                    "BEGIN DBMS_SCHEDULER.SET_ATTRIBUTE(name => :job_name, attribute => 'repeat_interval', value => :value); END;",
+                )
+                .build()?;
+            stmt.bind("job_name", &qualified_name)?;
+            stmt.bind("value", &repeat_interval_value)?;
+            stmt.execute(&[])?;
+        }
+
+        if let Some(comment_value) = normalized_comments.as_deref() {
+            let mut stmt = conn
+                .statement(
+                    "BEGIN DBMS_SCHEDULER.SET_ATTRIBUTE(name => :job_name, attribute => 'comments', value => :value); END;",
+                )
+                .build()?;
+            stmt.bind("job_name", &qualified_name)?;
+            stmt.bind("value", &comment_value)?;
+            stmt.execute(&[])?;
+        }
+
+        if let Some(enabled_flag) = enabled {
+            if enabled_flag {
+                Self::enable_scheduler_job(conn, owner, job_name)?;
+            } else {
+                Self::disable_scheduler_job(conn, owner, job_name, true)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_datapump_jobs_snapshot(
+        conn: &Connection,
+        owner_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let owner_filter =
+            Self::normalize_optional_security_identifier(owner_filter, "Owner filter")?;
+        let dba_where = owner_filter
+            .as_deref()
+            .map(|owner| format!("WHERE owner_name = '{owner}'"))
+            .unwrap_or_default();
+
+        let sql_dba = format!(
+            r#"
+SELECT
+    owner_name AS owner,
+    job_name,
+    operation,
+    job_mode,
+    state,
+    TO_CHAR(attached_sessions) AS attached_sessions,
+    TO_CHAR(datapump_sessions) AS datapump_sessions
+FROM dba_datapump_jobs
+{dba_where}
+ORDER BY owner_name, job_name
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let user_where = owner_filter
+            .as_deref()
+            .map(|owner| format!("WHERE USER = '{owner}'"))
+            .unwrap_or_default();
+
+        let sql_user = format!(
+            r#"
+SELECT
+    USER AS owner,
+    job_name,
+    operation,
+    job_mode,
+    state,
+    TO_CHAR(attached_sessions) AS attached_sessions,
+    TO_CHAR(datapump_sessions) AS datapump_sessions
+FROM user_datapump_jobs
+{user_where}
+ORDER BY job_name
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn start_datapump_export_job(
+        conn: &Connection,
+        job_name: &str,
+        directory: &str,
+        dump_file: &str,
+        log_file: &str,
+        schema_name: &str,
+    ) -> Result<(), OracleError> {
+        Self::start_datapump_job(
+            conn,
+            "EXPORT",
+            job_name,
+            directory,
+            dump_file,
+            log_file,
+            Some(schema_name),
+        )
+    }
+
+    pub fn start_datapump_import_job(
+        conn: &Connection,
+        job_name: &str,
+        directory: &str,
+        dump_file: &str,
+        log_file: &str,
+        schema_name: Option<&str>,
+    ) -> Result<(), OracleError> {
+        Self::start_datapump_job(
+            conn,
+            "IMPORT",
+            job_name,
+            directory,
+            dump_file,
+            log_file,
+            schema_name,
+        )
+    }
+
+    fn start_datapump_job(
+        conn: &Connection,
+        operation: &str,
+        job_name: &str,
+        directory: &str,
+        dump_file: &str,
+        log_file: &str,
+        schema_name: Option<&str>,
+    ) -> Result<(), OracleError> {
+        let normalized_operation = operation.trim().to_uppercase();
+        if !matches!(normalized_operation.as_str(), "EXPORT" | "IMPORT") {
+            return Err(Self::invalid_security_input_error(
+                "Data Pump operation must be EXPORT or IMPORT",
+            ));
+        }
+        let normalized_job_name =
+            Self::normalize_required_security_identifier(job_name, "Data Pump job")?;
+        let normalized_directory =
+            Self::normalize_required_security_identifier(directory, "Directory")?;
+        let normalized_dump_file =
+            Self::normalize_required_non_empty_text(dump_file, "Dump file", 255)?;
+        let normalized_log_file =
+            Self::normalize_required_non_empty_text(log_file, "Log file", 255)?;
+        let normalized_schema = Self::normalize_optional_security_identifier(schema_name, "Schema")?;
+        let schema_expr = normalized_schema
+            .as_deref()
+            .map(|schema| format!("IN ('{schema}')"))
+            .unwrap_or_default();
+
+        let mut stmt = conn
+            .statement(
+                "DECLARE h1 NUMBER; \
+BEGIN \
+h1 := DBMS_DATAPUMP.OPEN(operation => :operation, job_mode => 'SCHEMA', job_name => :job_name, version => 'COMPATIBLE'); \
+DBMS_DATAPUMP.ADD_FILE(handle => h1, filename => :dump_file, directory => :directory, filetype => DBMS_DATAPUMP.KU$_FILE_TYPE_DUMP_FILE); \
+DBMS_DATAPUMP.ADD_FILE(handle => h1, filename => :log_file, directory => :directory, filetype => DBMS_DATAPUMP.KU$_FILE_TYPE_LOG_FILE); \
+IF :schema_expr IS NOT NULL THEN \
+    DBMS_DATAPUMP.METADATA_FILTER(handle => h1, name => 'SCHEMA_EXPR', value => :schema_expr); \
+END IF; \
+DBMS_DATAPUMP.START_JOB(h1); \
+DBMS_DATAPUMP.DETACH(h1); \
+END;",
+            )
+            .build()?;
+        stmt.bind("operation", &normalized_operation)?;
+        stmt.bind("job_name", &normalized_job_name)?;
+        stmt.bind("dump_file", &normalized_dump_file)?;
+        stmt.bind("directory", &normalized_directory)?;
+        stmt.bind("log_file", &normalized_log_file)?;
+        stmt.bind("schema_expr", &schema_expr)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn stop_datapump_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        immediate: bool,
+    ) -> Result<(), OracleError> {
+        let normalized_owner = Self::normalize_optional_security_identifier(owner, "Owner")?;
+        let normalized_job_name =
+            Self::normalize_required_security_identifier(job_name, "Data Pump job")?;
+        let immediate_number: i64 = if immediate { 1 } else { 0 };
+
+        if let Some(owner_name) = normalized_owner.as_deref() {
+            let mut stmt = conn
+                .statement(
+                    "DECLARE h1 NUMBER; \
+BEGIN \
+h1 := DBMS_DATAPUMP.ATTACH(job_name => :job_name, job_owner => :job_owner); \
+DBMS_DATAPUMP.STOP_JOB(h1, immediate => :immediate, keep_master => 1); \
+DBMS_DATAPUMP.DETACH(h1); \
+END;",
+                )
+                .build()?;
+            stmt.bind("job_name", &normalized_job_name)?;
+            stmt.bind("job_owner", &owner_name)?;
+            stmt.bind("immediate", &immediate_number)?;
+            stmt.execute(&[])?;
+            return Ok(());
+        }
+
+        let mut stmt = conn
+            .statement(
+                "DECLARE h1 NUMBER; \
+BEGIN \
+h1 := DBMS_DATAPUMP.ATTACH(job_name => :job_name); \
+DBMS_DATAPUMP.STOP_JOB(h1, immediate => :immediate, keep_master => 1); \
+DBMS_DATAPUMP.DETACH(h1); \
+END;",
+            )
+            .build()?;
+        stmt.bind("job_name", &normalized_job_name)?;
+        stmt.bind("immediate", &immediate_number)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn run_rman_backup_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        backup_script: &str,
+    ) -> Result<(), OracleError> {
+        let normalized_script =
+            Self::normalize_required_non_empty_text(backup_script, "Backup script", 3000)?;
+        let shell_command = format!(
+            "rman target / <<'SPACE_QUERY_RMAN'\n{}\nEXIT\nSPACE_QUERY_RMAN",
+            normalized_script
+        );
+        Self::create_and_run_shell_job(conn, owner, job_name, &shell_command)
+    }
+
+    pub fn run_rman_restore_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        restore_script: &str,
+    ) -> Result<(), OracleError> {
+        let normalized_script =
+            Self::normalize_required_non_empty_text(restore_script, "Restore script", 3000)?;
+        let shell_command = format!(
+            "rman target / <<'SPACE_QUERY_RMAN'\n{}\nEXIT\nSPACE_QUERY_RMAN",
+            normalized_script
+        );
+        Self::create_and_run_shell_job(conn, owner, job_name, &shell_command)
+    }
+
+    fn create_and_run_shell_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        shell_command: &str,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
+        let normalized_command =
+            Self::normalize_required_non_empty_text(shell_command, "Shell command", 3000)?;
+        let mut stmt = conn
+            .statement(
+                "BEGIN \
+DBMS_SCHEDULER.CREATE_JOB(\
+job_name => :job_name,\
+job_type => 'EXECUTABLE',\
+job_action => '/bin/sh',\
+number_of_arguments => 2,\
+enabled => FALSE,\
+auto_drop => FALSE\
+); \
+DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE(job_name => :job_name, argument_position => 1, argument_value => '-lc'); \
+DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE(job_name => :job_name, argument_position => 2, argument_value => :command); \
+DBMS_SCHEDULER.ENABLE(name => :job_name); \
+DBMS_SCHEDULER.RUN_JOB(job_name => :job_name, use_current_session => FALSE); \
+END;",
+            )
+            .build()?;
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.bind("command", &normalized_command)?;
         stmt.execute(&[])?;
         Ok(())
     }
@@ -5359,6 +5894,43 @@ ORDER BY profile, resource_type, resource_name
         Ok(())
     }
 
+    pub fn create_user(
+        conn: &Connection,
+        username: &str,
+        password: &str,
+        default_tablespace: Option<&str>,
+        temporary_tablespace: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_create_user_sql(
+            username,
+            password,
+            default_tablespace,
+            temporary_tablespace,
+            profile,
+        )?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn drop_user(conn: &Connection, username: &str, cascade: bool) -> Result<(), OracleError> {
+        let sql = Self::build_drop_user_sql(username, cascade)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn create_role(conn: &Connection, role_name: &str) -> Result<(), OracleError> {
+        let sql = Self::build_create_role_sql(role_name)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn drop_role(conn: &Connection, role_name: &str) -> Result<(), OracleError> {
+        let sql = Self::build_drop_role_sql(role_name)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
     fn build_grant_role_sql(role_name: &str, username: &str) -> Result<String, OracleError> {
         let normalized_role = Self::normalize_required_security_identifier(role_name, "Role")?;
         let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
@@ -5594,6 +6166,58 @@ mod dba_feature_tests {
         let result =
             QueryExecutor::normalize_scheduler_qualified_job_name(Some("HR"), "JOB;DROP_TABLE");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_create_user_sql_with_optional_clauses() {
+        let sql = QueryExecutor::build_create_user_sql(
+            "app_user",
+            "AppPass123",
+            Some("users"),
+            Some("temp"),
+            Some("default"),
+        )
+        .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(
+            sql,
+            "CREATE USER APP_USER IDENTIFIED BY \"AppPass123\" DEFAULT TABLESPACE USERS TEMPORARY TABLESPACE TEMP PROFILE DEFAULT"
+        );
+    }
+
+    #[test]
+    fn build_drop_user_sql_supports_cascade() {
+        let sql = QueryExecutor::build_drop_user_sql("app_user", true)
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(sql, "DROP USER APP_USER CASCADE");
+    }
+
+    #[test]
+    fn build_role_ddl_sql_normalizes_identifier() {
+        let create_sql = QueryExecutor::build_create_role_sql("app_role")
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        let drop_sql = QueryExecutor::build_drop_role_sql("app_role")
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(create_sql, "CREATE ROLE APP_ROLE");
+        assert_eq!(drop_sql, "DROP ROLE APP_ROLE");
+    }
+
+    #[test]
+    fn normalize_scheduler_job_type_rejects_invalid_value() {
+        let invalid = QueryExecutor::normalize_scheduler_job_type("WINDOW");
+        assert!(invalid.is_err());
+        let valid = QueryExecutor::normalize_scheduler_job_type("plsql_block")
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(valid, "PLSQL_BLOCK");
+    }
+
+    #[test]
+    fn build_dataguard_sql_validates_target_name() {
+        let switchover = QueryExecutor::build_dataguard_switchover_sql("standby01")
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        let failover = QueryExecutor::build_dataguard_failover_sql("standby01")
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(switchover, "ALTER DATABASE SWITCHOVER TO STANDBY01");
+        assert_eq!(failover, "ALTER DATABASE FAILOVER TO STANDBY01");
     }
 }
 

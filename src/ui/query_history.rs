@@ -1,8 +1,9 @@
 use fltk::{
     app,
     browser::HoldBrowser,
-    button::Button,
+    button::{Button, CheckButton},
     enums::FrameType,
+    input::Input,
     group::Flex,
     prelude::*,
     text::{StyleTableEntry, TextBuffer, TextDisplay},
@@ -512,6 +513,7 @@ impl QueryHistoryDialog {
     pub fn show_with_registry(popups: Arc<Mutex<Vec<Window>>>) -> Option<String> {
         enum DialogMessage {
             UpdatePreview(usize),
+            FilterChanged,
             UseSelected,
             ClearHistory,
             Close,
@@ -548,22 +550,26 @@ impl QueryHistoryDialog {
         list_label.set_label_color(theme::text_primary());
         list_flex.fixed(&list_label, LABEL_ROW_HEIGHT);
 
+        let mut filter_row = Flex::default();
+        filter_row.set_type(fltk::group::FlexType::Row);
+        filter_row.set_spacing(DIALOG_SPACING);
+
+        let mut search_input = Input::default();
+        search_input.set_color(theme::input_bg());
+        search_input.set_text_color(theme::text_primary());
+        search_input.set_tooltip("Filter by SQL text, connection, timestamp, or error");
+        filter_row.fixed(&search_input, 224);
+
+        let mut failed_only_check = CheckButton::default().with_label("Failed only");
+        failed_only_check.set_label_color(theme::text_primary());
+        filter_row.fixed(&failed_only_check, 114);
+
+        filter_row.end();
+        list_flex.fixed(&filter_row, INPUT_ROW_HEIGHT);
+
         let mut browser = HoldBrowser::default();
         browser.set_color(theme::input_bg());
         browser.set_selection_color(theme::selection_strong());
-
-        // Populate browser with history entries
-        for entry in snapshot.iter() {
-            let color_prefix = if entry.success { "@C255 " } else { "@C1 " };
-            let display = format!(
-                "{color_prefix}{} | {} | {}ms | {} rows",
-                entry.timestamp,
-                truncate_sql(&entry.sql, 50),
-                entry.execution_time_ms,
-                entry.row_count
-            );
-            browser.add(&display);
-        }
 
         list_flex.end();
         content_flex.fixed(&list_flex, 350);
@@ -656,6 +662,20 @@ impl QueryHistoryDialog {
         // State for selected query
         let selected_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let queries: Arc<Mutex<Vec<QueryHistoryEntry>>> = Arc::new(Mutex::new(snapshot));
+        let filtered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let query_snapshot = queries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            populate_history_browser(
+                &query_snapshot,
+                &mut browser,
+                &filtered_indices,
+                &search_input.value(),
+                failed_only_check.value(),
+            );
+        }
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
 
@@ -669,6 +689,18 @@ impl QueryHistoryDialog {
                     app::awake();
                 }
             }
+        });
+
+        let sender_for_filter = sender.clone();
+        search_input.set_callback(move |_| {
+            let _ = sender_for_filter.send(DialogMessage::FilterChanged);
+            app::awake();
+        });
+
+        let sender_for_failed_only = sender.clone();
+        failed_only_check.set_callback(move |_| {
+            let _ = sender_for_failed_only.send(DialogMessage::FilterChanged);
+            app::awake();
         });
 
         // Use Query button
@@ -706,10 +738,16 @@ impl QueryHistoryDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(index) => {
+                        let entry_index = {
+                            let filtered = filtered_indices
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            filtered.get(index).copied()
+                        };
                         let queries = queries
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if let Some(entry) = queries.get(index) {
+                        if let Some(entry) = entry_index.and_then(|idx| queries.get(idx)) {
                             preview_buffer.set_text(&entry.sql);
                             let styles = build_preview_styles(&entry.sql, entry.error_line);
                             preview_style_buffer.set_text(&styles);
@@ -729,14 +767,39 @@ impl QueryHistoryDialog {
                             preview_flex_for_error.layout();
                         }
                     }
+                    DialogMessage::FilterChanged => {
+                        let query_snapshot = queries
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        populate_history_browser(
+                            &query_snapshot,
+                            &mut browser,
+                            &filtered_indices,
+                            &search_input.value(),
+                            failed_only_check.value(),
+                        );
+                        preview_buffer.set_text("");
+                        preview_style_buffer.set_text("");
+                        error_buffer.set_text("");
+                        error_display.hide();
+                        error_label.hide();
+                        preview_flex_for_error.layout();
+                    }
                     DialogMessage::UseSelected => {
                         let selected = browser.value();
                         if selected > 0 {
                             if let Ok(idx) = usize::try_from(selected - 1) {
+                                let entry_index = {
+                                    let filtered = filtered_indices
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    filtered.get(idx).copied()
+                                };
                                 let queries = queries
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Some(entry) = queries.get(idx) {
+                                if let Some(entry) = entry_index.and_then(|actual| queries.get(actual))
+                                {
                                     *selected_sql
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -763,7 +826,16 @@ impl QueryHistoryDialog {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clear();
-                                    browser.clear();
+                                    let query_snapshot = queries
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    populate_history_browser(
+                                        &query_snapshot,
+                                        &mut browser,
+                                        &filtered_indices,
+                                        &search_input.value(),
+                                        failed_only_check.value(),
+                                    );
                                     preview_buffer.set_text("");
                                     preview_style_buffer.set_text("");
                                     error_buffer.set_text("");
@@ -884,9 +956,80 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 }
 
+fn history_entry_matches_filter(
+    entry: &QueryHistoryEntry,
+    search_lower: &str,
+    failed_only: bool,
+) -> bool {
+    if failed_only && entry.success {
+        return false;
+    }
+
+    if search_lower.is_empty() {
+        return true;
+    }
+
+    let sql = entry.sql.to_ascii_lowercase();
+    if sql.contains(search_lower) {
+        return true;
+    }
+
+    let connection = entry.connection_name.to_ascii_lowercase();
+    if connection.contains(search_lower) {
+        return true;
+    }
+
+    let timestamp = entry.timestamp.to_ascii_lowercase();
+    if timestamp.contains(search_lower) {
+        return true;
+    }
+
+    match entry.error_message.as_deref() {
+        Some(message) => message.to_ascii_lowercase().contains(search_lower),
+        None => false,
+    }
+}
+
+fn history_entry_display(entry: &QueryHistoryEntry) -> String {
+    let color_prefix = if entry.success { "@C255 " } else { "@C1 " };
+    format!(
+        "{color_prefix}{} | {} | {}ms | {} rows",
+        entry.timestamp,
+        truncate_sql(&entry.sql, 50),
+        entry.execution_time_ms,
+        entry.row_count
+    )
+}
+
+fn populate_history_browser(
+    entries: &[QueryHistoryEntry],
+    browser: &mut HoldBrowser,
+    filtered_indices: &Arc<Mutex<Vec<usize>>>,
+    search_text: &str,
+    failed_only: bool,
+) {
+    let search_lower = search_text.trim().to_ascii_lowercase();
+    browser.clear();
+
+    let mut indices = filtered_indices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    indices.clear();
+
+    for (index, entry) in entries.iter().enumerate() {
+        if history_entry_matches_filter(entry, &search_lower, failed_only) {
+            browser.add(&history_entry_display(entry));
+            indices.push(index);
+        }
+    }
+}
+
 #[cfg(test)]
 mod query_history_tests {
-    use super::{sanitize_history_message, sanitize_history_sql, truncate_sql, REDACTED_SECRET};
+    use super::{
+        history_entry_matches_filter, sanitize_history_message, sanitize_history_sql, truncate_sql,
+        QueryHistoryEntry, REDACTED_SECRET,
+    };
 
     #[test]
     fn truncate_sql_preserves_multibyte_text_while_normalizing_whitespace() {
@@ -951,5 +1094,48 @@ mod query_history_tests {
         let sanitized = sanitize_history_message(message);
         assert!(sanitized.contains(&format!("alice:{}@", REDACTED_SECRET)));
         assert!(!sanitized.contains("pa55"));
+    }
+
+    #[test]
+    fn history_filter_matches_sql_and_connection() {
+        let entry = QueryHistoryEntry {
+            sql: "SELECT * FROM employees".to_string(),
+            timestamp: "2026-02-21 10:00:00".to_string(),
+            execution_time_ms: 10,
+            row_count: 1,
+            connection_name: "HRDEV".to_string(),
+            success: true,
+            error_message: None,
+            error_line: None,
+        };
+        assert!(history_entry_matches_filter(&entry, "employees", false));
+        assert!(history_entry_matches_filter(&entry, "hrdev", false));
+        assert!(!history_entry_matches_filter(&entry, "orders", false));
+    }
+
+    #[test]
+    fn history_filter_failed_only_excludes_success_rows() {
+        let success_entry = QueryHistoryEntry {
+            sql: "SELECT 1".to_string(),
+            timestamp: "2026-02-21 10:00:00".to_string(),
+            execution_time_ms: 5,
+            row_count: 1,
+            connection_name: "DEV".to_string(),
+            success: true,
+            error_message: None,
+            error_line: None,
+        };
+        let failed_entry = QueryHistoryEntry {
+            sql: "BROKEN".to_string(),
+            timestamp: "2026-02-21 11:00:00".to_string(),
+            execution_time_ms: 5,
+            row_count: 0,
+            connection_name: "DEV".to_string(),
+            success: false,
+            error_message: Some("ORA-00900 invalid SQL statement".to_string()),
+            error_line: Some(1),
+        };
+        assert!(!history_entry_matches_filter(&success_entry, "", true));
+        assert!(history_entry_matches_filter(&failed_entry, "", true));
     }
 }

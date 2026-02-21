@@ -2,17 +2,18 @@ use fltk::{
     app,
     button::{Button, CheckButton},
     draw::set_cursor,
-    enums::{Align, Cursor, FrameType},
+    enums::{Align, CallbackTrigger, Cursor, FrameType},
     frame::Frame,
     group::{Flex, FlexType},
-    input::{Input, IntInput},
+    input::{Input, IntInput, SecretInput},
+    menu::Choice,
     prelude::*,
     window::Window,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::db::{
     format_connection_busy_message, try_lock_connection_with_activity, QueryExecutor, QueryResult,
@@ -1485,6 +1486,23 @@ impl SqlEditorWidget {
                 owner_text: String,
                 failed_only: bool,
             },
+            CreateRequested {
+                owner_text: String,
+                job_text: String,
+                job_type_text: String,
+                job_action_text: String,
+                repeat_interval_text: String,
+                comments_text: String,
+                enabled: bool,
+            },
+            AlterRequested {
+                owner_text: String,
+                job_text: String,
+                job_action_text: String,
+                repeat_interval_text: String,
+                comments_text: String,
+                enabled_state: Option<bool>,
+            },
             HistoryRequested {
                 owner_text: String,
                 job_text: String,
@@ -1505,6 +1523,27 @@ impl SqlEditorWidget {
                 owner_text: String,
                 job_text: String,
             },
+            DataPumpJobsRequested {
+                owner_text: String,
+            },
+            DataPumpExportRequested {
+                job_text: String,
+                directory_text: String,
+                dump_file_text: String,
+                log_file_text: String,
+                schema_text: String,
+            },
+            DataPumpImportRequested {
+                job_text: String,
+                directory_text: String,
+                dump_file_text: String,
+                log_file_text: String,
+                schema_text: String,
+            },
+            DataPumpStopRequested {
+                owner_text: String,
+                job_text: String,
+            },
             JobsLoaded {
                 request_id: u64,
                 failed_only: bool,
@@ -1514,7 +1553,12 @@ impl SqlEditorWidget {
                 request_id: u64,
                 result: Result<QueryResult, String>,
             },
+            DataPumpJobsLoaded {
+                request_id: u64,
+                result: Result<QueryResult, String>,
+            },
             ActionFinished(Result<String, String>),
+            DataPumpActionFinished(Result<String, String>),
             CloseRequested,
         }
 
@@ -1631,6 +1675,51 @@ impl SqlEditorWidget {
         button_row.end();
         root.fixed(&button_row, BUTTON_ROW_HEIGHT + 4);
 
+        let mut admin_row = Flex::default();
+        admin_row.set_type(FlexType::Row);
+        admin_row.set_spacing(DIALOG_SPACING);
+
+        let mut create_job_btn = Button::default().with_label("Create Job");
+        create_job_btn.set_color(theme::button_success());
+        create_job_btn.set_label_color(theme::text_primary());
+        create_job_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&create_job_btn, BUTTON_WIDTH_LARGE + 12);
+
+        let mut alter_job_btn = Button::default().with_label("Alter Job");
+        alter_job_btn.set_color(theme::button_secondary());
+        alter_job_btn.set_label_color(theme::text_primary());
+        alter_job_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&alter_job_btn, BUTTON_WIDTH_LARGE + 8);
+
+        let mut dp_jobs_btn = Button::default().with_label("Data Pump Jobs");
+        dp_jobs_btn.set_color(theme::button_secondary());
+        dp_jobs_btn.set_label_color(theme::text_primary());
+        dp_jobs_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&dp_jobs_btn, BUTTON_WIDTH_LARGE + 34);
+
+        let mut dp_export_btn = Button::default().with_label("DP Export");
+        dp_export_btn.set_color(theme::button_secondary());
+        dp_export_btn.set_label_color(theme::text_primary());
+        dp_export_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&dp_export_btn, BUTTON_WIDTH_LARGE + 6);
+
+        let mut dp_import_btn = Button::default().with_label("DP Import");
+        dp_import_btn.set_color(theme::button_secondary());
+        dp_import_btn.set_label_color(theme::text_primary());
+        dp_import_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&dp_import_btn, BUTTON_WIDTH_LARGE + 6);
+
+        let mut dp_stop_btn = Button::default().with_label("DP Stop");
+        dp_stop_btn.set_color(theme::button_warning());
+        dp_stop_btn.set_label_color(theme::text_primary());
+        dp_stop_btn.set_frame(FrameType::RFlatBox);
+        admin_row.fixed(&dp_stop_btn, BUTTON_WIDTH_LARGE);
+
+        let admin_filler = Frame::default();
+        admin_row.resizable(&admin_filler);
+        admin_row.end();
+        root.fixed(&admin_row, BUTTON_ROW_HEIGHT + 4);
+
         let mut result_table =
             ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 210);
         result_table.set_max_cell_display_chars(320);
@@ -1667,6 +1756,191 @@ impl SqlEditorWidget {
             let _ = sender_history.send(SchedulerMessage::HistoryRequested {
                 owner_text: owner_input_for_history.value(),
                 job_text: job_input_for_history.value(),
+            });
+            app::awake();
+        });
+
+        let sender_create = sender.clone();
+        let owner_input_for_create = owner_input.clone();
+        let job_input_for_create = job_input.clone();
+        create_job_btn.set_callback(move |_| {
+            let job_type = match prompt_optional_text("Scheduler job type", "PLSQL_BLOCK") {
+                Some(value) if !value.trim().is_empty() => value,
+                Some(_) => "PLSQL_BLOCK".to_string(),
+                None => return,
+            };
+            let Some(job_action) = prompt_optional_text("Scheduler job action", "BEGIN NULL; END;")
+            else {
+                return;
+            };
+            let repeat_interval =
+                prompt_optional_text("Repeat interval (optional)", "").unwrap_or_default();
+            let comments = prompt_optional_text("Comments (optional)", "").unwrap_or_default();
+            let enabled_choice = fltk::dialog::choice2_default(
+                "Enable job immediately?",
+                "Cancel",
+                "Enable",
+                "Create disabled",
+            );
+            let enabled = match enabled_choice {
+                Some(1) => true,
+                Some(2) => false,
+                _ => return,
+            };
+
+            let _ = sender_create.send(SchedulerMessage::CreateRequested {
+                owner_text: owner_input_for_create.value(),
+                job_text: job_input_for_create.value(),
+                job_type_text: job_type,
+                job_action_text: job_action,
+                repeat_interval_text: repeat_interval,
+                comments_text: comments,
+                enabled,
+            });
+            app::awake();
+        });
+
+        let sender_alter = sender.clone();
+        let owner_input_for_alter = owner_input.clone();
+        let job_input_for_alter = job_input.clone();
+        alter_job_btn.set_callback(move |_| {
+            let Some(job_action) =
+                prompt_optional_text("New job action (blank = no change)", "")
+            else {
+                return;
+            };
+            let Some(repeat_interval) =
+                prompt_optional_text("New repeat interval (blank = no change)", "")
+            else {
+                return;
+            };
+            let Some(comments) = prompt_optional_text("New comments (blank = no change)", "")
+            else {
+                return;
+            };
+            let enabled_choice = fltk::dialog::choice2_default(
+                "Enabled state change",
+                "Skip",
+                "Enable",
+                "Disable",
+            );
+            let enabled_state = match enabled_choice {
+                Some(1) => Some(true),
+                Some(2) => Some(false),
+                _ => None,
+            };
+
+            let _ = sender_alter.send(SchedulerMessage::AlterRequested {
+                owner_text: owner_input_for_alter.value(),
+                job_text: job_input_for_alter.value(),
+                job_action_text: job_action,
+                repeat_interval_text: repeat_interval,
+                comments_text: comments,
+                enabled_state,
+            });
+            app::awake();
+        });
+
+        let sender_dp_jobs = sender.clone();
+        let owner_input_for_dp_jobs = owner_input.clone();
+        dp_jobs_btn.set_callback(move |_| {
+            let _ = sender_dp_jobs.send(SchedulerMessage::DataPumpJobsRequested {
+                owner_text: owner_input_for_dp_jobs.value(),
+            });
+            app::awake();
+        });
+
+        let sender_dp_export = sender.clone();
+        let job_input_for_dp_export = job_input.clone();
+        let owner_input_for_dp_export = owner_input.clone();
+        dp_export_btn.set_callback(move |_| {
+            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR") else {
+                return;
+            };
+            let current_job = job_input_for_dp_export.value();
+            let base_job_name = if current_job.trim().is_empty() {
+                "DP_EXPORT_JOB".to_string()
+            } else {
+                current_job.trim().to_string()
+            };
+            let dump_default = format!("{}.dmp", base_job_name.to_lowercase());
+            let log_default = format!("{}.log", base_job_name.to_lowercase());
+            let Some(dump_file) = prompt_optional_text("Dump file", &dump_default) else {
+                return;
+            };
+            let Some(log_file) = prompt_optional_text("Log file", &log_default) else {
+                return;
+            };
+            let owner_hint = owner_input_for_dp_export.value();
+            let schema_default = if owner_hint.trim().is_empty() {
+                String::new()
+            } else {
+                owner_hint.trim().to_string()
+            };
+            let Some(schema_name) = prompt_optional_text("Schema name", &schema_default) else {
+                return;
+            };
+
+            let _ = sender_dp_export.send(SchedulerMessage::DataPumpExportRequested {
+                job_text: base_job_name,
+                directory_text: directory,
+                dump_file_text: dump_file,
+                log_file_text: log_file,
+                schema_text: schema_name,
+            });
+            app::awake();
+        });
+
+        let sender_dp_import = sender.clone();
+        let job_input_for_dp_import = job_input.clone();
+        let owner_input_for_dp_import = owner_input.clone();
+        dp_import_btn.set_callback(move |_| {
+            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR") else {
+                return;
+            };
+            let current_job = job_input_for_dp_import.value();
+            let base_job_name = if current_job.trim().is_empty() {
+                "DP_IMPORT_JOB".to_string()
+            } else {
+                current_job.trim().to_string()
+            };
+            let dump_default = format!("{}.dmp", base_job_name.to_lowercase());
+            let log_default = format!("{}.log", base_job_name.to_lowercase());
+            let Some(dump_file) = prompt_optional_text("Dump file", &dump_default) else {
+                return;
+            };
+            let Some(log_file) = prompt_optional_text("Log file", &log_default) else {
+                return;
+            };
+            let owner_hint = owner_input_for_dp_import.value();
+            let schema_default = if owner_hint.trim().is_empty() {
+                String::new()
+            } else {
+                owner_hint.trim().to_string()
+            };
+            let Some(schema_name) =
+                prompt_optional_text("Schema name (optional for full import)", &schema_default)
+            else {
+                return;
+            };
+
+            let _ = sender_dp_import.send(SchedulerMessage::DataPumpImportRequested {
+                job_text: base_job_name,
+                directory_text: directory,
+                dump_file_text: dump_file,
+                log_file_text: log_file,
+                schema_text: schema_name,
+            });
+            app::awake();
+        });
+
+        let sender_dp_stop = sender.clone();
+        let owner_input_for_dp_stop = owner_input.clone();
+        let job_input_for_dp_stop = job_input.clone();
+        dp_stop_btn.set_callback(move |_| {
+            let _ = sender_dp_stop.send(SchedulerMessage::DataPumpStopRequested {
+                owner_text: owner_input_for_dp_stop.value(),
+                job_text: job_input_for_dp_stop.value(),
             });
             app::awake();
         });
@@ -1733,6 +2007,7 @@ impl SqlEditorWidget {
 
         let mut latest_jobs_request_id = 0u64;
         let mut latest_history_request_id = 0u64;
+        let mut latest_datapump_request_id = 0u64;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
 
         while dialog.shown() {
@@ -1785,6 +2060,157 @@ impl SqlEditorWidget {
                                 failed_only,
                                 result,
                             });
+                            app::awake();
+                        });
+                    }
+                    SchedulerMessage::CreateRequested {
+                        owner_text,
+                        job_text,
+                        job_type_text,
+                        job_action_text,
+                        repeat_interval_text,
+                        comments_text,
+                        enabled,
+                    } => {
+                        let owner = match normalize_optional_identifier(&owner_text, "Owner") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let job_name = match normalize_required_identifier(&job_text, "Job") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let qualified = qualified_owner_object(owner.as_deref(), &job_name);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Create scheduler job {}?", qualified),
+                            "Cancel",
+                            "Create",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Creating {}...", qualified));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Creating scheduler job {}", qualified),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::create_scheduler_job(
+                                        db_conn.as_ref(),
+                                        owner.as_deref(),
+                                        &job_name,
+                                        &job_type_text,
+                                        &job_action_text,
+                                        normalize_optional_text_param(&repeat_interval_text)
+                                            .as_deref(),
+                                        normalize_optional_text_param(&comments_text).as_deref(),
+                                        enabled,
+                                    )
+                                    .map(|_| format!("Scheduler job {} created", qualified))
+                                    .map_err(|err| {
+                                        format!("Failed to create scheduler job {}: {err}", qualified)
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ = sender_result.send(SchedulerMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SchedulerMessage::AlterRequested {
+                        owner_text,
+                        job_text,
+                        job_action_text,
+                        repeat_interval_text,
+                        comments_text,
+                        enabled_state,
+                    } => {
+                        let owner = match normalize_optional_identifier(&owner_text, "Owner") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let job_name = match normalize_required_identifier(&job_text, "Job") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let job_action = normalize_optional_text_param(&job_action_text);
+                        let repeat_interval = normalize_optional_text_param(&repeat_interval_text);
+                        let comments = normalize_optional_text_param(&comments_text);
+                        if job_action.is_none()
+                            && repeat_interval.is_none()
+                            && comments.is_none()
+                            && enabled_state.is_none()
+                        {
+                            fltk::dialog::alert_default(
+                                "At least one attribute change is required for ALTER.",
+                            );
+                            continue;
+                        }
+
+                        let qualified = qualified_owner_object(owner.as_deref(), &job_name);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Alter scheduler job {}?", qualified),
+                            "Cancel",
+                            "Alter",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Altering {}...", qualified));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Altering scheduler job {}", qualified),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::alter_scheduler_job(
+                                        db_conn.as_ref(),
+                                        owner.as_deref(),
+                                        &job_name,
+                                        job_action.as_deref(),
+                                        repeat_interval.as_deref(),
+                                        comments.as_deref(),
+                                        enabled_state,
+                                    )
+                                    .map(|_| format!("Scheduler job {} altered", qualified))
+                                    .map_err(|err| {
+                                        format!("Failed to alter scheduler job {}: {err}", qualified)
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ = sender_result.send(SchedulerMessage::ActionFinished(result));
                             app::awake();
                         });
                     }
@@ -2095,6 +2521,245 @@ impl SqlEditorWidget {
                             app::awake();
                         });
                     }
+                    SchedulerMessage::DataPumpJobsRequested { owner_text } => {
+                        let owner_filter = match normalize_optional_identifier(&owner_text, "Owner")
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        latest_datapump_request_id =
+                            latest_datapump_request_id.saturating_add(1);
+                        let request_id = latest_datapump_request_id;
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label("Loading Data Pump jobs...");
+                        result_table.display_result(&dba_info_result("Loading Data Pump jobs..."));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                "Loading Data Pump jobs",
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::get_datapump_jobs_snapshot(
+                                        db_conn.as_ref(),
+                                        owner_filter.as_deref(),
+                                    )
+                                    .map_err(|err| format!("Failed to load Data Pump jobs: {err}")),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ = sender_result.send(SchedulerMessage::DataPumpJobsLoaded {
+                                request_id,
+                                result,
+                            });
+                            app::awake();
+                        });
+                    }
+                    SchedulerMessage::DataPumpExportRequested {
+                        job_text,
+                        directory_text,
+                        dump_file_text,
+                        log_file_text,
+                        schema_text,
+                    } => {
+                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let schema_name =
+                            match normalize_required_identifier(&schema_text, "Schema") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Start Data Pump export job {}?", job_name),
+                            "Cancel",
+                            "Start",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Starting Data Pump export {}...", job_name));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Starting Data Pump export {}", job_name),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::start_datapump_export_job(
+                                        db_conn.as_ref(),
+                                        &job_name,
+                                        &directory_text,
+                                        &dump_file_text,
+                                        &log_file_text,
+                                        &schema_name,
+                                    )
+                                    .map(|_| format!("Data Pump export job {} started", job_name))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to start Data Pump export job {}: {err}",
+                                            job_name
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ =
+                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SchedulerMessage::DataPumpImportRequested {
+                        job_text,
+                        directory_text,
+                        dump_file_text,
+                        log_file_text,
+                        schema_text,
+                    } => {
+                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let schema_name = normalize_optional_text_param(&schema_text);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Start Data Pump import job {}?", job_name),
+                            "Cancel",
+                            "Start",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Starting Data Pump import {}...", job_name));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Starting Data Pump import {}", job_name),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::start_datapump_import_job(
+                                        db_conn.as_ref(),
+                                        &job_name,
+                                        &directory_text,
+                                        &dump_file_text,
+                                        &log_file_text,
+                                        schema_name.as_deref(),
+                                    )
+                                    .map(|_| format!("Data Pump import job {} started", job_name))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to start Data Pump import job {}: {err}",
+                                            job_name
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ =
+                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SchedulerMessage::DataPumpStopRequested {
+                        owner_text,
+                        job_text,
+                    } => {
+                        let owner = match normalize_optional_identifier(&owner_text, "Owner") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let qualified = qualified_owner_object(owner.as_deref(), &job_name);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Stop Data Pump job {}?", qualified),
+                            "Cancel",
+                            "Stop",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Stopping Data Pump {}...", qualified));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Stopping Data Pump job {}", qualified),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::stop_datapump_job(
+                                        db_conn.as_ref(),
+                                        owner.as_deref(),
+                                        &job_name,
+                                        true,
+                                    )
+                                    .map(|_| format!("Data Pump job {} stop requested", qualified))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to stop Data Pump job {}: {err}",
+                                            qualified
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+                            let _ =
+                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            app::awake();
+                        });
+                    }
                     SchedulerMessage::JobsLoaded {
                         request_id,
                         failed_only,
@@ -2156,6 +2821,34 @@ impl SqlEditorWidget {
                             }
                         }
                     }
+                    SchedulerMessage::DataPumpJobsLoaded { request_id, result } => {
+                        if request_id != latest_datapump_request_id {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Default);
+                        app::flush();
+
+                        match result {
+                            Ok(snapshot) => {
+                                result_table.display_result(&snapshot);
+                                last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+                                status.set_label(&format!(
+                                    "Loaded {} Data Pump jobs in {} ms",
+                                    snapshot.row_count,
+                                    snapshot.execution_time.as_millis()
+                                ));
+                            }
+                            Err(err) => {
+                                result_table.display_result(&dba_info_result(&format!(
+                                    "Data Pump job load failed. {}\nTip: DBA_DATAPUMP_JOBS privilege may be required.",
+                                    err
+                                )));
+                                last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+                                status.set_label("Data Pump job load failed");
+                            }
+                        }
+                    }
                     SchedulerMessage::ActionFinished(result) => {
                         set_cursor(Cursor::Default);
                         app::flush();
@@ -2171,6 +2864,24 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Scheduler action failed");
+                                fltk::dialog::alert_default(&err);
+                            }
+                        }
+                    }
+                    SchedulerMessage::DataPumpActionFinished(result) => {
+                        set_cursor(Cursor::Default);
+                        app::flush();
+
+                        match result {
+                            Ok(message) => {
+                                status.set_label(&message);
+                                let _ = sender.send(SchedulerMessage::DataPumpJobsRequested {
+                                    owner_text: owner_input.value(),
+                                });
+                                app::awake();
+                            }
+                            Err(err) => {
+                                status.set_label("Data Pump action failed");
                                 fltk::dialog::alert_default(&err);
                             }
                         }
@@ -2229,6 +2940,23 @@ impl SqlEditorWidget {
             SetProfileRequested {
                 user_text: String,
                 profile_text: String,
+            },
+            CreateUserRequested {
+                user_text: String,
+                password_text: String,
+                default_tablespace_text: String,
+                temporary_tablespace_text: String,
+                profile_text: String,
+            },
+            DropUserRequested {
+                user_text: String,
+                cascade: bool,
+            },
+            CreateRoleRequested {
+                role_text: String,
+            },
+            DropRoleRequested {
+                role_text: String,
             },
             ExpirePasswordRequested {
                 user_text: String,
@@ -2321,6 +3049,41 @@ impl SqlEditorWidget {
         input_row.end();
         root.fixed(&input_row, INPUT_ROW_HEIGHT);
 
+        let mut quick_row = Flex::default();
+        quick_row.set_type(FlexType::Row);
+        quick_row.set_spacing(DIALOG_SPACING);
+
+        let mut quick_label = Frame::default().with_label("Quick:");
+        quick_label.set_label_color(theme::text_primary());
+        quick_label.set_align(Align::Inside | Align::Left);
+        quick_row.fixed(&quick_label, 46);
+
+        let mut quick_action_choice = Choice::default();
+        quick_action_choice.set_color(theme::input_bg());
+        quick_action_choice.set_text_color(theme::text_primary());
+        quick_action_choice.add_choice(
+            "Grant Role|Revoke Role|Grant Sys Priv|Revoke Sys Priv|Set Profile|Lock User|Unlock User|Expire Password|Create User|Drop User|Create Role|Drop Role",
+        );
+        quick_action_choice.set_value(0);
+        quick_row.fixed(&quick_action_choice, 220);
+
+        let mut quick_run_btn = Button::default().with_label("Run Quick Action");
+        quick_run_btn.set_color(theme::button_primary());
+        quick_run_btn.set_label_color(theme::text_primary());
+        quick_run_btn.set_frame(FrameType::RFlatBox);
+        quick_row.fixed(&quick_run_btn, BUTTON_WIDTH_LARGE + 42);
+
+        let quick_filler = Frame::default();
+        quick_row.resizable(&quick_filler);
+        quick_row.end();
+        root.fixed(&quick_row, BUTTON_ROW_HEIGHT + 4);
+
+        let mut quick_hint = Frame::default()
+            .with_label("Hint: select user row, choose action, then run quick action.");
+        quick_hint.set_label_color(theme::text_secondary());
+        quick_hint.set_align(Align::Left | Align::Inside);
+        root.fixed(&quick_hint, LABEL_ROW_HEIGHT);
+
         let mut view_row = Flex::default();
         view_row.set_type(FlexType::Row);
         view_row.set_spacing(DIALOG_SPACING);
@@ -2367,72 +3130,105 @@ impl SqlEditorWidget {
         view_row.end();
         root.fixed(&view_row, BUTTON_ROW_HEIGHT + 4);
 
-        let mut action_row = Flex::default();
-        action_row.set_type(FlexType::Row);
-        action_row.set_spacing(DIALOG_SPACING);
+        let mut action_row_primary = Flex::default();
+        action_row_primary.set_type(FlexType::Row);
+        action_row_primary.set_spacing(DIALOG_SPACING);
 
         let mut grant_btn = Button::default().with_label("Grant Role");
         grant_btn.set_color(theme::button_success());
         grant_btn.set_label_color(theme::text_primary());
         grant_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&grant_btn, BUTTON_WIDTH_LARGE + 10);
+        action_row_primary.fixed(&grant_btn, BUTTON_WIDTH_LARGE + 10);
 
         let mut revoke_btn = Button::default().with_label("Revoke Role");
         revoke_btn.set_color(theme::button_warning());
         revoke_btn.set_label_color(theme::text_primary());
         revoke_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&revoke_btn, BUTTON_WIDTH_LARGE + 16);
+        action_row_primary.fixed(&revoke_btn, BUTTON_WIDTH_LARGE + 16);
 
         let mut grant_sys_btn = Button::default().with_label("Grant Sys Priv");
         grant_sys_btn.set_color(theme::button_success());
         grant_sys_btn.set_label_color(theme::text_primary());
         grant_sys_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&grant_sys_btn, BUTTON_WIDTH_LARGE + 26);
+        action_row_primary.fixed(&grant_sys_btn, BUTTON_WIDTH_LARGE + 26);
 
         let mut revoke_sys_btn = Button::default().with_label("Revoke Sys Priv");
         revoke_sys_btn.set_color(theme::button_warning());
         revoke_sys_btn.set_label_color(theme::text_primary());
         revoke_sys_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&revoke_sys_btn, BUTTON_WIDTH_LARGE + 32);
+        action_row_primary.fixed(&revoke_sys_btn, BUTTON_WIDTH_LARGE + 32);
 
         let mut set_profile_btn = Button::default().with_label("Set Profile");
         set_profile_btn.set_color(theme::button_secondary());
         set_profile_btn.set_label_color(theme::text_primary());
         set_profile_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&set_profile_btn, BUTTON_WIDTH_LARGE + 14);
-
-        let mut lock_user_btn = Button::default().with_label("Lock User");
-        lock_user_btn.set_color(theme::button_warning());
-        lock_user_btn.set_label_color(theme::text_primary());
-        lock_user_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&lock_user_btn, BUTTON_WIDTH_LARGE + 4);
-
-        let mut unlock_user_btn = Button::default().with_label("Unlock User");
-        unlock_user_btn.set_color(theme::button_secondary());
-        unlock_user_btn.set_label_color(theme::text_primary());
-        unlock_user_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&unlock_user_btn, BUTTON_WIDTH_LARGE + 12);
+        action_row_primary.fixed(&set_profile_btn, BUTTON_WIDTH_LARGE + 14);
 
         let mut expire_password_btn = Button::default().with_label("Expire Password");
         expire_password_btn.set_color(theme::button_warning());
         expire_password_btn.set_label_color(theme::text_primary());
         expire_password_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&expire_password_btn, BUTTON_WIDTH_LARGE + 28);
+        action_row_primary.fixed(&expire_password_btn, BUTTON_WIDTH_LARGE + 28);
 
-        let action_filler = Frame::default();
-        action_row.resizable(&action_filler);
+        let action_primary_filler = Frame::default();
+        action_row_primary.resizable(&action_primary_filler);
+        action_row_primary.end();
+        root.fixed(&action_row_primary, BUTTON_ROW_HEIGHT + 4);
+
+        let mut action_row_secondary = Flex::default();
+        action_row_secondary.set_type(FlexType::Row);
+        action_row_secondary.set_spacing(DIALOG_SPACING);
+
+        let mut create_user_btn = Button::default().with_label("Create User");
+        create_user_btn.set_color(theme::button_success());
+        create_user_btn.set_label_color(theme::text_primary());
+        create_user_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&create_user_btn, BUTTON_WIDTH_LARGE + 18);
+
+        let mut drop_user_btn = Button::default().with_label("Drop User");
+        drop_user_btn.set_color(theme::button_danger());
+        drop_user_btn.set_label_color(theme::text_primary());
+        drop_user_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&drop_user_btn, BUTTON_WIDTH_LARGE + 12);
+
+        let mut create_role_btn = Button::default().with_label("Create Role");
+        create_role_btn.set_color(theme::button_success());
+        create_role_btn.set_label_color(theme::text_primary());
+        create_role_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&create_role_btn, BUTTON_WIDTH_LARGE + 16);
+
+        let mut drop_role_btn = Button::default().with_label("Drop Role");
+        drop_role_btn.set_color(theme::button_danger());
+        drop_role_btn.set_label_color(theme::text_primary());
+        drop_role_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&drop_role_btn, BUTTON_WIDTH_LARGE + 10);
+
+        let mut lock_user_btn = Button::default().with_label("Lock User");
+        lock_user_btn.set_color(theme::button_warning());
+        lock_user_btn.set_label_color(theme::text_primary());
+        lock_user_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&lock_user_btn, BUTTON_WIDTH_LARGE + 4);
+
+        let mut unlock_user_btn = Button::default().with_label("Unlock User");
+        unlock_user_btn.set_color(theme::button_secondary());
+        unlock_user_btn.set_label_color(theme::text_primary());
+        unlock_user_btn.set_frame(FrameType::RFlatBox);
+        action_row_secondary.fixed(&unlock_user_btn, BUTTON_WIDTH_LARGE + 12);
+
+        let action_secondary_filler = Frame::default();
+        action_row_secondary.resizable(&action_secondary_filler);
 
         let mut close_btn = Button::default().with_label("Close");
         close_btn.set_color(theme::button_subtle());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
-        action_row.fixed(&close_btn, BUTTON_WIDTH);
+        action_row_secondary.fixed(&close_btn, BUTTON_WIDTH);
 
-        action_row.end();
-        root.fixed(&action_row, BUTTON_ROW_HEIGHT + 4);
+        action_row_secondary.end();
+        root.fixed(&action_row_secondary, BUTTON_ROW_HEIGHT + 4);
 
         let mut result_table =
-            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 250);
+            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 336);
         result_table.set_max_cell_display_chars(320);
         let table_widget = result_table.get_widget();
         root.resizable(&table_widget);
@@ -2533,6 +3329,129 @@ impl SqlEditorWidget {
             app::awake();
         });
 
+        let mut quick_hint_for_choice = quick_hint.clone();
+        quick_action_choice.set_callback(move |choice| {
+            quick_hint_for_choice.set_label(security_quick_action_hint(choice.value()));
+            app::awake();
+        });
+        quick_hint.set_label(security_quick_action_hint(quick_action_choice.value()));
+
+        let sender_quick_run = sender.clone();
+        let quick_choice_for_run = quick_action_choice.clone();
+        let user_input_for_quick = user_input.clone();
+        let role_input_for_quick = role_input.clone();
+        let profile_input_for_quick = profile_input.clone();
+        quick_run_btn.set_callback(move |_| {
+            let action = quick_choice_for_run.value();
+            let dispatched = match action {
+                0 => sender_quick_run
+                    .send(SecurityMessage::GrantRoleRequested {
+                        user_text: user_input_for_quick.value(),
+                        role_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                1 => sender_quick_run
+                    .send(SecurityMessage::RevokeRoleRequested {
+                        user_text: user_input_for_quick.value(),
+                        role_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                2 => sender_quick_run
+                    .send(SecurityMessage::GrantSystemPrivRequested {
+                        user_text: user_input_for_quick.value(),
+                        priv_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                3 => sender_quick_run
+                    .send(SecurityMessage::RevokeSystemPrivRequested {
+                        user_text: user_input_for_quick.value(),
+                        priv_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                4 => sender_quick_run
+                    .send(SecurityMessage::SetProfileRequested {
+                        user_text: user_input_for_quick.value(),
+                        profile_text: profile_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                5 => sender_quick_run
+                    .send(SecurityMessage::LockUserRequested {
+                        user_text: user_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                6 => sender_quick_run
+                    .send(SecurityMessage::UnlockUserRequested {
+                        user_text: user_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                7 => sender_quick_run
+                    .send(SecurityMessage::ExpirePasswordRequested {
+                        user_text: user_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                8 => {
+                    let Some(password) = prompt_secret_text("User password") else {
+                        return;
+                    };
+                    let Some(default_tablespace) =
+                        prompt_optional_text("Default tablespace (optional)", "")
+                    else {
+                        return;
+                    };
+                    let Some(temporary_tablespace) =
+                        prompt_optional_text("Temporary tablespace (optional)", "")
+                    else {
+                        return;
+                    };
+                    sender_quick_run
+                        .send(SecurityMessage::CreateUserRequested {
+                            user_text: user_input_for_quick.value(),
+                            password_text: password,
+                            default_tablespace_text: default_tablespace,
+                            temporary_tablespace_text: temporary_tablespace,
+                            profile_text: profile_input_for_quick.value(),
+                        })
+                        .is_ok()
+                }
+                9 => {
+                    let choice = fltk::dialog::choice2_default(
+                        "Drop user mode",
+                        "Cancel",
+                        "Drop",
+                        "Drop CASCADE",
+                    );
+                    let cascade = match choice {
+                        Some(1) => false,
+                        Some(2) => true,
+                        _ => return,
+                    };
+                    sender_quick_run
+                        .send(SecurityMessage::DropUserRequested {
+                            user_text: user_input_for_quick.value(),
+                            cascade,
+                        })
+                        .is_ok()
+                }
+                10 => sender_quick_run
+                    .send(SecurityMessage::CreateRoleRequested {
+                        role_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                11 => sender_quick_run
+                    .send(SecurityMessage::DropRoleRequested {
+                        role_text: role_input_for_quick.value(),
+                    })
+                    .is_ok(),
+                _ => {
+                    fltk::dialog::alert_default("Select a quick action first.");
+                    false
+                }
+            };
+            if dispatched {
+                app::awake();
+            }
+        });
+
         let sender_grant = sender.clone();
         let user_input_for_grant = user_input.clone();
         let role_input_for_grant = role_input.clone();
@@ -2584,6 +3503,72 @@ impl SqlEditorWidget {
             let _ = sender_set_profile.send(SecurityMessage::SetProfileRequested {
                 user_text: user_input_for_set_profile.value(),
                 profile_text: profile_input_for_set_profile.value(),
+            });
+            app::awake();
+        });
+
+        let sender_create_user = sender.clone();
+        let user_input_for_create_user = user_input.clone();
+        let profile_input_for_create_user = profile_input.clone();
+        create_user_btn.set_callback(move |_| {
+            let Some(password) = prompt_secret_text("User password") else {
+                return;
+            };
+            let Some(default_tablespace) =
+                prompt_optional_text("Default tablespace (optional)", "")
+            else {
+                return;
+            };
+            let Some(temporary_tablespace) =
+                prompt_optional_text("Temporary tablespace (optional)", "")
+            else {
+                return;
+            };
+            let _ = sender_create_user.send(SecurityMessage::CreateUserRequested {
+                user_text: user_input_for_create_user.value(),
+                password_text: password,
+                default_tablespace_text: default_tablespace,
+                temporary_tablespace_text: temporary_tablespace,
+                profile_text: profile_input_for_create_user.value(),
+            });
+            app::awake();
+        });
+
+        let sender_drop_user = sender.clone();
+        let user_input_for_drop_user = user_input.clone();
+        drop_user_btn.set_callback(move |_| {
+            let choice = fltk::dialog::choice2_default(
+                "Drop user mode",
+                "Cancel",
+                "Drop",
+                "Drop CASCADE",
+            );
+            let cascade = match choice {
+                Some(1) => false,
+                Some(2) => true,
+                _ => return,
+            };
+            let _ = sender_drop_user.send(SecurityMessage::DropUserRequested {
+                user_text: user_input_for_drop_user.value(),
+                cascade,
+            });
+            app::awake();
+        });
+
+        let sender_create_role = sender.clone();
+        let role_input_for_create_role = role_input.clone();
+        create_role_btn.set_callback(move |_| {
+            let _ = sender_create_role.send(SecurityMessage::CreateRoleRequested {
+                role_text: role_input_for_create_role.value(),
+            });
+            app::awake();
+        });
+
+        let sender_drop_role = sender.clone();
+        let role_input_for_drop_role = role_input.clone();
+        drop_role_btn.set_callback(move |_| {
+            let _ = sender_drop_role.send(SecurityMessage::DropRoleRequested {
+                role_text: role_input_for_drop_role.value(),
             });
             app::awake();
         });
@@ -3058,6 +4043,239 @@ impl SqlEditorWidget {
                             app::awake();
                         });
                     }
+                    SecurityMessage::CreateUserRequested {
+                        user_text,
+                        password_text,
+                        default_tablespace_text,
+                        temporary_tablespace_text,
+                        profile_text,
+                    } => {
+                        let user = match normalize_required_identifier(&user_text, "User") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let profile = match normalize_optional_identifier(&profile_text, "Profile")
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let default_tablespace = match normalize_optional_identifier(
+                            &default_tablespace_text,
+                            "Default tablespace",
+                        ) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let temporary_tablespace = match normalize_optional_identifier(
+                            &temporary_tablespace_text,
+                            "Temporary tablespace",
+                        ) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        if password_text.trim().is_empty() {
+                            fltk::dialog::alert_default("Password is required for CREATE USER.");
+                            continue;
+                        }
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Create user {}?", user),
+                            "Cancel",
+                            "Create",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Creating user {}...", user));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Creating user {}", user),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::create_user(
+                                        db_conn.as_ref(),
+                                        &user,
+                                        &password_text,
+                                        default_tablespace.as_deref(),
+                                        temporary_tablespace.as_deref(),
+                                        profile.as_deref(),
+                                    )
+                                    .map(|_| format!("User {} created", user))
+                                    .map_err(|err| {
+                                        format!("Failed to create user {}: {err}", user)
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(SecurityMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SecurityMessage::DropUserRequested { user_text, cascade } => {
+                        let user = match normalize_required_identifier(&user_text, "User") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!(
+                                "Drop user {}{}?",
+                                user,
+                                if cascade { " CASCADE" } else { "" }
+                            ),
+                            "Cancel",
+                            "Drop",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Dropping user {}...", user));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Dropping user {}", user),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::drop_user(
+                                        db_conn.as_ref(),
+                                        &user,
+                                        cascade,
+                                    )
+                                    .map(|_| {
+                                        if cascade {
+                                            format!("User {} dropped (CASCADE)", user)
+                                        } else {
+                                            format!("User {} dropped", user)
+                                        }
+                                    })
+                                    .map_err(|err| format!("Failed to drop user {}: {err}", user)),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(SecurityMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SecurityMessage::CreateRoleRequested { role_text } => {
+                        let role = match normalize_required_identifier(&role_text, "Role") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Create role {}?", role),
+                            "Cancel",
+                            "Create",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Creating role {}...", role));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Creating role {}", role),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::create_role(db_conn.as_ref(), &role)
+                                        .map(|_| format!("Role {} created", role))
+                                        .map_err(|err| format!("Failed to create role {}: {err}", role)),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(SecurityMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    SecurityMessage::DropRoleRequested { role_text } => {
+                        let role = match normalize_required_identifier(&role_text, "Role") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Drop role {}?", role),
+                            "Cancel",
+                            "Drop",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        status.set_label(&format!("Dropping role {}...", role));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Dropping role {}", role),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::drop_role(db_conn.as_ref(), &role)
+                                        .map(|_| format!("Role {} dropped", role))
+                                        .map_err(|err| format!("Failed to drop role {}: {err}", role)),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(SecurityMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
                     SecurityMessage::ExpirePasswordRequested { user_text } => {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
@@ -3336,12 +4554,23 @@ impl SqlEditorWidget {
                 lookback_text: String,
                 attention_only: bool,
             },
+            RunBackupRequested {
+                owner_text: String,
+                job_text: String,
+                script_text: String,
+            },
+            RunRestoreRequested {
+                owner_text: String,
+                job_text: String,
+                script_text: String,
+            },
             SnapshotLoaded {
                 request_id: u64,
                 mode: RmanViewMode,
                 attention_only: bool,
                 result: Result<QueryResult, String>,
             },
+            ActionFinished(Result<String, String>),
             CloseRequested,
         }
 
@@ -3423,8 +4652,52 @@ impl SqlEditorWidget {
         controls.end();
         root.fixed(&controls, BUTTON_ROW_HEIGHT + 4);
 
+        let mut action_row = Flex::default();
+        action_row.set_type(FlexType::Row);
+        action_row.set_spacing(DIALOG_SPACING);
+
+        let mut owner_label = Frame::default().with_label("Owner:");
+        owner_label.set_label_color(theme::text_primary());
+        owner_label.set_align(Align::Inside | Align::Left);
+        action_row.fixed(&owner_label, 48);
+
+        let mut owner_input = Input::default();
+        owner_input.set_color(theme::input_bg());
+        owner_input.set_text_color(theme::text_primary());
+        owner_input.set_tooltip("Optional scheduler owner for RMAN job");
+        action_row.fixed(&owner_input, 130);
+
+        let mut job_label = Frame::default().with_label("Job:");
+        job_label.set_label_color(theme::text_primary());
+        job_label.set_align(Align::Inside | Align::Left);
+        action_row.fixed(&job_label, 36);
+
+        let mut job_input = Input::default();
+        job_input.set_value("RMAN_BACKUP_JOB");
+        job_input.set_color(theme::input_bg());
+        job_input.set_text_color(theme::text_primary());
+        job_input.set_tooltip("DBMS_SCHEDULER job name");
+        action_row.fixed(&job_input, 170);
+
+        let mut run_backup_btn = Button::default().with_label("Run Backup");
+        run_backup_btn.set_color(theme::button_success());
+        run_backup_btn.set_label_color(theme::text_primary());
+        run_backup_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&run_backup_btn, BUTTON_WIDTH_LARGE + 20);
+
+        let mut run_restore_btn = Button::default().with_label("Run Restore");
+        run_restore_btn.set_color(theme::button_warning());
+        run_restore_btn.set_label_color(theme::text_primary());
+        run_restore_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&run_restore_btn, BUTTON_WIDTH_LARGE + 20);
+
+        let action_filler = Frame::default();
+        action_row.resizable(&action_filler);
+        action_row.end();
+        root.fixed(&action_row, BUTTON_ROW_HEIGHT + 4);
+
         let mut result_table =
-            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 190);
+            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 232);
         result_table.set_max_cell_display_chars(360);
         let table_widget = result_table.get_widget();
         root.resizable(&table_widget);
@@ -3475,6 +4748,58 @@ impl SqlEditorWidget {
             app::awake();
         });
 
+        let sender_run_backup = sender.clone();
+        let owner_input_for_backup = owner_input.clone();
+        let mut job_input_for_backup = job_input.clone();
+        run_backup_btn.set_callback(move |_| {
+            let current_job = job_input_for_backup.value();
+            let job_text = if current_job.trim().is_empty() {
+                let generated = default_rman_job_name("RMAN_BACKUP_JOB");
+                job_input_for_backup.set_value(&generated);
+                generated
+            } else {
+                current_job
+            };
+            let Some(script_text) = prompt_optional_text(
+                "RMAN backup script (without EXIT)",
+                "BACKUP DATABASE PLUS ARCHIVELOG;",
+            ) else {
+                return;
+            };
+            let _ = sender_run_backup.send(RmanMessage::RunBackupRequested {
+                owner_text: owner_input_for_backup.value(),
+                job_text,
+                script_text,
+            });
+            app::awake();
+        });
+
+        let sender_run_restore = sender.clone();
+        let owner_input_for_restore = owner_input.clone();
+        let mut job_input_for_restore = job_input.clone();
+        run_restore_btn.set_callback(move |_| {
+            let current_job = job_input_for_restore.value();
+            let job_text = if current_job.trim().is_empty() {
+                let generated = default_rman_job_name("RMAN_RESTORE_JOB");
+                job_input_for_restore.set_value(&generated);
+                generated
+            } else {
+                current_job
+            };
+            let Some(script_text) = prompt_optional_text(
+                "RMAN restore script (without EXIT)",
+                "RESTORE DATABASE;\nRECOVER DATABASE;",
+            ) else {
+                return;
+            };
+            let _ = sender_run_restore.send(RmanMessage::RunRestoreRequested {
+                owner_text: owner_input_for_restore.value(),
+                job_text,
+                script_text,
+            });
+            app::awake();
+        });
+
         let sender_close = sender.clone();
         close_btn.set_callback(move |_| {
             let _ = sender_close.send(RmanMessage::CloseRequested);
@@ -3493,7 +4818,11 @@ impl SqlEditorWidget {
         app::awake();
 
         let mut latest_request_id = 0u64;
+        let mut current_mode = RmanViewMode::Jobs;
+        let mut current_lookback_text = lookback_input.value();
+        let mut current_attention_only = attention_only_check.value();
         let mut loading_snapshot = false;
+        let mut action_running = false;
         let mut pending_request: Option<(RmanViewMode, String, bool)> = None;
         while dialog.shown() {
             app::wait();
@@ -3505,7 +4834,7 @@ impl SqlEditorWidget {
                         lookback_text,
                         attention_only,
                     } => {
-                        if loading_snapshot {
+                        if loading_snapshot || action_running {
                             pending_request = Some((mode, lookback_text, attention_only));
                             status.set_label(&format!(
                                 "{} request queued (will run after current load)",
@@ -3530,6 +4859,9 @@ impl SqlEditorWidget {
                             }
                         };
 
+                        current_mode = mode;
+                        current_lookback_text = lookback_text;
+                        current_attention_only = attention_only;
                         latest_request_id = latest_request_id.saturating_add(1);
                         let request_id = latest_request_id;
 
@@ -3541,6 +4873,10 @@ impl SqlEditorWidget {
                         coverage_btn.deactivate();
                         lookback_input.deactivate();
                         attention_only_check.deactivate();
+                        owner_input.deactivate();
+                        job_input.deactivate();
+                        run_backup_btn.deactivate();
+                        run_restore_btn.deactivate();
                         status.set_label(&format!("Loading {}...", mode.label()));
                         result_table.display_result(&dba_info_result(&format!(
                             "Loading {}...",
@@ -3599,6 +4935,174 @@ impl SqlEditorWidget {
                             app::awake();
                         });
                     }
+                    RmanMessage::RunBackupRequested {
+                        owner_text,
+                        job_text,
+                        script_text,
+                    } => {
+                        if loading_snapshot || action_running {
+                            status.set_label("RMAN request already in progress");
+                            continue;
+                        }
+
+                        let owner = match normalize_optional_identifier(&owner_text, "Owner") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let job_name = match normalize_required_identifier(&job_text, "Job") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        if script_text.trim().is_empty() {
+                            fltk::dialog::alert_default("Backup script is required.");
+                            continue;
+                        }
+
+                        let qualified = qualified_owner_object(owner.as_deref(), &job_name);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Submit RMAN backup job {}?", qualified),
+                            "Cancel",
+                            "Submit",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        jobs_btn.deactivate();
+                        sets_btn.deactivate();
+                        coverage_btn.deactivate();
+                        lookback_input.deactivate();
+                        attention_only_check.deactivate();
+                        owner_input.deactivate();
+                        job_input.deactivate();
+                        run_backup_btn.deactivate();
+                        run_restore_btn.deactivate();
+                        status.set_label(&format!("Submitting RMAN backup job {}...", qualified));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Submitting RMAN backup job {}", qualified),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::run_rman_backup_job(
+                                        db_conn.as_ref(),
+                                        owner.as_deref(),
+                                        &job_name,
+                                        &script_text,
+                                    )
+                                    .map(|_| format!("RMAN backup job {} submitted", qualified))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to submit RMAN backup job {}: {err}",
+                                            qualified
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(RmanMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    RmanMessage::RunRestoreRequested {
+                        owner_text,
+                        job_text,
+                        script_text,
+                    } => {
+                        if loading_snapshot || action_running {
+                            status.set_label("RMAN request already in progress");
+                            continue;
+                        }
+
+                        let owner = match normalize_optional_identifier(&owner_text, "Owner") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let job_name = match normalize_required_identifier(&job_text, "Job") {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        if script_text.trim().is_empty() {
+                            fltk::dialog::alert_default("Restore script is required.");
+                            continue;
+                        }
+
+                        let qualified = qualified_owner_object(owner.as_deref(), &job_name);
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Submit RMAN restore job {}?", qualified),
+                            "Cancel",
+                            "Submit",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        jobs_btn.deactivate();
+                        sets_btn.deactivate();
+                        coverage_btn.deactivate();
+                        lookback_input.deactivate();
+                        attention_only_check.deactivate();
+                        owner_input.deactivate();
+                        job_input.deactivate();
+                        run_backup_btn.deactivate();
+                        run_restore_btn.deactivate();
+                        status.set_label(&format!("Submitting RMAN restore job {}...", qualified));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Submitting RMAN restore job {}", qualified),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::run_rman_restore_job(
+                                        db_conn.as_ref(),
+                                        owner.as_deref(),
+                                        &job_name,
+                                        &script_text,
+                                    )
+                                    .map(|_| format!("RMAN restore job {} submitted", qualified))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to submit RMAN restore job {}: {err}",
+                                            qualified
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(RmanMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
                     RmanMessage::SnapshotLoaded {
                         request_id,
                         mode,
@@ -3617,6 +5121,10 @@ impl SqlEditorWidget {
                         coverage_btn.activate();
                         lookback_input.activate();
                         attention_only_check.activate();
+                        owner_input.activate();
+                        job_input.activate();
+                        run_backup_btn.activate();
+                        run_restore_btn.activate();
 
                         match result {
                             Ok(snapshot) => {
@@ -3654,6 +5162,66 @@ impl SqlEditorWidget {
                                     attention_only: queued_attention_only,
                                 });
                                 app::awake();
+                            }
+                        }
+                    }
+                    RmanMessage::ActionFinished(result) => {
+                        set_cursor(Cursor::Default);
+                        app::flush();
+                        action_running = false;
+                        jobs_btn.activate();
+                        sets_btn.activate();
+                        coverage_btn.activate();
+                        lookback_input.activate();
+                        attention_only_check.activate();
+                        owner_input.activate();
+                        job_input.activate();
+                        run_backup_btn.activate();
+                        run_restore_btn.activate();
+
+                        match result {
+                            Ok(message) => {
+                                status.set_label(&message);
+                                let (reload_mode, reload_lookback_text, reload_attention_only) =
+                                    if let Some((
+                                        queued_mode,
+                                        queued_lookback_text,
+                                        queued_attention_only,
+                                    )) = pending_request.take()
+                                    {
+                                        (queued_mode, queued_lookback_text, queued_attention_only)
+                                    } else {
+                                        (
+                                            current_mode,
+                                            current_lookback_text.clone(),
+                                            current_attention_only,
+                                        )
+                                    };
+                                let _ = sender.send(RmanMessage::LoadRequested {
+                                    mode: reload_mode,
+                                    lookback_text: reload_lookback_text,
+                                    attention_only: reload_attention_only,
+                                });
+                                app::awake();
+                            }
+                            Err(err) => {
+                                status.set_label("RMAN action failed");
+                                fltk::dialog::alert_default(&err);
+                                if let Some((
+                                    queued_mode,
+                                    queued_lookback_text,
+                                    queued_attention_only,
+                                )) = pending_request.take()
+                                {
+                                    if dialog.shown() {
+                                        let _ = sender.send(RmanMessage::LoadRequested {
+                                            mode: queued_mode,
+                                            lookback_text: queued_lookback_text,
+                                            attention_only: queued_attention_only,
+                                        });
+                                        app::awake();
+                                    }
+                                }
                             }
                         }
                     }
@@ -4169,6 +5737,14 @@ impl SqlEditorWidget {
                 mode: DataGuardViewMode,
                 attention_only: bool,
             },
+            StartApplyRequested,
+            StopApplyRequested,
+            SwitchoverRequested {
+                target_text: String,
+            },
+            FailoverRequested {
+                target_text: String,
+            },
             ForceLogSwitchRequested,
             SnapshotLoaded {
                 request_id: u64,
@@ -4259,8 +5835,52 @@ impl SqlEditorWidget {
         controls.end();
         root.fixed(&controls, BUTTON_ROW_HEIGHT + 4);
 
+        let mut action_row = Flex::default();
+        action_row.set_type(FlexType::Row);
+        action_row.set_spacing(DIALOG_SPACING);
+
+        let mut target_label = Frame::default().with_label("Target:");
+        target_label.set_label_color(theme::text_primary());
+        target_label.set_align(Align::Inside | Align::Left);
+        action_row.fixed(&target_label, 48);
+
+        let mut target_input = Input::default();
+        target_input.set_color(theme::input_bg());
+        target_input.set_text_color(theme::text_primary());
+        target_input.set_tooltip("DB_UNIQUE_NAME for switchover/failover");
+        action_row.fixed(&target_input, 180);
+
+        let mut start_apply_btn = Button::default().with_label("Start Apply");
+        start_apply_btn.set_color(theme::button_success());
+        start_apply_btn.set_label_color(theme::text_primary());
+        start_apply_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&start_apply_btn, BUTTON_WIDTH_LARGE + 16);
+
+        let mut stop_apply_btn = Button::default().with_label("Stop Apply");
+        stop_apply_btn.set_color(theme::button_warning());
+        stop_apply_btn.set_label_color(theme::text_primary());
+        stop_apply_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&stop_apply_btn, BUTTON_WIDTH_LARGE + 12);
+
+        let mut switchover_btn = Button::default().with_label("Switchover");
+        switchover_btn.set_color(theme::button_warning());
+        switchover_btn.set_label_color(theme::text_primary());
+        switchover_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&switchover_btn, BUTTON_WIDTH_LARGE + 12);
+
+        let mut failover_btn = Button::default().with_label("Failover");
+        failover_btn.set_color(theme::button_danger());
+        failover_btn.set_label_color(theme::text_primary());
+        failover_btn.set_frame(FrameType::RFlatBox);
+        action_row.fixed(&failover_btn, BUTTON_WIDTH_LARGE + 8);
+
+        let action_filler = Frame::default();
+        action_row.resizable(&action_filler);
+        action_row.end();
+        root.fixed(&action_row, BUTTON_ROW_HEIGHT + 4);
+
         let mut result_table =
-            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 190);
+            ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, dialog_h - 232);
         result_table.set_max_cell_display_chars(360);
         let table_widget = result_table.get_widget();
         root.resizable(&table_widget);
@@ -4317,6 +5937,36 @@ impl SqlEditorWidget {
             app::awake();
         });
 
+        let sender_start_apply = sender.clone();
+        start_apply_btn.set_callback(move |_| {
+            let _ = sender_start_apply.send(DataGuardMessage::StartApplyRequested);
+            app::awake();
+        });
+
+        let sender_stop_apply = sender.clone();
+        stop_apply_btn.set_callback(move |_| {
+            let _ = sender_stop_apply.send(DataGuardMessage::StopApplyRequested);
+            app::awake();
+        });
+
+        let sender_switchover = sender.clone();
+        let target_input_for_switchover = target_input.clone();
+        switchover_btn.set_callback(move |_| {
+            let _ = sender_switchover.send(DataGuardMessage::SwitchoverRequested {
+                target_text: target_input_for_switchover.value(),
+            });
+            app::awake();
+        });
+
+        let sender_failover = sender.clone();
+        let target_input_for_failover = target_input.clone();
+        failover_btn.set_callback(move |_| {
+            let _ = sender_failover.send(DataGuardMessage::FailoverRequested {
+                target_text: target_input_for_failover.value(),
+            });
+            app::awake();
+        });
+
         let sender_force = sender.clone();
         force_switch_btn.set_callback(move |_| {
             let _ = sender_force.send(DataGuardMessage::ForceLogSwitchRequested);
@@ -4342,6 +5992,7 @@ impl SqlEditorWidget {
         let mut latest_request_id = 0u64;
         let mut current_mode = DataGuardViewMode::Overview;
         let mut current_database_role: Option<String> = None;
+        let mut current_db_unique_name: Option<String> = None;
         let mut overview_loaded = false;
         let mut loading_snapshot = false;
         let mut action_running = false;
@@ -4381,6 +6032,11 @@ impl SqlEditorWidget {
                         dest_btn.deactivate();
                         apply_btn.deactivate();
                         gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
                         refresh_dataguard_force_switch_button(
                             &mut force_switch_btn,
                             current_database_role.as_deref(),
@@ -4458,6 +6114,336 @@ impl SqlEditorWidget {
                             app::awake();
                         });
                     }
+                    DataGuardMessage::StartApplyRequested => {
+                        if loading_snapshot || action_running {
+                            status.set_label("Data Guard request already in progress");
+                            continue;
+                        }
+                        if !overview_loaded {
+                            fltk::dialog::alert_default(
+                                "Load Data Guard Overview first to verify role before apply control.",
+                            );
+                            continue;
+                        }
+                        if !dataguard_role_allows_apply_control(
+                            current_database_role.as_deref(),
+                        ) {
+                            let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
+                            fltk::dialog::alert_default(&format!(
+                                "Start apply is supported for PHYSICAL STANDBY role (current: {}).",
+                                role
+                            ));
+                            continue;
+                        }
+
+                        let confirm = fltk::dialog::choice2_default(
+                            "Start managed standby apply now?",
+                            "Cancel",
+                            "Start",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        attention_only_check.deactivate();
+                        overview_btn.deactivate();
+                        dest_btn.deactivate();
+                        apply_btn.deactivate();
+                        gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
+                        refresh_dataguard_force_switch_button(
+                            &mut force_switch_btn,
+                            current_database_role.as_deref(),
+                            overview_loaded,
+                            loading_snapshot,
+                            action_running,
+                        );
+                        status.set_label("Starting Data Guard apply...");
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                "Starting Data Guard apply",
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::start_dataguard_apply(
+                                        db_conn.as_ref(),
+                                    )
+                                    .map(|_| "Data Guard apply started".to_string())
+                                    .map_err(|err| {
+                                        format!("Failed to start Data Guard apply: {err}")
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(DataGuardMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    DataGuardMessage::StopApplyRequested => {
+                        if loading_snapshot || action_running {
+                            status.set_label("Data Guard request already in progress");
+                            continue;
+                        }
+                        if !overview_loaded {
+                            fltk::dialog::alert_default(
+                                "Load Data Guard Overview first to verify role before apply control.",
+                            );
+                            continue;
+                        }
+                        if !dataguard_role_allows_apply_control(
+                            current_database_role.as_deref(),
+                        ) {
+                            let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
+                            fltk::dialog::alert_default(&format!(
+                                "Stop apply is supported for PHYSICAL STANDBY role (current: {}).",
+                                role
+                            ));
+                            continue;
+                        }
+
+                        let confirm = fltk::dialog::choice2_default(
+                            "Stop managed standby apply now?",
+                            "Cancel",
+                            "Stop",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        attention_only_check.deactivate();
+                        overview_btn.deactivate();
+                        dest_btn.deactivate();
+                        apply_btn.deactivate();
+                        gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
+                        refresh_dataguard_force_switch_button(
+                            &mut force_switch_btn,
+                            current_database_role.as_deref(),
+                            overview_loaded,
+                            loading_snapshot,
+                            action_running,
+                        );
+                        status.set_label("Stopping Data Guard apply...");
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                "Stopping Data Guard apply",
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::stop_dataguard_apply(
+                                        db_conn.as_ref(),
+                                    )
+                                    .map(|_| "Data Guard apply stopped".to_string())
+                                    .map_err(|err| {
+                                        format!("Failed to stop Data Guard apply: {err}")
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(DataGuardMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    DataGuardMessage::SwitchoverRequested { target_text } => {
+                        if loading_snapshot || action_running {
+                            status.set_label("Data Guard request already in progress");
+                            continue;
+                        }
+                        if !overview_loaded {
+                            fltk::dialog::alert_default(
+                                "Load Data Guard Overview first to validate target information.",
+                            );
+                            continue;
+                        }
+
+                        let target =
+                            match normalize_required_identifier(&target_text, "Target DB name") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
+                        if current_db_unique_name.as_deref() == Some(target.as_str()) {
+                            fltk::dialog::alert_default(
+                                "Target DB_UNIQUE_NAME must be different from current database.",
+                            );
+                            continue;
+                        }
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Execute switchover to {}?", target),
+                            "Cancel",
+                            "Execute",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        attention_only_check.deactivate();
+                        overview_btn.deactivate();
+                        dest_btn.deactivate();
+                        apply_btn.deactivate();
+                        gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
+                        refresh_dataguard_force_switch_button(
+                            &mut force_switch_btn,
+                            current_database_role.as_deref(),
+                            overview_loaded,
+                            loading_snapshot,
+                            action_running,
+                        );
+                        status.set_label(&format!("Executing switchover to {}...", target));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Executing Data Guard switchover to {}", target),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::switchover_dataguard(
+                                        db_conn.as_ref(),
+                                        &target,
+                                    )
+                                    .map(|_| format!("Data Guard switchover executed to {}", target))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to execute Data Guard switchover to {}: {err}",
+                                            target
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(DataGuardMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
+                    DataGuardMessage::FailoverRequested { target_text } => {
+                        if loading_snapshot || action_running {
+                            status.set_label("Data Guard request already in progress");
+                            continue;
+                        }
+                        if !overview_loaded {
+                            fltk::dialog::alert_default(
+                                "Load Data Guard Overview first to validate target information.",
+                            );
+                            continue;
+                        }
+
+                        let target =
+                            match normalize_required_identifier(&target_text, "Target DB name") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
+                        if current_db_unique_name.as_deref() == Some(target.as_str()) {
+                            fltk::dialog::alert_default(
+                                "Target DB_UNIQUE_NAME must be different from current database.",
+                            );
+                            continue;
+                        }
+
+                        let confirm = fltk::dialog::choice2_default(
+                            &format!("Execute failover to {}?", target),
+                            "Cancel",
+                            "Execute",
+                            "",
+                        );
+                        if confirm != Some(1) {
+                            continue;
+                        }
+
+                        set_cursor(Cursor::Wait);
+                        app::flush();
+                        action_running = true;
+                        attention_only_check.deactivate();
+                        overview_btn.deactivate();
+                        dest_btn.deactivate();
+                        apply_btn.deactivate();
+                        gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
+                        refresh_dataguard_force_switch_button(
+                            &mut force_switch_btn,
+                            current_database_role.as_deref(),
+                            overview_loaded,
+                            loading_snapshot,
+                            action_running,
+                        );
+                        status.set_label(&format!("Executing failover to {}...", target));
+
+                        let sender_result = sender.clone();
+                        let connection = self.connection.clone();
+                        thread::spawn(move || {
+                            let result = match try_lock_connection_with_activity(
+                                &connection,
+                                format!("Executing Data Guard failover to {}", target),
+                            ) {
+                                Some(mut guard) => match guard.require_live_connection() {
+                                    Ok(db_conn) => QueryExecutor::failover_dataguard(
+                                        db_conn.as_ref(),
+                                        &target,
+                                    )
+                                    .map(|_| format!("Data Guard failover executed to {}", target))
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to execute Data Guard failover to {}: {err}",
+                                            target
+                                        )
+                                    }),
+                                    Err(message) => Err(message),
+                                },
+                                None => Err(format_connection_busy_message()),
+                            };
+
+                            let _ = sender_result.send(DataGuardMessage::ActionFinished(result));
+                            app::awake();
+                        });
+                    }
                     DataGuardMessage::ForceLogSwitchRequested => {
                         if loading_snapshot || action_running {
                             status.set_label("Data Guard request already in progress");
@@ -4491,6 +6477,11 @@ impl SqlEditorWidget {
                         dest_btn.deactivate();
                         apply_btn.deactivate();
                         gap_btn.deactivate();
+                        target_input.deactivate();
+                        start_apply_btn.deactivate();
+                        stop_apply_btn.deactivate();
+                        switchover_btn.deactivate();
+                        failover_btn.deactivate();
                         refresh_dataguard_force_switch_button(
                             &mut force_switch_btn,
                             current_database_role.as_deref(),
@@ -4541,19 +6532,31 @@ impl SqlEditorWidget {
                         dest_btn.activate();
                         apply_btn.activate();
                         gap_btn.activate();
+                        target_input.activate();
+                        start_apply_btn.activate();
+                        stop_apply_btn.activate();
+                        switchover_btn.activate();
+                        failover_btn.activate();
 
                         match result {
                             Ok(snapshot) => {
                                 if matches!(mode, DataGuardViewMode::Overview) {
                                     overview_loaded = true;
                                     current_database_role = dataguard_role_from_snapshot(&snapshot);
+                                    current_db_unique_name =
+                                        dataguard_db_unique_name_from_snapshot(&snapshot);
                                 }
                                 result_table.display_result(&snapshot);
                                 let role_suffix = if matches!(mode, DataGuardViewMode::Overview) {
-                                    current_database_role
+                                    let role = current_database_role
                                         .as_deref()
-                                        .map(|role| format!(", role={role}"))
-                                        .unwrap_or_default()
+                                        .map(|value| format!(", role={value}"))
+                                        .unwrap_or_default();
+                                    let db_unique_name = current_db_unique_name
+                                        .as_deref()
+                                        .map(|value| format!(", db_unique_name={value}"))
+                                        .unwrap_or_default();
+                                    format!("{role}{db_unique_name}")
                                 } else {
                                     String::new()
                                 };
@@ -4569,6 +6572,7 @@ impl SqlEditorWidget {
                                 if matches!(mode, DataGuardViewMode::Overview) {
                                     overview_loaded = false;
                                     current_database_role = None;
+                                    current_db_unique_name = None;
                                 }
                                 result_table.display_result(&dba_info_result(&format!(
                                     "Data Guard {} load failed. {}\nTip: V$DATAGUARD_STATS / V$ARCHIVE_DEST_STATUS views can require elevated privileges.",
@@ -4608,6 +6612,11 @@ impl SqlEditorWidget {
                         dest_btn.activate();
                         apply_btn.activate();
                         gap_btn.activate();
+                        target_input.activate();
+                        start_apply_btn.activate();
+                        stop_apply_btn.activate();
+                        switchover_btn.activate();
+                        failover_btn.activate();
                         refresh_dataguard_force_switch_button(
                             &mut force_switch_btn,
                             current_database_role.as_deref(),
@@ -4819,6 +6828,137 @@ fn parse_percentage_thresholds(warn_text: &str, critical_text: &str) -> Result<(
     Ok((warn, critical))
 }
 
+fn security_quick_action_hint(action_index: i32) -> &'static str {
+    match action_index {
+        0 => "Quick: grant role. Fill User + Role/Priv.",
+        1 => "Quick: revoke role. Fill User + Role/Priv.",
+        2 => "Quick: grant system privilege. Fill User + Role/Priv.",
+        3 => "Quick: revoke system privilege. Fill User + Role/Priv.",
+        4 => "Quick: set profile. Fill User + Profile.",
+        5 => "Quick: lock user. Fill User.",
+        6 => "Quick: unlock user. Fill User.",
+        7 => "Quick: expire password. Fill User.",
+        8 => "Quick: create user. Fill User (+ optional Profile).",
+        9 => "Quick: drop user. Fill User.",
+        10 => "Quick: create role. Fill Role/Priv.",
+        11 => "Quick: drop role. Fill Role/Priv.",
+        _ => "Quick: select action, then run.",
+    }
+}
+
+fn prompt_optional_text(prompt: &str, default_value: &str) -> Option<String> {
+    fltk::dialog::input_default(prompt, default_value)
+}
+
+fn prompt_secret_text(prompt: &str) -> Option<String> {
+    let current_group = fltk::group::Group::try_current();
+    fltk::group::Group::set_current(None::<&fltk::group::Group>);
+
+    let mut dialog = Window::default().with_size(440, 160).with_label("Input");
+    center_on_main(&mut dialog);
+    dialog.set_color(theme::panel_raised());
+    dialog.make_modal(true);
+
+    let mut root = Flex::default().with_pos(10, 10).with_size(420, 140);
+    root.set_type(FlexType::Column);
+    root.set_spacing(DIALOG_SPACING);
+
+    let mut prompt_label = Frame::default().with_label(prompt);
+    prompt_label.set_align(Align::Left | Align::Inside | Align::Wrap);
+    prompt_label.set_label_color(theme::text_primary());
+    root.fixed(&prompt_label, 46);
+
+    let mut password_input = SecretInput::default();
+    password_input.set_color(theme::input_bg());
+    password_input.set_text_color(theme::text_primary());
+    password_input.set_trigger(CallbackTrigger::EnterKeyAlways);
+    root.fixed(&password_input, INPUT_ROW_HEIGHT);
+
+    let mut button_row = Flex::default();
+    button_row.set_type(FlexType::Row);
+    button_row.set_spacing(DIALOG_SPACING);
+
+    let button_filler = Frame::default();
+    button_row.resizable(&button_filler);
+
+    let mut ok_btn = Button::default().with_label("OK");
+    ok_btn.set_color(theme::button_primary());
+    ok_btn.set_label_color(theme::text_primary());
+    ok_btn.set_frame(FrameType::RFlatBox);
+    button_row.fixed(&ok_btn, BUTTON_WIDTH);
+
+    let mut cancel_btn = Button::default().with_label("Cancel");
+    cancel_btn.set_color(theme::button_subtle());
+    cancel_btn.set_label_color(theme::text_primary());
+    cancel_btn.set_frame(FrameType::RFlatBox);
+    button_row.fixed(&cancel_btn, BUTTON_WIDTH);
+
+    button_row.end();
+    root.fixed(&button_row, BUTTON_ROW_HEIGHT);
+    root.end();
+    dialog.end();
+    fltk::group::Group::set_current(current_group.as_ref());
+
+    let (response_tx, response_rx) = mpsc::channel::<Option<String>>();
+
+    {
+        let response_tx = response_tx.clone();
+        let mut dialog = dialog.clone();
+        let password_input = password_input.clone();
+        ok_btn.set_callback(move |_| {
+            let _ = response_tx.send(Some(password_input.value()));
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let response_tx = response_tx.clone();
+        let mut dialog = dialog.clone();
+        cancel_btn.set_callback(move |_| {
+            let _ = response_tx.send(None);
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    {
+        let response_tx = response_tx.clone();
+        let mut dialog = dialog.clone();
+        let password_input_for_enter = password_input.clone();
+        let mut password_input_callback = password_input.clone();
+        password_input_callback.set_callback(move |_| {
+            let _ = response_tx.send(Some(password_input_for_enter.value()));
+            dialog.hide();
+            app::awake();
+        });
+    }
+
+    dialog.show();
+    let _ = dialog.take_focus();
+    let _ = password_input.take_focus();
+
+    while dialog.shown() {
+        app::wait();
+    }
+
+    let result = match response_rx.try_recv() {
+        Ok(value) => value,
+        Err(_) => None,
+    };
+    Window::delete(dialog);
+    result
+}
+
+fn normalize_optional_text_param(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
 fn normalize_optional_sql_id(value: &str) -> Result<Option<String>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -4950,6 +7090,31 @@ fn dataguard_role_from_snapshot(snapshot: &QueryResult) -> Option<String> {
     Some(role)
 }
 
+fn dataguard_db_unique_name_from_snapshot(snapshot: &QueryResult) -> Option<String> {
+    let db_unique_name_index = snapshot
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case("DB_UNIQUE_NAME"))?;
+    let first_row = snapshot.rows.first()?;
+    let db_unique_name = first_row.get(db_unique_name_index)?.trim().to_uppercase();
+    if db_unique_name.is_empty() || db_unique_name == "-" {
+        return None;
+    }
+    Some(db_unique_name)
+}
+
+fn dataguard_role_allows_apply_control(database_role: Option<&str>) -> bool {
+    database_role == Some("PHYSICAL STANDBY")
+}
+
+fn default_rman_job_name(prefix: &str) -> String {
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    };
+    format!("{}_{}", prefix.trim().to_uppercase(), timestamp)
+}
+
 fn refresh_dataguard_force_switch_button(
     force_switch_btn: &mut Button,
     database_role: Option<&str>,
@@ -4992,13 +7157,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        column_value_by_name, current_selected_row_index, dataguard_role_from_snapshot,
+        column_value_by_name, current_selected_row_index, dataguard_db_unique_name_from_snapshot,
+        dataguard_role_allows_apply_control, dataguard_role_from_snapshot, default_rman_job_name,
         filter_alert_rows, is_ascii_identifier, normalize_optional_sql_id,
         normalize_required_identifier, normalize_required_system_privilege,
         parse_bounded_positive_u32, parse_optional_non_negative_i32, parse_percentage_thresholds,
         parse_positive_u32, parse_sid_serial_row, parse_sql_id_child_row,
-        parse_sql_monitor_session_target, qualified_owner_object, sql_monitor_session_target_label,
-        QueryResult,
+        parse_sql_monitor_session_target, qualified_owner_object, security_quick_action_hint,
+        sql_monitor_session_target_label, QueryResult,
     };
 
     #[test]
@@ -5229,5 +7395,48 @@ mod tests {
             Duration::from_millis(5),
         );
         assert_eq!(dataguard_role_from_snapshot(&empty_role), None);
+    }
+
+    #[test]
+    fn dataguard_db_unique_name_from_snapshot_reads_value() {
+        let snapshot = QueryResult::new_select(
+            "SELECT",
+            vec![ColumnInfo {
+                name: "DB_UNIQUE_NAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            }],
+            vec![vec!["standby01".to_string()]],
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            dataguard_db_unique_name_from_snapshot(&snapshot),
+            Some("STANDBY01".to_string())
+        );
+    }
+
+    #[test]
+    fn dataguard_role_allows_apply_control_only_for_physical_standby() {
+        assert!(dataguard_role_allows_apply_control(Some("PHYSICAL STANDBY")));
+        assert!(!dataguard_role_allows_apply_control(Some("PRIMARY")));
+        assert!(!dataguard_role_allows_apply_control(None));
+    }
+
+    #[test]
+    fn default_rman_job_name_includes_prefix() {
+        let generated = default_rman_job_name("rman_backup_job");
+        assert!(generated.starts_with("RMAN_BACKUP_JOB_"));
+    }
+
+    #[test]
+    fn security_quick_action_hint_maps_known_actions() {
+        assert_eq!(
+            security_quick_action_hint(0),
+            "Quick: grant role. Fill User + Role/Priv."
+        );
+        assert_eq!(
+            security_quick_action_hint(11),
+            "Quick: drop role. Fill Role/Priv."
+        );
     }
 }
