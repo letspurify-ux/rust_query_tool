@@ -2613,6 +2613,257 @@ impl QueryExecutor {
 
         Ok(plan_lines)
     }
+
+    pub fn get_session_lock_snapshot(conn: &Connection) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    TO_CHAR(s.sid) AS sid,
+    TO_CHAR(s.serial#) AS serial,
+    NVL(s.username, '(SYS)') AS username,
+    NVL(s.status, '-') AS status,
+    NVL(s.event, '-') AS wait_event,
+    TO_CHAR(NVL(s.seconds_in_wait, 0)) AS wait_seconds,
+    NVL(TO_CHAR(s.blocking_session), '-') AS blocking_sid,
+    NVL(
+        (
+            SELECT TO_CHAR(bs.serial#)
+            FROM v$session bs
+            WHERE bs.sid = s.blocking_session
+        ),
+        '-'
+    ) AS blocking_serial,
+    CASE
+        WHEN l.request > 0 THEN 'WAITING'
+        WHEN l.lmode > 0 THEN 'HOLDING'
+        ELSE '-'
+    END AS lock_state,
+    NVL(TO_CHAR(l.type), '-') AS lock_type
+FROM v$session s
+LEFT JOIN v$lock l
+    ON l.sid = s.sid
+    AND (l.request > 0 OR l.block > 0 OR l.lmode > 0)
+WHERE s.type = 'USER'
+ORDER BY
+    CASE WHEN s.blocking_session IS NULL THEN 1 ELSE 0 END,
+    s.blocking_session,
+    s.sid
+"#;
+
+        let start = Instant::now();
+        let mut stmt = conn.statement(sql).build()?;
+        let rows = stmt.query(&[])?;
+
+        let mut result_rows: Vec<Vec<String>> = Vec::new();
+        for row_result in rows {
+            let row: Row = row_result?;
+            let mut values = Vec::with_capacity(10);
+            for idx in 0..10 {
+                let value: Option<String> = row.get(idx).unwrap_or(None);
+                values.push(value.unwrap_or_default());
+            }
+            result_rows.push(values);
+        }
+
+        let columns = vec![
+            ColumnInfo {
+                name: "SID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SERIAL#".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "USERNAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "STATUS".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "WAIT_EVENT".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "WAIT_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "BLOCKING_SID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "BLOCKING_SERIAL#".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "LOCK_STATE".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "LOCK_TYPE".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+        ];
+
+        Ok(QueryResult::new_select(
+            sql,
+            columns,
+            result_rows,
+            start.elapsed(),
+        ))
+    }
+
+    pub fn get_heavy_execution_snapshot(
+        conn: &Connection,
+        min_elapsed_seconds: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    TO_CHAR(s.sid) AS sid,
+    TO_CHAR(s.serial#) AS serial,
+    NVL(s.username, '(SYS)') AS username,
+    NVL(s.status, '-') AS status,
+    TO_CHAR(NVL(s.last_call_et, 0)) AS elapsed_secs,
+    NVL(s.event, '-') AS wait_event,
+    NVL(s.sql_id, '-') AS sql_id,
+    NVL(TO_CHAR(ROUND((q.elapsed_time / 1000000), 2)), '0') AS sql_elapsed_secs,
+    NVL(TO_CHAR(q.buffer_gets), '0') AS buffer_gets,
+    NVL(TO_CHAR(q.disk_reads), '0') AS disk_reads,
+    NVL(s.program, '-') AS program,
+    NVL(
+        SUBSTR(
+            REPLACE(REPLACE(q.sql_text, CHR(10), ' '), CHR(13), ' '),
+            1,
+            180
+        ),
+        '(no sql text)'
+    ) AS sql_text
+FROM v$session s
+LEFT JOIN v$sql q
+    ON q.sql_id = s.sql_id
+    AND q.child_number = s.sql_child_number
+WHERE s.type = 'USER'
+    AND s.status = 'ACTIVE'
+    AND NVL(s.last_call_et, 0) >= :min_elapsed_seconds
+ORDER BY
+    NVL(s.last_call_et, 0) DESC,
+    NVL(q.buffer_gets, 0) DESC,
+    s.sid
+"#;
+
+        let start = Instant::now();
+        let mut stmt = conn.statement(sql).build()?;
+        let min_elapsed_bind = i64::from(min_elapsed_seconds);
+        stmt.bind("min_elapsed_seconds", &min_elapsed_bind)?;
+        let rows = stmt.query(&[])?;
+
+        let mut result_rows: Vec<Vec<String>> = Vec::new();
+        for row_result in rows {
+            let row: Row = row_result?;
+            let mut values = Vec::with_capacity(12);
+            for idx in 0..12 {
+                let value: Option<String> = row.get(idx).unwrap_or(None);
+                values.push(value.unwrap_or_default());
+            }
+            result_rows.push(values);
+        }
+
+        let columns = vec![
+            ColumnInfo {
+                name: "SID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SERIAL#".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "USERNAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "STATUS".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "ELAPSED_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "WAIT_EVENT".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_ID".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_ELAPSED_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "BUFFER_GETS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "DISK_READS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "PROGRAM".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_TEXT".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+        ];
+
+        Ok(QueryResult::new_select(
+            sql,
+            columns,
+            result_rows,
+            start.elapsed(),
+        ))
+    }
+
+    fn build_kill_session_sql(sid: i64, serial: i64, immediate: bool) -> String {
+        if immediate {
+            format!("ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+        } else {
+            format!("ALTER SYSTEM KILL SESSION '{sid},{serial}'")
+        }
+    }
+
+    pub fn kill_session(
+        conn: &Connection,
+        sid: i64,
+        serial: i64,
+        immediate: bool,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_kill_session_sql(sid, serial, immediate);
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dba_feature_tests {
+    use super::QueryExecutor;
+
+    #[test]
+    fn kill_session_sql_uses_immediate_when_requested() {
+        let sql = QueryExecutor::build_kill_session_sql(101, 222, true);
+        assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222' IMMEDIATE");
+    }
+
+    #[test]
+    fn kill_session_sql_omits_immediate_when_not_requested() {
+        let sql = QueryExecutor::build_kill_session_sql(101, 222, false);
+        assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222'");
+    }
 }
 
 pub struct ObjectBrowser;

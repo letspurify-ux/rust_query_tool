@@ -116,7 +116,9 @@ impl ConnectionDialog {
 
         // Load saved connections
         {
-            let cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cfg = config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for conn in cfg.get_all_connections() {
                 saved_browser.add(&conn.name);
             }
@@ -273,7 +275,10 @@ impl ConnectionDialog {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
-        popups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(dialog.clone());
+        popups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(dialog.clone());
 
         // Saved connection selection callback
         let config_cb = config.clone();
@@ -287,7 +292,9 @@ impl ConnectionDialog {
 
         saved_browser.set_callback(move |browser| {
             if let Some(selected) = browser.selected_text() {
-                let cfg = config_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let cfg = config_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(conn) = cfg.get_connection_by_name(&selected) {
                     name_input_cb.set_value(&conn.name);
                     user_input_cb.set_value(&conn.username);
@@ -435,7 +442,9 @@ impl ConnectionDialog {
                                 "",
                             );
                             if choice == Some(1) {
-                                let mut cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut cfg = config
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 cfg.remove_connection(&selected);
                                 if let Err(e) = cfg.save() {
                                     fltk::dialog::alert_default(&format!(
@@ -470,7 +479,9 @@ impl ConnectionDialog {
                         }
                     },
                     DialogMessage::Save(info) => {
-                        let mut cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut cfg = config
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         cfg.add_recent_connection(info.clone());
                         if let Err(e) = cfg.save() {
                             fltk::dialog::alert_default(&format!(
@@ -486,7 +497,9 @@ impl ConnectionDialog {
                     }
                     DialogMessage::Connect(info, save_connection) => {
                         if save_connection {
-                            let mut cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let mut cfg = config
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                             cfg.add_recent_connection(info.clone());
                             if let Err(e) = cfg.save() {
                                 fltk::dialog::alert_default(&format!(
@@ -496,7 +509,9 @@ impl ConnectionDialog {
                             }
                         }
 
-                        *result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
+                        *result
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
                         dialog.hide();
                     }
                     DialogMessage::Cancel => {
@@ -511,7 +526,8 @@ impl ConnectionDialog {
 
         // Remove dialog from popups to prevent memory leak
         popups
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
 
         // Explicitly destroy top-level dialog widgets to release native resources.
@@ -519,7 +535,10 @@ impl ConnectionDialog {
 
         // Clear password from the returned ConnectionInfo clone held in config
         // (it was already saved to keyring if needed)
-        let final_result = result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let final_result = result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         final_result
     }
 }

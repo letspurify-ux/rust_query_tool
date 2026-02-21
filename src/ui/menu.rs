@@ -331,6 +331,12 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
+            "&Tools/&Session Lock Monitor...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
             "&Tools/",
             Shortcut::None,
             MenuFlag::MenuDivider,
@@ -427,6 +433,7 @@ impl MenuBarBuilder {
                     F4 - Quick Describe (Editor)\n\n\
                     Tools:\n\
                     Ctrl+E - Export Results\n\
+                    Session Lock Monitor - no shortcut\n\
                     Query History - no shortcut\n\n\
                     Results Table:\n\
                     Ctrl+C - Copy Selected Cells\n\

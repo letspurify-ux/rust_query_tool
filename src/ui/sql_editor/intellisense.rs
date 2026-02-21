@@ -327,7 +327,10 @@ impl SqlEditorWidget {
     pub(super) fn take_keyup_debounce_timeout_handle(
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> Option<app::TimeoutHandle> {
-        keyup_debounce_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        keyup_debounce_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub(crate) fn invalidate_keyup_debounce(
@@ -335,7 +338,9 @@ impl SqlEditorWidget {
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> u64 {
         Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
-        let mut generation_guard = keyup_debounce_generation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut generation_guard = keyup_debounce_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let generation = (*generation_guard).wrapping_add(1);
         *generation_guard = generation;
         generation
@@ -374,13 +379,19 @@ impl SqlEditorWidget {
             Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
             move |timeout_handle| {
                 {
-                    let mut slot = keyup_debounce_handle_for_timeout.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut slot = keyup_debounce_handle_for_timeout
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if slot.as_ref().copied() == Some(timeout_handle) {
                         *slot = None;
                     }
                 }
 
-                if *keyup_debounce_generation_for_timeout.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != generation {
+                if *keyup_debounce_generation_for_timeout
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    != generation
+                {
                     return;
                 }
 
@@ -414,7 +425,9 @@ impl SqlEditorWidget {
                 );
             },
         );
-        *keyup_debounce_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        *keyup_debounce_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
     fn is_same_raw_cursor_offset(current_raw: i32, scheduled_raw: i32) -> bool {
@@ -448,7 +461,9 @@ impl SqlEditorWidget {
         let column_sender_for_insert = column_sender.clone();
         let connection_for_insert = connection.clone();
         {
-            let mut popup = intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut popup = intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             popup.set_selected_callback(move |selected| {
                 let cursor_pos = Self::raw_cursor_position(
                     &buffer_for_insert,
@@ -461,7 +476,9 @@ impl SqlEditorWidget {
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
                     let should_prefetch = {
-                        let data = intellisense_data_for_insert.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let data = intellisense_data_for_insert
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         data.is_known_relation(&selected)
                     };
                     if should_prefetch {
@@ -473,7 +490,9 @@ impl SqlEditorWidget {
                         );
                     }
                 }
-                let range = *completion_range_for_insert.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let range = *completion_range_for_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let (start, end) = if let Some((range_start, range_end)) = range {
                     (range_start, range_end)
                 } else {
@@ -493,7 +512,9 @@ impl SqlEditorWidget {
                     editor_for_insert
                         .set_insert_position((cursor_pos_usize + selected.len()) as i32);
                 }
-                *completion_range_for_insert.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *completion_range_for_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             });
         }
 
@@ -523,15 +544,21 @@ impl SqlEditorWidget {
         editor.handle(move |ed, ev| {
             match ev {
                 Event::DndEnter | Event::DndDrag => {
-                    *dnd_file_drop_pending_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    *dnd_file_drop_pending_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                     true
                 }
                 Event::DndLeave => {
-                    *dnd_file_drop_pending_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                    *dnd_file_drop_pending_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                     true
                 }
                 Event::DndRelease => {
-                    *dnd_file_drop_pending_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    *dnd_file_drop_pending_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                     true
                 }
                 Event::Push => {
@@ -566,7 +593,10 @@ impl SqlEditorWidget {
                     let key = fltk::app::event_key();
                     let original_key = fltk::app::event_original_key();
                     let shortcut_key = Self::shortcut_key_for_layout(key, original_key);
-                    let popup_visible = intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_visible();
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
                         || state.contains(fltk::enums::Shortcut::Command);
@@ -575,9 +605,16 @@ impl SqlEditorWidget {
 
                     if ctrl_or_cmd && shift && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -590,9 +627,16 @@ impl SqlEditorWidget {
 
                     if alt && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -607,9 +651,16 @@ impl SqlEditorWidget {
                         match shortcut_key {
                             Key::Escape => {
                                 // Close popup, consume event
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                                *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                *completion_range_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                *pending_intellisense_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -619,27 +670,43 @@ impl SqlEditorWidget {
                             Key::Up => {
                                 // Navigate popup up, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).select_prev();
+                                *nav_anchor_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_prev();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                *suppress_nav_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                                 return true;
                             }
                             Key::Down => {
                                 // Navigate popup down, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).select_next();
+                                *nav_anchor_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_next();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                *suppress_nav_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                                 return true;
                             }
                             Key::Enter | Key::KPEnter | Key::Tab => {
                                 // Insert selected suggestion, consume event
-                                let selected =
-                                    intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_selected();
+                                let selected = intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .get_selected();
                                 let has_selected = selected.is_some();
                                 if let Some(selected) = selected {
                                     let cursor_pos = Self::raw_cursor_position(
@@ -647,7 +714,9 @@ impl SqlEditorWidget {
                                         ed.insert_position(),
                                     );
                                     let cursor_pos_usize = cursor_pos as usize;
-                                    let range = *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    let range = *completion_range_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                                     let (start, end) = if let Some((range_start, range_end)) = range
                                     {
                                         (range_start, range_end)
@@ -674,8 +743,12 @@ impl SqlEditorWidget {
                                             (cursor_pos_usize + selected.len()) as i32,
                                         );
                                     }
-                                    *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                    *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                    *completion_range_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                    *pending_intellisense_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
                                     // Update syntax highlighting after insertion
                                     let cursor_pos = Self::raw_cursor_position(
@@ -683,7 +756,8 @@ impl SqlEditorWidget {
                                         ed.insert_position(),
                                     ) as usize;
                                     highlighter_for_handle
-                                        .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .highlight_buffer_window(
                                             &buffer_for_handle,
                                             &mut style_buffer_for_handle,
@@ -692,10 +766,17 @@ impl SqlEditorWidget {
                                         );
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
-                                    *suppress_enter_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                    *suppress_enter_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                                 }
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                                *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                *pending_intellisense_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -756,10 +837,15 @@ impl SqlEditorWidget {
                                 return true;
                             }
                             Key::Enter | Key::KPEnter => {
-                                if *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                                if *ctrl_enter_handled_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                {
                                     return true;
                                 }
-                                *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                *ctrl_enter_handled_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
@@ -833,7 +919,10 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::KeyUp => {
-                    let popup_visible = intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_visible();
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
                     if !ed.active() || (!ed.has_focus() && !popup_visible) {
                         return false;
                     }
@@ -895,9 +984,16 @@ impl SqlEditorWidget {
                         )
                     {
                         if popup_visible {
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -907,27 +1003,44 @@ impl SqlEditorWidget {
                     }
 
                     if matches!(key, Key::Up | Key::Down)
-                        && *suppress_nav_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                        && *suppress_nav_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
                     {
-                        if let Some(pos) = *nav_anchor_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                        if let Some(pos) = *nav_anchor_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        {
                             ed.set_insert_position(pos);
                             ed.show_insert_position();
                         }
-                        *nav_anchor_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                        *suppress_nav_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                        *nav_anchor_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        *suppress_nav_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                         return true;
                     }
 
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *suppress_enter_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                        && *suppress_enter_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
                     {
-                        *suppress_enter_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                        *suppress_enter_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                         return true;
                     }
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                        && *ctrl_enter_handled_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
                     {
-                        *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                        *ctrl_enter_handled_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                         return true;
                     }
 
@@ -937,9 +1050,16 @@ impl SqlEditorWidget {
                         Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown
                     ) {
                         if popup_visible {
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         }
                         Self::invalidate_keyup_debounce(
                             &keyup_debounce_generation_for_handle,
@@ -983,7 +1103,9 @@ impl SqlEditorWidget {
                     };
 
                     if fast_path_applied {
-                        *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        *pending_intellisense_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         Self::invalidate_keyup_debounce(
                             &keyup_debounce_generation_for_handle,
                             &keyup_debounce_handle_for_handle,
@@ -1007,9 +1129,16 @@ impl SqlEditorWidget {
                                 &intellisense_parse_cache_for_handle,
                             );
                         } else {
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -1039,9 +1168,16 @@ impl SqlEditorWidget {
                                     &intellisense_parse_cache_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                                *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                *completion_range_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                *pending_intellisense_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -1066,9 +1202,16 @@ impl SqlEditorWidget {
                                     &intellisense_parse_cache_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                                *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                *completion_range_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                                *pending_intellisense_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                                 Self::invalidate_keyup_debounce(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
@@ -1077,9 +1220,16 @@ impl SqlEditorWidget {
                         } else {
                             // Non-identifier character (space, punctuation, etc.)
                             // Close popup - user is done with this word
-                            intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-                            *completion_range_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            *completion_range_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *pending_intellisense_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                             Self::invalidate_keyup_debounce(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
@@ -1106,7 +1256,10 @@ impl SqlEditorWidget {
                 }
                 Event::Shortcut => {
                     let key = fltk::app::event_key();
-                    let popup_visible = intellisense_popup_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_visible();
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
                     let state = fltk::app::event_state();
                     let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
                         || state.contains(fltk::enums::Shortcut::Command);
@@ -1122,10 +1275,15 @@ impl SqlEditorWidget {
                     }
 
                     if ctrl_or_cmd && matches!(key, Key::Enter | Key::KPEnter) {
-                        if *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+                        if *ctrl_enter_handled_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        {
                             return true;
                         }
-                        *ctrl_enter_handled_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        *ctrl_enter_handled_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                         widget_for_shortcuts.execute_statement_at_cursor();
                         return true;
                     }
@@ -1134,7 +1292,9 @@ impl SqlEditorWidget {
                 }
                 Event::Paste => {
                     let from_drop = {
-                        let mut pending = dnd_file_drop_pending_for_handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut pending = dnd_file_drop_pending_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let was_pending = *pending;
                         *pending = false;
                         was_pending
@@ -1278,9 +1438,16 @@ impl SqlEditorWidget {
             && Self::non_whitespace_char_before_cursor(buffer, cursor_pos) == Some(';');
 
         if should_hide_after_statement_terminator {
-            intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-            *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            *pending_intellisense
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *completion_range
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return;
         }
 
@@ -1297,7 +1464,9 @@ impl SqlEditorWidget {
             );
 
         let cached_context = {
-            let cache = intellisense_parse_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = intellisense_parse_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache
                 .as_ref()
                 .filter(|entry| {
@@ -1322,11 +1491,14 @@ impl SqlEditorWidget {
                 .map(|span| span.token.clone())
                 .collect();
             let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
-            *intellisense_parse_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IntellisenseParseCacheEntry {
-                statement_text: statement_text.clone(),
-                cursor_in_statement,
-                context: parsed.clone(),
-            });
+            *intellisense_parse_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(IntellisenseParseCacheEntry {
+                    statement_text: statement_text.clone(),
+                    cursor_in_statement,
+                    context: parsed.clone(),
+                });
             parsed
         };
 
@@ -1346,8 +1518,12 @@ impl SqlEditorWidget {
         let allow_empty_prefix =
             qualifier.is_some() || include_columns || matches!(context, SqlContext::TableName);
         if prefix.is_empty() && !allow_empty_prefix {
-            *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *pending_intellisense
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *completion_range
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return;
         }
 
@@ -1408,7 +1584,8 @@ impl SqlEditorWidget {
             }
         }
         intellisense_data
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace_virtual_table_columns(virtual_table_columns);
 
         // Load columns from DB for real tables (skip virtual tables)
@@ -1434,7 +1611,9 @@ impl SqlEditorWidget {
         }
 
         let columns_loading = {
-            let data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::has_column_loading_for_scope(
                 include_columns,
                 &column_tables,
@@ -1444,7 +1623,9 @@ impl SqlEditorWidget {
         };
 
         let suggestions = {
-            let mut data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let column_scope = if !column_tables.is_empty() {
                 Some(column_tables.as_slice())
             } else {
@@ -1472,14 +1653,24 @@ impl SqlEditorWidget {
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
         if should_refresh_when_columns_ready {
-            *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingIntellisense { cursor_pos });
+            *pending_intellisense
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(PendingIntellisense { cursor_pos });
         } else {
-            *pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *pending_intellisense
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
 
         if suggestions.is_empty() {
-            intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).hide();
-            *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            *completion_range
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return;
         }
 
@@ -1489,14 +1680,18 @@ impl SqlEditorWidget {
             Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
 
         intellisense_popup
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .show_suggestions(suggestions, popup_x, popup_y);
         let completion_start = if prefix.is_empty() {
             cursor_pos_usize
         } else {
             start
         };
-        *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((completion_start, cursor_pos_usize));
+        *completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((completion_start, cursor_pos_usize));
         let mut editor = editor.clone();
         let _ = editor.take_focus();
     }
@@ -1520,7 +1715,9 @@ impl SqlEditorWidget {
         for table in &wildcard_tables {
             Self::request_table_columns(table, intellisense_data, column_sender, connection);
             let columns = {
-                let data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 data.get_columns_for_table(table)
             };
             wildcard_columns.extend(columns);
@@ -1660,7 +1857,9 @@ impl SqlEditorWidget {
         }
 
         let should_prefetch = {
-            let data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.is_known_relation(word)
         };
 
@@ -1681,7 +1880,9 @@ impl SqlEditorWidget {
         }
 
         let table_key = {
-            let mut data = intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let selected = table_key_candidates
                 .iter()
                 .find(|candidate| data.is_known_relation(candidate))
@@ -2521,11 +2722,18 @@ impl SqlEditorWidget {
         key: Key,
         typed_char: Option<char>,
     ) -> bool {
-        if !intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_visible() {
+        if !intellisense_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible()
+        {
             return false;
         }
 
-        let Some((start, end)) = *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) else {
+        let Some((start, end)) = *completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        else {
             return false;
         };
 
@@ -2542,16 +2750,23 @@ impl SqlEditorWidget {
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
         let prefix = Self::prefix_in_completion_range(buffer, start, cursor_pos);
         {
-            let mut popup = intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut popup = intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             popup.filter_visible_suggestions_by_prefix(&prefix);
             if !popup.is_visible() {
-                *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *completion_range
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             } else {
                 let (popup_width, popup_height) = popup.popup_dimensions();
                 let (popup_x, popup_y) =
                     Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
                 popup.set_position(popup_x, popup_y);
-                *completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((start, cursor.max(start)));
+                *completion_range
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((start, cursor.max(start)));
             }
         }
         true
@@ -2854,7 +3069,10 @@ impl SqlEditorWidget {
         Window::delete(dialog);
     }
     pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
-        let mut popup = self.intellisense_popup.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut popup = self
+            .intellisense_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !popup.is_visible() {
             return;
         }
@@ -2862,15 +3080,24 @@ impl SqlEditorWidget {
             return;
         }
         popup.hide();
-        *self.completion_range.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        *self.pending_intellisense.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .pending_intellisense
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     #[allow(dead_code)]
     pub fn update_intellisense_data(&mut self, data: IntellisenseData) {
         let mut data = data;
         data.rebuild_indices();
-        *self.intellisense_data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
+        *self
+            .intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
     }
 
     pub fn get_intellisense_data(&self) -> Arc<Mutex<IntellisenseData>> {

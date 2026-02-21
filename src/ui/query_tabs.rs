@@ -36,7 +36,9 @@ struct CallbackSuppressGuard {
 impl CallbackSuppressGuard {
     fn new(counter: Arc<Mutex<u32>>) -> Self {
         {
-            let mut guard = counter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = counter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = guard.saturating_add(1);
         }
         Self { counter }
@@ -45,7 +47,10 @@ impl CallbackSuppressGuard {
 
 impl Drop for CallbackSuppressGuard {
     fn drop(&mut self) {
-        let mut guard = self.counter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .counter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = guard.saturating_sub(1);
     }
 }
@@ -66,13 +71,17 @@ impl QueryTabsWidget {
         tab_id: QueryTabId,
     ) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let callback_result = panic::catch_unwind(AssertUnwindSafe(|| cb(tab_id)));
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -152,7 +161,11 @@ impl QueryTabsWidget {
         let on_select_for_cb = on_select.clone();
         let suppress_for_cb = suppress_select_callback_depth.clone();
         tabs.set_callback(move |tabs| {
-            if *suppress_for_cb.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) > 0 {
+            if *suppress_for_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                > 0
+            {
                 return;
             }
             let Some(selected) = tabs.value() else {
@@ -160,7 +173,8 @@ impl QueryTabsWidget {
             };
             let selected_ptr = selected.as_widget_ptr();
             let selected_id = entries_for_cb
-                .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
                 .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
                 .map(|entry| entry.id);
@@ -185,7 +199,10 @@ impl QueryTabsWidget {
     where
         F: FnMut(QueryTabId) + 'static,
     {
-        *self.on_select.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+        *self
+            .on_select
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn get_widget(&self) -> Tabs {
@@ -194,7 +211,10 @@ impl QueryTabsWidget {
 
     pub fn add_tab(&mut self, label: &str) -> QueryTabId {
         let tab_id = {
-            let mut next = self.next_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut next = self
+                .next_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let id = *next;
             *next = next.saturating_add(1);
             id
@@ -208,10 +228,13 @@ impl QueryTabsWidget {
         group.end();
         self.tabs.end();
 
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(TabEntry {
-            id: tab_id,
-            group: group.clone(),
-        });
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(TabEntry {
+                id: tab_id,
+                group: group.clone(),
+            });
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         let _ = self.tabs.set_value(&group);
@@ -235,7 +258,8 @@ impl QueryTabsWidget {
         let selected = self.tabs.value()?;
         let selected_ptr = selected.as_widget_ptr();
         self.entries
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
             .map(|entry| entry.id)
@@ -252,7 +276,10 @@ impl QueryTabsWidget {
 
     pub fn close_tab(&mut self, tab_id: QueryTabId) -> bool {
         let group = {
-            let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(index) = entries.iter().position(|entry| entry.id == tab_id) else {
                 return false;
             };
@@ -275,7 +302,8 @@ impl QueryTabsWidget {
 
     pub fn tab_group(&self, tab_id: QueryTabId) -> Option<Group> {
         self.entries
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .find(|entry| entry.id == tab_id)
             .map(|entry| entry.group.clone())
@@ -283,7 +311,8 @@ impl QueryTabsWidget {
 
     pub fn tab_ids(&self) -> Vec<QueryTabId> {
         self.entries
-            .lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .map(|entry| entry.id)
             .collect()

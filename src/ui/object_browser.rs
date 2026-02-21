@@ -216,7 +216,11 @@ impl ObjectBrowserWidget {
         self.tree.set_item_label_font(profile.normal);
         self.tree.set_item_label_size(ui_size);
         let filter_text = self.filter_input.value().to_lowercase();
-        let cache_snapshot = self.object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let cache_snapshot = self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         Self::rebuild_root_categories(&mut self.tree);
         Self::populate_tree(&mut self.tree, &cache_snapshot, &filter_text);
         // Force layout recalculation so new font metrics take effect immediately.
@@ -233,7 +237,9 @@ impl ObjectBrowserWidget {
 
         self.filter_input.set_callback(move |input| {
             let filter_text = input.value().to_lowercase();
-            let cache = object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = object_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
             tree.redraw();
         });
@@ -269,15 +275,21 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             // Process any pending messages
             {
-                let r = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let r = receiver
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
                         Ok(RefreshEvent::Cache(cache)) => {
                             {
-                                *object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = cache;
+                                *object_cache
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = cache;
                             }
                             let filter_text = filter_input.value().to_lowercase();
-                            let cache = object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let cache = object_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
                             tree.redraw();
                         }
@@ -358,7 +370,9 @@ impl ObjectBrowserWidget {
             let mut disconnected = false;
             loop {
                 let message = {
-                    let r = receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let r = receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     r.try_recv()
                 };
 
@@ -557,7 +571,9 @@ impl ObjectBrowserWidget {
                             result,
                         } => match result {
                             Ok(routines) => {
-                                let mut cache = object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut cache = object_cache
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 cache.package_routines.insert(package_name, routines);
                                 let filter_text = filter_input.value().to_lowercase();
                                 ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
@@ -725,7 +741,9 @@ impl ObjectBrowserWidget {
                                     if object_type == "PACKAGES" {
                                         let package_name = object_name.clone();
                                         let should_fetch = {
-                                            let cache = object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            let cache = object_cache
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                                             !cache.package_routines.contains_key(&package_name)
                                         };
                                         if should_fetch {
@@ -1925,7 +1943,10 @@ impl ObjectBrowserWidget {
     where
         F: FnMut(SqlAction) + 'static,
     {
-        *self.sql_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+        *self
+            .sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -1949,13 +1970,17 @@ impl ObjectBrowserWidget {
 
     fn emit_sql_callback(callback_slot: &SqlExecuteCallback, action: SqlAction) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(action)));
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1967,13 +1992,17 @@ impl ObjectBrowserWidget {
 
     fn emit_status_callback(callback_slot: &StatusCallback, message: &str) {
         let callback = {
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
 
         if let Some(mut cb) = callback {
             let call_result = panic::catch_unwind(AssertUnwindSafe(|| cb(message)));
-            let mut slot = callback_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = callback_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
                 *slot = Some(cb);
             }
@@ -1991,14 +2020,20 @@ impl ObjectBrowserWidget {
     where
         F: FnMut(&str) + 'static,
     {
-        *self.status_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+        *self
+            .status_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn refresh(&mut self) {
         // First clear items and filter
         self.clear_items();
         self.filter_input.set_value("");
-        *self.object_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
+        *self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
         self.emit_status("Refreshing object browser metadata");
 
         let sender = self.refresh_sender.clone();
@@ -2202,7 +2237,13 @@ impl Drop for ObjectBrowserWidget {
         // the widget tree unnecessarily.
         self.filter_input.set_callback(|_| {});
         self.tree.handle(|_, _| false);
-        *self.sql_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        *self.status_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .status_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }

@@ -47,8 +47,14 @@ struct SelectTransformState {
     compute_seen_numeric: Vec<bool>,
 }
 
-const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(0);
-const PROGRESS_ROWS_MAX_BATCH: usize = 1;
+// Flush streamed rows in larger batches to reduce UI churn on huge result sets.
+// Send buffered rows when either:
+// - first batch reaches 100 rows
+// - 1 second passes
+// - an additional batch reaches 100,000 rows
+const PROGRESS_ROWS_INITIAL_BATCH: usize = 100;
+const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const PROGRESS_ROWS_MAX_BATCH: usize = 100_000;
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
 
 #[derive(Clone)]
@@ -2975,8 +2981,14 @@ impl SqlEditorWidget {
             return;
         }
 
-        if *self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            let _ = self.ui_action_sender.send(UiActionResult::QueryAlreadyRunning);
+        if *self
+            .query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            let _ = self
+                .ui_action_sender
+                .send(UiActionResult::QueryAlreadyRunning);
             app::awake();
             return;
         }
@@ -3016,7 +3028,9 @@ impl SqlEditorWidget {
         // Reset cancel flag before starting new execution
         cancel_flag.store(false, Ordering::SeqCst);
 
-        *query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
 
         set_cursor(Cursor::Wait);
         app::flush();
@@ -3096,6 +3110,9 @@ impl SqlEditorWidget {
                         &current_query_connection,
                         Some(Arc::clone(conn)),
                     );
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        let _ = conn.break_execution();
+                    }
                 }
 
                 // Keep conn_guard alive (don't drop it) so the lock is held during execution
@@ -5692,6 +5709,7 @@ impl SqlEditorWidget {
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut cursor_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
+                                    let mut has_flushed_rows = false;
                                     let cursor_start = Instant::now();
                                     let mut cursor_timed_out = false;
                                     let (heading_enabled, feedback_enabled) =
@@ -5745,6 +5763,7 @@ impl SqlEditorWidget {
                                             if SqlEditorWidget::should_flush_progress_rows(
                                                 last_flush,
                                                 buffered_rows.len(),
+                                                has_flushed_rows,
                                             ) {
                                                 let rows = std::mem::take(&mut buffered_rows);
                                                 SqlEditorWidget::append_spool_rows(&session, &rows);
@@ -5752,6 +5771,7 @@ impl SqlEditorWidget {
                                                     .send(QueryProgress::Rows { index, rows });
                                                 app::awake();
                                                 last_flush = Instant::now();
+                                                has_flushed_rows = true;
                                             }
                                             true
                                         },
@@ -5875,6 +5895,7 @@ impl SqlEditorWidget {
 
                                     let mut buffered_rows: Vec<Vec<String>> = Vec::new();
                                     let mut last_flush = Instant::now();
+                                    let mut has_flushed_rows = false;
                                     let cursor_start = Instant::now();
                                     let mut cursor_timed_out = false;
                                     let (heading_enabled, feedback_enabled) =
@@ -5927,6 +5948,7 @@ impl SqlEditorWidget {
                                             if SqlEditorWidget::should_flush_progress_rows(
                                                 last_flush,
                                                 buffered_rows.len(),
+                                                has_flushed_rows,
                                             ) {
                                                 let rows = std::mem::take(&mut buffered_rows);
                                                 SqlEditorWidget::append_spool_rows(&session, &rows);
@@ -5934,6 +5956,7 @@ impl SqlEditorWidget {
                                                     .send(QueryProgress::Rows { index, rows });
                                                 app::awake();
                                                 last_flush = Instant::now();
+                                                has_flushed_rows = true;
                                             }
                                             true
                                         },
@@ -6098,6 +6121,7 @@ impl SqlEditorWidget {
                                 let select_column_count = std::cell::Cell::new(0usize);
                                 let mut last_select_row: Option<Vec<String>> = None;
                                 let mut last_flush = Instant::now();
+                                let mut has_flushed_rows = false;
                                 let statement_start = Instant::now();
                                 let mut timed_out = false;
                                 let (colsep, null_text, _trimspool_enabled) =
@@ -6130,7 +6154,10 @@ impl SqlEditorWidget {
                                             select_column_names = names.clone();
                                             select_column_count.set(names.len());
                                             {
-                                                let mut state = transform_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                                let mut state =
+                                                    transform_state.lock().unwrap_or_else(
+                                                        |poisoned| poisoned.into_inner(),
+                                                    );
                                                 state.break_index =
                                                     break_column.as_ref().and_then(|target| {
                                                         let target_key =
@@ -6223,7 +6250,10 @@ impl SqlEditorWidget {
                                             let mut row = row;
                                             last_select_row = Some(row.clone());
                                             {
-                                                let mut state = transform_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                                let mut state =
+                                                    transform_state.lock().unwrap_or_else(
+                                                        |poisoned| poisoned.into_inner(),
+                                                    );
                                                 if let Some(config) = compute_config.as_ref() {
                                                     let grouped_compute =
                                                         config.of_column.is_some()
@@ -6304,6 +6334,7 @@ impl SqlEditorWidget {
                                             if SqlEditorWidget::should_flush_progress_rows(
                                                 last_flush,
                                                 buffered_rows.len(),
+                                                has_flushed_rows,
                                             ) {
                                                 let rows = std::mem::take(&mut buffered_rows);
                                                 SqlEditorWidget::append_spool_rows(&session, &rows);
@@ -6311,6 +6342,7 @@ impl SqlEditorWidget {
                                                     .send(QueryProgress::Rows { index, rows });
                                                 app::awake();
                                                 last_flush = Instant::now();
+                                                has_flushed_rows = true;
                                             }
                                             true
                                         },
@@ -7198,9 +7230,18 @@ impl SqlEditorWidget {
         }
     }
 
-    fn should_flush_progress_rows(last_flush: Instant, buffered_len: usize) -> bool {
-        buffered_len >= PROGRESS_ROWS_MAX_BATCH
-            || last_flush.elapsed() >= PROGRESS_ROWS_FLUSH_INTERVAL
+    fn should_flush_progress_rows(
+        last_flush: Instant,
+        buffered_len: usize,
+        has_flushed_rows: bool,
+    ) -> bool {
+        let row_threshold = if has_flushed_rows {
+            PROGRESS_ROWS_MAX_BATCH
+        } else {
+            PROGRESS_ROWS_INITIAL_BATCH
+        };
+
+        buffered_len >= row_threshold || last_flush.elapsed() >= PROGRESS_ROWS_FLUSH_INTERVAL
     }
 
     fn emit_select_result(
@@ -7734,7 +7775,9 @@ impl SqlEditorWidget {
             let mut dialog = dialog.clone();
             let input = input.clone();
             ok_btn.set_callback(move |_| {
-                *result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input.value());
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input.value());
                 dialog.hide();
             });
         }
@@ -7743,7 +7786,9 @@ impl SqlEditorWidget {
             let cancelled = cancelled.clone();
             let mut dialog = dialog.clone();
             cancel_btn.set_callback(move |_| {
-                *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                *cancelled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                 dialog.hide();
             });
         }
@@ -7754,7 +7799,9 @@ impl SqlEditorWidget {
             let input_value = input.clone();
             let mut dialog_cb = dialog.clone();
             input_cb.set_callback(move |_| {
-                *result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input_value.value());
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input_value.value());
                 dialog_cb.hide();
             });
         }
@@ -7764,7 +7811,9 @@ impl SqlEditorWidget {
             let mut dialog_cb = dialog.clone();
             let mut dialog_handle = dialog.clone();
             dialog_cb.set_callback(move |_| {
-                *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                *cancelled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                 dialog_handle.hide();
             });
         }
@@ -7779,10 +7828,16 @@ impl SqlEditorWidget {
         // Explicitly destroy top-level dialog widgets to release native resources.
         fltk::window::Window::delete(dialog);
 
-        if *cancelled.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+        if *cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
             None
         } else {
-            result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+            result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -8034,7 +8089,10 @@ impl SqlEditorWidget {
     where
         F: FnMut(QueryProgress) + 'static,
     {
-        *self.progress_callback.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+        *self
+            .progress_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 }
 

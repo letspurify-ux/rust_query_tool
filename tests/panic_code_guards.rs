@@ -1,5 +1,5 @@
-use std::fs;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
