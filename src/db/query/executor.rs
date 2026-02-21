@@ -2841,10 +2841,15 @@ ORDER BY
         } else {
             format_option.trim().to_string()
         };
-        let normalized_sql_id = sql_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_uppercase());
+        let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id, "SQL_ID")?;
+
+        if let Some(child) = child_number {
+            if child < 0 {
+                return Err(Self::invalid_security_input_error(
+                    "Child cursor number must be non-negative",
+                ));
+            }
+        }
 
         let sql = if normalized_sql_id.is_some() {
             if child_number.is_some() {
@@ -2926,7 +2931,7 @@ WHERE ROWNUM <= {normalized_limit}
         conn: &Connection,
         sql_id: &str,
     ) -> Result<QueryResult, OracleError> {
-        let normalized_sql_id = sql_id.trim().to_uppercase();
+        let normalized_sql_id = Self::normalize_required_sql_id_filter(sql_id, "SQL_ID")?;
         let sql_gv = r#"
 SELECT * FROM (
     SELECT
@@ -3058,18 +3063,59 @@ WHERE ROWNUM <= 5
         sql_id_filter: Option<&str>,
         username_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
-        let normalized_sql_id = sql_id_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_uppercase);
-        let normalized_user = username_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_uppercase);
+        let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
+        let normalized_user =
+            Self::normalize_optional_security_identifier(username_filter, "User filter")?;
 
-        let mut sql = r#"
+        if let Ok(result) = Self::query_sql_monitor_rows(
+            conn,
+            true,
+            min_elapsed_seconds,
+            active_only,
+            normalized_sql_id.as_deref(),
+            normalized_user.as_deref(),
+        ) {
+            return Ok(result);
+        }
+
+        Self::query_sql_monitor_rows(
+            conn,
+            false,
+            min_elapsed_seconds,
+            active_only,
+            normalized_sql_id.as_deref(),
+            normalized_user.as_deref(),
+        )
+    }
+
+    fn query_sql_monitor_rows(
+        conn: &Connection,
+        use_global_view: bool,
+        min_elapsed_seconds: u32,
+        active_only: bool,
+        sql_id_filter: Option<&str>,
+        username_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let source_view = if use_global_view {
+            "gv$sql_monitor"
+        } else {
+            "v$sql_monitor"
+        };
+        let inst_id_expr = if use_global_view {
+            "NVL(TO_CHAR(m.inst_id), '-')"
+        } else {
+            "'-'"
+        };
+        let order_clause = if use_global_view {
+            "ORDER BY NVL(m.elapsed_time, 0) DESC, m.sql_exec_start DESC, m.inst_id\n"
+        } else {
+            "ORDER BY NVL(m.elapsed_time, 0) DESC, m.sql_exec_start DESC, m.sid\n"
+        };
+
+        let mut sql = format!(
+            r#"
 SELECT
-    NVL(TO_CHAR(m.inst_id), '-') AS inst_id,
+    {inst_id_expr} AS inst_id,
     NVL(TO_CHAR(m.sid), '-') AS sid,
     NVL(TO_CHAR(m.session_serial#), '-') AS serial,
     NVL(m.status, '-') AS status,
@@ -3090,19 +3136,19 @@ SELECT
         ),
         '(no sql text)'
     ) AS sql_text
-FROM gv$sql_monitor m
+FROM {source_view} m
 WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
   AND (:active_only = 0 OR m.status IN ('EXECUTING', 'QUEUED', 'DONE (FIRST N ROWS)'))
  "#
-        .to_string();
+        );
 
-        if normalized_sql_id.is_some() {
+        if sql_id_filter.is_some() {
             sql.push_str("  AND UPPER(m.sql_id) = :sql_id_filter\n");
         }
-        if normalized_user.is_some() {
+        if username_filter.is_some() {
             sql.push_str("  AND UPPER(m.username) = :username_filter\n");
         }
-        sql.push_str("ORDER BY NVL(m.elapsed_time, 0) DESC, m.sql_exec_start DESC, m.inst_id\n");
+        sql.push_str(order_clause);
 
         let start = Instant::now();
         let mut stmt = conn.statement(&sql).build()?;
@@ -3110,11 +3156,11 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
         let active_only_flag: i64 = if active_only { 1 } else { 0 };
         stmt.bind("min_elapsed_us", &min_elapsed_us)?;
         stmt.bind("active_only", &active_only_flag)?;
-        if let Some(sql_id) = normalized_sql_id.as_ref() {
-            stmt.bind("sql_id_filter", sql_id)?;
+        if let Some(sql_id) = sql_id_filter {
+            stmt.bind("sql_id_filter", &sql_id)?;
         }
-        if let Some(username) = normalized_user.as_ref() {
-            stmt.bind("username_filter", username)?;
+        if let Some(username) = username_filter {
+            stmt.bind("username_filter", &username)?;
         }
         let rows = stmt.query(&[])?;
 
@@ -3201,7 +3247,8 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
         lookback_hours: u32,
         attention_only: bool,
     ) -> Result<QueryResult, OracleError> {
-        let lookback_hours = lookback_hours.max(1).min(24 * 30);
+        let lookback_hours =
+            Self::validate_bounded_positive_u32(lookback_hours, "Lookback hours", 24 * 30)?;
         let attention_clause = if attention_only {
             "  AND UPPER(NVL(status, '-')) NOT IN ('COMPLETED')\n"
         } else {
@@ -3228,7 +3275,24 @@ WHERE ROWNUM <= 300
 "#
         );
 
-        Self::execute_select(conn, &sql, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, &sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    '-' AS session_key,
+    '-' AS input_type,
+    'N/A' AS status,
+    '-' AS start_time,
+    '-' AS end_time,
+    '-' AS elapsed_secs,
+    '-' AS output_mb,
+    'V$RMAN_BACKUP_JOB_DETAILS privilege unavailable' AS output_device_type
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
     }
 
     pub fn get_rman_backup_set_snapshot(
@@ -3236,7 +3300,8 @@ WHERE ROWNUM <= 300
         lookback_hours: u32,
         attention_only: bool,
     ) -> Result<QueryResult, OracleError> {
-        let lookback_hours = lookback_hours.max(1).min(24 * 30);
+        let lookback_hours =
+            Self::validate_bounded_positive_u32(lookback_hours, "Lookback hours", 24 * 30)?;
         let attention_clause = if attention_only {
             "  AND NVL(status, '-') <> 'A'\n"
         } else {
@@ -3273,7 +3338,26 @@ WHERE ROWNUM <= 400
 "#
         );
 
-        Self::execute_select(conn, &sql, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, &sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    '-' AS set_stamp,
+    '-' AS set_count,
+    '-' AS backup_type,
+    '-' AS incremental_level,
+    '-' AS pieces,
+    '-' AS start_time,
+    '-' AS completion_time,
+    '-' AS elapsed_secs,
+    '-' AS output_mb,
+    'N/A (V$BACKUP_SET_DETAILS privilege unavailable)' AS status
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
     }
 
     pub fn get_rman_backup_coverage_snapshot(
@@ -3480,7 +3564,20 @@ SELECT
 FROM v$database
 "#;
 
-        Self::execute_select(conn, sql_fallback, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, sql_fallback, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_minimal = r#"
+SELECT
+    'DB_ROLE' AS metric,
+    '-' AS metric_value,
+    'RMAN view privilege unavailable' AS detail,
+    'INFO' AS alert_status
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_ash_session_activity_snapshot(
@@ -3489,7 +3586,8 @@ FROM v$database
         wait_only: bool,
         sql_id_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
-        let lookback_minutes = lookback_minutes.max(1).min(24 * 60);
+        let lookback_minutes =
+            Self::validate_bounded_positive_u32(lookback_minutes, "ASH minutes", 24 * 60)?;
         let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
         let wait_clause = if wait_only {
             "  AND ash.session_state = 'WAITING'\n"
@@ -3643,8 +3741,9 @@ WHERE ROWNUM <= 600
         wait_only: bool,
         sql_id_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
-        let lookback_minutes = lookback_minutes.max(1).min(24 * 60);
-        let top_n = top_n.max(1).min(200);
+        let lookback_minutes =
+            Self::validate_bounded_positive_u32(lookback_minutes, "ASH minutes", 24 * 60)?;
+        let top_n = Self::validate_bounded_positive_u32(top_n, "TopN", 200)?;
         let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
         let wait_clause = if wait_only {
             "  AND ash.session_state = 'WAITING'\n"
@@ -3829,8 +3928,9 @@ WHERE ROWNUM <= {top_n}
         top_n: u32,
         sql_id_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
-        let lookback_hours = lookback_hours.max(1).min(24 * 30);
-        let top_n = top_n.max(1).min(200);
+        let lookback_hours =
+            Self::validate_bounded_positive_u32(lookback_hours, "AWR hours", 24 * 30)?;
+        let top_n = Self::validate_bounded_positive_u32(top_n, "TopN", 200)?;
         let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
         let sql_id_clause = normalized_sql_id
             .as_deref()
@@ -4030,7 +4130,28 @@ SELECT
 FROM v$database d
 "#;
 
-        Self::execute_select(conn, sql_fallback, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, sql_fallback, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_minimal = r#"
+SELECT
+    '-' AS db_unique_name,
+    '-' AS database_role,
+    '-' AS open_mode,
+    '-' AS protection_mode,
+    '-' AS protection_level,
+    '-' AS switchover_status,
+    '-' AS force_logging,
+    '-' AS flashback_on,
+    '-' AS dataguard_broker,
+    '-' AS transport_lag,
+    '-' AS apply_lag,
+    '-' AS apply_finish_time
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_destination_snapshot(
@@ -4086,7 +4207,26 @@ ORDER BY dest_id
 "#
         );
 
-        Self::execute_select(conn, &sql_fallback, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, &sql_fallback, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_minimal = r#"
+SELECT
+    '-' AS dest_id,
+    '-' AS target,
+    'N/A' AS status,
+    '-' AS database_mode,
+    '-' AS recovery_mode,
+    '-' AS protection_mode,
+    '-' AS destination,
+    '-' AS archived_seq,
+    '-' AS applied_seq,
+    'Data Guard destination privilege unavailable' AS error
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_apply_process_snapshot(
@@ -4124,7 +4264,24 @@ FROM v$dataguard_process
 ORDER BY name
 "#;
 
-        Self::execute_select(conn, sql_fallback, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, sql_fallback, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_minimal = r#"
+SELECT
+    '-' AS process,
+    '-' AS client_process,
+    'N/A' AS status,
+    '-' AS thread_no,
+    '-' AS sequence_no,
+    '-' AS block_no,
+    '-' AS blocks,
+    '-' AS delay_mins
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_archive_gap_snapshot(
@@ -4156,7 +4313,19 @@ FROM (
 ORDER BY sort_order, thread_no
 "#;
 
-        Self::execute_select(conn, sql, Instant::now())
+        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    '-' AS thread_no,
+    'N/A' AS low_sequence,
+    '-' AS high_sequence
+FROM dual
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
     }
 
     pub fn force_archive_log_switch(conn: &Connection) -> Result<(), OracleError> {
@@ -4433,6 +4602,7 @@ ORDER BY
         Self::execute_select(conn, &sql, Instant::now())
     }
 
+    #[cfg(test)]
     fn qualified_scheduler_job_name(owner: Option<&str>, job_name: &str) -> String {
         match owner.map(str::trim).filter(|value| !value.is_empty()) {
             Some(owner_name) => format!("{owner_name}.{}", job_name.trim()),
@@ -4452,6 +4622,27 @@ ORDER BY
             message: Cow::Owned(message.into()),
             source: None,
         }
+    }
+
+    fn validate_bounded_positive_u32(
+        value: u32,
+        field_name: &str,
+        max: u32,
+    ) -> Result<u32, OracleError> {
+        if value == 0 {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be a positive integer",
+                field_name
+            )));
+        }
+        if value > max {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be {} or less",
+                field_name, max
+            )));
+        }
+
+        Ok(value)
     }
 
     fn normalize_required_security_identifier(
@@ -4520,6 +4711,32 @@ ORDER BY
         Ok(Some(normalized))
     }
 
+    fn normalize_required_sql_id_filter(
+        value: &str,
+        field_name: &str,
+    ) -> Result<String, OracleError> {
+        match Self::normalize_optional_sql_id_filter(Some(value), field_name)? {
+            Some(sql_id) => Ok(sql_id),
+            None => Err(Self::invalid_security_input_error(format!(
+                "{} is required",
+                field_name
+            ))),
+        }
+    }
+
+    fn normalize_scheduler_qualified_job_name(
+        owner: Option<&str>,
+        job_name: &str,
+    ) -> Result<String, OracleError> {
+        let normalized_job = Self::normalize_required_security_identifier(job_name, "Job")?;
+        let normalized_owner = Self::normalize_optional_security_identifier(owner, "Owner")?;
+
+        Ok(match normalized_owner {
+            Some(owner_name) => format!("{owner_name}.{normalized_job}"),
+            None => normalized_job,
+        })
+    }
+
     fn normalize_required_security_privilege(value: &str) -> Result<String, OracleError> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -4553,10 +4770,8 @@ ORDER BY
         owner_filter: Option<&str>,
         failed_only: bool,
     ) -> Result<QueryResult, OracleError> {
-        let owner_filter = owner_filter
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_uppercase);
+        let owner_filter =
+            Self::normalize_optional_security_identifier(owner_filter, "Owner filter")?;
         let mut shared_conditions: Vec<String> = Vec::new();
         if let Some(owner) = owner_filter.as_deref() {
             shared_conditions.push(format!("owner = '{owner}'"));
@@ -4663,10 +4878,10 @@ ORDER BY job_name
         owner: Option<&str>,
         job_name: &str,
     ) -> Result<QueryResult, OracleError> {
-        let normalized_job = job_name.trim();
-        let owner_clause = owner
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let normalized_job = Self::normalize_required_security_identifier(job_name, "Job")?;
+        let normalized_owner = Self::normalize_optional_security_identifier(owner, "Owner")?;
+        let owner_clause = normalized_owner
+            .as_deref()
             .map(|value| format!("AND owner = '{}'", value))
             .unwrap_or_default();
         let sql_dba = format!(
@@ -4746,7 +4961,7 @@ WHERE ROWNUM <= 200
         owner: Option<&str>,
         job_name: &str,
     ) -> Result<(), OracleError> {
-        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
         let mut stmt =
             conn.statement("BEGIN DBMS_SCHEDULER.RUN_JOB(job_name => :job_name, use_current_session => FALSE); END;")
                 .build()?;
@@ -4761,7 +4976,7 @@ WHERE ROWNUM <= 200
         job_name: &str,
         force: bool,
     ) -> Result<(), OracleError> {
-        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
         let mut stmt = conn
             .statement(
                 "BEGIN DBMS_SCHEDULER.STOP_JOB(job_name => :job_name, force => :force); END;",
@@ -4779,7 +4994,7 @@ WHERE ROWNUM <= 200
         owner: Option<&str>,
         job_name: &str,
     ) -> Result<(), OracleError> {
-        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
         let mut stmt = conn
             .statement("BEGIN DBMS_SCHEDULER.ENABLE(name => :job_name); END;")
             .build()?;
@@ -4794,7 +5009,7 @@ WHERE ROWNUM <= 200
         job_name: &str,
         force: bool,
     ) -> Result<(), OracleError> {
-        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
         let mut stmt = conn
             .statement("BEGIN DBMS_SCHEDULER.DISABLE(name => :job_name, force => :force); END;")
             .build()?;
@@ -5342,6 +5557,42 @@ mod dba_feature_tests {
     #[test]
     fn normalize_optional_sql_id_filter_rejects_invalid_symbols() {
         let result = QueryExecutor::normalize_optional_sql_id_filter(Some("bad-sql-id"), "SQL");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_bounded_positive_u32_accepts_in_range_value() {
+        let value = QueryExecutor::validate_bounded_positive_u32(30, "TopN", 200)
+            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
+        assert_eq!(value, 30);
+    }
+
+    #[test]
+    fn validate_bounded_positive_u32_rejects_zero_and_over_max() {
+        assert!(QueryExecutor::validate_bounded_positive_u32(0, "TopN", 200).is_err());
+        assert!(QueryExecutor::validate_bounded_positive_u32(201, "TopN", 200).is_err());
+    }
+
+    #[test]
+    fn normalize_required_sql_id_filter_rejects_empty_value() {
+        let result = QueryExecutor::normalize_required_sql_id_filter("   ", "SQL_ID");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_scheduler_qualified_job_name_normalizes_owner_and_job() {
+        let result =
+            QueryExecutor::normalize_scheduler_qualified_job_name(Some("hr"), "nightly_etl")
+                .unwrap_or_else(|err| {
+                    panic!("unexpected error: {err}");
+                });
+        assert_eq!(result, "HR.NIGHTLY_ETL");
+    }
+
+    #[test]
+    fn normalize_scheduler_qualified_job_name_rejects_invalid_tokens() {
+        let result =
+            QueryExecutor::normalize_scheduler_qualified_job_name(Some("HR"), "JOB;DROP_TABLE");
         assert!(result.is_err());
     }
 }

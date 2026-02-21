@@ -1204,34 +1204,59 @@ impl MainWindow {
     }
 
     fn open_query_history_dialog(state: &Arc<Mutex<AppState>>) {
-        let (mut buffer, mut editor, popups) = {
+        let popups = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                s.sql_buffer.clone(),
-                s.sql_editor.get_editor(),
-                s.popups.clone(),
-            )
+            s.popups.clone()
         };
         if let Some(sql) = QueryHistoryDialog::show_with_registry(popups) {
-            let buffer_length = buffer.length();
-            let text_to_insert = if buffer_length > 0 {
-                format!("\n{}", sql)
-            } else {
-                sql
+            let (created_tab_id, schema_sender, file_sender, created_editor, created_right_tile) = {
+                let mut s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut created_tab_id = None;
+                let mut created_editor: Option<SqlEditorWidget> = None;
+                let mut created_right_tile: Option<Tile> = None;
+                if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
+                    s.sql_buffer.set_text(&sql);
+                    s.sql_editor.reset_undo_redo_history();
+                    s.set_tab_file_path(tab_id, None);
+                    s.set_tab_pristine_text(tab_id, sql);
+                    created_editor = Some(s.sql_editor.clone());
+                    created_right_tile = Some(s.right_tile.clone());
+                    created_tab_id = Some(tab_id);
+                }
+                (
+                    created_tab_id,
+                    s.schema_sender.clone(),
+                    s.file_sender.clone(),
+                    created_editor,
+                    created_right_tile,
+                )
             };
-            buffer.insert(buffer_length, &text_to_insert);
 
-            let new_length = buffer.length();
-            editor.set_insert_position(new_length);
-            editor.show_insert_position();
-
-            state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .sql_editor
-                .refresh_highlighting();
+            if let Some(tab_id) = created_tab_id {
+                if let Some(schema_sender) = schema_sender {
+                    MainWindow::attach_editor_callbacks(state, tab_id, schema_sender);
+                }
+                if let Some(file_sender) = file_sender {
+                    MainWindow::attach_file_drop_callback(state, tab_id, file_sender);
+                }
+                if let Some(mut editor) = created_editor {
+                    editor.refresh_highlighting();
+                    editor.focus();
+                }
+                if let Some(mut right_tile) = created_right_tile {
+                    right_tile.redraw();
+                }
+                app::redraw();
+            } else {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set_status_message("Failed to create a new query tab");
+            }
         }
     }
 
@@ -3325,6 +3350,8 @@ impl MainWindow {
                     match r.try_recv() {
                         Ok(result) => {
                             let mut created_tab_for_open: Option<QueryTabId> = None;
+                            let mut created_editor_for_open: Option<SqlEditorWidget> = None;
+                            let mut created_right_tile_for_open: Option<Tile> = None;
                             match result {
                                 FileActionResult::OpenInNewTab { path, result } => match result {
                                     Ok(content) => {
@@ -3340,9 +3367,8 @@ impl MainWindow {
                                             s.sql_editor.reset_undo_redo_history();
                                             s.set_tab_file_path(tab_id, Some(path.clone()));
                                             s.set_tab_pristine_text(tab_id, content);
-                                            s.sql_editor.refresh_highlighting();
-                                            s.sql_editor.focus();
-                                            s.right_tile.redraw();
+                                            created_editor_for_open = Some(s.sql_editor.clone());
+                                            created_right_tile_for_open = Some(s.right_tile.clone());
                                             created_tab_for_open = Some(tab_id);
                                         }
                                     }
@@ -3396,11 +3422,13 @@ impl MainWindow {
                                     tab_id,
                                     file_sender.clone(),
                                 );
-                                state
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .sql_editor
-                                    .focus();
+                                if let Some(mut editor) = created_editor_for_open {
+                                    editor.refresh_highlighting();
+                                    editor.focus();
+                                }
+                                if let Some(mut right_tile) = created_right_tile_for_open {
+                                    right_tile.redraw();
+                                }
                                 app::redraw();
                             }
                         }

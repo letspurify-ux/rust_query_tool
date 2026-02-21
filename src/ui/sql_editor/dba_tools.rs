@@ -784,6 +784,7 @@ impl SqlEditorWidget {
 
         let mut latest_request_id = 0u64;
         let mut refresh_in_flight = false;
+        let mut pending_refresh_request: Option<(String, bool, String, String)> = None;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
         let mut last_snapshot_columns: Vec<String> = Vec::new();
 
@@ -799,7 +800,15 @@ impl SqlEditorWidget {
                         username_text,
                         from_auto,
                     } => {
-                        if from_auto && refresh_in_flight {
+                        if refresh_in_flight {
+                            if from_auto {
+                                continue;
+                            }
+                            pending_refresh_request =
+                                Some((min_elapsed_text, active_only, sql_id_text, username_text));
+                            status.set_label(
+                                "SQL monitor refresh queued (will run after current load)",
+                            );
                             continue;
                         }
 
@@ -1007,6 +1016,25 @@ impl SqlEditorWidget {
                                 status.set_label("SQL monitor load failed");
                             }
                         }
+
+                        if let Some((
+                            queued_min_elapsed_text,
+                            queued_active_only,
+                            queued_sql_id_text,
+                            queued_username_text,
+                        )) = pending_refresh_request.take()
+                        {
+                            if dialog.shown() {
+                                let _ = sender.send(SqlMonitorMessage::RefreshRequested {
+                                    min_elapsed_text: queued_min_elapsed_text,
+                                    active_only: queued_active_only,
+                                    sql_id_text: queued_sql_id_text,
+                                    username_text: queued_username_text,
+                                    from_auto: false,
+                                });
+                                app::awake();
+                            }
+                        }
                     }
                     SqlMonitorMessage::ActionFinished(result) => {
                         set_cursor(Cursor::Default);
@@ -1031,6 +1059,7 @@ impl SqlEditorWidget {
                         }
                     }
                     SqlMonitorMessage::CloseRequested => {
+                        pending_refresh_request = None;
                         dialog.hide();
                     }
                 }
@@ -3618,15 +3647,18 @@ impl SqlEditorWidget {
                         if let Some((queued_mode, queued_lookback_text, queued_attention_only)) =
                             pending_request.take()
                         {
-                            let _ = sender.send(RmanMessage::LoadRequested {
-                                mode: queued_mode,
-                                lookback_text: queued_lookback_text,
-                                attention_only: queued_attention_only,
-                            });
-                            app::awake();
+                            if dialog.shown() {
+                                let _ = sender.send(RmanMessage::LoadRequested {
+                                    mode: queued_mode,
+                                    lookback_text: queued_lookback_text,
+                                    attention_only: queued_attention_only,
+                                });
+                                app::awake();
+                            }
                         }
                     }
                     RmanMessage::CloseRequested => {
+                        pending_request = None;
                         dialog.hide();
                     }
                 }
@@ -3861,6 +3893,8 @@ impl SqlEditorWidget {
 
         let mut latest_request_id = 0u64;
         let mut loading_snapshot = false;
+        let mut pending_request: Option<(PerfViewMode, String, String, String, bool, String)> =
+            None;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
         let mut last_snapshot_columns: Vec<String> = Vec::new();
         while dialog.shown() {
@@ -3877,7 +3911,18 @@ impl SqlEditorWidget {
                         sql_id_text,
                     } => {
                         if loading_snapshot {
-                            status.set_label("AWR/ASH snapshot load is already in progress");
+                            pending_request = Some((
+                                mode,
+                                ash_minutes_text,
+                                awr_hours_text,
+                                top_n_text,
+                                wait_only,
+                                sql_id_text,
+                            ));
+                            status.set_label(&format!(
+                                "{} request queued (will run after current load)",
+                                mode.label()
+                            ));
                             continue;
                         }
 
@@ -4061,8 +4106,31 @@ impl SqlEditorWidget {
                                 status.set_label("AWR/ASH snapshot load failed");
                             }
                         }
+
+                        if let Some((
+                            queued_mode,
+                            queued_ash_minutes_text,
+                            queued_awr_hours_text,
+                            queued_top_n_text,
+                            queued_wait_only,
+                            queued_sql_id_text,
+                        )) = pending_request.take()
+                        {
+                            if dialog.shown() {
+                                let _ = sender.send(PerformanceMessage::LoadRequested {
+                                    mode: queued_mode,
+                                    ash_minutes_text: queued_ash_minutes_text,
+                                    awr_hours_text: queued_awr_hours_text,
+                                    top_n_text: queued_top_n_text,
+                                    wait_only: queued_wait_only,
+                                    sql_id_text: queued_sql_id_text,
+                                });
+                                app::awake();
+                            }
+                        }
                     }
                     PerformanceMessage::CloseRequested => {
+                        pending_request = None;
                         dialog.hide();
                     }
                 }
@@ -4277,6 +4345,7 @@ impl SqlEditorWidget {
         let mut overview_loaded = false;
         let mut loading_snapshot = false;
         let mut action_running = false;
+        let mut pending_load_request: Option<(DataGuardViewMode, bool)> = None;
         refresh_dataguard_force_switch_button(
             &mut force_switch_btn,
             current_database_role.as_deref(),
@@ -4294,7 +4363,9 @@ impl SqlEditorWidget {
                         attention_only,
                     } => {
                         if loading_snapshot || action_running {
-                            status.set_label("Data Guard request already in progress");
+                            pending_load_request = Some((mode, attention_only));
+                            status
+                                .set_label(&format!("Data Guard {} request queued", mode.label()));
                             continue;
                         }
 
@@ -4515,6 +4586,18 @@ impl SqlEditorWidget {
                             loading_snapshot,
                             action_running,
                         );
+
+                        if let Some((queued_mode, queued_attention_only)) =
+                            pending_load_request.take()
+                        {
+                            if dialog.shown() {
+                                let _ = sender.send(DataGuardMessage::LoadRequested {
+                                    mode: queued_mode,
+                                    attention_only: queued_attention_only,
+                                });
+                                app::awake();
+                            }
+                        }
                     }
                     DataGuardMessage::ActionFinished(result) => {
                         set_cursor(Cursor::Default);
@@ -4536,19 +4619,39 @@ impl SqlEditorWidget {
                         match result {
                             Ok(message) => {
                                 status.set_label(&message);
+                                let (reload_mode, reload_attention_only) =
+                                    if let Some((queued_mode, queued_attention_only)) =
+                                        pending_load_request.take()
+                                    {
+                                        (queued_mode, queued_attention_only)
+                                    } else {
+                                        (current_mode, attention_only_check.value())
+                                    };
                                 let _ = sender.send(DataGuardMessage::LoadRequested {
-                                    mode: current_mode,
-                                    attention_only: attention_only_check.value(),
+                                    mode: reload_mode,
+                                    attention_only: reload_attention_only,
                                 });
                                 app::awake();
                             }
                             Err(err) => {
                                 status.set_label("Data Guard action failed");
                                 fltk::dialog::alert_default(&err);
+                                if let Some((queued_mode, queued_attention_only)) =
+                                    pending_load_request.take()
+                                {
+                                    if dialog.shown() {
+                                        let _ = sender.send(DataGuardMessage::LoadRequested {
+                                            mode: queued_mode,
+                                            attention_only: queued_attention_only,
+                                        });
+                                        app::awake();
+                                    }
+                                }
                             }
                         }
                     }
                     DataGuardMessage::CloseRequested => {
+                        pending_load_request = None;
                         dialog.hide();
                     }
                 }
