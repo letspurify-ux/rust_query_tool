@@ -1,5 +1,6 @@
 use oracle::sql_type::{OracleType, RefCursor};
 use oracle::{Connection, Error as OracleError, Row, Statement};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -2829,11 +2830,2386 @@ ORDER BY
         ))
     }
 
-    fn build_kill_session_sql(sid: i64, serial: i64, immediate: bool) -> String {
-        if immediate {
-            format!("ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+    pub fn get_cursor_plan_snapshot(
+        conn: &Connection,
+        sql_id: Option<&str>,
+        child_number: Option<i32>,
+        format_option: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_format = if format_option.trim().is_empty() {
+            "ALLSTATS LAST +COST +BYTES +PREDICATE +PEEKED_BINDS +OUTLINE".to_string()
         } else {
-            format!("ALTER SYSTEM KILL SESSION '{sid},{serial}'")
+            format_option.trim().to_string()
+        };
+        let normalized_sql_id = sql_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_uppercase());
+
+        let sql = if normalized_sql_id.is_some() {
+            if child_number.is_some() {
+                "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:sql_id, :child_number, :format_option))"
+            } else {
+                "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(:sql_id, NULL, :format_option))"
+            }
+        } else {
+            "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, :format_option))"
+        };
+
+        let start = Instant::now();
+        let mut stmt = conn.statement(sql).build()?;
+        stmt.bind("format_option", &normalized_format)?;
+        if let Some(sql_id_value) = normalized_sql_id.as_ref() {
+            stmt.bind("sql_id", sql_id_value)?;
+            if let Some(child) = child_number {
+                let child_bind = i64::from(child);
+                stmt.bind("child_number", &child_bind)?;
+            }
+        }
+
+        let rows = stmt.query(&[])?;
+        let mut result_rows: Vec<Vec<String>> = Vec::new();
+        for row_result in rows {
+            let row: Row = row_result?;
+            let value: Option<String> = row.get(0).unwrap_or(None);
+            result_rows.push(vec![value.unwrap_or_default()]);
+        }
+
+        Ok(QueryResult::new_select(
+            "DBMS_XPLAN.DISPLAY_CURSOR",
+            vec![ColumnInfo {
+                name: "PLAN_TABLE_OUTPUT".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            }],
+            result_rows,
+            start.elapsed(),
+        ))
+    }
+
+    pub fn get_recent_sql_cursor_candidates(
+        conn: &Connection,
+        limit_rows: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_limit = limit_rows.max(1).min(500);
+        let sql = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        s.sql_id,
+        TO_CHAR(s.child_number) AS child_number,
+        NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
+        NVL(s.parsing_schema_name, '-') AS parsing_schema_name,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(NVL(s.buffer_gets, 0)) AS buffer_gets,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        NVL(
+            SUBSTR(
+                REPLACE(REPLACE(s.sql_text, CHR(10), ' '), CHR(13), ' '),
+                1,
+                240
+            ),
+            '(no sql text)'
+        ) AS sql_text
+    FROM v$sql s
+    WHERE s.sql_id IS NOT NULL
+    ORDER BY
+        s.last_active_time DESC NULLS LAST,
+        s.elapsed_time DESC NULLS LAST
+)
+WHERE ROWNUM <= {normalized_limit}
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_sql_text_by_sql_id(
+        conn: &Connection,
+        sql_id: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_sql_id = sql_id.trim().to_uppercase();
+        let sql_gv = r#"
+SELECT * FROM (
+    SELECT
+        NVL(TO_CHAR(s.inst_id), '-') AS inst_id,
+        NVL(s.sql_id, '-') AS sql_id,
+        TO_CHAR(s.child_number) AS child_number,
+        NVL(s.parsing_schema_name, '-') AS parsing_schema_name,
+        NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        NVL(
+            REPLACE(
+                REPLACE(DBMS_LOB.SUBSTR(s.sql_fulltext, 4000, 1), CHR(10), ' '),
+                CHR(13),
+                ' '
+            ),
+            '(no sql text)'
+        ) AS sql_text
+    FROM gv$sql s
+    WHERE s.sql_id = :sql_id
+    ORDER BY
+        s.last_active_time DESC NULLS LAST,
+        s.elapsed_time DESC NULLS LAST,
+        s.inst_id
+)
+WHERE ROWNUM <= 5
+"#;
+
+        if let Ok(result) = Self::query_sql_text_rows(conn, sql_gv, &normalized_sql_id) {
+            return Ok(result);
+        }
+
+        let sql_v = r#"
+SELECT * FROM (
+    SELECT
+        '-' AS inst_id,
+        NVL(s.sql_id, '-') AS sql_id,
+        TO_CHAR(s.child_number) AS child_number,
+        NVL(s.parsing_schema_name, '-') AS parsing_schema_name,
+        NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        NVL(
+            REPLACE(
+                REPLACE(DBMS_LOB.SUBSTR(s.sql_fulltext, 4000, 1), CHR(10), ' '),
+                CHR(13),
+                ' '
+            ),
+            '(no sql text)'
+        ) AS sql_text
+    FROM v$sql s
+    WHERE s.sql_id = :sql_id
+    ORDER BY
+        s.last_active_time DESC NULLS LAST,
+        s.elapsed_time DESC NULLS LAST
+)
+WHERE ROWNUM <= 5
+"#;
+
+        Self::query_sql_text_rows(conn, sql_v, &normalized_sql_id)
+    }
+
+    fn query_sql_text_rows(
+        conn: &Connection,
+        sql: &str,
+        sql_id: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let start = Instant::now();
+        let mut stmt = conn.statement(sql).build()?;
+        stmt.bind("sql_id", &sql_id)?;
+        let rows = stmt.query(&[])?;
+
+        let mut result_rows: Vec<Vec<String>> = Vec::new();
+        for row_result in rows {
+            let row: Row = row_result?;
+            let mut values = Vec::with_capacity(8);
+            for idx in 0..8 {
+                let value: Option<String> = row.get(idx).unwrap_or(None);
+                values.push(value.unwrap_or_default());
+            }
+            result_rows.push(values);
+        }
+
+        Ok(QueryResult::new_select(
+            sql,
+            vec![
+                ColumnInfo {
+                    name: "INST_ID".to_string(),
+                    data_type: "NUMBER".to_string(),
+                },
+                ColumnInfo {
+                    name: "SQL_ID".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+                ColumnInfo {
+                    name: "CHILD_NUMBER".to_string(),
+                    data_type: "NUMBER".to_string(),
+                },
+                ColumnInfo {
+                    name: "PARSING_SCHEMA_NAME".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                },
+                ColumnInfo {
+                    name: "LAST_ACTIVE_TIME".to_string(),
+                    data_type: "DATE".to_string(),
+                },
+                ColumnInfo {
+                    name: "ELAPSED_SECS".to_string(),
+                    data_type: "NUMBER".to_string(),
+                },
+                ColumnInfo {
+                    name: "EXECUTIONS".to_string(),
+                    data_type: "NUMBER".to_string(),
+                },
+                ColumnInfo {
+                    name: "SQL_TEXT".to_string(),
+                    data_type: "CLOB".to_string(),
+                },
+            ],
+            result_rows,
+            start.elapsed(),
+        ))
+    }
+
+    pub fn get_sql_monitor_snapshot(
+        conn: &Connection,
+        min_elapsed_seconds: u32,
+        active_only: bool,
+        sql_id_filter: Option<&str>,
+        username_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_sql_id = sql_id_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_uppercase);
+        let normalized_user = username_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_uppercase);
+
+        let mut sql = r#"
+SELECT
+    NVL(TO_CHAR(m.inst_id), '-') AS inst_id,
+    NVL(TO_CHAR(m.sid), '-') AS sid,
+    NVL(TO_CHAR(m.session_serial#), '-') AS serial,
+    NVL(m.status, '-') AS status,
+    NVL(m.username, '-') AS username,
+    NVL(m.sql_id, '-') AS sql_id,
+    NVL(TO_CHAR(m.sql_exec_id), '-') AS sql_exec_id,
+    NVL(TO_CHAR(m.sql_exec_start, 'YYYY-MM-DD HH24:MI:SS'), '-') AS sql_exec_start,
+    TO_CHAR(ROUND(NVL(m.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+    TO_CHAR(ROUND(NVL(m.cpu_time, 0) / 1000000, 2)) AS cpu_secs,
+    TO_CHAR(ROUND(NVL(m.user_io_wait_time, 0) / 1000000, 2)) AS io_wait_secs,
+    TO_CHAR(NVL(m.buffer_gets, 0)) AS buffer_gets,
+    TO_CHAR(NVL(m.disk_reads, 0)) AS disk_reads,
+    NVL(
+        SUBSTR(
+            REPLACE(REPLACE(m.sql_text, CHR(10), ' '), CHR(13), ' '),
+            1,
+            220
+        ),
+        '(no sql text)'
+    ) AS sql_text
+FROM gv$sql_monitor m
+WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
+  AND (:active_only = 0 OR m.status IN ('EXECUTING', 'QUEUED', 'DONE (FIRST N ROWS)'))
+ "#
+        .to_string();
+
+        if normalized_sql_id.is_some() {
+            sql.push_str("  AND UPPER(m.sql_id) = :sql_id_filter\n");
+        }
+        if normalized_user.is_some() {
+            sql.push_str("  AND UPPER(m.username) = :username_filter\n");
+        }
+        sql.push_str("ORDER BY NVL(m.elapsed_time, 0) DESC, m.sql_exec_start DESC, m.inst_id\n");
+
+        let start = Instant::now();
+        let mut stmt = conn.statement(&sql).build()?;
+        let min_elapsed_us = i64::from(min_elapsed_seconds).saturating_mul(1_000_000);
+        let active_only_flag: i64 = if active_only { 1 } else { 0 };
+        stmt.bind("min_elapsed_us", &min_elapsed_us)?;
+        stmt.bind("active_only", &active_only_flag)?;
+        if let Some(sql_id) = normalized_sql_id.as_ref() {
+            stmt.bind("sql_id_filter", sql_id)?;
+        }
+        if let Some(username) = normalized_user.as_ref() {
+            stmt.bind("username_filter", username)?;
+        }
+        let rows = stmt.query(&[])?;
+
+        let mut result_rows: Vec<Vec<String>> = Vec::new();
+        for row_result in rows {
+            let row: Row = row_result?;
+            let mut values = Vec::with_capacity(14);
+            for idx in 0..14 {
+                let value: Option<String> = row.get(idx).unwrap_or(None);
+                values.push(value.unwrap_or_default());
+            }
+            result_rows.push(values);
+        }
+
+        let columns = vec![
+            ColumnInfo {
+                name: "INST_ID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SERIAL#".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "STATUS".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "USERNAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_ID".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_EXEC_ID".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_EXEC_START".to_string(),
+                data_type: "DATE".to_string(),
+            },
+            ColumnInfo {
+                name: "ELAPSED_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "CPU_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "IO_WAIT_SECS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "BUFFER_GETS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "DISK_READS".to_string(),
+                data_type: "NUMBER".to_string(),
+            },
+            ColumnInfo {
+                name: "SQL_TEXT".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            },
+        ];
+
+        Ok(QueryResult::new_select(
+            &sql,
+            columns,
+            result_rows,
+            start.elapsed(),
+        ))
+    }
+
+    pub fn get_rman_job_snapshot(
+        conn: &Connection,
+        lookback_hours: u32,
+        attention_only: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let lookback_hours = lookback_hours.max(1).min(24 * 30);
+        let attention_clause = if attention_only {
+            "  AND UPPER(NVL(status, '-')) NOT IN ('COMPLETED')\n"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        TO_CHAR(session_key) AS session_key,
+        NVL(input_type, '-') AS input_type,
+        NVL(status, '-') AS status,
+        NVL(TO_CHAR(start_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS start_time,
+        NVL(TO_CHAR(end_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS end_time,
+        TO_CHAR(NVL(elapsed_seconds, 0)) AS elapsed_secs,
+        TO_CHAR(ROUND(NVL(output_bytes, 0) / 1048576, 2)) AS output_mb,
+        NVL(output_device_type, '-') AS output_device_type
+    FROM v$rman_backup_job_details
+    WHERE start_time >= SYSDATE - ({lookback_hours} / 24)
+{attention_clause}
+    ORDER BY start_time DESC, session_key DESC
+)
+WHERE ROWNUM <= 300
+"#
+        );
+
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_rman_backup_set_snapshot(
+        conn: &Connection,
+        lookback_hours: u32,
+        attention_only: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let lookback_hours = lookback_hours.max(1).min(24 * 30);
+        let attention_clause = if attention_only {
+            "  AND NVL(status, '-') <> 'A'\n"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        TO_CHAR(set_stamp) AS set_stamp,
+        TO_CHAR(set_count) AS set_count,
+        DECODE(
+            backup_type,
+            'D', 'DATAFILE',
+            'L', 'ARCHIVELOG',
+            'I', 'INCREMENTAL',
+            'C', 'CONTROLFILE',
+            NVL(backup_type, '-')
+        ) AS backup_type,
+        NVL(TO_CHAR(incremental_level), '-') AS incremental_level,
+        TO_CHAR(NVL(pieces, 0)) AS pieces,
+        NVL(TO_CHAR(start_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS start_time,
+        NVL(TO_CHAR(completion_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS completion_time,
+        TO_CHAR(NVL(elapsed_seconds, 0)) AS elapsed_secs,
+        TO_CHAR(ROUND(NVL(output_bytes, 0) / 1048576, 2)) AS output_mb,
+        NVL(status, '-') AS status
+    FROM v$backup_set_details
+    WHERE completion_time >= SYSDATE - ({lookback_hours} / 24)
+{attention_clause}
+    ORDER BY completion_time DESC, set_stamp DESC, set_count DESC
+)
+WHERE ROWNUM <= 400
+"#
+        );
+
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_rman_backup_coverage_snapshot(
+        conn: &Connection,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    metric,
+    metric_value,
+    detail,
+    alert_status
+FROM (
+    SELECT
+        'DB_ROLE' AS metric,
+        NVL((SELECT database_role FROM v$database), '-') AS metric_value,
+        'open_mode='
+            || NVL((SELECT open_mode FROM v$database), '-')
+            || ', log_mode='
+            || NVL((SELECT log_mode FROM v$database), '-') AS detail,
+        'INFO' AS alert_status
+    FROM dual
+
+    UNION ALL
+
+    SELECT
+        'LAST_DATAFILE_BACKUP' AS metric,
+        NVL(
+            (
+                SELECT TO_CHAR(MAX(completion_time), 'YYYY-MM-DD HH24:MI:SS')
+                FROM v$backup_set_details
+                WHERE backup_type = 'D'
+            ),
+            'N/A'
+        ) AS metric_value,
+        NVL(
+            (
+                SELECT TO_CHAR(ROUND((SYSDATE - MAX(completion_time)) * 24, 2))
+                FROM v$backup_set_details
+                WHERE backup_type = 'D'
+            ),
+            '-'
+        ) || ' h ago' AS detail,
+        CASE
+            WHEN (
+                SELECT MAX(completion_time)
+                FROM v$backup_set_details
+                WHERE backup_type = 'D'
+            ) IS NULL THEN 'CRITICAL'
+            WHEN
+                (
+                    SYSDATE
+                    - (
+                        SELECT MAX(completion_time)
+                        FROM v$backup_set_details
+                        WHERE backup_type = 'D'
+                    )
+                ) * 24 >= 24 THEN 'WARN'
+            ELSE 'OK'
+        END AS alert_status
+    FROM dual
+
+    UNION ALL
+
+    SELECT
+        'LAST_ARCHIVELOG_BACKUP' AS metric,
+        NVL(
+            (
+                SELECT TO_CHAR(MAX(completion_time), 'YYYY-MM-DD HH24:MI:SS')
+                FROM v$backup_set_details
+                WHERE backup_type = 'L'
+            ),
+            'N/A'
+        ) AS metric_value,
+        NVL(
+            (
+                SELECT TO_CHAR(ROUND((SYSDATE - MAX(completion_time)) * 24, 2))
+                FROM v$backup_set_details
+                WHERE backup_type = 'L'
+            ),
+            '-'
+        ) || ' h ago' AS detail,
+        CASE
+            WHEN (
+                SELECT MAX(completion_time)
+                FROM v$backup_set_details
+                WHERE backup_type = 'L'
+            ) IS NULL THEN 'CRITICAL'
+            WHEN
+                (
+                    SYSDATE
+                    - (
+                        SELECT MAX(completion_time)
+                        FROM v$backup_set_details
+                        WHERE backup_type = 'L'
+                    )
+                ) * 24 >= 8 THEN 'WARN'
+            ELSE 'OK'
+        END AS alert_status
+    FROM dual
+
+    UNION ALL
+
+    SELECT
+        'LAST_ARCHIVED_LOG_GENERATED' AS metric,
+        NVL(
+            (
+                SELECT TO_CHAR(MAX(completion_time), 'YYYY-MM-DD HH24:MI:SS')
+                FROM v$archived_log
+                WHERE archived = 'YES'
+            ),
+            'N/A'
+        ) AS metric_value,
+        NVL(
+            (
+                SELECT TO_CHAR(ROUND((SYSDATE - MAX(completion_time)) * 24, 2))
+                FROM v$archived_log
+                WHERE archived = 'YES'
+            ),
+            '-'
+        ) || ' h ago' AS detail,
+        CASE
+            WHEN (
+                SELECT MAX(completion_time)
+                FROM v$archived_log
+                WHERE archived = 'YES'
+            ) IS NULL THEN 'WARN'
+            WHEN
+                (
+                    SYSDATE
+                    - (
+                        SELECT MAX(completion_time)
+                        FROM v$archived_log
+                        WHERE archived = 'YES'
+                    )
+                ) * 24 >= 6 THEN 'WARN'
+            ELSE 'OK'
+        END AS alert_status
+    FROM dual
+
+    UNION ALL
+
+    SELECT
+        'FRA_USED_PCT' AS metric,
+        NVL(
+            (
+                SELECT TO_CHAR(
+                    ROUND(
+                        CASE
+                            WHEN space_limit = 0 THEN 0
+                            ELSE (space_used / space_limit) * 100
+                        END,
+                        2
+                    )
+                )
+                FROM v$recovery_file_dest
+            ),
+            '0'
+        ) AS metric_value,
+        NVL(
+            (
+                SELECT
+                    'used_mb='
+                        || TO_CHAR(ROUND(space_used / 1048576, 2))
+                        || ', reclaimable_mb='
+                        || TO_CHAR(ROUND(space_reclaimable / 1048576, 2))
+                FROM v$recovery_file_dest
+            ),
+            '-'
+        ) AS detail,
+        CASE
+            WHEN (
+                SELECT
+                    CASE
+                        WHEN space_limit = 0 THEN 0
+                        ELSE (space_used / space_limit) * 100
+                    END
+                FROM v$recovery_file_dest
+            ) >= 90 THEN 'CRITICAL'
+            WHEN (
+                SELECT
+                    CASE
+                        WHEN space_limit = 0 THEN 0
+                        ELSE (space_used / space_limit) * 100
+                    END
+                FROM v$recovery_file_dest
+            ) >= 80 THEN 'WARN'
+            ELSE 'OK'
+        END AS alert_status
+    FROM dual
+)
+ORDER BY metric
+"#;
+
+        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    'DB_ROLE' AS metric,
+    NVL(database_role, '-') AS metric_value,
+    'open_mode=' || NVL(open_mode, '-') || ', log_mode=' || NVL(log_mode, '-') AS detail,
+    'INFO' AS alert_status
+FROM v$database
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
+    }
+
+    pub fn get_ash_session_activity_snapshot(
+        conn: &Connection,
+        lookback_minutes: u32,
+        wait_only: bool,
+        sql_id_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let lookback_minutes = lookback_minutes.max(1).min(24 * 60);
+        let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
+        let wait_clause = if wait_only {
+            "  AND ash.session_state = 'WAITING'\n"
+        } else {
+            ""
+        };
+        let sql_id_clause = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND ash.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_gv = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        NVL(TO_CHAR(ash.inst_id), '-') AS inst_id,
+        TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+        TO_CHAR(ash.session_id) AS sid,
+        TO_CHAR(ash.session_serial#) AS serial,
+        NVL(u.username, '-') AS username,
+        NVL(ash.session_state, '-') AS session_state,
+        NVL(ash.wait_class, '-') AS wait_class,
+        NVL(ash.event, '-') AS event,
+        NVL(TO_CHAR(ash.blocking_session), '-') AS blocking_sid,
+        NVL(ash.sql_id, '-') AS sql_id,
+        NVL(ash.module, '-') AS module,
+        NVL(ash.program, '-') AS program
+    FROM gv$active_session_history ash
+    LEFT JOIN all_users u
+        ON u.user_id = ash.user_id
+    WHERE ash.sample_time >= SYSTIMESTAMP - NUMTODSINTERVAL({lookback_minutes}, 'MINUTE')
+{wait_clause}{sql_id_clause}
+    ORDER BY ash.sample_time DESC, ash.inst_id, ash.session_id
+)
+WHERE ROWNUM <= 600
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_gv, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        '-' AS inst_id,
+        TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+        TO_CHAR(ash.session_id) AS sid,
+        TO_CHAR(ash.session_serial#) AS serial,
+        NVL(u.username, '-') AS username,
+        NVL(ash.session_state, '-') AS session_state,
+        NVL(ash.wait_class, '-') AS wait_class,
+        NVL(ash.event, '-') AS event,
+        NVL(TO_CHAR(ash.blocking_session), '-') AS blocking_sid,
+        NVL(ash.sql_id, '-') AS sql_id,
+        NVL(ash.module, '-') AS module,
+        NVL(ash.program, '-') AS program
+    FROM v$active_session_history ash
+    LEFT JOIN all_users u
+        ON u.user_id = ash.user_id
+    WHERE ash.sample_time >= SYSTIMESTAMP - NUMTODSINTERVAL({lookback_minutes}, 'MINUTE')
+{wait_clause}{sql_id_clause}
+    ORDER BY ash.sample_time DESC, ash.session_id
+)
+WHERE ROWNUM <= 600
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_v, Instant::now()) {
+            return Ok(result);
+        }
+
+        let wait_clause_session = if wait_only {
+            "  AND s.state = 'WAITING'\n"
+        } else {
+            ""
+        };
+        let sql_id_clause_session = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND s.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_session_gv = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        NVL(TO_CHAR(s.inst_id), '-') AS inst_id,
+        TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+        TO_CHAR(s.sid) AS sid,
+        TO_CHAR(s.serial#) AS serial,
+        NVL(u.username, '-') AS username,
+        NVL(s.state, 'ON CPU') AS session_state,
+        NVL(s.wait_class, '-') AS wait_class,
+        NVL(s.event, '-') AS event,
+        NVL(TO_CHAR(s.blocking_session), '-') AS blocking_sid,
+        NVL(s.sql_id, '-') AS sql_id,
+        NVL(s.module, '-') AS module,
+        NVL(s.program, '-') AS program
+    FROM gv$session s
+    LEFT JOIN all_users u
+        ON u.user_id = s.user#
+    WHERE s.type = 'USER'
+      AND s.status = 'ACTIVE'
+{wait_clause_session}{sql_id_clause_session}
+    ORDER BY NVL(s.last_call_et, 0) DESC, s.inst_id, s.sid
+)
+WHERE ROWNUM <= 600
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_session_gv, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_session_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        '-' AS inst_id,
+        TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
+        TO_CHAR(s.sid) AS sid,
+        TO_CHAR(s.serial#) AS serial,
+        NVL(u.username, '-') AS username,
+        NVL(s.state, 'ON CPU') AS session_state,
+        NVL(s.wait_class, '-') AS wait_class,
+        NVL(s.event, '-') AS event,
+        NVL(TO_CHAR(s.blocking_session), '-') AS blocking_sid,
+        NVL(s.sql_id, '-') AS sql_id,
+        NVL(s.module, '-') AS module,
+        NVL(s.program, '-') AS program
+    FROM v$session s
+    LEFT JOIN all_users u
+        ON u.user_id = s.user#
+    WHERE s.type = 'USER'
+      AND s.status = 'ACTIVE'
+{wait_clause_session}{sql_id_clause_session}
+    ORDER BY NVL(s.last_call_et, 0) DESC, s.sid
+)
+WHERE ROWNUM <= 600
+"#
+        );
+
+        Self::execute_select(conn, &sql_session_v, Instant::now())
+    }
+
+    pub fn get_ash_top_sql_snapshot(
+        conn: &Connection,
+        lookback_minutes: u32,
+        top_n: u32,
+        wait_only: bool,
+        sql_id_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let lookback_minutes = lookback_minutes.max(1).min(24 * 60);
+        let top_n = top_n.max(1).min(200);
+        let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
+        let wait_clause = if wait_only {
+            "  AND ash.session_state = 'WAITING'\n"
+        } else {
+            ""
+        };
+        let sql_id_clause = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND ash.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_gv = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        ash.sql_id,
+        TO_CHAR(COUNT(*)) AS ash_samples,
+        TO_CHAR(SUM(CASE WHEN ash.session_state = 'ON CPU' THEN 1 ELSE 0 END)) AS cpu_samples,
+        TO_CHAR(SUM(CASE WHEN ash.session_state = 'WAITING' THEN 1 ELSE 0 END)) AS wait_samples,
+        TO_CHAR(ROUND(COUNT(*) / {lookback_minutes}, 2)) AS avg_samples_per_min,
+        NVL(MAX(u.username), '-') AS sample_user,
+        NVL(MAX(ash.module), '-') AS module,
+        NVL(
+            SUBSTR(
+                MAX(REPLACE(REPLACE(q.sql_text, CHR(10), ' '), CHR(13), ' ')),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM gv$active_session_history ash
+    LEFT JOIN all_users u
+        ON u.user_id = ash.user_id
+    LEFT JOIN gv$sql q
+        ON q.inst_id = ash.inst_id
+        AND q.sql_id = ash.sql_id
+    WHERE ash.sample_time >= SYSTIMESTAMP - NUMTODSINTERVAL({lookback_minutes}, 'MINUTE')
+      AND ash.sql_id IS NOT NULL
+{wait_clause}{sql_id_clause}
+    GROUP BY ash.sql_id
+    ORDER BY COUNT(*) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_gv, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        ash.sql_id,
+        TO_CHAR(COUNT(*)) AS ash_samples,
+        TO_CHAR(SUM(CASE WHEN ash.session_state = 'ON CPU' THEN 1 ELSE 0 END)) AS cpu_samples,
+        TO_CHAR(SUM(CASE WHEN ash.session_state = 'WAITING' THEN 1 ELSE 0 END)) AS wait_samples,
+        TO_CHAR(ROUND(COUNT(*) / {lookback_minutes}, 2)) AS avg_samples_per_min,
+        NVL(MAX(u.username), '-') AS sample_user,
+        NVL(MAX(ash.module), '-') AS module,
+        NVL(
+            SUBSTR(
+                MAX(REPLACE(REPLACE(q.sql_text, CHR(10), ' '), CHR(13), ' ')),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM v$active_session_history ash
+    LEFT JOIN all_users u
+        ON u.user_id = ash.user_id
+    LEFT JOIN v$sql q
+        ON q.sql_id = ash.sql_id
+    WHERE ash.sample_time >= SYSTIMESTAMP - NUMTODSINTERVAL({lookback_minutes}, 'MINUTE')
+      AND ash.sql_id IS NOT NULL
+{wait_clause}{sql_id_clause}
+    GROUP BY ash.sql_id
+    ORDER BY COUNT(*) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_v, Instant::now()) {
+            return Ok(result);
+        }
+
+        let wait_clause_session = if wait_only {
+            "  AND s.state = 'WAITING'\n"
+        } else {
+            ""
+        };
+        let sql_id_clause_session = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND s.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_session_gv = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        s.sql_id,
+        TO_CHAR(COUNT(*)) AS ash_samples,
+        TO_CHAR(SUM(CASE WHEN s.state = 'ON CPU' THEN 1 ELSE 0 END)) AS cpu_samples,
+        TO_CHAR(SUM(CASE WHEN s.state = 'WAITING' THEN 1 ELSE 0 END)) AS wait_samples,
+        '-' AS avg_samples_per_min,
+        NVL(MAX(u.username), '-') AS sample_user,
+        NVL(MAX(s.module), '-') AS module,
+        NVL(
+            SUBSTR(
+                MAX(REPLACE(REPLACE(q.sql_text, CHR(10), ' '), CHR(13), ' ')),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM gv$session s
+    LEFT JOIN all_users u
+        ON u.user_id = s.user#
+    LEFT JOIN gv$sql q
+        ON q.inst_id = s.inst_id
+        AND q.sql_id = s.sql_id
+        AND q.child_number = s.sql_child_number
+    WHERE s.type = 'USER'
+      AND s.status = 'ACTIVE'
+      AND s.sql_id IS NOT NULL
+{wait_clause_session}{sql_id_clause_session}
+    GROUP BY s.sql_id
+    ORDER BY COUNT(*) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_session_gv, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_session_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        s.sql_id,
+        TO_CHAR(COUNT(*)) AS ash_samples,
+        TO_CHAR(SUM(CASE WHEN s.state = 'ON CPU' THEN 1 ELSE 0 END)) AS cpu_samples,
+        TO_CHAR(SUM(CASE WHEN s.state = 'WAITING' THEN 1 ELSE 0 END)) AS wait_samples,
+        '-' AS avg_samples_per_min,
+        NVL(MAX(u.username), '-') AS sample_user,
+        NVL(MAX(s.module), '-') AS module,
+        NVL(
+            SUBSTR(
+                MAX(REPLACE(REPLACE(q.sql_text, CHR(10), ' '), CHR(13), ' ')),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM v$session s
+    LEFT JOIN all_users u
+        ON u.user_id = s.user#
+    LEFT JOIN v$sql q
+        ON q.sql_id = s.sql_id
+        AND q.child_number = s.sql_child_number
+    WHERE s.type = 'USER'
+      AND s.status = 'ACTIVE'
+      AND s.sql_id IS NOT NULL
+{wait_clause_session}{sql_id_clause_session}
+    GROUP BY s.sql_id
+    ORDER BY COUNT(*) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        Self::execute_select(conn, &sql_session_v, Instant::now())
+    }
+
+    pub fn get_awr_top_sql_snapshot(
+        conn: &Connection,
+        lookback_hours: u32,
+        top_n: u32,
+        sql_id_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let lookback_hours = lookback_hours.max(1).min(24 * 30);
+        let top_n = top_n.max(1).min(200);
+        let normalized_sql_id = Self::normalize_optional_sql_id_filter(sql_id_filter, "SQL_ID")?;
+        let sql_id_clause = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND st.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_awr = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        st.sql_id,
+        TO_CHAR(SUM(st.executions_delta)) AS executions,
+        TO_CHAR(ROUND(SUM(st.elapsed_time_delta) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(
+            ROUND(
+                CASE
+                    WHEN SUM(st.executions_delta) = 0 THEN 0
+                    ELSE (SUM(st.elapsed_time_delta) / 1000000) / SUM(st.executions_delta)
+                END,
+                4
+            )
+        ) AS elapsed_per_exec,
+        TO_CHAR(ROUND(SUM(st.cpu_time_delta) / 1000000, 2)) AS cpu_secs,
+        TO_CHAR(SUM(st.buffer_gets_delta)) AS buffer_gets,
+        TO_CHAR(SUM(st.disk_reads_delta)) AS disk_reads,
+        NVL(
+            MAX(DBMS_LOB.SUBSTR(txt.sql_text, 180, 1)),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM dba_hist_sqlstat st
+    JOIN dba_hist_snapshot sn
+        ON sn.dbid = st.dbid
+        AND sn.instance_number = st.instance_number
+        AND sn.snap_id = st.snap_id
+    LEFT JOIN dba_hist_sqltext txt
+        ON txt.dbid = st.dbid
+        AND txt.sql_id = st.sql_id
+    WHERE sn.end_interval_time >= SYSTIMESTAMP - NUMTODSINTERVAL({lookback_hours}, 'HOUR')
+{sql_id_clause}
+    GROUP BY st.sql_id
+    ORDER BY SUM(st.elapsed_time_delta) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_awr, Instant::now()) {
+            return Ok(result);
+        }
+
+        let shared_sql_id_clause = normalized_sql_id
+            .as_deref()
+            .map(|sql_id| format!("  AND s.sql_id = '{sql_id}'\n"))
+            .unwrap_or_default();
+
+        let sql_shared_pool = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        s.sql_id,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(
+            ROUND(
+                CASE
+                    WHEN NVL(s.executions, 0) = 0 THEN 0
+                    ELSE (NVL(s.elapsed_time, 0) / 1000000) / s.executions
+                END,
+                4
+            )
+        ) AS elapsed_per_exec,
+        TO_CHAR(ROUND(NVL(s.cpu_time, 0) / 1000000, 2)) AS cpu_secs,
+        TO_CHAR(NVL(s.buffer_gets, 0)) AS buffer_gets,
+        TO_CHAR(NVL(s.disk_reads, 0)) AS disk_reads,
+        NVL(
+            SUBSTR(
+                REPLACE(REPLACE(s.sql_text, CHR(10), ' '), CHR(13), ' '),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM gv$sql s
+    WHERE s.sql_id IS NOT NULL
+      AND NVL(s.last_active_time, SYSDATE) >= SYSDATE - ({lookback_hours} / 24)
+{shared_sql_id_clause}
+    ORDER BY NVL(s.elapsed_time, 0) DESC, NVL(s.buffer_gets, 0) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_shared_pool, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_shared_pool_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        s.sql_id,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(
+            ROUND(
+                CASE
+                    WHEN NVL(s.executions, 0) = 0 THEN 0
+                    ELSE (NVL(s.elapsed_time, 0) / 1000000) / s.executions
+                END,
+                4
+            )
+        ) AS elapsed_per_exec,
+        TO_CHAR(ROUND(NVL(s.cpu_time, 0) / 1000000, 2)) AS cpu_secs,
+        TO_CHAR(NVL(s.buffer_gets, 0)) AS buffer_gets,
+        TO_CHAR(NVL(s.disk_reads, 0)) AS disk_reads,
+        NVL(
+            SUBSTR(
+                REPLACE(REPLACE(s.sql_text, CHR(10), ' '), CHR(13), ' '),
+                1,
+                180
+            ),
+            '(sql text unavailable)'
+        ) AS sql_text
+    FROM v$sql s
+    WHERE s.sql_id IS NOT NULL
+      AND NVL(s.last_active_time, SYSDATE) >= SYSDATE - ({lookback_hours} / 24)
+{shared_sql_id_clause}
+    ORDER BY NVL(s.elapsed_time, 0) DESC, NVL(s.buffer_gets, 0) DESC
+)
+WHERE ROWNUM <= {top_n}
+"#
+        );
+
+        Self::execute_select(conn, &sql_shared_pool_v, Instant::now())
+    }
+
+    pub fn get_dataguard_overview_snapshot(conn: &Connection) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    NVL(d.db_unique_name, '-') AS db_unique_name,
+    NVL(d.database_role, '-') AS database_role,
+    NVL(d.open_mode, '-') AS open_mode,
+    NVL(d.protection_mode, '-') AS protection_mode,
+    NVL(d.protection_level, '-') AS protection_level,
+    NVL(d.switchover_status, '-') AS switchover_status,
+    NVL(d.force_logging, '-') AS force_logging,
+    NVL(d.flashback_on, '-') AS flashback_on,
+    NVL(d.dataguard_broker, '-') AS dataguard_broker,
+    NVL(
+        (
+            SELECT value
+            FROM v$dataguard_stats
+            WHERE LOWER(name) = 'transport lag'
+              AND ROWNUM = 1
+        ),
+        '-'
+    ) AS transport_lag,
+    NVL(
+        (
+            SELECT value
+            FROM v$dataguard_stats
+            WHERE LOWER(name) = 'apply lag'
+              AND ROWNUM = 1
+        ),
+        '-'
+    ) AS apply_lag,
+    NVL(
+        (
+            SELECT value
+            FROM v$dataguard_stats
+            WHERE LOWER(name) = 'apply finish time'
+              AND ROWNUM = 1
+        ),
+        '-'
+    ) AS apply_finish_time
+FROM v$database d
+"#;
+
+        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    NVL(d.db_unique_name, '-') AS db_unique_name,
+    NVL(d.database_role, '-') AS database_role,
+    NVL(d.open_mode, '-') AS open_mode,
+    NVL(d.protection_mode, '-') AS protection_mode,
+    NVL(d.protection_level, '-') AS protection_level,
+    NVL(d.switchover_status, '-') AS switchover_status,
+    NVL(d.force_logging, '-') AS force_logging,
+    NVL(d.flashback_on, '-') AS flashback_on,
+    NVL(d.dataguard_broker, '-') AS dataguard_broker,
+    '-' AS transport_lag,
+    '-' AS apply_lag,
+    '-' AS apply_finish_time
+FROM v$database d
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
+    }
+
+    pub fn get_dataguard_destination_snapshot(
+        conn: &Connection,
+        attention_only: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let attention_clause = if attention_only {
+            "  AND (UPPER(NVL(status, '-')) <> 'VALID' OR NVL(TRIM(error), '-') <> '-')\n"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"
+SELECT
+    TO_CHAR(dest_id) AS dest_id,
+    NVL(target, '-') AS target,
+    NVL(status, '-') AS status,
+    NVL(database_mode, '-') AS database_mode,
+    NVL(recovery_mode, '-') AS recovery_mode,
+    NVL(protection_mode, '-') AS protection_mode,
+    NVL(destination, '-') AS destination,
+    NVL(TO_CHAR(archived_seq#), '-') AS archived_seq,
+    NVL(TO_CHAR(applied_seq#), '-') AS applied_seq,
+    NVL(error, '-') AS error
+FROM v$archive_dest_status
+WHERE status <> 'INACTIVE'
+{attention_clause}
+ORDER BY dest_id
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = format!(
+            r#"
+SELECT
+    TO_CHAR(dest_id) AS dest_id,
+    NVL(target, '-') AS target,
+    NVL(status, '-') AS status,
+    '-' AS database_mode,
+    NVL(schedule, '-') AS recovery_mode,
+    '-' AS protection_mode,
+    NVL(destination, '-') AS destination,
+    '-' AS archived_seq,
+    '-' AS applied_seq,
+    NVL(error, '-') AS error
+FROM v$archive_dest
+WHERE status <> 'INACTIVE'
+{attention_clause}
+ORDER BY dest_id
+"#
+        );
+
+        Self::execute_select(conn, &sql_fallback, Instant::now())
+    }
+
+    pub fn get_dataguard_apply_process_snapshot(
+        conn: &Connection,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    NVL(process, '-') AS process,
+    NVL(client_process, '-') AS client_process,
+    NVL(status, '-') AS status,
+    NVL(TO_CHAR(thread#), '-') AS thread_no,
+    NVL(TO_CHAR(sequence#), '-') AS sequence_no,
+    NVL(TO_CHAR(block#), '-') AS block_no,
+    NVL(TO_CHAR(blocks), '-') AS blocks,
+    NVL(TO_CHAR(delay_mins), '-') AS delay_mins
+FROM v$managed_standby
+ORDER BY process
+"#;
+
+        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_fallback = r#"
+SELECT
+    NVL(name, '-') AS process,
+    NVL(role, '-') AS client_process,
+    NVL(action, '-') AS status,
+    '-' AS thread_no,
+    '-' AS sequence_no,
+    '-' AS block_no,
+    '-' AS blocks,
+    '-' AS delay_mins
+FROM v$dataguard_process
+ORDER BY name
+"#;
+
+        Self::execute_select(conn, sql_fallback, Instant::now())
+    }
+
+    pub fn get_dataguard_archive_gap_snapshot(
+        conn: &Connection,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = r#"
+SELECT
+    thread_no,
+    low_sequence,
+    high_sequence
+FROM (
+    SELECT
+        NVL(TO_CHAR(thread#), '-') AS thread_no,
+        NVL(TO_CHAR(low_sequence#), '-') AS low_sequence,
+        NVL(TO_CHAR(high_sequence#), '-') AS high_sequence,
+        0 AS sort_order
+    FROM v$archive_gap
+
+    UNION ALL
+
+    SELECT
+        '-' AS thread_no,
+        'NO_GAP' AS low_sequence,
+        '-' AS high_sequence,
+        1 AS sort_order
+    FROM dual
+    WHERE NOT EXISTS (SELECT 1 FROM v$archive_gap)
+)
+ORDER BY sort_order, thread_no
+"#;
+
+        Self::execute_select(conn, sql, Instant::now())
+    }
+
+    pub fn force_archive_log_switch(conn: &Connection) -> Result<(), OracleError> {
+        let mut role_stmt = conn
+            .statement("SELECT database_role FROM v$database")
+            .build()?;
+        let role = role_stmt.query_row_as::<String>(&[])?.trim().to_uppercase();
+        if role != "PRIMARY" {
+            return Err(Self::invalid_security_input_error(
+                "Archive log switch is supported only on PRIMARY database role",
+            ));
+        }
+
+        conn.execute("ALTER SYSTEM ARCHIVE LOG CURRENT", &[])?;
+        Ok(())
+    }
+
+    pub fn get_tablespace_usage_snapshot(
+        conn: &Connection,
+        warn_pct: u32,
+        critical_pct: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = format!(
+            r#"
+SELECT
+    m.tablespace_name,
+    TO_CHAR(ROUND((m.used_space * t.block_size) / 1048576, 2)) AS used_mb,
+    TO_CHAR(ROUND((m.tablespace_size * t.block_size) / 1048576, 2)) AS total_mb,
+    TO_CHAR(ROUND(m.used_percent, 2)) AS used_pct,
+    CASE
+        WHEN m.used_percent >= {critical_pct} THEN 'CRITICAL'
+        WHEN m.used_percent >= {warn_pct} THEN 'WARN'
+        ELSE 'OK'
+    END AS alert_status
+FROM dba_tablespace_usage_metrics m
+JOIN dba_tablespaces t
+    ON t.tablespace_name = m.tablespace_name
+WHERE t.contents = 'PERMANENT'
+ORDER BY m.used_percent DESC, m.tablespace_name
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_temp_usage_snapshot(
+        conn: &Connection,
+        warn_pct: u32,
+        critical_pct: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = format!(
+            r#"
+SELECT
+    tf.tablespace_name,
+    TO_CHAR(ROUND(SUM(tf.bytes) / 1048576, 2)) AS total_mb,
+    TO_CHAR(ROUND(NVL(SUM(th.bytes_used), 0) / 1048576, 2)) AS used_mb,
+    TO_CHAR(ROUND(NVL(SUM(th.bytes_free), 0) / 1048576, 2)) AS free_mb,
+    TO_CHAR(
+        ROUND(
+            CASE
+                WHEN SUM(tf.bytes) = 0 THEN 0
+                ELSE NVL(SUM(th.bytes_used), 0) / SUM(tf.bytes) * 100
+            END,
+            2
+        )
+    ) AS used_pct,
+    CASE
+        WHEN
+            (
+                CASE
+                    WHEN SUM(tf.bytes) = 0 THEN 0
+                    ELSE NVL(SUM(th.bytes_used), 0) / SUM(tf.bytes) * 100
+                END
+            ) >= {critical_pct} THEN 'CRITICAL'
+        WHEN
+            (
+                CASE
+                    WHEN SUM(tf.bytes) = 0 THEN 0
+                    ELSE NVL(SUM(th.bytes_used), 0) / SUM(tf.bytes) * 100
+                END
+            ) >= {warn_pct} THEN 'WARN'
+        ELSE 'OK'
+    END AS alert_status
+FROM dba_temp_files tf
+LEFT JOIN v$temp_space_header th
+    ON th.tablespace_name = tf.tablespace_name
+GROUP BY tf.tablespace_name
+ORDER BY
+    CASE
+        WHEN SUM(tf.bytes) = 0 THEN 0
+        ELSE NVL(SUM(th.bytes_used), 0) / SUM(tf.bytes)
+    END DESC,
+    tf.tablespace_name
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_undo_usage_snapshot(
+        conn: &Connection,
+        warn_pct: u32,
+        critical_pct: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = format!(
+            r#"
+SELECT
+    m.tablespace_name,
+    TO_CHAR(ROUND((m.used_space * t.block_size) / 1048576, 2)) AS used_mb,
+    TO_CHAR(ROUND((m.tablespace_size * t.block_size) / 1048576, 2)) AS total_mb,
+    TO_CHAR(ROUND(m.used_percent, 2)) AS used_pct,
+    CASE
+        WHEN m.used_percent >= {critical_pct} THEN 'CRITICAL'
+        WHEN m.used_percent >= {warn_pct} THEN 'WARN'
+        ELSE 'OK'
+    END AS alert_status
+FROM dba_tablespace_usage_metrics m
+JOIN dba_tablespaces t
+    ON t.tablespace_name = m.tablespace_name
+WHERE t.contents = 'UNDO'
+ORDER BY m.used_percent DESC, m.tablespace_name
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_archive_usage_snapshot(
+        conn: &Connection,
+        warn_pct: u32,
+        critical_pct: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = format!(
+            r#"
+SELECT
+    NVL(name, '(FRA)') AS fra_name,
+    TO_CHAR(ROUND(space_used / 1048576, 2)) AS used_mb,
+    TO_CHAR(ROUND(space_limit / 1048576, 2)) AS limit_mb,
+    TO_CHAR(ROUND(space_reclaimable / 1048576, 2)) AS reclaimable_mb,
+    TO_CHAR(
+        ROUND(
+            CASE
+                WHEN space_limit = 0 THEN 0
+                ELSE (space_used / space_limit) * 100
+            END,
+            2
+        )
+    ) AS used_pct,
+    CASE
+        WHEN
+            (
+                CASE
+                    WHEN space_limit = 0 THEN 0
+                    ELSE (space_used / space_limit) * 100
+                END
+            ) >= {critical_pct} THEN 'CRITICAL'
+        WHEN
+            (
+                CASE
+                    WHEN space_limit = 0 THEN 0
+                    ELSE (space_used / space_limit) * 100
+                END
+            ) >= {warn_pct} THEN 'WARN'
+        ELSE 'OK'
+    END AS alert_status
+FROM v$recovery_file_dest
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    pub fn get_datafile_usage_snapshot(
+        conn: &Connection,
+        warn_pct: u32,
+        critical_pct: u32,
+    ) -> Result<QueryResult, OracleError> {
+        let sql = format!(
+            r#"
+WITH free_map AS (
+    SELECT
+        file_id,
+        SUM(bytes) AS free_bytes
+    FROM dba_free_space
+    GROUP BY file_id
+)
+SELECT
+    TO_CHAR(df.file_id) AS file_id,
+    df.tablespace_name,
+    NVL(df.autoextensible, 'NO') AS autoextensible,
+    TO_CHAR(ROUND(df.bytes / 1048576, 2)) AS current_mb,
+    TO_CHAR(
+        ROUND(
+            CASE
+                WHEN NVL(df.maxbytes, 0) = 0 THEN df.bytes
+                ELSE df.maxbytes
+            END / 1048576,
+            2
+        )
+    ) AS max_mb,
+    TO_CHAR(
+        ROUND(
+            (df.bytes - NVL(fm.free_bytes, 0)) / 1048576,
+            2
+        )
+    ) AS used_mb,
+    TO_CHAR(
+        ROUND(
+            CASE
+                WHEN NVL(df.maxbytes, 0) = 0 THEN
+                    CASE
+                        WHEN df.bytes = 0 THEN 0
+                        ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.bytes * 100
+                    END
+                ELSE
+                    CASE
+                        WHEN df.maxbytes = 0 THEN 0
+                        ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.maxbytes * 100
+                    END
+            END,
+            2
+        )
+    ) AS used_pct,
+    CASE
+        WHEN
+            (
+                CASE
+                    WHEN NVL(df.maxbytes, 0) = 0 THEN
+                        CASE
+                            WHEN df.bytes = 0 THEN 0
+                            ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.bytes * 100
+                        END
+                    ELSE
+                        CASE
+                            WHEN df.maxbytes = 0 THEN 0
+                            ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.maxbytes * 100
+                        END
+                END
+            ) >= {critical_pct} THEN 'CRITICAL'
+        WHEN
+            (
+                CASE
+                    WHEN NVL(df.maxbytes, 0) = 0 THEN
+                        CASE
+                            WHEN df.bytes = 0 THEN 0
+                            ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.bytes * 100
+                        END
+                    ELSE
+                        CASE
+                            WHEN df.maxbytes = 0 THEN 0
+                            ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.maxbytes * 100
+                        END
+                END
+            ) >= {warn_pct} THEN 'WARN'
+        ELSE 'OK'
+    END AS alert_status,
+    NVL(df.file_name, '-') AS file_name
+FROM dba_data_files df
+LEFT JOIN free_map fm
+    ON fm.file_id = df.file_id
+ORDER BY
+    CASE
+        WHEN NVL(df.maxbytes, 0) = 0 THEN
+            CASE
+                WHEN df.bytes = 0 THEN 0
+                ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.bytes
+            END
+        ELSE
+            CASE
+                WHEN df.maxbytes = 0 THEN 0
+                ELSE (df.bytes - NVL(fm.free_bytes, 0)) / df.maxbytes
+            END
+    END DESC,
+    df.tablespace_name,
+    df.file_id
+"#
+        );
+        Self::execute_select(conn, &sql, Instant::now())
+    }
+
+    fn qualified_scheduler_job_name(owner: Option<&str>, job_name: &str) -> String {
+        match owner.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(owner_name) => format!("{owner_name}.{}", job_name.trim()),
+            None => job_name.trim().to_string(),
+        }
+    }
+
+    fn is_ascii_identifier(value: &str) -> bool {
+        value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#')
+    }
+
+    fn invalid_security_input_error(message: impl Into<String>) -> OracleError {
+        #[allow(deprecated)]
+        OracleError::InvalidArgument {
+            message: Cow::Owned(message.into()),
+            source: None,
+        }
+    }
+
+    fn normalize_required_security_identifier(
+        value: &str,
+        field_name: &str,
+    ) -> Result<String, OracleError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} is required",
+                field_name
+            )));
+        }
+
+        let upper = trimmed.to_uppercase();
+        if !Self::is_ascii_identifier(&upper) {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must use only letters, digits, _, $, #",
+                field_name
+            )));
+        }
+
+        Ok(upper)
+    }
+
+    fn normalize_optional_security_identifier(
+        value: Option<&str>,
+        field_name: &str,
+    ) -> Result<Option<String>, OracleError> {
+        let Some(raw_value) = value else {
+            return Ok(None);
+        };
+        if raw_value.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Self::normalize_required_security_identifier(raw_value, field_name).map(Some)
+    }
+
+    fn normalize_optional_sql_id_filter(
+        value: Option<&str>,
+        field_name: &str,
+    ) -> Result<Option<String>, OracleError> {
+        let Some(raw_value) = value else {
+            return Ok(None);
+        };
+        let trimmed = raw_value.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized = trimmed.to_uppercase();
+        if !normalized.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must use only ASCII letters and digits",
+                field_name
+            )));
+        }
+        if normalized.len() > 13 {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be 13 characters or less",
+                field_name
+            )));
+        }
+
+        Ok(Some(normalized))
+    }
+
+    fn normalize_required_security_privilege(value: &str) -> Result<String, OracleError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Self::invalid_security_input_error(
+                "System privilege is required",
+            ));
+        }
+
+        let mut normalized_tokens: Vec<String> = Vec::new();
+        for token in trimmed.split_whitespace() {
+            let upper = token.to_uppercase();
+            if !Self::is_ascii_identifier(&upper) {
+                return Err(Self::invalid_security_input_error(
+                    "System privilege must use words composed of letters, digits, _, $, #",
+                ));
+            }
+            normalized_tokens.push(upper);
+        }
+
+        if normalized_tokens.is_empty() {
+            return Err(Self::invalid_security_input_error(
+                "System privilege is required",
+            ));
+        }
+
+        Ok(normalized_tokens.join(" "))
+    }
+
+    pub fn get_scheduler_jobs_snapshot(
+        conn: &Connection,
+        owner_filter: Option<&str>,
+        failed_only: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let owner_filter = owner_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_uppercase);
+        let mut shared_conditions: Vec<String> = Vec::new();
+        if let Some(owner) = owner_filter.as_deref() {
+            shared_conditions.push(format!("owner = '{owner}'"));
+        }
+        if failed_only {
+            shared_conditions.push(
+                "(NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))"
+                    .to_string(),
+            );
+        }
+        let owner_clause = if shared_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", shared_conditions.join("\n  AND "))
+        };
+
+        let sql_dba = format!(
+            r#"
+SELECT
+    owner,
+    job_name,
+    enabled,
+    NVL(state, '-') AS state,
+    NVL(job_class, '-') AS job_class,
+    NVL(SUBSTR(repeat_interval, 1, 160), '-') AS repeat_interval,
+    NVL(TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_start,
+    NVL(TO_CHAR(next_run_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS next_run,
+    TO_CHAR(run_count) AS run_count,
+    TO_CHAR(failure_count) AS failure_count,
+    NVL(SUBSTR(job_action, 1, 220), '-') AS job_action
+FROM dba_scheduler_jobs
+{owner_clause}
+ORDER BY owner, job_name
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_all = format!(
+            r#"
+SELECT
+    owner,
+    job_name,
+    enabled,
+    NVL(state, '-') AS state,
+    NVL(job_class, '-') AS job_class,
+    NVL(SUBSTR(repeat_interval, 1, 160), '-') AS repeat_interval,
+    NVL(TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_start,
+    NVL(TO_CHAR(next_run_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS next_run,
+    TO_CHAR(run_count) AS run_count,
+    TO_CHAR(failure_count) AS failure_count,
+    NVL(SUBSTR(job_action, 1, 220), '-') AS job_action
+FROM all_scheduler_jobs
+{owner_clause}
+ORDER BY owner, job_name
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_all, Instant::now()) {
+            return Ok(result);
+        }
+
+        let mut user_conditions: Vec<String> = Vec::new();
+        if let Some(owner) = owner_filter.as_deref() {
+            user_conditions.push(format!("USER = '{owner}'"));
+        }
+        if failed_only {
+            user_conditions.push(
+                "(NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))"
+                    .to_string(),
+            );
+        }
+        let user_where_clause = if user_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", user_conditions.join("\n  AND "))
+        };
+        let sql_user = format!(
+            r#"
+SELECT
+    USER AS owner,
+    job_name,
+    enabled,
+    NVL(state, '-') AS state,
+    NVL(job_class, '-') AS job_class,
+    NVL(SUBSTR(repeat_interval, 1, 160), '-') AS repeat_interval,
+    NVL(TO_CHAR(last_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_start,
+    NVL(TO_CHAR(next_run_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS next_run,
+    TO_CHAR(run_count) AS run_count,
+    TO_CHAR(failure_count) AS failure_count,
+    NVL(SUBSTR(job_action, 1, 220), '-') AS job_action
+FROM user_scheduler_jobs
+{user_where_clause}
+ORDER BY job_name
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn get_scheduler_job_history_snapshot(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_job = job_name.trim();
+        let owner_clause = owner
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("AND owner = '{}'", value))
+            .unwrap_or_default();
+        let sql_dba = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        owner,
+        job_name,
+        status,
+        TO_CHAR(error#) AS error_no,
+        NVL(TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS actual_start,
+        NVL(TO_CHAR(log_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS log_date,
+        NVL(TO_CHAR(run_duration), '-') AS run_duration,
+        NVL(SUBSTR(additional_info, 1, 260), '-') AS additional_info
+    FROM dba_scheduler_job_run_details
+    WHERE job_name = '{normalized_job}'
+      {owner_clause}
+    ORDER BY log_date DESC
+)
+WHERE ROWNUM <= 200
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_all = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        owner,
+        job_name,
+        status,
+        TO_CHAR(error#) AS error_no,
+        NVL(TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS actual_start,
+        NVL(TO_CHAR(log_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS log_date,
+        NVL(TO_CHAR(run_duration), '-') AS run_duration,
+        NVL(SUBSTR(additional_info, 1, 260), '-') AS additional_info
+    FROM all_scheduler_job_run_details
+    WHERE job_name = '{normalized_job}'
+      {owner_clause}
+    ORDER BY log_date DESC
+)
+WHERE ROWNUM <= 200
+"#
+        );
+
+        if let Ok(result) = Self::execute_select(conn, &sql_all, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_user = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        USER AS owner,
+        job_name,
+        status,
+        TO_CHAR(error#) AS error_no,
+        NVL(TO_CHAR(actual_start_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS actual_start,
+        NVL(TO_CHAR(log_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS log_date,
+        NVL(TO_CHAR(run_duration), '-') AS run_duration,
+        NVL(SUBSTR(additional_info, 1, 260), '-') AS additional_info
+    FROM user_scheduler_job_run_details
+    WHERE job_name = '{normalized_job}'
+    ORDER BY log_date DESC
+)
+WHERE ROWNUM <= 200
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn run_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let mut stmt =
+            conn.statement("BEGIN DBMS_SCHEDULER.RUN_JOB(job_name => :job_name, use_current_session => FALSE); END;")
+                .build()?;
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn stop_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        force: bool,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let mut stmt = conn
+            .statement(
+                "BEGIN DBMS_SCHEDULER.STOP_JOB(job_name => :job_name, force => :force); END;",
+            )
+            .build()?;
+        let force_number: i64 = if force { 1 } else { 0 };
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.bind("force", &force_number)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn enable_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let mut stmt = conn
+            .statement("BEGIN DBMS_SCHEDULER.ENABLE(name => :job_name); END;")
+            .build()?;
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn disable_scheduler_job(
+        conn: &Connection,
+        owner: Option<&str>,
+        job_name: &str,
+        force: bool,
+    ) -> Result<(), OracleError> {
+        let qualified_name = Self::qualified_scheduler_job_name(owner, job_name);
+        let mut stmt = conn
+            .statement("BEGIN DBMS_SCHEDULER.DISABLE(name => :job_name, force => :force); END;")
+            .build()?;
+        let force_number: i64 = if force { 1 } else { 0 };
+        stmt.bind("job_name", &qualified_name)?;
+        stmt.bind("force", &force_number)?;
+        stmt.execute(&[])?;
+        Ok(())
+    }
+
+    pub fn get_user_summary_snapshot(
+        conn: &Connection,
+        username: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let sql_dba = format!(
+            r#"
+SELECT
+    username,
+    account_status,
+    profile,
+    default_tablespace,
+    temporary_tablespace,
+    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
+    NVL(TO_CHAR(expiry_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS expiry_at,
+    NVL(TO_CHAR(lock_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS lock_at
+FROM dba_users
+WHERE username = '{normalized_user}'
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_all = format!(
+            r#"
+SELECT
+    username,
+    'N/A' AS account_status,
+    'N/A' AS profile,
+    'N/A' AS default_tablespace,
+    'N/A' AS temporary_tablespace,
+    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
+    '-' AS expiry_at,
+    '-' AS lock_at
+FROM all_users
+WHERE username = '{normalized_user}'
+"#
+        );
+        Self::execute_select(conn, &sql_all, Instant::now())
+    }
+
+    pub fn get_users_overview_snapshot(
+        conn: &Connection,
+        username_filter: Option<&str>,
+        profile_filter: Option<&str>,
+        attention_only: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let username_filter =
+            Self::normalize_optional_security_identifier(username_filter, "User filter")?;
+        let profile_filter =
+            Self::normalize_optional_security_identifier(profile_filter, "Profile filter")?;
+
+        let mut dba_conditions: Vec<String> = Vec::new();
+        if let Some(username) = username_filter.as_deref() {
+            dba_conditions.push(format!("username = '{username}'"));
+        }
+        if let Some(profile) = profile_filter.as_deref() {
+            dba_conditions.push(format!("profile = '{profile}'"));
+        }
+        if attention_only {
+            dba_conditions.push(
+                "(UPPER(NVL(account_status, '-')) LIKE '%LOCKED%' OR UPPER(NVL(account_status, '-')) LIKE '%EXPIRED%')"
+                    .to_string(),
+            );
+        }
+        let dba_where_clause = if dba_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", dba_conditions.join("\n  AND "))
+        };
+
+        let sql_dba = format!(
+            r#"
+SELECT
+    username,
+    account_status,
+    profile,
+    default_tablespace,
+    temporary_tablespace,
+    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
+    NVL(TO_CHAR(expiry_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS expiry_at,
+    NVL(TO_CHAR(lock_date, 'YYYY-MM-DD HH24:MI:SS'), '-') AS lock_at
+FROM dba_users
+{dba_where_clause}
+ORDER BY username
+"#
+        );
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                if profile_filter.is_some() || attention_only {
+                    return Err(err);
+                }
+            }
+        }
+
+        let all_where_clause = username_filter
+            .as_deref()
+            .map(|username| format!("WHERE username = '{username}'"))
+            .unwrap_or_default();
+
+        let sql_all = format!(
+            r#"
+SELECT
+    username,
+    'N/A' AS account_status,
+    'N/A' AS profile,
+    'N/A' AS default_tablespace,
+    'N/A' AS temporary_tablespace,
+    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
+    '-' AS expiry_at,
+    '-' AS lock_at
+FROM all_users
+{all_where_clause}
+ORDER BY username
+"#
+        );
+        Self::execute_select(conn, &sql_all, Instant::now())
+    }
+
+    pub fn get_user_role_grants_snapshot(
+        conn: &Connection,
+        username: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let sql_dba = format!(
+            r#"
+SELECT
+    grantee,
+    granted_role,
+    admin_option,
+    default_role
+FROM dba_role_privs
+WHERE grantee = '{normalized_user}'
+ORDER BY granted_role
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_user = format!(
+            r#"
+SELECT
+    USER AS grantee,
+    granted_role,
+    admin_option,
+    default_role
+FROM user_role_privs
+WHERE USER = '{normalized_user}'
+ORDER BY granted_role
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn get_user_system_grants_snapshot(
+        conn: &Connection,
+        username: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let sql_dba = format!(
+            r#"
+SELECT
+    grantee,
+    privilege,
+    admin_option
+FROM dba_sys_privs
+WHERE grantee = '{normalized_user}'
+ORDER BY privilege
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_user = format!(
+            r#"
+SELECT
+    USER AS grantee,
+    privilege,
+    admin_option
+FROM user_sys_privs
+WHERE USER = '{normalized_user}'
+ORDER BY privilege
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn get_user_object_grants_snapshot(
+        conn: &Connection,
+        username: &str,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let sql_dba = format!(
+            r#"
+SELECT
+    grantee,
+    owner,
+    table_name,
+    privilege,
+    grantable
+FROM dba_tab_privs
+WHERE grantee = '{normalized_user}'
+ORDER BY owner, table_name, privilege
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_all = format!(
+            r#"
+SELECT
+    grantee,
+    owner,
+    table_name,
+    privilege,
+    grantable
+FROM all_tab_privs
+WHERE grantee = '{normalized_user}'
+ORDER BY owner, table_name, privilege
+"#
+        );
+        Self::execute_select(conn, &sql_all, Instant::now())
+    }
+
+    pub fn get_profile_limits_snapshot(
+        conn: &Connection,
+        profile_filter: Option<&str>,
+    ) -> Result<QueryResult, OracleError> {
+        let normalized_profile_filter =
+            Self::normalize_optional_security_identifier(profile_filter, "Profile filter")?;
+        let where_clause = normalized_profile_filter
+            .as_deref()
+            .map(|profile| format!("WHERE profile = '{profile}'"))
+            .unwrap_or_default();
+
+        let sql_dba = format!(
+            r#"
+SELECT
+    profile,
+    resource_name,
+    resource_type,
+    limit
+FROM dba_profiles
+{where_clause}
+ORDER BY profile, resource_type, resource_name
+"#
+        );
+        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
+            return Ok(result);
+        }
+
+        let sql_user = format!(
+            r#"
+SELECT
+    profile,
+    resource_name,
+    resource_type,
+    limit
+FROM user_profiles
+{where_clause}
+ORDER BY profile, resource_type, resource_name
+"#
+        );
+        Self::execute_select(conn, &sql_user, Instant::now())
+    }
+
+    pub fn grant_role_to_user(
+        conn: &Connection,
+        role_name: &str,
+        username: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_grant_role_sql(role_name, username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn revoke_role_from_user(
+        conn: &Connection,
+        role_name: &str,
+        username: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_revoke_role_sql(role_name, username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn set_user_profile(
+        conn: &Connection,
+        username: &str,
+        profile: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_set_user_profile_sql(username, profile)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn grant_system_priv_to_user(
+        conn: &Connection,
+        privilege: &str,
+        username: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_grant_system_priv_sql(privilege, username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn revoke_system_priv_from_user(
+        conn: &Connection,
+        privilege: &str,
+        username: &str,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_revoke_system_priv_sql(privilege, username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn lock_user_account(conn: &Connection, username: &str) -> Result<(), OracleError> {
+        let sql = Self::build_lock_user_account_sql(username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn unlock_user_account(conn: &Connection, username: &str) -> Result<(), OracleError> {
+        let sql = Self::build_unlock_user_account_sql(username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    pub fn expire_user_password(conn: &Connection, username: &str) -> Result<(), OracleError> {
+        let sql = Self::build_expire_user_password_sql(username)?;
+        conn.execute(&sql, &[])?;
+        Ok(())
+    }
+
+    fn build_grant_role_sql(role_name: &str, username: &str) -> Result<String, OracleError> {
+        let normalized_role = Self::normalize_required_security_identifier(role_name, "Role")?;
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("GRANT {normalized_role} TO {normalized_user}"))
+    }
+
+    fn build_revoke_role_sql(role_name: &str, username: &str) -> Result<String, OracleError> {
+        let normalized_role = Self::normalize_required_security_identifier(role_name, "Role")?;
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("REVOKE {normalized_role} FROM {normalized_user}"))
+    }
+
+    fn build_set_user_profile_sql(username: &str, profile: &str) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let normalized_profile = Self::normalize_required_security_identifier(profile, "Profile")?;
+        Ok(format!(
+            "ALTER USER {normalized_user} PROFILE {normalized_profile}"
+        ))
+    }
+
+    fn build_grant_system_priv_sql(privilege: &str, username: &str) -> Result<String, OracleError> {
+        let normalized_privilege = Self::normalize_required_security_privilege(privilege)?;
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("GRANT {normalized_privilege} TO {normalized_user}"))
+    }
+
+    fn build_revoke_system_priv_sql(
+        privilege: &str,
+        username: &str,
+    ) -> Result<String, OracleError> {
+        let normalized_privilege = Self::normalize_required_security_privilege(privilege)?;
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!(
+            "REVOKE {normalized_privilege} FROM {normalized_user}"
+        ))
+    }
+
+    fn build_lock_user_account_sql(username: &str) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("ALTER USER {normalized_user} ACCOUNT LOCK"))
+    }
+
+    fn build_unlock_user_account_sql(username: &str) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("ALTER USER {normalized_user} ACCOUNT UNLOCK"))
+    }
+
+    fn build_expire_user_password_sql(username: &str) -> Result<String, OracleError> {
+        let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        Ok(format!("ALTER USER {normalized_user} PASSWORD EXPIRE"))
+    }
+
+    fn build_kill_session_sql(
+        sid: i64,
+        serial: i64,
+        instance_id: Option<i64>,
+        immediate: bool,
+    ) -> String {
+        let target = match instance_id {
+            Some(inst) => format!("{sid},{serial},@{inst}"),
+            None => format!("{sid},{serial}"),
+        };
+        if immediate {
+            format!("ALTER SYSTEM KILL SESSION '{target}' IMMEDIATE")
+        } else {
+            format!("ALTER SYSTEM KILL SESSION '{target}'")
         }
     }
 
@@ -2843,7 +5219,17 @@ ORDER BY
         serial: i64,
         immediate: bool,
     ) -> Result<(), OracleError> {
-        let sql = Self::build_kill_session_sql(sid, serial, immediate);
+        Self::kill_session_on_instance(conn, sid, serial, None, immediate)
+    }
+
+    pub fn kill_session_on_instance(
+        conn: &Connection,
+        sid: i64,
+        serial: i64,
+        instance_id: Option<i64>,
+        immediate: bool,
+    ) -> Result<(), OracleError> {
+        let sql = Self::build_kill_session_sql(sid, serial, instance_id, immediate);
         conn.execute(&sql, &[])?;
         Ok(())
     }
@@ -2855,14 +5241,108 @@ mod dba_feature_tests {
 
     #[test]
     fn kill_session_sql_uses_immediate_when_requested() {
-        let sql = QueryExecutor::build_kill_session_sql(101, 222, true);
+        let sql = QueryExecutor::build_kill_session_sql(101, 222, None, true);
         assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222' IMMEDIATE");
     }
 
     #[test]
     fn kill_session_sql_omits_immediate_when_not_requested() {
-        let sql = QueryExecutor::build_kill_session_sql(101, 222, false);
+        let sql = QueryExecutor::build_kill_session_sql(101, 222, None, false);
         assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222'");
+    }
+
+    #[test]
+    fn kill_session_sql_includes_instance_when_requested() {
+        let sql = QueryExecutor::build_kill_session_sql(101, 222, Some(3), true);
+        assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222,@3' IMMEDIATE");
+    }
+
+    #[test]
+    fn qualified_scheduler_job_name_with_owner_prefixes_owner() {
+        let name = QueryExecutor::qualified_scheduler_job_name(Some("HR"), "NIGHTLY_ETL");
+        assert_eq!(name, "HR.NIGHTLY_ETL");
+    }
+
+    #[test]
+    fn qualified_scheduler_job_name_without_owner_uses_job_only() {
+        let name = QueryExecutor::qualified_scheduler_job_name(None, "NIGHTLY_ETL");
+        assert_eq!(name, "NIGHTLY_ETL");
+    }
+
+    #[test]
+    fn build_grant_role_sql_normalizes_identifiers() {
+        let sql = QueryExecutor::build_grant_role_sql("dba", "hr").unwrap_or_else(|err| {
+            panic!("unexpected error: {err}");
+        });
+        assert_eq!(sql, "GRANT DBA TO HR");
+    }
+
+    #[test]
+    fn build_grant_role_sql_rejects_invalid_identifier() {
+        let result = QueryExecutor::build_grant_role_sql("DBA", "HR;DROP_USER");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_grant_system_priv_sql_normalizes_multi_word_privilege() {
+        let sql = QueryExecutor::build_grant_system_priv_sql("create   session", "hr")
+            .unwrap_or_else(|err| {
+                panic!("unexpected error: {err}");
+            });
+        assert_eq!(sql, "GRANT CREATE SESSION TO HR");
+    }
+
+    #[test]
+    fn build_revoke_system_priv_sql_rejects_invalid_privilege_token() {
+        let result = QueryExecutor::build_revoke_system_priv_sql("CREATE-SESSION", "HR");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_set_user_profile_sql_normalizes_identifiers() {
+        let sql =
+            QueryExecutor::build_set_user_profile_sql("hr", "default").unwrap_or_else(|err| {
+                panic!("unexpected error: {err}");
+            });
+        assert_eq!(sql, "ALTER USER HR PROFILE DEFAULT");
+    }
+
+    #[test]
+    fn build_lock_unlock_expire_sql_rejects_empty_user() {
+        assert!(QueryExecutor::build_lock_user_account_sql(" ").is_err());
+        assert!(QueryExecutor::build_unlock_user_account_sql("").is_err());
+        assert!(QueryExecutor::build_expire_user_password_sql(" ").is_err());
+    }
+
+    #[test]
+    fn normalize_required_security_identifier_rejects_sql_injection_pattern() {
+        let result =
+            QueryExecutor::normalize_required_security_identifier("HR'; DROP USER SYS;--", "User");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_optional_security_identifier_accepts_empty_as_none() {
+        let result = QueryExecutor::normalize_optional_security_identifier(Some("   "), "Profile")
+            .unwrap_or_else(|err| {
+                panic!("unexpected error: {err}");
+            });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn normalize_optional_sql_id_filter_accepts_valid_value() {
+        let result = QueryExecutor::normalize_optional_sql_id_filter(Some("7v9h9ttw0g3cn"), "SQL")
+            .unwrap_or_else(|err| {
+                panic!("unexpected error: {err}");
+            });
+        assert_eq!(result, Some("7V9H9TTW0G3CN".to_string()));
+    }
+
+    #[test]
+    fn normalize_optional_sql_id_filter_rejects_invalid_symbols() {
+        let result = QueryExecutor::normalize_optional_sql_id_filter(Some("bad-sql-id"), "SQL");
+        assert!(result.is_err());
     }
 }
 

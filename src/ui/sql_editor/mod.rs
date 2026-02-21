@@ -29,6 +29,7 @@ use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistory, QueryHistoryEntry};
 use oracle::Connection;
 
+mod dba_tools;
 mod execution;
 mod intellisense;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)

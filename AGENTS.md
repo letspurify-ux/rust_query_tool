@@ -1,6 +1,6 @@
 # AGENTS.md — SPACE Query 에이전트 작업 표준
 
-> 최종 업데이트: 2026-02-20 (panic 회피 가이드 보강 및 에러 처리 체크리스트 추가)  
+> 최종 업데이트: 2026-02-21 (코드베이스 빠른 맵을 현재 디렉토리 구조로 현행화)  
 > 적용 범위: 이 파일이 위치한 디렉터리(저장소 루트) 전체
 
 이 문서는 SPACE Query 저장소에서 작업하는 에이전트의 **실행 기준**입니다.  
@@ -59,31 +59,44 @@
 
 ## 4) 코드베이스 빠른 맵
 
+아래 맵은 신규 기능 파일(예: DBA 도구)까지 포함해 탐색 실수를 줄이기 위해 최신 구조를 반영한다.
+
 ```text
 src/
 ├── app.rs
 ├── main.rs
 ├── sql_text.rs
 ├── db/
+│   ├── mod.rs
 │   ├── connection.rs
 │   ├── session.rs
 │   └── query/
 │       ├── executor.rs
+│       ├── query_tests.rs
 │       ├── script.rs
 │       └── types.rs
 ├── ui/
+│   ├── mod.rs
+│   ├── menu.rs
 │   ├── main_window.rs
 │   ├── query_tabs.rs
 │   ├── result_table.rs
+│   ├── object_browser.rs
+│   ├── intellisense.rs
+│   ├── intellisense_context.rs
 │   ├── sql_editor/
+│   │   ├── dba_tools.rs
 │   │   ├── execution.rs
 │   │   ├── intellisense.rs
+│   │   ├── session_monitor.rs
 │   │   └── query_text.rs
 │   └── ...
 └── utils/
+    ├── mod.rs
     ├── config.rs
     ├── credential_store.rs
-    └── logging.rs
+    ├── logging.rs
+    └── memory.rs
 ```
 
 팁:

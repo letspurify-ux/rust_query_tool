@@ -2349,6 +2349,94 @@ impl MainWindow {
                 sql_editor.show_session_lock_monitor();
                 true
             }
+            "Tools/Cursor Plan Analyzer..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_cursor_plan_analyzer();
+                true
+            }
+            "Tools/SQL Monitor Dashboard..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_sql_monitor_dashboard();
+                true
+            }
+            "Tools/Storage Dashboard..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_storage_dashboard();
+                true
+            }
+            "Tools/Scheduler Manager..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_scheduler_manager();
+                true
+            }
+            "Tools/Security Manager..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_security_manager();
+                true
+            }
+            "Tools/RMAN Dashboard..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_rman_dashboard();
+                true
+            }
+            "Tools/AWR/ASH Dashboard..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_awr_ash_dashboard();
+                true
+            }
+            "Tools/Data Guard Dashboard..." => {
+                let sql_editor = {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .sql_editor
+                        .clone()
+                };
+                sql_editor.show_data_guard_dashboard();
+                true
+            }
             "Tools/Export Results..." => {
                 let has_data = state
                     .lock()

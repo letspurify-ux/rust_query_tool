@@ -337,6 +337,54 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
+            "&Tools/&Cursor Plan Analyzer...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/S&QL Monitor Dashboard...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/&Storage Dashboard...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/Scheduler &Manager...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/Security Mana&ger...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/&RMAN Dashboard...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/AWR/&ASH Dashboard...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Tools/&Data Guard Dashboard...",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
             "&Tools/",
             Shortcut::None,
             MenuFlag::MenuDivider,
@@ -434,6 +482,14 @@ impl MenuBarBuilder {
                     Tools:\n\
                     Ctrl+E - Export Results\n\
                     Session Lock Monitor - no shortcut\n\
+                    Cursor Plan Analyzer - no shortcut\n\
+                    SQL Monitor Dashboard - no shortcut\n\
+                    Storage Dashboard - no shortcut\n\
+                    Scheduler Manager - no shortcut\n\
+                    Security Manager - no shortcut\n\
+                    RMAN Dashboard - no shortcut\n\
+                    AWR/ASH Dashboard - no shortcut\n\
+                    Data Guard Dashboard - no shortcut\n\
                     Query History - no shortcut\n\n\
                     Results Table:\n\
                     Ctrl+C - Copy Selected Cells\n\
