@@ -472,16 +472,16 @@ impl ResultTableWidget {
                         let _ = table_for_handle.take_focus();
                         if let Some((row, col)) = Self::get_cell_at_mouse(&table_for_handle) {
                             if app::event_clicks() {
-                                // Clone the cell value so the Ref is dropped before
-                                // entering the modal dialog's event loop. Holding the
-                                // borrow across app::wait() would panic if flush_pending
-                                // tries to borrow_mut full_data during the nested loop.
-                                let cell_val_owned =
-                                    full_data_for_handle.try_lock().ok().and_then(|data| {
-                                        data.get(row as usize)
-                                            .and_then(|r| r.get(col as usize))
-                                            .cloned()
-                                    });
+                                // Clone the cell value before entering the modal dialog
+                                // event loop so the full_data lock is released first.
+                                let cell_val_owned = {
+                                    let data = full_data_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    data.get(row as usize)
+                                        .and_then(|r| r.get(col as usize))
+                                        .cloned()
+                                };
                                 if let Some(cell_val) = cell_val_owned {
                                     Self::show_cell_text_dialog(
                                         &cell_val,

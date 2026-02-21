@@ -219,19 +219,24 @@ impl LogViewerDialog {
             while let Ok(message) = receiver.try_recv() {
                 match message {
                     DialogMessage::UpdatePreview(browser_index) => {
-                        let fi = filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if let Some(&entry_index) = fi.get(browser_index) {
+                        let entry_index = {
+                            let fi = filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            fi.get(browser_index).copied()
+                        };
+                        let detail = entry_index.and_then(|entry_index| {
                             let ents = entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if let Some(entry) = ents.get(entry_index) {
-                                let detail = format!(
+                            ents.get(entry_index).map(|entry| {
+                                format!(
                                     "Timestamp: {}\nLevel: {}\nSource: {}\n\n{}",
                                     entry.timestamp,
                                     entry.level.label(),
                                     entry.source,
                                     entry.message
-                                );
-                                detail_buffer.set_text(&detail);
-                            }
+                                )
+                            })
+                        });
+                        if let Some(detail) = detail {
+                            detail_buffer.set_text(&detail);
                         }
                     }
                     DialogMessage::FilterChanged => {
@@ -278,20 +283,28 @@ impl LogViewerDialog {
                         dlg.show();
                         let path = dlg.filename();
                         if !path.as_os_str().is_empty() {
-                            let ents = entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let fi = filtered_indices.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let mut output = String::new();
-                            for &idx in fi.iter() {
-                                if let Some(entry) = ents.get(idx) {
-                                    output.push_str(&format!(
-                                        "[{}] [{}] [{}] {}\n",
-                                        entry.timestamp,
-                                        entry.level.label(),
-                                        entry.source,
-                                        entry.message
-                                    ));
+                            let filtered_snapshot = {
+                                filtered_indices
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone()
+                            };
+                            let output = {
+                                let ents = entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut output = String::new();
+                                for idx in filtered_snapshot {
+                                    if let Some(entry) = ents.get(idx) {
+                                        output.push_str(&format!(
+                                            "[{}] [{}] [{}] {}\n",
+                                            entry.timestamp,
+                                            entry.level.label(),
+                                            entry.source,
+                                            entry.message
+                                        ));
+                                    }
                                 }
-                            }
+                                output
+                            };
                             match std::fs::write(&path, output) {
                                 Ok(()) => {
                                     fltk::dialog::message_default(&format!(

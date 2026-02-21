@@ -457,9 +457,8 @@ impl MainWindow {
             editor.cancel_current();
         }
 
-        if let Ok(mut s) = state.try_lock() {
-            s.set_status_message("Cancelling running queries...");
-        }
+        let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.set_status_message("Cancelling running queries...");
     }
 
     fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
@@ -1484,9 +1483,8 @@ impl MainWindow {
             if let Some(file_sender) = file_sender {
                 Self::attach_file_drop_callback(state, tab_id, file_sender);
             }
-            if let Ok(mut s) = state.try_lock() {
-                s.sql_editor.focus();
-            }
+            let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.sql_editor.focus();
         }
 
         true
@@ -3046,9 +3044,10 @@ impl MainWindow {
             }
 
             let health_worker_registered = state
-                .try_lock()
-                .map(|s| s.health_stop_signal.is_some())
-                .unwrap_or(true);
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .health_stop_signal
+                .is_some();
             if should_restart_health_check_worker(health_disconnected, health_worker_registered) {
                 crate::utils::logging::log_error(
                     "connection",
@@ -3064,9 +3063,8 @@ impl MainWindow {
                 let health_connection = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).connection.clone();
                 let stop_flag =
                     MainWindow::start_health_check_worker(health_connection, health_sender);
-                if let Ok(mut s) = state.try_lock() {
-                    s.health_stop_signal = Some(stop_flag);
-                }
+                let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                s.health_stop_signal = Some(stop_flag);
             }
 
             // Stop polling if all channels are disconnected

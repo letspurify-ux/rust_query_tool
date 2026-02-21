@@ -1223,7 +1223,7 @@ impl SqlEditorWidget {
                             UiActionResult::QueryAlreadyRunning => {
                                 let busy_message = crate::db::format_connection_busy_message();
                                 widget.emit_status(&busy_message);
-                                fltk::dialog::message_default(&busy_message);
+                                fltk::dialog::alert_default(&busy_message);
                             }
                         }
                         if should_reset_cursor {
@@ -1803,11 +1803,41 @@ impl SqlEditorWidget {
         *self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn apply_history_navigation_text(&mut self, text: &str) {
+        {
+            let mut applying_navigation = self
+                .applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *applying_navigation = true;
+        }
+
+        self.buffer.set_text(text);
+
+        {
+            let mut applying_navigation = self
+                .applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *applying_navigation = false;
+        }
+
+        self.refresh_highlighting();
+        let cursor_pos = text.len().min(i32::MAX as usize) as i32;
+        self.editor.set_insert_position(cursor_pos);
+        self.editor.show_insert_position();
+    }
+
     pub fn navigate_history(&mut self, direction: i32) {
+        enum NavigationUpdate {
+            NoOp,
+            RestoreOriginal(String),
+            ShowSql(String),
+        }
+
         let mut cursor = self.history_cursor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut original = self.history_original.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut history_entries = self.history_navigation_entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut applying_navigation = self.applying_history_navigation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if cursor.is_none() {
             // Keep navigation aligned with persisted history while avoiding long UI stalls
@@ -1825,51 +1855,57 @@ impl SqlEditorWidget {
             return;
         };
 
-        let next_index = match *cursor {
+        let update = match *cursor {
             None => {
                 if direction > 0 {
-                    Some(0)
+                    if let Some(first) = entries.first() {
+                        *cursor = Some(0);
+                        NavigationUpdate::ShowSql(first.sql.clone())
+                    } else {
+                        NavigationUpdate::NoOp
+                    }
                 } else {
                     return;
                 }
             }
             Some(index) => {
                 if direction > 0 {
-                    Some(index.saturating_add(1))
-                } else if index == 0 {
-                    if let Some(saved) = original.take() {
-                        *applying_navigation = true;
-                        self.buffer.set_text(&saved);
-                        *applying_navigation = false;
-                        self.refresh_highlighting();
-                        self.editor.set_insert_position(saved.len() as i32);
-                        self.editor.show_insert_position();
+                    let next_index = index.saturating_add(1);
+                    if next_index >= entries.len() {
+                        NavigationUpdate::NoOp
+                    } else {
+                        *cursor = Some(next_index);
+                        NavigationUpdate::ShowSql(entries[next_index].sql.clone())
                     }
+                } else if index == 0 {
                     *cursor = None;
                     history_entries.take();
-                    return;
+                    if let Some(saved) = original.take() {
+                        NavigationUpdate::RestoreOriginal(saved)
+                    } else {
+                        NavigationUpdate::NoOp
+                    }
                 } else {
-                    Some(index.saturating_sub(1))
+                    let next_index = index.saturating_sub(1);
+                    *cursor = Some(next_index);
+                    NavigationUpdate::ShowSql(entries[next_index].sql.clone())
                 }
             }
         };
 
-        let Some(next_index) = next_index else {
-            return;
-        };
+        drop(history_entries);
+        drop(original);
+        drop(cursor);
 
-        if next_index >= entries.len() {
-            return;
+        match update {
+            NavigationUpdate::NoOp => {}
+            NavigationUpdate::RestoreOriginal(saved) => {
+                self.apply_history_navigation_text(&saved);
+            }
+            NavigationUpdate::ShowSql(sql) => {
+                self.apply_history_navigation_text(&sql);
+            }
         }
-
-        *cursor = Some(next_index);
-        let sql = &entries[next_index].sql;
-        *applying_navigation = true;
-        self.buffer.set_text(sql);
-        *applying_navigation = false;
-        self.refresh_highlighting();
-        self.editor.set_insert_position(sql.len() as i32);
-        self.editor.show_insert_position();
     }
 
     pub fn select_block_in_direction(&mut self, direction: i32) {

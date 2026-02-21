@@ -2976,7 +2976,8 @@ impl SqlEditorWidget {
         }
 
         if *self.query_running.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            self.emit_status("A query is already running. Please wait for it to finish.");
+            let _ = self.ui_action_sender.send(UiActionResult::QueryAlreadyRunning);
+            app::awake();
             return;
         }
 
