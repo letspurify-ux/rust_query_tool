@@ -56,6 +56,27 @@ fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
     }
 }
 
+const LOCK_WAIT_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+
+fn lock_with_wait_warning<'a, T>(
+    mutex: &'a Arc<Mutex<T>>,
+    context: &str,
+) -> std::sync::MutexGuard<'a, T> {
+    let lock_started_at = Instant::now();
+    let guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let waited = lock_started_at.elapsed();
+    if waited >= LOCK_WAIT_WARN_THRESHOLD {
+        crate::utils::logging::log_warning(
+            "ui",
+            &format!(
+                "Result table lock waited {:.3}s while {context}",
+                waited.as_secs_f64()
+            ),
+        );
+    }
+    guard
+}
+
 /// Minimum interval between UI updates during streaming
 const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(0);
 /// Maximum rows to buffer before forcing a UI update
@@ -361,17 +382,16 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(font_profile.bold, font_size);
-                    if let Ok(hdrs) = headers_for_draw.try_lock() {
-                        if let Some(text) = hdrs.get(col as usize) {
-                            draw::draw_text2(
-                                text,
-                                x + TABLE_CELL_PADDING,
-                                y,
-                                w - TABLE_CELL_PADDING * 2,
-                                h,
-                                Align::Left,
-                            );
-                        }
+                    let hdrs = lock_with_wait_warning(&headers_for_draw, "drawing header cell");
+                    if let Some(text) = hdrs.get(col as usize) {
+                        draw::draw_text2(
+                            text,
+                            x + TABLE_CELL_PADDING,
+                            y,
+                            w - TABLE_CELL_PADDING * 2,
+                            h,
+                            Align::Left,
+                        );
                     }
                     draw::set_draw_color(border_color);
                     draw::draw_line(x, y + h - 1, x + w, y + h - 1);
@@ -396,35 +416,16 @@ impl ResultTableWidget {
                     draw::set_draw_color(cell_fg);
                     draw::set_font(font_profile.normal, font_size);
 
-                    if let Ok(data) = full_data_for_draw.try_lock() {
-                        if let Some(row_data) = data.get(row as usize) {
-                            if let Some(cell_val) = row_data.get(col as usize) {
-                                let max_chars = *max_cell_display_chars_for_draw.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Some(truncated_end) =
-                                    truncated_content_end(cell_val, max_chars)
-                                {
-                                    if truncated_end > 0 {
-                                        let visible = &cell_val[..truncated_end];
-                                        draw::draw_text2(
-                                            visible,
-                                            x + TABLE_CELL_PADDING,
-                                            y,
-                                            w - TABLE_CELL_PADDING * 2,
-                                            h,
-                                            Align::Left,
-                                        );
-                                    }
+                    let data = lock_with_wait_warning(&full_data_for_draw, "drawing table cell");
+                    if let Some(row_data) = data.get(row as usize) {
+                        if let Some(cell_val) = row_data.get(col as usize) {
+                            let max_chars = *max_cell_display_chars_for_draw.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(truncated_end) = truncated_content_end(cell_val, max_chars)
+                            {
+                                if truncated_end > 0 {
+                                    let visible = &cell_val[..truncated_end];
                                     draw::draw_text2(
-                                        "…",
-                                        x + TABLE_CELL_PADDING,
-                                        y,
-                                        w - TABLE_CELL_PADDING * 2,
-                                        h,
-                                        Align::Right,
-                                    );
-                                } else {
-                                    draw::draw_text2(
-                                        cell_val,
+                                        visible,
                                         x + TABLE_CELL_PADDING,
                                         y,
                                         w - TABLE_CELL_PADDING * 2,
@@ -432,6 +433,23 @@ impl ResultTableWidget {
                                         Align::Left,
                                     );
                                 }
+                                draw::draw_text2(
+                                    "…",
+                                    x + TABLE_CELL_PADDING,
+                                    y,
+                                    w - TABLE_CELL_PADDING * 2,
+                                    h,
+                                    Align::Right,
+                                );
+                            } else {
+                                draw::draw_text2(
+                                    cell_val,
+                                    x + TABLE_CELL_PADDING,
+                                    y,
+                                    w - TABLE_CELL_PADDING * 2,
+                                    h,
+                                    Align::Left,
+                                );
                             }
                         }
                     }
@@ -476,12 +494,15 @@ impl ResultTableWidget {
                                 // entering the modal dialog's event loop. Holding the
                                 // borrow across app::wait() would panic if flush_pending
                                 // tries to borrow_mut full_data during the nested loop.
-                                let cell_val_owned =
-                                    full_data_for_handle.try_lock().ok().and_then(|data| {
-                                        data.get(row as usize)
-                                            .and_then(|r| r.get(col as usize))
-                                            .cloned()
-                                    });
+                                let cell_val_owned = {
+                                    let data = lock_with_wait_warning(
+                                        &full_data_for_handle,
+                                        "opening cell text dialog",
+                                    );
+                                    data.get(row as usize)
+                                        .and_then(|r| r.get(col as usize))
+                                        .cloned()
+                                };
                                 if let Some(cell_val) = cell_val_owned {
                                     Self::show_cell_text_dialog(
                                         &cell_val,
