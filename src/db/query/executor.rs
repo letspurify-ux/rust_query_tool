@@ -4676,6 +4676,17 @@ ORDER BY
         Ok(value)
     }
 
+    fn validate_positive_i64(value: i64, field_name: &str) -> Result<i64, OracleError> {
+        if value <= 0 {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be a positive integer",
+                field_name
+            )));
+        }
+
+        Ok(value)
+    }
+
     fn normalize_required_security_identifier(
         value: &str,
         field_name: &str,
@@ -6016,6 +6027,13 @@ ORDER BY profile, resource_type, resource_name
         instance_id: Option<i64>,
         immediate: bool,
     ) -> Result<(), OracleError> {
+        let sid = Self::validate_positive_i64(sid, "SID")?;
+        let serial = Self::validate_positive_i64(serial, "SERIAL#")?;
+        let instance_id = match instance_id {
+            Some(value) => Some(Self::validate_positive_i64(value, "INST_ID")?),
+            None => None,
+        };
+
         let sql = Self::build_kill_session_sql(sid, serial, instance_id, immediate);
         conn.execute(&sql, &[])?;
         Ok(())
@@ -6042,6 +6060,12 @@ mod dba_feature_tests {
     fn kill_session_sql_includes_instance_when_requested() {
         let sql = QueryExecutor::build_kill_session_sql(101, 222, Some(3), true);
         assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222,@3' IMMEDIATE");
+    }
+
+    #[test]
+    fn validate_positive_i64_rejects_zero_or_negative_values() {
+        assert!(QueryExecutor::validate_positive_i64(0, "SID").is_err());
+        assert!(QueryExecutor::validate_positive_i64(-1, "SID").is_err());
     }
 
     #[test]
