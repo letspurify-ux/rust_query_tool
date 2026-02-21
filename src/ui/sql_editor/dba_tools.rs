@@ -1805,8 +1805,7 @@ impl SqlEditorWidget {
         let owner_input_for_alter = owner_input.clone();
         let job_input_for_alter = job_input.clone();
         alter_job_btn.set_callback(move |_| {
-            let Some(job_action) =
-                prompt_optional_text("New job action (blank = no change)", "")
+            let Some(job_action) = prompt_optional_text("New job action (blank = no change)", "")
             else {
                 return;
             };
@@ -1819,12 +1818,8 @@ impl SqlEditorWidget {
             else {
                 return;
             };
-            let enabled_choice = fltk::dialog::choice2_default(
-                "Enabled state change",
-                "Skip",
-                "Enable",
-                "Disable",
-            );
+            let enabled_choice =
+                fltk::dialog::choice2_default("Enabled state change", "Skip", "Enable", "Disable");
             let enabled_state = match enabled_choice {
                 Some(1) => Some(true),
                 Some(2) => Some(false),
@@ -1855,7 +1850,8 @@ impl SqlEditorWidget {
         let job_input_for_dp_export = job_input.clone();
         let owner_input_for_dp_export = owner_input.clone();
         dp_export_btn.set_callback(move |_| {
-            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR") else {
+            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR")
+            else {
                 return;
             };
             let current_job = job_input_for_dp_export.value();
@@ -1896,7 +1892,8 @@ impl SqlEditorWidget {
         let job_input_for_dp_import = job_input.clone();
         let owner_input_for_dp_import = owner_input.clone();
         dp_import_btn.set_callback(move |_| {
-            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR") else {
+            let Some(directory) = prompt_optional_text("Data Pump directory", "DATA_PUMP_DIR")
+            else {
                 return;
             };
             let current_job = job_input_for_dp_import.value();
@@ -2124,7 +2121,10 @@ impl SqlEditorWidget {
                                     )
                                     .map(|_| format!("Scheduler job {} created", qualified))
                                     .map_err(|err| {
-                                        format!("Failed to create scheduler job {}: {err}", qualified)
+                                        format!(
+                                            "Failed to create scheduler job {}: {err}",
+                                            qualified
+                                        )
                                     }),
                                     Err(message) => Err(message),
                                 },
@@ -2205,7 +2205,10 @@ impl SqlEditorWidget {
                                     )
                                     .map(|_| format!("Scheduler job {} altered", qualified))
                                     .map_err(|err| {
-                                        format!("Failed to alter scheduler job {}: {err}", qualified)
+                                        format!(
+                                            "Failed to alter scheduler job {}: {err}",
+                                            qualified
+                                        )
                                     }),
                                     Err(message) => Err(message),
                                 },
@@ -2532,8 +2535,7 @@ impl SqlEditorWidget {
                             }
                         };
 
-                        latest_datapump_request_id =
-                            latest_datapump_request_id.saturating_add(1);
+                        latest_datapump_request_id = latest_datapump_request_id.saturating_add(1);
                         let request_id = latest_datapump_request_id;
 
                         set_cursor(Cursor::Wait);
@@ -2558,10 +2560,8 @@ impl SqlEditorWidget {
                                 },
                                 None => Err(format_connection_busy_message()),
                             };
-                            let _ = sender_result.send(SchedulerMessage::DataPumpJobsLoaded {
-                                request_id,
-                                result,
-                            });
+                            let _ = sender_result
+                                .send(SchedulerMessage::DataPumpJobsLoaded { request_id, result });
                             app::awake();
                         });
                     }
@@ -2572,14 +2572,14 @@ impl SqlEditorWidget {
                         log_file_text,
                         schema_text,
                     } => {
-                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
-                        {
-                            Ok(value) => value,
-                            Err(err) => {
-                                fltk::dialog::alert_default(&err);
-                                continue;
-                            }
-                        };
+                        let job_name =
+                            match normalize_required_identifier(&job_text, "Data Pump job") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
                         let schema_name =
                             match normalize_required_identifier(&schema_text, "Schema") {
                                 Ok(value) => value,
@@ -2629,8 +2629,8 @@ impl SqlEditorWidget {
                                 },
                                 None => Err(format_connection_busy_message()),
                             };
-                            let _ =
-                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            let _ = sender_result
+                                .send(SchedulerMessage::DataPumpActionFinished(result));
                             app::awake();
                         });
                     }
@@ -2641,14 +2641,14 @@ impl SqlEditorWidget {
                         log_file_text,
                         schema_text,
                     } => {
-                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
-                        {
-                            Ok(value) => value,
-                            Err(err) => {
-                                fltk::dialog::alert_default(&err);
-                                continue;
-                            }
-                        };
+                        let job_name =
+                            match normalize_required_identifier(&job_text, "Data Pump job") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
                         let schema_name = normalize_optional_text_param(&schema_text);
                         let confirm = fltk::dialog::choice2_default(
                             &format!("Start Data Pump import job {}?", job_name),
@@ -2691,8 +2691,8 @@ impl SqlEditorWidget {
                                 },
                                 None => Err(format_connection_busy_message()),
                             };
-                            let _ =
-                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            let _ = sender_result
+                                .send(SchedulerMessage::DataPumpActionFinished(result));
                             app::awake();
                         });
                     }
@@ -2707,14 +2707,14 @@ impl SqlEditorWidget {
                                 continue;
                             }
                         };
-                        let job_name = match normalize_required_identifier(&job_text, "Data Pump job")
-                        {
-                            Ok(value) => value,
-                            Err(err) => {
-                                fltk::dialog::alert_default(&err);
-                                continue;
-                            }
-                        };
+                        let job_name =
+                            match normalize_required_identifier(&job_text, "Data Pump job") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
 
                         let qualified = qualified_owner_object(owner.as_deref(), &job_name);
                         let confirm = fltk::dialog::choice2_default(
@@ -2747,17 +2747,14 @@ impl SqlEditorWidget {
                                     )
                                     .map(|_| format!("Data Pump job {} stop requested", qualified))
                                     .map_err(|err| {
-                                        format!(
-                                            "Failed to stop Data Pump job {}: {err}",
-                                            qualified
-                                        )
+                                        format!("Failed to stop Data Pump job {}: {err}", qualified)
                                     }),
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
                             };
-                            let _ =
-                                sender_result.send(SchedulerMessage::DataPumpActionFinished(result));
+                            let _ = sender_result
+                                .send(SchedulerMessage::DataPumpActionFinished(result));
                             app::awake();
                         });
                     }
@@ -3539,12 +3536,8 @@ impl SqlEditorWidget {
         let sender_drop_user = sender.clone();
         let user_input_for_drop_user = user_input.clone();
         drop_user_btn.set_callback(move |_| {
-            let choice = fltk::dialog::choice2_default(
-                "Drop user mode",
-                "Cancel",
-                "Drop",
-                "Drop CASCADE",
-            );
+            let choice =
+                fltk::dialog::choice2_default("Drop user mode", "Cancel", "Drop", "Drop CASCADE");
             let cascade = match choice {
                 Some(1) => false,
                 Some(2) => true,
@@ -4202,19 +4195,19 @@ impl SqlEditorWidget {
                                 format!("Dropping user {}", user),
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::drop_user(
-                                        db_conn.as_ref(),
-                                        &user,
-                                        cascade,
-                                    )
-                                    .map(|_| {
-                                        if cascade {
-                                            format!("User {} dropped (CASCADE)", user)
-                                        } else {
-                                            format!("User {} dropped", user)
-                                        }
-                                    })
-                                    .map_err(|err| format!("Failed to drop user {}: {err}", user)),
+                                    Ok(db_conn) => {
+                                        QueryExecutor::drop_user(db_conn.as_ref(), &user, cascade)
+                                            .map(|_| {
+                                                if cascade {
+                                                    format!("User {} dropped (CASCADE)", user)
+                                                } else {
+                                                    format!("User {} dropped", user)
+                                                }
+                                            })
+                                            .map_err(|err| {
+                                                format!("Failed to drop user {}: {err}", user)
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
@@ -4255,9 +4248,13 @@ impl SqlEditorWidget {
                                 format!("Creating role {}", role),
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::create_role(db_conn.as_ref(), &role)
-                                        .map(|_| format!("Role {} created", role))
-                                        .map_err(|err| format!("Failed to create role {}: {err}", role)),
+                                    Ok(db_conn) => {
+                                        QueryExecutor::create_role(db_conn.as_ref(), &role)
+                                            .map(|_| format!("Role {} created", role))
+                                            .map_err(|err| {
+                                                format!("Failed to create role {}: {err}", role)
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
@@ -4298,9 +4295,13 @@ impl SqlEditorWidget {
                                 format!("Dropping role {}", role),
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::drop_role(db_conn.as_ref(), &role)
-                                        .map(|_| format!("Role {} dropped", role))
-                                        .map_err(|err| format!("Failed to drop role {}: {err}", role)),
+                                    Ok(db_conn) => {
+                                        QueryExecutor::drop_role(db_conn.as_ref(), &role)
+                                            .map(|_| format!("Role {} dropped", role))
+                                            .map_err(|err| {
+                                                format!("Failed to drop role {}: {err}", role)
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
@@ -6150,9 +6151,7 @@ impl SqlEditorWidget {
                             );
                             continue;
                         }
-                        if !dataguard_role_allows_apply_control(
-                            current_database_role.as_deref(),
-                        ) {
+                        if !dataguard_role_allows_apply_control(current_database_role.as_deref()) {
                             let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
                             fltk::dialog::alert_default(&format!(
                                 "Start apply is supported for PHYSICAL STANDBY role (current: {}).",
@@ -6201,13 +6200,13 @@ impl SqlEditorWidget {
                                 "Starting Data Guard apply",
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::start_dataguard_apply(
-                                        db_conn.as_ref(),
-                                    )
-                                    .map(|_| "Data Guard apply started".to_string())
-                                    .map_err(|err| {
-                                        format!("Failed to start Data Guard apply: {err}")
-                                    }),
+                                    Ok(db_conn) => {
+                                        QueryExecutor::start_dataguard_apply(db_conn.as_ref())
+                                            .map(|_| "Data Guard apply started".to_string())
+                                            .map_err(|err| {
+                                                format!("Failed to start Data Guard apply: {err}")
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
@@ -6228,9 +6227,7 @@ impl SqlEditorWidget {
                             );
                             continue;
                         }
-                        if !dataguard_role_allows_apply_control(
-                            current_database_role.as_deref(),
-                        ) {
+                        if !dataguard_role_allows_apply_control(current_database_role.as_deref()) {
                             let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
                             fltk::dialog::alert_default(&format!(
                                 "Stop apply is supported for PHYSICAL STANDBY role (current: {}).",
@@ -6279,13 +6276,13 @@ impl SqlEditorWidget {
                                 "Stopping Data Guard apply",
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::stop_dataguard_apply(
-                                        db_conn.as_ref(),
-                                    )
-                                    .map(|_| "Data Guard apply stopped".to_string())
-                                    .map_err(|err| {
-                                        format!("Failed to stop Data Guard apply: {err}")
-                                    }),
+                                    Ok(db_conn) => {
+                                        QueryExecutor::stop_dataguard_apply(db_conn.as_ref())
+                                            .map(|_| "Data Guard apply stopped".to_string())
+                                            .map_err(|err| {
+                                                format!("Failed to stop Data Guard apply: {err}")
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
@@ -6304,6 +6301,15 @@ impl SqlEditorWidget {
                             fltk::dialog::alert_default(
                                 "Load Data Guard Overview first to validate target information.",
                             );
+                            continue;
+                        }
+
+                        let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
+                        if role != "PRIMARY" && role != "PHYSICAL STANDBY" {
+                            fltk::dialog::alert_default(&format!(
+                                "Switchover is supported only on PRIMARY or PHYSICAL STANDBY role (current: {}).",
+                                role
+                            ));
                             continue;
                         }
 
@@ -6366,7 +6372,9 @@ impl SqlEditorWidget {
                                         db_conn.as_ref(),
                                         &target,
                                     )
-                                    .map(|_| format!("Data Guard switchover executed to {}", target))
+                                    .map(|_| {
+                                        format!("Data Guard switchover executed to {}", target)
+                                    })
                                     .map_err(|err| {
                                         format!(
                                             "Failed to execute Data Guard switchover to {}: {err}",
@@ -6391,6 +6399,15 @@ impl SqlEditorWidget {
                             fltk::dialog::alert_default(
                                 "Load Data Guard Overview first to validate target information.",
                             );
+                            continue;
+                        }
+
+                        let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
+                        if role != "PHYSICAL STANDBY" {
+                            fltk::dialog::alert_default(&format!(
+                                "Failover is supported only on PHYSICAL STANDBY role (current: {}).",
+                                role
+                            ));
                             continue;
                         }
 
@@ -6444,26 +6461,29 @@ impl SqlEditorWidget {
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
                         thread::spawn(move || {
-                            let result = match try_lock_connection_with_activity(
-                                &connection,
-                                format!("Executing Data Guard failover to {}", target),
-                            ) {
-                                Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::failover_dataguard(
-                                        db_conn.as_ref(),
-                                        &target,
-                                    )
-                                    .map(|_| format!("Data Guard failover executed to {}", target))
-                                    .map_err(|err| {
-                                        format!(
+                            let result =
+                                match try_lock_connection_with_activity(
+                                    &connection,
+                                    format!("Executing Data Guard failover to {}", target),
+                                ) {
+                                    Some(mut guard) => match guard.require_live_connection() {
+                                        Ok(db_conn) => QueryExecutor::failover_dataguard(
+                                            db_conn.as_ref(),
+                                            &target,
+                                        )
+                                        .map(|_| {
+                                            format!("Data Guard failover executed to {}", target)
+                                        })
+                                        .map_err(|err| {
+                                            format!(
                                             "Failed to execute Data Guard failover to {}: {err}",
                                             target
                                         )
-                                    }),
-                                    Err(message) => Err(message),
-                                },
-                                None => Err(format_connection_busy_message()),
-                            };
+                                        }),
+                                        Err(message) => Err(message),
+                                    },
+                                    None => Err(format_connection_busy_message()),
+                                };
 
                             let _ = sender_result.send(DataGuardMessage::ActionFinished(result));
                             app::awake();
@@ -6994,8 +7014,8 @@ fn normalize_optional_sql_id(value: &str) -> Result<Option<String>, String> {
     if !upper.chars().all(|ch| ch.is_ascii_alphanumeric()) {
         return Err("SQL_ID must contain only ASCII letters and digits".to_string());
     }
-    if upper.len() > 13 {
-        return Err("SQL_ID should be at most 13 characters".to_string());
+    if upper.len() != 13 {
+        return Err("SQL_ID must be exactly 13 characters".to_string());
     }
 
     Ok(Some(upper))
@@ -7138,7 +7158,12 @@ fn default_rman_job_name(prefix: &str) -> String {
         Err(_) => 0,
     };
     let sequence = RMAN_JOB_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{}_{}_{}", prefix.trim().to_uppercase(), timestamp_millis, sequence)
+    format!(
+        "{}_{}_{}",
+        prefix.trim().to_uppercase(),
+        timestamp_millis,
+        sequence
+    )
 }
 
 fn refresh_security_action_controls(
@@ -7181,8 +7206,9 @@ fn refresh_security_action_controls(
     set_enabled(unlock_user_btn);
 
     if profiles_mode {
-        quick_run_btn
-            .set_tooltip("Disabled in Profiles view. Switch to Users/Summary/Grants to run actions.");
+        quick_run_btn.set_tooltip(
+            "Disabled in Profiles view. Switch to Users/Summary/Grants to run actions.",
+        );
     } else {
         quick_run_btn.set_tooltip("Run selected quick action");
     }
@@ -7270,6 +7296,16 @@ mod tests {
     #[test]
     fn normalize_optional_sql_id_rejects_non_alnum() {
         assert!(normalize_optional_sql_id("abc-123").is_err());
+    }
+
+    #[test]
+    fn normalize_optional_sql_id_requires_exactly_13_chars() {
+        assert!(normalize_optional_sql_id("abc123").is_err());
+        assert!(normalize_optional_sql_id("12345678901234").is_err());
+        assert_eq!(
+            normalize_optional_sql_id("7v9h9ttw0g3cn"),
+            Ok(Some("7V9H9TTW0G3CN".to_string()))
+        );
     }
 
     #[test]
@@ -7490,7 +7526,9 @@ mod tests {
 
     #[test]
     fn dataguard_role_allows_apply_control_only_for_physical_standby() {
-        assert!(dataguard_role_allows_apply_control(Some("PHYSICAL STANDBY")));
+        assert!(dataguard_role_allows_apply_control(Some(
+            "PHYSICAL STANDBY"
+        )));
         assert!(!dataguard_role_allows_apply_control(Some("PRIMARY")));
         assert!(!dataguard_role_allows_apply_control(None));
     }

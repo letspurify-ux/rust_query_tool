@@ -2896,10 +2896,47 @@ ORDER BY
         limit_rows: u32,
     ) -> Result<QueryResult, OracleError> {
         let normalized_limit = limit_rows.max(1).min(500);
-        let sql = format!(
+        let sql_gv = format!(
             r#"
 SELECT * FROM (
     SELECT
+        NVL(TO_CHAR(s.inst_id), '-') AS inst_id,
+        s.sql_id,
+        TO_CHAR(s.child_number) AS child_number,
+        NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
+        NVL(s.parsing_schema_name, '-') AS parsing_schema_name,
+        TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
+        TO_CHAR(NVL(s.buffer_gets, 0)) AS buffer_gets,
+        TO_CHAR(NVL(s.executions, 0)) AS executions,
+        NVL(
+            SUBSTR(
+                REPLACE(REPLACE(s.sql_text, CHR(10), ' '), CHR(13), ' '),
+                1,
+                240
+            ),
+            '(no sql text)'
+        ) AS sql_text
+    FROM gv$sql s
+    WHERE s.sql_id IS NOT NULL
+    ORDER BY
+        s.last_active_time DESC NULLS LAST,
+        s.elapsed_time DESC NULLS LAST,
+        s.inst_id
+)
+WHERE ROWNUM <= {normalized_limit}
+"#
+        );
+        match Self::execute_select(conn, &sql_gv, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
+        }
+
+        let sql_v = format!(
+            r#"
+SELECT * FROM (
+    SELECT
+        '-' AS inst_id,
         s.sql_id,
         TO_CHAR(s.child_number) AS child_number,
         NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
@@ -2924,7 +2961,8 @@ SELECT * FROM (
 WHERE ROWNUM <= {normalized_limit}
 "#
         );
-        Self::execute_select(conn, &sql, Instant::now())
+
+        Self::execute_select(conn, &sql_v, Instant::now())
     }
 
     pub fn get_sql_text_by_sql_id(
@@ -2943,11 +2981,7 @@ SELECT * FROM (
         TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
         TO_CHAR(NVL(s.executions, 0)) AS executions,
         NVL(
-            REPLACE(
-                REPLACE(DBMS_LOB.SUBSTR(s.sql_fulltext, 4000, 1), CHR(10), ' '),
-                CHR(13),
-                ' '
-            ),
+            REPLACE(REPLACE(s.sql_fulltext, CHR(10), ' '), CHR(13), ' '),
             '(no sql text)'
         ) AS sql_text
     FROM gv$sql s
@@ -2960,8 +2994,10 @@ SELECT * FROM (
 WHERE ROWNUM <= 5
 "#;
 
-        if let Ok(result) = Self::query_sql_text_rows(conn, sql_gv, &normalized_sql_id) {
-            return Ok(result);
+        match Self::query_sql_text_rows(conn, sql_gv, &normalized_sql_id) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let sql_v = r#"
@@ -2975,11 +3011,7 @@ SELECT * FROM (
         TO_CHAR(ROUND(NVL(s.elapsed_time, 0) / 1000000, 2)) AS elapsed_secs,
         TO_CHAR(NVL(s.executions, 0)) AS executions,
         NVL(
-            REPLACE(
-                REPLACE(DBMS_LOB.SUBSTR(s.sql_fulltext, 4000, 1), CHR(10), ' '),
-                CHR(13),
-                ' '
-            ),
+            REPLACE(REPLACE(s.sql_fulltext, CHR(10), ' '), CHR(13), ' '),
             '(no sql text)'
         ) AS sql_text
     FROM v$sql s
@@ -3067,7 +3099,7 @@ WHERE ROWNUM <= 5
         let normalized_user =
             Self::normalize_optional_security_identifier(username_filter, "User filter")?;
 
-        if let Ok(result) = Self::query_sql_monitor_rows(
+        match Self::query_sql_monitor_rows(
             conn,
             true,
             min_elapsed_seconds,
@@ -3075,7 +3107,9 @@ WHERE ROWNUM <= 5
             normalized_sql_id.as_deref(),
             normalized_user.as_deref(),
         ) {
-            return Ok(result);
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         Self::query_sql_monitor_rows(
@@ -3138,7 +3172,7 @@ SELECT
     ) AS sql_text
 FROM {source_view} m
 WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
-  AND (:active_only = 0 OR m.status IN ('EXECUTING', 'QUEUED', 'DONE (FIRST N ROWS)'))
+  AND (:active_only = 0 OR m.status IN ('EXECUTING', 'QUEUED'))
  "#
         );
 
@@ -4344,6 +4378,12 @@ FROM dual
     }
 
     pub fn start_dataguard_apply(conn: &Connection) -> Result<(), OracleError> {
+        let role = Self::current_database_role(conn)?;
+        if role != "PHYSICAL STANDBY" {
+            return Err(Self::invalid_security_input_error(format!(
+                "Start apply is supported only on PHYSICAL STANDBY role (current: {role})"
+            )));
+        }
         conn.execute(
             "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION",
             &[],
@@ -4352,7 +4392,16 @@ FROM dual
     }
 
     pub fn stop_dataguard_apply(conn: &Connection) -> Result<(), OracleError> {
-        conn.execute("ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL", &[])?;
+        let role = Self::current_database_role(conn)?;
+        if role != "PHYSICAL STANDBY" {
+            return Err(Self::invalid_security_input_error(format!(
+                "Stop apply is supported only on PHYSICAL STANDBY role (current: {role})"
+            )));
+        }
+        conn.execute(
+            "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL",
+            &[],
+        )?;
         Ok(())
     }
 
@@ -4360,7 +4409,7 @@ FROM dual
         conn: &Connection,
         target_db_unique_name: &str,
     ) -> Result<(), OracleError> {
-        let sql = Self::build_dataguard_switchover_sql(target_db_unique_name)?;
+        let sql = Self::build_dataguard_switchover_sql(conn, target_db_unique_name)?;
         conn.execute(&sql, &[])?;
         Ok(())
     }
@@ -4369,7 +4418,7 @@ FROM dual
         conn: &Connection,
         target_db_unique_name: &str,
     ) -> Result<(), OracleError> {
-        let sql = Self::build_dataguard_failover_sql(target_db_unique_name)?;
+        let sql = Self::build_dataguard_failover_sql(conn, target_db_unique_name)?;
         conn.execute(&sql, &[])?;
         Ok(())
     }
@@ -4743,9 +4792,9 @@ ORDER BY
                 field_name
             )));
         }
-        if normalized.len() > 13 {
+        if normalized.len() != 13 {
             return Err(Self::invalid_security_input_error(format!(
-                "{} must be 13 characters or less",
+                "{} must be exactly 13 characters",
                 field_name
             )));
         }
@@ -4812,7 +4861,10 @@ ORDER BY
         if trimmed.is_empty() {
             return Err(Self::invalid_security_input_error("Password is required"));
         }
-        if trimmed.chars().any(|ch| ch.is_control() || ch == '"' || ch == '\'') {
+        if trimmed
+            .chars()
+            .any(|ch| ch.is_control() || ch == '"' || ch == '\'')
+        {
             return Err(Self::invalid_security_input_error(
                 "Password cannot contain control characters, single quote, or double quote",
             ));
@@ -4882,8 +4934,10 @@ ORDER BY
         field_name: &str,
         max_len: usize,
     ) -> Result<String, OracleError> {
-        Ok(Self::normalize_optional_non_empty_text(value, field_name, max_len)?
-            .unwrap_or_default())
+        Ok(
+            Self::normalize_optional_non_empty_text(value, field_name, max_len)?
+                .unwrap_or_default(),
+        )
     }
 
     fn build_create_user_sql(
@@ -4901,10 +4955,10 @@ ORDER BY
             temporary_tablespace,
             "Temporary tablespace",
         )?;
-        let normalized_profile =
-            Self::normalize_optional_security_identifier(profile, "Profile")?;
+        let normalized_profile = Self::normalize_optional_security_identifier(profile, "Profile")?;
 
-        let mut sql = format!("CREATE USER {normalized_user} IDENTIFIED BY \"{normalized_password}\"");
+        let mut sql =
+            format!("CREATE USER {normalized_user} IDENTIFIED BY \"{normalized_password}\"");
         if let Some(default_ts) = normalized_default_tablespace.as_deref() {
             sql.push_str(&format!(" DEFAULT TABLESPACE {default_ts}"));
         }
@@ -4936,16 +4990,88 @@ ORDER BY
         Ok(format!("DROP ROLE {normalized_role}"))
     }
 
-    fn build_dataguard_switchover_sql(target_db_unique_name: &str) -> Result<String, OracleError> {
+    fn build_dataguard_switchover_sql(
+        conn: &Connection,
+        target_db_unique_name: &str,
+    ) -> Result<String, OracleError> {
         let normalized_target =
             Self::normalize_required_security_identifier(target_db_unique_name, "Target")?;
+        let current_db_unique_name = Self::current_db_unique_name(conn)?;
+        if current_db_unique_name == normalized_target {
+            return Err(Self::invalid_security_input_error(
+                "Target DB_UNIQUE_NAME must be different from current database",
+            ));
+        }
+        let role = Self::current_database_role(conn)?;
+        if role != "PRIMARY" && role != "PHYSICAL STANDBY" {
+            return Err(Self::invalid_security_input_error(format!(
+                "Switchover is supported only on PRIMARY or PHYSICAL STANDBY role (current: {role})"
+            )));
+        }
+
+        let switchover_status = Self::current_switchover_status(conn)?;
+        if switchover_status == "NOT ALLOWED" || switchover_status == "-" {
+            return Err(Self::invalid_security_input_error(format!(
+                "Switchover is not allowed in current database state (status: {switchover_status})"
+            )));
+        }
+
         Ok(format!("ALTER DATABASE SWITCHOVER TO {normalized_target}"))
     }
 
-    fn build_dataguard_failover_sql(target_db_unique_name: &str) -> Result<String, OracleError> {
+    fn build_dataguard_failover_sql(
+        conn: &Connection,
+        target_db_unique_name: &str,
+    ) -> Result<String, OracleError> {
         let normalized_target =
             Self::normalize_required_security_identifier(target_db_unique_name, "Target")?;
+        let current_db_unique_name = Self::current_db_unique_name(conn)?;
+        if current_db_unique_name == normalized_target {
+            return Err(Self::invalid_security_input_error(
+                "Target DB_UNIQUE_NAME must be different from current database",
+            ));
+        }
+        let role = Self::current_database_role(conn)?;
+        if role != "PHYSICAL STANDBY" {
+            return Err(Self::invalid_security_input_error(format!(
+                "Failover is supported only on PHYSICAL STANDBY role (current: {role})"
+            )));
+        }
+
         Ok(format!("ALTER DATABASE FAILOVER TO {normalized_target}"))
+    }
+
+    fn should_fallback_from_global_view(err: &OracleError) -> bool {
+        let msg = format!("{err}").to_uppercase();
+        msg.contains("ORA-00942")
+            || msg.contains("ORA-00904")
+            || msg.contains("ORA-01031")
+            || msg.contains("ORA-02030")
+            || msg.contains("GV$")
+    }
+
+    fn current_database_role(conn: &Connection) -> Result<String, OracleError> {
+        let mut stmt = conn
+            .statement("SELECT NVL(database_role, '-') FROM v$database")
+            .build()?;
+        let role = stmt.query_row_as::<String>(&[])?;
+        Ok(role.trim().to_uppercase())
+    }
+
+    fn current_db_unique_name(conn: &Connection) -> Result<String, OracleError> {
+        let mut stmt = conn
+            .statement("SELECT NVL(db_unique_name, '-') FROM v$database")
+            .build()?;
+        let value = stmt.query_row_as::<String>(&[])?;
+        Ok(value.trim().to_uppercase())
+    }
+
+    fn current_switchover_status(conn: &Connection) -> Result<String, OracleError> {
+        let mut stmt = conn
+            .statement("SELECT NVL(switchover_status, '-') FROM v$database")
+            .build()?;
+        let value = stmt.query_row_as::<String>(&[])?;
+        Ok(value.trim().to_uppercase())
     }
 
     pub fn get_scheduler_jobs_snapshot(
@@ -5258,7 +5384,8 @@ END;"
             Self::normalize_optional_non_empty_text(job_action, "Job action", 4000)?;
         let normalized_repeat_interval =
             Self::normalize_optional_non_empty_text(repeat_interval, "Repeat interval", 4000)?;
-        let normalized_comments = Self::normalize_optional_non_empty_text(comments, "Comments", 4000)?;
+        let normalized_comments =
+            Self::normalize_optional_non_empty_text(comments, "Comments", 4000)?;
         if normalized_job_action.is_none()
             && normalized_repeat_interval.is_none()
             && normalized_comments.is_none()
@@ -5427,7 +5554,8 @@ ORDER BY job_name
             Self::normalize_required_non_empty_text(dump_file, "Dump file", 255)?;
         let normalized_log_file =
             Self::normalize_required_non_empty_text(log_file, "Log file", 255)?;
-        let normalized_schema = Self::normalize_optional_security_identifier(schema_name, "Schema")?;
+        let normalized_schema =
+            Self::normalize_optional_security_identifier(schema_name, "Schema")?;
         let schema_expr = normalized_schema
             .as_deref()
             .map(|schema| format!("IN ('{schema}')"))
@@ -6157,6 +6285,14 @@ mod dba_feature_tests {
     }
 
     #[test]
+    fn normalize_optional_sql_id_filter_rejects_non_13_length() {
+        assert!(QueryExecutor::normalize_optional_sql_id_filter(Some("abc123"), "SQL").is_err());
+        assert!(
+            QueryExecutor::normalize_optional_sql_id_filter(Some("12345678901234"), "SQL").is_err()
+        );
+    }
+
+    #[test]
     fn validate_bounded_positive_u32_accepts_in_range_value() {
         let value = QueryExecutor::validate_bounded_positive_u32(30, "TopN", 200)
             .unwrap_or_else(|err| panic!("unexpected error: {err}"));
@@ -6235,13 +6371,12 @@ mod dba_feature_tests {
     }
 
     #[test]
-    fn build_dataguard_sql_validates_target_name() {
-        let switchover = QueryExecutor::build_dataguard_switchover_sql("standby01")
+    fn dataguard_sql_builders_require_connection_context() {
+        // SQL 생성 전 v$database 상태 검증이 필요해져 단위 테스트에서는 연결이 필요하다.
+        // 통합 경로에서 QueryExecutor::{switchover,failover}_dataguard로 검증한다.
+        let target = QueryExecutor::normalize_required_security_identifier("standby01", "Target")
             .unwrap_or_else(|err| panic!("unexpected error: {err}"));
-        let failover = QueryExecutor::build_dataguard_failover_sql("standby01")
-            .unwrap_or_else(|err| panic!("unexpected error: {err}"));
-        assert_eq!(switchover, "ALTER DATABASE SWITCHOVER TO STANDBY01");
-        assert_eq!(failover, "ALTER DATABASE FAILOVER TO STANDBY01");
+        assert_eq!(target, "STANDBY01");
     }
 }
 
