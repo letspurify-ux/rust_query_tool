@@ -3465,6 +3465,7 @@ impl SqlEditorWidget {
 
         let mut latest_request_id = 0u64;
         let mut loading_snapshot = false;
+        let mut pending_request: Option<(RmanViewMode, String, bool)> = None;
         while dialog.shown() {
             app::wait();
 
@@ -3476,7 +3477,11 @@ impl SqlEditorWidget {
                         attention_only,
                     } => {
                         if loading_snapshot {
-                            status.set_label("RMAN snapshot load is already in progress");
+                            pending_request = Some((mode, lookback_text, attention_only));
+                            status.set_label(&format!(
+                                "{} request queued (will run after current load)",
+                                mode.label()
+                            ));
                             continue;
                         }
 
@@ -3608,6 +3613,17 @@ impl SqlEditorWidget {
                                 )));
                                 status.set_label("RMAN snapshot load failed");
                             }
+                        }
+
+                        if let Some((queued_mode, queued_lookback_text, queued_attention_only)) =
+                            pending_request.take()
+                        {
+                            let _ = sender.send(RmanMessage::LoadRequested {
+                                mode: queued_mode,
+                                lookback_text: queued_lookback_text,
+                                attention_only: queued_attention_only,
+                            });
+                            app::awake();
                         }
                     }
                     RmanMessage::CloseRequested => {
