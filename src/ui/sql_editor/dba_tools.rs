@@ -10,7 +10,7 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -117,6 +117,7 @@ const RMAN_LOOKBACK_MAX_HOURS: u32 = 24 * 30;
 const ASH_LOOKBACK_MAX_MINUTES: u32 = 24 * 60;
 const AWR_LOOKBACK_MAX_HOURS: u32 = 24 * 30;
 const PERFORMANCE_TOP_N_MAX: u32 = 200;
+static RMAN_JOB_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl SqlEditorWidget {
     pub fn show_cursor_plan_analyzer(&self) {
@@ -3071,6 +3072,7 @@ impl SqlEditorWidget {
         quick_run_btn.set_color(theme::button_primary());
         quick_run_btn.set_label_color(theme::text_primary());
         quick_run_btn.set_frame(FrameType::RFlatBox);
+        quick_run_btn.set_tooltip("Run selected quick action");
         quick_row.fixed(&quick_run_btn, BUTTON_WIDTH_LARGE + 42);
 
         let quick_filler = Frame::default();
@@ -3613,6 +3615,22 @@ impl SqlEditorWidget {
         let mut latest_request_id = 0u64;
         let mut current_view_mode = SecurityViewMode::Users;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+        refresh_security_action_controls(
+            current_view_mode,
+            &mut quick_run_btn,
+            &mut grant_btn,
+            &mut revoke_btn,
+            &mut grant_sys_btn,
+            &mut revoke_sys_btn,
+            &mut set_profile_btn,
+            &mut expire_password_btn,
+            &mut create_user_btn,
+            &mut drop_user_btn,
+            &mut create_role_btn,
+            &mut drop_role_btn,
+            &mut lock_user_btn,
+            &mut unlock_user_btn,
+        );
 
         let _ = sender.send(SecurityMessage::LoadRequested {
             mode: SecurityViewMode::Users,
@@ -3662,6 +3680,22 @@ impl SqlEditorWidget {
                                 }
                             };
                         current_view_mode = mode;
+                        refresh_security_action_controls(
+                            current_view_mode,
+                            &mut quick_run_btn,
+                            &mut grant_btn,
+                            &mut revoke_btn,
+                            &mut grant_sys_btn,
+                            &mut revoke_sys_btn,
+                            &mut set_profile_btn,
+                            &mut expire_password_btn,
+                            &mut create_user_btn,
+                            &mut drop_user_btn,
+                            &mut create_role_btn,
+                            &mut drop_role_btn,
+                            &mut lock_user_btn,
+                            &mut unlock_user_btn,
+                        );
 
                         latest_request_id = latest_request_id.saturating_add(1);
                         let request_id = latest_request_id;
@@ -4487,10 +4521,12 @@ impl SqlEditorWidget {
                 if selected_row >= 0 {
                     let selected_index = selected_row as usize;
                     if let Some(row) = result_table.row_values(selected_index) {
-                        if let Some(first_value) = row.first() {
-                            let normalized = first_value.trim().to_uppercase();
-                            if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                user_input.set_value(&normalized);
+                        if !matches!(current_view_mode, SecurityViewMode::Profiles) {
+                            if let Some(first_value) = row.first() {
+                                let normalized = first_value.trim().to_uppercase();
+                                if !normalized.is_empty() && is_ascii_identifier(&normalized) {
+                                    user_input.set_value(&normalized);
+                                }
                             }
                         }
                         match current_view_mode {
@@ -4673,10 +4709,11 @@ impl SqlEditorWidget {
         action_row.fixed(&job_label, 36);
 
         let mut job_input = Input::default();
-        job_input.set_value("RMAN_BACKUP_JOB");
+        job_input.set_value(&default_rman_job_name("RMAN_BACKUP_JOB"));
         job_input.set_color(theme::input_bg());
         job_input.set_text_color(theme::text_primary());
-        job_input.set_tooltip("DBMS_SCHEDULER job name");
+        job_input.set_tooltip("Auto-generated unique scheduler job name");
+        job_input.set_readonly(true);
         action_row.fixed(&job_input, 170);
 
         let mut run_backup_btn = Button::default().with_label("Run Backup");
@@ -4752,14 +4789,8 @@ impl SqlEditorWidget {
         let owner_input_for_backup = owner_input.clone();
         let mut job_input_for_backup = job_input.clone();
         run_backup_btn.set_callback(move |_| {
-            let current_job = job_input_for_backup.value();
-            let job_text = if current_job.trim().is_empty() {
-                let generated = default_rman_job_name("RMAN_BACKUP_JOB");
-                job_input_for_backup.set_value(&generated);
-                generated
-            } else {
-                current_job
-            };
+            let job_text = default_rman_job_name("RMAN_BACKUP_JOB");
+            job_input_for_backup.set_value(&job_text);
             let Some(script_text) = prompt_optional_text(
                 "RMAN backup script (without EXIT)",
                 "BACKUP DATABASE PLUS ARCHIVELOG;",
@@ -4778,14 +4809,8 @@ impl SqlEditorWidget {
         let owner_input_for_restore = owner_input.clone();
         let mut job_input_for_restore = job_input.clone();
         run_restore_btn.set_callback(move |_| {
-            let current_job = job_input_for_restore.value();
-            let job_text = if current_job.trim().is_empty() {
-                let generated = default_rman_job_name("RMAN_RESTORE_JOB");
-                job_input_for_restore.set_value(&generated);
-                generated
-            } else {
-                current_job
-            };
+            let job_text = default_rman_job_name("RMAN_RESTORE_JOB");
+            job_input_for_restore.set_value(&job_text);
             let Some(script_text) = prompt_optional_text(
                 "RMAN restore script (without EXIT)",
                 "RESTORE DATABASE;\nRECOVER DATABASE;",
@@ -7108,11 +7133,59 @@ fn dataguard_role_allows_apply_control(database_role: Option<&str>) -> bool {
 }
 
 fn default_rman_job_name(prefix: &str) -> String {
-    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
+    let timestamp_millis = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis(),
         Err(_) => 0,
     };
-    format!("{}_{}", prefix.trim().to_uppercase(), timestamp)
+    let sequence = RMAN_JOB_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", prefix.trim().to_uppercase(), timestamp_millis, sequence)
+}
+
+fn refresh_security_action_controls(
+    mode: SecurityViewMode,
+    quick_run_btn: &mut Button,
+    grant_btn: &mut Button,
+    revoke_btn: &mut Button,
+    grant_sys_btn: &mut Button,
+    revoke_sys_btn: &mut Button,
+    set_profile_btn: &mut Button,
+    expire_password_btn: &mut Button,
+    create_user_btn: &mut Button,
+    drop_user_btn: &mut Button,
+    create_role_btn: &mut Button,
+    drop_role_btn: &mut Button,
+    lock_user_btn: &mut Button,
+    unlock_user_btn: &mut Button,
+) {
+    let profiles_mode = matches!(mode, SecurityViewMode::Profiles);
+    let set_enabled = |button: &mut Button| {
+        if profiles_mode {
+            button.deactivate();
+        } else {
+            button.activate();
+        }
+    };
+
+    set_enabled(quick_run_btn);
+    set_enabled(grant_btn);
+    set_enabled(revoke_btn);
+    set_enabled(grant_sys_btn);
+    set_enabled(revoke_sys_btn);
+    set_enabled(set_profile_btn);
+    set_enabled(expire_password_btn);
+    set_enabled(create_user_btn);
+    set_enabled(drop_user_btn);
+    set_enabled(create_role_btn);
+    set_enabled(drop_role_btn);
+    set_enabled(lock_user_btn);
+    set_enabled(unlock_user_btn);
+
+    if profiles_mode {
+        quick_run_btn
+            .set_tooltip("Disabled in Profiles view. Switch to Users/Summary/Grants to run actions.");
+    } else {
+        quick_run_btn.set_tooltip("Run selected quick action");
+    }
 }
 
 fn refresh_dataguard_force_switch_button(
@@ -7426,6 +7499,13 @@ mod tests {
     fn default_rman_job_name_includes_prefix() {
         let generated = default_rman_job_name("rman_backup_job");
         assert!(generated.starts_with("RMAN_BACKUP_JOB_"));
+    }
+
+    #[test]
+    fn default_rman_job_name_is_unique_between_calls() {
+        let first = default_rman_job_name("rman_backup_job");
+        let second = default_rman_job_name("rman_backup_job");
+        assert_ne!(first, second);
     }
 
     #[test]
