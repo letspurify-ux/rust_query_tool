@@ -400,27 +400,6 @@ enum HealthCheckCurrentConnectionState {
     Unavailable,
 }
 
-const LOCK_WAIT_WARN_THRESHOLD: Duration = Duration::from_millis(100);
-
-fn lock_app_state_with_warning<'a>(
-    state: &'a Arc<Mutex<AppState>>,
-    context: &str,
-) -> std::sync::MutexGuard<'a, AppState> {
-    let lock_started_at = Instant::now();
-    let guard = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let waited = lock_started_at.elapsed();
-    if waited >= LOCK_WAIT_WARN_THRESHOLD {
-        crate::utils::logging::log_warning(
-            "ui",
-            &format!(
-                "AppState lock waited {:.3}s while {context}",
-                waited.as_secs_f64()
-            ),
-        );
-    }
-    guard
-}
-
 impl MainWindow {
     fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
         let weak_state = Arc::downgrade(state);
@@ -428,9 +407,13 @@ impl MainWindow {
             let Some(state_for_tick) = weak_state.upgrade() else {
                 return;
             };
-            let mut s = lock_app_state_with_warning(&state_for_tick, "ticking status animation");
-            s.tick_status_animation();
-            let should_reschedule = s.status_animation_running;
+            let should_reschedule = match state_for_tick.try_lock() {
+                Ok(mut s) => {
+                    s.tick_status_animation();
+                    s.status_animation_running
+                }
+                Err(_) => true,
+            };
             if should_reschedule {
                 MainWindow::start_status_animation_timer(&state_for_tick);
             }
@@ -474,8 +457,9 @@ impl MainWindow {
             editor.cancel_current();
         }
 
-        lock_app_state_with_warning(state, "updating cancel status")
-            .set_status_message("Cancelling running queries...");
+        if let Ok(mut s) = state.try_lock() {
+            s.set_status_message("Cancelling running queries...");
+        }
     }
 
     fn focus_existing_tab_with_same_file_name(state: &mut AppState, path: &Path) -> bool {
@@ -1114,9 +1098,10 @@ impl MainWindow {
         let weak_state_for_tab_select = Arc::downgrade(&state);
         query_tabs.set_on_select(move |tab_id| {
             if let Some(state_for_tab_select) = weak_state_for_tab_select.upgrade() {
-                let mut s = lock_app_state_with_warning(&state_for_tab_select, "selecting query tab");
-                if s.set_active_editor_tab(tab_id) {
-                    s.sql_editor.focus();
+                if let Ok(mut s) = state_for_tab_select.try_lock() {
+                    if s.set_active_editor_tab(tab_id) {
+                        s.sql_editor.focus();
+                    }
                 }
             }
         });
@@ -1499,9 +1484,9 @@ impl MainWindow {
             if let Some(file_sender) = file_sender {
                 Self::attach_file_drop_callback(state, tab_id, file_sender);
             }
-            lock_app_state_with_warning(state, "focusing editor after tab creation")
-                .sql_editor
-                .focus();
+            if let Ok(mut s) = state.try_lock() {
+                s.sql_editor.focus();
+            }
         }
 
         true
@@ -1638,8 +1623,12 @@ impl MainWindow {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
                 return;
             };
-            lock_app_state_with_warning(&state_for_status, "propagating editor status")
-                .set_status_message(message);
+            match state_for_status.try_lock() {
+                Ok(mut s) => {
+                    s.set_status_message(message);
+                }
+                Err(_) => {}
+            };
         });
 
         let weak_state_for_find = Arc::downgrade(state);
@@ -1804,8 +1793,10 @@ impl MainWindow {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                 return;
             };
-            lock_app_state_with_warning(&state_for_dirty, "applying buffer dirty state")
-                .on_tab_buffer_modified(tab_id, ins, del, buf);
+            match state_for_dirty.try_lock() {
+                Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
+                Err(_) => {}
+            };
         });
     }
 
@@ -1864,7 +1855,7 @@ impl MainWindow {
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
                     let conn_sender = conn_sender.clone();
                     {
-                        let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                        let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.status_bar
                             .set_label(&format!("Connecting to {}...", info.display_string()));
                     }
@@ -1907,7 +1898,7 @@ impl MainWindow {
                 else {
                     let busy_message = format_connection_busy_message();
                     fltk::dialog::alert_default(&busy_message);
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let conn_info = s.connection_info.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                     s.status_bar
                         .set_label(&format_status(&busy_message, &conn_info));
@@ -1936,7 +1927,7 @@ impl MainWindow {
                 let filename = dialog.filename();
                 if !filename.as_os_str().is_empty() {
                     {
-                        let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                        let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         if MainWindow::focus_existing_tab_with_same_file_name(&mut s, &filename) {
                             return true;
                         }
@@ -2059,7 +2050,7 @@ impl MainWindow {
             }
             "Query/New Tab" => {
                 let created_tab_id = {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let created = MainWindow::create_query_editor_tab(&mut s);
                     s.right_tile.redraw();
                     created
@@ -2239,7 +2230,7 @@ impl MainWindow {
                 } else {
                     let busy_message = format_connection_busy_message();
                     fltk::dialog::alert_default(&busy_message);
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let conn_info = s.connection_info.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                     s.status_bar
                         .set_label(&format_status(&busy_message, &conn_info));
@@ -2264,7 +2255,7 @@ impl MainWindow {
                     config_snapshot
                 };
                 if let Some(settings) = show_settings_dialog(&config_snapshot) {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let mut s = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let save_result = {
                         let mut config = s.config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         config.editor_font = settings.font.clone();
@@ -2531,17 +2522,20 @@ impl MainWindow {
                 let mut should_retry_schema_sync = false;
                 let mut connection_for_retry: Option<SharedConnection> = None;
 
-                let mut s = lock_app_state_with_warning(
-                    &state_for_status,
-                    "updating browser status label",
-                );
-                let conn_info = s.connection_info.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-                s.status_bar.set_label(&format_status(message, &conn_info));
+                match state_for_status.try_lock() {
+                    Ok(mut s) => {
+                        let conn_info = s.connection_info.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                        s.status_bar.set_label(&format_status(message, &conn_info));
 
-                if message == "Object browser metadata refresh completed" && conn_info.is_some() {
-                    should_retry_schema_sync = true;
-                    connection_for_retry = Some(s.connection.clone());
-                }
+                        if message == "Object browser metadata refresh completed"
+                            && conn_info.is_some()
+                        {
+                            should_retry_schema_sync = true;
+                            connection_for_retry = Some(s.connection.clone());
+                        }
+                    }
+                    Err(_) => {}
+                };
 
                 if should_retry_schema_sync {
                     if let Some(connection) = connection_for_retry {
@@ -2654,8 +2648,9 @@ impl MainWindow {
                     false
                 }
                 fltk::enums::Event::Resize => {
-                    let s = lock_app_state_with_warning(&state_for_window, "handling window resize");
-                    MainWindow::adjust_query_layout_on_resize(&s);
+                    if let Ok(s) = state_for_window.try_lock() {
+                        MainWindow::adjust_query_layout_on_resize(&s);
+                    }
                     false
                 }
                 _ => false,
@@ -2766,12 +2761,16 @@ impl MainWindow {
             let mut conn_disconnected = false;
             let mut file_disconnected = false;
             let mut health_disconnected = false;
+            let mut deferred_by_borrow_conflict = false;
 
             // Check for schema updates
             {
                 let r = schema_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let Ok(mut s) = state.try_lock() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(update) => {
                             let current_generation = MainWindow::current_connection_generation(&s);
@@ -2799,7 +2798,10 @@ impl MainWindow {
             {
                 let r = conn_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let Ok(mut s) = state.try_lock() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(result) => {
                             match result {
@@ -2885,7 +2887,10 @@ impl MainWindow {
             {
                 let r = file_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let Ok(mut s) = state.try_lock() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(result) => {
                             let mut created_tab_for_open: Option<QueryTabId> = None;
@@ -2972,7 +2977,10 @@ impl MainWindow {
             {
                 let r = health_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
-                    let mut s = lock_app_state_with_warning(&state, "processing polled channel event");
+                    let Ok(mut s) = state.try_lock() else {
+                        deferred_by_borrow_conflict = true;
+                        break;
+                    };
                     match r.try_recv() {
                         Ok(ConnectionHealthResult::Checked {
                             disconnect_message,
@@ -3022,10 +3030,25 @@ impl MainWindow {
                 }
             }
 
-            let health_worker_registered =
-                lock_app_state_with_warning(&state, "checking health worker registration")
-                    .health_stop_signal
-                    .is_some();
+            if deferred_by_borrow_conflict {
+                app::add_timeout3(0.05, move |_| {
+                    schedule_poll(
+                        schema_receiver.clone(),
+                        conn_receiver.clone(),
+                        file_receiver.clone(),
+                        health_receiver.clone(),
+                        state_weak.clone(),
+                        schema_sender.clone(),
+                        file_sender.clone(),
+                    );
+                });
+                return;
+            }
+
+            let health_worker_registered = state
+                .try_lock()
+                .map(|s| s.health_stop_signal.is_some())
+                .unwrap_or(true);
             if should_restart_health_check_worker(health_disconnected, health_worker_registered) {
                 crate::utils::logging::log_error(
                     "connection",
@@ -3041,8 +3064,9 @@ impl MainWindow {
                 let health_connection = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).connection.clone();
                 let stop_flag =
                     MainWindow::start_health_check_worker(health_connection, health_sender);
-                lock_app_state_with_warning(&state, "saving restarted health worker signal")
-                    .health_stop_signal = Some(stop_flag);
+                if let Ok(mut s) = state.try_lock() {
+                    s.health_stop_signal = Some(stop_flag);
+                }
             }
 
             // Stop polling if all channels are disconnected
