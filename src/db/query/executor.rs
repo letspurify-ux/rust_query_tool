@@ -5117,8 +5117,10 @@ ORDER BY owner, job_name
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let sql_all = format!(
@@ -5141,8 +5143,10 @@ ORDER BY owner, job_name
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql_all, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_all, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let mut user_conditions: Vec<String> = Vec::new();
@@ -5214,8 +5218,10 @@ WHERE ROWNUM <= 200
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let sql_all = format!(
@@ -5239,8 +5245,10 @@ WHERE ROWNUM <= 200
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql_all, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_all, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let sql_user = format!(
@@ -5466,8 +5474,10 @@ FROM dba_datapump_jobs
 ORDER BY owner_name, job_name
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
+            Err(_) => {}
         }
 
         let user_where = owner_filter
