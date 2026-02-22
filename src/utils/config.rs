@@ -207,16 +207,46 @@ impl AppConfig {
     }
 
     pub fn remove_connection(&mut self, name: &str) -> Result<(), String> {
-        self.recent_connections.retain(|c| c.name != name);
-        // Remove password from OS keyring after config list cleanup so users can
-        // still remove stale/broken entries even if keyring backends fail.
-        credential_store::delete_password(name).map_err(|e| {
-            format!("Connection removed, but failed to remove password from keyring: {e}")
-        })
+        self.remove_connection_with(name, credential_store::delete_password)
     }
 
     pub fn get_all_connections(&self) -> &Vec<ConnectionInfo> {
         &self.recent_connections
+    }
+}
+
+impl AppConfig {
+    fn remove_connection_with<F>(&mut self, name: &str, delete_password: F) -> Result<(), String>
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let removed = self.recent_connections.iter().any(|c| c.name == name);
+        self.recent_connections.retain(|c| c.name != name);
+
+        if self.last_connection.as_deref() == Some(name) {
+            self.last_connection = None;
+        }
+
+        if !removed {
+            return Ok(());
+        }
+
+        // Remove password from OS keyring after config list cleanup.
+        // Keyring failures are logged but do not block removal from config.
+        if let Err(err) = delete_password(name) {
+            crate::utils::logging::log_warning(
+                "config",
+                &format!(
+                    "Connection removed from config, but failed to remove password from keyring: {err}"
+                ),
+            );
+            eprintln!(
+                "Connection removed from config, but failed to remove password from keyring: {}",
+                err
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -479,5 +509,63 @@ impl QueryHistory {
 impl Default for QueryHistory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+    use crate::db::ConnectionInfo;
+
+    fn sample_connection(name: &str) -> ConnectionInfo {
+        ConnectionInfo {
+            name: name.to_string(),
+            host: "localhost".to_string(),
+            port: 1521,
+            service_name: "orcl".to_string(),
+            username: "scott".to_string(),
+            password: String::new(),
+        }
+    }
+
+    #[test]
+    fn remove_connection_clears_last_selected_connection() {
+        let mut config = AppConfig::new();
+        config.recent_connections.push(sample_connection("primary"));
+        config.last_connection = Some("primary".to_string());
+
+        let result = config.remove_connection_with("primary", |_| Ok(()));
+
+        assert!(result.is_ok());
+        assert!(config.recent_connections.is_empty());
+        assert!(config.last_connection.is_none());
+    }
+
+    #[test]
+    fn remove_connection_ignores_keyring_error_after_list_cleanup() {
+        let mut config = AppConfig::new();
+        config.recent_connections.push(sample_connection("primary"));
+
+        let result =
+            config.remove_connection_with("primary", |_| Err("keyring backend unavailable".into()));
+
+        assert!(result.is_ok());
+        assert!(config.recent_connections.is_empty());
+    }
+
+    #[test]
+    fn remove_connection_skips_keyring_delete_when_entry_does_not_exist() {
+        let mut config = AppConfig::new();
+        config.recent_connections.push(sample_connection("primary"));
+        let mut delete_called = false;
+
+        let result = config.remove_connection_with("missing", |_| {
+            delete_called = true;
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(!delete_called);
+        assert_eq!(config.recent_connections.len(), 1);
     }
 }
