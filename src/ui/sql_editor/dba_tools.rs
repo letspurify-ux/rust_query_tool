@@ -7177,8 +7177,7 @@ fn parse_owner_job_row(row_values: &[String]) -> Option<(String, String)> {
 fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, i32)> {
     let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
     let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
-        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))
-        .unwrap_or("0")
+        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))?
         .trim();
     let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
@@ -7464,6 +7463,13 @@ mod tests {
             parse_sql_id_child_row(&row, &columns),
             Some(("7V9H9TTW0G3CN".to_string(), 4))
         );
+    }
+
+    #[test]
+    fn parse_sql_id_child_row_requires_child_column() {
+        let columns = vec!["SQL_ID".to_string()];
+        let row = vec!["7v9h9ttw0g3cn".to_string()];
+        assert_eq!(parse_sql_id_child_row(&row, &columns), None);
     }
 
     #[test]
