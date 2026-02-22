@@ -4951,9 +4951,31 @@ ORDER BY
         } else {
             errors.join(" | ")
         };
-        Self::invalid_security_input_error(format!(
+        #[allow(deprecated)]
+        OracleError::InternalError(format!(
             "{context} failed after fallback attempts: {detail}"
         ))
+    }
+
+    fn current_session_user_upper(conn: &Connection) -> Result<String, OracleError> {
+        let mut stmt = conn.statement("SELECT USER FROM dual").build()?;
+        let username = stmt.query_row_as::<String>(&[])?;
+        Ok(username.trim().to_uppercase())
+    }
+
+    fn ensure_user_view_matches_target_user(
+        conn: &Connection,
+        normalized_user: &str,
+        context: &str,
+    ) -> Result<(), OracleError> {
+        let current_user = Self::current_session_user_upper(conn)?;
+        if current_user == normalized_user {
+            return Ok(());
+        }
+
+        Err(Self::invalid_security_input_error(format!(
+            "{context} fallback to USER_* views is allowed only for current session user (requested: {normalized_user}, current: {current_user})"
+        )))
     }
 
     fn current_database_role(conn: &Connection) -> Result<String, OracleError> {
@@ -5742,6 +5764,7 @@ WHERE username = '{normalized_user}'
         profile_filter: Option<&str>,
         attention_only: bool,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let username_filter =
             Self::normalize_optional_security_identifier(username_filter, "User filter")?;
         let profile_filter =
@@ -5783,11 +5806,12 @@ ORDER BY username
 "#
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
-            Ok(result) => return Ok(result),
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
             Err(err) => {
                 if profile_filter.is_some() || attention_only {
                     return Err(err);
                 }
+                fallback_errors.push(format!("dba_users: {err}"));
             }
         }
 
@@ -5812,13 +5836,23 @@ FROM all_users
 ORDER BY username
 "#
         );
-        Self::execute_select(conn, &sql_all, Instant::now())
+        match Self::execute_select(conn, &sql_all, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
+            Err(err) => {
+                fallback_errors.push(format!("all_users: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Users overview snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_user_role_grants_snapshot(
         conn: &Connection,
         username: &str,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
         let sql_dba = format!(
             r#"
@@ -5832,29 +5866,39 @@ WHERE grantee = '{normalized_user}'
 ORDER BY granted_role
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_role_privs")),
+            Err(err) => fallback_errors.push(format!("dba_role_privs: {err}")),
         }
 
-        let sql_user = format!(
-            r#"
+        Self::ensure_user_view_matches_target_user(conn, &normalized_user, "Role grants snapshot")?;
+
+        let sql_user = r#"
 SELECT
     USER AS grantee,
     granted_role,
     admin_option,
     default_role
 FROM user_role_privs
-WHERE USER = '{normalized_user}'
 ORDER BY granted_role
-"#
-        );
-        Self::execute_select(conn, &sql_user, Instant::now())
+"#;
+        match Self::execute_select(conn, sql_user, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "user_role_privs")),
+            Err(err) => {
+                fallback_errors.push(format!("user_role_privs: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Role grants snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_user_system_grants_snapshot(
         conn: &Connection,
         username: &str,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
         let sql_dba = format!(
             r#"
@@ -5867,28 +5911,42 @@ WHERE grantee = '{normalized_user}'
 ORDER BY privilege
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_sys_privs")),
+            Err(err) => fallback_errors.push(format!("dba_sys_privs: {err}")),
         }
 
-        let sql_user = format!(
-            r#"
+        Self::ensure_user_view_matches_target_user(
+            conn,
+            &normalized_user,
+            "System privileges snapshot",
+        )?;
+
+        let sql_user = r#"
 SELECT
     USER AS grantee,
     privilege,
     admin_option
 FROM user_sys_privs
-WHERE USER = '{normalized_user}'
 ORDER BY privilege
-"#
-        );
-        Self::execute_select(conn, &sql_user, Instant::now())
+"#;
+        match Self::execute_select(conn, sql_user, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "user_sys_privs")),
+            Err(err) => {
+                fallback_errors.push(format!("user_sys_privs: {err}"));
+                Err(Self::chained_fallback_error(
+                    "System privileges snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_user_object_grants_snapshot(
         conn: &Connection,
         username: &str,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
         let sql_dba = format!(
             r#"
@@ -5903,8 +5961,9 @@ WHERE grantee = '{normalized_user}'
 ORDER BY owner, table_name, privilege
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_tab_privs")),
+            Err(err) => fallback_errors.push(format!("dba_tab_privs: {err}")),
         }
 
         let sql_all = format!(
@@ -5920,13 +5979,23 @@ WHERE grantee = '{normalized_user}'
 ORDER BY owner, table_name, privilege
 "#
         );
-        Self::execute_select(conn, &sql_all, Instant::now())
+        match Self::execute_select(conn, &sql_all, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "all_tab_privs")),
+            Err(err) => {
+                fallback_errors.push(format!("all_tab_privs: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Object privileges snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_profile_limits_snapshot(
         conn: &Connection,
         profile_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let normalized_profile_filter =
             Self::normalize_optional_security_identifier(profile_filter, "Profile filter")?;
         let where_clause = normalized_profile_filter
@@ -5946,8 +6015,9 @@ FROM dba_profiles
 ORDER BY profile, resource_type, resource_name
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_profiles")),
+            Err(err) => fallback_errors.push(format!("dba_profiles: {err}")),
         }
 
         let sql_user = format!(
@@ -5962,7 +6032,16 @@ FROM user_profiles
 ORDER BY profile, resource_type, resource_name
 "#
         );
-        Self::execute_select(conn, &sql_user, Instant::now())
+        match Self::execute_select(conn, &sql_user, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "user_profiles")),
+            Err(err) => {
+                fallback_errors.push(format!("user_profiles: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Profile limits snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn grant_role_to_user(

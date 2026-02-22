@@ -555,11 +555,16 @@ fn parse_selected_session_identity(
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case("SERIAL"))
         })?;
-    let instance_id = columns
+    let instance_id = match columns
         .iter()
         .position(|name| name.eq_ignore_ascii_case("INST_ID"))
-        .and_then(|index| row_values.get(index))
-        .and_then(|value| parse_positive_i64(value, "INST_ID").ok());
+    {
+        Some(index) => {
+            let value = row_values.get(index)?;
+            Some(parse_positive_i64(value, "INST_ID").ok()?)
+        }
+        None => None,
+    };
 
     let sid_text = row_values.get(sid_index)?;
     let serial_text = row_values.get(serial_index)?;
@@ -663,5 +668,16 @@ mod tests {
     fn parse_selected_session_identity_rejects_non_numeric_row() {
         let row = vec!["(message)".to_string()];
         assert_eq!(parse_selected_session_identity(&row, &[]), None);
+    }
+
+    #[test]
+    fn parse_selected_session_identity_rejects_invalid_instance_id() {
+        let row = vec!["bad".to_string(), "123".to_string(), "456".to_string()];
+        let columns = vec![
+            "INST_ID".to_string(),
+            "SID".to_string(),
+            "SERIAL#".to_string(),
+        ];
+        assert_eq!(parse_selected_session_identity(&row, &columns), None);
     }
 }
