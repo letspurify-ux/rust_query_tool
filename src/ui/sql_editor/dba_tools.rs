@@ -1897,9 +1897,7 @@ impl SqlEditorWidget {
             let Some(schema_name) = prompt_optional_text("Schema name", &schema_default) else {
                 return;
             };
-            let Some(job_mode) =
-                prompt_optional_text("Job mode (SCHEMA/TABLE/TABLESPACE/FULL)", "SCHEMA")
-            else {
+            let Some(job_mode) = prompt_optional_text("Job mode (SCHEMA/FULL)", "SCHEMA") else {
                 return;
             };
 
@@ -1947,9 +1945,7 @@ impl SqlEditorWidget {
             else {
                 return;
             };
-            let Some(job_mode) =
-                prompt_optional_text("Job mode (SCHEMA/TABLE/TABLESPACE/FULL)", "SCHEMA")
-            else {
+            let Some(job_mode) = prompt_optional_text("Job mode (SCHEMA/FULL)", "SCHEMA") else {
                 return;
             };
 
@@ -7205,8 +7201,9 @@ fn default_rman_job_name(prefix: &str) -> String {
     };
     let sequence = RMAN_JOB_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{}_{}_{}",
+        "{}_{}_{}_{}",
         prefix.trim().to_uppercase(),
+        std::process::id(),
         timestamp_millis,
         sequence
     )

@@ -28,6 +28,7 @@ enum SessionMonitorMessage {
         min_elapsed_text: String,
     },
     KillRequested {
+        instance_text: String,
         sid_text: String,
         serial_text: String,
     },
@@ -100,6 +101,17 @@ impl SqlEditorWidget {
         heavy_load_btn.set_frame(FrameType::RFlatBox);
         control_row.fixed(&heavy_load_btn, BUTTON_WIDTH_LARGE + 54);
 
+        let mut instance_label = Frame::default().with_label("INST:");
+        instance_label.set_label_color(theme::text_primary());
+        instance_label.set_align(Align::Inside | Align::Left);
+        control_row.fixed(&instance_label, 42);
+
+        let mut instance_input = IntInput::default();
+        instance_input.set_color(theme::input_bg());
+        instance_input.set_text_color(theme::text_primary());
+        instance_input.set_tooltip("Optional RAC instance id");
+        control_row.fixed(&instance_input, 62);
+
         let mut sid_label = Frame::default().with_label("SID:");
         sid_label.set_label_color(theme::text_primary());
         sid_label.set_align(Align::Inside | Align::Left);
@@ -161,10 +173,12 @@ impl SqlEditorWidget {
         });
 
         let sender_kill = sender.clone();
+        let instance_input_for_kill = instance_input.clone();
         let sid_input_for_kill = sid_input.clone();
         let serial_input_for_kill = serial_input.clone();
         kill_btn.set_callback(move |_| {
             let _ = sender_kill.send(SessionMonitorMessage::KillRequested {
+                instance_text: instance_input_for_kill.value(),
                 sid_text: sid_input_for_kill.value(),
                 serial_text: serial_input_for_kill.value(),
             });
@@ -196,7 +210,6 @@ impl SqlEditorWidget {
         let mut latest_refresh_request_id: u64 = 0;
         let mut latest_snapshot_columns: Vec<String> = Vec::new();
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
-        let mut selected_instance_id: Option<i64> = None;
         while dialog.shown() {
             app::wait();
 
@@ -288,6 +301,7 @@ impl SqlEditorWidget {
                         });
                     }
                     SessionMonitorMessage::KillRequested {
+                        instance_text,
                         sid_text,
                         serial_text,
                     } => {
@@ -306,8 +320,21 @@ impl SqlEditorWidget {
                             }
                         };
 
+                        let parsed_instance_id =
+                            match parse_optional_positive_i64(&instance_text, "INST_ID") {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            };
+                        let target_label = match parsed_instance_id {
+                            Some(inst) => format!("{sid},{serial},@{inst}"),
+                            None => format!("{sid},{serial}"),
+                        };
+
                         let confirm = fltk::dialog::choice2_default(
-                            &format!("Kill session {sid},{serial} immediately?"),
+                            &format!("Kill session {target_label} immediately?"),
                             "Cancel",
                             "Kill",
                             "",
@@ -318,9 +345,9 @@ impl SqlEditorWidget {
 
                         set_cursor(Cursor::Wait);
                         app::flush();
-                        status.set_label(&format!("Killing session {sid},{serial}..."));
+                        status.set_label(&format!("Killing session {target_label}..."));
 
-                        let instance_id_for_kill = selected_instance_id;
+                        let instance_id_for_kill = parsed_instance_id;
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
                         thread::spawn(move || {
@@ -336,9 +363,9 @@ impl SqlEditorWidget {
                                         instance_id_for_kill,
                                         true,
                                     )
-                                    .map(|_| format!("Session {sid},{serial} was killed"))
+                                    .map(|_| format!("Session {target_label} was killed"))
                                     .map_err(|err| {
-                                        format!("Failed to kill session {sid},{serial}: {err}")
+                                        format!("Failed to kill session {target_label}: {err}")
                                     }),
                                     Err(message) => Err(message),
                                 },
@@ -453,7 +480,11 @@ impl SqlEditorWidget {
                         if let Some((instance_id, sid, serial)) =
                             parse_selected_session_identity(&row_values, &latest_snapshot_columns)
                         {
-                            selected_instance_id = instance_id;
+                            instance_input.set_value(
+                                &instance_id
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_default(),
+                            );
                             sid_input.set_value(&sid.to_string());
                             serial_input.set_value(&serial.to_string());
                         }
@@ -482,6 +513,15 @@ fn parse_positive_i64(value: &str, name: &str) -> Result<i64, String> {
     }
 
     Ok(parsed)
+}
+
+fn parse_optional_positive_i64(value: &str, name: &str) -> Result<Option<i64>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    parse_positive_i64(trimmed, name).map(Some)
 }
 
 fn parse_positive_u32(value: &str, name: &str) -> Result<u32, String> {
@@ -544,7 +584,10 @@ fn monitor_info_result(message: &str) -> QueryResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_positive_i64, parse_positive_u32, parse_selected_session_identity};
+    use super::{
+        parse_optional_positive_i64, parse_positive_i64, parse_positive_u32,
+        parse_selected_session_identity,
+    };
 
     #[test]
     fn parse_positive_i64_accepts_positive_numbers() {
@@ -555,6 +598,12 @@ mod tests {
     fn parse_positive_i64_rejects_zero_or_negative() {
         assert!(parse_positive_i64("0", "SID").is_err());
         assert!(parse_positive_i64("-1", "SID").is_err());
+    }
+
+    #[test]
+    fn parse_optional_positive_i64_handles_empty_and_value() {
+        assert_eq!(parse_optional_positive_i64("", "INST_ID"), Ok(None));
+        assert_eq!(parse_optional_positive_i64("3", "INST_ID"), Ok(Some(3)));
     }
 
     #[test]
