@@ -116,18 +116,23 @@ impl AppLog {
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(path) = Self::log_path() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let tmp_path = path.with_extension("json.tmp");
-            let file = fs::File::create(&tmp_path)?;
-            let mut writer = BufWriter::new(file);
-            serde_json::to_writer(&mut writer, self)?;
-            use std::io::Write;
-            writer.flush()?;
-            rename_overwrite(&tmp_path, &path)?;
+        let path = Self::log_path().ok_or_else(|| {
+            std::io::Error::other("Log directory is unavailable")
+        })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_millis));
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, self)?;
+        use std::io::Write;
+        writer.flush()?;
+        rename_overwrite(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -138,17 +143,7 @@ impl AppLog {
 }
 
 fn rename_overwrite(from: &PathBuf, to: &PathBuf) -> Result<(), std::io::Error> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            if to.exists() {
-                fs::remove_file(to)?;
-                fs::rename(from, to)
-            } else {
-                Err(rename_err)
-            }
-        }
-    }
+    fs::rename(from, to)
 }
 
 impl Default for AppLog {
@@ -252,10 +247,23 @@ pub fn flush_log_writer() -> Result<(), String> {
         return Err("Log writer is not available".to_string());
     }
 
-    match rx.recv_timeout(log_writer_response_timeout()) {
+    let timeout = log_writer_response_timeout();
+    match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err("Timed out while waiting for log persistence".to_string())
+            let (retry_tx, retry_rx) = mpsc::channel::<Result<(), String>>();
+            if send_log_command(LogCommand::Flush(retry_tx)).is_err() {
+                return Err("Log writer is not available".to_string());
+            }
+            match retry_rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err("Timed out while waiting for log persistence".to_string())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("Log writer disconnected while flushing".to_string())
+                }
+            }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err("Log writer disconnected while flushing".to_string())
@@ -288,7 +296,15 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
     }
 
     // Persist via background writer
-    let _ = send_log_command(LogCommand::Write(entry));
+    if let Err(send_err) = send_log_command(LogCommand::Write(entry.clone())) {
+        if let LogCommand::Write(failed_entry) = send_err.0 {
+            let mut log = AppLog::load();
+            log.add_entry(failed_entry);
+            if let Err(err) = log.save() {
+                eprintln!("Failed to persist log entry through fallback path: {err}");
+            }
+        }
+    }
 }
 
 pub fn log_info(source: &str, message: &str) {
@@ -318,7 +334,7 @@ pub fn get_log_entries() -> Vec<LogEntry> {
 
 /// Clear all log entries (in-memory + persisted).
 pub fn clear_log() -> Result<(), String> {
-    match log_writer_sender().send(LogCommand::Clear) {
+    match send_log_command(LogCommand::Clear) {
         Ok(()) => {
             flush_log_writer()?;
             if let Ok(mut buf) = in_memory_log().lock() {

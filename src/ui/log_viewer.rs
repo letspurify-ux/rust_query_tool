@@ -417,6 +417,9 @@ fn escape_browser_label(text: &str) -> String {
 }
 
 fn truncate_message(msg: &str, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
     // Replace newlines with spaces for single-line display
     let mut normalized = String::with_capacity(msg.len());
     for ch in msg.chars() {
@@ -433,9 +436,12 @@ fn truncate_message(msg: &str, max_len: usize) -> String {
     }
 
     if trimmed.chars().count() > max_len {
+        if max_len <= 3 {
+            return "...".chars().take(max_len).collect();
+        }
         let end = trimmed
             .char_indices()
-            .nth(max_len)
+            .nth(max_len - 3)
             .map(|(idx, _)| idx)
             .unwrap_or(trimmed.len());
         format!("{}...", &trimmed[..end])
@@ -453,8 +459,15 @@ mod log_viewer_tests {
         let msg = "a".repeat(100);
         let result = truncate_message(&msg, 50);
         assert!(result.ends_with("..."));
-        // 50 chars + "..."
-        assert_eq!(result.len(), 53);
+        assert_eq!(result.len(), 50);
+    }
+
+    #[test]
+    fn truncate_message_respects_tiny_limits() {
+        assert_eq!(truncate_message("abcdef", 0), "");
+        assert_eq!(truncate_message("abcdef", 1), ".");
+        assert_eq!(truncate_message("abcdef", 2), "..");
+        assert_eq!(truncate_message("abcdef", 3), "...");
     }
 
     #[test]
@@ -473,7 +486,7 @@ mod log_viewer_tests {
     fn truncate_message_handles_multibyte() {
         let msg = "가나다라마바사아자차";
         let result = truncate_message(msg, 5);
-        assert_eq!(result, "가나다라마...");
+        assert_eq!(result, "가나...");
     }
 
     #[test]

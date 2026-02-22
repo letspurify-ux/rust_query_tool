@@ -33,8 +33,16 @@ fn build_connection_info(
         if host.is_empty() {
             return false;
         }
+        let is_ipv6_bracketed = host.starts_with('[')
+            && host.ends_with(']')
+            && host[1..host.len().saturating_sub(1)]
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() || ch == ':');
+        if is_ipv6_bracketed {
+            return true;
+        }
         host.chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
     }
 
     fn is_valid_service_name(service_name: &str) -> bool {
@@ -57,6 +65,9 @@ fn build_connection_info(
     }
     if username.is_empty() {
         return Err("Username is required".to_string());
+    }
+    if password.is_empty() {
+        return Err("Password is required".to_string());
     }
     if host.is_empty() {
         return Err("Host is required".to_string());
@@ -481,9 +492,8 @@ impl ConnectionDialog {
                                 let mut cfg = config
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Err(e) = cfg.remove_connection(&selected) {
-                                    fltk::dialog::alert_default(&e);
-                                } else if let Err(e) = cfg.save() {
+                                let removal_error = cfg.remove_connection(&selected).err();
+                                if let Err(e) = cfg.save() {
                                     fltk::dialog::alert_default(&format!(
                                         "Failed to save config: {}",
                                         e
@@ -492,6 +502,9 @@ impl ConnectionDialog {
                                     saved_browser.clear();
                                     for conn in cfg.get_all_connections() {
                                         saved_browser.add(&conn.name);
+                                    }
+                                    if let Some(error_message) = removal_error {
+                                        fltk::dialog::alert_default(&error_message);
                                     }
                                 }
                             }
