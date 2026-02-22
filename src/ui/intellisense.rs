@@ -1103,8 +1103,7 @@ impl IntellisenseData {
         self.column_loading_started_at.remove(&key);
         let entries = Self::build_entries(&columns);
         self.columns.insert(key.clone(), columns);
-        self.column_entries_by_table
-            .insert(key, entries);
+        self.column_entries_by_table.insert(key, entries);
         self.all_columns_dirty = true;
     }
 

@@ -172,3 +172,27 @@
 ### [테스트] 회귀 테스트 추가
 - `get_suggestions_keeps_to_underscore_matches`가 `TO_CHAR`와 `TO_CHAR()`를 모두 반환하는지 검증.
 - `parse_error_line_ignores_non_error_line_wording`를 추가해 `command line` 노이즈를 배제하고 `at line` 라인을 선택하는지 검증.
+### [중] 토큰 그룹 분리 시 불필요한 전체 depth 벡터 생성 제거
+- **증상**: `split_top_level_symbol_groups` / `split_top_level_keyword_groups`가 매 호출마다 `paren_depths(tokens)`를 만들어 전체 토큰 길이만큼 추가 메모리를 할당하고 한 번 더 순회함.
+- **수정**: depth 벡터 사전 생성 방식 대신, 단일 순회 중 `depth`를 직접 갱신하는 스트리밍 방식으로 변경.
+- **효과**: 토큰 분할 hot path에서 메모리 할당과 2-pass 순회를 제거해 대용량 SQL에서 파싱 전처리 비용 감소.
+
+### [중] SQL 파서/컨텍스트 분석의 대문자 변환 비용 절감
+- **증상**: 키워드 판별 중심 로직에서 `to_uppercase()`를 광범위하게 사용해, 유니코드 케이스 매핑 비용과 추가 할당이 불필요하게 발생함.
+- **수정**: 키워드 비교/명령 파싱 경로를 `to_ascii_uppercase()`로 전환.
+- **효과**: ASCII 기반 SQL 키워드 처리 경로에서 문자열 정규화 비용을 낮춰 반복 파싱 성능 개선.
+
+## 2026-02-22 추가 다건 수정 내역 (7)
+
+### [중] 로그/히스토리 미리보기 문자열 정규화의 중복 순회/할당 축소
+- **증상**: `truncate_message`/`truncate_sql`이 공백 정규화 후 `trim()` + `chars().count()` + `char_indices().nth(...)`를 추가로 수행해 문자열을 여러 번 순회했고, 잘라내기 시 `format!`으로 추가 할당이 발생했음.
+- **수정**:
+  - 정규화 단계에서 선행/연속 공백을 직접 제거하고 후행 공백을 `pop()`으로 정리하도록 변경.
+  - 길이 판별/절단 지점을 단일 `char_indices()` 순회로 계산.
+  - 접미 `...` 추가를 `String::with_capacity` + `push_str`로 처리해 불필요한 포맷팅 할당 제거.
+- **효과**: 로그/히스토리 리스트 렌더링의 hot path에서 문자 스캔 횟수와 임시 문자열 할당이 줄어 입력/필터 반응성을 개선.
+
+### [하] 로그 목록 필터 인덱스 벡터 사전 용량 예약
+- **증상**: `populate_browser`의 인덱스 벡터가 기본 용량 0에서 시작해 엔트리 수 증가에 따라 재할당될 수 있었음.
+- **수정**: `Vec::with_capacity(entries.len())`로 초기화.
+- **효과**: 대량 로그 표시 시 재할당 횟수 감소.
