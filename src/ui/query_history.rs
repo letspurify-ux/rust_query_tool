@@ -31,6 +31,10 @@ enum HistoryCommand {
 const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const REDACTED_SECRET: &str = "<redacted>";
 
+fn fold_for_case_insensitive(value: &str) -> String {
+    value.chars().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
 fn history_writer_response_timeout() -> Duration {
     std::env::var("SPACE_QUERY_HISTORY_TIMEOUT_SECS")
         .ok()
@@ -150,7 +154,19 @@ pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err("Timed out while waiting for query history persistence".to_string())
+            let (retry_tx, retry_rx) = mpsc::channel::<Result<(), String>>();
+            if send_history_command(HistoryCommand::Flush(retry_tx)).is_err() {
+                return Err("Query history writer is not available".to_string());
+            }
+            match retry_rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Err("Timed out while waiting for query history persistence".to_string())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("Query history writer disconnected while flushing".to_string())
+                }
+            }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err("Query history writer disconnected while flushing".to_string())
@@ -163,7 +179,7 @@ pub fn flush_history_writer() -> Result<(), String> {
 }
 
 fn parse_error_line(message: &str) -> Option<usize> {
-    let lowercase = message.to_lowercase();
+    let lowercase = fold_for_case_insensitive(message);
     let patterns = [
         "error at line",
         "line:",
@@ -214,7 +230,7 @@ fn parse_error_line(message: &str) -> Option<usize> {
         }
     }
 
-    best_line.map(|(_, line)| line)
+    best_line.map(|(_, line)| line).filter(|line| *line > 0)
 }
 
 fn sanitize_history_sql(sql: &str) -> String {
@@ -1180,20 +1196,20 @@ fn history_entry_matches_filter(
         return true;
     }
 
-    if entry.sql.to_lowercase().contains(search_lower) {
+    if fold_for_case_insensitive(&entry.sql).contains(search_lower) {
         return true;
     }
 
-    if entry.connection_name.to_lowercase().contains(search_lower) {
+    if fold_for_case_insensitive(&entry.connection_name).contains(search_lower) {
         return true;
     }
 
-    if entry.timestamp.to_lowercase().contains(search_lower) {
+    if fold_for_case_insensitive(&entry.timestamp).contains(search_lower) {
         return true;
     }
 
     match entry.error_message.as_deref() {
-        Some(message) => message.to_lowercase().contains(search_lower),
+        Some(message) => fold_for_case_insensitive(message).contains(search_lower),
         None => false,
     }
 }
@@ -1216,7 +1232,7 @@ fn populate_history_browser(
     search_text: &str,
     failed_only: bool,
 ) {
-    let search_lower = search_text.trim().to_lowercase();
+    let search_lower = fold_for_case_insensitive(search_text.trim());
     browser.clear();
 
     let mut indices = filtered_indices

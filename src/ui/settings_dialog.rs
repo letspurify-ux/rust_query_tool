@@ -11,6 +11,10 @@ use fltk::{
 };
 use std::sync::{Arc, Mutex};
 
+fn fold_for_case_insensitive(value: &str) -> String {
+    value.chars().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
 use crate::utils::AppConfig;
@@ -71,13 +75,13 @@ fn refill_font_list(
     filtered: &mut Vec<String>,
     selected_font: &mut String,
 ) {
-    let query = query.trim().to_lowercase();
+    let query = fold_for_case_insensitive(query.trim());
 
     filtered.clear();
     browser.clear();
 
     for name in all_fonts {
-        if query.is_empty() || name.to_lowercase().contains(&query) {
+        if query.is_empty() || fold_for_case_insensitive(name).contains(&query) {
             filtered.push(name.clone());
         }
     }

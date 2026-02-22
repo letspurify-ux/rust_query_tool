@@ -14,6 +14,16 @@ const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 5000;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 
+fn app_data_base_dir() -> Option<PathBuf> {
+    if let Some(path) = dirs::data_dir() {
+        return Some(path);
+    }
+    if let Some(home) = dirs::home_dir() {
+        return Some(home.join(".local").join("share"));
+    }
+    None
+}
+
 fn log_writer_response_timeout() -> Duration {
     std::env::var("SPACE_QUERY_LOG_TIMEOUT_SECS")
         .ok()
@@ -68,7 +78,7 @@ impl AppLog {
     }
 
     fn log_path() -> Option<PathBuf> {
-        dirs::data_dir().map(|mut p| {
+        app_data_base_dir().map(|mut p| {
             p.push(APP_DIR_NAME);
             p.push(LOG_FILE_NAME);
             p
@@ -116,9 +126,8 @@ impl AppLog {
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::log_path().ok_or_else(|| {
-            std::io::Error::other("Log directory is unavailable")
-        })?;
+        let path = Self::log_path()
+            .ok_or_else(|| std::io::Error::other("Log directory is unavailable"))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -126,7 +135,8 @@ impl AppLog {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let tmp_path = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_millis));
+        let tmp_path =
+            path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_millis));
         let file = fs::File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, self)?;
@@ -362,7 +372,7 @@ pub fn clear_log() -> Result<(), String> {
 // ── Crash log helpers ──
 
 pub fn crash_log_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|mut p| {
+    app_data_base_dir().map(|mut p| {
         p.push(APP_DIR_NAME);
         p.push(CRASH_LOG_FILE_NAME);
         p
@@ -373,15 +383,29 @@ pub fn crash_log_path() -> Option<PathBuf> {
 pub fn write_crash_log(info: &str) {
     if let Some(path) = crash_log_path() {
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "Failed to create crash log directory {}: {}",
+                    parent.display(),
+                    err
+                );
+                return;
+            }
         }
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let report = format!(
             "=== SPACE Query Crash Report ===\nTimestamp: {}\n\n{}\n\n",
             timestamp, info
         );
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = std::io::Write::write_all(&mut file, report.as_bytes());
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(err) = std::io::Write::write_all(&mut file, report.as_bytes()) {
+                    eprintln!("Failed to write crash log {}: {}", path.display(), err);
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to open crash log {}: {}", path.display(), err);
+            }
         }
     }
 }

@@ -13,6 +13,10 @@ use fltk::{
 };
 use std::sync::{Arc, Mutex};
 
+fn fold_for_case_insensitive(value: &str) -> String {
+    value.chars().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
 /// Find/Replace dialog
 pub struct FindReplaceDialog;
 
@@ -439,7 +443,8 @@ impl FindReplaceDialog {
                             let matches = if case_sensitive {
                                 selected == search_text
                             } else {
-                                selected.to_lowercase() == search_text.to_lowercase()
+                                fold_for_case_insensitive(&selected)
+                                    == fold_for_case_insensitive(&search_text)
                             };
 
                             if matches {
@@ -673,34 +678,38 @@ fn find_next_match(
         return Some((match_start, match_end));
     }
 
-    let pos = find_ascii_case_insensitive(haystack, search_text)?;
-    let match_start = start_pos + pos;
-    let match_end = match_start + search_text.len();
-    Some((match_start, match_end))
+    let (relative_start, relative_end) =
+        find_unicode_case_insensitive_bounds(haystack, search_text)?;
+    Some((start_pos + relative_start, start_pos + relative_end))
 }
 
-fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    let haystack_bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    if needle_bytes.is_empty() || needle_bytes.len() > haystack_bytes.len() {
+fn find_unicode_case_insensitive_bounds(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_folded = fold_for_case_insensitive(needle);
+    if needle_folded.is_empty() {
         return None;
     }
 
-    let last = haystack_bytes.len() - needle_bytes.len();
-    for idx in 0..=last {
-        if !haystack.is_char_boundary(idx) {
-            continue;
+    let mut start_positions: Vec<usize> = haystack.char_indices().map(|(idx, _)| idx).collect();
+    start_positions.push(haystack.len());
+
+    for &start in &start_positions {
+        if start >= haystack.len() {
+            break;
         }
-        let end = idx + needle_bytes.len();
-        if !haystack.is_char_boundary(end) {
-            continue;
-        }
-        if haystack_bytes[idx..end]
-            .iter()
-            .zip(needle_bytes.iter())
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        {
-            return Some(idx);
+        for &end in &start_positions {
+            if end <= start {
+                continue;
+            }
+            let Some(candidate) = haystack.get(start..end) else {
+                continue;
+            };
+            let folded = fold_for_case_insensitive(candidate);
+            if folded == needle_folded {
+                return Some((start, end));
+            }
+            if folded.len() > needle_folded.len() {
+                break;
+            }
         }
     }
 
@@ -728,6 +737,17 @@ mod tests {
             .expect("expected to find second match");
         assert_eq!(start, second_han);
         assert_eq!(end, second_han + "한".len());
+    }
+
+    #[test]
+    fn find_next_match_case_insensitive_handles_unicode_letters() {
+        let text = "Ärger ärger";
+        let first = find_next_match(text, "ärger", 0, false).expect("expected first match");
+        assert_eq!(&text[first.0..first.1], "Ärger");
+
+        let second =
+            find_next_match(text, "ÄRGER", first.1 as i32, false).expect("expected second match");
+        assert_eq!(&text[second.0..second.1], "ärger");
     }
 
     #[test]
