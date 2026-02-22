@@ -546,12 +546,15 @@ fn parse_selected_session_identity(
 ) -> Option<(Option<i64>, i64, i64)> {
     let sid_index = columns
         .iter()
-        .position(|name| name.eq_ignore_ascii_case("SID"))
-        .unwrap_or(0);
+        .position(|name| name.eq_ignore_ascii_case("SID"))?;
     let serial_index = columns
         .iter()
         .position(|name| name.eq_ignore_ascii_case("SERIAL#"))
-        .unwrap_or_else(|| sid_index.saturating_add(1));
+        .or_else(|| {
+            columns
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case("SERIAL"))
+        })?;
     let instance_id = columns
         .iter()
         .position(|name| name.eq_ignore_ascii_case("INST_ID"))
@@ -621,8 +624,9 @@ mod tests {
     #[test]
     fn parse_selected_session_identity_reads_sid_and_serial() {
         let row = vec!["123".to_string(), "456".to_string(), "SCOTT".to_string()];
+        let columns = vec!["SID".to_string(), "SERIAL#".to_string()];
         assert_eq!(
-            parse_selected_session_identity(&row, &[]),
+            parse_selected_session_identity(&row, &columns),
             Some((None, 123, 456))
         );
     }

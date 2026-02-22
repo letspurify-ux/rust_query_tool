@@ -2609,14 +2609,18 @@ impl SqlEditorWidget {
                                     continue;
                                 }
                             };
-                        let schema_name =
+                        let normalized_mode = job_mode_text.trim().to_uppercase();
+                        let schema_name = if normalized_mode == "FULL" {
+                            None
+                        } else {
                             match normalize_required_identifier(&schema_text, "Schema") {
-                                Ok(value) => value,
+                                Ok(value) => Some(value),
                                 Err(err) => {
                                     fltk::dialog::alert_default(&err);
                                     continue;
                                 }
-                            };
+                            }
+                        };
                         let confirm = fltk::dialog::choice2_default(
                             &format!("Start Data Pump export job {}?", job_name),
                             "Cancel",
@@ -2645,7 +2649,7 @@ impl SqlEditorWidget {
                                         &directory_text,
                                         &dump_file_text,
                                         &log_file_text,
-                                        &schema_name,
+                                        schema_name.as_deref(),
                                         &job_mode_text,
                                     )
                                     .map(|_| format!("Data Pump export job {} started", job_name))
@@ -6789,10 +6793,9 @@ fn parse_sql_monitor_session_target(
     row_values: &[String],
     columns: &[String],
 ) -> Option<(Option<i64>, i64, i64)> {
-    let sid_text = column_value_by_name(row_values, columns, "SID")
-        .or_else(|| row_values.first().map(|value| value.as_str()))?;
+    let sid_text = column_value_by_name(row_values, columns, "SID")?;
     let serial_text = column_value_by_name(row_values, columns, "SERIAL#")
-        .or_else(|| row_values.get(1).map(|value| value.as_str()))?;
+        .or_else(|| column_value_by_name(row_values, columns, "SERIAL"))?;
     let sid = parse_positive_i64(sid_text)?;
     let serial = parse_positive_i64(serial_text)?;
     let instance_id =
@@ -6837,7 +6840,8 @@ fn filter_alert_rows(snapshot: &QueryResult) -> QueryResult {
 
 #[cfg(test)]
 fn parse_sid_serial_row(row_values: &[String]) -> Option<(i64, i64)> {
-    let (_, sid, serial) = parse_sql_monitor_session_target(row_values, &[])?;
+    let columns = vec!["SID".to_string(), "SERIAL#".to_string()];
+    let (_, sid, serial) = parse_sql_monitor_session_target(row_values, &columns)?;
     if sid < 0 || serial < 0 {
         return None;
     }
@@ -7133,12 +7137,10 @@ fn parse_owner_job_row(row_values: &[String]) -> Option<(String, String)> {
 }
 
 fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, i32)> {
-    let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")
-        .or_else(|| row_values.first().map(|value| value.as_str()))?;
+    let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
     let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
         .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))
-        .or_else(|| row_values.get(1).map(|value| value.as_str()))
-        .unwrap_or("")
+        .unwrap_or("0")
         .trim();
     let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
@@ -7146,8 +7148,7 @@ fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(
     }
     let child = parse_optional_non_negative_i32(child_text, "Child#")
         .ok()
-        .flatten()
-        .unwrap_or(0);
+        .flatten()?;
     Some((sql_id, child))
 }
 
@@ -7376,15 +7377,23 @@ mod tests {
 
     #[test]
     fn parse_sql_id_child_row_parses_valid_row() {
+        let columns = vec!["SQL_ID".to_string(), "CHILD_NUMBER".to_string()];
         let row = vec![
             "7v9h9ttw0g3cn".to_string(),
             "2".to_string(),
             "2026-02-20 11:00:00".to_string(),
         ];
         assert_eq!(
-            parse_sql_id_child_row(&row, &[]),
+            parse_sql_id_child_row(&row, &columns),
             Some(("7V9H9TTW0G3CN".to_string(), 2))
         );
+    }
+
+    #[test]
+    fn parse_sql_id_child_row_rejects_invalid_child_value() {
+        let columns = vec!["SQL_ID".to_string(), "CHILD_NUMBER".to_string()];
+        let row = vec!["7v9h9ttw0g3cn".to_string(), "-".to_string()];
+        assert_eq!(parse_sql_id_child_row(&row, &columns), None);
     }
 
     #[test]
