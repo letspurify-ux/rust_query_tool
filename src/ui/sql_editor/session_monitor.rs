@@ -195,6 +195,7 @@ impl SqlEditorWidget {
 
         let mut latest_refresh_request_id: u64 = 0;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+        let mut selected_instance_id: Option<i64> = None;
         while dialog.shown() {
             app::wait();
 
@@ -318,6 +319,7 @@ impl SqlEditorWidget {
                         app::flush();
                         status.set_label(&format!("Killing session {sid},{serial}..."));
 
+                        let instance_id_for_kill = selected_instance_id;
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
                         thread::spawn(move || {
@@ -326,10 +328,11 @@ impl SqlEditorWidget {
                                 "Killing database session",
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::kill_session(
+                                    Ok(db_conn) => QueryExecutor::kill_session_on_instance(
                                         db_conn.as_ref(),
                                         sid,
                                         serial,
+                                        instance_id_for_kill,
                                         true,
                                     )
                                     .map(|_| format!("Session {sid},{serial} was killed"))
@@ -436,7 +439,10 @@ impl SqlEditorWidget {
                 if selected_row >= 0 {
                     let selected_row_index = selected_row as usize;
                     if let Some(row_values) = result_table.row_values(selected_row_index) {
-                        if let Some((sid, serial)) = parse_selected_session_identity(&row_values) {
+                        if let Some((instance_id, sid, serial)) =
+                            parse_selected_session_identity(&row_values)
+                        {
+                            selected_instance_id = instance_id;
                             sid_input.set_value(&sid.to_string());
                             serial_input.set_value(&serial.to_string());
                         }
@@ -483,12 +489,22 @@ fn parse_positive_u32(value: &str, name: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
-fn parse_selected_session_identity(row_values: &[String]) -> Option<(i64, i64)> {
-    let sid_text = row_values.get(0)?;
-    let serial_text = row_values.get(1)?;
+fn parse_selected_session_identity(row_values: &[String]) -> Option<(Option<i64>, i64, i64)> {
+    let uses_inst_id = row_values.len() >= 11;
+    let sid_index = if uses_inst_id { 1 } else { 0 };
+    let serial_index = sid_index + 1;
+    let instance_id = if uses_inst_id {
+        row_values
+            .first()
+            .and_then(|value| parse_positive_i64(value, "INST_ID").ok())
+    } else {
+        None
+    };
+    let sid_text = row_values.get(sid_index)?;
+    let serial_text = row_values.get(serial_index)?;
     let sid = parse_positive_i64(sid_text, "SID").ok()?;
     let serial = parse_positive_i64(serial_text, "SERIAL#").ok()?;
-    Some((sid, serial))
+    Some((instance_id, sid, serial))
 }
 
 fn monitor_info_result(message: &str) -> QueryResult {
@@ -534,7 +550,25 @@ mod tests {
     #[test]
     fn parse_selected_session_identity_reads_sid_and_serial() {
         let row = vec!["123".to_string(), "456".to_string(), "SCOTT".to_string()];
-        assert_eq!(parse_selected_session_identity(&row), Some((123, 456)));
+        assert_eq!(parse_selected_session_identity(&row), Some((None, 123, 456)));
+    }
+
+    #[test]
+    fn parse_selected_session_identity_reads_instance_sid_serial() {
+        let row = vec![
+            "3".to_string(),
+            "123".to_string(),
+            "456".to_string(),
+            "SCOTT".to_string(),
+            "ACTIVE".to_string(),
+            "-".to_string(),
+            "0".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "TM".to_string(),
+        ];
+        assert_eq!(parse_selected_session_identity(&row), Some((Some(3), 123, 456)));
     }
 
     #[test]

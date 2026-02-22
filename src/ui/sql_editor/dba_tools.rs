@@ -2635,6 +2635,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         &schema_name,
+                                        "SCHEMA",
                                     )
                                     .map(|_| format!("Data Pump export job {} started", job_name))
                                     .map_err(|err| {
@@ -2697,6 +2698,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         schema_name.as_deref(),
+                                        "SCHEMA",
                                     )
                                     .map(|_| format!("Data Pump import job {} started", job_name))
                                     .map_err(|err| {
@@ -2762,6 +2764,7 @@ impl SqlEditorWidget {
                                         owner.as_deref(),
                                         &job_name,
                                         true,
+                                        false,
                                     )
                                     .map(|_| format!("Data Pump job {} stop requested", qualified))
                                     .map_err(|err| {
@@ -5046,6 +5049,7 @@ impl SqlEditorWidget {
                                         owner.as_deref(),
                                         &job_name,
                                         &script_text,
+                                        true,
                                     )
                                     .map(|_| format!("RMAN backup job {} submitted", qualified))
                                     .map_err(|err| {
@@ -5130,6 +5134,7 @@ impl SqlEditorWidget {
                                         owner.as_deref(),
                                         &job_name,
                                         &script_text,
+                                        true,
                                     )
                                     .map(|_| format!("RMAN restore job {} submitted", qualified))
                                     .map_err(|err| {
@@ -7120,7 +7125,8 @@ fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(
         .or_else(|| row_values.first().map(|value| value.as_str()))?;
     let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
         .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))
-        .or_else(|| row_values.get(1).map(|value| value.as_str()))?
+        .or_else(|| row_values.get(1).map(|value| value.as_str()))
+        .unwrap_or("")
         .trim();
     let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
@@ -7128,7 +7134,8 @@ fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(
     }
     let child = parse_optional_non_negative_i32(child_text, "Child#")
         .ok()
-        .flatten()?;
+        .flatten()
+        .unwrap_or(0);
     Some((sql_id, child))
 }
 
