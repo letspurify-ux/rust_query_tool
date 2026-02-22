@@ -216,7 +216,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 }
                 // Record the function name that preceded this '(' so we can
                 // distinguish function-internal FROM from SQL FROM clauses.
-                let func_name = last_word.take().map(|w| w.to_uppercase());
+                let func_name = last_word.take().map(|w| w.to_ascii_uppercase());
                 if paren_func_stack.len() <= depth {
                     paren_func_stack.push(func_name);
                 } else {
@@ -266,7 +266,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 continue;
             }
             SqlToken::Word(word) => {
-                let upper = word.to_uppercase();
+                let upper = word.to_ascii_uppercase();
 
                 // CTE state machine
                 match cte_state {
@@ -540,7 +540,7 @@ fn collect_tables_deep(
                     phase_stack.push(SqlPhase::Initial);
                 }
                 phase_stack[depth] = SqlPhase::Initial;
-                let func_name = last_word.take().map(|w| w.to_uppercase());
+                let func_name = last_word.take().map(|w| w.to_ascii_uppercase());
                 if paren_func_stack.len() <= depth {
                     paren_func_stack.push(func_name);
                 } else {
@@ -705,7 +705,7 @@ fn collect_tables_deep(
                 continue;
             }
             SqlToken::Word(word) => {
-                let upper = word.to_uppercase();
+                let upper = word.to_ascii_uppercase();
 
                 // CTE state machine for table collection
                 match cte_state {
@@ -926,7 +926,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             }
             // If we hit a top-level statement keyword before WITH, no CTEs.
             SqlToken::Word(w) if depth == 0 => {
-                let u = w.to_uppercase();
+                let u = w.to_ascii_uppercase();
                 if matches!(
                     u.as_str(),
                     "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
@@ -946,7 +946,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 
     // Skip RECURSIVE if present
     if let Some(SqlToken::Word(w)) = tokens.get(idx) {
-        if w.to_uppercase() == "RECURSIVE" {
+        if w.to_ascii_uppercase() == "RECURSIVE" {
             idx += 1;
         }
     }
@@ -960,7 +960,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         // Expect CTE name
         let cte_name = match tokens.get(idx) {
             Some(SqlToken::Word(w)) => {
-                let u = w.to_uppercase();
+                let u = w.to_ascii_uppercase();
                 if matches!(
                     u.as_str(),
                     "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
@@ -995,7 +995,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 
         // Expect AS
         if let Some(SqlToken::Word(w)) = tokens.get(idx) {
-            if w.to_uppercase() == "AS" {
+            if w.to_ascii_uppercase() == "AS" {
                 idx += 1;
             }
         }
@@ -1042,7 +1042,7 @@ fn peek_word_upper(tokens: &[SqlToken], idx: usize) -> Option<&'static str> {
                 continue;
             }
             SqlToken::Word(w) => {
-                let upper = w.to_uppercase();
+                let upper = w.to_ascii_uppercase();
                 // Return a static str by matching known keywords
                 return match upper.as_str() {
                     "BY" => Some("BY"),
@@ -1067,7 +1067,7 @@ fn strip_identifier_quotes(value: &str) -> String {
 }
 
 fn normalize_identifier_for_lookup(value: &str) -> String {
-    strip_identifier_quotes(value).to_uppercase()
+    strip_identifier_quotes(value).to_ascii_uppercase()
 }
 
 fn split_identifier_parts_for_lookup(value: &str) -> Vec<String> {
@@ -1150,7 +1150,7 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
         Some(SqlToken::Symbol(sym)) if sym == "(" => None,
         Some(SqlToken::Word(word)) => {
             let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-            let upper = word.to_uppercase();
+            let upper = word.to_ascii_uppercase();
             // Skip if this is a keyword rather than a table name
             if !is_quoted && (is_join_keyword(&upper) || is_table_stop_keyword(&upper)) {
                 return None;
@@ -1184,7 +1184,7 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
     match tokens.get(start) {
         Some(SqlToken::Word(word)) => {
             let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-            let upper = word.to_uppercase();
+            let upper = word.to_ascii_uppercase();
             if upper == "AS" {
                 if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
                     if !is_identifier_word_token(alias) {
@@ -1229,7 +1229,7 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
     match tokens.get(idx) {
         Some(SqlToken::Word(word)) => {
             let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-            let upper = word.to_uppercase();
+            let upper = word.to_ascii_uppercase();
             if upper == "AS" {
                 idx += 1;
                 // Skip comments after AS
@@ -1401,26 +1401,26 @@ pub fn resolve_qualifier_tables(
     }
 
     if let Some((_, name)) = alias_match {
-        if seen.insert(name.to_uppercase()) {
+        if seen.insert(name.to_ascii_uppercase()) {
             return vec![name];
         }
     }
 
     if let Some((_, name)) = name_match {
-        if seen.insert(name.to_uppercase()) {
+        if seen.insert(name.to_ascii_uppercase()) {
             return vec![name];
         }
     }
 
     if let Some((_, name)) = short_name_match {
-        if seen.insert(name.to_uppercase()) {
+        if seen.insert(name.to_ascii_uppercase()) {
             return vec![name];
         }
     }
 
     // If no match found, try the qualifier as a direct table name
     let normalized = strip_identifier_quotes(qualifier);
-    if seen.insert(normalized.to_uppercase()) {
+    if seen.insert(normalized.to_ascii_uppercase()) {
         return vec![normalized];
     }
 
@@ -1433,7 +1433,7 @@ pub fn resolve_all_scope_tables(tables_in_scope: &[ScopedTableRef]) -> Vec<Strin
     let mut seen = HashSet::new();
 
     for table_ref in tables_in_scope {
-        let upper = table_ref.name.to_uppercase();
+        let upper = table_ref.name.to_ascii_uppercase();
         if seen.insert(upper) {
             result.push(table_ref.name.clone());
         }
@@ -1502,7 +1502,7 @@ fn select_list_start_index(tokens: &[SqlToken]) -> usize {
     while idx < tokens.len() {
         match &tokens[idx] {
             SqlToken::Word(w) => {
-                let upper = w.to_uppercase();
+                let upper = w.to_ascii_uppercase();
                 if matches!(upper.as_str(), "DISTINCT" | "ALL" | "UNIQUE") {
                     idx += 1;
                 } else {
@@ -1527,7 +1527,7 @@ fn select_list_end_index(tokens: &[SqlToken], start: usize) -> usize {
         let token = &tokens[idx];
         if is_top_level_depth(&token_depths, idx) {
             if let SqlToken::Word(w) = token {
-                let upper = w.to_uppercase();
+                let upper = w.to_ascii_uppercase();
                 if matches!(upper.as_str(), "FROM" | "INTO" | "BULK") {
                     break;
                 }
@@ -1561,7 +1561,7 @@ fn append_wildcard_item_tables(
         if let SqlToken::Symbol(s) = meaningful[0] {
             if s == "*" {
                 for table in resolve_all_scope_tables(tables_in_scope) {
-                    let key = table.to_uppercase();
+                    let key = table.to_ascii_uppercase();
                     if seen.insert(key) {
                         tables.push(table);
                     }
@@ -1581,7 +1581,7 @@ fn append_wildcard_item_tables(
                     normalize_dotted_identifier_tokens(&meaningful[..meaningful.len() - 2])
                 {
                     for table in resolve_qualifier_tables(&normalized, tables_in_scope) {
-                        let key = table.to_uppercase();
+                        let key = table.to_ascii_uppercase();
                         if seen.insert(key) {
                             tables.push(table);
                         }
@@ -1680,7 +1680,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
 
     // Case 2: Implicit alias — last token is a Word following `)` or another Word
     if let SqlToken::Word(alias) = last {
-        let alias_upper = alias.to_uppercase();
+        let alias_upper = alias.to_ascii_uppercase();
         if !is_select_item_trailing_keyword(&alias_upper) {
             if let Some(prev) = second_last {
                 let is_implicit = match prev {
