@@ -164,9 +164,17 @@ pub fn flush_history_writer() -> Result<(), String> {
 
 fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = message.to_lowercase();
-    let patterns = ["error at line", "line:", " line ", "ora-06512: at line"];
+    let patterns = [
+        "error at line",
+        "line:",
+        " line ",
+        // Keep ORA-06512 lower priority so we prefer primary parser errors.
+        "ora-06512: at line",
+    ];
 
-    for needle in patterns {
+    let mut best_line: Option<(usize, usize)> = None;
+
+    for (priority, needle) in patterns.iter().enumerate() {
         let mut search_start = 0usize;
         while search_start < lowercase.len() {
             let Some(relative_idx) = lowercase[search_start..].find(needle) else {
@@ -194,13 +202,19 @@ fn parse_error_line(message: &str) -> Option<usize> {
             }
 
             if let Ok(value) = digits.parse::<usize>() {
-                return Some(value);
+                match best_line {
+                    None => best_line = Some((priority, value)),
+                    Some((best_priority, _)) if priority < best_priority => {
+                        best_line = Some((priority, value));
+                    }
+                    _ => {}
+                }
             }
             search_start = idx.saturating_add(needle.len());
         }
     }
 
-    None
+    best_line.map(|(_, line)| line)
 }
 
 fn sanitize_history_sql(sql: &str) -> String {
@@ -570,9 +584,8 @@ fn redact_uri_credentials(text: &str) -> String {
                 output.push_str(REDACTED_SECRET);
                 output.push_str(host);
             } else if !userinfo.is_empty() {
+                // Preserve source format for user-only URI auth segments.
                 output.push_str(userinfo);
-                output.push(':');
-                output.push_str(REDACTED_SECRET);
                 output.push_str(host);
             } else {
                 output.push_str(authority);
@@ -650,10 +663,7 @@ fn preview_style_table() -> Vec<StyleTableEntry> {
 /// thread is unreachable.
 fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
     let (tx, rx) = mpsc::channel();
-    if history_writer_sender()
-        .send(HistoryCommand::Snapshot(tx))
-        .is_ok()
-    {
+    if send_history_command(HistoryCommand::Snapshot(tx)).is_ok() {
         match rx.recv_timeout(history_writer_response_timeout()) {
             Ok(snapshot) => (snapshot, false),
             Err(_) => {
@@ -1142,10 +1152,10 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 
     if trimmed.chars().count() > max_len {
-        let visible_len = max_len.saturating_sub(3);
-        if visible_len == 0 {
-            return "...".to_string();
+        if max_len <= 3 {
+            return "...".chars().take(max_len).collect();
         }
+        let visible_len = max_len - 3;
         let end = trimmed
             .char_indices()
             .nth(visible_len)
@@ -1170,18 +1180,15 @@ fn history_entry_matches_filter(
         return true;
     }
 
-    let sql = entry.sql.to_lowercase();
-    if sql.contains(search_lower) {
+    if entry.sql.to_lowercase().contains(search_lower) {
         return true;
     }
 
-    let connection = entry.connection_name.to_lowercase();
-    if connection.contains(search_lower) {
+    if entry.connection_name.to_lowercase().contains(search_lower) {
         return true;
     }
 
-    let timestamp = entry.timestamp.to_lowercase();
-    if timestamp.contains(search_lower) {
+    if entry.timestamp.to_lowercase().contains(search_lower) {
         return true;
     }
 
@@ -1302,6 +1309,13 @@ mod query_history_tests {
         let message = "failed near line 1
 ORA-06512: at line 27";
         assert_eq!(parse_error_line(message), Some(1));
+    }
+
+    #[test]
+    fn sanitize_history_message_preserves_user_only_uri_format() {
+        let sql = "failed to reach https://scott@db-host/service";
+        let sanitized = sanitize_history_message(sql);
+        assert!(sanitized.contains("https://scott@db-host/service"));
     }
 
     #[test]
