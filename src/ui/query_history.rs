@@ -137,79 +137,44 @@ pub fn flush_history_writer() -> Result<(), String> {
 
 fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = message.to_ascii_lowercase();
-    for needle in ["error at line", "line:", " line "] {
-        if let Some(idx) = lowercase.find(needle) {
-            let start = idx + needle.len();
+    let mut parsed_lines: Vec<usize> = Vec::new();
+
+    for needle in ["error at line", "line:", " line ", "ora-06512: at line"] {
+        let mut search_start = 0usize;
+        while search_start < lowercase.len() {
+            let Some(relative_idx) = lowercase[search_start..].find(needle) else {
+                break;
+            };
+            let idx = search_start + relative_idx;
+            let mut cursor = idx + needle.len();
+            cursor = next_char_boundary(&lowercase, cursor);
+
             let mut digits = String::new();
-            for ch in lowercase[start..].chars() {
+            while cursor < lowercase.len() {
+                let Some((ch, next)) = next_char_with_clamped_boundary(&lowercase, cursor) else {
+                    break;
+                };
                 if ch.is_ascii_whitespace() && digits.is_empty() {
+                    cursor = next;
                     continue;
                 }
                 if ch.is_ascii_digit() {
                     digits.push(ch);
-                } else {
-                    break;
+                    cursor = next;
+                    continue;
                 }
+                break;
             }
+
             if let Ok(value) = digits.parse::<usize>() {
-                return Some(value);
+                parsed_lines.push(value);
             }
+
+            search_start = idx.saturating_add(needle.len());
         }
     }
-    None
-}
 
-fn split_sql_and_comments(line: &str) -> (&str, &str) {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut idx = 0usize;
-
-    while idx < line.len() {
-        let Some(ch) = line[idx..].chars().next() else {
-            break;
-        };
-        let next = idx + ch.len_utf8();
-
-        if !in_double && ch == '\'' {
-            if in_single && next < line.len() {
-                if let Some(next_ch) = line[next..].chars().next() {
-                    if next_ch == '\'' {
-                        idx = next + next_ch.len_utf8();
-                        continue;
-                    }
-                }
-            }
-            in_single = !in_single;
-            idx = next;
-            continue;
-        }
-
-        if !in_single && ch == '"' {
-            if in_double && next < line.len() {
-                if let Some(next_ch) = line[next..].chars().next() {
-                    if next_ch == '"' {
-                        idx = next + next_ch.len_utf8();
-                        continue;
-                    }
-                }
-            }
-            in_double = !in_double;
-            idx = next;
-            continue;
-        }
-
-        if !in_single && !in_double && ch == '-' && next < line.len() {
-            if let Some(next_ch) = line[next..].chars().next() {
-                if next_ch == '-' {
-                    return (&line[..idx], &line[idx..]);
-                }
-            }
-        }
-
-        idx = next;
-    }
-
-    (line, "")
+    parsed_lines.into_iter().last()
 }
 
 fn sanitize_history_sql(sql: &str) -> String {
@@ -315,114 +280,213 @@ fn redact_identified_by_clause(text: &str) -> String {
         return String::new();
     }
 
-    let mut output = String::with_capacity(text.len());
-    for segment in text.split_inclusive('\n') {
-        let has_newline = segment.ends_with('\n');
-        let line = if has_newline {
-            &segment[..segment.len().saturating_sub(1)]
-        } else {
-            segment
-        };
-        let (code, comment) = split_sql_and_comments(line);
-        output.push_str(&redact_identified_by_clause_in_code(code));
-        output.push_str(comment);
-        if has_newline {
-            output.push('\n');
-        }
+    #[derive(Clone, Copy)]
+    enum SqlState {
+        Code,
+        SingleQuoted,
+        DoubleQuoted,
+        LineComment,
+        BlockComment,
     }
 
-    if !text.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
-    }
-
-    output
-}
-
-fn redact_identified_by_clause_in_code(text: &str) -> String {
     const IDENTIFIED_BY: &str = "IDENTIFIED BY";
 
     let mut output = String::with_capacity(text.len());
-    let mut cursor = 0usize;
+    let mut state = SqlState::Code;
+    let mut idx = 0usize;
 
-    while let Some(found) = find_ascii_case_insensitive(text, IDENTIFIED_BY, cursor) {
-        let pattern_end = found + IDENTIFIED_BY.len();
-        output.push_str(&text[cursor..pattern_end]);
-
-        let mut value_start = pattern_end;
-        while value_start < text.len() {
-            let Some((ch, next)) = next_char_with_clamped_boundary(text, value_start) else {
-                break;
-            };
-            if ch.is_whitespace() {
-                output.push(ch);
-                value_start = next;
-            } else {
-                value_start = next_char_boundary(text, value_start);
-                break;
-            }
-        }
-
-        if value_start >= text.len() {
-            cursor = value_start;
-            break;
-        }
-
-        let Some((first, _)) = next_char_with_clamped_boundary(text, value_start) else {
-            cursor = text.len();
+    while idx < text.len() {
+        let Some((ch, next)) = next_char_with_clamped_boundary(text, idx) else {
             break;
         };
-        if first == '\'' || first == '"' {
-            let quote = first;
-            output.push(quote);
-            let mut value_end = value_start + quote.len_utf8();
-            let mut closed_quote = false;
-            while value_end < text.len() {
-                let Some((ch, next)) = next_char_with_clamped_boundary(text, value_end) else {
-                    value_end = text.len();
-                    break;
-                };
-                value_end = next;
-                if ch == quote {
-                    if value_end < text.len() {
-                        let Some((next_ch, next_boundary)) =
-                            next_char_with_clamped_boundary(text, value_end)
-                        else {
-                            value_end = text.len();
-                            break;
-                        };
-                        if next_ch == quote {
-                            value_end = next_boundary;
+
+        match state {
+            SqlState::Code => {
+                if ch == '\'' {
+                    output.push(ch);
+                    state = SqlState::SingleQuoted;
+                    idx = next;
+                    continue;
+                }
+                if ch == '"' {
+                    output.push(ch);
+                    state = SqlState::DoubleQuoted;
+                    idx = next;
+                    continue;
+                }
+                if ch == '-' {
+                    if let Some((next_ch, next_boundary)) =
+                        next_char_with_clamped_boundary(text, next)
+                    {
+                        if next_ch == '-' {
+                            output.push(ch);
+                            output.push(next_ch);
+                            state = SqlState::LineComment;
+                            idx = next_boundary;
                             continue;
                         }
                     }
-                    closed_quote = true;
-                    break;
+                }
+                if ch == '/' {
+                    if let Some((next_ch, next_boundary)) =
+                        next_char_with_clamped_boundary(text, next)
+                    {
+                        if next_ch == '*' {
+                            output.push(ch);
+                            output.push(next_ch);
+                            state = SqlState::BlockComment;
+                            idx = next_boundary;
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(found) = find_ascii_case_insensitive(text, IDENTIFIED_BY, idx) {
+                    if found == idx {
+                        let pattern_end = found + IDENTIFIED_BY.len();
+                        output.push_str(&text[idx..pattern_end]);
+
+                        let mut value_start = pattern_end;
+                        while value_start < text.len() {
+                            let Some((ws, next_ws)) =
+                                next_char_with_clamped_boundary(text, value_start)
+                            else {
+                                break;
+                            };
+                            if ws.is_whitespace() {
+                                output.push(ws);
+                                value_start = next_ws;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if value_start >= text.len() {
+                            idx = value_start;
+                            continue;
+                        }
+
+                        let Some((first, _)) = next_char_with_clamped_boundary(text, value_start)
+                        else {
+                            idx = text.len();
+                            continue;
+                        };
+
+                        if first == '\'' || first == '"' {
+                            let quote = first;
+                            output.push(quote);
+                            let mut value_end = value_start + quote.len_utf8();
+                            let mut closed_quote = false;
+                            while value_end < text.len() {
+                                let Some((vch, vnext)) =
+                                    next_char_with_clamped_boundary(text, value_end)
+                                else {
+                                    value_end = text.len();
+                                    break;
+                                };
+                                value_end = vnext;
+                                if vch == quote {
+                                    if value_end < text.len() {
+                                        let Some((escaped, escaped_next)) =
+                                            next_char_with_clamped_boundary(text, value_end)
+                                        else {
+                                            value_end = text.len();
+                                            break;
+                                        };
+                                        if escaped == quote {
+                                            value_end = escaped_next;
+                                            continue;
+                                        }
+                                    }
+                                    closed_quote = true;
+                                    break;
+                                }
+                            }
+                            output.push_str(REDACTED_SECRET);
+                            if closed_quote {
+                                output.push(quote);
+                            }
+                            idx = value_end;
+                            continue;
+                        }
+
+                        let mut value_end = value_start;
+                        while value_end < text.len() {
+                            let Some((vch, vnext)) =
+                                next_char_with_clamped_boundary(text, value_end)
+                            else {
+                                value_end = text.len();
+                                break;
+                            };
+                            if vch.is_whitespace() || matches!(vch, ';' | ')' | ',' | '\n' | '\r') {
+                                break;
+                            }
+                            value_end = vnext;
+                        }
+                        output.push_str(REDACTED_SECRET);
+                        idx = value_end;
+                        continue;
+                    }
+                }
+
+                output.push(ch);
+                idx = next;
+            }
+            SqlState::SingleQuoted => {
+                output.push(ch);
+                idx = next;
+                if ch == '\'' {
+                    if let Some((escaped, escaped_next)) =
+                        next_char_with_clamped_boundary(text, idx)
+                    {
+                        if escaped == '\'' {
+                            output.push(escaped);
+                            idx = escaped_next;
+                            continue;
+                        }
+                    }
+                    state = SqlState::Code;
                 }
             }
-            output.push_str(REDACTED_SECRET);
-            if closed_quote {
-                output.push(quote);
+            SqlState::DoubleQuoted => {
+                output.push(ch);
+                idx = next;
+                if ch == '"' {
+                    if let Some((escaped, escaped_next)) =
+                        next_char_with_clamped_boundary(text, idx)
+                    {
+                        if escaped == '"' {
+                            output.push(escaped);
+                            idx = escaped_next;
+                            continue;
+                        }
+                    }
+                    state = SqlState::Code;
+                }
             }
-            cursor = value_end;
-            continue;
-        }
-
-        let mut value_end = value_start;
-        while value_end < text.len() {
-            let Some((ch, next)) = next_char_with_clamped_boundary(text, value_end) else {
-                value_end = text.len();
-                break;
-            };
-            if ch.is_whitespace() || matches!(ch, ';' | ')' | ',' | '\n' | '\r') {
-                break;
+            SqlState::LineComment => {
+                output.push(ch);
+                idx = next;
+                if ch == '\n' {
+                    state = SqlState::Code;
+                }
             }
-            value_end = next;
+            SqlState::BlockComment => {
+                output.push(ch);
+                idx = next;
+                if ch == '*' {
+                    if let Some((slash, slash_next)) = next_char_with_clamped_boundary(text, idx) {
+                        if slash == '/' {
+                            output.push(slash);
+                            idx = slash_next;
+                            state = SqlState::Code;
+                        }
+                    }
+                }
+            }
         }
-        output.push_str(REDACTED_SECRET);
-        cursor = value_end;
     }
 
-    output.push_str(&text[cursor..]);
     output
 }
 
@@ -1009,6 +1073,10 @@ impl QueryHistoryDialog {
                         &format!("Query history fallback save error: {save_err}"),
                     );
                     eprintln!("Query history fallback save error: {save_err}");
+                    fltk::dialog::alert_default(&format!(
+                        "Failed to save query history: {}",
+                        save_err
+                    ));
                 }
             }
         }
@@ -1123,8 +1191,8 @@ fn populate_history_browser(
 #[cfg(test)]
 mod query_history_tests {
     use super::{
-        history_entry_matches_filter, sanitize_history_message, sanitize_history_sql, truncate_sql,
-        QueryHistoryEntry, REDACTED_SECRET,
+        history_entry_matches_filter, parse_error_line, sanitize_history_message,
+        sanitize_history_sql, truncate_sql, QueryHistoryEntry, REDACTED_SECRET,
     };
 
     #[test]
@@ -1190,6 +1258,25 @@ mod query_history_tests {
         let sanitized = sanitize_history_message(message);
         assert!(sanitized.contains(&format!("alice:{}@", REDACTED_SECRET)));
         assert!(!sanitized.contains("pa55"));
+    }
+
+    #[test]
+    fn parse_error_line_prefers_last_relevant_line_reference() {
+        let message = "failed near line 1
+ORA-06512: at line 27";
+        assert_eq!(parse_error_line(message), Some(27));
+    }
+
+    #[test]
+    fn sanitize_history_sql_ignores_identified_by_in_comments_and_strings() {
+        let sql = "/* IDENTIFIED BY should_not_change */
+SELECT 'IDENTIFIED BY keep_me' FROM dual;
+CREATE USER app IDENTIFIED BY real_secret;";
+        let sanitized = sanitize_history_sql(sql);
+        assert!(sanitized.contains("IDENTIFIED BY should_not_change"));
+        assert!(sanitized.contains("IDENTIFIED BY keep_me"));
+        assert!(sanitized.contains(&format!("IDENTIFIED BY {}", REDACTED_SECRET)));
+        assert!(!sanitized.contains("real_secret"));
     }
 
     #[test]
