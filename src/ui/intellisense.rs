@@ -1991,7 +1991,7 @@ mod intellisense_tests {
         data.set_virtual_table_columns("EMP", vec!["VIRTUAL_COL".to_string()]);
         data.clear_virtual_tables();
 
-        let columns = data.get_column_suggestions("", Some(&vec!["EMP".to_string()]));
+        let columns = data.get_column_suggestions("", Some(&["EMP".to_string()]));
         assert!(
             columns.contains(&"REAL_COL".to_string()),
             "real table columns should remain cached after virtual cache clear"
@@ -2008,7 +2008,7 @@ mod intellisense_tests {
         data.set_columns_for_table("EMP", vec!["REAL_COL".to_string()]);
         data.set_virtual_table_columns("EMP", vec!["VIRTUAL_COL".to_string()]);
 
-        let columns = data.get_column_suggestions("", Some(&vec!["EMP".to_string()]));
+        let columns = data.get_column_suggestions("", Some(&["EMP".to_string()]));
         assert!(
             columns.contains(&"VIRTUAL_COL".to_string()),
             "virtual table columns should be used while virtual entries exist"

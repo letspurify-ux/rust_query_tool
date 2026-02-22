@@ -564,12 +564,17 @@ impl ConnectionDialog {
                         if let Err(e) = cfg.add_recent_connection(info.clone()) {
                             fltk::dialog::alert_default(&e);
                         } else if let Err(e) = cfg.save() {
-                            let _ = crate::utils::credential_store::delete_password(&info.name);
+                            let cleanup_error =
+                                crate::utils::credential_store::delete_password(&info.name).err();
                             cfg.recent_connections.retain(|c| c.name != info.name);
-                            fltk::dialog::alert_default(&format!(
-                                "Failed to save connection: {}",
-                                e
-                            ));
+                            let mut message = format!("Failed to save connection: {}", e);
+                            if let Some(cleanup_error) = cleanup_error {
+                                message.push_str(&format!(
+                                    "\nAdditionally failed to roll back keyring entry: {}",
+                                    cleanup_error
+                                ));
+                            }
+                            fltk::dialog::alert_default(&message);
                         } else {
                             saved_browser.clear();
                             for conn in cfg.get_all_connections() {
@@ -587,12 +592,19 @@ impl ConnectionDialog {
                                 continue;
                             }
                             if let Err(e) = cfg.save() {
-                                let _ = crate::utils::credential_store::delete_password(&info.name);
+                                let cleanup_error =
+                                    crate::utils::credential_store::delete_password(&info.name)
+                                        .err();
                                 cfg.recent_connections.retain(|c| c.name != info.name);
-                                fltk::dialog::alert_default(&format!(
-                                    "Failed to save connection: {}",
-                                    e
-                                ));
+                                let mut message =
+                                    format!("Failed to save connection: {}", e);
+                                if let Some(cleanup_error) = cleanup_error {
+                                    message.push_str(&format!(
+                                        "\nAdditionally failed to roll back keyring entry: {}",
+                                        cleanup_error
+                                    ));
+                                }
+                                fltk::dialog::alert_default(&message);
                                 continue;
                             }
                         }
