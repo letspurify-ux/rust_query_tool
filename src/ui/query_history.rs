@@ -600,8 +600,11 @@ fn redact_uri_credentials(text: &str) -> String {
                 output.push_str(REDACTED_SECRET);
                 output.push_str(host);
             } else if !userinfo.is_empty() {
-                // Preserve source format for user-only URI auth segments.
+                // Username-only authority (user@host) can still expose credentials.
+                // Mask to avoid leaking account identifiers in history previews.
                 output.push_str(userinfo);
+                output.push(':');
+                output.push_str(REDACTED_SECRET);
                 output.push_str(host);
             } else {
                 output.push_str(authority);
@@ -1328,10 +1331,14 @@ ORA-06512: at line 27";
     }
 
     #[test]
-    fn sanitize_history_message_preserves_user_only_uri_format() {
+    fn sanitize_history_message_redacts_user_only_uri_credentials() {
         let sql = "failed to reach https://scott@db-host/service";
         let sanitized = sanitize_history_message(sql);
-        assert!(sanitized.contains("https://scott@db-host/service"));
+        assert!(sanitized.contains(&format!(
+            "https://scott:{}@db-host/service",
+            REDACTED_SECRET
+        )));
+        assert!(!sanitized.contains("https://scott@db-host/service"));
     }
 
     #[test]
