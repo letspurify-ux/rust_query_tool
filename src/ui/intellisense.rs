@@ -906,8 +906,9 @@ impl IntellisenseData {
                 if !prefix_upper.is_empty() && *func == prefix_upper {
                     continue;
                 }
-                if seen.insert((*func).to_string()) {
-                    suggestions.push(format!("{func}{FUNCTION_SUFFIX}"));
+                let rendered = format!("{func}{FUNCTION_SUFFIX}");
+                if seen.insert(rendered.to_uppercase()) {
+                    suggestions.push(rendered);
                 }
                 if suggestions.len() >= MAX_SUGGESTIONS {
                     break;
@@ -1303,8 +1304,8 @@ impl IntellisenseData {
     }
 
     fn dedup_suggestions_case_insensitive(suggestions: &mut Vec<String>) {
-        suggestions.sort_unstable();
-        suggestions.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let mut seen = HashSet::new();
+        suggestions.retain(|value| seen.insert(value.to_ascii_uppercase()));
     }
 }
 
