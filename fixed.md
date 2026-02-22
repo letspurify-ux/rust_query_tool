@@ -1,6 +1,6 @@
-# fixed.md
+# 예외 처리 보완 내역
 
-## 2026-02-22 오류 검토 및 즉시 수정 내역
+## 중(이상) 우선 수정
 
 ### [중] Clippy 경고(문서 주석 위치)로 인한 품질 게이트 실패
 - **증상**: `cargo clippy --all-targets --all-features -- -D warnings` 실행 시 `src/sql_text.rs`의 파일 상단 doc comment 다음 빈 줄로 인해 `clippy::empty_line_after_doc_comments` 에러 발생.
@@ -22,3 +22,7 @@
 - **증상**: 테스트에서 단일 테이블 전달 시 `Some(&vec![...])`를 사용해 불필요한 힙 할당 발생.
 - **수정**: `Some(&[...])` 슬라이스로 교체.
 - **효과**: 테스트 코드 단순화 및 불필요한 할당 제거.
+1. 연결 저장 실패 시 keyring 롤백 실패가 묵살되던 문제를 보완했습니다.
+   - `DialogMessage::Save`와 `DialogMessage::Connect(save_connection=true)` 경로에서
+     `delete_password` 실패를 무시하지 않고 에러 메시지에 함께 노출하도록 수정했습니다.
+   - 이제 설정 저장 실패와 keyring 롤백 실패가 동시에 발생하면 사용자에게 두 실패 원인이 모두 표시됩니다.
