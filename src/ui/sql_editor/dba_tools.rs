@@ -1551,6 +1551,7 @@ impl SqlEditorWidget {
                 dump_file_text: String,
                 log_file_text: String,
                 schema_text: String,
+                job_mode_text: String,
             },
             DataPumpImportRequested {
                 job_text: String,
@@ -1558,6 +1559,7 @@ impl SqlEditorWidget {
                 dump_file_text: String,
                 log_file_text: String,
                 schema_text: String,
+                job_mode_text: String,
             },
             DataPumpStopRequested {
                 owner_text: String,
@@ -1895,6 +1897,11 @@ impl SqlEditorWidget {
             let Some(schema_name) = prompt_optional_text("Schema name", &schema_default) else {
                 return;
             };
+            let Some(job_mode) =
+                prompt_optional_text("Job mode (SCHEMA/TABLE/TABLESPACE/FULL)", "SCHEMA")
+            else {
+                return;
+            };
 
             let _ = sender_dp_export.send(SchedulerMessage::DataPumpExportRequested {
                 job_text: base_job_name,
@@ -1902,6 +1909,7 @@ impl SqlEditorWidget {
                 dump_file_text: dump_file,
                 log_file_text: log_file,
                 schema_text: schema_name,
+                job_mode_text: job_mode,
             });
             app::awake();
         });
@@ -1939,6 +1947,11 @@ impl SqlEditorWidget {
             else {
                 return;
             };
+            let Some(job_mode) =
+                prompt_optional_text("Job mode (SCHEMA/TABLE/TABLESPACE/FULL)", "SCHEMA")
+            else {
+                return;
+            };
 
             let _ = sender_dp_import.send(SchedulerMessage::DataPumpImportRequested {
                 job_text: base_job_name,
@@ -1946,6 +1959,7 @@ impl SqlEditorWidget {
                 dump_file_text: dump_file,
                 log_file_text: log_file,
                 schema_text: schema_name,
+                job_mode_text: job_mode,
             });
             app::awake();
         });
@@ -2589,6 +2603,7 @@ impl SqlEditorWidget {
                         dump_file_text,
                         log_file_text,
                         schema_text,
+                        job_mode_text,
                     } => {
                         let job_name =
                             match normalize_required_identifier(&job_text, "Data Pump job") {
@@ -2635,7 +2650,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         &schema_name,
-                                        "SCHEMA",
+                                        &job_mode_text,
                                     )
                                     .map(|_| format!("Data Pump export job {} started", job_name))
                                     .map_err(|err| {
@@ -2659,6 +2674,7 @@ impl SqlEditorWidget {
                         dump_file_text,
                         log_file_text,
                         schema_text,
+                        job_mode_text,
                     } => {
                         let job_name =
                             match normalize_required_identifier(&job_text, "Data Pump job") {
@@ -2698,7 +2714,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         schema_name.as_deref(),
-                                        "SCHEMA",
+                                        &job_mode_text,
                                     )
                                     .map(|_| format!("Data Pump import job {} started", job_name))
                                     .map_err(|err| {
@@ -7387,7 +7403,11 @@ mod tests {
             "SQL_ID".to_string(),
             "CHILD_NUMBER".to_string(),
         ];
-        let row = vec!["1".to_string(), "7v9h9ttw0g3cn".to_string(), "4".to_string()];
+        let row = vec![
+            "1".to_string(),
+            "7v9h9ttw0g3cn".to_string(),
+            "4".to_string(),
+        ];
         assert_eq!(
             parse_sql_id_child_row(&row, &columns),
             Some(("7V9H9TTW0G3CN".to_string(), 4))

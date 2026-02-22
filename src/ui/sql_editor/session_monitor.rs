@@ -550,7 +550,10 @@ mod tests {
     #[test]
     fn parse_selected_session_identity_reads_sid_and_serial() {
         let row = vec!["123".to_string(), "456".to_string(), "SCOTT".to_string()];
-        assert_eq!(parse_selected_session_identity(&row), Some((None, 123, 456)));
+        assert_eq!(
+            parse_selected_session_identity(&row),
+            Some((None, 123, 456))
+        );
     }
 
     #[test]
@@ -568,7 +571,10 @@ mod tests {
             "-".to_string(),
             "TM".to_string(),
         ];
-        assert_eq!(parse_selected_session_identity(&row), Some((Some(3), 123, 456)));
+        assert_eq!(
+            parse_selected_session_identity(&row),
+            Some((Some(3), 123, 456))
+        );
     }
 
     #[test]
