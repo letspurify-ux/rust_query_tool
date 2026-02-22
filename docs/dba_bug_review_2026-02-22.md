@@ -5,16 +5,19 @@
 - `src/ui/sql_editor/session_monitor.rs`
 - `src/db/query/executor.rs`
 
+검토 방법(정적 분석):
+- `rg -n "should_fallback_from_global_view|get_ash_session_activity_snapshot|get_ash_top_sql_snapshot|get_awr_top_sql_snapshot|get_dataguard_overview_snapshot|get_dataguard_archive_gap_snapshot|get_session_lock_snapshot|get_heavy_execution_snapshot|query_sql_monitor_rows|get_scheduler_jobs_snapshot|get_scheduler_job_history_snapshot|get_datapump_jobs_snapshot|start_datapump_job|stop_datapump_job|create_and_run_shell_job|parse_sql_id_child_row|kill_session" src/ui/sql_editor/dba_tools.rs src/ui/sql_editor/session_monitor.rs src/db/query/executor.rs`
+
 ## 1) 전역 뷰 fallback 판단이 과도하게 넓어 실제 오류를 가림
-- `should_fallback_from_global_view`는 `ORA-00904`/`ORA-00942`/`ORA-01031`뿐 아니라 문자열에 `GV$`가 포함되면 무조건 fallback합니다.
-- 이로 인해 SQL 오타/컬럼 변경 등 실제 결함이 권한 이슈처럼 은폐될 수 있습니다.
+- `should_fallback_from_global_view`는 `ORA-00904`/`ORA-00942`/`ORA-01031`/`ORA-02030`을 모두 fallback 대상으로 처리합니다.
+- SQL 오타/컬럼 변경 등 실제 결함이 권한 이슈처럼 은폐될 수 있습니다.
 
 ## 2) ASH Session Activity가 오류 원인 구분 없이 단계적 fallback
 - `get_ash_session_activity_snapshot`는 `gv$active_session_history` 실패 시 에러 타입 구분 없이 `v$`, 다시 `gv$session`, `v$session`으로 내려갑니다.
-- 결과의 의미(ASH 표본 vs 현재 세션 스냅샷)가 달라지는데 사용자에게 명시되지 않습니다.
+- 결과 의미(ASH 표본 vs 현재 세션 스냅샷)가 달라지는데 사용자에게 명시되지 않습니다.
 
 ## 3) ASH Top SQL도 동일한 무차별 fallback
-- `get_ash_top_sql_snapshot` 역시 실패 원인 구분 없이 ASH -> 현재 세션 집계로 대체합니다.
+- `get_ash_top_sql_snapshot`도 실패 원인 구분 없이 ASH -> 현재 세션 집계로 대체합니다.
 - 라이선스/권한 이슈와 실제 SQL 결함을 구분하기 어렵습니다.
 
 ## 4) AWR Top SQL 실패 시 Shared Pool로 의미가 바뀜
@@ -41,9 +44,9 @@
 - `get_heavy_execution_snapshot`은 전역 뷰를 사용하지 않습니다.
 - 다중 인스턴스 부하 분석의 완전성이 떨어집니다.
 
-## 10) 별도 Session Monitor UI는 인스턴스 지정 kill 미지원
-- `session_monitor.rs`는 `QueryExecutor::kill_session`(instance 없음)만 호출합니다.
-- RAC 환경에서 원격 인스턴스 세션 kill 시 실패 가능성이 큽니다.
+## 10) Session Monitor의 v$ fallback 경로는 INST_ID가 `-`로 고정되어 kill 정확도가 떨어짐
+- session/lock 조회가 전역 뷰 실패로 `v$` 경로를 타면 `inst_id` 컬럼이 `'-'`로 채워집니다.
+- 이 상태에서 kill를 수행하면 instance 지정이 빠져 RAC에서 의도와 다른 대상 처리/실패가 날 수 있습니다.
 
 ## 11) Session/Lock row 파싱에서 타입 변환 오류를 침묵 처리
 - `row.get(idx).unwrap_or(None)` 패턴으로 변환 실패가 빈 문자열로 대체됩니다.
@@ -55,7 +58,7 @@
 
 ## 13) SQL Monitor row 파싱도 동일한 침묵 처리
 - `query_sql_monitor_rows` 역시 `unwrap_or(None)`로 오류를 숨깁니다.
-- 특히 kill 대상 식별 컬럼이 비정상일 때 원인 파악이 어렵습니다.
+- kill 대상 식별 컬럼이 비정상일 때 원인 파악이 어렵습니다.
 
 ## 14) Scheduler jobs 조회 fallback에서 원인 정보 손실
 - `get_scheduler_jobs_snapshot`은 `DBA -> ALL -> USER` 순으로 내려가며 중간 에러를 버립니다.

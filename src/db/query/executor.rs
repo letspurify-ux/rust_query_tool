@@ -2692,7 +2692,9 @@ ORDER BY
         let start = Instant::now();
         let mut stmt = match conn.statement(sql_gv).build() {
             Ok(stmt) => stmt,
-            Err(err) if Self::should_fallback_from_global_view(&err) => conn.statement(sql_v).build()?,
+            Err(err) if Self::should_fallback_from_global_view(&err) => {
+                conn.statement(sql_v).build()?
+            }
             Err(err) => return Err(err),
         };
         let rows = stmt.query(&[])?;
@@ -2841,7 +2843,9 @@ ORDER BY
         let start = Instant::now();
         let mut stmt = match conn.statement(sql_gv).build() {
             Ok(stmt) => stmt,
-            Err(err) if Self::should_fallback_from_global_view(&err) => conn.statement(sql_v).build()?,
+            Err(err) if Self::should_fallback_from_global_view(&err) => {
+                conn.statement(sql_v).build()?
+            }
             Err(err) => return Err(err),
         };
         let min_elapsed_bind = i64::from(min_elapsed_seconds);
@@ -3133,9 +3137,9 @@ WHERE ROWNUM <= 5
             let row: Row = row_result?;
             let mut values = Vec::with_capacity(8);
             for idx in 0..8 {
-            let value: Option<String> = row.get(idx)?;
-            values.push(value.unwrap_or_default());
-        }
+                let value: Option<String> = row.get(idx)?;
+                values.push(value.unwrap_or_default());
+            }
             result_rows.push(values);
         }
 
@@ -3295,7 +3299,7 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
             let row: Row = row_result?;
             let mut values = Vec::with_capacity(14);
             for idx in 0..14 {
-                let value: Option<String> = row.get(idx).unwrap_or(None);
+                let value: Option<String> = row.get(idx)?;
                 values.push(value.unwrap_or_default());
             }
             result_rows.push(values);
@@ -3954,7 +3958,9 @@ WHERE ROWNUM <= {top_n}
             Err(_) => {}
         }
 
-        Err(Self::invalid_security_input_error("AWR Top SQL requires AWR access (DBA_HIST_SQLSTAT/DBA_HIST_SNAPSHOT/DBA_HIST_SQLTEXT)"))
+        Err(Self::invalid_security_input_error(
+            "AWR Top SQL requires AWR access (DBA_HIST_SQLSTAT/DBA_HIST_SNAPSHOT/DBA_HIST_SQLTEXT)",
+        ))
     }
 
     pub fn get_dataguard_overview_snapshot(conn: &Connection) -> Result<QueryResult, OracleError> {
@@ -4899,10 +4905,18 @@ ORDER BY
 
     fn should_fallback_from_global_view(err: &OracleError) -> bool {
         let msg = format!("{err}").to_uppercase();
-        msg.contains("ORA-00942")
-            || msg.contains("ORA-00904")
-            || msg.contains("ORA-01031")
-            || msg.contains("ORA-02030")
+        msg.contains("ORA-00942") || msg.contains("ORA-01031") || msg.contains("ORA-02030")
+    }
+
+    fn chained_fallback_error(context: &str, errors: &[String]) -> OracleError {
+        let detail = if errors.is_empty() {
+            "no fallback details".to_string()
+        } else {
+            errors.join(" | ")
+        };
+        Self::invalid_security_input_error(format!(
+            "{context} failed after fallback attempts: {detail}"
+        ))
     }
 
     fn current_database_role(conn: &Connection) -> Result<String, OracleError> {
@@ -4934,6 +4948,7 @@ ORDER BY
         owner_filter: Option<&str>,
         failed_only: bool,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let owner_filter =
             Self::normalize_optional_security_identifier(owner_filter, "Owner filter")?;
         let mut shared_conditions: Vec<String> = Vec::new();
@@ -4975,7 +4990,7 @@ ORDER BY owner, job_name
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("dba_scheduler_jobs: {err}")),
         }
 
         let sql_all = format!(
@@ -5001,7 +5016,7 @@ ORDER BY owner, job_name
         match Self::execute_select(conn, &sql_all, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("all_scheduler_jobs: {err}")),
         }
 
         let mut user_conditions: Vec<String> = Vec::new();
@@ -5038,7 +5053,16 @@ FROM user_scheduler_jobs
 ORDER BY job_name
 "#
         );
-        Self::execute_select(conn, &sql_user, Instant::now())
+        match Self::execute_select(conn, &sql_user, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("user_scheduler_jobs: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Scheduler jobs snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_scheduler_job_history_snapshot(
@@ -5046,6 +5070,7 @@ ORDER BY job_name
         owner: Option<&str>,
         job_name: &str,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let normalized_job = Self::normalize_required_security_identifier(job_name, "Job")?;
         let normalized_owner = Self::normalize_optional_security_identifier(owner, "Owner")?;
         let owner_clause = normalized_owner
@@ -5076,7 +5101,7 @@ WHERE ROWNUM <= 200
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("dba_scheduler_job_run_details: {err}")),
         }
 
         let sql_all = format!(
@@ -5103,7 +5128,7 @@ WHERE ROWNUM <= 200
         match Self::execute_select(conn, &sql_all, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("all_scheduler_job_run_details: {err}")),
         }
 
         let sql_user = format!(
@@ -5125,7 +5150,16 @@ SELECT * FROM (
 WHERE ROWNUM <= 200
 "#
         );
-        Self::execute_select(conn, &sql_user, Instant::now())
+        match Self::execute_select(conn, &sql_user, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("user_scheduler_job_run_details: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Scheduler job history snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn run_scheduler_job(
@@ -5307,6 +5341,7 @@ END;"
         conn: &Connection,
         owner_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
+        let mut fallback_errors: Vec<String> = Vec::new();
         let owner_filter =
             Self::normalize_optional_security_identifier(owner_filter, "Owner filter")?;
         let dba_where = owner_filter
@@ -5332,7 +5367,7 @@ ORDER BY owner_name, job_name
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("dba_datapump_jobs: {err}")),
         }
 
         let user_where = owner_filter
@@ -5355,7 +5390,16 @@ FROM user_datapump_jobs
 ORDER BY job_name
 "#
         );
-        Self::execute_select(conn, &sql_user, Instant::now())
+        match Self::execute_select(conn, &sql_user, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("user_datapump_jobs: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Data Pump jobs snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn start_datapump_export_job(
