@@ -3032,7 +3032,7 @@ WHERE ROWNUM <= {normalized_limit}
             r#"
 SELECT * FROM (
     SELECT
-        '-' AS inst_id,
+        TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE')) AS inst_id,
         s.sql_id,
         TO_CHAR(s.child_number) AS child_number,
         NVL(TO_CHAR(s.last_active_time, 'YYYY-MM-DD HH24:MI:SS'), '-') AS last_active_time,
@@ -3099,7 +3099,7 @@ WHERE ROWNUM <= 5
         let sql_v = r#"
 SELECT * FROM (
     SELECT
-        '-' AS inst_id,
+        TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE')) AS inst_id,
         NVL(s.sql_id, '-') AS sql_id,
         TO_CHAR(s.child_number) AS child_number,
         NVL(s.parsing_schema_name, '-') AS parsing_schema_name,
@@ -3777,7 +3777,7 @@ WHERE ROWNUM <= 600
             r#"
 SELECT * FROM (
     SELECT
-        '-' AS inst_id,
+        TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE')) AS inst_id,
         TO_CHAR(ash.sample_time, 'YYYY-MM-DD HH24:MI:SS') AS sample_time,
         TO_CHAR(ash.session_id) AS sid,
         TO_CHAR(ash.session_serial#) AS serial,
@@ -4187,28 +4187,11 @@ ORDER BY name
     ) -> Result<QueryResult, OracleError> {
         let sql = r#"
 SELECT
-    thread_no,
-    low_sequence,
-    high_sequence
-FROM (
-    SELECT
-        NVL(TO_CHAR(thread#), '-') AS thread_no,
-        NVL(TO_CHAR(low_sequence#), '-') AS low_sequence,
-        NVL(TO_CHAR(high_sequence#), '-') AS high_sequence,
-        0 AS sort_order
-    FROM v$archive_gap
-
-    UNION ALL
-
-    SELECT
-        '-' AS thread_no,
-        'NO_GAP' AS low_sequence,
-        '-' AS high_sequence,
-        1 AS sort_order
-    FROM dual
-    WHERE NOT EXISTS (SELECT 1 FROM v$archive_gap)
-)
-ORDER BY sort_order, thread_no
+    NVL(TO_CHAR(thread#), '-') AS thread_no,
+    NVL(TO_CHAR(low_sequence#), '-') AS low_sequence,
+    NVL(TO_CHAR(high_sequence#), '-') AS high_sequence
+FROM v$archive_gap
+ORDER BY thread#
 "#;
 
         let mut fallback_errors: Vec<String> = Vec::new();
@@ -4903,8 +4886,28 @@ ORDER BY
     }
 
     fn should_fallback_from_global_view(err: &OracleError) -> bool {
+        let fallback_codes = [942, 1031, 2030];
+        if let Some(code) = Self::extract_ora_error_code(err) {
+            return fallback_codes.contains(&code);
+        }
+
         let msg = format!("{err}").to_uppercase();
         msg.contains("ORA-00942") || msg.contains("ORA-01031") || msg.contains("ORA-02030")
+    }
+
+    fn extract_ora_error_code(err: &OracleError) -> Option<i32> {
+        let msg = format!("{err}");
+        let ora_offset = msg.find("ORA-")?;
+        let digits = msg
+            .get(ora_offset + 4..)?
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() {
+            return None;
+        }
+
+        digits.parse::<i32>().ok()
     }
 
     fn chained_fallback_error(context: &str, errors: &[String]) -> OracleError {
@@ -5478,11 +5481,6 @@ ORDER BY job_name
                 "Data Pump job mode must be one of SCHEMA, TABLE, TABLESPACE, FULL",
             ));
         }
-        if matches!(normalized_job_mode.as_str(), "TABLE" | "TABLESPACE") {
-            return Err(Self::invalid_security_input_error(
-                "TABLE/TABLESPACE mode is not supported yet: please use SCHEMA or FULL",
-            ));
-        }
         if normalized_job_mode == "SCHEMA" && normalized_schema.is_none() {
             return Err(Self::invalid_security_input_error(
                 "Schema is required when Data Pump job mode is SCHEMA",
@@ -5495,8 +5493,7 @@ ORDER BY job_name
         }
         let schema_expr = normalized_schema
             .as_deref()
-            .map(|schema| format!("IN ('{schema}')"))
-            .unwrap_or_default();
+            .map(|schema| format!("IN ('{schema}')"));
 
         let mut stmt = conn
             .statement(
@@ -5505,7 +5502,7 @@ BEGIN \
 h1 := DBMS_DATAPUMP.OPEN(operation => :operation, job_mode => :job_mode, job_name => :job_name, version => 'COMPATIBLE'); \
 DBMS_DATAPUMP.ADD_FILE(handle => h1, filename => :dump_file, directory => :directory, filetype => DBMS_DATAPUMP.KU$_FILE_TYPE_DUMP_FILE); \
 DBMS_DATAPUMP.ADD_FILE(handle => h1, filename => :log_file, directory => :directory, filetype => DBMS_DATAPUMP.KU$_FILE_TYPE_LOG_FILE); \
-IF :schema_expr IS NOT NULL THEN \
+IF :has_schema_expr = 1 THEN \
     DBMS_DATAPUMP.METADATA_FILTER(handle => h1, name => 'SCHEMA_EXPR', value => :schema_expr); \
 END IF; \
 DBMS_DATAPUMP.START_JOB(h1); \
@@ -5519,7 +5516,10 @@ END;",
         stmt.bind("dump_file", &normalized_dump_file)?;
         stmt.bind("directory", &normalized_directory)?;
         stmt.bind("log_file", &normalized_log_file)?;
-        stmt.bind("schema_expr", &schema_expr)?;
+        let schema_expr_text = schema_expr.unwrap_or_default();
+        let has_schema_expr: i64 = if schema_expr_text.is_empty() { 0 } else { 1 };
+        stmt.bind("schema_expr", &schema_expr_text)?;
+        stmt.bind("has_schema_expr", &has_schema_expr)?;
         stmt.execute(&[])?;
         Ok(())
     }
