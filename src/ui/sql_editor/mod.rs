@@ -849,14 +849,20 @@ impl SqlEditorWidget {
                                         result.message
                                     ));
                                 }
-                                QueryHistoryDialog::add_to_history(
+                                if let Err(history_err) = QueryHistoryDialog::add_to_history(
                                     &result.sql,
                                     result.execution_time.as_millis() as u64,
                                     result.row_count,
                                     connection_name,
                                     result.success,
                                     &result.message,
-                                );
+                                ) {
+                                    crate::utils::logging::log_error("history", &history_err);
+                                    fltk::dialog::alert_default(&format!(
+                                        "Failed to save query history: {}",
+                                        history_err
+                                    ));
+                                }
                                 SqlEditorWidget::invoke_query_result_callback(
                                     &execute_callback,
                                     result,

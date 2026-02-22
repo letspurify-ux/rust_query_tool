@@ -12,7 +12,15 @@ const APP_DIR_NAME: &str = "space_query";
 const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 5000;
-const LOG_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
+
+fn log_writer_response_timeout() -> Duration {
+    std::env::var("SPACE_QUERY_LOG_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -155,74 +163,96 @@ enum LogCommand {
     Flush(mpsc::Sender<Result<(), String>>),
 }
 
-fn log_writer_sender() -> &'static mpsc::Sender<LogCommand> {
-    static LOG_WRITER: OnceLock<mpsc::Sender<LogCommand>> = OnceLock::new();
-    LOG_WRITER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<LogCommand>();
-        thread::spawn(move || {
-            let mut log = AppLog::load();
-            let apply_command =
-                |log: &mut AppLog,
-                 command: LogCommand,
-                 needs_save: &mut bool,
-                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
-                    match command {
-                        LogCommand::Write(entry) => {
-                            log.add_entry(entry);
-                            *needs_save = true;
-                        }
-                        LogCommand::Clear => {
-                            log.entries.clear();
-                            *needs_save = true;
-                        }
-                        LogCommand::Flush(reply) => {
-                            flush_replies.push(reply);
-                        }
-                    };
+fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
+    let (sender, receiver) = mpsc::channel::<LogCommand>();
+    thread::spawn(move || {
+        let mut log = AppLog::load();
+        let apply_command =
+            |log: &mut AppLog,
+             command: LogCommand,
+             needs_save: &mut bool,
+             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+                match command {
+                    LogCommand::Write(entry) => {
+                        log.add_entry(entry);
+                        *needs_save = true;
+                    }
+                    LogCommand::Clear => {
+                        log.entries.clear();
+                        *needs_save = true;
+                    }
+                    LogCommand::Flush(reply) => {
+                        flush_replies.push(reply);
+                    }
                 };
-            loop {
-                let cmd = match receiver.recv() {
-                    Ok(cmd) => cmd,
-                    Err(_) => break,
-                };
-                let previous_state = log.clone();
-                let mut needs_save = false;
-                let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
-                let mut persist_result: Result<(), String> = Ok(());
-                apply_command(&mut log, cmd, &mut needs_save, &mut flush_replies);
-                while let Ok(next) = receiver.try_recv() {
-                    apply_command(&mut log, next, &mut needs_save, &mut flush_replies);
-                }
-                if needs_save {
-                    match log.save() {
-                        Ok(()) => {
-                            persist_result = Ok(());
-                        }
-                        Err(err) => {
-                            let msg = format!("Log save error: {err}");
-                            eprintln!("{msg}");
-                            log = previous_state;
-                            persist_result = Err(msg);
-                        }
+            };
+        loop {
+            let cmd = match receiver.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            };
+            let previous_state = log.clone();
+            let mut needs_save = false;
+            let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+            let mut persist_result: Result<(), String> = Ok(());
+            apply_command(&mut log, cmd, &mut needs_save, &mut flush_replies);
+            while let Ok(next) = receiver.try_recv() {
+                apply_command(&mut log, next, &mut needs_save, &mut flush_replies);
+            }
+            if needs_save {
+                match log.save() {
+                    Ok(()) => {
+                        persist_result = Ok(());
+                    }
+                    Err(err) => {
+                        let msg = format!("Log save error: {err}");
+                        eprintln!("{msg}");
+                        log = previous_state;
+                        persist_result = Err(msg);
                     }
                 }
-
-                for reply in flush_replies {
-                    let _ = reply.send(persist_result.clone());
-                }
             }
-        });
-        sender
-    })
+
+            for reply in flush_replies {
+                let _ = reply.send(persist_result.clone());
+            }
+        }
+    });
+    sender
+}
+
+fn log_writer_handle() -> &'static Mutex<mpsc::Sender<LogCommand>> {
+    static LOG_WRITER: OnceLock<Mutex<mpsc::Sender<LogCommand>>> = OnceLock::new();
+    LOG_WRITER.get_or_init(|| Mutex::new(spawn_log_writer()))
+}
+
+fn log_writer_sender() -> mpsc::Sender<LogCommand> {
+    log_writer_handle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn send_log_command(command: LogCommand) -> Result<(), mpsc::SendError<LogCommand>> {
+    let sender = log_writer_sender();
+    let command = match sender.send(command) {
+        Ok(()) => return Ok(()),
+        Err(err) => err.0,
+    };
+    let mut guard = log_writer_handle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = spawn_log_writer();
+    guard.send(command)
 }
 
 pub fn flush_log_writer() -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    if log_writer_sender().send(LogCommand::Flush(tx)).is_err() {
+    if send_log_command(LogCommand::Flush(tx)).is_err() {
         return Err("Log writer is not available".to_string());
     }
 
-    match rx.recv_timeout(LOG_WRITER_RESPONSE_TIMEOUT) {
+    match rx.recv_timeout(log_writer_response_timeout()) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err("Timed out while waiting for log persistence".to_string())
@@ -258,7 +288,7 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
     }
 
     // Persist via background writer
-    let _ = log_writer_sender().send(LogCommand::Write(entry));
+    let _ = send_log_command(LogCommand::Write(entry));
 }
 
 pub fn log_info(source: &str, message: &str) {

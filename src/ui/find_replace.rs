@@ -439,7 +439,7 @@ impl FindReplaceDialog {
                             let matches = if case_sensitive {
                                 selected == search_text
                             } else {
-                                selected.to_ascii_lowercase() == search_text.to_ascii_lowercase()
+                                selected.to_lowercase() == search_text.to_lowercase()
                             };
 
                             if matches {
