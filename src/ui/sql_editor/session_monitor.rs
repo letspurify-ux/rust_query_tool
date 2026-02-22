@@ -356,17 +356,29 @@ impl SqlEditorWidget {
                                 "Killing database session",
                             ) {
                                 Some(mut guard) => match guard.require_live_connection() {
-                                    Ok(db_conn) => QueryExecutor::kill_session_on_instance(
-                                        db_conn.as_ref(),
-                                        sid,
-                                        serial,
-                                        instance_id_for_kill,
-                                        true,
-                                    )
-                                    .map(|_| format!("Session {target_label} was killed"))
-                                    .map_err(|err| {
-                                        format!("Failed to kill session {target_label}: {err}")
-                                    }),
+                                    Ok(db_conn) => {
+                                        let kill_result = match instance_id_for_kill {
+                                            Some(inst) => QueryExecutor::kill_session_on_instance(
+                                                db_conn.as_ref(),
+                                                sid,
+                                                serial,
+                                                Some(inst),
+                                                true,
+                                            ),
+                                            None => QueryExecutor::kill_session(
+                                                db_conn.as_ref(),
+                                                sid,
+                                                serial,
+                                                true,
+                                            ),
+                                        };
+
+                                        kill_result
+                                            .map(|_| format!("Session {target_label} was killed"))
+                                            .map_err(|err| {
+                                                format!("Failed to kill session {target_label}: {err}")
+                                            })
+                                    }
                                     Err(message) => Err(message),
                                 },
                                 None => Err(format_connection_busy_message()),
