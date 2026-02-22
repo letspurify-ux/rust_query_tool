@@ -6143,15 +6143,6 @@ ORDER BY profile, resource_type, resource_name
         }
     }
 
-    pub fn kill_session(
-        conn: &Connection,
-        sid: i64,
-        serial: i64,
-        immediate: bool,
-    ) -> Result<(), OracleError> {
-        Self::kill_session_on_instance(conn, sid, serial, None, immediate)
-    }
-
     pub fn kill_session_on_instance(
         conn: &Connection,
         sid: i64,
