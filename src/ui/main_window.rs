@@ -3368,7 +3368,8 @@ impl MainWindow {
                                             s.set_tab_file_path(tab_id, Some(path.clone()));
                                             s.set_tab_pristine_text(tab_id, content);
                                             created_editor_for_open = Some(s.sql_editor.clone());
-                                            created_right_tile_for_open = Some(s.right_tile.clone());
+                                            created_right_tile_for_open =
+                                                Some(s.right_tile.clone());
                                             created_tab_for_open = Some(tab_id);
                                         }
                                     }
