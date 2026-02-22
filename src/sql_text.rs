@@ -1,4 +1,4 @@
-/// Shared SQL text helpers used across execution, formatting, and IntelliSense.
+//! Shared SQL text helpers used across execution, formatting, and IntelliSense.
 
 #[inline]
 pub(crate) fn is_identifier_char(ch: char) -> bool {
