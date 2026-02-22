@@ -57,6 +57,21 @@
 - 미존재 연결 삭제 시 keyring 미호출
 시나리오를 검증하는 테스트를 `src/utils/config.rs`에 추가.
 
+## 2026-02-22 DBA 유저 기능 다건 수정
+
+### [중] Security 뷰 로드 시 불필요한 Profile 검증으로 조회가 막히던 문제 수정
+- **증상**: Role/System/Object/Summary 뷰에서도 `Profile` 입력값을 항상 검증해, `Profile` 칸에 과거 오타가 남아 있으면 사용자 조회가 실패할 수 있었음.
+- **수정**: 뷰별 입력 정규화 로직(`normalize_security_view_filters`)을 추가해 Users/Profiles 뷰에서만 Profile 필터를 검증/적용하도록 변경.
+- **효과**: User 기반 보안 조회(요약/권한/오브젝트)가 Profile 입력 상태와 독립적으로 동작.
+
+### [중] Security 결과 행 선택 자동 채움이 컬럼 순서 의존이던 문제 수정
+- **증상**: 자동 채움이 `row.get(1)`, `row.get(2)` 같은 고정 인덱스를 사용해 쿼리 컬럼 순서가 달라지면 User/Role/Profile에 잘못된 값이 들어갈 수 있었음.
+- **수정**: 컬럼명 기반 파서(`security_autofill_values`)로 전환해 `USERNAME/GRANTEE`, `GRANTED_ROLE/PRIVILEGE`, `PROFILE`을 안전하게 추출하도록 변경.
+- **효과**: 뷰별 SELECT 컬럼 순서 변경이나 변형 쿼리에서도 자동 입력 회귀 위험 감소.
+
+### [테스트] Security 입력/자동채움 회귀 테스트 추가
+- RoleGrants 모드에서 Profile 입력값이 무시되는지 검증.
+- Users 모드에서 컬럼 순서가 뒤바뀐 행에서도 USERNAME/PROFILE을 정확히 자동 채움하는지 검증.
 ## 2026-02-22 추가 다건 수정 내역 (3)
 
 ### [중] 히스토리/오류 메시지의 user-only URI 자격증명 미마스킹 수정
