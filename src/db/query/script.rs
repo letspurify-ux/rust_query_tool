@@ -71,7 +71,7 @@ impl SplitState {
         if self.token.is_empty() {
             return;
         }
-        let upper = self.token.to_uppercase();
+        let upper = self.token.to_ascii_uppercase();
 
         if matches!(upper.as_str(), "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
             && self
@@ -1054,7 +1054,7 @@ impl QueryExecutor {
                     }
                     if k > j {
                         let word: String = chars[j..k].iter().collect();
-                        let word = word.to_uppercase();
+                        let word = word.to_ascii_uppercase();
                         if word == "SELECT" {
                             subquery_paren_depth += 1;
                         }
@@ -1264,7 +1264,7 @@ impl QueryExecutor {
         }
 
         // Check if this is a PL/SQL statement that needs trailing semicolon
-        let upper = without_semis.to_uppercase();
+        let upper = without_semis.to_ascii_uppercase();
         if upper.ends_with("END") || upper.contains("END ") {
             format!("{};", without_semis)
         } else {
@@ -1277,7 +1277,7 @@ impl QueryExecutor {
         cleaned
             .split_whitespace()
             .next()
-            .map(|token| token.to_uppercase())
+            .map(|token| token.to_ascii_uppercase())
     }
 
     pub fn is_select_statement(sql: &str) -> bool {
@@ -1967,7 +1967,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         if mode == "OFF" {
             return ToolCommand::SetServerOutput {
                 enabled: false,
@@ -2027,7 +2027,7 @@ impl QueryExecutor {
         }
 
         let mut idx = 2usize;
-        let mut object_type = tokens[idx].to_uppercase();
+        let mut object_type = tokens[idx].to_ascii_uppercase();
         if object_type == "PACKAGE"
             && tokens
                 .get(idx + 1)
@@ -2076,7 +2076,7 @@ impl QueryExecutor {
             };
         }
 
-        let topic = tokens[1].to_uppercase();
+        let topic = tokens[1].to_ascii_uppercase();
         match topic.as_str() {
             "USER" => ToolCommand::ShowUser,
             "ALL" => ToolCommand::ShowAll,
@@ -2340,7 +2340,7 @@ impl QueryExecutor {
             };
         }
 
-        match tokens[1].to_uppercase().as_str() {
+        match tokens[1].to_ascii_uppercase().as_str() {
             "SUM" | "COUNT" => {
                 let mode = if tokens[1].eq_ignore_ascii_case("SUM") {
                     ComputeMode::Sum
@@ -2447,7 +2447,7 @@ impl QueryExecutor {
         }
         let mut parts = rest.splitn(2, char::is_whitespace);
         let token_raw = parts.next().unwrap_or("");
-        let token = token_raw.to_uppercase();
+        let token = token_raw.to_ascii_uppercase();
         let action = parts
             .next()
             .map(str::trim)
@@ -2478,7 +2478,7 @@ impl QueryExecutor {
         }
 
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let token = parts.next().unwrap_or("").to_uppercase();
+        let token = parts.next().unwrap_or("").to_ascii_uppercase();
         let extra = parts.next().map(str::trim).unwrap_or("");
 
         if !extra.is_empty() {
@@ -2621,7 +2621,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetErrorContinue { enabled: true },
             "OFF" => ToolCommand::SetErrorContinue { enabled: false },
@@ -2643,7 +2643,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetAutoCommit { enabled: true },
             "OFF" => ToolCommand::SetAutoCommit { enabled: false },
@@ -2666,7 +2666,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetDefine {
                 enabled: true,
@@ -2718,7 +2718,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetScan { enabled: true },
             "OFF" => ToolCommand::SetScan { enabled: false },
@@ -2740,7 +2740,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetVerify { enabled: true },
             "OFF" => ToolCommand::SetVerify { enabled: false },
@@ -2762,7 +2762,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetEcho { enabled: true },
             "OFF" => ToolCommand::SetEcho { enabled: false },
@@ -2784,7 +2784,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetTiming { enabled: true },
             "OFF" => ToolCommand::SetTiming { enabled: false },
@@ -2806,7 +2806,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetFeedback { enabled: true },
             "OFF" => ToolCommand::SetFeedback { enabled: false },
@@ -2828,7 +2828,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetHeading { enabled: true },
             "OFF" => ToolCommand::SetHeading { enabled: false },
@@ -2890,7 +2890,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetTrimSpool { enabled: true },
             "OFF" => ToolCommand::SetTrimSpool { enabled: false },
@@ -2912,7 +2912,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetTrimOut { enabled: true },
             "OFF" => ToolCommand::SetTrimOut { enabled: false },
@@ -2934,7 +2934,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetSqlBlankLines { enabled: true },
             "OFF" => ToolCommand::SetSqlBlankLines { enabled: false },
@@ -2956,7 +2956,7 @@ impl QueryExecutor {
             };
         }
 
-        let mode = tokens[2].to_uppercase();
+        let mode = tokens[2].to_ascii_uppercase();
         match mode.as_str() {
             "ON" => ToolCommand::SetTab { enabled: true },
             "OFF" => ToolCommand::SetTab { enabled: false },
@@ -3075,7 +3075,7 @@ impl QueryExecutor {
             return Err("VAR requires a data type.".to_string());
         }
 
-        let upper = trimmed.to_uppercase();
+        let upper = trimmed.to_ascii_uppercase();
         let compact = upper.replace(' ', "");
 
         if compact == "REFCURSOR" || compact == "SYS_REFCURSOR" {
