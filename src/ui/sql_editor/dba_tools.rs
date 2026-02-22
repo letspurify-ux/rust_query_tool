@@ -3309,17 +3309,39 @@ impl SqlEditorWidget {
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
 
+        fn enqueue_security_view_load(
+            sender: &mpsc::Sender<SecurityMessage>,
+            mode: SecurityViewMode,
+            user_text: String,
+            profile_text: String,
+            attention_only: bool,
+        ) -> Result<(), String> {
+            normalize_security_view_filters(mode, &user_text, &profile_text)?;
+            sender
+                .send(SecurityMessage::LoadRequested {
+                    mode,
+                    user_text,
+                    profile_text,
+                    attention_only,
+                })
+                .map_err(|_| "Failed to queue security view load request".to_string())
+        }
+
         let sender_users = sender.clone();
         let user_input_for_users = user_input.clone();
         let profile_input_for_users = profile_input.clone();
         let attention_only_check_for_users = attention_only_check.clone();
         users_btn.set_callback(move |_| {
-            let _ = sender_users.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::Users,
-                user_text: user_input_for_users.value(),
-                profile_text: profile_input_for_users.value(),
-                attention_only: attention_only_check_for_users.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_users,
+                SecurityViewMode::Users,
+                user_input_for_users.value(),
+                profile_input_for_users.value(),
+                attention_only_check_for_users.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3328,12 +3350,16 @@ impl SqlEditorWidget {
         let profile_input_for_summary = profile_input.clone();
         let attention_only_check_for_summary = attention_only_check.clone();
         summary_btn.set_callback(move |_| {
-            let _ = sender_summary.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::Summary,
-                user_text: user_input_for_summary.value(),
-                profile_text: profile_input_for_summary.value(),
-                attention_only: attention_only_check_for_summary.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_summary,
+                SecurityViewMode::Summary,
+                user_input_for_summary.value(),
+                profile_input_for_summary.value(),
+                attention_only_check_for_summary.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3342,12 +3368,16 @@ impl SqlEditorWidget {
         let profile_input_for_roles = profile_input.clone();
         let attention_only_check_for_roles = attention_only_check.clone();
         roles_btn.set_callback(move |_| {
-            let _ = sender_roles.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::RoleGrants,
-                user_text: user_input_for_roles.value(),
-                profile_text: profile_input_for_roles.value(),
-                attention_only: attention_only_check_for_roles.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_roles,
+                SecurityViewMode::RoleGrants,
+                user_input_for_roles.value(),
+                profile_input_for_roles.value(),
+                attention_only_check_for_roles.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3356,12 +3386,16 @@ impl SqlEditorWidget {
         let profile_input_for_sys = profile_input.clone();
         let attention_only_check_for_sys = attention_only_check.clone();
         sys_btn.set_callback(move |_| {
-            let _ = sender_sys.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::SystemGrants,
-                user_text: user_input_for_sys.value(),
-                profile_text: profile_input_for_sys.value(),
-                attention_only: attention_only_check_for_sys.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_sys,
+                SecurityViewMode::SystemGrants,
+                user_input_for_sys.value(),
+                profile_input_for_sys.value(),
+                attention_only_check_for_sys.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3370,12 +3404,16 @@ impl SqlEditorWidget {
         let profile_input_for_obj = profile_input.clone();
         let attention_only_check_for_obj = attention_only_check.clone();
         obj_btn.set_callback(move |_| {
-            let _ = sender_obj.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::ObjectGrants,
-                user_text: user_input_for_obj.value(),
-                profile_text: profile_input_for_obj.value(),
-                attention_only: attention_only_check_for_obj.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_obj,
+                SecurityViewMode::ObjectGrants,
+                user_input_for_obj.value(),
+                profile_input_for_obj.value(),
+                attention_only_check_for_obj.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3384,12 +3422,16 @@ impl SqlEditorWidget {
         let profile_input_for_profiles = profile_input.clone();
         let attention_only_check_for_profiles = attention_only_check.clone();
         profile_btn.set_callback(move |_| {
-            let _ = sender_profiles.send(SecurityMessage::LoadRequested {
-                mode: SecurityViewMode::Profiles,
-                user_text: user_input_for_profiles.value(),
-                profile_text: profile_input_for_profiles.value(),
-                attention_only: attention_only_check_for_profiles.value(),
-            });
+            if let Err(err) = enqueue_security_view_load(
+                &sender_profiles,
+                SecurityViewMode::Profiles,
+                user_input_for_profiles.value(),
+                profile_input_for_profiles.value(),
+                attention_only_check_for_profiles.value(),
+            ) {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
             app::awake();
         });
 
@@ -3878,13 +3920,20 @@ impl SqlEditorWidget {
             &mut unlock_user_btn,
         );
 
-        let _ = sender.send(SecurityMessage::LoadRequested {
-            mode: SecurityViewMode::Users,
-            user_text: user_input.value(),
-            profile_text: profile_input.value(),
-            attention_only: attention_only_check.value(),
-        });
-        app::awake();
+        if let Err(err) = enqueue_security_view_load(
+            &sender,
+            SecurityViewMode::Users,
+            user_input.value(),
+            profile_input.value(),
+            attention_only_check.value(),
+        ) {
+            status.set_label(&format!(
+                "Initial security view load failed: {}",
+                err
+            ));
+        } else {
+            app::awake();
+        }
 
         while dialog.shown() {
             app::wait();
@@ -4731,13 +4780,20 @@ impl SqlEditorWidget {
                         match result {
                             Ok(message) => {
                                 status.set_label(&message);
-                                let _ = sender.send(SecurityMessage::LoadRequested {
-                                    mode: current_view_mode,
-                                    user_text: user_input.value(),
-                                    profile_text: profile_input.value(),
-                                    attention_only: attention_only_check.value(),
-                                });
-                                app::awake();
+                                if let Err(err) = enqueue_security_view_load(
+                                    &sender,
+                                    current_view_mode,
+                                    user_input.value(),
+                                    profile_input.value(),
+                                    attention_only_check.value(),
+                                ) {
+                                    status.set_label(&format!(
+                                        "Reload skipped after action: {}",
+                                        err
+                                    ));
+                                } else {
+                                    app::awake();
+                                }
                             }
                             Err(err) => {
                                 status.set_label("Security action failed");
