@@ -182,8 +182,9 @@ fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = fold_for_case_insensitive(message);
     let patterns = [
         "error at line",
+        "near line",
         "line:",
-        " line ",
+        " at line ",
         // Keep ORA-06512 lower priority so we prefer primary parser errors.
         "ora-06512: at line",
     ];
@@ -1341,6 +1342,13 @@ mod query_history_tests {
         let message = "failed near line 1
 ORA-06512: at line 27";
         assert_eq!(parse_error_line(message), Some(1));
+    }
+
+    #[test]
+    fn parse_error_line_ignores_non_error_line_wording() {
+        let message = "client command line 8 received
+server location at line 12";
+        assert_eq!(parse_error_line(message), Some(12));
     }
 
     #[test]
