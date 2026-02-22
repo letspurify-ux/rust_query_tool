@@ -3097,7 +3097,7 @@ impl SqlEditorWidget {
         quick_action_choice.set_color(theme::input_bg());
         quick_action_choice.set_text_color(theme::text_primary());
         quick_action_choice.add_choice(
-            "Grant Role|Revoke Role|Grant Sys Priv|Revoke Sys Priv|Set Profile|Lock User|Unlock User|Expire Password|Create User|Drop User|Create Role|Drop Role",
+            "Select action...|Grant Role|Revoke Role|Grant Sys Priv|Revoke Sys Priv|Set Profile|Lock User|Unlock User|Expire Password|Create User|Drop User|Create Role|Drop Role",
         );
         quick_action_choice.set_value(0);
         quick_row.fixed(&quick_action_choice, 220);
@@ -3380,52 +3380,52 @@ impl SqlEditorWidget {
         quick_run_btn.set_callback(move |_| {
             let action = quick_choice_for_run.value();
             let dispatched = match action {
-                0 => sender_quick_run
+                1 => sender_quick_run
                     .send(SecurityMessage::GrantRoleRequested {
                         user_text: user_input_for_quick.value(),
                         role_text: role_input_for_quick.value(),
                     })
                     .is_ok(),
-                1 => sender_quick_run
+                2 => sender_quick_run
                     .send(SecurityMessage::RevokeRoleRequested {
                         user_text: user_input_for_quick.value(),
                         role_text: role_input_for_quick.value(),
                     })
                     .is_ok(),
-                2 => sender_quick_run
+                3 => sender_quick_run
                     .send(SecurityMessage::GrantSystemPrivRequested {
                         user_text: user_input_for_quick.value(),
                         priv_text: role_input_for_quick.value(),
                     })
                     .is_ok(),
-                3 => sender_quick_run
+                4 => sender_quick_run
                     .send(SecurityMessage::RevokeSystemPrivRequested {
                         user_text: user_input_for_quick.value(),
                         priv_text: role_input_for_quick.value(),
                     })
                     .is_ok(),
-                4 => sender_quick_run
+                5 => sender_quick_run
                     .send(SecurityMessage::SetProfileRequested {
                         user_text: user_input_for_quick.value(),
                         profile_text: profile_input_for_quick.value(),
                     })
                     .is_ok(),
-                5 => sender_quick_run
+                6 => sender_quick_run
                     .send(SecurityMessage::LockUserRequested {
                         user_text: user_input_for_quick.value(),
                     })
                     .is_ok(),
-                6 => sender_quick_run
+                7 => sender_quick_run
                     .send(SecurityMessage::UnlockUserRequested {
                         user_text: user_input_for_quick.value(),
                     })
                     .is_ok(),
-                7 => sender_quick_run
+                8 => sender_quick_run
                     .send(SecurityMessage::ExpirePasswordRequested {
                         user_text: user_input_for_quick.value(),
                     })
                     .is_ok(),
-                8 => {
+                9 => {
                     let Some(password) = prompt_secret_text("User password") else {
                         return;
                     };
@@ -3449,7 +3449,7 @@ impl SqlEditorWidget {
                         })
                         .is_ok()
                 }
-                9 => {
+                10 => {
                     let choice = fltk::dialog::choice2_default(
                         "Drop user mode",
                         "Cancel",
@@ -3468,12 +3468,12 @@ impl SqlEditorWidget {
                         })
                         .is_ok()
                 }
-                10 => sender_quick_run
+                11 => sender_quick_run
                     .send(SecurityMessage::CreateRoleRequested {
                         role_text: role_input_for_quick.value(),
                     })
                     .is_ok(),
-                11 => sender_quick_run
+                12 => sender_quick_run
                     .send(SecurityMessage::DropRoleRequested {
                         role_text: role_input_for_quick.value(),
                     })
@@ -6859,20 +6859,40 @@ fn parse_percentage_thresholds(warn_text: &str, critical_text: &str) -> Result<(
 
 fn security_quick_action_hint(action_index: i32) -> &'static str {
     match action_index {
-        0 => "Quick: grant role. Fill User + Role/Priv.",
-        1 => "Quick: revoke role. Fill User + Role/Priv.",
-        2 => "Quick: grant system privilege. Fill User + Role/Priv.",
-        3 => "Quick: revoke system privilege. Fill User + Role/Priv.",
-        4 => "Quick: set profile. Fill User + Profile.",
-        5 => "Quick: lock user. Fill User.",
-        6 => "Quick: unlock user. Fill User.",
-        7 => "Quick: expire password. Fill User.",
-        8 => "Quick: create user. Fill User (+ optional Profile).",
-        9 => "Quick: drop user. Fill User.",
-        10 => "Quick: create role. Fill Role/Priv.",
-        11 => "Quick: drop role. Fill Role/Priv.",
-        _ => "Quick: select action, then run.",
+        1 => "Quick: grant role. Fill User + Role/Priv.",
+        2 => "Quick: revoke role. Fill User + Role/Priv.",
+        3 => "Quick: grant system privilege. Fill User + Role/Priv.",
+        4 => "Quick: revoke system privilege. Fill User + Role/Priv.",
+        5 => "Quick: set profile. Fill User + Profile.",
+        6 => "Quick: lock user. Fill User.",
+        7 => "Quick: unlock user. Fill User.",
+        8 => "Quick: expire password. Fill User.",
+        9 => "Quick: create user. Fill User (+ optional Profile).",
+        10 => "Quick: drop user. Fill User.",
+        11 => "Quick: create role. Fill Role/Priv.",
+        12 => "Quick: drop role. Fill Role/Priv.",
+        _ => "Quick: select an action first, then run.",
     }
+}
+
+fn security_mode_uses_user(mode: SecurityViewMode) -> bool {
+    !matches!(mode, SecurityViewMode::Profiles)
+}
+
+fn security_mode_uses_role(mode: SecurityViewMode) -> bool {
+    matches!(
+        mode,
+        SecurityViewMode::RoleGrants
+            | SecurityViewMode::SystemGrants
+            | SecurityViewMode::ObjectGrants
+    )
+}
+
+fn security_mode_uses_profile(mode: SecurityViewMode) -> bool {
+    matches!(
+        mode,
+        SecurityViewMode::Users | SecurityViewMode::Summary | SecurityViewMode::Profiles
+    )
 }
 
 fn prompt_optional_text(prompt: &str, default_value: &str) -> Option<String> {
@@ -6984,13 +7004,17 @@ fn normalize_security_view_filters(
     user_text: &str,
     profile_text: &str,
 ) -> Result<(Option<String>, Option<String>), String> {
-    let user = match mode {
-        SecurityViewMode::Profiles => None,
-        SecurityViewMode::Users => normalize_optional_identifier(user_text, "User")?,
-        _ => Some(normalize_required_identifier(user_text, "User")?),
+    let user = if security_mode_uses_user(mode) {
+        if matches!(mode, SecurityViewMode::Users) {
+            normalize_optional_identifier(user_text, "User")?
+        } else {
+            Some(normalize_required_identifier(user_text, "User")?)
+        }
+    } else {
+        None
     };
 
-    let profile_filter = if matches!(mode, SecurityViewMode::Users | SecurityViewMode::Profiles) {
+    let profile_filter = if security_mode_uses_profile(mode) {
         normalize_optional_identifier(profile_text, "Profile")?
     } else {
         None
@@ -7017,11 +7041,11 @@ fn security_autofill_values(
     row_values: &[String],
     columns: &[String],
 ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let user_value = if matches!(mode, SecurityViewMode::Profiles) {
-        None
-    } else {
+    let user_value = if security_mode_uses_user(mode) {
         normalized_identifier_cell(row_values, columns, "USERNAME")
             .or_else(|| normalized_identifier_cell(row_values, columns, "GRANTEE"))
+    } else {
+        None
     };
 
     let role_value = match mode {
@@ -7035,12 +7059,10 @@ fn security_autofill_values(
         _ => None,
     };
 
-    let profile_value = match mode {
-        SecurityViewMode::Summary | SecurityViewMode::Users => {
-            normalized_identifier_cell(row_values, columns, "PROFILE")
-        }
-        SecurityViewMode::Profiles => normalized_identifier_cell(row_values, columns, "PROFILE"),
-        _ => None,
+    let profile_value = if security_mode_uses_profile(mode) {
+        normalized_identifier_cell(row_values, columns, "PROFILE")
+    } else {
+        None
     };
 
     if user_value.is_none() && role_value.is_none() && profile_value.is_none() {
@@ -7243,6 +7265,7 @@ fn refresh_security_action_controls(
     unlock_user_btn: &mut Button,
 ) {
     let profiles_mode = matches!(mode, SecurityViewMode::Profiles);
+    let role_actions_mode = security_mode_uses_role(mode);
     let set_enabled = |button: &mut Button| {
         if profiles_mode {
             button.deactivate();
@@ -7270,7 +7293,12 @@ fn refresh_security_action_controls(
             "Disabled in Profiles view. Switch to Users/Summary/Grants to run actions.",
         );
     } else {
-        quick_run_btn.set_tooltip("Run selected quick action");
+        let quick_tooltip = if role_actions_mode {
+            "Run selected quick action (grant/revoke actions are most relevant in grants views)"
+        } else {
+            "Run selected quick action"
+        };
+        quick_run_btn.set_tooltip(quick_tooltip);
     }
 }
 
@@ -7323,7 +7351,8 @@ mod tests {
         normalize_security_view_filters, parse_bounded_positive_u32,
         parse_optional_non_negative_i32, parse_percentage_thresholds, parse_positive_u32,
         parse_sid_serial_row, parse_sql_id_child_row, parse_sql_monitor_session_target,
-        qualified_owner_object, security_autofill_values, security_quick_action_hint,
+        qualified_owner_object, security_autofill_values, security_mode_uses_profile,
+        security_mode_uses_role, security_mode_uses_user, security_quick_action_hint,
         sql_monitor_session_target_label, QueryResult, SecurityViewMode,
     };
 
@@ -7665,13 +7694,34 @@ mod tests {
     }
 
     #[test]
+    fn security_mode_field_usage_matches_view() {
+        assert!(security_mode_uses_user(SecurityViewMode::Users));
+        assert!(security_mode_uses_user(SecurityViewMode::Summary));
+        assert!(!security_mode_uses_user(SecurityViewMode::Profiles));
+
+        assert!(security_mode_uses_role(SecurityViewMode::RoleGrants));
+        assert!(security_mode_uses_role(SecurityViewMode::SystemGrants));
+        assert!(security_mode_uses_role(SecurityViewMode::ObjectGrants));
+        assert!(!security_mode_uses_role(SecurityViewMode::Users));
+
+        assert!(security_mode_uses_profile(SecurityViewMode::Users));
+        assert!(security_mode_uses_profile(SecurityViewMode::Summary));
+        assert!(security_mode_uses_profile(SecurityViewMode::Profiles));
+        assert!(!security_mode_uses_profile(SecurityViewMode::RoleGrants));
+    }
+
+    #[test]
     fn security_quick_action_hint_maps_known_actions() {
         assert_eq!(
             security_quick_action_hint(0),
+            "Quick: select an action first, then run."
+        );
+        assert_eq!(
+            security_quick_action_hint(1),
             "Quick: grant role. Fill User + Role/Priv."
         );
         assert_eq!(
-            security_quick_action_hint(11),
+            security_quick_action_hint(12),
             "Quick: drop role. Fill Role/Priv."
         );
     }
