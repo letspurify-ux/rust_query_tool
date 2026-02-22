@@ -71,13 +71,13 @@ fn refill_font_list(
     filtered: &mut Vec<String>,
     selected_font: &mut String,
 ) {
-    let query = query.trim().to_ascii_lowercase();
+    let query = query.trim().to_lowercase();
 
     filtered.clear();
     browser.clear();
 
     for name in all_fonts {
-        if query.is_empty() || name.to_ascii_lowercase().contains(&query) {
+        if query.is_empty() || name.to_lowercase().contains(&query) {
             filtered.push(name.clone());
         }
     }

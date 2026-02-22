@@ -34,7 +34,7 @@ fn build_connection_info(
             return false;
         }
         host.chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
     }
 
     fn is_valid_service_name(service_name: &str) -> bool {
@@ -329,10 +329,12 @@ impl ConnectionDialog {
                         Err(err) => {
                             keyring_load_failed = true;
                             fltk::dialog::alert_default(&err);
-                            String::new()
+                            pass_input_cb.value()
                         }
                     };
-                    pass_input_cb.set_value(&password);
+                    if !keyring_load_failed {
+                        pass_input_cb.set_value(&password);
+                    }
                     host_input_cb.set_value(&conn.host);
                     port_input_cb.set_value(&conn.port.to_string());
                     service_input_cb.set_value(&conn.service_name);
@@ -529,6 +531,8 @@ impl ConnectionDialog {
                         if let Err(e) = cfg.add_recent_connection(info.clone()) {
                             fltk::dialog::alert_default(&e);
                         } else if let Err(e) = cfg.save() {
+                            let _ = crate::utils::credential_store::delete_password(&info.name);
+                            cfg.recent_connections.retain(|c| c.name != info.name);
                             fltk::dialog::alert_default(&format!(
                                 "Failed to save connection: {}",
                                 e
@@ -550,10 +554,13 @@ impl ConnectionDialog {
                                 continue;
                             }
                             if let Err(e) = cfg.save() {
+                                let _ = crate::utils::credential_store::delete_password(&info.name);
+                                cfg.recent_connections.retain(|c| c.name != info.name);
                                 fltk::dialog::alert_default(&format!(
                                     "Failed to save connection: {}",
                                     e
                                 ));
+                                continue;
                             }
                         }
 

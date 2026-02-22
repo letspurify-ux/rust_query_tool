@@ -28,95 +28,122 @@ enum HistoryCommand {
     Flush(mpsc::Sender<Result<(), String>>),
 }
 
-const HISTORY_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const REDACTED_SECRET: &str = "<redacted>";
 
-fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
-    static HISTORY_WRITER: OnceLock<mpsc::Sender<HistoryCommand>> = OnceLock::new();
-    HISTORY_WRITER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<HistoryCommand>();
-        thread::spawn(move || {
-            let mut history = QueryHistory::load();
-            let apply_command =
-                |history: &mut QueryHistory,
-                 command: HistoryCommand,
-                 needs_save: &mut bool,
-                 snapshot_replies: &mut Vec<mpsc::Sender<Vec<QueryHistoryEntry>>>,
-                 flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
-                    match command {
-                        HistoryCommand::Add(entry) => {
-                            history.add_entry(entry);
-                            *needs_save = true;
-                        }
-                        HistoryCommand::Clear => {
-                            history.queries.clear();
-                            *needs_save = true;
-                        }
-                        HistoryCommand::Snapshot(reply) => {
-                            snapshot_replies.push(reply);
-                        }
-                        HistoryCommand::Flush(reply) => {
-                            flush_replies.push(reply);
-                        }
+fn history_writer_response_timeout() -> Duration {
+    std::env::var("SPACE_QUERY_HISTORY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
+}
+
+fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
+    let (sender, receiver) = mpsc::channel::<HistoryCommand>();
+    thread::spawn(move || {
+        let mut history = QueryHistory::load();
+        let apply_command =
+            |history: &mut QueryHistory,
+             command: HistoryCommand,
+             needs_save: &mut bool,
+             snapshot_replies: &mut Vec<mpsc::Sender<Vec<QueryHistoryEntry>>>,
+             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+                match command {
+                    HistoryCommand::Add(entry) => {
+                        history.add_entry(entry);
+                        *needs_save = true;
                     }
-                };
-            while let Ok(cmd) = receiver.recv() {
-                let previous_state = history.clone();
-                let mut needs_save = false;
-                let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
-                let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+                    HistoryCommand::Clear => {
+                        history.queries.clear();
+                        *needs_save = true;
+                    }
+                    HistoryCommand::Snapshot(reply) => {
+                        snapshot_replies.push(reply);
+                    }
+                    HistoryCommand::Flush(reply) => {
+                        flush_replies.push(reply);
+                    }
+                }
+            };
+        while let Ok(cmd) = receiver.recv() {
+            let previous_state = history.clone();
+            let mut needs_save = false;
+            let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
+            let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
+            apply_command(
+                &mut history,
+                cmd,
+                &mut needs_save,
+                &mut snapshot_replies,
+                &mut flush_replies,
+            );
+            let mut persist_result: Result<(), String> = Ok(());
+            while let Ok(next) = receiver.try_recv() {
                 apply_command(
                     &mut history,
-                    cmd,
+                    next,
                     &mut needs_save,
                     &mut snapshot_replies,
                     &mut flush_replies,
                 );
-                let mut persist_result: Result<(), String> = Ok(());
-                // Drain any pending commands before saving
-                while let Ok(next) = receiver.try_recv() {
-                    apply_command(
-                        &mut history,
-                        next,
-                        &mut needs_save,
-                        &mut snapshot_replies,
-                        &mut flush_replies,
-                    );
-                }
-                if needs_save {
-                    match history.save() {
-                        Ok(()) => {
-                            persist_result = Ok(());
-                        }
-                        Err(err) => {
-                            let msg = format!("Query history save error: {err}");
-                            crate::utils::logging::log_error("history", &msg);
-                            eprintln!("{msg}");
-                            history = previous_state;
-                            persist_result = Err(msg);
-                        }
+            }
+            if needs_save {
+                match history.save() {
+                    Ok(()) => {
+                        persist_result = Ok(());
+                    }
+                    Err(err) => {
+                        let msg = format!("Query history save error: {err}");
+                        crate::utils::logging::log_error("history", &msg);
+                        eprintln!("{msg}");
+                        history = previous_state;
+                        persist_result = Err(msg);
                     }
                 }
-
-                for reply in snapshot_replies {
-                    let _ = reply.send(history.queries.clone());
-                }
-
-                for reply in flush_replies {
-                    let _ = reply.send(persist_result.clone());
-                }
             }
-        });
-        sender
-    })
+
+            for reply in snapshot_replies {
+                let _ = reply.send(history.queries.clone());
+            }
+
+            for reply in flush_replies {
+                let _ = reply.send(persist_result.clone());
+            }
+        }
+    });
+    sender
+}
+
+fn history_writer_handle() -> &'static Mutex<mpsc::Sender<HistoryCommand>> {
+    static HISTORY_WRITER: OnceLock<Mutex<mpsc::Sender<HistoryCommand>>> = OnceLock::new();
+    HISTORY_WRITER.get_or_init(|| Mutex::new(spawn_history_writer()))
+}
+
+fn history_writer_sender() -> mpsc::Sender<HistoryCommand> {
+    history_writer_handle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn send_history_command(command: HistoryCommand) -> Result<(), mpsc::SendError<HistoryCommand>> {
+    let initial_sender = history_writer_sender();
+    let command = match initial_sender.send(command) {
+        Ok(()) => return Ok(()),
+        Err(err) => err.0,
+    };
+
+    let mut guard = history_writer_handle()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = spawn_history_writer();
+    guard.send(command)
 }
 
 pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    if history_writer_sender()
-        .send(HistoryCommand::Flush(tx))
-        .is_err()
-    {
+    if send_history_command(HistoryCommand::Flush(tx)).is_err() {
         return Err("Query history writer is not available".to_string());
     }
 
@@ -132,14 +159,14 @@ pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String
 }
 
 pub fn flush_history_writer() -> Result<(), String> {
-    flush_history_writer_with_timeout(HISTORY_WRITER_RESPONSE_TIMEOUT)
+    flush_history_writer_with_timeout(history_writer_response_timeout())
 }
 
 fn parse_error_line(message: &str) -> Option<usize> {
-    let lowercase = message.to_ascii_lowercase();
-    let mut parsed_lines: Vec<usize> = Vec::new();
+    let lowercase = message.to_lowercase();
+    let patterns = ["error at line", "line:", " line ", "ora-06512: at line"];
 
-    for needle in ["error at line", "line:", " line ", "ora-06512: at line"] {
+    for needle in patterns {
         let mut search_start = 0usize;
         while search_start < lowercase.len() {
             let Some(relative_idx) = lowercase[search_start..].find(needle) else {
@@ -154,7 +181,7 @@ fn parse_error_line(message: &str) -> Option<usize> {
                 let Some((ch, next)) = next_char_with_clamped_boundary(&lowercase, cursor) else {
                     break;
                 };
-                if ch.is_ascii_whitespace() && digits.is_empty() {
+                if ch.is_whitespace() && digits.is_empty() {
                     cursor = next;
                     continue;
                 }
@@ -167,14 +194,13 @@ fn parse_error_line(message: &str) -> Option<usize> {
             }
 
             if let Ok(value) = digits.parse::<usize>() {
-                parsed_lines.push(value);
+                return Some(value);
             }
-
             search_start = idx.saturating_add(needle.len());
         }
     }
 
-    parsed_lines.into_iter().last()
+    None
 }
 
 fn sanitize_history_sql(sql: &str) -> String {
@@ -628,9 +654,21 @@ fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
         .send(HistoryCommand::Snapshot(tx))
         .is_ok()
     {
-        match rx.recv_timeout(HISTORY_WRITER_RESPONSE_TIMEOUT) {
+        match rx.recv_timeout(history_writer_response_timeout()) {
             Ok(snapshot) => (snapshot, false),
-            Err(_) => (QueryHistory::load().queries, true),
+            Err(_) => {
+                if let Ok(()) = flush_history_writer() {
+                    let (retry_tx, retry_rx) = mpsc::channel();
+                    if send_history_command(HistoryCommand::Snapshot(retry_tx)).is_ok() {
+                        if let Ok(retry_snapshot) =
+                            retry_rx.recv_timeout(history_writer_response_timeout())
+                        {
+                            return (retry_snapshot, false);
+                        }
+                    }
+                }
+                (QueryHistory::load().queries, true)
+            }
         }
     } else {
         // Writer thread dead – fall back to disk
@@ -639,7 +677,7 @@ fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
 }
 
 pub fn clear_history() -> Result<(), String> {
-    match history_writer_sender().send(HistoryCommand::Clear) {
+    match send_history_command(HistoryCommand::Clear) {
         Ok(()) => flush_history_writer(),
         Err(send_err) => {
             if let HistoryCommand::Clear = send_err.0 {
@@ -1037,9 +1075,9 @@ impl QueryHistoryDialog {
         connection_name: &str,
         success: bool,
         message: &str,
-    ) {
+    ) -> Result<(), String> {
         if sql.trim().is_empty() {
-            return;
+            return Ok(());
         }
 
         let sanitized_sql = sanitize_history_sql(sql);
@@ -1061,25 +1099,20 @@ impl QueryHistoryDialog {
             error_line,
         };
 
-        if let Err(err) = history_writer_sender().send(HistoryCommand::Add(entry)) {
+        if let Err(err) = send_history_command(HistoryCommand::Add(entry)) {
             app::awake();
-            // Fallback: if channel is disconnected, save directly
             if let HistoryCommand::Add(entry) = err.0 {
                 let mut history = QueryHistory::load();
                 history.add_entry(entry);
                 if let Err(save_err) = history.save() {
-                    crate::utils::logging::log_error(
-                        "history",
-                        &format!("Query history fallback save error: {save_err}"),
-                    );
-                    eprintln!("Query history fallback save error: {save_err}");
-                    fltk::dialog::alert_default(&format!(
-                        "Failed to save query history: {}",
-                        save_err
-                    ));
+                    let error_message = format!("Query history fallback save error: {save_err}");
+                    crate::utils::logging::log_error("history", &error_message);
+                    eprintln!("{error_message}");
+                    return Err(error_message);
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -1109,9 +1142,13 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 
     if trimmed.chars().count() > max_len {
+        let visible_len = max_len.saturating_sub(3);
+        if visible_len == 0 {
+            return "...".to_string();
+        }
         let end = trimmed
             .char_indices()
-            .nth(max_len)
+            .nth(visible_len)
             .map(|(idx, _)| idx)
             .unwrap_or(trimmed.len());
         format!("{}...", &trimmed[..end])
@@ -1133,23 +1170,23 @@ fn history_entry_matches_filter(
         return true;
     }
 
-    let sql = entry.sql.to_ascii_lowercase();
+    let sql = entry.sql.to_lowercase();
     if sql.contains(search_lower) {
         return true;
     }
 
-    let connection = entry.connection_name.to_ascii_lowercase();
+    let connection = entry.connection_name.to_lowercase();
     if connection.contains(search_lower) {
         return true;
     }
 
-    let timestamp = entry.timestamp.to_ascii_lowercase();
+    let timestamp = entry.timestamp.to_lowercase();
     if timestamp.contains(search_lower) {
         return true;
     }
 
     match entry.error_message.as_deref() {
-        Some(message) => message.to_ascii_lowercase().contains(search_lower),
+        Some(message) => message.to_lowercase().contains(search_lower),
         None => false,
     }
 }
@@ -1172,7 +1209,7 @@ fn populate_history_browser(
     search_text: &str,
     failed_only: bool,
 ) {
-    let search_lower = search_text.trim().to_ascii_lowercase();
+    let search_lower = search_text.trim().to_lowercase();
     browser.clear();
 
     let mut indices = filtered_indices
@@ -1204,7 +1241,7 @@ mod query_history_tests {
     #[test]
     fn truncate_sql_truncates_on_char_boundary_for_multibyte_text() {
         let sql = "가나다라마바사";
-        assert_eq!(truncate_sql(sql, 5), "가나다라마...");
+        assert_eq!(truncate_sql(sql, 5), "가나...");
     }
 
     #[test]
@@ -1261,10 +1298,10 @@ mod query_history_tests {
     }
 
     #[test]
-    fn parse_error_line_prefers_last_relevant_line_reference() {
+    fn parse_error_line_prefers_primary_error_line_reference() {
         let message = "failed near line 1
 ORA-06512: at line 27";
-        assert_eq!(parse_error_line(message), Some(27));
+        assert_eq!(parse_error_line(message), Some(1));
     }
 
     #[test]
