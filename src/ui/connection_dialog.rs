@@ -596,8 +596,7 @@ impl ConnectionDialog {
                                     crate::utils::credential_store::delete_password(&info.name)
                                         .err();
                                 cfg.recent_connections.retain(|c| c.name != info.name);
-                                let mut message =
-                                    format!("Failed to save connection: {}", e);
+                                let mut message = format!("Failed to save connection: {}", e);
                                 if let Some(cleanup_error) = cleanup_error {
                                     message.push_str(&format!(
                                         "\nAdditionally failed to roll back keyring entry: {}",
