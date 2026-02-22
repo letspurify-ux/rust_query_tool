@@ -1403,11 +1403,7 @@ impl QueryExecutor {
         if !trimmed_line.is_empty() {
             if trimmed_line == "/" {
                 let spans = spans_for_sql(sql);
-                if let Some(prev) = spans
-                    .iter()
-                    .filter(|span| span.end <= line_start)
-                    .next_back()
-                {
+                if let Some(prev) = spans.iter().rfind(|span| span.end <= line_start) {
                     return Some((prev.start, prev.end));
                 }
             }
@@ -2031,7 +2027,7 @@ impl QueryExecutor {
             // Skip EDITIONABLE/NONEDITIONABLE
             if tokens
                 .get(idx)
-                .map_or(false, |t| *t == "EDITIONABLE" || *t == "NONEDITIONABLE")
+                .is_some_and(|t| *t == "EDITIONABLE" || *t == "NONEDITIONABLE")
             {
                 idx += 1;
             }
