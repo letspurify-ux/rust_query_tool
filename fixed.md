@@ -105,3 +105,22 @@
 - keyring 비밀번호 존재 시 우선 적용,
 - keyring 비밀번호 부재 시 기존 입력값 유지
 시나리오를 `src/ui/connection_dialog.rs` 테스트에 추가.
+
+## 2026-02-22 추가 다건 수정 내역 (5)
+
+### [중] CONNECT 감지 오탐(주석/문자열) 수정
+- **증상**: 실행 전 부트스트랩 명령 감지(`has_connection_bootstrap_command`)가 라인 단위 텍스트를 직접 검사해, `/* CONNECT ... */` 주석이나 `'CONNECT ...'` 문자열도 연결 명령으로 오탐할 수 있었음.
+- **수정**: 감지 경로를 `QueryExecutor::split_script_items` 기반으로 전환해 실제 파싱된 `ToolCommand`만 대상으로 판단하도록 변경.
+- **효과**: 주석/리터럴 내 CONNECT 텍스트로 인한 잘못된 연결 허용/분기 진입을 방지.
+
+### [중] 커서 오프셋 경계 미검증으로 인한 UTF-8 경계 취약점 보완
+- **증상**: `statement_at_cursor`/`statement_bounds_in_text`가 전달받은 `cursor_pos`를 그대로 사용해, 잘못된 mid-byte 오프셋이 들어오면 하위 경계 계산에서 잠재적 오류/예상치 못한 동작 여지가 있었음.
+- **수정**: `clamp_cursor_to_char_boundary`를 추가해 `cursor_pos`를 문자열 길이 내로 clamp하고, UTF-8 유효 경계(`is_char_boundary`)로 보정 후 실행기 호출.
+- **효과**: 바이트 오프셋 정책을 준수하며, 잘못된 커서 입력에서도 안전하게 가장 가까운 유효 경계로 복구.
+
+### [테스트] 회귀 테스트 추가
+- 주석/문자열 내 CONNECT 오탐 방지,
+- mid-byte 커서 보정,
+- out-of-bounds 커서 보정,
+- 경계 보정 유틸 동작
+시나리오를 `src/ui/sql_editor/query_text.rs` 테스트로 추가.
