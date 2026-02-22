@@ -29,6 +29,23 @@ fn build_connection_info(
     port_text: &str,
     service_name: &str,
 ) -> Result<ConnectionInfo, String> {
+    fn is_valid_host(host: &str) -> bool {
+        if host.is_empty() {
+            return false;
+        }
+        host.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
+    }
+
+    fn is_valid_service_name(service_name: &str) -> bool {
+        if service_name.is_empty() {
+            return false;
+        }
+        service_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '$' | '#' | '/'))
+    }
+
     let name = name.trim();
     let username = username.trim();
     let host = host.trim();
@@ -44,8 +61,14 @@ fn build_connection_info(
     if host.is_empty() {
         return Err("Host is required".to_string());
     }
+    if !is_valid_host(host) {
+        return Err("Host contains invalid characters".to_string());
+    }
     if service_name.is_empty() {
         return Err("Service name is required".to_string());
+    }
+    if !is_valid_service_name(service_name) {
+        return Err("Service name contains invalid characters".to_string());
     }
 
     let port = port_text
@@ -300,9 +323,11 @@ impl ConnectionDialog {
                     name_input_cb.set_value(&conn.name);
                     user_input_cb.set_value(&conn.username);
                     // Load password from OS keyring on demand.
+                    let mut keyring_load_failed = false;
                     let password = match AppConfig::get_password_for_connection(&conn.name) {
                         Ok(password_opt) => password_opt.unwrap_or_default(),
                         Err(err) => {
+                            keyring_load_failed = true;
                             fltk::dialog::alert_default(&err);
                             String::new()
                         }
@@ -313,7 +338,7 @@ impl ConnectionDialog {
                     service_input_cb.set_value(&conn.service_name);
 
                     // Double click to connect immediately
-                    if app::event_clicks() {
+                    if app::event_clicks() && !keyring_load_failed {
                         let info = ConnectionInfo::new(
                             &conn.name,
                             &conn.username,
@@ -592,6 +617,17 @@ mod tests {
 
         let result = build_connection_info("local", "scott", "tiger", "localhost", "0", "ORCL");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_connection_info_rejects_invalid_host_and_service_characters() {
+        let invalid_host =
+            build_connection_info("local", "scott", "tiger", "local host", "1521", "ORCL");
+        assert!(invalid_host.is_err());
+
+        let invalid_service =
+            build_connection_info("local", "scott", "tiger", "localhost", "1521", "ORCL!");
+        assert!(invalid_service.is_err());
     }
 
     #[test]
