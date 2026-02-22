@@ -309,6 +309,7 @@ impl SqlEditorWidget {
         let mut latest_recent_request_id = 0u64;
         let mut latest_sql_text_request_id = 0u64;
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+        let mut last_snapshot_columns: Vec<String> = Vec::new();
 
         while dialog.shown() {
             app::wait();
@@ -472,6 +473,11 @@ impl SqlEditorWidget {
 
                         match result {
                             Ok(snapshot) => {
+                                last_snapshot_columns = snapshot
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect();
                                 result_table.display_result(&snapshot);
                                 status.set_label(&format!(
                                     "Loaded {} lines in {} ms",
@@ -497,6 +503,11 @@ impl SqlEditorWidget {
 
                         match result {
                             Ok(snapshot) => {
+                                last_snapshot_columns = snapshot
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect();
                                 result_table.display_result(&snapshot);
                                 last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
                                 status.set_label(&format!(
@@ -528,6 +539,11 @@ impl SqlEditorWidget {
 
                         match result {
                             Ok(snapshot) => {
+                                last_snapshot_columns = snapshot
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect();
                                 result_table.display_result(&snapshot);
                                 status.set_label(&format!(
                                     "Loaded SQL text for {} ({} row(s), {} ms)",
@@ -558,7 +574,9 @@ impl SqlEditorWidget {
                 if selected_row >= 0 {
                     let selected_index = selected_row as usize;
                     if let Some(row) = result_table.row_values(selected_index) {
-                        if let Some((sql_id, child)) = parse_sql_id_child_row(&row) {
+                        if let Some((sql_id, child)) =
+                            parse_sql_id_child_row(&row, &last_snapshot_columns)
+                        {
                             sql_id_input.set_value(&sql_id);
                             child_input.set_value(&child.to_string());
                         }
@@ -6742,9 +6760,9 @@ fn column_value_by_name<'a>(
     row_values.get(index).map(|value| value.as_str())
 }
 
-fn parse_non_negative_i64(value: &str) -> Option<i64> {
+fn parse_positive_i64(value: &str) -> Option<i64> {
     let parsed = value.trim().parse::<i64>().ok()?;
-    if parsed < 0 {
+    if parsed <= 0 {
         return None;
     }
     Some(parsed)
@@ -6758,10 +6776,10 @@ fn parse_sql_monitor_session_target(
         .or_else(|| row_values.first().map(|value| value.as_str()))?;
     let serial_text = column_value_by_name(row_values, columns, "SERIAL#")
         .or_else(|| row_values.get(1).map(|value| value.as_str()))?;
-    let sid = parse_non_negative_i64(sid_text)?;
-    let serial = parse_non_negative_i64(serial_text)?;
+    let sid = parse_positive_i64(sid_text)?;
+    let serial = parse_positive_i64(serial_text)?;
     let instance_id =
-        column_value_by_name(row_values, columns, "INST_ID").and_then(parse_non_negative_i64);
+        column_value_by_name(row_values, columns, "INST_ID").and_then(parse_positive_i64);
 
     Some((instance_id, sid, serial))
 }
@@ -7097,9 +7115,14 @@ fn parse_owner_job_row(row_values: &[String]) -> Option<(String, String)> {
     Some((owner_upper, job_upper))
 }
 
-fn parse_sql_id_child_row(row_values: &[String]) -> Option<(String, i32)> {
-    let sql_id = row_values.first()?.trim().to_uppercase();
-    let child_text = row_values.get(1)?.trim();
+fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, i32)> {
+    let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")
+        .or_else(|| row_values.first().map(|value| value.as_str()))?;
+    let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
+        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))
+        .or_else(|| row_values.get(1).map(|value| value.as_str()))?
+        .trim();
+    let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
         return None;
     }
@@ -7339,7 +7362,7 @@ mod tests {
             "2026-02-20 11:00:00".to_string(),
         ];
         assert_eq!(
-            parse_sql_id_child_row(&row),
+            parse_sql_id_child_row(&row, &[]),
             Some(("7V9H9TTW0G3CN".to_string(), 2))
         );
     }
@@ -7347,7 +7370,21 @@ mod tests {
     #[test]
     fn parse_sql_id_child_row_rejects_invalid_row() {
         let row = vec!["(message)".to_string(), "-".to_string()];
-        assert_eq!(parse_sql_id_child_row(&row), None);
+        assert_eq!(parse_sql_id_child_row(&row, &[]), None);
+    }
+
+    #[test]
+    fn parse_sql_id_child_row_uses_named_columns() {
+        let columns = vec![
+            "INST_ID".to_string(),
+            "SQL_ID".to_string(),
+            "CHILD_NUMBER".to_string(),
+        ];
+        let row = vec!["1".to_string(), "7v9h9ttw0g3cn".to_string(), "4".to_string()];
+        assert_eq!(
+            parse_sql_id_child_row(&row, &columns),
+            Some(("7V9H9TTW0G3CN".to_string(), 4))
+        );
     }
 
     #[test]
