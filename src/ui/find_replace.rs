@@ -479,40 +479,30 @@ impl FindReplaceDialog {
                             continue;
                         }
                         let text = buffer.text();
-                        let new_text = if case_sensitive {
-                            text.replace(&search_text, &replace_text)
+                        let (new_text, count) = if case_sensitive {
+                            let count = text.matches(&search_text).count();
+                            (text.replace(&search_text, &replace_text), count)
                         } else {
                             let mut result = String::with_capacity(text.len());
+                            let mut count = 0usize;
                             let mut search_pos = 0usize;
                             while let Some((match_start, match_end)) =
                                 find_next_match(&text, &search_text, search_pos as i32, false)
                             {
-                                result.push_str(text.get(search_pos..match_start).unwrap_or(""));
+                                if let Some(prefix) = text.get(search_pos..match_start) {
+                                    result.push_str(prefix);
+                                }
                                 result.push_str(&replace_text);
+                                count = count.saturating_add(1);
                                 search_pos = match_end;
                                 if search_pos >= text.len() {
                                     break;
                                 }
                             }
-                            result.push_str(text.get(search_pos..).unwrap_or(""));
-                            result
-                        };
-
-                        let count = if case_sensitive {
-                            text.matches(&search_text).count()
-                        } else {
-                            let mut count = 0usize;
-                            let mut search_pos = 0usize;
-                            while let Some((_match_start, match_end)) =
-                                find_next_match(&text, &search_text, search_pos as i32, false)
-                            {
-                                count += 1;
-                                search_pos = match_end;
-                                if search_pos >= text.len() {
-                                    break;
-                                }
+                            if let Some(tail) = text.get(search_pos..) {
+                                result.push_str(tail);
                             }
-                            count
+                            (result, count)
                         };
 
                         buffer.set_text(&new_text);
@@ -689,31 +679,29 @@ fn find_unicode_case_insensitive_bounds(haystack: &str, needle: &str) -> Option<
         return None;
     }
 
-    let mut start_positions: Vec<usize> = haystack.char_indices().map(|(idx, _)| idx).collect();
-    start_positions.push(haystack.len());
-
-    for &start in &start_positions {
-        if start >= haystack.len() {
-            break;
-        }
-        for &end in &start_positions {
-            if end <= start {
-                continue;
-            }
-            let Some(candidate) = haystack.get(start..end) else {
-                continue;
-            };
-            let folded = fold_for_case_insensitive(candidate);
-            if folded == needle_folded {
-                return Some((start, end));
-            }
-            if folded.len() > needle_folded.len() {
-                break;
+    let mut folded_haystack = String::with_capacity(haystack.len());
+    let mut folded_to_original: Vec<usize> = Vec::with_capacity(haystack.len() + 1);
+    folded_to_original.push(0);
+    for (byte_idx, ch) in haystack.char_indices() {
+        for lowered in ch.to_lowercase() {
+            let mut buf = [0_u8; 4];
+            let lowered_str = lowered.encode_utf8(&mut buf);
+            folded_haystack.push(lowered);
+            for _ in lowered_str.as_bytes() {
+                folded_to_original.push(byte_idx);
             }
         }
     }
+    folded_to_original.push(haystack.len());
 
-    None
+    let folded_start = folded_haystack.find(&needle_folded)?;
+    let folded_end = folded_start + needle_folded.len();
+    let start = folded_to_original.get(folded_start).copied().unwrap_or(0);
+    let end = folded_to_original
+        .get(folded_end)
+        .copied()
+        .unwrap_or(haystack.len());
+    (start < end).then_some((start, end))
 }
 
 #[cfg(test)]

@@ -233,6 +233,14 @@ fn parse_error_line(message: &str) -> Option<usize> {
     best_line.map(|(_, line)| line).filter(|line| *line > 0)
 }
 
+fn clamp_error_line_to_sql(error_line: Option<usize>, sql: &str) -> Option<usize> {
+    let line_count = sql.lines().count();
+    match (error_line, line_count) {
+        (Some(line), count) if count > 0 => Some(line.min(count).max(1)),
+        _ => None,
+    }
+}
+
 fn sanitize_history_sql(sql: &str) -> String {
     sanitize_sensitive_text(sql)
 }
@@ -683,7 +691,10 @@ fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
         match rx.recv_timeout(history_writer_response_timeout()) {
             Ok(snapshot) => (snapshot, false),
             Err(_) => {
-                if let Ok(()) = flush_history_writer() {
+                for _ in 0..2 {
+                    if flush_history_writer().is_err() {
+                        continue;
+                    }
                     let (retry_tx, retry_rx) = mpsc::channel();
                     if send_history_command(HistoryCommand::Snapshot(retry_tx)).is_ok() {
                         if let Ok(retry_snapshot) =
@@ -1113,7 +1124,10 @@ impl QueryHistoryDialog {
         } else {
             Some(sanitized_message.clone())
         };
-        let error_line = error_message.as_deref().and_then(parse_error_line);
+        let error_line = clamp_error_line_to_sql(
+            error_message.as_deref().and_then(parse_error_line),
+            &sanitized_sql,
+        );
         let entry = QueryHistoryEntry {
             sql: sanitized_sql,
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),

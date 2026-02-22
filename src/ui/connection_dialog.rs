@@ -9,6 +9,7 @@ use fltk::{
     prelude::*,
     window::Window,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,23 +36,29 @@ fn build_connection_info(
         }
         let is_ipv6_bracketed = host.starts_with('[')
             && host.ends_with(']')
-            && host[1..host.len().saturating_sub(1)]
-                .chars()
-                .all(|ch| ch.is_ascii_hexdigit() || ch == ':');
+            && host
+                .get(1..host.len().saturating_sub(1))
+                .map(|inner| {
+                    !inner.is_empty()
+                        && inner.chars().all(|ch| {
+                            ch.is_ascii_hexdigit() || matches!(ch, ':' | '.' | '%' | '-' | '_')
+                        })
+                })
+                .unwrap_or(false);
         if is_ipv6_bracketed {
             return true;
         }
         host.chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
     }
 
     fn is_valid_service_name(service_name: &str) -> bool {
         if service_name.is_empty() {
             return false;
         }
-        service_name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '$' | '#' | '/'))
+        service_name.chars().all(|ch| {
+            ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '$' | '#' | '/' | ':' | '@')
+        })
     }
 
     let name = name.trim();
@@ -117,6 +124,7 @@ impl ConnectionDialog {
         let result: Arc<Mutex<Option<ConnectionInfo>>> = Arc::new(Mutex::new(None));
         let config = Arc::new(Mutex::new(AppConfig::load()));
         let test_in_progress = Arc::new(Mutex::new(false));
+        let dialog_alive = Arc::new(AtomicBool::new(true));
 
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
@@ -508,7 +516,10 @@ impl ConnectionDialog {
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 let previous_connections = cfg.recent_connections.clone();
-                                let removal_error = cfg.remove_connection(&selected).err();
+                                if let Err(error_message) = cfg.remove_connection(&selected) {
+                                    fltk::dialog::alert_default(&error_message);
+                                    continue;
+                                }
                                 if let Err(e) = cfg.save() {
                                     cfg.recent_connections = previous_connections;
                                     fltk::dialog::alert_default(&format!(
@@ -520,9 +531,6 @@ impl ConnectionDialog {
                                     for conn in cfg.get_all_connections() {
                                         saved_browser.add(&conn.name);
                                     }
-                                    if let Some(error_message) = removal_error {
-                                        fltk::dialog::alert_default(&error_message);
-                                    }
                                 }
                             }
                         } else {
@@ -531,9 +539,20 @@ impl ConnectionDialog {
                     }
                     DialogMessage::Test(info) => {
                         let sender = sender.clone();
+                        let dialog_alive = dialog_alive.clone();
                         thread::spawn(move || {
                             let result = DatabaseConnection::test_connection(&info)
                                 .map_err(|e| e.to_string());
+                            if !dialog_alive.load(Ordering::Relaxed) {
+                                if let Err(err) = &result {
+                                    crate::utils::logging::log_warning(
+                                        "connection_dialog",
+                                        &format!(
+                                            "Connection test finished after dialog closed: {err}"
+                                        ),
+                                    );
+                                }
+                            }
                             let _ = sender.send(DialogMessage::TestResult(result));
                             let _ = sender.send(DialogMessage::SetTestInProgress(false));
                             app::awake();
@@ -549,14 +568,19 @@ impl ConnectionDialog {
                             test_btn.activate();
                         }
                     }
-                    DialogMessage::TestResult(result) => match result {
-                        Ok(_) => {
-                            fltk::dialog::message_default("Connection successful!");
+                    DialogMessage::TestResult(result) => {
+                        if !dialog.shown() {
+                            continue;
                         }
-                        Err(e) => {
-                            fltk::dialog::alert_default(&format!("Connection failed: {}", e));
+                        match result {
+                            Ok(_) => {
+                                fltk::dialog::message_default("Connection successful!");
+                            }
+                            Err(e) => {
+                                fltk::dialog::alert_default(&format!("Connection failed: {}", e));
+                            }
                         }
-                    },
+                    }
                     DialogMessage::Save(info) => {
                         let mut cfg = config
                             .lock()
@@ -608,6 +632,8 @@ impl ConnectionDialog {
                 }
             }
         }
+
+        dialog_alive.store(false, Ordering::Relaxed);
 
         // Clear password input field to minimize password lifetime in memory
         pass_input.set_value("");

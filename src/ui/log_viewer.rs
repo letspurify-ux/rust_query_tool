@@ -246,6 +246,8 @@ impl LogViewerDialog {
                         });
                         if let Some(detail) = detail {
                             detail_buffer.set_text(&detail);
+                        } else {
+                            detail_buffer.set_text("");
                         }
                     }
                     DialogMessage::FilterChanged => {
@@ -306,25 +308,30 @@ impl LogViewerDialog {
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .clone()
                             };
-                            let output = {
+                            let write_result = (|| -> Result<(), String> {
+                                use std::io::Write;
+                                let file = std::fs::File::create(&path)
+                                    .map_err(|err| format!("create failed: {err}"))?;
+                                let mut writer = std::io::BufWriter::new(file);
                                 let ents = entries
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let mut output = String::new();
                                 for idx in filtered_snapshot {
                                     if let Some(entry) = ents.get(idx) {
-                                        output.push_str(&format!(
-                                            "[{}] [{}] [{}] {}\n",
+                                        writeln!(
+                                            writer,
+                                            "[{}] [{}] [{}] {}",
                                             entry.timestamp,
                                             entry.level.label(),
                                             entry.source,
                                             entry.message
-                                        ));
+                                        )
+                                        .map_err(|err| format!("write failed: {err}"))?;
                                     }
                                 }
-                                output
-                            };
-                            match std::fs::write(&path, output) {
+                                writer.flush().map_err(|err| format!("flush failed: {err}"))
+                            })();
+                            match write_result {
                                 Ok(()) => {
                                     fltk::dialog::message_default(&format!(
                                         "Log exported to {}",
@@ -420,10 +427,10 @@ fn truncate_message(msg: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
-    // Replace newlines with spaces for single-line display
+    // Replace hard line breaks/tabs for single-line list preview while keeping regular spaces intact.
     let mut normalized = String::with_capacity(msg.len());
     for ch in msg.chars() {
-        if ch.is_whitespace() {
+        if matches!(ch, '\n' | '\r' | '\t') {
             normalized.push(' ');
         } else {
             normalized.push(ch);

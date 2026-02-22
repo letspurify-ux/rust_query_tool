@@ -416,8 +416,16 @@ pub fn take_crash_log() -> Option<String> {
     if !path.exists() {
         return None;
     }
-    let content = fs::read_to_string(&path).ok()?;
-    let _ = fs::remove_file(&path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!("Failed to read crash log {}: {}", path.display(), err);
+            return None;
+        }
+    };
+    if let Err(err) = fs::remove_file(&path) {
+        eprintln!("Failed to remove crash log {}: {}", path.display(), err);
+    }
     Some(content)
 }
 
