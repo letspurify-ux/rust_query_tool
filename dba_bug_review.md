@@ -1,53 +1,93 @@
-# DBA 기능 버그 리뷰 (10건)
+# DBA 기능 버그 리뷰 (20건)
 
-검토 범위: `src/ui/sql_editor/dba_tools.rs`, `src/db/query/executor.rs`
+검토 범위:
+- `src/ui/sql_editor/dba_tools.rs`
+- `src/ui/sql_editor/session_monitor.rs`
+- `src/db/query/executor.rs`
 
-## 1) SQL_ID 길이 검증이 "정확히 13자"가 아니라 "최대 13자"로 되어 있음
-- 현상: UI/DB 레이어 모두 SQL_ID를 1~13자까지 허용합니다.
-- 근거: UI는 `upper.len() > 13`만 검사하고, DB도 `normalized.len() > 13`만 검사합니다.
-- 영향: 잘못된 짧은 SQL_ID가 정상 입력으로 통과해 "조회 결과 없음" 형태의 오동작(사용자 혼란)을 유발합니다.
+검토 방법(정적 분석):
+- `rg -n "should_fallback_from_global_view|get_session_lock_snapshot|get_heavy_execution_snapshot|get_ash_session_activity_snapshot|get_ash_top_sql_snapshot|get_awr_top_sql_snapshot|get_dataguard_overview_snapshot|get_dataguard_archive_gap_snapshot|get_scheduler_jobs_snapshot|get_scheduler_job_history_snapshot|get_datapump_jobs_snapshot|start_datapump_job|create_and_run_shell_job|parse_selected_session_identity|query_sql_monitor_rows" src/db/query/executor.rs src/ui/sql_editor/dba_tools.rs src/ui/sql_editor/session_monitor.rs`
 
-## 2) Cursor 후보 조회가 RAC 비대응(`v$sql` 고정)
-- 현상: 최근 SQL cursor 후보 조회가 `v$sql`만 사용합니다.
-- 근거: `get_recent_sql_cursor_candidates` 쿼리의 FROM 절이 `v$sql` 고정입니다.
-- 영향: RAC 환경에서 다른 인스턴스의 hot cursor를 누락할 수 있습니다.
+## 1) fallback 에러 분류가 지나치게 단순함
+- `should_fallback_from_global_view`가 `ORA-00942/01031/02030` 문자열 포함 여부만으로 fallback을 결정.
+- 같은 에러 코드라도 원인(권한/오타/환경)이 다른 경우를 구분하지 못함.
 
-## 3) SQL Text 조회가 4000 byte에서 강제 절단됨
-- 현상: SQL text를 `DBMS_LOB.SUBSTR(..., 4000, 1)`로만 읽습니다.
-- 근거: `get_sql_text_by_sql_id`의 `gv$sql`, `v$sql` 쿼리 모두 동일하게 4000 제한.
-- 영향: 긴 SQL 분석 시 핵심 후반부가 잘려 DBA 분석 정확도가 떨어집니다.
+## 2) Session/Lock 조회의 v$ fallback은 INST_ID를 `-`로 고정
+- fallback SQL에서 inst_id를 문자열 `'-'`로 채움.
+- RAC에서 kill 대상 인스턴스 식별력이 사라짐.
 
-## 4) GV$ 실패 시 원인 무시 후 V$로 무조건 폴백
-- 현상: `gv$` 질의 실패 원인을 구분하지 않고 무조건 `v$` 재시도합니다.
-- 근거: `if let Ok(result) = ... { return Ok(result); }` 패턴으로 모든 오류를 일괄 무시.
-- 영향: 실제 장애(권한 문제/구문 오류/세션 오류)가 RAC 미지원처럼 위장되어 진단을 어렵게 만듭니다.
+## 3) Session/Lock v$ fallback의 blocking serial 조회는 인스턴스 구분 없음
+- `v$session bs WHERE bs.sid = s.blocking_session`만 사용.
+- RAC에서 SID 충돌 시 blocking serial 오매칭 위험.
 
-## 5) SQL Monitor의 `active_only` 조건에 사실상 완료 상태가 포함됨
-- 현상: active_only인데 `DONE (FIRST N ROWS)`도 포함됩니다.
-- 근거: `m.status IN ('EXECUTING', 'QUEUED', 'DONE (FIRST N ROWS)')`.
-- 영향: "활성 세션만" 기대한 사용자가 완료된 항목을 보게 되어 필터 의미가 흐려집니다.
+## 4) Session/Lock 결과는 항상 `sql_gv`를 SQL 텍스트로 기록
+- fallback으로 `sql_v`를 실행해도 `QueryResult::new_select(sql_gv, ...)`로 저장.
+- 화면/로그에 실제 실행 SQL과 표시 SQL이 달라 디버깅 혼란.
 
-## 6) Data Guard Start Apply: 서버측 역할 검증 부재
-- 현상: `start_dataguard_apply`는 역할 확인 없이 ALTER를 바로 수행합니다.
-- 근거: SQL 실행 전 `database_role` 검증 로직이 없습니다(반면 archive log switch는 검증 존재).
-- 영향: UI 외 경로/API 호출 시 잘못된 role에서 실행되어 ORA 오류를 유발합니다.
+## 5) Session/Lock 결과 파싱이 NULL과 빈 문자열을 동일시
+- `value.unwrap_or_default()`로 모든 NULL을 `""`로 변환.
+- 미수집/미존재/공백 구분이 사라져 운영 판단이 왜곡될 수 있음.
 
-## 7) Data Guard Stop Apply: 서버측 역할 검증 부재
-- 현상: `stop_dataguard_apply`도 역할 검증 없이 즉시 실행합니다.
-- 근거: `ALTER DATABASE RECOVER ... CANCEL` 직접 실행.
-- 영향: 동일하게 잘못된 role에서 실패하며, 방어로직이 UI에만 존재합니다.
+## 6) Heavy execution fallback도 INST_ID를 `-`로 고정
+- 단일 뷰 fallback 시 inst_id 손실.
+- RAC에서 세션 식별/추적 정확도 저하.
 
-## 8) Data Guard Switchover: 서버측 role/state/target 사전 검증 부재
-- 현상: `switchover_dataguard`는 SQL 문자열 생성 후 즉시 실행합니다.
-- 근거: 함수 내 검증은 식별자 포맷뿐이며 role/status/자기 자신 target 여부는 검증하지 않습니다.
-- 영향: 잘못된 상태에서 호출 시 런타임 오류를 유발하고, 실패 원인이 사용자에게 늦게 노출됩니다.
+## 7) Heavy execution도 실행 SQL 추적 정보가 왜곡됨
+- fallback으로 v$를 써도 결과 메타에는 gv$ SQL이 남음.
+- 문제 재현 시 어떤 쿼리가 실제 실행됐는지 확인 어려움.
 
-## 9) Data Guard Failover: 서버측 role/state/target 사전 검증 부재
-- 현상: `failover_dataguard`도 사전 검증 없이 실행합니다.
-- 근거: switchover와 동일 패턴.
-- 영향: 운영 중 오조작 위험 및 오류 메시지 지연.
+## 8) Heavy execution 파싱도 NULL을 빈 문자열로 소거
+- `unwrap_or_default` 동일 패턴.
+- 숫자/텍스트 컬럼의 결측 상태가 모두 빈 문자열로 합쳐짐.
 
-## 10) Data Guard UI에서 Switchover/Failover는 role 체크가 없음
-- 현상: Start/Stop Apply는 role을 체크하지만 Switchover/Failover 분기에는 role 검증이 없습니다.
-- 근거: Start/Stop에는 `dataguard_role_allows_apply_control(...)` 체크가 있으나 Switchover/Failover 분기에는 없음.
-- 영향: UI 레벨에서도 부적절한 role에서 위험 액션 버튼 실행 경로가 열려 있습니다.
+## 9) SQL Monitor fallback 경로도 INST_ID를 `-`로 고정
+- `use_global_view=false`면 inst_id_expr이 `'-'`.
+- RAC kill/추적 시 cross-instance 식별 불가.
+
+## 10) SQL Monitor 파싱도 NULL 구분 손실
+- `query_sql_monitor_rows`에서 `unwrap_or_default` 사용.
+- `sql_exec_id` 등 식별 키가 빈 문자열로 치환되어 품질 진단이 어려움.
+
+## 11) ASH Session Activity는 fallback 중간 실패 원인을 버림
+- gv$ 실패 시 `Err(_) => {}`로 원인 문자열을 폐기.
+- 사용자에게 실패 맥락이 전달되지 않음.
+
+## 12) ASH Session Activity fallback 시 INST_ID 의미가 바뀜
+- gv$는 실제 inst_id, v$는 `'-'`.
+- 같은 UI 컬럼이 환경/권한에 따라 다른 의미를 갖게 됨.
+
+## 13) ASH Top SQL도 동일하게 중간 fallback 에러를 폐기
+- gv$ 실패 원인이 최종 에러 메시지에 남지 않음.
+- 운영자가 권한 문제인지 질의 결함인지 분리하기 어려움.
+
+## 14) AWR Top SQL도 fallback 원인을 버리고 고정 메시지 반환
+- gv 시도 실패 세부 원인을 남기지 않고 일반 메시지로 반환.
+- 실제 장애 분석 정보가 유실됨.
+
+## 15) Data Guard overview는 실패를 `-` 채움 데이터로 은폐
+- 최종 minimal 결과를 정상 조회처럼 반환.
+- 조회 실패와 실제 값 부재를 구분하기 어려움.
+
+## 16) Data Guard destination도 실패를 `N/A` 행으로 은폐
+- 권한/뷰 접근 실패 시 informational row를 반환.
+- 모니터링 화면에서 장애가 정상값처럼 보일 수 있음.
+
+## 17) Data Guard apply process도 실패를 `N/A`로 대체
+- `v$managed_standby`/`v$dataguard_process` 모두 실패해도 에러 대신 최소행 반환.
+- 실제 실패 원인 노출이 사라짐.
+
+## 18) Data Guard archive gap도 실패 시 `N/A`로 대체
+- 조회 실패와 “진짜 gap 없음”이 명확히 분리되지 않음.
+- 운영 오판 가능성 존재.
+
+## 19) Session Monitor의 선택 row 파서는 컬럼 개수 추정에 의존
+- `row_values.len() >= 11`이면 INST_ID 포함으로 간주.
+- 컬럼 구성 변경(추가/숨김)에 매우 취약하고 잘못된 SID/SERIAL 파싱 위험.
+
+## 20) Data Pump 시작 API가 모드별 필수 파라미터 제약을 검증하지 않음
+- `TABLE/TABLESPACE/FULL` 모드에서도 schema_expr만 선택적으로 적용.
+- 모드별 필터 요구사항 부재로 런타임 ORA 오류를 늦게 맞게 됨.
+
+---
+
+참고: 본 문서는 코드 정적 검토 결과이며, Oracle 버전/옵션/권한 정책에 따라 실제 재현 양상은 달라질 수 있습니다.
