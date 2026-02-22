@@ -2019,8 +2019,8 @@ impl QueryExecutor {
         // For CREATE statements, skip optional modifiers
         if verb == "CREATE" {
             // Skip "OR REPLACE"
-            if tokens.get(idx).map_or(false, |t| *t == "OR")
-                && tokens.get(idx + 1).map_or(false, |t| *t == "REPLACE")
+            if tokens.get(idx).is_some_and(|t| *t == "OR")
+                && tokens.get(idx + 1).is_some_and(|t| *t == "REPLACE")
             {
                 idx += 2;
             }
@@ -2032,11 +2032,11 @@ impl QueryExecutor {
                 idx += 1;
             }
             // Skip FORCE / NO FORCE (for views/synonyms)
-            if tokens.get(idx).map_or(false, |t| *t == "NO")
-                && tokens.get(idx + 1).map_or(false, |t| *t == "FORCE")
+            if tokens.get(idx).is_some_and(|t| *t == "NO")
+                && tokens.get(idx + 1).is_some_and(|t| *t == "FORCE")
             {
                 idx += 2;
-            } else if tokens.get(idx).map_or(false, |t| *t == "FORCE") {
+            } else if tokens.get(idx).is_some_and(|t| *t == "FORCE") {
                 idx += 1;
             }
         }
@@ -2057,9 +2057,9 @@ impl QueryExecutor {
         match tokens.get(idx).copied() {
             Some("TABLE") => "Table",
             Some("GLOBAL") | Some("PRIVATE")
-                if (tokens.get(idx + 1).map_or(false, |t| *t == "TEMPORARY")
-                    && tokens.get(idx + 2).map_or(false, |t| *t == "TABLE"))
-                    || tokens.get(idx + 1).map_or(false, |t| *t == "TABLE") =>
+                if (tokens.get(idx + 1).is_some_and(|t| *t == "TEMPORARY")
+                    && tokens.get(idx + 2).is_some_and(|t| *t == "TABLE"))
+                    || tokens.get(idx + 1).is_some_and(|t| *t == "TABLE") =>
             {
                 "Table"
             }
@@ -2068,7 +2068,7 @@ impl QueryExecutor {
             Some("PROCEDURE") => "Procedure",
             Some("FUNCTION") => "Function",
             Some("PACKAGE") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "BODY") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "BODY") {
                     "Package Body"
                 } else {
                     "Package"
@@ -2078,30 +2078,30 @@ impl QueryExecutor {
             Some("SEQUENCE") => "Sequence",
             Some("SYNONYM") => "Synonym",
             Some("PUBLIC") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "SYNONYM") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "SYNONYM") {
                     "Synonym"
-                } else if tokens.get(idx + 1).map_or(false, |t| *t == "DATABASE") {
+                } else if tokens.get(idx + 1).is_some_and(|t| *t == "DATABASE") {
                     "Database Link"
                 } else {
                     "Object"
                 }
             }
             Some("PRIVATE") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "SYNONYM") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "SYNONYM") {
                     "Synonym"
                 } else {
                     "Object"
                 }
             }
             Some("TYPE") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "BODY") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "BODY") {
                     "Type Body"
                 } else {
                     "Type"
                 }
             }
             Some("DATABASE") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "LINK") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "LINK") {
                     "Database Link"
                 } else {
                     "Database"
@@ -2122,7 +2122,7 @@ impl QueryExecutor {
             Some("SESSION") => "Session",
             Some("SYSTEM") => "System",
             Some("ROLLBACK") => {
-                if tokens.get(idx + 1).map_or(false, |t| *t == "SEGMENT") {
+                if tokens.get(idx + 1).is_some_and(|t| *t == "SEGMENT") {
                     "Rollback Segment"
                 } else {
                     "Object"

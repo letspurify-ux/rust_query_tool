@@ -11,6 +11,13 @@
 ## 추가 확인 사항
 - 전체 clippy에는 기존 코드 전반의 다수 lint(`unnecessary_map_or`, `arc_with_non_send_sync`, `items_after_test_module` 등)가 남아 있습니다. 이번 작업에서는 요청 즉시 조치 대상으로 확인된 항목을 우선 수정했습니다.
 
+### [중] Clippy 경고(`filter(...).next_back()`/`map_or(false, ...)`) 정리
+- **증상**: `cargo clippy --all-targets --all-features -- -D warnings`에서 `src/db/query/executor.rs`의 `clippy::filter_next`, `clippy::unnecessary_map_or`가 다수 보고됨.
+- **원인**: 역방향 탐색 패턴을 `filter().next_back()`로 작성했고, `Option` 비교에서 `map_or(false, ...)`를 반복 사용.
+- **수정**:
+  - 역방향 탐색을 `iter().rfind(...)`로 치환.
+  - `map_or(false, predicate)`를 `is_some_and(predicate)`로 치환.
+- **효과**: 해당 구간의 Clippy 경고가 제거되어 품질 게이트 실패 요인 일부를 해소.
 ## 2026-02-22 추가 다건 수정 내역
 
 ### [중] DDL 오브젝트 타입 파싱 분기 단순화 및 오탐 여지 축소
