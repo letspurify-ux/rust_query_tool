@@ -104,12 +104,12 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
     tokens: &'a [SqlToken],
     delimiter: &str,
 ) -> Vec<Vec<&'a SqlToken>> {
-    let token_depths = paren_depths(tokens);
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
+    let mut depth = 0usize;
 
-    for (idx, token) in tokens.iter().enumerate() {
-        let at_root = is_top_level_depth(&token_depths, idx);
+    for token in tokens {
+        let at_root = depth == 0;
         if let SqlToken::Symbol(sym) = token {
             if sym == delimiter && at_root {
                 if !current.is_empty() {
@@ -120,6 +120,7 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
         }
 
         current.push(token);
+        apply_paren_token(&mut depth, token);
     }
 
     if !current.is_empty() {
@@ -137,14 +138,14 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
     tokens: &'a [SqlToken],
     break_keywords: &[&str],
 ) -> Vec<Vec<&'a SqlToken>> {
-    let token_depths = paren_depths(tokens);
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
+    let mut depth = 0usize;
 
-    for (idx, token) in tokens.iter().enumerate() {
+    for token in tokens {
         let is_break = match token {
             SqlToken::Word(word) => {
-                is_top_level_depth(&token_depths, idx)
+                depth == 0
                     && break_keywords
                         .iter()
                         .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -159,6 +160,7 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
         }
 
         current.push(token);
+        apply_paren_token(&mut depth, token);
     }
 
     if !current.is_empty() {

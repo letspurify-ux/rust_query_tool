@@ -369,7 +369,8 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 ///
 /// 실제 구문 경계 계산은 실행기 쪽 규칙을 그대로 사용해 동작 일관성을 유지합니다.
 pub(crate) fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String> {
-    QueryExecutor::statement_at_cursor(sql, cursor_pos)
+    let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
+    QueryExecutor::statement_at_cursor(sql, safe_cursor)
 }
 
 /// 현재 커서 위치가 속한 문장의 바이트 범위를 반환합니다.
@@ -377,42 +378,88 @@ pub(crate) fn statement_at_cursor(sql: &str, cursor_pos: usize) -> Option<String
 /// SQL*Plus 스타일 단독 `/` 구분자, tool command 문맥까지 포함한 경계 판정은
 /// `QueryExecutor`의 기존 규칙을 재사용합니다.
 pub(crate) fn statement_bounds_in_text(sql: &str, cursor_pos: usize) -> (usize, usize) {
-    QueryExecutor::statement_bounds_at_cursor(sql, cursor_pos).unwrap_or((0, sql.len()))
+    let safe_cursor = clamp_cursor_to_char_boundary(sql, cursor_pos);
+    QueryExecutor::statement_bounds_at_cursor(sql, safe_cursor).unwrap_or((0, sql.len()))
 }
 
 /// 쿼리 실행 전 선처리에서 `CONNECT`, `DISCONNECT`, 또는 `@` 스크립트 실행 명령이
 /// 포함되는지 판별합니다. 해당 라인은 기존 연결 유무와 무관하게 실행을 허용합니다.
 pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
-    sql.lines().any(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
+    QueryExecutor::split_script_items(sql)
+        .into_iter()
+        .any(|item| match item {
+            ScriptItem::Statement(_) => false,
+            ScriptItem::ToolCommand(command) => match command {
+                ToolCommand::Connect { .. } | ToolCommand::Disconnect | ToolCommand::RunScript { .. } => {
+                    true
+                }
+                ToolCommand::Unsupported { raw, .. } => {
+                    let upper = raw.trim().to_uppercase();
+                    upper == "CONNECT"
+                        || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
+                        || upper.starts_with("CONN ")
+                        || upper == "DISCONNECT"
+                        || upper == "DISC"
+                        || raw.trim_start().starts_with('@')
+                }
+                _ => false,
+            },
+        })
+}
 
-        match QueryExecutor::parse_tool_command(trimmed) {
-            Some(ToolCommand::Connect { .. })
-            | Some(ToolCommand::Disconnect)
-            | Some(ToolCommand::RunScript { .. }) => true,
-            Some(ToolCommand::Unsupported { raw, .. }) => {
-                let upper = raw.trim().to_uppercase();
-                upper == "CONNECT"
-                    || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
-                    || upper.starts_with("CONN ")
-                    || upper == "DISCONNECT"
-                    || upper == "DISC"
-                    || raw.trim_start().starts_with('@')
-            }
-            _ => false,
-        }
-    })
+fn clamp_cursor_to_char_boundary(sql: &str, cursor_pos: usize) -> usize {
+    let mut clamped = cursor_pos.min(sql.len());
+    while clamped > 0 && !sql.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{has_connection_bootstrap_command, tokenize_sql};
+    use super::{
+        clamp_cursor_to_char_boundary, has_connection_bootstrap_command, statement_at_cursor,
+        statement_bounds_in_text, tokenize_sql,
+    };
     use crate::db::SplitState;
     use crate::sql_text;
     use crate::ui::sql_editor::SqlToken;
+
+    #[test]
+    fn has_connection_bootstrap_command_ignores_connect_in_block_comment() {
+        let sql = "/*\nCONNECT scott/tiger\n*/\nSELECT 1 FROM dual";
+        assert!(!has_connection_bootstrap_command(sql));
+    }
+
+    #[test]
+    fn has_connection_bootstrap_command_ignores_connect_in_string_literal() {
+        let sql = "SELECT 'CONNECT scott/tiger' FROM dual";
+        assert!(!has_connection_bootstrap_command(sql));
+    }
+
+    #[test]
+    fn statement_bounds_clamps_mid_byte_cursor() {
+        let sql = "SELECT '가' FROM dual;";
+        let pos = sql.find('가').unwrap_or(0) + 1;
+        let (start, end) = statement_bounds_in_text(sql, pos);
+        assert!(start <= end);
+        assert_eq!(&sql[start..end], "SELECT '가' FROM dual");
+    }
+
+    #[test]
+    fn statement_at_cursor_clamps_out_of_bounds_cursor() {
+        let sql = "SELECT 1 FROM dual;";
+        let result = statement_at_cursor(sql, usize::MAX);
+        assert_eq!(result.as_deref(), Some("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn clamp_cursor_to_char_boundary_moves_to_previous_boundary() {
+        let sql = "가a";
+        assert_eq!(clamp_cursor_to_char_boundary(sql, 1), 0);
+        assert_eq!(clamp_cursor_to_char_boundary(sql, 2), 0);
+        assert_eq!(clamp_cursor_to_char_boundary(sql, 3), 3);
+    }
 
     fn tokenize_sql_reference(sql: &str) -> Vec<SqlToken> {
         let mut tokens = Vec::new();
