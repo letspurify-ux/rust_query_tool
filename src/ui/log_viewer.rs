@@ -375,7 +375,7 @@ fn populate_browser(
     filter: Option<LogLevel>,
 ) {
     browser.clear();
-    let mut indices = Vec::new();
+    let mut indices = Vec::with_capacity(entries.len());
 
     for (i, entry) in entries.iter().enumerate() {
         if let Some(level) = filter {
@@ -420,33 +420,52 @@ fn truncate_message(msg: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
-    // Replace newlines with spaces for single-line display
+
     let mut normalized = String::with_capacity(msg.len());
+    let mut last_was_whitespace = true;
     for ch in msg.chars() {
         if ch.is_whitespace() {
-            normalized.push(' ');
+            if !last_was_whitespace {
+                normalized.push(' ');
+                last_was_whitespace = true;
+            }
         } else {
             normalized.push(ch);
+            last_was_whitespace = false;
         }
     }
-    let trimmed = normalized.trim();
 
-    if trimmed.is_empty() {
+    while normalized.ends_with(' ') {
+        normalized.pop();
+    }
+
+    if normalized.is_empty() {
         return String::new();
     }
 
-    if trimmed.chars().count() > max_len {
-        if max_len <= 3 {
-            return "...".chars().take(max_len).collect();
+    if max_len <= 3 {
+        let keep = max_len.min(3);
+        return "...".chars().take(keep).collect();
+    }
+
+    let visible_len = max_len - 3;
+    let mut visible_chars = 0usize;
+    let mut truncate_at = normalized.len();
+    for (idx, _) in normalized.char_indices() {
+        if visible_chars == visible_len {
+            truncate_at = idx;
+            break;
         }
-        let end = trimmed
-            .char_indices()
-            .nth(max_len - 3)
-            .map(|(idx, _)| idx)
-            .unwrap_or(trimmed.len());
-        format!("{}...", &trimmed[..end])
+        visible_chars += 1;
+    }
+
+    if visible_chars < visible_len {
+        normalized
     } else {
-        trimmed.to_string()
+        let mut output = String::with_capacity(truncate_at + 3);
+        output.push_str(&normalized[..truncate_at]);
+        output.push_str("...");
+        output
     }
 }
 
