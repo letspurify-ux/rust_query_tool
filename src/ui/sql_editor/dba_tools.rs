@@ -3681,34 +3681,17 @@ impl SqlEditorWidget {
                         profile_text,
                         attention_only,
                     } => {
-                        let user = match mode {
-                            SecurityViewMode::Profiles => None,
-                            SecurityViewMode::Users => {
-                                match normalize_optional_identifier(&user_text, "User") {
-                                    Ok(value) => value,
-                                    Err(err) => {
-                                        fltk::dialog::alert_default(&err);
-                                        continue;
-                                    }
-                                }
+                        let (user, profile_filter) = match normalize_security_view_filters(
+                            mode,
+                            &user_text,
+                            &profile_text,
+                        ) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
                             }
-                            _ => match normalize_required_identifier(&user_text, "User") {
-                                Ok(value) => Some(value),
-                                Err(err) => {
-                                    fltk::dialog::alert_default(&err);
-                                    continue;
-                                }
-                            },
                         };
-
-                        let profile_filter =
-                            match normalize_optional_identifier(&profile_text, "Profile") {
-                                Ok(value) => value,
-                                Err(err) => {
-                                    fltk::dialog::alert_default(&err);
-                                    continue;
-                                }
-                            };
                         current_view_mode = mode;
                         refresh_security_action_controls(
                             current_view_mode,
@@ -4559,57 +4542,19 @@ impl SqlEditorWidget {
                 if selected_row >= 0 {
                     let selected_index = selected_row as usize;
                     if let Some(row) = result_table.row_values(selected_index) {
-                        if !matches!(current_view_mode, SecurityViewMode::Profiles) {
-                            if let Some(first_value) = row.first() {
-                                let normalized = first_value.trim().to_uppercase();
-                                if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                    user_input.set_value(&normalized);
-                                }
+                        let columns = result_table.columns();
+                        if let Some((next_user, next_role, next_profile)) =
+                            security_autofill_values(current_view_mode, &row, &columns)
+                        {
+                            if let Some(user_value) = next_user.as_deref() {
+                                user_input.set_value(user_value);
                             }
-                        }
-                        match current_view_mode {
-                            SecurityViewMode::RoleGrants => {
-                                if let Some(value) = row.get(1) {
-                                    let normalized = value.trim().to_uppercase();
-                                    if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                        role_input.set_value(&normalized);
-                                    }
-                                }
+                            if let Some(role_value) = next_role.as_deref() {
+                                role_input.set_value(role_value);
                             }
-                            SecurityViewMode::SystemGrants => {
-                                if let Some(value) = row.get(1) {
-                                    if let Ok(normalized) =
-                                        normalize_required_system_privilege(value)
-                                    {
-                                        role_input.set_value(&normalized);
-                                    }
-                                }
+                            if let Some(profile_value) = next_profile.as_deref() {
+                                profile_input.set_value(profile_value);
                             }
-                            SecurityViewMode::Summary => {
-                                if let Some(value) = row.get(2) {
-                                    let normalized = value.trim().to_uppercase();
-                                    if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                        profile_input.set_value(&normalized);
-                                    }
-                                }
-                            }
-                            SecurityViewMode::Users => {
-                                if let Some(value) = row.get(2) {
-                                    let normalized = value.trim().to_uppercase();
-                                    if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                        profile_input.set_value(&normalized);
-                                    }
-                                }
-                            }
-                            SecurityViewMode::Profiles => {
-                                if let Some(value) = row.first() {
-                                    let normalized = value.trim().to_uppercase();
-                                    if !normalized.is_empty() && is_ascii_identifier(&normalized) {
-                                        profile_input.set_value(&normalized);
-                                    }
-                                }
-                            }
-                            SecurityViewMode::ObjectGrants => {}
                         }
                     }
                 }
@@ -7034,6 +6979,77 @@ fn prompt_secret_text(prompt: &str) -> Option<String> {
     result
 }
 
+fn normalize_security_view_filters(
+    mode: SecurityViewMode,
+    user_text: &str,
+    profile_text: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let user = match mode {
+        SecurityViewMode::Profiles => None,
+        SecurityViewMode::Users => normalize_optional_identifier(user_text, "User")?,
+        _ => Some(normalize_required_identifier(user_text, "User")?),
+    };
+
+    let profile_filter = if matches!(mode, SecurityViewMode::Users | SecurityViewMode::Profiles) {
+        normalize_optional_identifier(profile_text, "Profile")?
+    } else {
+        None
+    };
+
+    Ok((user, profile_filter))
+}
+
+fn normalized_identifier_cell(
+    row_values: &[String],
+    columns: &[String],
+    name: &str,
+) -> Option<String> {
+    let value = column_value_by_name(row_values, columns, name)?;
+    let normalized = value.trim().to_uppercase();
+    if normalized.is_empty() || !is_ascii_identifier(&normalized) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn security_autofill_values(
+    mode: SecurityViewMode,
+    row_values: &[String],
+    columns: &[String],
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let user_value = if matches!(mode, SecurityViewMode::Profiles) {
+        None
+    } else {
+        normalized_identifier_cell(row_values, columns, "USERNAME")
+            .or_else(|| normalized_identifier_cell(row_values, columns, "GRANTEE"))
+    };
+
+    let role_value = match mode {
+        SecurityViewMode::RoleGrants => {
+            normalized_identifier_cell(row_values, columns, "GRANTED_ROLE")
+        }
+        SecurityViewMode::SystemGrants => {
+            let privilege = column_value_by_name(row_values, columns, "PRIVILEGE")?;
+            normalize_required_system_privilege(privilege).ok()
+        }
+        _ => None,
+    };
+
+    let profile_value = match mode {
+        SecurityViewMode::Summary | SecurityViewMode::Users => {
+            normalized_identifier_cell(row_values, columns, "PROFILE")
+        }
+        SecurityViewMode::Profiles => normalized_identifier_cell(row_values, columns, "PROFILE"),
+        _ => None,
+    };
+
+    if user_value.is_none() && role_value.is_none() && profile_value.is_none() {
+        return None;
+    }
+
+    Some((user_value, role_value, profile_value))
+}
+
 fn normalize_optional_text_param(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -7304,10 +7320,11 @@ mod tests {
         dataguard_role_allows_apply_control, dataguard_role_from_snapshot, default_rman_job_name,
         filter_alert_rows, is_ascii_identifier, normalize_optional_sql_id,
         normalize_required_identifier, normalize_required_system_privilege,
-        parse_bounded_positive_u32, parse_optional_non_negative_i32, parse_percentage_thresholds,
-        parse_positive_u32, parse_sid_serial_row, parse_sql_id_child_row,
-        parse_sql_monitor_session_target, qualified_owner_object, security_quick_action_hint,
-        sql_monitor_session_target_label, QueryResult,
+        normalize_security_view_filters, parse_bounded_positive_u32,
+        parse_optional_non_negative_i32, parse_percentage_thresholds, parse_positive_u32,
+        parse_sid_serial_row, parse_sql_id_child_row, parse_sql_monitor_session_target,
+        qualified_owner_object, security_autofill_values, security_quick_action_hint,
+        sql_monitor_session_target_label, QueryResult, SecurityViewMode,
     };
 
     #[test]
@@ -7614,6 +7631,37 @@ mod tests {
         let first = default_rman_job_name("rman_backup_job");
         let second = default_rman_job_name("rman_backup_job");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn normalize_security_view_filters_ignores_profile_for_non_profile_modes() {
+        let filters =
+            normalize_security_view_filters(SecurityViewMode::RoleGrants, "scott", "bad-profile!")
+                .unwrap_or_else(|err| panic!("expected filters for role grants: {err}"));
+
+        assert_eq!(filters.0.as_deref(), Some("SCOTT"));
+        assert_eq!(filters.1, None);
+    }
+
+    #[test]
+    fn security_autofill_values_uses_column_names() {
+        let columns = vec![
+            "PROFILE".to_string(),
+            "ACCOUNT_STATUS".to_string(),
+            "USERNAME".to_string(),
+        ];
+        let row = vec![
+            "DEFAULT".to_string(),
+            "OPEN".to_string(),
+            "app_user".to_string(),
+        ];
+
+        let values = security_autofill_values(SecurityViewMode::Users, &row, &columns)
+            .unwrap_or_else(|| panic!("expected autofill values"));
+
+        assert_eq!(values.0.as_deref(), Some("APP_USER"));
+        assert_eq!(values.1, None);
+        assert_eq!(values.2.as_deref(), Some("DEFAULT"));
     }
 
     #[test]

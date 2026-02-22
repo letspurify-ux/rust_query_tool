@@ -1432,6 +1432,13 @@ impl ResultTableWidget {
         self.table.rows() > 0
     }
 
+    pub fn columns(&self) -> Vec<String> {
+        self.headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn row_values(&self, row: usize) -> Option<Vec<String>> {
         self.full_data
             .lock()
