@@ -194,6 +194,7 @@ impl SqlEditorWidget {
         app::awake();
 
         let mut latest_refresh_request_id: u64 = 0;
+        let mut latest_snapshot_columns: Vec<String> = Vec::new();
         let mut last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
         let mut selected_instance_id: Option<i64> = None;
         while dialog.shown() {
@@ -358,6 +359,11 @@ impl SqlEditorWidget {
 
                         match result {
                             Ok(snapshot) => {
+                                latest_snapshot_columns = snapshot
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect();
                                 result_table.display_result(&snapshot);
                                 last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
                                 status.set_label(&format!(
@@ -390,6 +396,11 @@ impl SqlEditorWidget {
 
                         match result {
                             Ok(snapshot) => {
+                                latest_snapshot_columns = snapshot
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect();
                                 result_table.display_result(&snapshot);
                                 last_table_selection = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
                                 status.set_label(&format!(
@@ -440,7 +451,7 @@ impl SqlEditorWidget {
                     let selected_row_index = selected_row as usize;
                     if let Some(row_values) = result_table.row_values(selected_row_index) {
                         if let Some((instance_id, sid, serial)) =
-                            parse_selected_session_identity(&row_values)
+                            parse_selected_session_identity(&row_values, &latest_snapshot_columns)
                         {
                             selected_instance_id = instance_id;
                             sid_input.set_value(&sid.to_string());
@@ -489,21 +500,32 @@ fn parse_positive_u32(value: &str, name: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
-fn parse_selected_session_identity(row_values: &[String]) -> Option<(Option<i64>, i64, i64)> {
-    let uses_inst_id = row_values.len() >= 11;
-    let sid_index = if uses_inst_id { 1 } else { 0 };
-    let serial_index = sid_index + 1;
-    let instance_id = if uses_inst_id {
-        row_values
-            .first()
-            .and_then(|value| parse_positive_i64(value, "INST_ID").ok())
-    } else {
-        None
-    };
+fn parse_selected_session_identity(
+    row_values: &[String],
+    columns: &[String],
+) -> Option<(Option<i64>, i64, i64)> {
+    let sid_index = columns
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("SID"))
+        .unwrap_or(0);
+    let serial_index = columns
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("SERIAL#"))
+        .unwrap_or_else(|| sid_index.saturating_add(1));
+    let instance_id = columns
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("INST_ID"))
+        .and_then(|index| row_values.get(index))
+        .and_then(|value| parse_positive_i64(value, "INST_ID").ok());
+
     let sid_text = row_values.get(sid_index)?;
     let serial_text = row_values.get(serial_index)?;
     let sid = parse_positive_i64(sid_text, "SID").ok()?;
     let serial = parse_positive_i64(serial_text, "SERIAL#").ok()?;
+    if sid <= 0 || serial <= 0 {
+        return None;
+    }
+
     Some((instance_id, sid, serial))
 }
 
@@ -551,7 +573,7 @@ mod tests {
     fn parse_selected_session_identity_reads_sid_and_serial() {
         let row = vec!["123".to_string(), "456".to_string(), "SCOTT".to_string()];
         assert_eq!(
-            parse_selected_session_identity(&row),
+            parse_selected_session_identity(&row, &[]),
             Some((None, 123, 456))
         );
     }
@@ -572,7 +594,14 @@ mod tests {
             "TM".to_string(),
         ];
         assert_eq!(
-            parse_selected_session_identity(&row),
+            parse_selected_session_identity(
+                &row,
+                &[
+                    "INST_ID".to_string(),
+                    "SID".to_string(),
+                    "SERIAL#".to_string(),
+                ],
+            ),
             Some((Some(3), 123, 456))
         );
     }
@@ -580,6 +609,6 @@ mod tests {
     #[test]
     fn parse_selected_session_identity_rejects_non_numeric_row() {
         let row = vec!["(message)".to_string()];
-        assert_eq!(parse_selected_session_identity(&row), None);
+        assert_eq!(parse_selected_session_identity(&row, &[]), None);
     }
 }

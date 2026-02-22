@@ -2656,7 +2656,7 @@ ORDER BY
 
         let sql_v = r#"
 SELECT
-    '-' AS inst_id,
+    TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE')) AS inst_id,
     TO_CHAR(s.sid) AS sid,
     TO_CHAR(s.serial#) AS serial,
     NVL(s.username, '(SYS)') AS username,
@@ -2690,10 +2690,10 @@ ORDER BY
 "#;
 
         let start = Instant::now();
-        let mut stmt = match conn.statement(sql_gv).build() {
-            Ok(stmt) => stmt,
+        let (executed_sql, mut stmt) = match conn.statement(sql_gv).build() {
+            Ok(stmt) => (sql_gv, stmt),
             Err(err) if Self::should_fallback_from_global_view(&err) => {
-                conn.statement(sql_v).build()?
+                (sql_v, conn.statement(sql_v).build()?)
             }
             Err(err) => return Err(err),
         };
@@ -2705,7 +2705,7 @@ ORDER BY
             let mut values = Vec::with_capacity(11);
             for idx in 0..11 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_default());
+                values.push(value.unwrap_or_else(|| "-".to_string()));
             }
             result_rows.push(values);
         }
@@ -2758,7 +2758,7 @@ ORDER BY
         ];
 
         Ok(QueryResult::new_select(
-            sql_gv,
+            executed_sql,
             columns,
             result_rows,
             start.elapsed(),
@@ -2807,7 +2807,7 @@ ORDER BY
 
         let sql_v = r#"
 SELECT
-    '-' AS inst_id,
+    TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE')) AS inst_id,
     TO_CHAR(s.sid) AS sid,
     TO_CHAR(s.serial#) AS serial,
     NVL(s.username, '(SYS)') AS username,
@@ -2841,10 +2841,10 @@ ORDER BY
 "#;
 
         let start = Instant::now();
-        let mut stmt = match conn.statement(sql_gv).build() {
-            Ok(stmt) => stmt,
+        let (executed_sql, mut stmt) = match conn.statement(sql_gv).build() {
+            Ok(stmt) => (sql_gv, stmt),
             Err(err) if Self::should_fallback_from_global_view(&err) => {
-                conn.statement(sql_v).build()?
+                (sql_v, conn.statement(sql_v).build()?)
             }
             Err(err) => return Err(err),
         };
@@ -2858,7 +2858,7 @@ ORDER BY
             let mut values = Vec::with_capacity(13);
             for idx in 0..13 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_default());
+                values.push(value.unwrap_or_else(|| "-".to_string()));
             }
             result_rows.push(values);
         }
@@ -2919,7 +2919,7 @@ ORDER BY
         ];
 
         Ok(QueryResult::new_select(
-            sql_gv,
+            executed_sql,
             columns,
             result_rows,
             start.elapsed(),
@@ -3195,6 +3195,7 @@ WHERE ROWNUM <= 5
         let normalized_user =
             Self::normalize_optional_security_identifier(username_filter, "User filter")?;
 
+        let mut fallback_errors: Vec<String> = Vec::new();
         match Self::query_sql_monitor_rows(
             conn,
             true,
@@ -3205,17 +3206,26 @@ WHERE ROWNUM <= 5
         ) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("gv$sql_monitor: {err}")),
         }
 
-        Self::query_sql_monitor_rows(
+        match Self::query_sql_monitor_rows(
             conn,
             false,
             min_elapsed_seconds,
             active_only,
             normalized_sql_id.as_deref(),
             normalized_user.as_deref(),
-        )
+        ) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("v$sql_monitor: {err}"));
+                Err(Self::chained_fallback_error(
+                    "SQL Monitor snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     fn query_sql_monitor_rows(
@@ -3234,7 +3244,7 @@ WHERE ROWNUM <= 5
         let inst_id_expr = if use_global_view {
             "NVL(TO_CHAR(m.inst_id), '-')"
         } else {
-            "'-'"
+            "TO_CHAR(SYS_CONTEXT('USERENV', 'INSTANCE'))"
         };
         let order_clause = if use_global_view {
             "ORDER BY NVL(m.elapsed_time, 0) DESC, m.sql_exec_start DESC, m.inst_id\n"
@@ -3300,7 +3310,7 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
             let mut values = Vec::with_capacity(14);
             for idx in 0..14 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_default());
+                values.push(value.unwrap_or_else(|| "-".to_string()));
             }
             result_rows.push(values);
         }
@@ -3756,10 +3766,11 @@ WHERE ROWNUM <= 600
 "#
         );
 
+        let mut fallback_errors: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_gv, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("gv$active_session_history: {err}")),
         }
 
         let sql_v = format!(
@@ -3791,7 +3802,13 @@ WHERE ROWNUM <= 600
 
         match Self::execute_select(conn, &sql_v, Instant::now()) {
             Ok(result) => Ok(result),
-            Err(err) => Err(err),
+            Err(err) => {
+                fallback_errors.push(format!("v$active_session_history: {err}"));
+                Err(Self::chained_fallback_error(
+                    "ASH session activity snapshot",
+                    &fallback_errors,
+                ))
+            }
         }
     }
 
@@ -3851,10 +3868,11 @@ WHERE ROWNUM <= {top_n}
 "#
         );
 
+        let mut fallback_errors: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_gv, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("gv$active_session_history: {err}")),
         }
 
         let sql_v = format!(
@@ -3893,7 +3911,13 @@ WHERE ROWNUM <= {top_n}
 
         match Self::execute_select(conn, &sql_v, Instant::now()) {
             Ok(result) => Ok(result),
-            Err(err) => Err(err),
+            Err(err) => {
+                fallback_errors.push(format!("v$active_session_history: {err}"));
+                Err(Self::chained_fallback_error(
+                    "ASH top SQL snapshot",
+                    &fallback_errors,
+                ))
+            }
         }
     }
 
@@ -3952,14 +3976,16 @@ WHERE ROWNUM <= {top_n}
 "#
         );
 
+        let mut fallback_errors: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_awr, Instant::now()) {
             Ok(result) => return Ok(result),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(_) => {}
+            Err(err) => fallback_errors.push(format!("dba_hist_sqlstat: {err}")),
         }
 
-        Err(Self::invalid_security_input_error(
+        Err(Self::chained_fallback_error(
             "AWR Top SQL requires AWR access (DBA_HIST_SQLSTAT/DBA_HIST_SNAPSHOT/DBA_HIST_SQLTEXT)",
+            &fallback_errors,
         ))
     }
 
@@ -4005,8 +4031,10 @@ SELECT
 FROM v$database d
 "#;
 
-        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
-            return Ok(result);
+        let mut fallback_errors: Vec<String> = Vec::new();
+        match Self::execute_select(conn, sql, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) => fallback_errors.push(format!("v$database + v$dataguard_stats: {err}")),
         }
 
         let sql_fallback = r#"
@@ -4026,28 +4054,16 @@ SELECT
 FROM v$database d
 "#;
 
-        if let Ok(result) = Self::execute_select(conn, sql_fallback, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, sql_fallback, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("v$database fallback: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Data Guard overview snapshot",
+                    &fallback_errors,
+                ))
+            }
         }
-
-        let sql_minimal = r#"
-SELECT
-    '-' AS db_unique_name,
-    '-' AS database_role,
-    '-' AS open_mode,
-    '-' AS protection_mode,
-    '-' AS protection_level,
-    '-' AS switchover_status,
-    '-' AS force_logging,
-    '-' AS flashback_on,
-    '-' AS dataguard_broker,
-    '-' AS transport_lag,
-    '-' AS apply_lag,
-    '-' AS apply_finish_time
-FROM dual
-"#;
-
-        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_destination_snapshot(
@@ -4079,8 +4095,10 @@ ORDER BY dest_id
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql, Instant::now()) {
-            return Ok(result);
+        let mut fallback_errors: Vec<String> = Vec::new();
+        match Self::execute_select(conn, &sql, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) => fallback_errors.push(format!("v$archive_dest_status: {err}")),
         }
 
         let sql_fallback = format!(
@@ -4103,26 +4121,16 @@ ORDER BY dest_id
 "#
         );
 
-        if let Ok(result) = Self::execute_select(conn, &sql_fallback, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_fallback, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("v$archive_dest: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Data Guard destination snapshot",
+                    &fallback_errors,
+                ))
+            }
         }
-
-        let sql_minimal = r#"
-SELECT
-    '-' AS dest_id,
-    '-' AS target,
-    'N/A' AS status,
-    '-' AS database_mode,
-    '-' AS recovery_mode,
-    '-' AS protection_mode,
-    '-' AS destination,
-    '-' AS archived_seq,
-    '-' AS applied_seq,
-    'Data Guard destination privilege unavailable' AS error
-FROM dual
-"#;
-
-        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_apply_process_snapshot(
@@ -4142,8 +4150,10 @@ FROM v$managed_standby
 ORDER BY process
 "#;
 
-        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
-            return Ok(result);
+        let mut fallback_errors: Vec<String> = Vec::new();
+        match Self::execute_select(conn, sql, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) => fallback_errors.push(format!("v$managed_standby: {err}")),
         }
 
         let sql_fallback = r#"
@@ -4160,24 +4170,16 @@ FROM v$dataguard_process
 ORDER BY name
 "#;
 
-        if let Ok(result) = Self::execute_select(conn, sql_fallback, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, sql_fallback, Instant::now()) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                fallback_errors.push(format!("v$dataguard_process: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Data Guard apply process snapshot",
+                    &fallback_errors,
+                ))
+            }
         }
-
-        let sql_minimal = r#"
-SELECT
-    '-' AS process,
-    '-' AS client_process,
-    'N/A' AS status,
-    '-' AS thread_no,
-    '-' AS sequence_no,
-    '-' AS block_no,
-    '-' AS blocks,
-    '-' AS delay_mins
-FROM dual
-"#;
-
-        Self::execute_select(conn, sql_minimal, Instant::now())
     }
 
     pub fn get_dataguard_archive_gap_snapshot(
@@ -4209,19 +4211,16 @@ FROM (
 ORDER BY sort_order, thread_no
 "#;
 
-        if let Ok(result) = Self::execute_select(conn, sql, Instant::now()) {
-            return Ok(result);
+        let mut fallback_errors: Vec<String> = Vec::new();
+        match Self::execute_select(conn, sql, Instant::now()) {
+            Ok(result) => return Ok(result),
+            Err(err) => fallback_errors.push(format!("v$archive_gap: {err}")),
         }
 
-        let sql_fallback = r#"
-SELECT
-    '-' AS thread_no,
-    'N/A' AS low_sequence,
-    '-' AS high_sequence
-FROM dual
-"#;
-
-        Self::execute_select(conn, sql_fallback, Instant::now())
+        Err(Self::chained_fallback_error(
+            "Data Guard archive gap snapshot",
+            &fallback_errors,
+        ))
     }
 
     pub fn force_archive_log_switch(conn: &Connection) -> Result<(), OracleError> {
@@ -5477,6 +5476,21 @@ ORDER BY job_name
         ) {
             return Err(Self::invalid_security_input_error(
                 "Data Pump job mode must be one of SCHEMA, TABLE, TABLESPACE, FULL",
+            ));
+        }
+        if matches!(normalized_job_mode.as_str(), "TABLE" | "TABLESPACE") {
+            return Err(Self::invalid_security_input_error(
+                "TABLE/TABLESPACE mode is not supported yet: please use SCHEMA or FULL",
+            ));
+        }
+        if normalized_job_mode == "SCHEMA" && normalized_schema.is_none() {
+            return Err(Self::invalid_security_input_error(
+                "Schema is required when Data Pump job mode is SCHEMA",
+            ));
+        }
+        if normalized_job_mode == "FULL" && normalized_schema.is_some() {
+            return Err(Self::invalid_security_input_error(
+                "Schema filter must be empty when Data Pump job mode is FULL",
             ));
         }
         let schema_expr = normalized_schema
