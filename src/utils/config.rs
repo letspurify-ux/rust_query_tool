@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -12,6 +13,7 @@ use crate::utils::credential_store;
 
 const APP_DIR_NAME: &str = "space_query";
 const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
+const MAX_RECENT_CONNECTIONS: usize = 50;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -94,9 +96,10 @@ impl AppConfig {
             if !conn.password.is_empty() {
                 if let Err(e) = credential_store::store_password(&conn.name, &conn.password) {
                     eprintln!("Keyring migration warning: {}", e);
+                } else {
+                    conn.clear_password();
+                    needs_resave = true;
                 }
-                conn.clear_password();
-                needs_resave = true;
             }
         }
 
@@ -116,32 +119,15 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(path) = Self::config_path() {
-            if let Some(parent) = path.parent() {
-                match fs::create_dir_all(parent) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        crate::utils::logging::log_error(
-                            "config",
-                            &format!("Config persistence error: {err}"),
-                        );
-                        eprintln!("Config persistence error: {err}");
-                        return Err(Box::new(err));
-                    }
-                }
-            }
-            let content = match serde_json::to_string_pretty(self) {
-                Ok(content) => content,
-                Err(err) => {
-                    crate::utils::logging::log_error(
-                        "config",
-                        &format!("Config persistence error: {err}"),
-                    );
-                    eprintln!("Config persistence error: {err}");
-                    return Err(Box::new(err));
-                }
-            };
-            match fs::write(&path, content) {
+        let path = Self::config_path().ok_or_else(|| {
+            let err = std::io::Error::other("Config directory is unavailable");
+            crate::utils::logging::log_error("config", &format!("Config persistence error: {err}"));
+            eprintln!("Config persistence error: {err}");
+            err
+        })?;
+
+        if let Some(parent) = path.parent() {
+            match fs::create_dir_all(parent) {
                 Ok(()) => {}
                 Err(err) => {
                     crate::utils::logging::log_error(
@@ -152,25 +138,46 @@ impl AppConfig {
                     return Err(Box::new(err));
                 }
             }
+        }
+        let content = match serde_json::to_string_pretty(self) {
+            Ok(content) => content,
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("Config persistence error: {err}"),
+                );
+                eprintln!("Config persistence error: {err}");
+                return Err(Box::new(err));
+            }
+        };
+        match fs::write(&path, content) {
+            Ok(()) => {}
+            Err(err) => {
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("Config persistence error: {err}"),
+                );
+                eprintln!("Config persistence error: {err}");
+                return Err(Box::new(err));
+            }
+        }
 
-            // Restrict file permissions to owner-only (0600) on Unix
-            #[cfg(unix)]
-            {
-                let permissions = fs::Permissions::from_mode(0o600);
-                if let Err(e) = fs::set_permissions(&path, permissions) {
-                    eprintln!("Warning: could not set config file permissions: {}", e);
-                }
+        // Restrict file permissions to owner-only (0600) on Unix
+        #[cfg(unix)]
+        {
+            let permissions = fs::Permissions::from_mode(0o600);
+            if let Err(e) = fs::set_permissions(&path, permissions) {
+                eprintln!("Warning: could not set config file permissions: {}", e);
             }
         }
         Ok(())
     }
 
-    pub fn add_recent_connection(&mut self, mut info: ConnectionInfo) {
+    pub fn add_recent_connection(&mut self, mut info: ConnectionInfo) -> Result<(), String> {
         // Store password in OS keyring, then clear from memory
         if !info.password.is_empty() {
-            if let Err(e) = credential_store::store_password(&info.name, &info.password) {
-                eprintln!("Keyring store warning: {}", e);
-            }
+            credential_store::store_password(&info.name, &info.password)
+                .map_err(|e| format!("Failed to store password in keyring: {e}"))?;
         }
         info.clear_password();
 
@@ -181,7 +188,8 @@ impl AppConfig {
         self.recent_connections.insert(0, info);
 
         // Keep only last 10 connections
-        self.recent_connections.truncate(10);
+        self.recent_connections.truncate(MAX_RECENT_CONNECTIONS);
+        Ok(())
     }
 
     pub fn get_connection_by_name(&self, name: &str) -> Option<&ConnectionInfo> {
@@ -190,23 +198,21 @@ impl AppConfig {
 
     /// Retrieve the password for a saved connection from the OS keyring on demand.
     /// Returns None if no password is stored or the connection name is not found.
-    pub fn get_password_for_connection(name: &str) -> Option<String> {
+    pub fn get_password_for_connection(name: &str) -> Result<Option<String>, String> {
         match credential_store::get_password(name) {
-            Ok(Some(password)) => Some(password),
-            Ok(None) => None,
-            Err(e) => {
-                eprintln!("Keyring load warning: {}", e);
-                None
-            }
+            Ok(Some(password)) => Ok(Some(password)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("Failed to load password from keyring: {e}")),
         }
     }
 
-    pub fn remove_connection(&mut self, name: &str) {
+    pub fn remove_connection(&mut self, name: &str) -> Result<(), String> {
         // Remove password from OS keyring
         if let Err(e) = credential_store::delete_password(name) {
-            eprintln!("Keyring delete warning: {}", e);
+            return Err(format!("Failed to remove password from keyring: {e}"));
         }
         self.recent_connections.retain(|c| c.name != name);
+        Ok(())
     }
 
     pub fn get_all_connections(&self) -> &Vec<ConnectionInfo> {
@@ -371,7 +377,13 @@ impl QueryHistory {
 
         if let Some(history) = loaded {
             if loaded_from_legacy {
-                let _ = history.save();
+                if let Err(err) = history.save() {
+                    crate::utils::logging::log_warning(
+                        "config",
+                        &format!("Failed to migrate legacy history path: {err}"),
+                    );
+                    eprintln!("Failed to migrate legacy history path: {err}");
+                }
             }
             return history;
         }
@@ -380,66 +392,78 @@ impl QueryHistory {
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(path) = Self::history_path() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|err| {
-                    crate::utils::logging::log_error(
-                        "config",
-                        &format!("History persistence error: {err}"),
-                    );
-                    eprintln!("History persistence error: {err}");
-                    err
-                })?;
-            }
-            // Atomic write: write to temp file first, then rename to avoid
-            // data loss if the process crashes mid-write.
-            let tmp_path = path.with_extension("json.tmp");
-            let file = fs::File::create(&tmp_path).map_err(|err| {
-                crate::utils::logging::log_error(
-                    "config",
-                    &format!("History persistence error: {err}"),
-                );
-                eprintln!("History persistence error: {err}");
-                err
-            })?;
-            let mut writer = BufWriter::new(file);
-            serde_json::to_writer(&mut writer, self).map_err(|err| {
-                crate::utils::logging::log_error(
-                    "config",
-                    &format!("History persistence error: {err}"),
-                );
-                eprintln!("History persistence error: {err}");
-                err
-            })?;
-            // Explicit flush so buffered bytes reach disk before rename.
-            use std::io::Write;
-            writer.flush().map_err(|err| {
-                crate::utils::logging::log_error(
-                    "config",
-                    &format!("History persistence error: {err}"),
-                );
-                eprintln!("History persistence error: {err}");
-                err
-            })?;
-            fs::rename(&tmp_path, &path).map_err(|err| {
-                crate::utils::logging::log_error(
-                    "config",
-                    &format!("History persistence error: {err}"),
-                );
-                eprintln!("History persistence error: {err}");
-                err
-            })?;
+        let path = Self::history_path().ok_or_else(|| {
+            let err = std::io::Error::other("History directory is unavailable");
+            crate::utils::logging::log_error(
+                "config",
+                &format!("History persistence error: {err}"),
+            );
+            eprintln!("History persistence error: {err}");
+            err
+        })?;
 
-            // Restrict file permissions to owner-only (0600) on Unix
-            #[cfg(unix)]
-            {
-                let permissions = fs::Permissions::from_mode(0o600);
-                if let Err(err) = fs::set_permissions(&path, permissions) {
-                    eprintln!(
-                        "Warning: could not set query history file permissions: {}",
-                        err
-                    );
-                }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                crate::utils::logging::log_error(
+                    "config",
+                    &format!("History persistence error: {err}"),
+                );
+                eprintln!("History persistence error: {err}");
+                err
+            })?;
+        }
+        // Atomic write: write to temp file first, then rename to avoid
+        // data loss if the process crashes mid-write.
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let tmp_path = path.with_extension(format!("json.tmp.{}.{}", process::id(), now_millis));
+        let file = fs::File::create(&tmp_path).map_err(|err| {
+            crate::utils::logging::log_error(
+                "config",
+                &format!("History persistence error: {err}"),
+            );
+            eprintln!("History persistence error: {err}");
+            err
+        })?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, self).map_err(|err| {
+            crate::utils::logging::log_error(
+                "config",
+                &format!("History persistence error: {err}"),
+            );
+            eprintln!("History persistence error: {err}");
+            err
+        })?;
+        // Explicit flush so buffered bytes reach disk before rename.
+        use std::io::Write;
+        writer.flush().map_err(|err| {
+            crate::utils::logging::log_error(
+                "config",
+                &format!("History persistence error: {err}"),
+            );
+            eprintln!("History persistence error: {err}");
+            err
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|err| {
+            crate::utils::logging::log_error(
+                "config",
+                &format!("History persistence error: {err}"),
+            );
+            eprintln!("History persistence error: {err}");
+            err
+        })?;
+
+        // Restrict file permissions to owner-only (0600) on Unix
+        #[cfg(unix)]
+        {
+            let permissions = fs::Permissions::from_mode(0o600);
+            if let Err(err) = fs::set_permissions(&path, permissions) {
+                eprintln!(
+                    "Warning: could not set query history file permissions: {}",
+                    err
+                );
             }
         }
         Ok(())

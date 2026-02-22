@@ -3,8 +3,8 @@ use fltk::{
     browser::HoldBrowser,
     button::{Button, CheckButton},
     enums::FrameType,
-    input::Input,
     group::Flex,
+    input::Input,
     prelude::*,
     text::{StyleTableEntry, TextBuffer, TextDisplay},
     window::Window,
@@ -28,7 +28,7 @@ enum HistoryCommand {
     Flush(mpsc::Sender<Result<(), String>>),
 }
 
-const HISTORY_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+const HISTORY_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const REDACTED_SECRET: &str = "<redacted>";
 
 fn history_writer_sender() -> &'static mpsc::Sender<HistoryCommand> {
@@ -137,25 +137,79 @@ pub fn flush_history_writer() -> Result<(), String> {
 
 fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = message.to_ascii_lowercase();
-    for needle in ["line ", "line:"] {
+    for needle in ["error at line", "line:", " line "] {
         if let Some(idx) = lowercase.find(needle) {
             let start = idx + needle.len();
             let mut digits = String::new();
             for ch in lowercase[start..].chars() {
+                if ch.is_ascii_whitespace() && digits.is_empty() {
+                    continue;
+                }
                 if ch.is_ascii_digit() {
                     digits.push(ch);
-                } else if !digits.is_empty() {
+                } else {
                     break;
                 }
             }
-            if !digits.is_empty() {
-                if let Ok(value) = digits.parse::<usize>() {
-                    return Some(value);
-                }
+            if let Ok(value) = digits.parse::<usize>() {
+                return Some(value);
             }
         }
     }
     None
+}
+
+fn split_sql_and_comments(line: &str) -> (&str, &str) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = 0usize;
+
+    while idx < line.len() {
+        let Some(ch) = line[idx..].chars().next() else {
+            break;
+        };
+        let next = idx + ch.len_utf8();
+
+        if !in_double && ch == '\'' {
+            if in_single && next < line.len() {
+                if let Some(next_ch) = line[next..].chars().next() {
+                    if next_ch == '\'' {
+                        idx = next + next_ch.len_utf8();
+                        continue;
+                    }
+                }
+            }
+            in_single = !in_single;
+            idx = next;
+            continue;
+        }
+
+        if !in_single && ch == '"' {
+            if in_double && next < line.len() {
+                if let Some(next_ch) = line[next..].chars().next() {
+                    if next_ch == '"' {
+                        idx = next + next_ch.len_utf8();
+                        continue;
+                    }
+                }
+            }
+            in_double = !in_double;
+            idx = next;
+            continue;
+        }
+
+        if !in_single && !in_double && ch == '-' && next < line.len() {
+            if let Some(next_ch) = line[next..].chars().next() {
+                if next_ch == '-' {
+                    return (&line[..idx], &line[idx..]);
+                }
+            }
+        }
+
+        idx = next;
+    }
+
+    (line, "")
 }
 
 fn sanitize_history_sql(sql: &str) -> String {
@@ -239,7 +293,10 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
     }
 
     let slash_idx = rest.find('/')?;
-    let at_idx = rest.rfind('@')?;
+    let at_idx = rest
+        .char_indices()
+        .filter_map(|(idx, ch)| if ch == '@' { Some(idx) } else { None })
+        .last()?;
     if slash_idx >= at_idx {
         return None;
     }
@@ -254,11 +311,35 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
 }
 
 fn redact_identified_by_clause(text: &str) -> String {
-    const IDENTIFIED_BY: &str = "IDENTIFIED BY";
-
     if text.is_empty() {
         return String::new();
     }
+
+    let mut output = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let line = if has_newline {
+            &segment[..segment.len().saturating_sub(1)]
+        } else {
+            segment
+        };
+        let (code, comment) = split_sql_and_comments(line);
+        output.push_str(&redact_identified_by_clause_in_code(code));
+        output.push_str(comment);
+        if has_newline {
+            output.push('\n');
+        }
+    }
+
+    if !text.ends_with('\n') && output.ends_with('\n') {
+        output.pop();
+    }
+
+    output
+}
+
+fn redact_identified_by_clause_in_code(text: &str) -> String {
+    const IDENTIFIED_BY: &str = "IDENTIFIED BY";
 
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
@@ -398,6 +479,11 @@ fn redact_uri_credentials(text: &str) -> String {
                 output.push_str(&userinfo[..colon_pos + 1]);
                 output.push_str(REDACTED_SECRET);
                 output.push_str(host);
+            } else if !userinfo.is_empty() {
+                output.push_str(userinfo);
+                output.push(':');
+                output.push_str(REDACTED_SECRET);
+                output.push_str(host);
             } else {
                 output.push_str(authority);
             }
@@ -472,19 +558,19 @@ fn preview_style_table() -> Vec<StyleTableEntry> {
 /// Retrieve a snapshot of the current history from the background writer thread,
 /// avoiding a redundant disk read + parse.  Falls back to disk if the writer
 /// thread is unreachable.
-fn load_snapshot() -> Vec<QueryHistoryEntry> {
+fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
     let (tx, rx) = mpsc::channel();
     if history_writer_sender()
         .send(HistoryCommand::Snapshot(tx))
         .is_ok()
     {
         match rx.recv_timeout(HISTORY_WRITER_RESPONSE_TIMEOUT) {
-            Ok(snapshot) => snapshot,
-            Err(_) => QueryHistory::load().queries,
+            Ok(snapshot) => (snapshot, false),
+            Err(_) => (QueryHistory::load().queries, true),
         }
     } else {
         // Writer thread dead – fall back to disk
-        QueryHistory::load().queries
+        (QueryHistory::load().queries, true)
     }
 }
 
@@ -519,7 +605,7 @@ impl QueryHistoryDialog {
             Close,
         }
 
-        let snapshot = load_snapshot();
+        let (snapshot, snapshot_is_fallback) = load_snapshot();
 
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
@@ -547,6 +633,9 @@ impl QueryHistoryDialog {
 
         let mut list_label =
             fltk::frame::Frame::default().with_label("Query History (Most Recent First):");
+        if snapshot_is_fallback {
+            list_label.set_label("Query History (disk fallback; recent updates may be delayed):");
+        }
         list_label.set_label_color(theme::text_primary());
         list_flex.fixed(&list_label, LABEL_ROW_HEIGHT);
 
@@ -798,7 +887,8 @@ impl QueryHistoryDialog {
                                 let queries = queries
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Some(entry) = entry_index.and_then(|actual| queries.get(actual))
+                                if let Some(entry) =
+                                    entry_index.and_then(|actual| queries.get(actual))
                                 {
                                     *selected_sql
                                         .lock()
@@ -913,7 +1003,13 @@ impl QueryHistoryDialog {
             if let HistoryCommand::Add(entry) = err.0 {
                 let mut history = QueryHistory::load();
                 history.add_entry(entry);
-                let _ = history.save();
+                if let Err(save_err) = history.save() {
+                    crate::utils::logging::log_error(
+                        "history",
+                        &format!("Query history fallback save error: {save_err}"),
+                    );
+                    eprintln!("Query history fallback save error: {save_err}");
+                }
             }
         }
     }
