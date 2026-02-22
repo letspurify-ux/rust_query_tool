@@ -116,6 +116,7 @@ impl ConnectionDialog {
 
         let result: Arc<Mutex<Option<ConnectionInfo>>> = Arc::new(Mutex::new(None));
         let config = Arc::new(Mutex::new(AppConfig::load()));
+        let test_in_progress = Arc::new(Mutex::new(false));
 
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
@@ -406,6 +407,7 @@ impl ConnectionDialog {
         // Test button callback
         let sender_for_test = sender.clone();
         let mut test_btn_for_toggle = test_btn.clone();
+        let test_in_progress_for_test = test_in_progress.clone();
         let name_input_test = name_input.clone();
         let user_input_test = user_input.clone();
         let pass_input_test = pass_input.clone();
@@ -414,6 +416,16 @@ impl ConnectionDialog {
         let service_input_test = service_input.clone();
 
         test_btn.set_callback(move |_| {
+            {
+                let mut guard = test_in_progress_for_test
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *guard {
+                    return;
+                }
+                *guard = true;
+            }
+
             let info = match build_connection_info(
                 &name_input_test.value(),
                 &user_input_test.value(),
@@ -425,6 +437,9 @@ impl ConnectionDialog {
                 Ok(info) => info,
                 Err(message) => {
                     fltk::dialog::alert_default(&message);
+                    *test_in_progress_for_test
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
                     return;
                 }
             };
@@ -492,8 +507,10 @@ impl ConnectionDialog {
                                 let mut cfg = config
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let previous_connections = cfg.recent_connections.clone();
                                 let removal_error = cfg.remove_connection(&selected).err();
                                 if let Err(e) = cfg.save() {
+                                    cfg.recent_connections = previous_connections;
                                     fltk::dialog::alert_default(&format!(
                                         "Failed to save config: {}",
                                         e
@@ -523,6 +540,9 @@ impl ConnectionDialog {
                         });
                     }
                     DialogMessage::SetTestInProgress(in_progress) => {
+                        *test_in_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = in_progress;
                         if in_progress {
                             test_btn.deactivate();
                         } else {

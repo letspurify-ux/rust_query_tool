@@ -210,8 +210,9 @@ impl AppConfig {
         self.recent_connections.retain(|c| c.name != name);
         // Remove password from OS keyring after config list cleanup so users can
         // still remove stale/broken entries even if keyring backends fail.
-        credential_store::delete_password(name)
-            .map_err(|e| format!("Connection removed, but failed to remove password from keyring: {e}"))
+        credential_store::delete_password(name).map_err(|e| {
+            format!("Connection removed, but failed to remove password from keyring: {e}")
+        })
     }
 
     pub fn get_all_connections(&self) -> &Vec<ConnectionInfo> {
