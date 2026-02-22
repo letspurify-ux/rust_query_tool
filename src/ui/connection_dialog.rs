@@ -74,6 +74,7 @@ impl ConnectionDialog {
             TestResult(Result<(), String>),
             Save(ConnectionInfo),
             Connect(ConnectionInfo, bool),
+            SetTestInProgress(bool),
             Cancel,
         }
 
@@ -299,8 +300,13 @@ impl ConnectionDialog {
                     name_input_cb.set_value(&conn.name);
                     user_input_cb.set_value(&conn.username);
                     // Load password from OS keyring on demand.
-                    let password =
-                        AppConfig::get_password_for_connection(&conn.name).unwrap_or_default();
+                    let password = match AppConfig::get_password_for_connection(&conn.name) {
+                        Ok(password_opt) => password_opt.unwrap_or_default(),
+                        Err(err) => {
+                            fltk::dialog::alert_default(&err);
+                            String::new()
+                        }
+                    };
                     pass_input_cb.set_value(&password);
                     host_input_cb.set_value(&conn.host);
                     port_input_cb.set_value(&conn.port.to_string());
@@ -316,7 +322,7 @@ impl ConnectionDialog {
                             conn.port,
                             &conn.service_name,
                         );
-                        let _ = sender_for_click.send(DialogMessage::Connect(info, true));
+                        let _ = sender_for_click.send(DialogMessage::Connect(info, false));
                         app::awake();
                     }
                 }
@@ -361,6 +367,7 @@ impl ConnectionDialog {
 
         // Test button callback
         let sender_for_test = sender.clone();
+        let mut test_btn_for_toggle = test_btn.clone();
         let name_input_test = name_input.clone();
         let user_input_test = user_input.clone();
         let pass_input_test = pass_input.clone();
@@ -384,6 +391,8 @@ impl ConnectionDialog {
                 }
             };
 
+            test_btn_for_toggle.deactivate();
+            let _ = sender_for_test.send(DialogMessage::SetTestInProgress(true));
             let _ = sender_for_test.send(DialogMessage::Test(info));
             app::awake();
         });
@@ -445,16 +454,18 @@ impl ConnectionDialog {
                                 let mut cfg = config
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                cfg.remove_connection(&selected);
-                                if let Err(e) = cfg.save() {
+                                if let Err(e) = cfg.remove_connection(&selected) {
+                                    fltk::dialog::alert_default(&e);
+                                } else if let Err(e) = cfg.save() {
                                     fltk::dialog::alert_default(&format!(
                                         "Failed to save config: {}",
                                         e
                                     ));
-                                }
-                                saved_browser.clear();
-                                for conn in cfg.get_all_connections() {
-                                    saved_browser.add(&conn.name);
+                                } else {
+                                    saved_browser.clear();
+                                    for conn in cfg.get_all_connections() {
+                                        saved_browser.add(&conn.name);
+                                    }
                                 }
                             }
                         } else {
@@ -467,8 +478,16 @@ impl ConnectionDialog {
                             let result = DatabaseConnection::test_connection(&info)
                                 .map_err(|e| e.to_string());
                             let _ = sender.send(DialogMessage::TestResult(result));
+                            let _ = sender.send(DialogMessage::SetTestInProgress(false));
                             app::awake();
                         });
+                    }
+                    DialogMessage::SetTestInProgress(in_progress) => {
+                        if in_progress {
+                            test_btn.deactivate();
+                        } else {
+                            test_btn.activate();
+                        }
                     }
                     DialogMessage::TestResult(result) => match result {
                         Ok(_) => {
@@ -482,8 +501,9 @@ impl ConnectionDialog {
                         let mut cfg = config
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        cfg.add_recent_connection(info.clone());
-                        if let Err(e) = cfg.save() {
+                        if let Err(e) = cfg.add_recent_connection(info.clone()) {
+                            fltk::dialog::alert_default(&e);
+                        } else if let Err(e) = cfg.save() {
                             fltk::dialog::alert_default(&format!(
                                 "Failed to save connection: {}",
                                 e
@@ -500,7 +520,10 @@ impl ConnectionDialog {
                             let mut cfg = config
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            cfg.add_recent_connection(info.clone());
+                            if let Err(e) = cfg.add_recent_connection(info.clone()) {
+                                fltk::dialog::alert_default(&e);
+                                continue;
+                            }
                             if let Err(e) = cfg.save() {
                                 fltk::dialog::alert_default(&format!(
                                     "Failed to save connection: {}",
