@@ -2666,9 +2666,13 @@ SELECT
     NVL(TO_CHAR(s.blocking_session), '-') AS blocking_sid,
     NVL(
         (
-            SELECT TO_CHAR(bs.serial#)
+            SELECT TO_CHAR(MAX(bs.serial#))
             FROM v$session bs
             WHERE bs.sid = s.blocking_session
+              AND (
+                    s.blocking_instance IS NULL
+                    OR TO_CHAR(s.blocking_instance) = SYS_CONTEXT('USERENV', 'INSTANCE')
+              )
         ),
         '-'
     ) AS blocking_serial,
@@ -2690,11 +2694,13 @@ ORDER BY
 "#;
 
         let start = Instant::now();
-        let (executed_sql, mut stmt) = match conn.statement(sql_gv).build() {
-            Ok(stmt) => (sql_gv, stmt),
-            Err(err) if Self::should_fallback_from_global_view(&err) => {
-                (sql_v, conn.statement(sql_v).build()?)
-            }
+        let (executed_sql, mut stmt, source_view) = match conn.statement(sql_gv).build() {
+            Ok(stmt) => (sql_gv, stmt, "gv$session+gv$lock"),
+            Err(err) if Self::should_fallback_from_global_view(&err) => (
+                sql_v,
+                conn.statement(sql_v).build()?,
+                "v$session+v$lock (current instance only)",
+            ),
             Err(err) => return Err(err),
         };
         let rows = stmt.query(&[])?;
@@ -2705,7 +2711,7 @@ ORDER BY
             let mut values = Vec::with_capacity(11);
             for idx in 0..11 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_else(|| "-".to_string()));
+                values.push(value.unwrap_or_else(|| "<NULL>".to_string()));
             }
             result_rows.push(values);
         }
@@ -2757,11 +2763,9 @@ ORDER BY
             },
         ];
 
-        Ok(QueryResult::new_select(
-            executed_sql,
-            columns,
-            result_rows,
-            start.elapsed(),
+        Ok(Self::annotate_result_source(
+            QueryResult::new_select(executed_sql, columns, result_rows, start.elapsed()),
+            source_view,
         ))
     }
 
@@ -2841,11 +2845,13 @@ ORDER BY
 "#;
 
         let start = Instant::now();
-        let (executed_sql, mut stmt) = match conn.statement(sql_gv).build() {
-            Ok(stmt) => (sql_gv, stmt),
-            Err(err) if Self::should_fallback_from_global_view(&err) => {
-                (sql_v, conn.statement(sql_v).build()?)
-            }
+        let (executed_sql, mut stmt, source_view) = match conn.statement(sql_gv).build() {
+            Ok(stmt) => (sql_gv, stmt, "gv$session+gv$sql"),
+            Err(err) if Self::should_fallback_from_global_view(&err) => (
+                sql_v,
+                conn.statement(sql_v).build()?,
+                "v$session+v$sql (current instance only)",
+            ),
             Err(err) => return Err(err),
         };
         let min_elapsed_bind = i64::from(min_elapsed_seconds);
@@ -2858,7 +2864,7 @@ ORDER BY
             let mut values = Vec::with_capacity(13);
             for idx in 0..13 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_else(|| "-".to_string()));
+                values.push(value.unwrap_or_else(|| "<NULL>".to_string()));
             }
             result_rows.push(values);
         }
@@ -2918,11 +2924,9 @@ ORDER BY
             },
         ];
 
-        Ok(QueryResult::new_select(
-            executed_sql,
-            columns,
-            result_rows,
-            start.elapsed(),
+        Ok(Self::annotate_result_source(
+            QueryResult::new_select(executed_sql, columns, result_rows, start.elapsed()),
+            source_view,
         ))
     }
 
@@ -2972,8 +2976,8 @@ ORDER BY
         let mut result_rows: Vec<Vec<String>> = Vec::new();
         for row_result in rows {
             let row: Row = row_result?;
-            let value: Option<String> = row.get(0).unwrap_or(None);
-            result_rows.push(vec![value.unwrap_or_default()]);
+            let value: Option<String> = row.get(0)?;
+            result_rows.push(vec![value.unwrap_or_else(|| "<NULL>".to_string())]);
         }
 
         Ok(QueryResult::new_select(
@@ -3198,6 +3202,7 @@ WHERE ROWNUM <= 5
             Self::normalize_optional_security_identifier(username_filter, "User filter")?;
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::query_sql_monitor_rows(
             conn,
             true,
@@ -3208,7 +3213,10 @@ WHERE ROWNUM <= 5
         ) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "gv$sql_monitor")),
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("gv$sql_monitor: {err}")),
+            Err(err) => {
+                fallback_sources.push("gv$sql_monitor".to_string());
+                fallback_errors.push(format!("gv$sql_monitor: {err}"));
+            }
         }
 
         match Self::query_sql_monitor_rows(
@@ -3221,9 +3229,11 @@ WHERE ROWNUM <= 5
         ) {
             Ok(result) => Ok(Self::annotate_result_source(result, "v$sql_monitor")),
             Err(err) => {
+                fallback_sources.push("v$sql_monitor".to_string());
                 fallback_errors.push(format!("v$sql_monitor: {err}"));
                 Err(Self::chained_fallback_error(
                     "SQL Monitor snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -3312,7 +3322,7 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
             let mut values = Vec::with_capacity(14);
             for idx in 0..14 {
                 let value: Option<String> = row.get(idx)?;
-                values.push(value.unwrap_or_else(|| "-".to_string()));
+                values.push(value.unwrap_or_else(|| "<NULL>".to_string()));
             }
             result_rows.push(values);
         }
@@ -3769,6 +3779,7 @@ WHERE ROWNUM <= 600
         );
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_gv, Instant::now()) {
             Ok(result) => {
                 return Ok(Self::annotate_result_source(
@@ -3777,7 +3788,10 @@ WHERE ROWNUM <= 600
                 ));
             }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("gv$active_session_history: {err}")),
+            Err(err) => {
+                fallback_sources.push("gv$active_session_history".to_string());
+                fallback_errors.push(format!("gv$active_session_history: {err}"));
+            }
         }
 
         let sql_v = format!(
@@ -3813,9 +3827,11 @@ WHERE ROWNUM <= 600
                 "v$active_session_history",
             )),
             Err(err) => {
+                fallback_sources.push("v$active_session_history".to_string());
                 fallback_errors.push(format!("v$active_session_history: {err}"));
                 Err(Self::chained_fallback_error(
                     "ASH session activity snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -3879,6 +3895,7 @@ WHERE ROWNUM <= {top_n}
         );
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_gv, Instant::now()) {
             Ok(result) => {
                 return Ok(Self::annotate_result_source(
@@ -3887,7 +3904,10 @@ WHERE ROWNUM <= {top_n}
                 ));
             }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("gv$active_session_history: {err}")),
+            Err(err) => {
+                fallback_sources.push("gv$active_session_history".to_string());
+                fallback_errors.push(format!("gv$active_session_history: {err}"));
+            }
         }
 
         let sql_v = format!(
@@ -3930,9 +3950,11 @@ WHERE ROWNUM <= {top_n}
                 "v$active_session_history",
             )),
             Err(err) => {
+                fallback_sources.push("v$active_session_history".to_string());
                 fallback_errors.push(format!("v$active_session_history: {err}"));
                 Err(Self::chained_fallback_error(
                     "ASH top SQL snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -3995,14 +4017,19 @@ WHERE ROWNUM <= {top_n}
         );
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::execute_select(conn, &sql_awr, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_hist_sqlstat")),
-            Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("dba_hist_sqlstat: {err}")),
+            Err(err) if !Self::should_fallback_from_awr_view(&err) => return Err(err),
+            Err(err) => {
+                fallback_sources.push("dba_hist_sqlstat".to_string());
+                fallback_errors.push(format!("dba_hist_sqlstat: {err}"));
+            }
         }
 
         Err(Self::chained_fallback_error(
             "AWR Top SQL requires AWR access (DBA_HIST_SQLSTAT/DBA_HIST_SNAPSHOT/DBA_HIST_SQLTEXT)",
+            &fallback_sources,
             &fallback_errors,
         ))
     }
@@ -4050,6 +4077,7 @@ FROM v$database d
 "#;
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::execute_select(conn, sql, Instant::now()) {
             Ok(result) => {
                 return Ok(Self::annotate_result_source(
@@ -4057,7 +4085,10 @@ FROM v$database d
                     "v$database + v$dataguard_stats",
                 ));
             }
-            Err(err) => fallback_errors.push(format!("v$database + v$dataguard_stats: {err}")),
+            Err(err) => {
+                fallback_sources.push("v$database + v$dataguard_stats".to_string());
+                fallback_errors.push(format!("v$database + v$dataguard_stats: {err}"));
+            }
         }
 
         let sql_fallback = r#"
@@ -4071,9 +4102,9 @@ SELECT
     NVL(d.force_logging, '-') AS force_logging,
     NVL(d.flashback_on, '-') AS flashback_on,
     NVL(d.dataguard_broker, '-') AS dataguard_broker,
-    '-' AS transport_lag,
-    '-' AS apply_lag,
-    '-' AS apply_finish_time
+    '<UNAVAILABLE>' AS transport_lag,
+    '<UNAVAILABLE>' AS apply_lag,
+    '<UNAVAILABLE>' AS apply_finish_time
 FROM v$database d
 "#;
 
@@ -4083,9 +4114,11 @@ FROM v$database d
                 "v$database (fallback)",
             )),
             Err(err) => {
+                fallback_sources.push("v$database fallback".to_string());
                 fallback_errors.push(format!("v$database fallback: {err}"));
                 Err(Self::chained_fallback_error(
                     "Data Guard overview snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -4151,8 +4184,13 @@ ORDER BY dest_id
             Ok(result) => Ok(result),
             Err(err) => {
                 fallback_errors.push(format!("v$archive_dest: {err}"));
+                let fallback_sources = vec![
+                    "v$archive_dest_status".to_string(),
+                    "v$archive_dest".to_string(),
+                ];
                 Err(Self::chained_fallback_error(
                     "Data Guard destination snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -4200,8 +4238,13 @@ ORDER BY name
             Ok(result) => Ok(result),
             Err(err) => {
                 fallback_errors.push(format!("v$dataguard_process: {err}"));
+                let fallback_sources = vec![
+                    "v$managed_standby".to_string(),
+                    "v$dataguard_process".to_string(),
+                ];
                 Err(Self::chained_fallback_error(
                     "Data Guard apply process snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -4221,15 +4264,38 @@ ORDER BY thread#
 "#;
 
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         match Self::execute_select(conn, sql, Instant::now()) {
-            Ok(result) => return Ok(result),
-            Err(err) => fallback_errors.push(format!("v$archive_gap: {err}")),
+            Ok(result) => return Ok(Self::annotate_result_source(result, "v$archive_gap")),
+            Err(err) => {
+                fallback_sources.push("v$archive_gap".to_string());
+                fallback_errors.push(format!("v$archive_gap: {err}"));
+            }
         }
 
-        Err(Self::chained_fallback_error(
-            "Data Guard archive gap snapshot",
-            &fallback_errors,
-        ))
+        let sql_fallback = r#"
+SELECT
+    '<UNAVAILABLE>' AS thread_no,
+    '<UNAVAILABLE>' AS low_sequence,
+    '<UNAVAILABLE>' AS high_sequence
+FROM dual
+"#;
+
+        match Self::execute_select(conn, sql_fallback, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(
+                result,
+                "dual archive-gap fallback",
+            )),
+            Err(err) => {
+                fallback_sources.push("dual archive-gap fallback".to_string());
+                fallback_errors.push(format!("dual archive-gap fallback: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Data Guard archive gap snapshot",
+                    &fallback_sources,
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn force_archive_log_switch(conn: &Connection) -> Result<(), OracleError> {
@@ -4924,6 +4990,22 @@ ORDER BY
             || msg.contains("ORA-02030")
     }
 
+    fn should_fallback_from_awr_view(err: &OracleError) -> bool {
+        let fallback_codes = [904, 942, 1031, 1376, 20000, 20200, 2030];
+        if let Some(code) = Self::extract_ora_error_code(err) {
+            return fallback_codes.contains(&code);
+        }
+
+        let msg = format!("{err}").to_uppercase();
+        msg.contains("ORA-00904")
+            || msg.contains("ORA-00942")
+            || msg.contains("ORA-01031")
+            || msg.contains("ORA-01376")
+            || msg.contains("ORA-20000")
+            || msg.contains("ORA-20200")
+            || msg.contains("ORA-02030")
+    }
+
     fn annotate_result_source(mut result: QueryResult, source_view: &str) -> QueryResult {
         let source_note = format!("Source view: {source_view}");
         result.message = if result.message.trim().is_empty() {
@@ -4931,6 +5013,18 @@ ORDER BY
         } else {
             format!("{} | {source_note}", result.message)
         };
+        result
+    }
+
+    fn append_result_source_column(mut result: QueryResult, source_view: &str) -> QueryResult {
+        result.columns.push(ColumnInfo {
+            name: "SOURCE_VIEW".to_string(),
+            data_type: "VARCHAR2".to_string(),
+        });
+        let source_text = source_view.to_string();
+        for row in &mut result.rows {
+            row.push(source_text.clone());
+        }
         result
     }
 
@@ -4949,15 +5043,32 @@ ORDER BY
         digits.parse::<i32>().ok()
     }
 
-    fn chained_fallback_error(context: &str, errors: &[String]) -> OracleError {
+    fn chained_fallback_error(
+        context: &str,
+        fallback_sources: &[String],
+        errors: &[String],
+    ) -> OracleError {
+        let source_detail = if fallback_sources.is_empty() {
+            "no fallback source".to_string()
+        } else {
+            fallback_sources.join(" -> ")
+        };
         let detail = if errors.is_empty() {
             "no fallback details".to_string()
         } else {
             errors.join(" | ")
         };
-        Self::invalid_security_input_error(format!(
-            "{context} failed after fallback attempts: {detail}"
+        Self::query_execution_error(format!(
+            "{context} failed after fallback attempts ({source_detail}): {detail}"
         ))
+    }
+
+    fn query_execution_error(message: impl Into<String>) -> OracleError {
+        #[allow(deprecated)]
+        OracleError::InvalidArgument {
+            message: Cow::Owned(message.into()),
+            source: None,
+        }
     }
 
     fn current_database_role(conn: &Connection) -> Result<String, OracleError> {
@@ -5029,7 +5140,12 @@ ORDER BY owner, job_name
         );
 
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
-            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_scheduler_jobs")),
+            Ok(result) => {
+                return Ok(Self::append_result_source_column(
+                    Self::annotate_result_source(result, "dba_scheduler_jobs"),
+                    "dba_scheduler_jobs",
+                ));
+            }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
             Err(err) => fallback_errors.push(format!("dba_scheduler_jobs: {err}")),
         }
@@ -5055,7 +5171,12 @@ ORDER BY owner, job_name
         );
 
         match Self::execute_select(conn, &sql_all, Instant::now()) {
-            Ok(result) => return Ok(Self::annotate_result_source(result, "all_scheduler_jobs")),
+            Ok(result) => {
+                return Ok(Self::append_result_source_column(
+                    Self::annotate_result_source(result, "all_scheduler_jobs"),
+                    "all_scheduler_jobs",
+                ));
+            }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
             Err(err) => fallback_errors.push(format!("all_scheduler_jobs: {err}")),
         }
@@ -5095,11 +5216,20 @@ ORDER BY job_name
 "#
         );
         match Self::execute_select(conn, &sql_user, Instant::now()) {
-            Ok(result) => Ok(Self::annotate_result_source(result, "user_scheduler_jobs")),
+            Ok(result) => Ok(Self::append_result_source_column(
+                Self::annotate_result_source(result, "user_scheduler_jobs"),
+                "user_scheduler_jobs",
+            )),
             Err(err) => {
                 fallback_errors.push(format!("user_scheduler_jobs: {err}"));
+                let fallback_sources = vec![
+                    "dba_scheduler_jobs".to_string(),
+                    "all_scheduler_jobs".to_string(),
+                    "user_scheduler_jobs".to_string(),
+                ];
                 Err(Self::chained_fallback_error(
                     "Scheduler jobs snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -5112,6 +5242,7 @@ ORDER BY job_name
         job_name: &str,
     ) -> Result<QueryResult, OracleError> {
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         let normalized_job = Self::normalize_required_security_identifier(job_name, "Job")?;
         let normalized_owner = Self::normalize_optional_security_identifier(owner, "Owner")?;
         let owner_clause = normalized_owner
@@ -5142,12 +5273,15 @@ WHERE ROWNUM <= 200
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => {
                 return Ok(Self::annotate_result_source(
-                    result,
+                    Self::append_result_source_column(result, "dba_scheduler_job_run_details"),
                     "dba_scheduler_job_run_details",
                 ));
             }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("dba_scheduler_job_run_details: {err}")),
+            Err(err) => {
+                fallback_sources.push("dba_scheduler_job_run_details".to_string());
+                fallback_errors.push(format!("dba_scheduler_job_run_details: {err}"));
+            }
         }
 
         let sql_all = format!(
@@ -5174,12 +5308,15 @@ WHERE ROWNUM <= 200
         match Self::execute_select(conn, &sql_all, Instant::now()) {
             Ok(result) => {
                 return Ok(Self::annotate_result_source(
-                    result,
+                    Self::append_result_source_column(result, "all_scheduler_job_run_details"),
                     "all_scheduler_job_run_details",
                 ));
             }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("all_scheduler_job_run_details: {err}")),
+            Err(err) => {
+                fallback_sources.push("all_scheduler_job_run_details".to_string());
+                fallback_errors.push(format!("all_scheduler_job_run_details: {err}"));
+            }
         }
 
         let sql_user = format!(
@@ -5203,13 +5340,15 @@ WHERE ROWNUM <= 200
         );
         match Self::execute_select(conn, &sql_user, Instant::now()) {
             Ok(result) => Ok(Self::annotate_result_source(
-                result,
+                Self::append_result_source_column(result, "user_scheduler_job_run_details"),
                 "user_scheduler_job_run_details",
             )),
             Err(err) => {
+                fallback_sources.push("user_scheduler_job_run_details".to_string());
                 fallback_errors.push(format!("user_scheduler_job_run_details: {err}"));
                 Err(Self::chained_fallback_error(
                     "Scheduler job history snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -5396,6 +5535,7 @@ END;"
         owner_filter: Option<&str>,
     ) -> Result<QueryResult, OracleError> {
         let mut fallback_errors: Vec<String> = Vec::new();
+        let mut fallback_sources: Vec<String> = Vec::new();
         let owner_filter =
             Self::normalize_optional_security_identifier(owner_filter, "Owner filter")?;
         let dba_where = owner_filter
@@ -5419,9 +5559,17 @@ ORDER BY owner_name, job_name
 "#
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
-            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_datapump_jobs")),
+            Ok(result) => {
+                return Ok(Self::append_result_source_column(
+                    Self::annotate_result_source(result, "dba_datapump_jobs"),
+                    "dba_datapump_jobs",
+                ));
+            }
             Err(err) if !Self::should_fallback_from_global_view(&err) => return Err(err),
-            Err(err) => fallback_errors.push(format!("dba_datapump_jobs: {err}")),
+            Err(err) => {
+                fallback_sources.push("dba_datapump_jobs".to_string());
+                fallback_errors.push(format!("dba_datapump_jobs: {err}"));
+            }
         }
 
         let user_where = owner_filter
@@ -5445,11 +5593,16 @@ ORDER BY job_name
 "#
         );
         match Self::execute_select(conn, &sql_user, Instant::now()) {
-            Ok(result) => Ok(Self::annotate_result_source(result, "user_datapump_jobs")),
+            Ok(result) => Ok(Self::append_result_source_column(
+                Self::annotate_result_source(result, "user_datapump_jobs"),
+                "user_datapump_jobs",
+            )),
             Err(err) => {
+                fallback_sources.push("user_datapump_jobs".to_string());
                 fallback_errors.push(format!("user_datapump_jobs: {err}"));
                 Err(Self::chained_fallback_error(
                     "Data Pump jobs snapshot",
+                    &fallback_sources,
                     &fallback_errors,
                 ))
             }
@@ -5543,9 +5696,11 @@ ORDER BY job_name
                 "Schema filter must be empty when Data Pump job mode is FULL",
             ));
         }
-        if matches!(normalized_job_mode.as_str(), "TABLE" | "TABLESPACE") {
+        if matches!(normalized_job_mode.as_str(), "TABLE" | "TABLESPACE")
+            && normalized_schema.is_none()
+        {
             return Err(Self::invalid_security_input_error(
-                "Data Pump TABLE/TABLESPACE modes are not supported yet; use SCHEMA or FULL",
+                "Schema is required for TABLE/TABLESPACE mode until object-level filters are provided",
             ));
         }
         let schema_expr = normalized_schema
