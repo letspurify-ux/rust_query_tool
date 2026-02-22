@@ -1147,8 +1147,12 @@ impl QueryHistoryDialog {
 
 /// Truncate SQL for display in list
 fn truncate_sql(sql: &str, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
+
     let mut normalized = String::with_capacity(sql.len());
-    let mut last_was_whitespace = false;
+    let mut last_was_whitespace = true;
     for ch in sql.chars() {
         if ch.is_whitespace() {
             if !last_was_whitespace {
@@ -1160,29 +1164,38 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
             last_was_whitespace = false;
         }
     }
-    let trimmed = normalized.trim();
 
-    if trimmed.is_empty() {
+    while normalized.ends_with(' ') {
+        normalized.pop();
+    }
+
+    if normalized.is_empty() {
         return String::new();
     }
 
-    if max_len == 0 {
-        return String::new();
+    if max_len <= 3 {
+        let keep = max_len.min(3);
+        return "...".chars().take(keep).collect();
     }
 
-    if trimmed.chars().count() > max_len {
-        if max_len <= 3 {
-            return "...".chars().take(max_len).collect();
+    let visible_len = max_len - 3;
+    let mut visible_chars = 0usize;
+    let mut truncate_at = normalized.len();
+    for (idx, _) in normalized.char_indices() {
+        if visible_chars == visible_len {
+            truncate_at = idx;
+            break;
         }
-        let visible_len = max_len - 3;
-        let end = trimmed
-            .char_indices()
-            .nth(visible_len)
-            .map(|(idx, _)| idx)
-            .unwrap_or(trimmed.len());
-        format!("{}...", &trimmed[..end])
+        visible_chars += 1;
+    }
+
+    if visible_chars < visible_len {
+        normalized
     } else {
-        trimmed.to_string()
+        let mut output = String::with_capacity(truncate_at + 3);
+        output.push_str(&normalized[..truncate_at]);
+        output.push_str("...");
+        output
     }
 }
 
