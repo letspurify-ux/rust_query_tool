@@ -9,7 +9,8 @@ set -euo pipefail
 #   2) 45분 동안 실행
 #      scripts/codex_autofix_loop.sh 45
 #   3) 모델 지정
-#      CODEX_MODEL='gpt-5.2-codex' scripts/codex_autofix_loop.sh 60
+#      CODEX_MODEL='gpt-5.3-codex-spark xhigh' scripts/codex_autofix_loop.sh 30
+#      CODEX_MODEL='gpt-5.3-codex-spark' CODEX_REASONING_EFFORT='xhigh' scripts/codex_autofix_loop.sh 30
 #   4) 자동 커밋 활성화
 #      AUTO_COMMIT=1 scripts/codex_autofix_loop.sh 60
 
@@ -21,6 +22,10 @@ Usage:
 Environment variables:
   CODEX_CMD      Codex CLI executable (default: codex)
   CODEX_MODEL    Model name passed to Codex (optional)
+                 If includes reasoning effort (e.g. "gpt-5.3-codex-spark xhigh"),
+                 it will be parsed as model + reasoning effort.
+  CODEX_REASONING_EFFORT  Optional reasoning effort (ex: xhigh, medium, low)
+  CODEX_RUST_LOG Optional rust log filter for codex (default: off)
   AUTO_COMMIT    Set to 1 to auto-commit each Codex patch
   COMMIT_PREFIX  Commit prefix when AUTO_COMMIT=1 (default: "fix: auto-fix")
 USAGE
@@ -37,31 +42,39 @@ END_TS="$((START_TS + DURATION_MINUTES * 60))"
 
 CODEX_CMD="${CODEX_CMD:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-}"
+CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-}"
+CODEX_RUST_LOG="${CODEX_RUST_LOG:-off}"
 AUTO_COMMIT="${AUTO_COMMIT:-0}"
 COMMIT_PREFIX="${COMMIT_PREFIX:-fix: auto-fix}"
 
 run_codex_fix() {
-  local prompt
-  prompt="저장소 전체를 오류 관점에서 검토하고, 발견된 문제를 최소 수정으로 고쳐주세요.\
-수정 후에는 포맷/린트/테스트를 실행해 상태를 확인하고 결과를 요약하세요.\
-제약: panic 유발 코드(unwrap/expect/panic) 도입 금지, UTF-8 경계 안전성 유지."
+  local prompt model reasoning_effort
+  local -a cmd_args=()
+
+  prompt="DBA 유저 기능에 버그 있는지 검토하고 여러건 한번에 수정해줘. 수정된 내용은 fixed.md에 추가해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘."
 
   if [[ -n "$CODEX_MODEL" ]]; then
-    "$CODEX_CMD" --model "$CODEX_MODEL" run "$prompt"
+    if [[ "$CODEX_MODEL" == *" "* ]]; then
+      model="${CODEX_MODEL%% *}"
+      reasoning_effort="${CODEX_MODEL#* }"
+      if [[ -n "$CODEX_REASONING_EFFORT" ]]; then
+        reasoning_effort="$CODEX_REASONING_EFFORT"
+      fi
+      cmd_args+=(--model "$model")
+      if [[ -n "$reasoning_effort" ]]; then
+        cmd_args+=(-c "reasoning_effort=$reasoning_effort")
+      fi
+    elif [[ -n "$CODEX_REASONING_EFFORT" ]]; then
+      cmd_args+=(--model "$CODEX_MODEL")
+      cmd_args+=(-c "reasoning_effort=$CODEX_REASONING_EFFORT")
+    else
+      cmd_args+=(--model "$CODEX_MODEL")
+    fi
   else
-    "$CODEX_CMD" run "$prompt"
-  fi
-}
-
-maybe_commit() {
-  if [[ "$AUTO_COMMIT" != "1" ]]; then
-    return 0
+    cmd_args=()
   fi
 
-  if ! git diff --quiet; then
-    git add -A
-    git commit -m "$COMMIT_PREFIX iteration $(date '+%Y-%m-%d %H:%M:%S')"
-  fi
+  RUST_LOG="$CODEX_RUST_LOG" "$CODEX_CMD" "${cmd_args[@]}" exec -- "$prompt"
 }
 
 iteration=1
@@ -72,7 +85,7 @@ while [[ "$(date +%s)" -lt "$END_TS" ]]; do
     echo "[WARN] Codex invocation failed in iteration $iteration"
   fi
 
-  maybe_commit
+  sleep 60
   iteration="$((iteration + 1))"
 done
 

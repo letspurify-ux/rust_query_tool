@@ -11,6 +11,7 @@ use fltk::{
     window::Window,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -118,6 +119,7 @@ const ASH_LOOKBACK_MAX_MINUTES: u32 = 24 * 60;
 const AWR_LOOKBACK_MAX_HOURS: u32 = 24 * 30;
 const PERFORMANCE_TOP_N_MAX: u32 = 200;
 static RMAN_JOB_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RMAN_JOB_NAME_PROCESS_TOKEN: OnceLock<u128> = OnceLock::new();
 
 impl SqlEditorWidget {
     pub fn show_cursor_plan_analyzer(&self) {
@@ -567,23 +569,26 @@ impl SqlEditorWidget {
                 }
             }
 
-            let selection = table_widget.get_selection();
-            if selection != last_table_selection {
-                last_table_selection = selection;
-                let selected_row = selection.0.min(selection.2);
-                if selected_row >= 0 {
-                    let selected_index = selected_row as usize;
-                    if let Some(row) = result_table.row_values(selected_index) {
-                        if let Some((sql_id, child)) =
-                            parse_sql_id_child_row(&row, &last_snapshot_columns)
-                        {
-                            sql_id_input.set_value(&sql_id);
-                            child_input.set_value(&child.to_string());
+                    let selection = table_widget.get_selection();
+                    if selection != last_table_selection {
+                        last_table_selection = selection;
+                        let selected_row = selection.0.min(selection.2);
+                        if selected_row >= 0 {
+                            let selected_index = selected_row as usize;
+                            if let Some(row) = result_table.row_values(selected_index) {
+                                if let Some((sql_id, child)) =
+                                    parse_sql_id_child_row(&row, &last_snapshot_columns)
+                                {
+                                    sql_id_input.set_value(&sql_id);
+                                    match child {
+                                        Some(value) => child_input.set_value(&value.to_string()),
+                                        None => child_input.set_value(""),
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
 
         set_cursor(Cursor::Default);
         app::flush();
@@ -2609,7 +2614,13 @@ impl SqlEditorWidget {
                                     continue;
                                 }
                             };
-                        let normalized_mode = job_mode_text.trim().to_uppercase();
+                        let normalized_mode = match normalize_datapump_mode(&job_mode_text) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
                         let schema_name = if normalized_mode == "FULL" {
                             None
                         } else {
@@ -2650,7 +2661,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         schema_name.as_deref(),
-                                        &job_mode_text,
+                                        &normalized_mode,
                                     )
                                     .map(|_| format!("Data Pump export job {} started", job_name))
                                     .map_err(|err| {
@@ -2684,7 +2695,24 @@ impl SqlEditorWidget {
                                     continue;
                                 }
                             };
-                        let schema_name = normalize_optional_text_param(&schema_text);
+                        let normalized_mode = match normalize_datapump_mode(&job_mode_text) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                fltk::dialog::alert_default(&err);
+                                continue;
+                            }
+                        };
+                        let schema_name = if normalized_mode == "FULL" {
+                            None
+                        } else {
+                            match normalize_required_identifier(&schema_text, "Schema") {
+                                Ok(value) => Some(value),
+                                Err(err) => {
+                                    fltk::dialog::alert_default(&err);
+                                    continue;
+                                }
+                            }
+                        };
                         let confirm = fltk::dialog::choice2_default(
                             &format!("Start Data Pump import job {}?", job_name),
                             "Cancel",
@@ -2714,7 +2742,7 @@ impl SqlEditorWidget {
                                         &dump_file_text,
                                         &log_file_text,
                                         schema_name.as_deref(),
-                                        &job_mode_text,
+                                        &normalized_mode,
                                     )
                                     .map(|_| format!("Data Pump import job {} started", job_name))
                                     .map_err(|err| {
@@ -3380,55 +3408,154 @@ impl SqlEditorWidget {
         quick_run_btn.set_callback(move |_| {
             let action = quick_choice_for_run.value();
             let dispatched = match action {
-                1 => sender_quick_run
-                    .send(SecurityMessage::GrantRoleRequested {
-                        user_text: user_input_for_quick.value(),
-                        role_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                2 => sender_quick_run
-                    .send(SecurityMessage::RevokeRoleRequested {
-                        user_text: user_input_for_quick.value(),
-                        role_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                3 => sender_quick_run
-                    .send(SecurityMessage::GrantSystemPrivRequested {
-                        user_text: user_input_for_quick.value(),
-                        priv_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                4 => sender_quick_run
-                    .send(SecurityMessage::RevokeSystemPrivRequested {
-                        user_text: user_input_for_quick.value(),
-                        priv_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                5 => sender_quick_run
-                    .send(SecurityMessage::SetProfileRequested {
-                        user_text: user_input_for_quick.value(),
-                        profile_text: profile_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                6 => sender_quick_run
-                    .send(SecurityMessage::LockUserRequested {
-                        user_text: user_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                7 => sender_quick_run
-                    .send(SecurityMessage::UnlockUserRequested {
-                        user_text: user_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                8 => sender_quick_run
-                    .send(SecurityMessage::ExpirePasswordRequested {
-                        user_text: user_input_for_quick.value(),
-                    })
-                    .is_ok(),
+                1 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    let role_text = role_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Grant role requires a username.");
+                        return;
+                    }
+                    if role_text.is_empty() {
+                        fltk::dialog::alert_default("Grant role requires a role name.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::GrantRoleRequested {
+                            user_text,
+                            role_text,
+                        })
+                        .is_ok()
+                }
+                2 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    let role_text = role_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Revoke role requires a username.");
+                        return;
+                    }
+                    if role_text.is_empty() {
+                        fltk::dialog::alert_default("Revoke role requires a role name.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::RevokeRoleRequested {
+                            user_text,
+                            role_text,
+                        })
+                        .is_ok()
+                }
+                3 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    let priv_text = role_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Grant system privilege requires a username.");
+                        return;
+                    }
+                    if priv_text.is_empty() {
+                        fltk::dialog::alert_default("Grant system privilege requires a privilege.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::GrantSystemPrivRequested {
+                            user_text,
+                            priv_text,
+                        })
+                        .is_ok()
+                }
+                4 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    let priv_text = role_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Revoke system privilege requires a username.");
+                        return;
+                    }
+                    if priv_text.is_empty() {
+                        fltk::dialog::alert_default("Revoke system privilege requires a privilege.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::RevokeSystemPrivRequested {
+                            user_text,
+                            priv_text,
+                        })
+                        .is_ok()
+                }
+                5 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    let profile_text = profile_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Set profile requires a username.");
+                        return;
+                    }
+                    if profile_text.is_empty() {
+                        fltk::dialog::alert_default("Set profile requires a profile.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::SetProfileRequested {
+                            user_text,
+                            profile_text,
+                        })
+                        .is_ok()
+                }
+                6 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Lock user requires a username.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::LockUserRequested {
+                            user_text,
+                        })
+                        .is_ok()
+                }
+                7 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Unlock user requires a username.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::UnlockUserRequested {
+                            user_text,
+                        })
+                        .is_ok()
+                }
+                8 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    if user_text.is_empty() {
+                        fltk::dialog::alert_default("Expire password requires a username.");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::ExpirePasswordRequested {
+                            user_text,
+                        })
+                        .is_ok()
+                }
                 9 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    if user_text.trim().is_empty() {
+                        fltk::dialog::alert_default("Create user requires a username");
+                        return;
+                    }
+                    let confirm = fltk::dialog::choice2_default(
+                        &format!("Create user {}?", user_text),
+                        "Cancel",
+                        "Create",
+                        "",
+                    );
+                    if confirm != Some(1) {
+                        return;
+                    }
                     let Some(password) = prompt_secret_text("User password") else {
                         return;
                     };
+                    if password.trim().is_empty() {
+                        fltk::dialog::alert_default("Password is required for CREATE USER.");
+                        return;
+                    }
                     let Some(default_tablespace) =
                         prompt_optional_text("Default tablespace (optional)", "")
                     else {
@@ -3441,7 +3568,7 @@ impl SqlEditorWidget {
                     };
                     sender_quick_run
                         .send(SecurityMessage::CreateUserRequested {
-                            user_text: user_input_for_quick.value(),
+                            user_text,
                             password_text: password,
                             default_tablespace_text: default_tablespace,
                             temporary_tablespace_text: temporary_tablespace,
@@ -3450,6 +3577,11 @@ impl SqlEditorWidget {
                         .is_ok()
                 }
                 10 => {
+                    let user_text = user_input_for_quick.value().trim().to_string();
+                    if user_text.trim().is_empty() {
+                        fltk::dialog::alert_default("Drop user requires a username.");
+                        return;
+                    }
                     let choice = fltk::dialog::choice2_default(
                         "Drop user mode",
                         "Cancel",
@@ -3462,22 +3594,29 @@ impl SqlEditorWidget {
                         _ => return,
                     };
                     sender_quick_run
-                        .send(SecurityMessage::DropUserRequested {
-                            user_text: user_input_for_quick.value(),
-                            cascade,
-                        })
+                        .send(SecurityMessage::DropUserRequested { user_text, cascade })
                         .is_ok()
                 }
-                11 => sender_quick_run
-                    .send(SecurityMessage::CreateRoleRequested {
-                        role_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
-                12 => sender_quick_run
-                    .send(SecurityMessage::DropRoleRequested {
-                        role_text: role_input_for_quick.value(),
-                    })
-                    .is_ok(),
+                11 => {
+                    let role_text = role_input_for_quick.value().trim().to_string();
+                    if role_text.trim().is_empty() {
+                        fltk::dialog::alert_default("Create role requires a role name");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::CreateRoleRequested { role_text })
+                        .is_ok()
+                }
+                12 => {
+                    let role_text = role_input_for_quick.value().trim().to_string();
+                    if role_text.trim().is_empty() {
+                        fltk::dialog::alert_default("Drop role requires a role name");
+                        return;
+                    }
+                    sender_quick_run
+                        .send(SecurityMessage::DropRoleRequested { role_text })
+                        .is_ok()
+                }
                 _ => {
                     fltk::dialog::alert_default("Select a quick action first.");
                     false
@@ -3492,9 +3631,19 @@ impl SqlEditorWidget {
         let user_input_for_grant = user_input.clone();
         let role_input_for_grant = role_input.clone();
         grant_btn.set_callback(move |_| {
+            let user_text = user_input_for_grant.value().trim().to_string();
+            let role_text = role_input_for_grant.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Grant role requires a username.");
+                return;
+            }
+            if role_text.is_empty() {
+                fltk::dialog::alert_default("Grant role requires a role name.");
+                return;
+            }
             let _ = sender_grant.send(SecurityMessage::GrantRoleRequested {
-                user_text: user_input_for_grant.value(),
-                role_text: role_input_for_grant.value(),
+                user_text,
+                role_text,
             });
             app::awake();
         });
@@ -3503,9 +3652,19 @@ impl SqlEditorWidget {
         let user_input_for_revoke = user_input.clone();
         let role_input_for_revoke = role_input.clone();
         revoke_btn.set_callback(move |_| {
+            let user_text = user_input_for_revoke.value().trim().to_string();
+            let role_text = role_input_for_revoke.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Revoke role requires a username.");
+                return;
+            }
+            if role_text.is_empty() {
+                fltk::dialog::alert_default("Revoke role requires a role name.");
+                return;
+            }
             let _ = sender_revoke.send(SecurityMessage::RevokeRoleRequested {
-                user_text: user_input_for_revoke.value(),
-                role_text: role_input_for_revoke.value(),
+                user_text,
+                role_text,
             });
             app::awake();
         });
@@ -3514,9 +3673,19 @@ impl SqlEditorWidget {
         let user_input_for_grant_sys = user_input.clone();
         let role_input_for_grant_sys = role_input.clone();
         grant_sys_btn.set_callback(move |_| {
+            let user_text = user_input_for_grant_sys.value().trim().to_string();
+            let priv_text = role_input_for_grant_sys.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Grant system privilege requires a username.");
+                return;
+            }
+            if priv_text.is_empty() {
+                fltk::dialog::alert_default("Grant system privilege requires a privilege.");
+                return;
+            }
             let _ = sender_grant_sys.send(SecurityMessage::GrantSystemPrivRequested {
-                user_text: user_input_for_grant_sys.value(),
-                priv_text: role_input_for_grant_sys.value(),
+                user_text,
+                priv_text,
             });
             app::awake();
         });
@@ -3525,9 +3694,19 @@ impl SqlEditorWidget {
         let user_input_for_revoke_sys = user_input.clone();
         let role_input_for_revoke_sys = role_input.clone();
         revoke_sys_btn.set_callback(move |_| {
+            let user_text = user_input_for_revoke_sys.value().trim().to_string();
+            let priv_text = role_input_for_revoke_sys.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Revoke system privilege requires a username.");
+                return;
+            }
+            if priv_text.is_empty() {
+                fltk::dialog::alert_default("Revoke system privilege requires a privilege.");
+                return;
+            }
             let _ = sender_revoke_sys.send(SecurityMessage::RevokeSystemPrivRequested {
-                user_text: user_input_for_revoke_sys.value(),
-                priv_text: role_input_for_revoke_sys.value(),
+                user_text,
+                priv_text,
             });
             app::awake();
         });
@@ -3536,9 +3715,19 @@ impl SqlEditorWidget {
         let user_input_for_set_profile = user_input.clone();
         let profile_input_for_set_profile = profile_input.clone();
         set_profile_btn.set_callback(move |_| {
+            let user_text = user_input_for_set_profile.value().trim().to_string();
+            let profile_text = profile_input_for_set_profile.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Set profile requires a username.");
+                return;
+            }
+            if profile_text.is_empty() {
+                fltk::dialog::alert_default("Set profile requires a profile.");
+                return;
+            }
             let _ = sender_set_profile.send(SecurityMessage::SetProfileRequested {
-                user_text: user_input_for_set_profile.value(),
-                profile_text: profile_input_for_set_profile.value(),
+                user_text,
+                profile_text,
             });
             app::awake();
         });
@@ -3547,9 +3736,18 @@ impl SqlEditorWidget {
         let user_input_for_create_user = user_input.clone();
         let profile_input_for_create_user = profile_input.clone();
         create_user_btn.set_callback(move |_| {
+            let user_text = user_input_for_create_user.value();
+            if user_text.trim().is_empty() {
+                fltk::dialog::alert_default("Create user requires a username.");
+                return;
+            }
             let Some(password) = prompt_secret_text("User password") else {
                 return;
             };
+            if password.trim().is_empty() {
+                fltk::dialog::alert_default("Password is required for CREATE USER.");
+                return;
+            }
             let Some(default_tablespace) =
                 prompt_optional_text("Default tablespace (optional)", "")
             else {
@@ -3561,7 +3759,7 @@ impl SqlEditorWidget {
                 return;
             };
             let _ = sender_create_user.send(SecurityMessage::CreateUserRequested {
-                user_text: user_input_for_create_user.value(),
+                user_text: user_text.trim().to_string(),
                 password_text: password,
                 default_tablespace_text: default_tablespace,
                 temporary_tablespace_text: temporary_tablespace,
@@ -3573,6 +3771,11 @@ impl SqlEditorWidget {
         let sender_drop_user = sender.clone();
         let user_input_for_drop_user = user_input.clone();
         drop_user_btn.set_callback(move |_| {
+            let user_text = user_input_for_drop_user.value().trim().to_string();
+            if user_text.trim().is_empty() {
+                fltk::dialog::alert_default("Drop user requires a username.");
+                return;
+            }
             let choice =
                 fltk::dialog::choice2_default("Drop user mode", "Cancel", "Drop", "Drop CASCADE");
             let cascade = match choice {
@@ -3580,55 +3783,68 @@ impl SqlEditorWidget {
                 Some(2) => true,
                 _ => return,
             };
-            let _ = sender_drop_user.send(SecurityMessage::DropUserRequested {
-                user_text: user_input_for_drop_user.value(),
-                cascade,
-            });
+            let _ =
+                sender_drop_user.send(SecurityMessage::DropUserRequested { user_text, cascade });
             app::awake();
         });
 
         let sender_create_role = sender.clone();
         let role_input_for_create_role = role_input.clone();
         create_role_btn.set_callback(move |_| {
-            let _ = sender_create_role.send(SecurityMessage::CreateRoleRequested {
-                role_text: role_input_for_create_role.value(),
-            });
+            let role_text = role_input_for_create_role.value().trim().to_string();
+            if role_text.trim().is_empty() {
+                fltk::dialog::alert_default("Create role requires a role name");
+                return;
+            }
+            let _ = sender_create_role.send(SecurityMessage::CreateRoleRequested { role_text });
             app::awake();
         });
 
         let sender_drop_role = sender.clone();
         let role_input_for_drop_role = role_input.clone();
         drop_role_btn.set_callback(move |_| {
-            let _ = sender_drop_role.send(SecurityMessage::DropRoleRequested {
-                role_text: role_input_for_drop_role.value(),
-            });
+            let role_text = role_input_for_drop_role.value().trim().to_string();
+            if role_text.trim().is_empty() {
+                fltk::dialog::alert_default("Drop role requires a role name");
+                return;
+            }
+            let _ = sender_drop_role.send(SecurityMessage::DropRoleRequested { role_text });
             app::awake();
         });
 
         let sender_lock_user = sender.clone();
         let user_input_for_lock_user = user_input.clone();
         lock_user_btn.set_callback(move |_| {
-            let _ = sender_lock_user.send(SecurityMessage::LockUserRequested {
-                user_text: user_input_for_lock_user.value(),
-            });
+            let user_text = user_input_for_lock_user.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Lock user requires a username.");
+                return;
+            }
+            let _ = sender_lock_user.send(SecurityMessage::LockUserRequested { user_text });
             app::awake();
         });
 
         let sender_unlock_user = sender.clone();
         let user_input_for_unlock_user = user_input.clone();
         unlock_user_btn.set_callback(move |_| {
-            let _ = sender_unlock_user.send(SecurityMessage::UnlockUserRequested {
-                user_text: user_input_for_unlock_user.value(),
-            });
+            let user_text = user_input_for_unlock_user.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Unlock user requires a username.");
+                return;
+            }
+            let _ = sender_unlock_user.send(SecurityMessage::UnlockUserRequested { user_text });
             app::awake();
         });
 
         let sender_expire_password = sender.clone();
         let user_input_for_expire_password = user_input.clone();
         expire_password_btn.set_callback(move |_| {
-            let _ = sender_expire_password.send(SecurityMessage::ExpirePasswordRequested {
-                user_text: user_input_for_expire_password.value(),
-            });
+            let user_text = user_input_for_expire_password.value().trim().to_string();
+            if user_text.is_empty() {
+                fltk::dialog::alert_default("Expire password requires a username.");
+                return;
+            }
+            let _ = sender_expire_password.send(SecurityMessage::ExpirePasswordRequested { user_text });
             app::awake();
         });
 
@@ -4546,15 +4762,13 @@ impl SqlEditorWidget {
                         if let Some((next_user, next_role, next_profile)) =
                             security_autofill_values(current_view_mode, &row, &columns)
                         {
-                            if let Some(user_value) = next_user.as_deref() {
-                                user_input.set_value(user_value);
-                            }
-                            if let Some(role_value) = next_role.as_deref() {
-                                role_input.set_value(role_value);
-                            }
-                            if let Some(profile_value) = next_profile.as_deref() {
-                                profile_input.set_value(profile_value);
-                            }
+                            user_input.set_value(next_user.as_deref().unwrap_or_default());
+                            role_input.set_value(next_role.as_deref().unwrap_or_default());
+                            profile_input.set_value(next_profile.as_deref().unwrap_or_default());
+                        } else {
+                            user_input.set_value("");
+                            role_input.set_value("");
+                            profile_input.set_value("");
                         }
                     }
                 }
@@ -6744,7 +6958,11 @@ fn parse_sql_monitor_session_target(
     let sid = parse_positive_i64(sid_text)?;
     let serial = parse_positive_i64(serial_text)?;
     let instance_id =
-        column_value_by_name(row_values, columns, "INST_ID").and_then(parse_positive_i64);
+        if let Some(instance_text) = column_value_by_name(row_values, columns, "INST_ID") {
+            Some(parse_positive_i64(instance_text)?)
+        } else {
+            None
+        };
 
     Some((instance_id, sid, serial))
 }
@@ -7014,7 +7232,7 @@ fn normalize_security_view_filters(
         None
     };
 
-    let profile_filter = if security_mode_uses_profile(mode) {
+    let profile_filter = if matches!(mode, SecurityViewMode::Users | SecurityViewMode::Profiles) {
         normalize_optional_identifier(profile_text, "Profile")?
     } else {
         None
@@ -7081,6 +7299,15 @@ fn normalize_optional_text_param(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+fn normalize_datapump_mode(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_uppercase();
+    if !matches!(normalized.as_str(), "SCHEMA" | "FULL") {
+        return Err("Data Pump job mode must be one of SCHEMA, FULL".to_string());
+    }
+
+    Ok(normalized)
+}
+
 fn normalize_optional_sql_id(value: &str) -> Result<Option<String>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -7105,6 +7332,12 @@ fn normalize_required_identifier(value: &str, name: &str) -> Result<String, Stri
     }
 
     let upper = trimmed.to_uppercase();
+    if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return Err(format!(
+            "{} must start with a letter, _, $, or #",
+            name
+        ));
+    }
     if !is_ascii_identifier(&upper) {
         return Err(format!("{} must use only letters, digits, _, $, #", name));
     }
@@ -7174,18 +7407,22 @@ fn parse_owner_job_row(row_values: &[String]) -> Option<(String, String)> {
     Some((owner_upper, job_upper))
 }
 
-fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, i32)> {
+fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, Option<i32>)> {
     let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
-    let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
-        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"))?
-        .trim();
     let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
         return None;
     }
-    let child = parse_optional_non_negative_i32(child_text, "Child#")
-        .ok()
-        .flatten()?;
+    let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
+        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"));
+    let child = if let Some(text) = child_text {
+        match parse_optional_non_negative_i32(&text, "Child#") {
+            Ok(value) => value,
+            Err(_) => return None,
+        }
+    } else {
+        None
+    };
     Some((sql_id, child))
 }
 
@@ -7233,15 +7470,22 @@ fn dataguard_role_allows_apply_control(database_role: Option<&str>) -> bool {
 }
 
 fn default_rman_job_name(prefix: &str) -> String {
+    let process_token = RMAN_JOB_NAME_PROCESS_TOKEN.get_or_init(|| {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(_) => 0,
+        }
+    });
     let timestamp_millis = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis(),
         Err(_) => 0,
     };
     let sequence = RMAN_JOB_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{}_{}_{}_{}",
+        "{}_{}_{}_{}_{}",
         prefix.trim().to_uppercase(),
         std::process::id(),
+        process_token,
         timestamp_millis,
         sequence
     )
@@ -7406,6 +7650,11 @@ mod tests {
     }
 
     #[test]
+    fn normalize_required_identifier_rejects_leading_digit() {
+        assert!(normalize_required_identifier("1alice", "User").is_err());
+    }
+
+    #[test]
     fn is_ascii_identifier_accepts_oracle_identifier_chars() {
         assert!(is_ascii_identifier("SYS$ROLE_1"));
         assert!(!is_ascii_identifier("bad-role"));
@@ -7430,7 +7679,7 @@ mod tests {
         ];
         assert_eq!(
             parse_sql_id_child_row(&row, &columns),
-            Some(("7V9H9TTW0G3CN".to_string(), 2))
+            Some(("7V9H9TTW0G3CN".to_string(), Some(2)))
         );
     }
 
@@ -7461,15 +7710,18 @@ mod tests {
         ];
         assert_eq!(
             parse_sql_id_child_row(&row, &columns),
-            Some(("7V9H9TTW0G3CN".to_string(), 4))
+            Some(("7V9H9TTW0G3CN".to_string(), Some(4)))
         );
     }
 
     #[test]
-    fn parse_sql_id_child_row_requires_child_column() {
+    fn parse_sql_id_child_row_allows_missing_child_column() {
         let columns = vec!["SQL_ID".to_string()];
         let row = vec!["7v9h9ttw0g3cn".to_string()];
-        assert_eq!(parse_sql_id_child_row(&row, &columns), None);
+        assert_eq!(
+            parse_sql_id_child_row(&row, &columns),
+            Some(("7V9H9TTW0G3CN".to_string(), None))
+        );
     }
 
     #[test]
@@ -7529,6 +7781,21 @@ mod tests {
             parse_sql_monitor_session_target(&row, &columns),
             Some((Some(2), 123, 456))
         );
+    }
+
+    #[test]
+    fn parse_sql_monitor_session_target_invalid_inst_id_rejects_row() {
+        let columns = vec![
+            "INST_ID".to_string(),
+            "SID".to_string(),
+            "SERIAL#".to_string(),
+        ];
+        let row = vec![
+            "bad-instance".to_string(),
+            "123".to_string(),
+            "456".to_string(),
+        ];
+        assert_eq!(parse_sql_monitor_session_target(&row, &columns), None);
     }
 
     #[test]
@@ -7669,12 +7936,34 @@ mod tests {
     }
 
     #[test]
+    fn default_rman_job_name_has_process_token_segments() {
+        let generated = default_rman_job_name("rman_backup_job");
+        let mut parts: Vec<&str> = generated.rsplitn(5, '_').collect();
+        parts.reverse();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], "RMAN_BACKUP_JOB");
+        assert_eq!(parts[1], std::process::id().to_string());
+        assert!(parts[2].parse::<u128>().is_ok());
+        assert!(parts[3].parse::<u128>().is_ok());
+        assert!(parts[4].parse::<u64>().is_ok());
+    }
+
+    #[test]
     fn normalize_security_view_filters_ignores_profile_for_non_profile_modes() {
         let filters =
             normalize_security_view_filters(SecurityViewMode::RoleGrants, "scott", "bad-profile!")
                 .unwrap_or_else(|err| panic!("expected filters for role grants: {err}"));
 
         assert_eq!(filters.0.as_deref(), Some("SCOTT"));
+        assert_eq!(filters.1, None);
+    }
+
+    #[test]
+    fn normalize_security_view_filters_ignores_profile_in_summary_mode() {
+        let filters =
+            normalize_security_view_filters(SecurityViewMode::Summary, "scott", "bad-profile!")
+                .unwrap_or_else(|err| panic!("expected filters for summary: {err}"));
+        assert_eq!(filters.0, Some("SCOTT".to_string()));
         assert_eq!(filters.1, None);
     }
 

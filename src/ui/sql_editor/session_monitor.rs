@@ -74,81 +74,96 @@ impl SqlEditorWidget {
         help.set_align(Align::Left | Align::Inside);
         root.fixed(&help, LABEL_ROW_HEIGHT);
 
-        let mut control_row = Flex::default();
-        control_row.set_type(FlexType::Row);
-        control_row.set_spacing(DIALOG_SPACING);
+        let mut control_stack = Flex::default();
+        control_stack.set_type(FlexType::Column);
+        control_stack.set_spacing(DIALOG_SPACING);
+
+        let mut query_row = Flex::default();
+        query_row.set_type(FlexType::Row);
+        query_row.set_spacing(DIALOG_SPACING);
 
         let mut refresh_btn = Button::default().with_label("Refresh");
         refresh_btn.set_color(theme::button_secondary());
         refresh_btn.set_label_color(theme::text_primary());
         refresh_btn.set_frame(FrameType::RFlatBox);
-        control_row.fixed(&refresh_btn, BUTTON_WIDTH_LARGE);
+        query_row.fixed(&refresh_btn, BUTTON_WIDTH_LARGE);
 
         let mut min_elapsed_label = Frame::default().with_label("Min Sec:");
         min_elapsed_label.set_label_color(theme::text_primary());
         min_elapsed_label.set_align(Align::Inside | Align::Left);
-        control_row.fixed(&min_elapsed_label, 56);
+        query_row.fixed(&min_elapsed_label, 56);
 
         let mut min_elapsed_input = IntInput::default();
         min_elapsed_input.set_value("15");
         min_elapsed_input.set_color(theme::input_bg());
         min_elapsed_input.set_text_color(theme::text_primary());
-        control_row.fixed(&min_elapsed_input, 64);
+        query_row.fixed(&min_elapsed_input, 64);
 
         let mut heavy_load_btn = Button::default().with_label("Heavy SQL/PLSQL");
         heavy_load_btn.set_color(theme::button_secondary());
         heavy_load_btn.set_label_color(theme::text_primary());
         heavy_load_btn.set_frame(FrameType::RFlatBox);
-        control_row.fixed(&heavy_load_btn, BUTTON_WIDTH_LARGE + 54);
+        query_row.fixed(&heavy_load_btn, BUTTON_WIDTH_LARGE + 54);
+        query_row.end();
+
+        let mut kill_row = Flex::default();
+        kill_row.set_type(FlexType::Row);
+        kill_row.set_spacing(DIALOG_SPACING);
 
         let mut instance_label = Frame::default().with_label("INST:");
         instance_label.set_label_color(theme::text_primary());
         instance_label.set_align(Align::Inside | Align::Left);
-        control_row.fixed(&instance_label, 42);
+        kill_row.fixed(&instance_label, 42);
 
         let mut instance_input = IntInput::default();
         instance_input.set_color(theme::input_bg());
         instance_input.set_text_color(theme::text_primary());
         instance_input.set_tooltip("Optional RAC instance id");
-        control_row.fixed(&instance_input, 62);
+        kill_row.fixed(&instance_input, 62);
 
         let mut sid_label = Frame::default().with_label("SID:");
         sid_label.set_label_color(theme::text_primary());
         sid_label.set_align(Align::Inside | Align::Left);
-        control_row.fixed(&sid_label, 34);
+        kill_row.fixed(&sid_label, 34);
 
         let mut sid_input = IntInput::default();
         sid_input.set_color(theme::input_bg());
         sid_input.set_text_color(theme::text_primary());
-        control_row.fixed(&sid_input, 90);
+        kill_row.fixed(&sid_input, 90);
 
         let mut serial_label = Frame::default().with_label("SERIAL#:");
         serial_label.set_label_color(theme::text_primary());
         serial_label.set_align(Align::Inside | Align::Left);
-        control_row.fixed(&serial_label, 64);
+        kill_row.fixed(&serial_label, 64);
 
         let mut serial_input = IntInput::default();
         serial_input.set_color(theme::input_bg());
         serial_input.set_text_color(theme::text_primary());
-        control_row.fixed(&serial_input, 110);
+        kill_row.fixed(&serial_input, 110);
 
         let mut kill_btn = Button::default().with_label("Kill Session");
         kill_btn.set_color(theme::button_danger());
         kill_btn.set_label_color(theme::text_primary());
         kill_btn.set_frame(FrameType::RFlatBox);
-        control_row.fixed(&kill_btn, BUTTON_WIDTH_LARGE + 20);
+        kill_row.fixed(&kill_btn, BUTTON_WIDTH_LARGE + 20);
 
-        let close_spacer = Frame::default();
-        control_row.resizable(&close_spacer);
+        let kill_row_spacer = Frame::default();
+        kill_row.resizable(&kill_row_spacer);
 
         let mut close_btn = Button::default().with_label("Close");
         close_btn.set_color(theme::button_subtle());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
-        control_row.fixed(&close_btn, BUTTON_WIDTH);
+        kill_row.fixed(&close_btn, BUTTON_WIDTH);
+        kill_row.end();
 
-        control_row.end();
-        root.fixed(&control_row, BUTTON_ROW_HEIGHT + 4);
+        control_stack.fixed(&query_row, BUTTON_ROW_HEIGHT + 4);
+        control_stack.fixed(&kill_row, BUTTON_ROW_HEIGHT + 4);
+        control_stack.end();
+        root.fixed(&control_stack, (BUTTON_ROW_HEIGHT + 4) * 2);
+
+        let control_bottom_gap = Frame::default();
+        root.fixed(&control_bottom_gap, DIALOG_SPACING);
 
         let mut result_table =
             ResultTableWidget::with_size(0, 0, dialog_w - DIALOG_MARGIN * 2, 320);

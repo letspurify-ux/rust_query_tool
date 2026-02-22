@@ -1596,7 +1596,7 @@ impl QueryExecutor {
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
             for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i).unwrap_or(None);
+                let value: Option<String> = row.get(i)?;
                 row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
             }
 
@@ -1666,7 +1666,7 @@ impl QueryExecutor {
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
             for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i).unwrap_or(None);
+                let value: Option<String> = row.get(i)?;
                 row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
             }
 
@@ -1742,7 +1742,7 @@ impl QueryExecutor {
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
             for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i).unwrap_or(None);
+                let value: Option<String> = row.get(i)?;
                 row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
             }
 
@@ -1806,7 +1806,7 @@ impl QueryExecutor {
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
             for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i).unwrap_or(None);
+                let value: Option<String> = row.get(i)?;
                 row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
             }
 
@@ -2536,9 +2536,9 @@ impl QueryExecutor {
             let mut rows: Vec<Vec<String>> = Vec::new();
             for row_result in result_set {
                 let row: Row = row_result?;
-                let line: Option<String> = row.get(0).unwrap_or(None);
-                let position: Option<String> = row.get(1).unwrap_or(None);
-                let text: Option<String> = row.get(2).unwrap_or(None);
+                let line: Option<String> = row.get(0)?;
+                let position: Option<String> = row.get(1)?;
+                let text: Option<String> = row.get(2)?;
                 rows.push(vec![
                     line.unwrap_or_default(),
                     position.unwrap_or_default(),
@@ -2968,7 +2968,7 @@ ORDER BY
         let mut result_rows: Vec<Vec<String>> = Vec::new();
         for row_result in rows {
             let row: Row = row_result?;
-            let value: Option<String> = row.get(0).unwrap_or(None);
+            let value: Option<String> = row.get(0)?;
             result_rows.push(vec![value.unwrap_or_default()]);
         }
 
@@ -4614,7 +4614,17 @@ ORDER BY
             )));
         }
 
-        let upper = trimmed.to_uppercase();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+        {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must start with a letter, _, $, or #",
+                field_name
+            )));
+        }
         if !Self::is_ascii_identifier(&upper) {
             return Err(Self::invalid_security_input_error(format!(
                 "{} must use only letters, digits, _, $, #",
@@ -4723,11 +4733,10 @@ ORDER BY
     }
 
     fn normalize_required_password(value: &str) -> Result<String, OracleError> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
+        if !value.chars().any(|ch| !ch.is_whitespace()) {
             return Err(Self::invalid_security_input_error("Password is required"));
         }
-        if trimmed
+        if value
             .chars()
             .any(|ch| ch.is_control() || ch == '"' || ch == '\'')
         {
@@ -4735,7 +4744,7 @@ ORDER BY
                 "Password cannot contain control characters, single quote, or double quote",
             ));
         }
-        Ok(trimmed.to_string())
+        Ok(value.to_string())
     }
 
     fn normalize_scheduler_job_type(value: &str) -> Result<String, OracleError> {
@@ -4913,11 +4922,7 @@ ORDER BY
             return fallback_codes.contains(&code);
         }
 
-        let msg = format!("{err}").to_uppercase();
-        msg.contains("ORA-00904")
-            || msg.contains("ORA-00942")
-            || msg.contains("ORA-01031")
-            || msg.contains("ORA-02030")
+        false
     }
 
     fn annotate_result_source(mut result: QueryResult, source_view: &str) -> QueryResult {
@@ -5543,12 +5548,9 @@ ORDER BY job_name
         let normalized_schema =
             Self::normalize_optional_security_identifier(schema_name, "Schema")?;
         let normalized_job_mode = job_mode.trim().to_uppercase();
-        if !matches!(
-            normalized_job_mode.as_str(),
-            "SCHEMA" | "TABLE" | "TABLESPACE" | "FULL"
-        ) {
+        if !matches!(normalized_job_mode.as_str(), "SCHEMA" | "FULL") {
             return Err(Self::invalid_security_input_error(
-                "Data Pump job mode must be one of SCHEMA, TABLE, TABLESPACE, FULL",
+                "Data Pump job mode must be one of SCHEMA, FULL",
             ));
         }
         if normalized_job_mode == "SCHEMA" && normalized_schema.is_none() {
@@ -5559,11 +5561,6 @@ ORDER BY job_name
         if normalized_job_mode == "FULL" && normalized_schema.is_some() {
             return Err(Self::invalid_security_input_error(
                 "Schema filter must be empty when Data Pump job mode is FULL",
-            ));
-        }
-        if matches!(normalized_job_mode.as_str(), "TABLE" | "TABLESPACE") {
-            return Err(Self::invalid_security_input_error(
-                "Data Pump TABLE/TABLESPACE modes are not supported yet; use SCHEMA or FULL",
             ));
         }
         let schema_expr = normalized_schema
@@ -5721,6 +5718,7 @@ END;",
         username: &str,
     ) -> Result<QueryResult, OracleError> {
         let normalized_user = Self::normalize_required_security_identifier(username, "User")?;
+        let mut fallback_errors: Vec<String> = Vec::new();
         let sql_dba = format!(
             r#"
 SELECT
@@ -5736,8 +5734,14 @@ FROM dba_users
 WHERE username = '{normalized_user}'
 "#
         );
-        if let Ok(result) = Self::execute_select(conn, &sql_dba, Instant::now()) {
-            return Ok(result);
+        match Self::execute_select(conn, &sql_dba, Instant::now()) {
+            Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
+            Err(err) => {
+                if !Self::should_fallback_from_global_view(&err) {
+                    return Err(err);
+                }
+                fallback_errors.push(format!("dba_users: {err}"));
+            }
         }
 
         let sql_all = format!(
@@ -5755,7 +5759,16 @@ FROM all_users
 WHERE username = '{normalized_user}'
 "#
         );
-        Self::execute_select(conn, &sql_all, Instant::now())
+        match Self::execute_select(conn, &sql_all, Instant::now()) {
+            Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
+            Err(err) => {
+                fallback_errors.push(format!("all_users: {err}"));
+                Err(Self::chained_fallback_error(
+                    "User summary snapshot",
+                    &fallback_errors,
+                ))
+            }
+        }
     }
 
     pub fn get_users_overview_snapshot(
@@ -5770,24 +5783,11 @@ WHERE username = '{normalized_user}'
         let profile_filter =
             Self::normalize_optional_security_identifier(profile_filter, "Profile filter")?;
 
-        let mut dba_conditions: Vec<String> = Vec::new();
-        if let Some(username) = username_filter.as_deref() {
-            dba_conditions.push(format!("username = '{username}'"));
-        }
-        if let Some(profile) = profile_filter.as_deref() {
-            dba_conditions.push(format!("profile = '{profile}'"));
-        }
-        if attention_only {
-            dba_conditions.push(
-                "(UPPER(NVL(account_status, '-')) LIKE '%LOCKED%' OR UPPER(NVL(account_status, '-')) LIKE '%EXPIRED%')"
-                    .to_string(),
-            );
-        }
-        let dba_where_clause = if dba_conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", dba_conditions.join("\n  AND "))
-        };
+        let dba_where_clause = Self::build_users_overview_where_clause(
+            username_filter.as_deref(),
+            profile_filter.as_deref(),
+            attention_only,
+        );
 
         let sql_dba = format!(
             r#"
@@ -5808,17 +5808,23 @@ ORDER BY username
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
             Err(err) => {
-                if profile_filter.is_some() || attention_only {
+                if attention_only {
+                    return Err(err);
+                }
+                if !Self::should_fallback_from_global_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_users: {err}"));
             }
         }
 
-        let all_where_clause = username_filter
-            .as_deref()
-            .map(|username| format!("WHERE username = '{username}'"))
-            .unwrap_or_default();
+        let all_where_clause = Self::build_users_overview_where_clause(
+            username_filter.as_deref(),
+            profile_filter.as_deref(),
+            false,
+        );
+        let all_where_clause_without_profile =
+            Self::build_users_overview_where_clause(username_filter.as_deref(), None, false);
 
         let sql_all = format!(
             r#"
@@ -5839,12 +5845,68 @@ ORDER BY username
         match Self::execute_select(conn, &sql_all, Instant::now()) {
             Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
             Err(err) => {
-                fallback_errors.push(format!("all_users: {err}"));
-                Err(Self::chained_fallback_error(
-                    "Users overview snapshot",
-                    &fallback_errors,
-                ))
+                if profile_filter.is_some() && Self::extract_ora_error_code(&err) == Some(904) {
+                    fallback_errors.push(format!("all_users (with profile filter): {err}"));
+                    let sql_all = format!(
+                        r#"
+SELECT
+    username,
+    'N/A' AS account_status,
+    'N/A' AS profile,
+    'N/A' AS default_tablespace,
+    'N/A' AS temporary_tablespace,
+    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
+    '-' AS expiry_at,
+    '-' AS lock_at
+FROM all_users
+{all_where_clause_without_profile}
+ORDER BY username
+"#
+                    );
+                    match Self::execute_select(conn, &sql_all, Instant::now()) {
+                        Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
+                        Err(all_err) => {
+                            fallback_errors.push(format!("all_users: {all_err}"));
+                            Err(Self::chained_fallback_error(
+                                "Users overview snapshot",
+                                &fallback_errors,
+                            ))
+                        }
+                    }
+                } else {
+                    fallback_errors.push(format!("all_users: {err}"));
+                    Err(Self::chained_fallback_error(
+                        "Users overview snapshot",
+                        &fallback_errors,
+                    ))
+                }
             }
+        }
+    }
+
+    fn build_users_overview_where_clause(
+        username_filter: Option<&str>,
+        profile_filter: Option<&str>,
+        attention_only: bool,
+    ) -> String {
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(username) = username_filter {
+            conditions.push(format!("username = '{username}'"));
+        }
+        if let Some(profile) = profile_filter {
+            conditions.push(format!("profile = '{profile}'"));
+        }
+        if attention_only {
+            conditions.push(
+                "(UPPER(NVL(account_status, '-')) LIKE '%LOCKED%' OR UPPER(NVL(account_status, '-')) LIKE '%EXPIRED%')"
+                    .to_string(),
+            );
+        }
+
+        if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join("\n  AND "))
         }
     }
 
@@ -5868,7 +5930,12 @@ ORDER BY granted_role
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_role_privs")),
-            Err(err) => fallback_errors.push(format!("dba_role_privs: {err}")),
+            Err(err) => {
+                if !Self::should_fallback_from_global_view(&err) {
+                    return Err(err);
+                }
+                fallback_errors.push(format!("dba_role_privs: {err}"));
+            }
         }
 
         Self::ensure_user_view_matches_target_user(conn, &normalized_user, "Role grants snapshot")?;
@@ -5913,7 +5980,12 @@ ORDER BY privilege
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_sys_privs")),
-            Err(err) => fallback_errors.push(format!("dba_sys_privs: {err}")),
+            Err(err) => {
+                if !Self::should_fallback_from_global_view(&err) {
+                    return Err(err);
+                }
+                fallback_errors.push(format!("dba_sys_privs: {err}"));
+            }
         }
 
         Self::ensure_user_view_matches_target_user(
@@ -5963,8 +6035,19 @@ ORDER BY owner, table_name, privilege
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_tab_privs")),
-            Err(err) => fallback_errors.push(format!("dba_tab_privs: {err}")),
+            Err(err) => {
+                if !Self::should_fallback_from_global_view(&err) {
+                    return Err(err);
+                }
+                fallback_errors.push(format!("dba_tab_privs: {err}"));
+            }
         }
+
+        Self::ensure_user_view_matches_target_user(
+            conn,
+            &normalized_user,
+            "Object privileges snapshot",
+        )?;
 
         let sql_all = format!(
             r#"
@@ -6017,7 +6100,12 @@ ORDER BY profile, resource_type, resource_name
         );
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_profiles")),
-            Err(err) => fallback_errors.push(format!("dba_profiles: {err}")),
+            Err(err) => {
+                if !Self::should_fallback_from_global_view(&err) {
+                    return Err(err);
+                }
+                fallback_errors.push(format!("dba_profiles: {err}"));
+            }
         }
 
         let sql_user = format!(
@@ -6243,6 +6331,28 @@ mod dba_feature_tests {
     use super::QueryExecutor;
 
     #[test]
+    fn build_users_overview_where_clause_includes_filters() {
+        let where_clause = QueryExecutor::build_users_overview_where_clause(
+            Some("SCOTT"),
+            Some("DEFAULT"),
+            false,
+        );
+        assert_eq!(
+            where_clause,
+            "WHERE username = 'SCOTT'\n  AND profile = 'DEFAULT'"
+        );
+    }
+
+    #[test]
+    fn build_users_overview_where_clause_supports_attention_only() {
+        let where_clause = QueryExecutor::build_users_overview_where_clause(None, Some("DEFAULT"), true);
+        assert_eq!(
+            where_clause,
+            "WHERE profile = 'DEFAULT'\n  AND (UPPER(NVL(account_status, '-')) LIKE '%LOCKED%' OR UPPER(NVL(account_status, '-')) LIKE '%EXPIRED%')"
+        );
+    }
+
+    #[test]
     fn kill_session_sql_uses_immediate_when_requested() {
         let sql = QueryExecutor::build_kill_session_sql(101, 222, None, true);
         assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222' IMMEDIATE");
@@ -6328,6 +6438,21 @@ mod dba_feature_tests {
         let result =
             QueryExecutor::normalize_required_security_identifier("HR'; DROP USER SYS;--", "User");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_required_security_identifier_rejects_leading_digit() {
+        let result = QueryExecutor::normalize_required_security_identifier("1ALICE", "User");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_required_password_preserves_leading_and_trailing_spaces() {
+        let result = QueryExecutor::normalize_required_password("  Pa ss  ")
+            .unwrap_or_else(|err| {
+                panic!("unexpected error: {err}");
+            });
+        assert_eq!(result, "  Pa ss  ");
     }
 
     #[test]
@@ -7845,16 +7970,10 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
-            let line: i32 = row.get(0).unwrap_or(0);
-            let position: i32 = row.get(1).unwrap_or(0);
-            let text: String = row
-                .get::<_, Option<String>>(2)
-                .unwrap_or(None)
-                .unwrap_or_default();
-            let attribute: String = row
-                .get::<_, Option<String>>(3)
-                .unwrap_or(None)
-                .unwrap_or_default();
+            let line: i32 = row.get::<_, Option<i32>>(0)?.unwrap_or(0);
+            let position: i32 = row.get::<_, Option<i32>>(1)?.unwrap_or(0);
+            let text: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let attribute: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
 
             errors.push(CompilationError {
                 line,
@@ -7889,10 +8008,7 @@ impl ObjectBrowser {
                 return Err(err);
             }
         };
-        let status: String = row
-            .get::<_, Option<String>>(0)
-            .unwrap_or(None)
-            .unwrap_or_default();
+        let status: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
         Ok(status)
     }
 }

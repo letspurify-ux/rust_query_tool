@@ -390,9 +390,9 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
         .any(|item| match item {
             ScriptItem::Statement(_) => false,
             ScriptItem::ToolCommand(command) => match command {
-                ToolCommand::Connect { .. } | ToolCommand::Disconnect | ToolCommand::RunScript { .. } => {
-                    true
-                }
+                ToolCommand::Connect { .. }
+                | ToolCommand::Disconnect
+                | ToolCommand::RunScript { .. } => true,
                 ToolCommand::Unsupported { raw, .. } => {
                     let upper = raw.trim().to_uppercase();
                     upper == "CONNECT"

@@ -222,3 +222,152 @@
 - **증상**: `populate_browser`의 인덱스 벡터가 기본 용량 0에서 시작해 엔트리 수 증가에 따라 재할당될 수 있었음.
 - **수정**: `Vec::with_capacity(entries.len())`로 초기화.
 - **효과**: 대량 로그 표시 시 재할당 횟수 감소.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (추가)
+
+### [중] 사용자 요약 조회에 데이터 출처 라벨이 빠져 운영 판단이 모호하던 문제 수정
+- **증상**: `get_user_summary_snapshot`이 `dba_users`/`all_users` 어느 뷰를 사용해 반환했는지 메시지로 구분되지 않아, 권한 범위를 즉시 식별하기 어려웠음.
+- **수정**: 사용자 요약 조회 결과에 `Source view: ...`를 부여하고, `all_users` 폴백 실패 시에도 원인 경로를 누적해 `User summary snapshot` 실패 메시지로 반환하도록 보강.
+- **효과**: 화면에서 동일 사용자 요약이 `dba_users` 기반인지 `all_users` 기반인지 즉시 확인 가능해지고, 폴백 오류 추적이 쉬워짐.
+
+### [중] DBA 뷰 fallback 판정을 에러 문자열 오탐 가능성에서 분리
+- **증상**: `should_fallback_from_global_view`가 오류 문자열 패턴 검색까지 함께 사용해, 텍스트에 유사 코드가 섞일 때 오탐성 fallback가 발생할 수 있었음.
+- **수정**: fallback 판단을 `extract_ora_error_code` 기반 ORA 코드 매칭으로 축소.
+- **효과**: DBA 뷰 접근 실패 여부 판단이 더 명시적으로 동작해, 잘못된 폴백 경로 전환 가능성이 낮아짐.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (8)
+
+### [중] SQL Monitor 세션 타깃 파싱에서 INST_ID 문자열 정합성 깨짐 시 즉시 실패 처리
+- **증상**: `INST_ID` 컬럼이 존재하지만 `-`/비숫자처럼 잘못된 값이 들어와도 `parse_sql_monitor_session_target`이 `(None, sid, serial)`를 반환해 RAC 환경에서 인스턴스 미지정 kill이 진행될 수 있었음.
+- **수정**: `INST_ID` 컬럼이 존재할 때 파싱 실패하면 전체 세션 타깃 파싱을 `None` 처리하도록 변경해 kill 경로를 차단하도록 강화.
+- **효과**: 인스턴스 식별이 모호한 상태에서 잘못된 세션 종료 시도를 방지.
+
+### [중] RMAN 작업명 기본값 충돌 위험 완화
+- **증상**: `default_rman_job_name`가 PID + 타임스탬프 + 증분 순번만 사용해, 프로세스 재시작 직후 동일 포맷이 극히 짧은 구간에서 중복될 수 있었음.
+- **수정**: 프로세스 시작 시점 기준 토큰을 `OnceLock` 기반으로 1회 생성해 이름에 포함하고, `(prefix, pid, process_token, timestamp, sequence)` 형식으로 확대.
+- **효과**: 동일 프로세스/동일 ms 구간에서도 충돌 가능성이 줄어 RMAN job/job restore 이름 중복 위험이 낮아짐.
+
+### [중] `row.get(...).unwrap_or(None)` 기반의 DB 타입 변환 실패 은닉 제거
+- **증상**: 일부 조회 루틴에서 `row.get(...).unwrap_or(None)`로 변환 실패를 `NULL` 문자열로 바꿔 버려 진짜 커넥션/권한/타입 이슈 원인을 가리고 있었음.
+- **수정**: DBA 사용자/모니터링 조회에서 사용하는 행 파싱 경로를 `row.get(...)?`로 전환해 변환 실패를 즉시 상위로 전파.
+- **효과**: 오류 추적성이 개선되고, 잘못된 결과/오탐 데이터 노출이 감소함.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (9)
+
+### [중] `Users` 뷰 fallback 시 Profile 필터가 빠지는 문제 수정
+- **증상**: `DBA USERS` 조회가 `dba_users`에서 실패하고 `all_users`로 fallback할 때, `Profile` 입력값은 이미 유효성 검사에서 걸러지는데도 실제 fallback SQL에는 반영되지 않아 프로파일 필터가 무시되었음.
+- **수정**: `get_users_overview_snapshot`의 `all_users` fallback WHERE 절에 `username`/`profile` 조건을 모두 적용하도록 변경.
+- **효과**: DBA 권한이 없어도 `Users` 뷰에서 `profile` 기준 조회가 동작해 관리자가 의도한 범위를 유지할 수 있음.
+
+### [중] Summary 모드에서 미사용 Profile 값으로 로드가 차단되던 문제 수정
+- **증상**: `Summary` 로드 시 `Profile` 입력값이 조회에서 사용되지 않음에도 정규화 단계에서 검증돼, 잘못된 Profile 문자열이 있으면 `Summary` 조회가 실패함.
+- **수정**: `normalize_security_view_filters`에서 `Profile` 유효성 검사 대상을 `Users`, `Profiles` 모드로 한정하고 `Summary`는 `Profile` 필터를 무시하도록 조정.
+- **효과**: 잘못된 Profile 텍스트가 있어도 요약 조회는 정상 수행되며, 뷰별 입력 규칙이 실제 쿼리 동작과 일치.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (10)
+
+### [중] `dba_tab_privs` 폴백에서 현재 사용자 검증 누락 문제 수정
+- **증상**: Object privileges 조회가 `dba_tab_privs`를 사용할 수 없을 때 `all_tab_privs`로 바로 이동하면서, 현재 세션 사용자가 아닌 타 사용자 요청도 실패 없이 현재 사용자 데이터로 오인될 수 있었음.
+- **수정**: `get_user_object_grants_snapshot`에서 `dba_tab_privs` 폴백 전 `ensure_user_view_matches_target_user`를 호출해 대상 사용자 일치 여부를 확인.
+- **효과**: 다른 사용자 권한 조회 시 오판 결과가 노출될 수 있던 동작을 차단하고, 실패 사유를 명확하게 안내.
+
+### [중] DBA 사용자 조회 함수의 fallback 전환 조건 정밀화
+- **증상**: 일부 DBA 사용자 조회 함수가 `dba_*` 쿼리 실패 시 오류 코드와 무관하게 바로 `all_*`/`user_*` 폴백을 시도해, 실제 DB 에러를 의미론적으로 은폐할 수 있었음.
+- **수정**: `get_user_summary_snapshot`, `get_users_overview_snapshot`, `get_user_role_grants_snapshot`, `get_user_system_grants_snapshot`, `get_user_object_grants_snapshot`, `get_profile_limits_snapshot`에서 `should_fallback_from_global_view`로 폴백 가능 코드만 허용.
+- **효과**: 조회 실패 원인 보존이 강화되고, 권한/뷰 접근 오류 외의 SQL 실행 오류는 즉시 상위로 전달되어 오탐/잘못된 fallback 동작을 줄임.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (11)
+
+### [중] Security 관리자에서 중요 역할 생성/삭제 동작의 실수 실행 위험 방지
+- **증상**: Security Manager에서 `Create Role`, `Drop Role`, Quick `Create User/Role`이 입력만 있을 때 바로 실행되어, 버튼 클릭 실수나 잘못된 텍스트로 즉시 DDL이 수행될 수 있었음.
+- **수정**: Quick Action 및 역할 버튼 경로에 사용자 확인 다이얼로그를 추가하고, 대상명 공백 검증을 선행해 실제 실행 전 취소할 수 있도록 변경.
+  - `Create User` Quick Action: 사용자명 비어 있음 방지 + 생성 확인
+  - `Create Role` Quick Action / 버튼: 역할명 비어 있음 방지 + 생성 확인
+  - `Drop Role` Quick Action / 버튼: 역할명 비어 있음 방지 + 삭제 확인
+- **효과**: 의도치 않은 권한 관련 DDL 실행 확률이 줄고, 잘못된 입력으로 인한 실패 루프를 즉시 차단 가능.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (12)
+
+### [중] RMAN 작업명 규격 테스트가 접두사 언더스코어를 오판하던 문제 수정
+- **증상**: `default_rman_job_name`의 접미사 파트(타이밍/시퀀스) 존재를 검증하는 테스트가 `split('_')` 길이 비교에 의존해, 접두사에 언더스코어가 포함된 경우 실제로는 5개가 아닌 더 많은 구간으로 분리되어 실패했습니다.
+- **수정**: 테스트를 접두사 전체를 보존하면서 마지막 4개 토큰만 역순으로 분리(`rsplitn`)해 검증하도록 변경했습니다.
+- **효과**: 접두사 형태가 달라져도 RMAN 기본 작업명 생성 규격(접두사 + PID + 토큰 + 타임스탬프 + 시퀀스)이 안정적으로 검증됩니다.
+
+### [하] DBA 사용자 작업 버튼에서 공백 사용자명 사전 차단
+- **증상**: `Create User`/`Drop User` 버튼과 Quick Action의 `Drop User`는 사용자명 미입력 시 실행 메시지 루트를 거쳐 즉시 에러로 귀결되어 불필요한 처리만 수행했습니다.
+- **수정**: 사용자명 미입력 시 백엔드 전송 전에 즉시 경고 다이얼로그로 차단하도록 사전 가드를 추가했습니다.
+- **효과**: 빈 입력으로 인한 불필요한 비동기 작업 전송을 줄이고 잘못된 클릭 실수를 감소시켰습니다.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (13)
+
+### [중] `Users` 뷰 `all_users` 폴백에서 PROFILE 필터 미지원 버전에 대한 재시도 보강
+- **증상**: `dba_users` 폴백 시 `all_users`에 `PROFILE` 컬럼이 없거나 접근 불가하면 ORA-00904가 발생하면서 `profile` 필터가 있을 때 사용자 목록 조회가 실패해 버림.
+- **수정**: `get_users_overview_snapshot`에서 `all_users` 폴백 실패가 `ORA-00904`일 때 `profile` 조건을 제외한 동일 사용자 조건으로 1회 재시도하도록 변경하고, 실패 경로는 추적 가능한 메시지로 보강.
+- **효과**: DBA 권한 제한 또는 뷰 스키마 차이 환경에서도 `Users` 뷰가 가능한 범위 내에서 동작을 복구.
+
+### [중] 보안 결과 행 자동채움 시 값 누락 컬럼에 대한 stale 값 잔존 제거
+- **증상**: Security 테이블 행을 선택할 때 일부 컬럼 값이 없으면 기존 입력값을 유지해 사용자/역할/프로파일 필드가 오염되어 잘못된 Quick/Action 실행으로 이어질 수 있었음.
+- **수정**: `security_autofill_values` 적용 시 해당 컬럼 값이 없으면 해당 입력 필드를 빈 값으로 명시 초기화하고, 행 파싱 실패 시도 전체 입력을 초기화.
+- **효과**: 행 변경 시 입력 상태 오염을 줄여 잘못된 값 기반 자동 실행 위험을 낮춤.
+
+### [테스트] Users 뷰 조회 조건 빌더 회귀 테스트 추가
+- `build_users_overview_where_clause`가 사용자명/프로파일/attention_only 조합에서 기대된 WHERE 절을 생성하는지 검증하는 단위 테스트를 추가해 폴백/필터 빌더 회귀를 조기에 탐지.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (14)
+
+### [중] Security 액션 경로에서 필수 입력값 미입력 전송 버그 수정
+- **증상**: 빠른 실행(Quick Action) 및 버튼 동작에서 사용자/역할/권한/프로파일이 비어 있는 상태로도 메시지가 전송되어 백엔드 정규화에서만 오류가 반환되어 사용자가 동작 실패 원인을 한 단계 늦게 인지했습니다.
+- **수정**: Quick Action(Grant/Revoke Role, System Privilege, Set Profile, Lock/Unlock/Expire)와 버튼 경로에 입력값 사전 검증을 추가해, 필수 항목이 비어 있으면 즉시 알림하고 전송하지 않도록 변경했습니다.
+- **효과**: 불필요한 메시지 전송/스레드 동작을 줄이고, 사용자 입력 오류를 즉시 차단해 오조작 위험과 불필요한 처리 경로를 감소시킵니다.
+
+### [하] 역할 생성/삭제 확인창 중복 제거
+- **증상**: Role 생성/삭제를 UI 버튼과 백엔드 둘 다에서 확인창을 띄워, 같은 동작에서 확인 다이얼로그가 2회 연속 표시되는 UX 결함이 있었습니다.
+- **수정**: UI 쪽 Role 생성/삭제의 중복 확인창을 제거하고 백엔드 확인 흐름으로 일원화했습니다(Quick Action 및 버튼 공통).
+- **효과**: 사용자 확인 플로우가 단일화되어 의도치 않은 중복 클릭 부담이 사라지고 동작 예측성이 개선됩니다.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (15)
+
+### [중] Cursor Plan 선택 시 CHILD 컬럼 부재 행에서 SQL_ID가 채워지지 않던 문제 수정
+- **증상**: `V$SQL`/`GV$SQL` 기반 결과에는 `CHILD_NUMBER`가 없을 수 있는데, 기존에는 해당 컬럼 부재면 `SQL_ID`까지 파싱 실패해 선택한 SQL_ID가 입력창에 자동 채워지지 않았습니다.
+- **수정**: `parse_sql_id_child_row`를 `SQL_ID + Option<CHILD>` 형태로 개선하고, Child 컬럼이 없을 때는 `sql_id`만 채우고 `child`는 비움으로 처리하도록 변경했습니다.
+- **효과**: 컬럼 구성이 다른 결과 집합에서도 최근 SQL 조회/로드 흐름이 멈추지 않고 동작합니다.
+
+### [중] Data Pump Import FULL 모드에서 스키마 값 오유입 차단
+- **증상**: FULL 모드에서는 스키마 필터가 허용되지 않는데, 사용자 입력 스키마 값이 그대로 전달되어 백엔드에서 즉시 `Schema filter must be empty when Data Pump job mode is FULL`로 실패했습니다.
+- **수정**: Data Pump Import 요청 처리에서 `job_mode`를 먼저 정규화한 뒤 FULL 모드일 경우 `schema_name`을 강제로 `None`으로 변환해 executor로 전달하도록 보강했습니다.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (16)
+
+### [중] Data Pump 모드 검증 및 SCHEMA/FULL 스키마 규칙 불일치 수정
+- **증상**: UI에서는 `SCHEMA/FULL` 모드를 안내하면서도 실행 엔진에는 `TABLE/TABLESPACE` 허용/거부가 혼재해 동작 경로가 모순되었고, Import는 SCHEMA 모드에서 스키마 미입력 시 런타임 에러로만 실패할 수 있었습니다.
+- **수정**:
+    - `QueryExecutor::start_datapump_job`에서 허용 모드를 `SCHEMA/FULL`로 축소하고 예외 메시지를 정합화했습니다.
+    - `src/ui/sql_editor/dba_tools.rs`의 Data Pump Export/Import 처리에서 모드 정규화 헬퍼(`normalize_datapump_mode`)를 통해 지원 모드만 허용하고, SCHEMA 모드에서는 스키마를 필수로, FULL 모드에서는 스키마를 금지하도록 선검증했습니다.
+    - Data Pump 시작 요청 시 정규화된 `normalized_mode`를 executor로 전달해 백엔드/UI의 검증 경로를 동일하게 유지했습니다.
+- **효과**: FULL 모드에서의 불필요한 즉시 실패를 줄이고, 사용자 입력값과 실제 실행 파라미터의 불일치를 예방합니다.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (17)
+
+### [중] DBA 사용자 식별자 앞글자 숫자 시작 검증 누락 보완
+- **증상**: `normalize_required_security_identifier`가 SQL 주입 차단은 했지만, 식별자 맨 앞이 숫자인 경우 에러 메시지 경로를 통과해 생성 SQL이 예상 범위를 벗어났습니다.
+- **수정**: 식별자 정규화에서 ASCII 대문자 변환은 유지하되 시작 문자가 숫자인 경우를 조기에 차단하도록 하고, DBA 사용자/권한/역할 파서에서 동일한 규칙이 적용되도록 경로를 고정했습니다.
+- **효과**: 사용자/역할/권한 이름이 Oracle 규칙에서 허용되지 않는 형태로 생성되거나 요청되는 경로를 차단했습니다.
+
+### [중] `normalize_required_password`의 문법 오류 및 공백 비밀번호 처리 정합성 보완
+- **증상**: 동일 함수에 남아 있던 `trimmed` 식별자 오염 코드(`if trimmed value...`)로 컴파일이 깨질 수 있었고, 비밀번호 공백 보존이 의도대로 동작하지 않을 가능성이 있었습니다.
+- **수정**: `normalize_required_password`의 잘못된 참조를 제거하고, 입력된 비밀번호 원문을 그대로 반환해 앞뒤 공백을 보존하도록 정리했습니다.
+- **효과**: 비밀번호가 공백을 포함한 경우 정상 처리되며, 동작 정합성이 개선됩니다.
+
+### [테스트] DBA 사용자 정규화 회귀 테스트 추가
+- `normalize_required_security_identifier`의 선두 숫자 차단 케이스를 추가했습니다.
+- `normalize_required_password`가 양끝 공백을 유지하는지 확인하는 케이스를 추가했습니다.
+
+## 2026-02-22 DBA 유저 기능 다건 수정 (18)
+
+### [중] Security 식별자 검증 일관성 및 사용자 생성 입력 가드 보완
+- **증상**: `Security` 화면의 사용자/역할/프로파일 정규화(`normalize_required_identifier`)가 앞글자 숫자 허용을 막지 못해 실행 단계에서만 실패가 발생했고, `CREATE USER`에서 공백 비밀번호가 백그라운드로 전달되어 액션 스레드가 불필요하게 동작한 뒤 실패했습니다.
+- **수정**: 
+  - `normalize_required_identifier`에 `시작 문자 숫자 제한` 검증을 추가해 잘못된 식별자를 UI 단계에서 즉시 차단했습니다.
+  - `CREATE USER` 버튼/Quick Action에서 비밀번호 `trim` 검사로 `공백/빈 문자열`을 전송 전에 차단했습니다.
+  - 추가 회귀 테스트로 선행 숫자 식별자 거부 케이스를 커버했습니다.
+- **효과**: 사용자/역할/프로파일 입력 오입력과 무의미한 비동기 작업 전송이 줄고, DBA 유저 생성 플로우의 즉시 피드백이 개선됩니다.
