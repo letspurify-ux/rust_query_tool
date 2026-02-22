@@ -100,6 +100,16 @@ fn build_connection_info(
     ))
 }
 
+fn resolved_password_for_saved_connection(
+    current_input: &str,
+    loaded_password: Option<String>,
+) -> String {
+    match loaded_password {
+        Some(password) => password,
+        None => current_input.to_string(),
+    }
+}
+
 impl ConnectionDialog {
     pub fn show_with_registry(popups: Arc<Mutex<Vec<Window>>>) -> Option<ConnectionInfo> {
         enum DialogMessage {
@@ -337,7 +347,9 @@ impl ConnectionDialog {
                     // Load password from OS keyring on demand.
                     let mut keyring_load_failed = false;
                     let password = match AppConfig::get_password_for_connection(&conn.name) {
-                        Ok(password_opt) => password_opt.unwrap_or_default(),
+                        Ok(password_opt) => {
+                            resolved_password_for_saved_connection(&pass_input_cb.value(), password_opt)
+                        }
                         Err(err) => {
                             keyring_load_failed = true;
                             fltk::dialog::alert_default(&err);
@@ -353,6 +365,12 @@ impl ConnectionDialog {
 
                     // Double click to connect immediately
                     if app::event_clicks() && !keyring_load_failed {
+                        if password.is_empty() {
+                            fltk::dialog::alert_default(
+                                "No password is saved for this connection. Enter a password before connecting.",
+                            );
+                            return;
+                        }
                         let info = ConnectionInfo::new(
                             &conn.name,
                             &conn.username,
@@ -507,10 +525,10 @@ impl ConnectionDialog {
                                 let mut cfg = config
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let previous_connections = cfg.recent_connections.clone();
+                                let previous_config = cfg.clone();
                                 let removal_error = cfg.remove_connection(&selected).err();
                                 if let Err(e) = cfg.save() {
-                                    cfg.recent_connections = previous_connections;
+                                    *cfg = previous_config;
                                     fltk::dialog::alert_default(&format!(
                                         "Failed to save config: {}",
                                         e
@@ -596,8 +614,7 @@ impl ConnectionDialog {
                                     crate::utils::credential_store::delete_password(&info.name)
                                         .err();
                                 cfg.recent_connections.retain(|c| c.name != info.name);
-                                let mut message =
-                                    format!("Failed to save connection: {}", e);
+                                let mut message = format!("Failed to save connection: {}", e);
                                 if let Some(cleanup_error) = cleanup_error {
                                     message.push_str(&format!(
                                         "\nAdditionally failed to roll back keyring entry: {}",
@@ -699,5 +716,22 @@ mod tests {
         assert_eq!(info.host, "localhost");
         assert_eq!(info.port, 1521);
         assert_eq!(info.service_name, "ORCL");
+    }
+
+    #[test]
+    fn resolved_password_for_saved_connection_prefers_loaded_password() {
+        let resolved = super::resolved_password_for_saved_connection(
+            "existing-input",
+            Some("from-keyring".to_string()),
+        );
+
+        assert_eq!(resolved, "from-keyring");
+    }
+
+    #[test]
+    fn resolved_password_for_saved_connection_keeps_current_input_when_missing() {
+        let resolved = super::resolved_password_for_saved_connection("typed-password", None);
+
+        assert_eq!(resolved, "typed-password");
     }
 }
