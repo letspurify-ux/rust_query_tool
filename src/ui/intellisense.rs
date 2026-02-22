@@ -748,6 +748,8 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "FEATURE_VALUE",
 ];
 
+const FUNCTION_SUFFIX: &str = "()";
+
 const MAX_SUGGESTIONS: usize = 50;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -825,20 +827,6 @@ impl IntellisenseData {
         let relation_only = prefer_relations && prefix_upper.is_empty();
         let column_only = prefer_columns && prefix_upper.is_empty();
 
-        let push_suggestion =
-            |value: String, suggestions: &mut Vec<String>, seen: &mut HashSet<String>| {
-                if !prefix_upper.is_empty() && value.to_uppercase() == prefix_upper {
-                    return suggestions.len() >= MAX_SUGGESTIONS;
-                }
-                if suggestions.len() >= MAX_SUGGESTIONS {
-                    return true;
-                }
-                if seen.insert(value.to_uppercase()) {
-                    suggestions.push(value);
-                }
-                suggestions.len() >= MAX_SUGGESTIONS
-            };
-
         if prefer_columns && include_columns {
             match column_tables {
                 Some(tables) if !tables.is_empty() => {
@@ -900,7 +888,13 @@ impl IntellisenseData {
         // Add SQL keywords
         for keyword in SQL_KEYWORDS {
             if keyword.starts_with(&prefix_upper) {
-                if push_suggestion(keyword.to_string(), &mut suggestions, &mut seen) {
+                if !prefix_upper.is_empty() && *keyword == prefix_upper {
+                    continue;
+                }
+                if seen.insert((*keyword).to_string()) {
+                    suggestions.push((*keyword).to_string());
+                }
+                if suggestions.len() >= MAX_SUGGESTIONS {
                     break;
                 }
             }
@@ -909,7 +903,13 @@ impl IntellisenseData {
         // Add Oracle functions
         for func in ORACLE_FUNCTIONS {
             if func.starts_with(&prefix_upper) {
-                if push_suggestion(format!("{}()", func), &mut suggestions, &mut seen) {
+                if !prefix_upper.is_empty() && *func == prefix_upper {
+                    continue;
+                }
+                if seen.insert((*func).to_string()) {
+                    suggestions.push(format!("{func}{FUNCTION_SUFFIX}"));
+                }
+                if suggestions.len() >= MAX_SUGGESTIONS {
                     break;
                 }
             }
@@ -1071,22 +1071,23 @@ impl IntellisenseData {
     }
 
     pub fn get_all_columns_for_highlighting(&self) -> Vec<String> {
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut columns = Vec::new();
 
-        for names in self.columns.values() {
-            for name in names {
-                let upper = name.to_uppercase();
-                if seen.insert(upper) {
-                    columns.push(name.clone());
+        for (table, entries) in &self.column_entries_by_table {
+            if self.virtual_column_entries_by_table.contains_key(table) {
+                continue;
+            }
+            for entry in entries {
+                if seen.insert(entry.upper.as_str()) {
+                    columns.push(entry.name.clone());
                 }
             }
         }
 
         for names in self.virtual_column_entries_by_table.values() {
             for entry in names {
-                let upper = entry.upper.clone();
-                if seen.insert(upper) {
+                if seen.insert(entry.upper.as_str()) {
                     columns.push(entry.name.clone());
                 }
             }
@@ -1099,9 +1100,10 @@ impl IntellisenseData {
         let key = table_name.to_uppercase();
         self.columns_loading.remove(&key);
         self.column_loading_started_at.remove(&key);
-        self.columns.insert(key.clone(), columns.clone());
+        let entries = Self::build_entries(&columns);
+        self.columns.insert(key.clone(), columns);
         self.column_entries_by_table
-            .insert(key, Self::build_entries(&columns));
+            .insert(key, entries);
         self.all_columns_dirty = true;
     }
 
