@@ -29,6 +29,58 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
 }
 
 #[test]
+fn is_window_shown_and_visible_requires_both_flags() {
+    assert!(is_window_shown_and_visible(true, true));
+    assert!(!is_window_shown_and_visible(true, false));
+    assert!(!is_window_shown_and_visible(false, true));
+    assert!(!is_window_shown_and_visible(false, false));
+}
+
+#[test]
+fn sql_editor_alert_calls_use_wrapper_function() {
+    let mod_src = include_str!("mod.rs");
+    assert!(
+        mod_src.contains("pub(crate) fn show_alert_dialog"),
+        "SqlEditorWidget::show_alert_dialog helper must be defined in mod.rs"
+    );
+    assert!(
+        mod_src.contains("struct PendingAlertState"),
+        "mod.rs should keep a single shared alert queue state"
+    );
+    assert!(
+        mod_src.contains("fn drain_pending_alerts()"),
+        "mod.rs should process alerts through a single drain function"
+    );
+    assert!(
+        mod_src.contains("is_window_shown_and_visible(window.shown(), window.visible())"),
+        "main window visibility check should require shown() and visible()"
+    );
+    assert!(
+        !mod_src.contains("fn show_alert_when_main_window_visible"),
+        "legacy per-alert recursive retry helper should not remain"
+    );
+    assert_eq!(
+        mod_src.matches("fltk::dialog::alert_default(").count(),
+        1,
+        "mod.rs should call fltk::dialog::alert_default only inside queue drain"
+    );
+
+    let file_checks = [
+        ("execution.rs", include_str!("execution.rs")),
+        ("dba_tools.rs", include_str!("dba_tools.rs")),
+        ("session_monitor.rs", include_str!("session_monitor.rs")),
+    ];
+
+    for (name, source) in file_checks {
+        assert_eq!(
+            source.matches("fltk::dialog::alert_default(").count(),
+            0,
+            "{name} should route alerts through SqlEditorWidget::show_alert_dialog"
+        );
+    }
+}
+
+#[test]
 fn format_sql_preserves_script_commands_and_slashes() {
     let cases = [
         (
