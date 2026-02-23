@@ -468,23 +468,6 @@ impl MainWindow {
         };
 
         if running_editors.is_empty() {
-            let cancelled_active_db_work =
-                crate::db::cancel_active_db_activity().unwrap_or_else(|err| {
-                    crate::utils::logging::log_error(
-                        "db",
-                        &format!("Failed to cancel active DB activity: {err}"),
-                    );
-                    false
-                });
-
-            if cancelled_active_db_work {
-                let mut s = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                s.set_status_message("Cancelling running DB activity...");
-                return;
-            }
-
             fallback_editor.cancel_current();
             return;
         }
@@ -3304,8 +3287,9 @@ impl MainWindow {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clone();
-                                    let current_connection_label =
-                                        current_connection.as_ref().map(|info| info.name.clone());
+                                    let current_connection_label = current_connection
+                                        .as_ref()
+                                        .map(|info| info.name.clone());
 
                                     if let Some(current_label) = current_connection_label {
                                         crate::utils::logging::log_error(
