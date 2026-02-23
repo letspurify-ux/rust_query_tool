@@ -523,40 +523,40 @@ impl SqlEditorWidget {
             return;
         }
 
-        let maybe_message = {
+        let (maybe_message, should_continue) = {
             let state = Self::pending_alert_state();
             let mut guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.queue.pop_front()
+            let message = guard.queue.pop_front();
+            let continue_pump = if message.is_some() {
+                !guard.queue.is_empty()
+            } else {
+                guard.pump_scheduled = false;
+                false
+            };
+            (message, continue_pump)
         };
 
         let Some(message) = maybe_message else {
-            let state = Self::pending_alert_state();
-            let mut guard = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.pump_scheduled = false;
             return;
         };
 
         fltk::dialog::alert_default(&message);
 
-        let should_continue = {
+        if should_continue {
+            Self::schedule_alert_pump(0.0);
+        } else {
             let state = Self::pending_alert_state();
             let mut guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if guard.queue.is_empty() {
                 guard.pump_scheduled = false;
-                false
-            } else {
-                true
+            } else if !guard.pump_scheduled {
+                guard.pump_scheduled = true;
+                Self::schedule_alert_pump(0.0);
             }
-        };
-
-        if should_continue {
-            Self::schedule_alert_pump(0.0);
         }
     }
 
