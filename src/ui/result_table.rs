@@ -522,14 +522,20 @@ impl ResultTableWidget {
                                     col,
                                 );
                                 if let Some(cell_val) = cell_val_owned {
-                                    Self::show_cell_text_dialog(
-                                        &cell_val,
+                                    let current_font_profile = {
                                         *font_profile_for_handle
                                             .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    };
+                                    let current_font_size = {
                                         *font_size_for_handle
                                             .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    };
+                                    Self::show_cell_text_dialog(
+                                        &cell_val,
+                                        current_font_profile,
+                                        current_font_size,
                                     );
                                     return true;
                                 }
@@ -931,40 +937,41 @@ impl ResultTableWidget {
         let rows = (row_bot - row_top + 1) as usize;
         let cols = (col_right - col_left + 1) as usize;
         let cell_count = rows * cols;
-
-        let headers = headers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let full_data = full_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut result = String::with_capacity((rows + 1) * cols * 16);
 
-        // Add headers
-        for col in col_left..=col_right {
-            if col > col_left {
-                result.push('\t');
-            }
-            if let Some(h) = headers.get(col as usize) {
-                result.push_str(h);
-            }
-        }
-        result.push('\n');
-
-        // Add data
-        for row in row_top..=row_bot {
+        {
+            let headers = headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for col in col_left..=col_right {
                 if col > col_left {
                     result.push('\t');
                 }
-                if let Some(val) = full_data
-                    .get(row as usize)
-                    .and_then(|r| r.get(col as usize))
-                {
-                    result.push_str(val);
+                if let Some(h) = headers.get(col as usize) {
+                    result.push_str(h);
                 }
             }
-            result.push('\n');
+        }
+        result.push('\n');
+
+        {
+            let full_data = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for row in row_top..=row_bot {
+                for col in col_left..=col_right {
+                    if col > col_left {
+                        result.push('\t');
+                    }
+                    if let Some(val) = full_data
+                        .get(row as usize)
+                        .and_then(|r| r.get(col as usize))
+                    {
+                        result.push_str(val);
+                    }
+                }
+                result.push('\n');
+            }
         }
 
         if !result.is_empty() {
@@ -979,21 +986,25 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) {
-        let headers = headers
+        let header_line = {
+            let headers = headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            headers.join("\t")
+        };
+
+        let row_count = full_data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let mut result = String::with_capacity(row_count * 16 + header_line.len() + 1);
+
+        result.push_str(&header_line);
+        result.push('\n');
+
         let full_data = full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let row_count = full_data.len();
-        let col_count = headers.len();
-        let mut result = String::with_capacity((row_count + 1) * col_count * 16);
-
-        // Add headers
-        result.push_str(&headers.join("\t"));
-        result.push('\n');
-
-        // Add all data
         for row in full_data.iter() {
             for (i, cell) in row.iter().enumerate() {
                 if i > 0 {
@@ -1395,24 +1406,29 @@ impl ResultTableWidget {
 
     /// Export all data to CSV format
     pub fn export_to_csv(&self) -> String {
-        let headers = self
-            .headers
+        let header_line = {
+            let headers = self
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let escaped: Vec<String> = headers.iter().map(|h| Self::escape_csv_field(h)).collect();
+            escaped.join(",")
+        };
+
+        let row_count = self
+            .full_data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let mut csv = String::with_capacity(row_count * 20 + header_line.len() + 1);
+
+        csv.push_str(&header_line);
+        csv.push('\n');
+
         let full_data = self
             .full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let row_count = full_data.len();
-        let col_count = headers.len();
-        let mut csv = String::with_capacity((row_count + 1) * col_count * 20);
-
-        // Header row
-        let header_line: Vec<String> = headers.iter().map(|h| Self::escape_csv_field(h)).collect();
-        csv.push_str(&header_line.join(","));
-        csv.push('\n');
-
-        // Data rows
         for row in full_data.iter() {
             for (i, cell) in row.iter().enumerate() {
                 if i > 0 {
