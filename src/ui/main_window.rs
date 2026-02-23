@@ -2019,7 +2019,7 @@ impl MainWindow {
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.status_bar
-                            .set_label(&format!("Connecting to {}...", info.display_string()));
+                            .set_label(&format!("Connecting to {}...", info.name));
                     }
                     thread::spawn(move || {
                         let mut db_conn = lock_connection_with_activity(
@@ -3256,7 +3256,7 @@ impl MainWindow {
                                 ConnectionResult::Success(info) => {
                                     crate::utils::logging::log_info(
                                         "connection",
-                                        &format!("Connected to {}", info.display_string()),
+                                        &format!("Connected to {}", info.name),
                                     );
                                     *s.connection_info
                                         .lock()
@@ -3289,7 +3289,7 @@ impl MainWindow {
                                         .clone();
                                     let current_connection_label = current_connection
                                         .as_ref()
-                                        .map(|info| info.display_string());
+                                        .map(|info| info.name.clone());
 
                                     if let Some(current_label) = current_connection_label {
                                         crate::utils::logging::log_error(

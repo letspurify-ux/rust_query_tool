@@ -41,12 +41,6 @@ impl ConnectionInfo {
         format!("//{}:{}/{}", self.host, self.port, self.service_name)
     }
 
-    pub fn display_string(&self) -> String {
-        format!(
-            "{} ({}@{}:{}/{})",
-            self.name, self.username, self.host, self.port, self.service_name
-        )
-    }
 
     /// Securely clear the password from memory by overwriting with zeros
     /// then releasing the allocation.
