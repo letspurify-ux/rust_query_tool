@@ -149,6 +149,17 @@ impl ResultTableWidget {
         Window::delete(dialog);
     }
 
+    fn try_clone_cell_value(
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        row: i32,
+        col: i32,
+    ) -> Option<String> {
+        let data = full_data.try_lock().ok()?;
+        data.get(row as usize)
+            .and_then(|r| r.get(col as usize))
+            .cloned()
+    }
+
     fn should_consume_boundary_arrow(table: &Table, key: Key) -> bool {
         let rows = table.rows();
         let cols = table.cols();
@@ -503,14 +514,13 @@ impl ResultTableWidget {
                             if app::event_clicks() {
                                 // Clone the cell value before entering the modal dialog
                                 // event loop so the full_data lock is released first.
-                                let cell_val_owned = {
-                                    let data = full_data_for_handle
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                    data.get(row as usize)
-                                        .and_then(|r| r.get(col as usize))
-                                        .cloned()
-                                };
+                                // Use try_lock() so a streaming flush that is currently
+                                // mutating the backing data never blocks the UI thread.
+                                let cell_val_owned = Self::try_clone_cell_value(
+                                    &full_data_for_handle,
+                                    row,
+                                    col,
+                                );
                                 if let Some(cell_val) = cell_val_owned {
                                     Self::show_cell_text_dialog(
                                         &cell_val,
