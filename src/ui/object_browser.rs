@@ -689,8 +689,8 @@ impl ObjectBrowserWidget {
             }
             match ev {
                 Event::Push => {
-                    let mouse_button = fltk::app::event_mouse_button();
-                    if mouse_button == fltk::app::MouseButton::Right {
+                    let mouse_button = fltk::app::event_button();
+                    if mouse_button == fltk::app::MouseButton::Right as i32 {
                         let clicked_item = t
                             .find_clicked(false)
                             .or_else(|| t.find_clicked(true))
@@ -718,7 +718,7 @@ impl ObjectBrowserWidget {
                         return true;
                     }
 
-                    if mouse_button == fltk::app::MouseButton::Left {
+                    if mouse_button == fltk::app::MouseButton::Left as i32 {
                         if fltk::app::event_clicks() {
                             let clicked_item = t
                                 .find_clicked(false)

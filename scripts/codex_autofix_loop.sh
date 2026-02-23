@@ -51,7 +51,7 @@ run_codex_fix() {
   local prompt model reasoning_effort
   local -a cmd_args=()
 
-  prompt="DBA 유저 기능에 버그 있는지 검토하고 여러건 한번에 수정해줘. 수정된 내용은 fixed.md에 추가해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘."
+  prompt="그리드 (결과 테이블에서) 편집 기능 개선해줘. 버그 있는지 검토하고 수정해줘. 수정된 내용은 fixed.md에 추가해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘."
 
   if [[ -n "$CODEX_MODEL" ]]; then
     if [[ "$CODEX_MODEL" == *" "* ]]; then

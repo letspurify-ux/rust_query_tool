@@ -8,6 +8,29 @@
 - **수정**: 파일 상단 주석을 모듈 내부 문서 주석(`//!`)으로 변경.
 - **효과**: 해당 lint 에러는 해소됨.
 
+## 2026-02-23 그리드(결과 테이블) 편집 안정화
+
+### [중] Enter/KPEnter/F2 단축키로 셀 편집 진입 및 빈 삽입 행 롤백 보완
+- **증상**: 결과 테이블에서 편집 모드 중 셀 단일 선택 시 키보드 진입으로 즉시 편집을 시작할 수 없었고, 행 추가 후 첫 입력을 취소하면 임시 행이 세션 데이터에 남아 삭제/저장 플로우에 영향을 줄 수 있었습니다.
+- **수정**:
+  - `table.handle`의 `Event::KeyDown`에서 `Enter`, `KPEnter`, `F2`를 단일 셀 편집 진입 키로 허용하고, 활성 편집 모드에서 `show_inline_cell_editor`를 즉시 호출하도록 개선했습니다.
+  - `insert_row_in_edit_mode`에서 삽입 창 취소 시 새로 추가된 임시 행을 `full_data`와 `row_states`에서 제거해 화면/상태를 원복하고,
+  - 편집 세션이 동시 소멸되는 경우에도 삽입 직후 `full_data`를 롤백해 일관성을 보장했습니다.
+- **효과**: 키보드 편집 진입이 안정화되고, 빈 삽입 행이 잔류하는 상태 오염을 방지해 staged edit 동작의 신뢰성이 향상됩니다.
+
+### [중] 선택 범위 바운드 미검증으로 인한 편집 액션 오동작 보완
+- **증상**: 데이터 수가 줄거나 변경된 뒤에도 `Table`의 선택 상태가 이전 범위를 가리키면, 복사/붙여넣기/단일 셀 업데이트 동작이 실제 행·열 범위를 벗어난 값으로 처리되어 잘못된 셀 수 계산이나 무의미한 편집 시도가 발생할 수 있었습니다.
+- **수정**: 선택 범위 정규화에 테이블 행/열 한계를 적용하는 클램프 경로를 추가하고(표 범위 밖 선택은 교집합 없으면 무시), 아래 경로에 적용했습니다.
+  - `selected_anchor_cell`
+  - `selected_row_range`
+  - `paste_clipboard_text_into_edit_mode`
+  - `copy_selected_to_clipboard`
+  - `copy_selected_with_headers`
+  - `get_selected_data`
+  - `resolve_update_target_cell`
+- **효과**: 정렬/삭제/새로고침 후 잔존 선택 상태에서 셀 편집 기능이 잘못된 범위를 따라가며 동작하지 않고, 유효 범위 기반으로 일관되게 동작합니다.
+- **테스트**: `normalized_selection_bounds_with_limits` 및 `resolve_update_target_cell` 관련 단위 테스트를 추가했습니다.
+
 ## 추가 확인 사항
 - 전체 clippy에는 기존 코드 전반의 다수 lint(`unnecessary_map_or`, `arc_with_non_send_sync`, `items_after_test_module` 등)가 남아 있습니다. 이번 작업에서는 요청 즉시 조치 대상으로 확인된 항목을 우선 수정했습니다.
 
@@ -391,3 +414,124 @@
 
 ### [테스트] Security 뷰 필터 경로 회귀 방지
 - `normalize_security_view_filters`의 뷰별 동작이 기대대로 유지되는지 확인하는 기존 테스트를 기반으로, UI 레벨 재조회 호출부는 동일 경로로 통일했습니다.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선
+
+### [중] 다중 선택 상태에서 `Update Cell`이 의도와 다른 셀/행을 갱신하던 문제 수정
+- **증상**: 다중 셀 선택 상태에서 우클릭 `Update Cell` 실행 시, 클릭한 셀이 아니라 선택 영역 앵커(좌상단) 기준으로 업데이트 대상이 결정되어 다른 행/컬럼이 갱신될 수 있었음.
+- **수정**: 컨텍스트 메뉴 호출 시 마우스 위치의 셀을 우선 편집 대상으로 전달하고, 컨텍스트 셀이 없는 경우에는 단일 셀 선택일 때만 업데이트를 허용하도록 `resolve_update_target_cell` 로직을 추가.
+- **효과**: 우클릭 기준 셀 편집 동작이 직관적으로 일치하고, 다중 선택에서의 오갱신(잘못된 행/셀 수정) 가능성을 차단.
+
+### [중] 결과 헤더가 `E.COL` 형태일 때 UPDATE/INSERT 컬럼 식별자가 깨지던 문제 수정
+- **증상**: 컬럼 헤더가 `E.ENAME`처럼 수식/한정자 형태일 때 기존 로직이 그대로 `"E"."ENAME"`을 DML 컬럼에 사용해 `SET`/`INSERT` SQL이 실패할 수 있었음.
+- **수정**: `last_identifier_segment`/`editable_column_identifier`를 추가해, DML 컬럼은 헤더의 마지막 식별자 세그먼트만 안전하게 추출해 사용하도록 변경.
+- **효과**: 한정자 포함 헤더에서도 편집 SQL 생성 안정성이 개선되고, 잘못된 컬럼 식별자로 인한 즉시 실패를 줄임.
+
+### [테스트] 결과 그리드 편집 회귀 테스트 추가
+- `last_identifier_segment`의 한정자/인용 식별자 분리 동작 검증.
+- `editable_column_identifier`의 DML 컬럼명 정규화 검증.
+- `resolve_update_target_cell`의 컨텍스트 셀 우선/단일 셀 선택 강제 동작 검증.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속)
+
+### [중] `Delete Row` 대상 `ROWID`를 대소문자 무시로 중복 제거하던 문제 수정
+- **증상**: 다중 행 삭제 시 `ROWID`를 `to_ascii_uppercase()` 기준으로 dedupe 하면서, 대소문자만 다른 유효 `ROWID`가 같은 값으로 합쳐져 일부 선택 행이 삭제 SQL에서 누락될 수 있었습니다.
+- **수정**: `selected_rowids` 경로를 정리해 `ROWID` dedupe를 원문(trim 후) 기준으로 처리하고, 공백/중복 처리 로직은 `push_unique_rowid` 헬퍼로 통합했습니다.
+- **효과**: 실제 `ROWID` 값이 대소문자를 구분하는 경우에도 선택한 행이 정확히 `DELETE` 대상에 반영됩니다.
+
+### [중] 인용 식별자 기반 `ROWID` 별칭 해석 및 편집 SQL 식별자 quoting 안정성 보강
+- **증상**: `SELECT "e"."ROWID" ...` 같은 쿼리에서 `ROWID` 토큰이 `"ROWID"`로 들어오면 별칭 해석이 실패해 다중 테이블 결과 편집 대상 테이블을 결정하지 못할 수 있었습니다. 또한 테이블명에 인용된 dot(`"A.B"`)이 포함되면 식별자 분해가 잘못될 여지가 있었습니다.
+- **수정**:
+  - `find_rowid_qualifier`에서 `ROWID` 판별 시 인용 제거 후 비교하도록 보완했습니다.
+  - `quote_qualified_identifier`에 `split_qualified_identifier`를 추가해, 인용 구간 내부 dot는 분리하지 않도록 처리했습니다.
+- **효과**: 인용 식별자를 사용하는 SQL에서도 `Update/Delete/Insert` 편집 SQL 생성이 더 안정적으로 동작합니다.
+
+### [테스트] 결과 그리드 편집 회귀 테스트 보강
+- `resolve_target_table_uses_quoted_rowid_alias_resolution` 추가.
+- `quote_qualified_identifier_preserves_dots_inside_quoted_segments` 추가.
+- `push_unique_rowid_preserves_case_sensitive_values` 추가.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속 2)
+
+### [중] 셀 외 영역 우클릭 시 이전 선택으로 편집 SQL이 실행될 수 있던 문제 수정
+- **증상**: 결과 테이블에서 셀/행 헤더가 아닌 위치를 우클릭해 컨텍스트 메뉴를 열면, 현재 마우스 위치와 무관하게 이전 선택 상태로 `Update Cell`/`Delete Row`가 실행될 수 있어 오편집 위험이 있었습니다.
+- **수정**:
+  - 컨텍스트 메뉴 진입 조건을 보강해, 셀 또는 row header에서 우클릭한 경우에만 메뉴를 표시하도록 변경했습니다.
+  - 셀 우클릭 시에는 선택 포함 판정을 정규화된 selection bounds 기준(`selection_contains_cell`)으로 처리해 선택 역방향/경계 케이스에서도 안정적으로 동작하도록 보강했습니다.
+- **효과**: 마우스 위치와 다른 이전 선택을 재사용해 편집 SQL이 실행되는 오동작 가능성을 차단했습니다.
+
+### [중] row header 우클릭 편집 대상 행 정합성 보강
+- **증상**: row header 우클릭 시 선택이 명시적으로 갱신되지 않아, `Delete Row`/`Insert Row` 기본값이 사용자가 클릭한 행이 아닌 이전 선택 행을 참조할 수 있었습니다.
+- **수정**:
+  - `get_row_header_at_mouse`를 추가해 row header 우클릭 행을 정확히 식별합니다.
+  - row header 우클릭 시 해당 행 전체를 즉시 선택하도록 변경했습니다.
+  - row header 컨텍스트 메뉴에서는 `Update Cell`을 제외해 행 단위 동작과 메뉴 의미를 일치시켰습니다.
+- **효과**: row header 기반 편집 동작이 클릭한 행 기준으로 일관되며, 행 컨텍스트에서의 오편집 가능성이 줄었습니다.
+
+### [테스트] selection 경계 처리 회귀 테스트 추가
+- `selection_contains_cell_normalizes_reversed_bounds` 추가.
+- `selection_contains_cell_rejects_negative_or_empty_selection` 추가.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속 3)
+
+### [중] 편집 불가 결과에서 편집 메뉴가 노출되던 UX/오동작 가능성 수정
+- **증상**: `ROWID`가 없거나 원본 SQL에서 단일 대상 테이블 해석이 불가능한 결과에서도 `Insert/Update/Delete` 메뉴가 노출되어, 실행 시점에만 에러 팝업으로 실패했습니다.
+- **수정**: 컨텍스트 메뉴 구성 전에 `can_show_row_edit_actions` 검사(`source_sql` 존재, `ROWID` 컬럼 존재, 대상 테이블 해석 가능)를 추가해, 편집 가능한 결과에서만 편집 메뉴를 노출하도록 변경했습니다.
+- **효과**: 편집 불가능한 결과에서의 불필요한 오류 팝업과 오조작 가능성을 줄였습니다.
+
+### [중] 대용량 결과에서 그리드 편집 진입 시 전체 데이터 clone으로 UI 멈춤 가능성 완화
+- **증상**: `Update/Delete/Insert` 경로가 `full_data` 전체를 매번 clone해, 큰 결과셋에서 우클릭 편집 진입 시 메모리 급증/지연이 발생할 수 있었습니다.
+- **수정**:
+  - `show_update_cell_dialog`: 선택 행의 `ROWID`/현재 셀 값만 잠금 구간에서 추출.
+  - `show_delete_row_dialog`: 선택 범위의 `ROWID`만 잠금 구간에서 수집.
+  - `show_insert_row_dialog`: 기본값용 선택 행 1개만 복제.
+- **효과**: 편집 동작 진입 시 불필요한 전체 데이터 복제를 제거해 대용량 결과에서 응답성이 개선됩니다.
+
+### [중] `Delete Row`가 선택 행 일부를 조용히 건너뛰던 동작 수정
+- **증상**: 선택 범위 내 일부 행에 `ROWID` 셀이 없거나 공백인 경우, 기존 구현은 해당 행을 조용히 건너뛰고 나머지 행만 삭제 SQL에 반영할 수 있었습니다.
+- **수정**: `collect_rowids_in_range`를 추가해 선택 범위를 엄격 검증하도록 변경하고, `ROWID` 누락/공백 행이 하나라도 있으면 즉시 오류로 중단하도록 보강했습니다.
+- **효과**: 부분 삭제(의도와 다른 일부 행만 삭제) 위험을 줄이고 삭제 대상 정합성을 높였습니다.
+
+### [테스트] 결과 그리드 편집 회귀 테스트 추가
+- `collect_rowids_in_range_errors_when_selected_row_lacks_rowid_cell`
+- `collect_rowids_in_range_errors_when_selected_row_has_empty_rowid`
+- `can_show_row_edit_actions_requires_rowid_and_resolved_target`
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속 4)
+
+### [중] `Insert Row` 메뉴가 `ROWID` 부재 결과에서 함께 숨겨지던 조건 결합 버그 수정
+- **증상**: `ROWID`가 없는 단순 조회 결과(`SELECT ENAME FROM EMP`)에서는 행 삽입이 기술적으로 가능해도, 컨텍스트 메뉴 가드가 `Insert/Update/Delete`를 한 조건으로 묶어 `Insert Row`까지 비노출 처리했습니다.
+- **수정**:
+  - 메뉴 노출 조건을 분리해 `Insert Row`는 `source_sql`에서 단일 대상 테이블 해석 가능 여부만으로 판단하도록 변경했습니다.
+  - `Update Cell`/`Delete Row`는 기존처럼 `ROWID` 컬럼 요구 조건을 별도 유지하도록 `can_show_rowid_edit_actions`를 추가했습니다.
+- **효과**: `ROWID`가 없는 결과에서도 가능한 경우 `Insert Row`를 바로 사용할 수 있고, `ROWID`가 필요한 편집 액션은 계속 안전하게 차단됩니다.
+
+### [테스트] 편집 메뉴 가드 회귀 테스트 보강
+- `can_show_insert_row_action_requires_resolved_target` 추가.
+- `can_show_rowid_edit_actions_requires_rowid_and_resolved_target` 추가.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속 5)
+
+### [중] 셀 선택 범위 역방향/비정상 selection에서 복사/선택 데이터 처리 오작동 가능성 수정
+- **증상**: 셀 영역이 역순으로 잡히거나 selection 값이 역전된 상태에서 `Copy`/`Copy with Headers`/`Get selected data` 경로가 음수 폭을 usize 변환하면서 예측 불가능한 값으로 동작할 수 있었습니다.
+- **수정**:
+  - `copy_selected_to_clipboard`, `copy_selected_with_headers`, `copy`, `get_selected_data`가 기존 `get_selection()` 직접 사용을 모두 `normalized_selection_bounds`로 통일했습니다.
+  - `normalized_selection_bounds`에 대한 회귀 테스트를 추가해 역순/음수 selection 경계 처리를 검증했습니다.
+- **효과**: 선택 영역 순서와 상관없이 셀 복사 및 선택 데이터 추출이 일관적으로 동작하며, 편집 흐름에서 범위 기반 붙여넣기/수정의 기본 입력 데이터 계산 안정성이 향상됩니다.
+
+## 2026-02-23 결과 테이블 그리드 편집 기능 개선 (후속 6)
+
+### [중] 키보드 편집 진입 동선 누락 및 취소 시 빈 삽입 행 잔존 버그 수정
+- **증상**:
+  - 편집 모드에서도 `Enter`/`F2`로 셀을 즉시 편집할 수 없어 마우스 더블클릭에만 의존해야 했고,
+  - 새 행 삽입에서 첫 편집을 `Esc`로 취소해도 빈 행이 `Inserted` 상태로 남아 저장/취소 흐름을 어지럽혔습니다.
+- **수정**:
+  - `Event::KeyDown`에 `Enter`/`KPEnter`/`F2` 처리 추가로, 단일 셀 선택 상태에서 즉시 `show_inline_cell_editor`를 호출하도록 했습니다.
+  - `insert_row_in_edit_mode`에서 첫 번째 컬럼 편집이 취소되면 해당 행과 `row_states`의 마지막 항목을 제거하고, 행 개수/선택 상태를 되돌리도록 했습니다.
+- **효과**:
+  - 키보드 작업 중심 편집 UX가 가능해졌고,
+  - 의도치 않게 추가된 빈 `Inserted` 행이 편집 상태에 남는 현상이 사라집니다.
+
+### [테스트] 그리드 편집 단위 테스트 보강
+- `resolved_selection_bounds_with_limits_clamps_to_current_table_size`
+- `resolve_update_target_cell_prefers_context_and_requires_single_selection_without_it`

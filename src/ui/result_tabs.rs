@@ -9,8 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::result_table::ResultGridSqlExecuteCallback;
 use crate::ui::theme;
 use crate::ui::ResultTableWidget;
+
+type ResultTabsChangeCallback = Box<dyn FnMut()>;
 
 #[derive(Clone)]
 pub struct ResultTabsWidget {
@@ -21,6 +24,8 @@ pub struct ResultTabsWidget {
     font_profile: Arc<Mutex<FontProfile>>,
     font_size: Arc<Mutex<u32>>,
     max_cell_display_chars: Arc<Mutex<usize>>,
+    execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
 }
 
 #[derive(Clone)]
@@ -37,6 +42,34 @@ struct ScriptOutputTab {
 }
 
 impl ResultTabsWidget {
+    fn fire_on_change_callback(&self) {
+        let mut callback = self
+            .on_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback_fn) = callback.as_mut() {
+            callback_fn();
+        }
+        *self
+            .on_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+    }
+
+    fn fire_on_change_with(callback_ref: &Arc<Mutex<Option<ResultTabsChangeCallback>>>) {
+        let mut callback = callback_ref
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(callback_fn) = callback.as_mut() {
+            callback_fn();
+        }
+        *callback_ref
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+    }
+
     fn content_bounds(tabs: &Tabs) -> (i32, i32, i32, i32) {
         // Keep a stable tab-header height regardless of surrounding splitter drags.
         // This avoids top/bottom header bar height jitter while panes are resized.
@@ -124,6 +157,10 @@ impl ResultTabsWidget {
         let max_cell_display_chars = Arc::new(Mutex::new(
             constants::RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(None));
+        let on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
+            Arc::new(Mutex::new(None));
 
         tabs.begin();
         let (x, y, w, h) = Self::content_bounds(&tabs);
@@ -165,6 +202,7 @@ impl ResultTabsWidget {
         let data_for_cb = data.clone();
         let active_for_cb = active_index.clone();
         let script_for_cb = script_output.clone();
+        let on_change_for_cb = on_change_callback.clone();
         tabs.set_callback(move |t| {
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
@@ -177,15 +215,18 @@ impl ResultTabsWidget {
                     *active_for_cb
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    Self::fire_on_change_with(&on_change_for_cb);
                     return;
                 }
-                let data = data_for_cb
+                let index = data_for_cb
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let index = data.iter().position(|tab| tab.group.as_widget_ptr() == ptr);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .position(|tab| tab.group.as_widget_ptr() == ptr);
                 *active_for_cb
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = index;
+                Self::fire_on_change_with(&on_change_for_cb);
             }
         });
 
@@ -241,7 +282,19 @@ impl ResultTabsWidget {
             font_profile,
             font_size,
             max_cell_display_chars,
+            execute_sql_callback,
+            on_change_callback,
         }
+    }
+
+    pub fn set_on_change<F>(&mut self, callback: F)
+    where
+        F: FnMut() + 'static,
+    {
+        *self
+            .on_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
     pub fn get_widget(&self) -> Tabs {
@@ -315,6 +368,7 @@ impl ResultTabsWidget {
         let mut script_display = script_output.display.clone();
         script_group.redraw();
         script_display.redraw();
+        self.fire_on_change_callback();
     }
 
     pub fn tab_count(&self) -> usize {
@@ -393,6 +447,12 @@ impl ResultTabsWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+        let execute_sql_callback = self
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        table.set_execute_sql_callback(execute_sql_callback);
         let widget = table.get_widget();
         group.resizable(&widget);
         group.end();
@@ -418,6 +478,7 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
+        self.fire_on_change_callback();
     }
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String]) {
@@ -430,6 +491,7 @@ impl ResultTabsWidget {
             let mut table = tab.table.clone();
             table.start_streaming(columns);
         }
+        self.fire_on_change_callback();
     }
 
     pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
@@ -454,6 +516,7 @@ impl ResultTabsWidget {
             let mut table = tab.table.clone();
             table.finish_streaming();
         }
+        self.fire_on_change_callback();
     }
 
     pub fn finish_all_streaming(&mut self) {
@@ -482,6 +545,35 @@ impl ResultTabsWidget {
             let mut table = tab.table.clone();
             table.display_result(result);
         }
+        self.fire_on_change_callback();
+    }
+
+    pub fn set_source_sql(&mut self, index: usize, sql: &str) {
+        if let Some(tab) = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+        {
+            let mut table = tab.table.clone();
+            table.set_source_sql(sql);
+        }
+        self.fire_on_change_callback();
+    }
+
+    pub fn set_execute_sql_callback(&mut self, callback: ResultGridSqlExecuteCallback) {
+        *self
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback.clone());
+        let tabs = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tab in tabs.iter() {
+            let mut table = tab.table.clone();
+            table.set_execute_sql_callback(Some(callback.clone()));
+        }
     }
 
     pub fn export_to_csv(&self) -> String {
@@ -500,6 +592,63 @@ impl ResultTabsWidget {
         self.current_table()
             .map(|table| table.has_data())
             .unwrap_or(false)
+    }
+
+    pub fn can_current_begin_edit_mode(&self) -> bool {
+        self.current_table()
+            .map(|table| table.can_begin_edit_mode())
+            .unwrap_or(false)
+    }
+
+    pub fn is_current_edit_mode_enabled(&self) -> bool {
+        self.current_table()
+            .map(|table| table.is_edit_mode_enabled())
+            .unwrap_or(false)
+    }
+
+    pub fn begin_current_edit_mode(&mut self) -> Result<String, String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("Open a result tab first.".to_string());
+        };
+        let result = table.begin_edit_mode();
+        self.fire_on_change_callback();
+        result
+    }
+
+    pub fn insert_row_in_current_edit_mode(&mut self) -> Result<String, String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("Open a result tab first.".to_string());
+        };
+        let result = table.insert_row_in_edit_mode();
+        self.fire_on_change_callback();
+        result
+    }
+
+    pub fn delete_selected_rows_in_current_edit_mode(&mut self) -> Result<String, String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("Open a result tab first.".to_string());
+        };
+        let result = table.delete_selected_rows_in_edit_mode();
+        self.fire_on_change_callback();
+        result
+    }
+
+    pub fn save_current_edit_mode(&mut self) -> Result<String, String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("Open a result tab first.".to_string());
+        };
+        let result = table.save_edit_mode();
+        self.fire_on_change_callback();
+        result
+    }
+
+    pub fn cancel_current_edit_mode(&mut self) -> Result<String, String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("Open a result tab first.".to_string());
+        };
+        let result = table.cancel_edit_mode();
+        self.fire_on_change_callback();
+        result
     }
 
     fn current_table(&self) -> Option<ResultTableWidget> {
@@ -536,6 +685,19 @@ impl ResultTabsWidget {
         if let Some(mut table) = self.current_table() {
             table.select_all();
         }
+    }
+
+    pub fn paste_from_clipboard(&self) -> bool {
+        if let Some(mut table) = self.current_table() {
+            table.paste_from_clipboard();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn has_current_result_table(&self) -> bool {
+        self.current_table().is_some()
     }
 
     fn delete_tab(&mut self, mut tab: ResultTab) {
@@ -640,6 +802,7 @@ impl ResultTabsWidget {
         }
 
         self.tabs.redraw();
+        self.fire_on_change_callback();
         true
     }
 
@@ -655,6 +818,7 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.fire_on_change_callback();
     }
 
     fn clear_script_output(&self) {

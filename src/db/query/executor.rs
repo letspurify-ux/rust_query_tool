@@ -4615,11 +4615,7 @@ ORDER BY
         }
 
         let upper = trimmed.to_ascii_uppercase();
-        if upper
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_digit())
-        {
+        if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
             return Err(Self::invalid_security_input_error(format!(
                 "{} must start with a letter, _, $, or #",
                 field_name
@@ -6332,11 +6328,8 @@ mod dba_feature_tests {
 
     #[test]
     fn build_users_overview_where_clause_includes_filters() {
-        let where_clause = QueryExecutor::build_users_overview_where_clause(
-            Some("SCOTT"),
-            Some("DEFAULT"),
-            false,
-        );
+        let where_clause =
+            QueryExecutor::build_users_overview_where_clause(Some("SCOTT"), Some("DEFAULT"), false);
         assert_eq!(
             where_clause,
             "WHERE username = 'SCOTT'\n  AND profile = 'DEFAULT'"
@@ -6345,7 +6338,8 @@ mod dba_feature_tests {
 
     #[test]
     fn build_users_overview_where_clause_supports_attention_only() {
-        let where_clause = QueryExecutor::build_users_overview_where_clause(None, Some("DEFAULT"), true);
+        let where_clause =
+            QueryExecutor::build_users_overview_where_clause(None, Some("DEFAULT"), true);
         assert_eq!(
             where_clause,
             "WHERE profile = 'DEFAULT'\n  AND (UPPER(NVL(account_status, '-')) LIKE '%LOCKED%' OR UPPER(NVL(account_status, '-')) LIKE '%EXPIRED%')"
@@ -6448,8 +6442,8 @@ mod dba_feature_tests {
 
     #[test]
     fn normalize_required_password_preserves_leading_and_trailing_spaces() {
-        let result = QueryExecutor::normalize_required_password("  Pa ss  ")
-            .unwrap_or_else(|err| {
+        let result =
+            QueryExecutor::normalize_required_password("  Pa ss  ").unwrap_or_else(|err| {
                 panic!("unexpected error: {err}");
             });
         assert_eq!(result, "  Pa ss  ");

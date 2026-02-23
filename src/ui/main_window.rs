@@ -1,9 +1,9 @@
 use fltk::{
     app,
-    button::Button,
+    button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
     draw::set_cursor,
-    enums::{Cursor, FrameType},
+    enums::{Align, Cursor, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
     input::IntInput,
@@ -26,6 +26,7 @@ use crate::db::{
     try_lock_connection_with_activity, ObjectBrowser, QueryResult, SharedConnection,
 };
 use crate::ui::constants::*;
+use crate::ui::result_table::ResultGridSqlExecuteCallback;
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
@@ -67,6 +68,13 @@ pub struct AppState {
     schema_highlight_data: HighlightData,
     query_timeout_input: IntInput,
     pub result_tabs: ResultTabsWidget,
+    result_toolbar: Flex,
+    result_edit_hint: Frame,
+    result_edit_check: CheckButton,
+    result_insert_btn: Button,
+    result_delete_btn: Button,
+    result_save_btn: Button,
+    result_cancel_btn: Button,
     pub result_tab_offset: usize,
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
@@ -89,6 +97,36 @@ pub struct AppState {
 
 struct HealthCheckStopSignal {
     stop_sender: std::sync::mpsc::Sender<()>,
+}
+
+fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, visible: bool) {
+    if visible {
+        toolbar.fixed(button, BUTTON_WIDTH_SMALL);
+        if !button.visible() {
+            button.show();
+        }
+        button.activate();
+    } else {
+        button.deactivate();
+        if button.visible() {
+            button.hide();
+        }
+        toolbar.fixed(button, 0);
+    }
+}
+
+fn set_result_hint_visibility(toolbar: &mut Flex, hint: &mut Frame, visible: bool) {
+    if visible {
+        toolbar.fixed(hint, RESULT_EDIT_HINT_WIDTH);
+        if !hint.visible() {
+            hint.show();
+        }
+    } else {
+        if hint.visible() {
+            hint.hide();
+        }
+        toolbar.fixed(hint, 0);
+    }
 }
 
 impl AppState {
@@ -320,8 +358,59 @@ impl AppState {
             &conn_info,
         ));
     }
+
+    fn refresh_result_edit_controls(&mut self) {
+        let can_edit = self.result_tabs.can_current_begin_edit_mode();
+        let edit_active = self.result_tabs.is_current_edit_mode_enabled();
+        let show_edit_check = can_edit;
+        let show_edit_hint = !can_edit && self.result_tabs.has_current_result_table();
+        if show_edit_check {
+            self.result_toolbar
+                .fixed(&self.result_edit_check, BUTTON_WIDTH_SMALL);
+            if !self.result_edit_check.visible() {
+                self.result_edit_check.show();
+            }
+            self.result_edit_check.activate();
+        } else {
+            self.result_edit_check.deactivate();
+            if self.result_edit_check.visible() {
+                self.result_edit_check.hide();
+            }
+            self.result_toolbar.fixed(&self.result_edit_check, 0);
+        }
+        set_result_hint_visibility(&mut self.result_toolbar, &mut self.result_edit_hint, show_edit_hint);
+        let desired_checked = edit_active && can_edit;
+        if self.result_edit_check.value() != desired_checked {
+            self.result_edit_check.set(desired_checked);
+        }
+
+        let show_action_buttons = edit_active && can_edit;
+        set_result_action_button_visibility(
+            &mut self.result_toolbar,
+            &mut self.result_insert_btn,
+            show_action_buttons,
+        );
+        set_result_action_button_visibility(
+            &mut self.result_toolbar,
+            &mut self.result_delete_btn,
+            show_action_buttons,
+        );
+        set_result_action_button_visibility(
+            &mut self.result_toolbar,
+            &mut self.result_save_btn,
+            show_action_buttons,
+        );
+        set_result_action_button_visibility(
+            &mut self.result_toolbar,
+            &mut self.result_cancel_btn,
+            show_action_buttons,
+        );
+        self.result_toolbar.layout();
+        self.result_toolbar.redraw();
+    }
 }
 
+const RESULT_EDIT_HINT_WIDTH: i32 = 250;
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const STATUS_ANIMATION_INTERVAL: f64 = 0.08;
@@ -859,6 +948,63 @@ impl MainWindow {
 
         let spacer = Frame::default();
         result_toolbar.resizable(&spacer);
+
+        let mut edit_hint_label = Frame::default().with_label("Editable only with ROWID");
+        edit_hint_label.set_label_color(theme::text_secondary());
+        edit_hint_label.set_align(Align::Right | Align::Inside);
+        result_toolbar.fixed(&edit_hint_label, 0);
+
+        let mut edit_mode_check = CheckButton::default()
+            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
+            .with_label("Edit");
+        edit_mode_check.set_tooltip("Enable staged edit mode for the current result tab");
+        edit_mode_check.hide();
+        result_toolbar.fixed(&edit_mode_check, 0);
+
+        let mut edit_insert_btn = Button::default()
+            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
+            .with_label("Insert");
+        edit_insert_btn.set_color(theme::button_secondary());
+        edit_insert_btn.set_label_color(theme::text_primary());
+        edit_insert_btn.set_frame(FrameType::RFlatBox);
+        edit_insert_btn.set_tooltip("Add a staged row (DB is not changed until Save)");
+        result_toolbar.fixed(&edit_insert_btn, BUTTON_WIDTH_SMALL);
+
+        let mut edit_delete_btn = Button::default()
+            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
+            .with_label("Delete");
+        edit_delete_btn.set_color(theme::button_warning());
+        edit_delete_btn.set_label_color(theme::text_primary());
+        edit_delete_btn.set_frame(FrameType::RFlatBox);
+        edit_delete_btn.set_tooltip("Delete selected row(s) in staged edit mode");
+        result_toolbar.fixed(&edit_delete_btn, BUTTON_WIDTH_SMALL);
+
+        let mut edit_save_btn = Button::default()
+            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
+            .with_label("Save");
+        edit_save_btn.set_color(theme::button_success());
+        edit_save_btn.set_label_color(theme::text_primary());
+        edit_save_btn.set_frame(FrameType::RFlatBox);
+        edit_save_btn.set_tooltip("Apply staged edits to DB");
+        result_toolbar.fixed(&edit_save_btn, BUTTON_WIDTH_SMALL);
+
+        let mut edit_cancel_btn = Button::default()
+            .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
+            .with_label("Cancel");
+        edit_cancel_btn.set_color(theme::button_danger());
+        edit_cancel_btn.set_label_color(theme::text_primary());
+        edit_cancel_btn.set_frame(FrameType::RFlatBox);
+        edit_cancel_btn.set_tooltip("Discard staged edits and restore rows");
+        edit_hint_label.hide();
+        edit_insert_btn.hide();
+        edit_delete_btn.hide();
+        edit_save_btn.hide();
+        edit_cancel_btn.hide();
+        result_toolbar.fixed(&edit_hint_label, 0);
+        result_toolbar.fixed(&edit_insert_btn, 0);
+        result_toolbar.fixed(&edit_delete_btn, 0);
+        result_toolbar.fixed(&edit_save_btn, 0);
+        result_toolbar.fixed(&edit_cancel_btn, 0);
         result_toolbar.end();
         result_bottom_flex.fixed(&result_toolbar, RESULT_TOOLBAR_HEIGHT);
         result_bottom_flex.end();
@@ -888,7 +1034,9 @@ impl MainWindow {
             const SPLIT_GRAB_MARGIN: i32 = 6;
             match ev {
                 fltk::enums::Event::Push => {
-                    if app::event_mouse_button() == fltk::app::MouseButton::Left {
+                    // Avoid event_mouse_button() because FLTK can emit non-standard button
+                    // values on some devices, which panics when cast to MouseButton.
+                    if app::event_button() == fltk::app::MouseButton::Left as i32 {
                         let split_top = query_split_bar_for_tile.y();
                         let split_bottom = split_top + query_split_bar_for_tile.h();
                         let near_split = (app::event_y() >= split_top - SPLIT_GRAB_MARGIN)
@@ -1026,6 +1174,13 @@ impl MainWindow {
             schema_highlight_data: HighlightData::new(),
             query_timeout_input: timeout_input.clone(),
             result_tabs,
+            result_toolbar: result_toolbar.clone(),
+            result_edit_hint: edit_hint_label.clone(),
+            result_edit_check: edit_mode_check.clone(),
+            result_insert_btn: edit_insert_btn.clone(),
+            result_delete_btn: edit_delete_btn.clone(),
+            result_save_btn: edit_save_btn.clone(),
+            result_cancel_btn: edit_cancel_btn.clone(),
             result_tab_offset: 0,
             object_browser,
             status_bar,
@@ -1045,6 +1200,42 @@ impl MainWindow {
             file_sender: None,
             health_stop_signal: None,
         }));
+
+        {
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let weak_state_for_result_tabs_change = Arc::downgrade(&state);
+            s.result_tabs.set_on_change(move || {
+                if let Some(state_for_result_tabs_change) = weak_state_for_result_tabs_change.upgrade()
+                {
+                    if let Ok(mut s) = state_for_result_tabs_change.try_lock() {
+                        s.refresh_result_edit_controls();
+                    }
+                }
+            });
+            s.refresh_result_edit_controls();
+        }
+
+        let weak_state_for_grid_edit = Arc::downgrade(&state);
+        let grid_edit_callback: ResultGridSqlExecuteCallback =
+            Arc::new(Mutex::new(Box::new(move |sql: String| {
+                let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
+                    return;
+                };
+                state_for_grid_edit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .sql_editor
+                    .execute_sql_text(&sql);
+            })));
+        {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .result_tabs
+                .set_execute_sql_callback(grid_edit_callback);
+        }
 
         let weak_state_for_execute = Arc::downgrade(&state);
         execute_btn.set_callback(move |_| {
@@ -1129,6 +1320,7 @@ impl MainWindow {
                 // Ask allocator to return free pages promptly.
                 malloc_trim_process();
             }
+            s.refresh_result_edit_controls();
             app::redraw();
         });
 
@@ -1153,6 +1345,7 @@ impl MainWindow {
             if had_tabs {
                 malloc_trim_process();
             }
+            s.refresh_result_edit_controls();
             app::redraw();
         });
 
@@ -1193,6 +1386,173 @@ impl MainWindow {
             if let Some(state_for_history) = weak_state_for_history_btn.upgrade() {
                 MainWindow::open_query_history_dialog(&state_for_history);
             }
+        });
+
+        let weak_state_for_edit_check = Arc::downgrade(&state);
+        edit_mode_check.set_callback(move |check| {
+            let Some(state_for_edit_check) = weak_state_for_edit_check.upgrade() else {
+                return;
+            };
+            let enabled = check.value();
+            let mut result_tabs = match state_for_edit_check.try_lock() {
+                Ok(s) => s.result_tabs.clone(),
+                Err(_) => return,
+            };
+            let action_result = if enabled {
+                result_tabs.begin_current_edit_mode()
+            } else if result_tabs.is_current_edit_mode_enabled() {
+                result_tabs.cancel_current_edit_mode()
+            } else {
+                Ok(String::new())
+            };
+
+            let mut error_message = None;
+            if let Ok(mut s) = state_for_edit_check.try_lock() {
+                match action_result {
+                    Ok(msg) => {
+                        if !msg.is_empty() {
+                            s.set_status_message(&msg);
+                        }
+                    }
+                    Err(err) => {
+                        error_message = Some(err);
+                    }
+                }
+                s.refresh_result_edit_controls();
+            }
+            if let Some(err) = error_message {
+                check.clear();
+                fltk::dialog::alert_default(&err);
+            }
+            app::redraw();
+        });
+
+        let weak_state_for_edit_insert = Arc::downgrade(&state);
+        edit_insert_btn.set_callback(move |_| {
+            let Some(state_for_edit_insert) = weak_state_for_edit_insert.upgrade() else {
+                return;
+            };
+            let mut result_tabs = {
+                state_for_edit_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result_tabs
+                    .clone()
+            };
+            let action_result = result_tabs.insert_row_in_current_edit_mode();
+            let mut error_message = None;
+            {
+                let mut s = state_for_edit_insert
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match action_result {
+                    Ok(msg) => s.set_status_message(&msg),
+                    Err(err) => {
+                        error_message = Some(err);
+                    }
+                }
+                s.refresh_result_edit_controls();
+            }
+            if let Some(err) = error_message {
+                fltk::dialog::alert_default(&err);
+            }
+            app::redraw();
+        });
+
+        let weak_state_for_edit_delete = Arc::downgrade(&state);
+        edit_delete_btn.set_callback(move |_| {
+            let Some(state_for_edit_delete) = weak_state_for_edit_delete.upgrade() else {
+                return;
+            };
+            let mut result_tabs = {
+                state_for_edit_delete
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result_tabs
+                    .clone()
+            };
+            let action_result = result_tabs.delete_selected_rows_in_current_edit_mode();
+            let mut error_message = None;
+            {
+                let mut s = state_for_edit_delete
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match action_result {
+                    Ok(msg) => s.set_status_message(&msg),
+                    Err(err) => {
+                        error_message = Some(err);
+                    }
+                }
+                s.refresh_result_edit_controls();
+            }
+            if let Some(err) = error_message {
+                fltk::dialog::alert_default(&err);
+            }
+            app::redraw();
+        });
+
+        let weak_state_for_edit_save = Arc::downgrade(&state);
+        edit_save_btn.set_callback(move |_| {
+            let Some(state_for_edit_save) = weak_state_for_edit_save.upgrade() else {
+                return;
+            };
+            let mut result_tabs = {
+                state_for_edit_save
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result_tabs
+                    .clone()
+            };
+            let save_result = result_tabs.save_current_edit_mode();
+            let mut error_message = None;
+            {
+                let mut s = state_for_edit_save
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match save_result {
+                    Ok(msg) => s.set_status_message(&msg),
+                    Err(err) => {
+                        error_message = Some(err);
+                    }
+                }
+                s.refresh_result_edit_controls();
+            }
+            if let Some(err) = error_message {
+                fltk::dialog::alert_default(&err);
+            }
+            app::redraw();
+        });
+
+        let weak_state_for_edit_cancel = Arc::downgrade(&state);
+        edit_cancel_btn.set_callback(move |_| {
+            let Some(state_for_edit_cancel) = weak_state_for_edit_cancel.upgrade() else {
+                return;
+            };
+            let mut result_tabs = {
+                state_for_edit_cancel
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .result_tabs
+                    .clone()
+            };
+            let action_result = result_tabs.cancel_current_edit_mode();
+            let mut error_message = None;
+            {
+                let mut s = state_for_edit_cancel
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match action_result {
+                    Ok(msg) => s.set_status_message(&msg),
+                    Err(err) => {
+                        error_message = Some(err);
+                    }
+                }
+                s.refresh_result_edit_controls();
+            }
+            if let Some(err) = error_message {
+                fltk::dialog::alert_default(&err);
+            }
+            app::redraw();
         });
 
         // Restore current group
@@ -1834,6 +2194,7 @@ impl MainWindow {
                     if !was_running {
                         MainWindow::start_status_animation_timer(&state_for_progress);
                     }
+                    s.refresh_result_edit_controls();
                 }
                 QueryProgress::SelectStart { index, columns } => {
                     let tab_index = s.result_tab_offset + index;
@@ -1845,6 +2206,7 @@ impl MainWindow {
                     if !was_running {
                         MainWindow::start_status_animation_timer(&state_for_progress);
                     }
+                    s.refresh_result_edit_controls();
                 }
                 QueryProgress::Rows { index, rows } => {
                     let tab_index = s.result_tab_offset + index;
@@ -1913,11 +2275,13 @@ impl MainWindow {
                         s.result_tabs.select_script_output();
                     }
                     if result.is_select {
+                        s.result_tabs.set_source_sql(tab_index, &result.sql);
                         s.result_tabs.finish_streaming(tab_index);
                     } else {
                         s.result_tabs.display_result(tab_index, &result);
                     }
                     s.fetch_row_counts.remove(&index);
+                    s.refresh_result_edit_controls();
                 }
                 QueryProgress::BatchFinished => {
                     s.result_tabs.finish_all_streaming();
@@ -1934,6 +2298,7 @@ impl MainWindow {
                     if needs_reset {
                         s.set_status_message("Ready");
                     }
+                    s.refresh_result_edit_controls();
                 }
             }
         });
@@ -2234,12 +2599,22 @@ impl MainWindow {
                 true
             }
             "Edit/Paste" => {
-                state
+                let s = state
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .get_editor()
-                    .paste();
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let result_tabs_widget = s.result_tabs.get_widget();
+                let focus_in_results = if let Some(focus) = app::focus() {
+                    focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
+                        || focus.inside(&result_tabs_widget)
+                } else {
+                    false
+                };
+
+                if focus_in_results {
+                    let _ = s.result_tabs.paste_from_clipboard();
+                } else {
+                    s.sql_editor.get_editor().paste();
+                }
                 true
             }
             "Edit/Select All" => {
@@ -3287,9 +3662,8 @@ impl MainWindow {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clone();
-                                    let current_connection_label = current_connection
-                                        .as_ref()
-                                        .map(|info| info.name.clone());
+                                    let current_connection_label =
+                                        current_connection.as_ref().map(|info| info.name.clone());
 
                                     if let Some(current_label) = current_connection_label {
                                         crate::utils::logging::log_error(

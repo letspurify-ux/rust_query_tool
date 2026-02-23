@@ -2,20 +2,24 @@ use fltk::{
     app,
     button::Button,
     draw,
-    enums::{Align, Event, FrameType, Key, Shortcut},
+    enums::{Align, CallbackTrigger, Event, FrameType, Key, Shortcut},
     group::Group,
+    input::Input,
     menu::MenuButton,
     prelude::*,
     table::{Table, TableContext},
     text::{TextBuffer, TextDisplay},
     window::Window,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::db::QueryResult;
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::intellisense_context::{self, ScopedTableRef};
+use crate::ui::sql_editor::{SqlEditorWidget, SqlToken};
 use crate::ui::theme;
 
 fn byte_index_after_n_chars(s: &str, n: usize) -> usize {
@@ -63,6 +67,8 @@ const MAX_BUFFERED_ROWS: usize = 500000;
 /// Stop computing column widths after this many rows (widths stabilize quickly)
 const WIDTH_SAMPLE_ROWS: usize = 5000;
 
+pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String)>>>;
+
 #[derive(Clone)]
 pub struct ResultTableWidget {
     table: Table,
@@ -82,6 +88,9 @@ pub struct ResultTableWidget {
     width_sampled_rows: Arc<Mutex<usize>>,
     font_profile: Arc<Mutex<FontProfile>>,
     font_size: Arc<Mutex<u32>>,
+    source_sql: Arc<Mutex<String>>,
+    execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    edit_session: Arc<Mutex<Option<TableEditSession>>>,
 }
 
 #[derive(Default)]
@@ -89,6 +98,23 @@ struct DragState {
     is_dragging: bool,
     start_row: i32,
     start_col: i32,
+}
+
+#[derive(Clone)]
+enum EditRowState {
+    Existing { rowid: String },
+    Inserted,
+}
+
+#[derive(Clone)]
+struct TableEditSession {
+    rowid_col: usize,
+    table_name: String,
+    editable_columns: Vec<(usize, String)>,
+    original_rows_by_rowid: HashMap<String, Vec<String>>,
+    original_row_order: Vec<String>,
+    deleted_rowids: Vec<String>,
+    row_states: Vec<EditRowState>,
 }
 
 impl ResultTableWidget {
@@ -351,6 +377,10 @@ impl ResultTableWidget {
         let font_size = Arc::new(Mutex::new(DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars =
             Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
+        let source_sql = Arc::new(Mutex::new(String::new()));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(None));
+        let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -493,22 +523,29 @@ impl ResultTableWidget {
         let full_data_for_handle = full_data.clone();
         let font_profile_for_handle = font_profile.clone();
         let font_size_for_handle = font_size.clone();
+        let source_sql_for_handle = source_sql.clone();
+        let execute_sql_callback_for_handle = execute_sql_callback.clone();
+        let edit_session_for_handle = edit_session.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
             }
             match ev {
                 Event::Push => {
-                    if app::event_mouse_button() == app::MouseButton::Right {
+                    let button = app::event_button();
+                    if button == app::MouseButton::Right as i32 {
                         Self::show_context_menu(
                             &table_for_handle,
                             &headers_for_handle,
                             &full_data_for_handle,
+                            &source_sql_for_handle,
+                            &execute_sql_callback_for_handle,
+                            &edit_session_for_handle,
                         );
                         return true;
                     }
                     // Left click - start drag selection
-                    if app::event_mouse_button() == app::MouseButton::Left {
+                    if button == app::MouseButton::Left as i32 {
                         let _ = table_for_handle.take_focus();
                         if let Some((row, col)) = Self::get_cell_at_mouse(&table_for_handle) {
                             if app::event_clicks() {
@@ -516,11 +553,31 @@ impl ResultTableWidget {
                                 // event loop so the full_data lock is released first.
                                 // Use try_lock() so a streaming flush that is currently
                                 // mutating the backing data never blocks the UI thread.
-                                let cell_val_owned = Self::try_clone_cell_value(
+                                let current_font_profile = {
+                                    *font_profile_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                };
+                                let current_font_size = {
+                                    *font_size_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                };
+                                if Self::try_edit_cell_in_edit_mode(
+                                    &table_for_handle,
+                                    &headers_for_handle,
                                     &full_data_for_handle,
+                                    &edit_session_for_handle,
                                     row,
                                     col,
-                                );
+                                    current_font_profile,
+                                    current_font_size,
+                                ) {
+                                    return true;
+                                }
+
+                                let cell_val_owned =
+                                    Self::try_clone_cell_value(&full_data_for_handle, row, col);
                                 if let Some(cell_val) = cell_val_owned {
                                     let current_font_profile = {
                                         *font_profile_for_handle
@@ -625,7 +682,59 @@ impl ResultTableWidget {
                             );
                             return true;
                         }
+                        if Self::matches_shortcut_key(key, original_key, 'v') {
+                            app::paste_text(&table_for_handle);
+                            return true;
+                        }
                     }
+
+                    if matches!(key, Key::Enter | Key::KPEnter | Key::F2) {
+                        let can_edit = Self::resolve_update_target_cell(
+                            table_for_handle.get_selection(),
+                            table_for_handle.rows().max(0) as usize,
+                            table_for_handle.cols().max(0) as usize,
+                            None,
+                        )
+                        .is_some()
+                            && edit_session_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .is_some();
+
+                        if can_edit {
+                            let current_font_profile = {
+                                *font_profile_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            };
+                            let current_font_size = {
+                                *font_size_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            };
+                            if let Some((row, col)) = Self::resolve_update_target_cell(
+                                table_for_handle.get_selection(),
+                                table_for_handle.rows().max(0) as usize,
+                                table_for_handle.cols().max(0) as usize,
+                                None,
+                            ) {
+                                if Self::try_edit_cell_in_edit_mode(
+                                    &table_for_handle,
+                                    &headers_for_handle,
+                                    &full_data_for_handle,
+                                    &edit_session_for_handle,
+                                    row as i32,
+                                    col as i32,
+                                    current_font_profile,
+                                    current_font_size,
+                                ) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                    }
+
                     false
                 }
                 Event::Shortcut => {
@@ -661,7 +770,30 @@ impl ResultTableWidget {
                         }
                         return true;
                     }
+                    if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'v') {
+                        app::paste_text(&table_for_handle);
+                        return true;
+                    }
                     false
+                }
+                Event::Paste => {
+                    let pasted_text = app::event_text();
+                    match Self::paste_clipboard_text_into_edit_mode(
+                        &table_for_handle,
+                        &full_data_for_handle,
+                        &edit_session_for_handle,
+                        &pasted_text,
+                    ) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            // Clipboard text can be delivered to this widget via non-edit paths
+                            // (e.g. drag/drop). Only surface actionable errors to users.
+                            if !err.is_empty() {
+                                fltk::dialog::alert_default(&err);
+                            }
+                            true
+                        }
+                    }
                 }
                 _ => false,
             }
@@ -678,13 +810,371 @@ impl ResultTableWidget {
             width_sampled_rows: Arc::new(Mutex::new(0)),
             font_profile,
             font_size,
+            source_sql,
+            execute_sql_callback,
+            edit_session,
         }
+    }
+
+    fn show_inline_cell_editor(
+        table: &Table,
+        row: i32,
+        col: i32,
+        current_value: &str,
+        font_profile: FontProfile,
+        font_size: u32,
+    ) -> Option<String> {
+        let Some((x, y, w, h)) = table.find_cell(TableContext::Cell, row, col) else {
+            return fltk::dialog::input_default("Value (blank/NULL -> NULL, '=expr' -> SQL)", current_value);
+        };
+
+        let current_group = Group::try_current();
+        let parent_group = table.parent();
+        if let Some(ref parent) = parent_group {
+            Group::set_current(Some(parent));
+        } else {
+            Group::set_current(None::<&Group>);
+        }
+
+        let input_x = x + 1;
+        let input_y = y + 1;
+        let input_w = (w - 2).max(24);
+        let input_h = (h - 2).max(24);
+        let mut input = Input::new(input_x, input_y, input_w, input_h, None);
+        Group::set_current(current_group.as_ref());
+
+        input.set_color(theme::input_bg());
+        input.set_text_color(theme::text_primary());
+        input.set_text_font(font_profile.normal);
+        input.set_text_size(font_size as i32);
+        input.set_value(current_value);
+        input.set_trigger(CallbackTrigger::EnterKeyAlways);
+
+        let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let finished = Arc::new(Mutex::new(false));
+        let cancelled = Arc::new(Mutex::new(false));
+
+        {
+            let result = result.clone();
+            let finished = finished.clone();
+            let input_value = input.clone();
+            input.set_callback(move |_| {
+                *result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input_value.value());
+                *finished
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            });
+        }
+
+        {
+            let result = result.clone();
+            let finished = finished.clone();
+            let cancelled = cancelled.clone();
+            let mut input_handle = input.clone();
+            input_handle.handle(move |widget, ev| match ev {
+                Event::KeyDown if app::event_key() == Key::Escape => {
+                    *cancelled
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    *finished
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    widget.hide();
+                    true
+                }
+                Event::Unfocus => {
+                    let is_finished = *finished
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !is_finished {
+                        *result
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(widget.value());
+                        *finished
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                    }
+                    false
+                }
+                _ => false,
+            });
+        }
+
+        let _ = input.take_focus();
+        while !*finished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            if input.was_deleted() {
+                *cancelled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                *finished
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                break;
+            }
+            app::wait();
+        }
+
+        let was_cancelled = *cancelled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let value = result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !input.was_deleted() {
+            Input::delete(input);
+        }
+        let mut table = table.clone();
+        if !table.was_deleted() {
+            let _ = table.take_focus();
+            table.redraw();
+        }
+        if was_cancelled {
+            None
+        } else {
+            Some(value.unwrap_or_default())
+        }
+    }
+
+    fn try_edit_cell_in_edit_mode(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        row: i32,
+        col: i32,
+        font_profile: FontProfile,
+        font_size: u32,
+    ) -> bool {
+        let (row_idx, col_idx) = match (usize::try_from(row), usize::try_from(col)) {
+            (Ok(r), Ok(c)) => (r, c),
+            _ => return true,
+        };
+
+        let (rowid_col, is_editable_column) = {
+            let guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = guard.as_ref() else {
+                return false;
+            };
+            (
+                session.rowid_col,
+                session
+                    .editable_columns
+                    .iter()
+                    .any(|(editable_col, _)| *editable_col == col_idx),
+            )
+        };
+
+        if col_idx == rowid_col {
+            fltk::dialog::alert_default("ROWID column cannot be edited.");
+            return true;
+        }
+        if !is_editable_column {
+            fltk::dialog::alert_default("Selected column is not editable.");
+            return true;
+        }
+
+        let column_exists = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(col_idx)
+            .is_some();
+        if !column_exists {
+            fltk::dialog::alert_default("Selected column is out of range.");
+            return true;
+        }
+
+        let current_value = {
+            let data = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get(row_idx)
+                .and_then(|row_data| row_data.get(col_idx))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let Some(new_value) = Self::show_inline_cell_editor(
+            table,
+            row,
+            col,
+            &current_value,
+            font_profile,
+            font_size,
+        ) else {
+            return true;
+        };
+        if new_value == current_value {
+            return true;
+        }
+
+        {
+            let mut data = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(row_data) = data.get_mut(row_idx) else {
+                fltk::dialog::alert_default("Selected row is out of range.");
+                return true;
+            };
+            if col_idx >= row_data.len() {
+                row_data.resize(col_idx + 1, String::new());
+            }
+            row_data[col_idx] = new_value;
+        }
+        let mut table = table.clone();
+        table.redraw();
+        true
     }
 
     fn matches_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
         let lower = Key::from_char(ascii.to_ascii_lowercase());
         let upper = Key::from_char(ascii.to_ascii_uppercase());
         key == lower || key == upper || original_key == lower || original_key == upper
+    }
+
+    fn parse_clipboard_rows(clipboard_text: &str) -> Vec<Vec<String>> {
+        if clipboard_text.is_empty() {
+            return Vec::new();
+        }
+        let normalized = clipboard_text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut rows: Vec<Vec<String>> = normalized
+            .split('\n')
+            .map(|line| line.split('\t').map(|cell| cell.to_string()).collect())
+            .collect();
+        while rows.len() > 1
+            && rows
+                .last()
+                .and_then(|row| row.first().map(|first| row.len() == 1 && first.is_empty()))
+                .unwrap_or(false)
+        {
+            rows.pop();
+        }
+        rows
+    }
+
+    fn apply_paste_values_to_data(
+        full_data: &mut Vec<Vec<String>>,
+        rowid_col: usize,
+        editable_cols: &HashSet<usize>,
+        anchor: (usize, usize),
+        selection: Option<(usize, usize, usize, usize)>,
+        pasted_rows: &[Vec<String>],
+    ) -> usize {
+        if pasted_rows.is_empty() {
+            return 0;
+        }
+
+        let mut changed_cells = 0usize;
+        let mut apply_value = |target_row: usize, target_col: usize, value: &str| {
+            if target_col == rowid_col || !editable_cols.contains(&target_col) {
+                return;
+            }
+            let Some(row) = full_data.get_mut(target_row) else {
+                return;
+            };
+            if target_col >= row.len() {
+                row.resize(target_col + 1, String::new());
+            }
+            if row.get(target_col).map(|existing| existing != value).unwrap_or(true) {
+                row[target_col] = value.to_string();
+                changed_cells = changed_cells.saturating_add(1);
+            }
+        };
+
+        if pasted_rows.len() == 1 && pasted_rows.first().map(|r| r.len()).unwrap_or(0) == 1 {
+            let fill_value = pasted_rows
+                .first()
+                .and_then(|row| row.first())
+                .map(|s| s.as_str())
+                .unwrap_or_default();
+            if let Some((row_start, col_start, row_end, col_end)) = selection {
+                for row_idx in row_start..=row_end {
+                    for col_idx in col_start..=col_end {
+                        apply_value(row_idx, col_idx, fill_value);
+                    }
+                }
+                return changed_cells;
+            }
+            apply_value(anchor.0, anchor.1, fill_value);
+            return changed_cells;
+        }
+
+        for (row_offset, source_row) in pasted_rows.iter().enumerate() {
+            for (col_offset, source_cell) in source_row.iter().enumerate() {
+                let Some(target_row) = anchor.0.checked_add(row_offset) else {
+                    continue;
+                };
+                let Some(target_col) = anchor.1.checked_add(col_offset) else {
+                    continue;
+                };
+                apply_value(target_row, target_col, source_cell);
+            }
+        }
+
+        changed_cells
+    }
+
+    fn paste_clipboard_text_into_edit_mode(
+        table: &Table,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        clipboard_text: &str,
+    ) -> Result<usize, String> {
+        let session = edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(String::new)?;
+        let anchor = Self::selected_anchor_cell(table)
+            .ok_or_else(|| "Select a target cell in the result table first.".to_string())?;
+        let pasted_rows = Self::parse_clipboard_rows(clipboard_text);
+        if pasted_rows.is_empty() {
+            return Err("Clipboard text is empty.".to_string());
+        }
+
+        let selection = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        );
+        let editable_cols: HashSet<usize> = session
+            .editable_columns
+            .iter()
+            .map(|(col_idx, _)| *col_idx)
+            .collect();
+        let changed_cells = {
+            let mut rows = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if rows.len() != session.row_states.len() {
+                return Err("Edit session and table rows are out of sync.".to_string());
+            }
+            Self::apply_paste_values_to_data(
+                &mut rows,
+                session.rowid_col,
+                &editable_cols,
+                anchor,
+                selection,
+                &pasted_rows,
+            )
+        };
+
+        if changed_cells == 0 {
+            return Err("No editable cells were updated from pasted values.".to_string());
+        }
+
+        let mut table = table.clone();
+        table.redraw();
+        Ok(changed_cells)
     }
 
     /// Get cell at mouse position (returns None if outside cells)
@@ -755,6 +1245,51 @@ impl ResultTableWidget {
                 break;
             }
             col += 1;
+        }
+
+        None
+    }
+
+    /// Get row index when mouse is over row header area.
+    fn get_row_header_at_mouse(table: &Table) -> Option<i32> {
+        let rows = table.rows();
+        if rows <= 0 {
+            return None;
+        }
+
+        let mouse_x = app::event_x();
+        let mouse_y = app::event_y();
+
+        let table_x = table.x();
+        let table_y = table.y();
+        let table_h = table.h();
+        let row_header_right = table_x + table.row_header_width();
+        let data_top = table_y + table.col_header_height();
+        let data_bottom = table_y + table_h;
+
+        if mouse_x < table_x
+            || mouse_x >= row_header_right
+            || mouse_y < data_top
+            || mouse_y >= data_bottom
+        {
+            return None;
+        }
+
+        let last_row = rows.saturating_sub(1);
+        let start_row = table.row_position().max(0).min(last_row);
+        let mut row = start_row;
+        while row < rows {
+            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::RowHeader, row, 0) {
+                if mouse_y >= cy && mouse_y < cy + ch {
+                    return Some(row);
+                }
+                if cy > mouse_y || cy >= data_bottom {
+                    break;
+                }
+            } else {
+                break;
+            }
+            row += 1;
         }
 
         None
@@ -831,24 +1366,1260 @@ impl ResultTableWidget {
         Some((row, col))
     }
 
+    fn is_unquoted_identifier(text: &str) -> bool {
+        let mut chars = text.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first.is_ascii_alphabetic() || matches!(first, '_' | '$' | '#')) {
+            return false;
+        }
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
+    }
+
+    fn quote_identifier_segment(text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return "\"\"".to_string();
+        }
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return trimmed.to_string();
+        }
+        // Keep unquoted identifiers unquoted regardless of case so SQL semantics
+        // (case-insensitive resolution to upper identifiers) are preserved.
+        if Self::is_unquoted_identifier(trimmed) {
+            return trimmed.to_string();
+        }
+        format!("\"{}\"", trimmed.replace('"', "\"\""))
+    }
+
+    fn split_qualified_identifier(name: &str) -> Vec<&str> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut segments = Vec::new();
+        let mut in_quotes = false;
+        let mut segment_start = 0usize;
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' {
+                if in_quotes {
+                    if let Some((_, next_ch)) = chars.peek() {
+                        if *next_ch == '"' {
+                            chars.next();
+                            continue;
+                        }
+                    }
+                    in_quotes = false;
+                } else {
+                    in_quotes = true;
+                }
+                continue;
+            }
+            if ch == '.' && !in_quotes {
+                if trimmed.is_char_boundary(segment_start) && trimmed.is_char_boundary(idx) {
+                    let segment = trimmed[segment_start..idx].trim();
+                    if !segment.is_empty() {
+                        segments.push(segment);
+                    }
+                }
+                segment_start = idx + ch.len_utf8();
+            }
+        }
+
+        if trimmed.is_char_boundary(segment_start) {
+            let segment = trimmed[segment_start..].trim();
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+        }
+        segments
+    }
+
+    fn quote_qualified_identifier(name: &str) -> String {
+        let segments = Self::split_qualified_identifier(name);
+        if segments.is_empty() {
+            return Self::quote_identifier_segment(name);
+        }
+        segments
+            .into_iter()
+            .map(Self::quote_identifier_segment)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn last_identifier_segment(name: &str) -> &str {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return "";
+        }
+
+        let mut in_quotes = false;
+        let mut last_dot_idx = None;
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' {
+                if in_quotes {
+                    if let Some((_, next_ch)) = chars.peek() {
+                        if *next_ch == '"' {
+                            chars.next();
+                            continue;
+                        }
+                    }
+                    in_quotes = false;
+                } else {
+                    in_quotes = true;
+                }
+                continue;
+            }
+            if ch == '.' && !in_quotes {
+                last_dot_idx = Some(idx);
+            }
+        }
+
+        if let Some(dot_idx) = last_dot_idx {
+            let start = dot_idx + 1;
+            if trimmed.is_char_boundary(start) {
+                return trimmed[start..].trim();
+            }
+        }
+        trimmed
+    }
+
+    fn editable_column_identifier(column_header: &str) -> Option<String> {
+        let column = Self::last_identifier_segment(column_header);
+        if column.is_empty() {
+            return None;
+        }
+        Some(Self::quote_identifier_segment(column))
+    }
+
+    fn sql_string_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn sql_literal_from_input(input: &str) -> String {
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+            return "NULL".to_string();
+        }
+        if let Some(expr) = trimmed.strip_prefix('=') {
+            let expr_trimmed = expr.trim();
+            if !expr_trimmed.is_empty() {
+                return expr_trimmed.to_string();
+            }
+        }
+        if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+            return trimmed.to_string();
+        }
+        Self::sql_string_literal(trimmed)
+    }
+
+    fn compose_edit_script(dml_sql: &str, source_sql: &str) -> String {
+        let dml = dml_sql.trim().trim_end_matches(';').trim();
+        let select_sql = source_sql.trim().trim_end_matches(';').trim();
+        if dml.is_empty() {
+            return String::new();
+        }
+        if select_sql.is_empty() {
+            return dml.to_string();
+        }
+        format!("{dml};\n{select_sql}")
+    }
+
+    fn normalize_header_for_lookup(header: &str) -> String {
+        header.replace('"', "").trim().to_ascii_uppercase()
+    }
+
+    fn find_rowid_column_index(headers: &[String]) -> Option<usize> {
+        headers.iter().position(|name| {
+            let normalized = Self::normalize_header_for_lookup(name);
+            normalized == "ROWID" || normalized.ends_with(".ROWID")
+        })
+    }
+
+    fn strip_identifier_quotes(text: &str) -> String {
+        let trimmed = text.trim();
+        if let Some(inner) = trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            return inner.replace("\"\"", "\"");
+        }
+        trimmed.to_string()
+    }
+
+    fn resolve_target_table_candidates(tables: &[ScopedTableRef]) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for table_ref in tables {
+            if table_ref.is_cte {
+                continue;
+            }
+            let key = table_ref.name.to_ascii_uppercase();
+            if seen.insert(key) {
+                result.push(table_ref.name.clone());
+            }
+        }
+        result
+    }
+
+    fn find_rowid_qualifier(tokens: &[SqlToken]) -> Option<String> {
+        let mut depth = 0usize;
+        let mut in_select = false;
+        let mut idx = 0usize;
+
+        while idx < tokens.len() {
+            match tokens.get(idx) {
+                Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                    depth = depth.saturating_add(1);
+                }
+                Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                    depth = depth.saturating_sub(1);
+                }
+                Some(SqlToken::Word(word)) => {
+                    if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
+                        in_select = true;
+                    } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+
+            if in_select && depth == 0 {
+                let qualifier = match (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)) {
+                    (
+                        Some(SqlToken::Word(lhs)),
+                        Some(SqlToken::Symbol(dot)),
+                        Some(SqlToken::Word(rhs)),
+                    ) if dot == "."
+                        && Self::strip_identifier_quotes(rhs).eq_ignore_ascii_case("ROWID") =>
+                    {
+                        Some(Self::strip_identifier_quotes(lhs))
+                    }
+                    _ => None,
+                };
+                if qualifier.is_some() {
+                    return qualifier;
+                }
+            }
+
+            idx += 1;
+        }
+
+        None
+    }
+
+    fn resolve_target_table(source_sql: &str) -> Result<String, String> {
+        let sql = source_sql.trim();
+        if sql.is_empty() {
+            return Err(
+                "Cannot edit rows: source SQL is not available for this result.".to_string(),
+            );
+        }
+
+        let tokens = SqlEditorWidget::tokenize_sql(sql);
+        let tables_in_scope = intellisense_context::collect_tables_in_statement(&tokens);
+        let candidates = Self::resolve_target_table_candidates(&tables_in_scope);
+        if candidates.is_empty() {
+            return Err(
+                "Cannot edit rows: no base table was resolved from this query.".to_string(),
+            );
+        }
+
+        if let Some(qualifier) = Self::find_rowid_qualifier(&tokens) {
+            let resolved =
+                intellisense_context::resolve_qualifier_tables(&qualifier, &tables_in_scope);
+            let mut resolved_deduped = Vec::new();
+            let mut seen = HashSet::new();
+            for table in resolved {
+                let key = table.to_ascii_uppercase();
+                if seen.insert(key) {
+                    resolved_deduped.push(table);
+                }
+            }
+            if resolved_deduped.len() == 1 {
+                return Ok(resolved_deduped.remove(0));
+            }
+        }
+
+        if candidates.len() == 1 {
+            return Ok(candidates[0].clone());
+        }
+
+        Err(format!(
+            "Cannot resolve a single edit target table (candidates: {}). Query one table or qualify ROWID with an alias.",
+            candidates.join(", ")
+        ))
+    }
+
+    fn selected_anchor_cell(table: &Table) -> Option<(usize, usize)> {
+        let (row_start, col_start, _, _) = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )?;
+        Some((row_start, col_start))
+    }
+
+    fn selected_row(table: &Table) -> Option<usize> {
+        Self::selected_anchor_cell(table).map(|(row, _)| row)
+    }
+
+    fn selected_row_range(table: &Table) -> Option<(usize, usize)> {
+        let (row_start, _, row_end, _) = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )?;
+        Some((row_start, row_end))
+    }
+
+    fn normalized_selection_bounds(
+        selection: (i32, i32, i32, i32),
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (row_top, col_left, row_bot, col_right) = selection;
+        if row_top < 0 || col_left < 0 || row_bot < 0 || col_right < 0 {
+            return None;
+        }
+
+        let row_start = row_top.min(row_bot) as usize;
+        let row_end = row_top.max(row_bot) as usize;
+        let col_start = col_left.min(col_right) as usize;
+        let col_end = col_left.max(col_right) as usize;
+        Some((row_start, col_start, row_end, col_end))
+    }
+
+    fn normalized_selection_bounds_with_limits(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        if max_rows == 0 || max_cols == 0 {
+            return None;
+        }
+
+        let (row_start, col_start, row_end, col_end) = Self::normalized_selection_bounds(selection)?;
+        if row_start >= max_rows || col_start >= max_cols {
+            return None;
+        }
+
+        let row_max = max_rows.saturating_sub(1);
+        let col_max = max_cols.saturating_sub(1);
+        let row_start = row_start.min(row_max);
+        let row_end = row_end.min(row_max);
+        let col_start = col_start.min(col_max);
+        let col_end = col_end.min(col_max);
+
+        if row_start > row_end || col_start > col_end {
+            None
+        } else {
+            Some((row_start, col_start, row_end, col_end))
+        }
+    }
+
+    fn selection_contains_cell(selection: (i32, i32, i32, i32), row: i32, col: i32) -> bool {
+        if row < 0 || col < 0 {
+            return false;
+        }
+        let Some((row_start, col_start, row_end, col_end)) =
+            Self::normalized_selection_bounds(selection)
+        else {
+            return false;
+        };
+
+        let row = row as usize;
+        let col = col as usize;
+        row >= row_start && row <= row_end && col >= col_start && col <= col_end
+    }
+
+    fn resolve_update_target_cell(
+        selection: (i32, i32, i32, i32),
+        max_rows: usize,
+        max_cols: usize,
+        context_cell: Option<(usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        if let Some((row, col)) = context_cell {
+            if row >= max_rows || col >= max_cols {
+                return None;
+            }
+            return Some((row, col));
+        }
+
+        let (row_start, col_start, row_end, col_end) =
+            Self::normalized_selection_bounds_with_limits(selection, max_rows, max_cols)?;
+        if row_start != row_end || col_start != col_end {
+            return None;
+        }
+
+        Some((row_start, col_start))
+    }
+
+    fn try_execute_sql(
+        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        sql: String,
+    ) {
+        let callback = execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(callback) = callback else {
+            fltk::dialog::alert_default("Edit callback is not connected.");
+            return;
+        };
+        let mut cb = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (*cb)(sql);
+    }
+
+    fn rowid_for_row(
+        row_index: usize,
+        headers: &[String],
+        full_data: &[Vec<String>],
+    ) -> Result<(usize, String), String> {
+        let rowid_col = Self::find_rowid_column_index(headers)
+            .ok_or_else(|| "Editing requires a ROWID column in the result set.".to_string())?;
+        let row = full_data
+            .get(row_index)
+            .ok_or_else(|| "Selected row is out of range.".to_string())?;
+        let rowid = row
+            .get(rowid_col)
+            .ok_or_else(|| "ROWID value is missing for the selected row.".to_string())?
+            .trim()
+            .to_string();
+        if rowid.is_empty() {
+            return Err("Selected row has an empty ROWID value.".to_string());
+        }
+        Ok((rowid_col, rowid))
+    }
+
+    fn push_unique_rowid(rowids: &mut Vec<String>, seen: &mut HashSet<String>, rowid_raw: &str) {
+        let rowid = rowid_raw.trim();
+        if rowid.is_empty() || seen.contains(rowid) {
+            return;
+        }
+        let rowid_owned = rowid.to_string();
+        seen.insert(rowid_owned.clone());
+        rowids.push(rowid_owned);
+    }
+
+    fn selected_rowids(
+        table: &Table,
+        headers: &[String],
+        full_data: &[Vec<String>],
+    ) -> Result<Vec<String>, String> {
+        let (row_start, row_end) = Self::selected_row_range(table)
+            .ok_or_else(|| "Select at least one row.".to_string())?;
+        let rowid_col = Self::find_rowid_column_index(headers)
+            .ok_or_else(|| "Editing requires a ROWID column in the result set.".to_string())?;
+
+        Self::collect_rowids_in_range(row_start, row_end, rowid_col, full_data)
+    }
+
+    fn collect_rowids_in_range(
+        row_start: usize,
+        row_end: usize,
+        rowid_col: usize,
+        full_data: &[Vec<String>],
+    ) -> Result<Vec<String>, String> {
+        let mut rowids = Vec::new();
+        let mut seen = HashSet::new();
+        for row_index in row_start..=row_end {
+            let row = full_data
+                .get(row_index)
+                .ok_or_else(|| format!("Selected row {} is out of range.", row_index + 1))?;
+            let rowid_raw = row.get(rowid_col).ok_or_else(|| {
+                format!("ROWID value is missing for selected row {}.", row_index + 1)
+            })?;
+            if rowid_raw.trim().is_empty() {
+                return Err(format!(
+                    "Selected row {} has an empty ROWID value.",
+                    row_index + 1
+                ));
+            }
+            Self::push_unique_rowid(&mut rowids, &mut seen, rowid_raw);
+        }
+
+        if rowids.is_empty() {
+            return Err("Selected rows do not contain valid ROWID values.".to_string());
+        }
+        Ok(rowids)
+    }
+
+    fn can_show_insert_row_action(source_sql: &str) -> bool {
+        if source_sql.trim().is_empty() {
+            return false;
+        }
+        Self::resolve_target_table(source_sql).is_ok()
+    }
+
+    fn can_show_rowid_edit_actions(headers: &[String], source_sql: &str) -> bool {
+        if !Self::can_show_insert_row_action(source_sql) {
+            return false;
+        }
+        Self::find_rowid_column_index(headers).is_some()
+    }
+
+    pub fn is_edit_mode_enabled(&self) -> bool {
+        self.edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    pub fn can_begin_edit_mode(&self) -> bool {
+        if self.is_edit_mode_enabled() {
+            return true;
+        }
+
+        let headers_snapshot = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql_text = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !Self::can_show_rowid_edit_actions(&headers_snapshot, &source_sql_text) {
+            return false;
+        }
+        let Some(rowid_col) = Self::find_rowid_column_index(&headers_snapshot) else {
+            return false;
+        };
+
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen = HashSet::new();
+        for row in rows.iter() {
+            let Some(rowid) = row.get(rowid_col).map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+                return false;
+            };
+            if !seen.insert(rowid.to_string()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn begin_edit_mode(&mut self) -> Result<String, String> {
+        if self.is_edit_mode_enabled() {
+            return Ok("Edit mode is already enabled.".to_string());
+        }
+
+        let headers_snapshot = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if headers_snapshot.is_empty() {
+            return Err("No result columns available for editing.".to_string());
+        }
+
+        let source_sql_text = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let table_name = Self::resolve_target_table(&source_sql_text)?;
+        let rowid_col = Self::find_rowid_column_index(&headers_snapshot)
+            .ok_or_else(|| "Editing requires a ROWID column in the result set.".to_string())?;
+
+        let editable_columns: Vec<(usize, String)> = headers_snapshot
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != rowid_col)
+            .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
+            .collect();
+        if editable_columns.is_empty() {
+            return Err("No editable columns were detected in this result set.".to_string());
+        }
+
+        let full_data_snapshot = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut original_rows_by_rowid = HashMap::new();
+        let mut original_row_order = Vec::with_capacity(full_data_snapshot.len());
+        let mut row_states = Vec::with_capacity(full_data_snapshot.len());
+        for (row_idx, row) in full_data_snapshot.iter().enumerate() {
+            let rowid = row
+                .get(rowid_col)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Row {} cannot be edited because ROWID is missing or empty.",
+                        row_idx + 1
+                    )
+                })?;
+            if original_rows_by_rowid.contains_key(&rowid) {
+                return Err(format!(
+                    "Edit mode requires unique ROWID values (duplicate: {}).",
+                    rowid
+                ));
+            }
+            original_rows_by_rowid.insert(rowid.clone(), row.clone());
+            original_row_order.push(rowid.clone());
+            row_states.push(EditRowState::Existing { rowid });
+        }
+
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col,
+            table_name,
+            editable_columns,
+            original_rows_by_rowid,
+            original_row_order,
+            deleted_rowids: Vec::new(),
+            row_states,
+        });
+
+        Ok("Edit mode enabled.".to_string())
+    }
+
+    pub fn insert_row_in_edit_mode(&mut self) -> Result<String, String> {
+        let headers_len = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if headers_len == 0 {
+            return Err("No result columns available for INSERT.".to_string());
+        }
+
+        let (rowid_col, first_edit_col) = {
+            let guard = self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = guard.as_ref() else {
+                return Err("Enable edit mode first.".to_string());
+            };
+            (
+                session.rowid_col,
+                session.editable_columns.first().map(|(idx, _)| *idx),
+            )
+        };
+
+        let new_row_index = {
+            let mut full_data = self
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let new_row_index = full_data.len();
+            let mut row = vec![String::new(); headers_len];
+            if rowid_col < row.len() {
+                row[rowid_col].clear();
+            }
+            full_data.push(row);
+            new_row_index
+        };
+        {
+            let mut guard = self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = guard.as_mut() else {
+                let mut full_data = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if new_row_index < full_data.len() {
+                    full_data.remove(new_row_index);
+                }
+                return Err("Edit mode is no longer active.".to_string());
+            };
+            session.row_states.push(EditRowState::Inserted);
+        }
+
+        self.table.set_rows((new_row_index + 1) as i32);
+        self.apply_table_metrics_for_current_font();
+
+        if let Some(first_col) = first_edit_col {
+            self.table.set_selection(
+                new_row_index as i32,
+                first_col as i32,
+                new_row_index as i32,
+                first_col as i32,
+            );
+            let profile = *self
+                .font_profile
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let size = *self
+                .font_size
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(value) = Self::show_inline_cell_editor(
+                &self.table,
+                new_row_index as i32,
+                first_col as i32,
+                "",
+                profile,
+                size,
+            ) {
+                let mut full_data = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(row) = full_data.get_mut(new_row_index) {
+                    if first_col >= row.len() {
+                        row.resize(first_col + 1, String::new());
+                    }
+                    row[first_col] = value;
+                }
+            } else {
+                {
+                    let mut full_data = self
+                        .full_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if new_row_index < full_data.len() {
+                        full_data.remove(new_row_index);
+                    }
+                }
+                {
+                    let mut guard = self
+                        .edit_session
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(session) = guard.as_mut() {
+                        if session.row_states.last().is_some() {
+                            session.row_states.pop();
+                        }
+                    }
+                }
+
+                let new_len = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len();
+                self.table.set_rows(new_len as i32);
+                if new_len > 0 {
+                    let row = (new_row_index).min(new_len.saturating_sub(1)) as i32;
+                    let col = self.table.get_selection().1.max(0);
+                    self.table.set_selection(row, col, row, col);
+                }
+                self.apply_table_metrics_for_current_font();
+                self.table.redraw();
+                return Ok("Cancelled row insertion and removed staged row.".to_string());
+            }
+        }
+
+        self.table.redraw();
+        Ok("Inserted a new staged row.".to_string())
+    }
+
+    pub fn delete_selected_rows_in_edit_mode(&mut self) -> Result<String, String> {
+        let (row_start, row_end) =
+            Self::selected_row_range(&self.table).ok_or_else(|| "Select row(s) to delete.".to_string())?;
+
+        let mut removed = 0usize;
+        {
+            let mut full_data = self
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = guard.as_mut() else {
+                return Err("Enable edit mode first.".to_string());
+            };
+
+            if full_data.len() != session.row_states.len() {
+                return Err("Edit session and table rows are out of sync.".to_string());
+            }
+
+            let mut deleted_set: HashSet<String> = session.deleted_rowids.iter().cloned().collect();
+            let end = row_end.min(full_data.len().saturating_sub(1));
+            for idx in (row_start..=end).rev() {
+                if idx >= full_data.len() || idx >= session.row_states.len() {
+                    continue;
+                }
+                if let EditRowState::Existing { rowid } = &session.row_states[idx] {
+                    if deleted_set.insert(rowid.clone()) {
+                        session.deleted_rowids.push(rowid.clone());
+                    }
+                }
+                full_data.remove(idx);
+                session.row_states.remove(idx);
+                removed += 1;
+            }
+        }
+
+        let new_len = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        self.table.set_rows(new_len as i32);
+        self.apply_table_metrics_for_current_font();
+        if new_len > 0 {
+            let row = row_start.min(new_len.saturating_sub(1)) as i32;
+            let col = self.table.get_selection().1.max(0);
+            self.table.set_selection(row, col, row, col);
+        }
+        self.table.redraw();
+        Ok(format!("Staged delete for {} row(s).", removed))
+    }
+
+    pub fn save_edit_mode(&mut self) -> Result<String, String> {
+        let session = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Enable edit mode first.".to_string())?;
+        let source_sql_text = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        if rows.len() != session.row_states.len() {
+            return Err("Edit session and table rows are out of sync.".to_string());
+        }
+
+        let mut statements = Vec::new();
+
+        if !session.deleted_rowids.is_empty() {
+            let delete_where = if session.deleted_rowids.len() == 1 {
+                format!("ROWID = {}", Self::sql_string_literal(&session.deleted_rowids[0]))
+            } else {
+                let rowid_literals = session
+                    .deleted_rowids
+                    .iter()
+                    .map(|rowid| Self::sql_string_literal(rowid))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("ROWID IN ({rowid_literals})")
+            };
+            statements.push(format!(
+                "DELETE FROM {} WHERE {}",
+                Self::quote_qualified_identifier(&session.table_name),
+                delete_where
+            ));
+        }
+
+        for (idx, row_state) in session.row_states.iter().enumerate() {
+            let Some(row) = rows.get(idx) else {
+                continue;
+            };
+            match row_state {
+                EditRowState::Existing { rowid } => {
+                    let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
+                        continue;
+                    };
+                    let mut assignments = Vec::new();
+                    for (col_idx, column_id) in session.editable_columns.iter() {
+                        let new_value = row.get(*col_idx).cloned().unwrap_or_default();
+                        let old_value = original_row.get(*col_idx).cloned().unwrap_or_default();
+                        if new_value != old_value {
+                            assignments.push(format!(
+                                "{} = {}",
+                                column_id,
+                                Self::sql_literal_from_input(&new_value)
+                            ));
+                        }
+                    }
+                    if !assignments.is_empty() {
+                        statements.push(format!(
+                            "UPDATE {} SET {} WHERE ROWID = {}",
+                            Self::quote_qualified_identifier(&session.table_name),
+                            assignments.join(", "),
+                            Self::sql_string_literal(rowid)
+                        ));
+                    }
+                }
+                EditRowState::Inserted => {
+                    let mut column_names = Vec::new();
+                    let mut values = Vec::new();
+                    for (col_idx, column_id) in session.editable_columns.iter() {
+                        column_names.push(column_id.clone());
+                        let value = row.get(*col_idx).cloned().unwrap_or_default();
+                        values.push(Self::sql_literal_from_input(&value));
+                    }
+                    if !column_names.is_empty() {
+                        statements.push(format!(
+                            "INSERT INTO {} ({}) VALUES ({})",
+                            Self::quote_qualified_identifier(&session.table_name),
+                            column_names.join(", "),
+                            values.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        if statements.is_empty() {
+            return Ok("No staged changes to save.".to_string());
+        }
+
+        let mut script = statements.join(";\n");
+        script.push(';');
+        let select_sql = source_sql_text.trim().trim_end_matches(';').trim();
+        if !select_sql.is_empty() {
+            script.push('\n');
+            script.push_str(select_sql);
+        }
+        Self::try_execute_sql(&self.execute_sql_callback, script);
+        Ok(format!("Applied {} staged statement(s).", statements.len()))
+    }
+
+    pub fn cancel_edit_mode(&mut self) -> Result<String, String> {
+        let session = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| "Edit mode is not active.".to_string())?;
+
+        let mut restored_rows = Vec::with_capacity(session.original_row_order.len());
+        for rowid in session.original_row_order.iter() {
+            if let Some(row) = session.original_rows_by_rowid.get(rowid) {
+                restored_rows.push(row.clone());
+            }
+        }
+        *self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = restored_rows;
+        let new_len = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        self.table.set_rows(new_len as i32);
+        self.apply_table_metrics_for_current_font();
+        self.recalculate_widths_for_current_font();
+        self.table.redraw();
+        Ok("Cancelled staged edits and restored original rows.".to_string())
+    }
+
+    fn show_update_cell_dialog(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        source_sql: &Arc<Mutex<String>>,
+        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        context_cell: Option<(usize, usize)>,
+    ) {
+        let Some((row_index, col_index)) =
+            Self::resolve_update_target_cell(
+                table.get_selection(),
+                table.rows().max(0) as usize,
+                table.cols().max(0) as usize,
+                context_cell,
+            )
+        else {
+            fltk::dialog::alert_default("Select a single cell to update.");
+            return;
+        };
+
+        let headers_snapshot = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql_text = source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let (rowid_col, rowid_value, current_value) = {
+            let data_guard = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (rowid_col, rowid_value) =
+                match Self::rowid_for_row(row_index, &headers_snapshot, &data_guard) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        return;
+                    }
+                };
+            let current_value = data_guard
+                .get(row_index)
+                .and_then(|row| row.get(col_index))
+                .cloned()
+                .unwrap_or_default();
+            (rowid_col, rowid_value, current_value)
+        };
+        if col_index == rowid_col {
+            fltk::dialog::alert_default("ROWID cell cannot be updated.");
+            return;
+        }
+
+        let Some(column_name) = headers_snapshot.get(col_index).cloned() else {
+            fltk::dialog::alert_default("Selected column is out of range.");
+            return;
+        };
+        let Some(column_identifier) = Self::editable_column_identifier(&column_name) else {
+            fltk::dialog::alert_default(
+                "Selected column cannot be mapped to an editable column name.",
+            );
+            return;
+        };
+
+        let prompt = format!(
+            "New value for {} (blank/NULL -> NULL, '=expr' -> SQL expression)",
+            column_name
+        );
+        let Some(input) = fltk::dialog::input_default(&prompt, &current_value) else {
+            return;
+        };
+
+        let table_name = match Self::resolve_target_table(&source_sql_text) {
+            Ok(name) => name,
+            Err(err) => {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
+        };
+
+        let sql = format!(
+            "UPDATE {} SET {} = {} WHERE ROWID = {}",
+            Self::quote_qualified_identifier(&table_name),
+            column_identifier,
+            Self::sql_literal_from_input(&input),
+            Self::sql_string_literal(&rowid_value)
+        );
+        let script = Self::compose_edit_script(&sql, &source_sql_text);
+        Self::try_execute_sql(execute_sql_callback, script);
+    }
+
+    fn show_delete_row_dialog(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        source_sql: &Arc<Mutex<String>>,
+        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    ) {
+        let headers_snapshot = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql_text = source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let rowids = {
+            let data_guard = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match Self::selected_rowids(table, &headers_snapshot, &data_guard) {
+                Ok(v) => v,
+                Err(err) => {
+                    fltk::dialog::alert_default(&err);
+                    return;
+                }
+            }
+        };
+
+        let delete_count = rowids.len();
+        let confirm = fltk::dialog::choice2_default(
+            &format!("Delete {} selected row(s)?", delete_count),
+            "Cancel",
+            "Delete",
+            "",
+        );
+        if confirm != Some(1) {
+            return;
+        }
+
+        let table_name = match Self::resolve_target_table(&source_sql_text) {
+            Ok(name) => name,
+            Err(err) => {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
+        };
+
+        let where_clause = if rowids.len() == 1 {
+            format!("ROWID = {}", Self::sql_string_literal(&rowids[0]))
+        } else {
+            let literals = rowids
+                .iter()
+                .map(|rowid| Self::sql_string_literal(rowid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ROWID IN ({literals})")
+        };
+        let sql = format!(
+            "DELETE FROM {} WHERE {}",
+            Self::quote_qualified_identifier(&table_name),
+            where_clause
+        );
+        let script = Self::compose_edit_script(&sql, &source_sql_text);
+        Self::try_execute_sql(execute_sql_callback, script);
+    }
+
+    fn show_insert_row_dialog(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        source_sql: &Arc<Mutex<String>>,
+        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    ) {
+        let headers_snapshot = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql_text = source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let table_name = match Self::resolve_target_table(&source_sql_text) {
+            Ok(name) => name,
+            Err(err) => {
+                fltk::dialog::alert_default(&err);
+                return;
+            }
+        };
+
+        let rowid_col = Self::find_rowid_column_index(&headers_snapshot);
+        let editable_columns: Vec<(usize, String)> = headers_snapshot
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| Some(*idx) != rowid_col)
+            .filter_map(|(idx, name)| {
+                Self::editable_column_identifier(name)
+                    .map(|column_identifier| (idx, column_identifier))
+            })
+            .collect();
+        if editable_columns.is_empty() {
+            fltk::dialog::alert_default("No editable columns are available for INSERT.");
+            return;
+        }
+
+        let selected_row = Self::selected_row(table);
+        let selected_row_values = selected_row.and_then(|row_index| {
+            full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(row_index)
+                .cloned()
+        });
+        let mut value_literals: Vec<String> = Vec::with_capacity(editable_columns.len());
+        let mut column_names: Vec<String> = Vec::with_capacity(editable_columns.len());
+        for (col_idx, column_identifier) in editable_columns {
+            let Some(column_name) = headers_snapshot.get(col_idx).cloned() else {
+                continue;
+            };
+            let default_value = selected_row_values
+                .as_ref()
+                .and_then(|row| row.get(col_idx))
+                .cloned()
+                .unwrap_or_default();
+            let prompt = format!(
+                "Value for {} (blank/NULL -> NULL, '=expr' -> SQL expression)",
+                column_name
+            );
+            let Some(input) = fltk::dialog::input_default(&prompt, &default_value) else {
+                return;
+            };
+            column_names.push(column_identifier);
+            value_literals.push(Self::sql_literal_from_input(&input));
+        }
+
+        if column_names.is_empty() || value_literals.is_empty() {
+            fltk::dialog::alert_default("No values were provided for INSERT.");
+            return;
+        }
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            Self::quote_qualified_identifier(&table_name),
+            column_names.join(", "),
+            value_literals.join(", ")
+        );
+        let script = Self::compose_edit_script(&sql, &source_sql_text);
+        Self::try_execute_sql(execute_sql_callback, script);
+    }
+
     fn show_context_menu(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        source_sql: &Arc<Mutex<String>>,
+        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
 
         let mut table = table.clone();
+        let clicked_cell = Self::get_cell_at_mouse(&table);
+        let context_cell = clicked_cell.and_then(|(row, col)| {
+            match (usize::try_from(row), usize::try_from(col)) {
+                (Ok(r), Ok(c)) => Some((r, c)),
+                _ => None,
+            }
+        });
+        let menu_headers_snapshot = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let menu_source_sql_text = source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let can_insert_row = Self::can_show_insert_row_action(&menu_source_sql_text);
+        let can_show_rowid_edit_actions =
+            Self::can_show_rowid_edit_actions(&menu_headers_snapshot, &menu_source_sql_text);
+        let in_edit_mode = edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        let clicked_row_header = if clicked_cell.is_none() {
+            Self::get_row_header_at_mouse(&table)
+        } else {
+            None
+        };
+
+        if clicked_cell.is_none() && clicked_row_header.is_none() {
+            return;
+        }
+
         // Give focus and potentially select cell under mouse for better UX
         let _ = table.take_focus();
-        if let Some((row, col)) = Self::get_cell_at_mouse(&table) {
-            let (row_top, col_left, row_bot, col_right) = table.get_selection();
-            // If the cell under mouse is not already in the selection, select it
-            if row < row_top || row > row_bot || col < col_left || col > col_right {
+        if let Some((row, col)) = clicked_cell {
+            // If the cell under mouse is not already in the selection, select it.
+            if !Self::selection_contains_cell(table.get_selection(), row, col) {
                 table.set_selection(row, col, row, col);
                 table.redraw();
             }
+        } else if let Some(row) = clicked_row_header {
+            let cols = table.cols();
+            if cols <= 0 {
+                return;
+            }
+            // Row-header context actions (delete/insert defaults) should target the clicked row.
+            table.set_selection(row, 0, row, cols.saturating_sub(1));
+            table.redraw();
         }
 
         // Prevent menu from being added to parent container
@@ -858,7 +2629,17 @@ impl ResultTableWidget {
         let mut menu = MenuButton::new(mouse_x, mouse_y, 0, 0, None);
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
-        menu.add_choice("Copy|Copy with Headers|Copy All");
+        let mut menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
+        if can_insert_row && !in_edit_mode {
+            menu_items.push("Insert Row");
+        }
+        if can_show_rowid_edit_actions && !in_edit_mode {
+            if context_cell.is_some() {
+                menu_items.push("Update Cell");
+            }
+            menu_items.push("Delete Row");
+        }
+        menu.add_choice(&menu_items.join("|"));
 
         if let Some(ref group) = current_group {
             fltk::group::Group::set_current(Some(group));
@@ -874,6 +2655,28 @@ impl ResultTableWidget {
                     Self::copy_selected_with_headers(&table, headers, full_data);
                 }
                 "Copy All" => Self::copy_all_to_clipboard(headers, full_data),
+                "Insert Row" => Self::show_insert_row_dialog(
+                    &table,
+                    headers,
+                    full_data,
+                    source_sql,
+                    execute_sql_callback,
+                ),
+                "Update Cell" => Self::show_update_cell_dialog(
+                    &table,
+                    headers,
+                    full_data,
+                    source_sql,
+                    execute_sql_callback,
+                    context_cell,
+                ),
+                "Delete Row" => Self::show_delete_row_dialog(
+                    &table,
+                    headers,
+                    full_data,
+                    source_sql,
+                    execute_sql_callback,
+                ),
                 _ => {}
             }
         }
@@ -886,10 +2689,15 @@ impl ResultTableWidget {
         _headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
-        let (row_top, col_left, row_bot, col_right) = table.get_selection();
-        if row_top < 0 || col_left < 0 {
+        let Some((row_top, col_left, row_bot, col_right)) =
+            Self::normalized_selection_bounds_with_limits(
+                table.get_selection(),
+                table.rows().max(0) as usize,
+                table.cols().max(0) as usize,
+            )
+        else {
             return 0;
-        }
+        };
 
         let rows = (row_bot - row_top + 1) as usize;
         let cols = (col_right - col_left + 1) as usize;
@@ -929,10 +2737,15 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
     ) -> usize {
-        let (row_top, col_left, row_bot, col_right) = table.get_selection();
-        if row_top < 0 || col_left < 0 {
+        let Some((row_top, col_left, row_bot, col_right)) =
+            Self::normalized_selection_bounds_with_limits(
+                table.get_selection(),
+                table.rows().max(0) as usize,
+                table.cols().max(0) as usize,
+            )
+        else {
             return 0;
-        }
+        };
 
         let rows = (row_bot - row_top + 1) as usize;
         let cols = (col_right - col_left + 1) as usize;
@@ -1021,6 +2834,18 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = if result.is_select {
+            result.sql.clone()
+        } else {
+            String::new()
+        };
         if !result.is_select {
             let font_size = *self
                 .font_size
@@ -1109,6 +2934,10 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
@@ -1132,6 +2961,10 @@ impl ResultTableWidget {
             .width_sampled_rows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         // Initialize pending widths based on headers
         let font_size = *self
@@ -1297,6 +3130,10 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.table.set_rows(0);
         self.table.set_cols(0);
         {
@@ -1343,10 +3180,19 @@ impl ResultTableWidget {
     }
 
     pub fn copy(&self) -> usize {
+        let Some((row_top, col_left, row_bot, col_right)) =
+            Self::normalized_selection_bounds_with_limits(
+                self.table.get_selection(),
+                self.table.rows().max(0) as usize,
+                self.table.cols().max(0) as usize,
+            )
+        else {
+            return 0;
+        };
         let count = Self::copy_selected_to_clipboard(&self.table, &self.headers, &self.full_data);
         if count > 0 {
-            let rows = (self.table.get_selection().2 - self.table.get_selection().0 + 1) as usize;
-            let cols = (self.table.get_selection().3 - self.table.get_selection().1 + 1) as usize;
+            let rows = (row_bot - row_top + 1) as usize;
+            let cols = (col_right - col_left + 1) as usize;
             println!("Copied {} cells ({} rows x {} cols)", count, rows, cols);
         }
         count
@@ -1365,13 +3211,22 @@ impl ResultTableWidget {
         }
     }
 
+    pub fn paste_from_clipboard(&mut self) {
+        let _ = self.table.take_focus();
+        app::paste_text(&self.table);
+    }
+
     #[allow(dead_code)]
     pub fn get_selected_data(&self) -> Option<String> {
-        let (row_top, col_left, row_bot, col_right) = self.table.get_selection();
-
-        if row_top < 0 || col_left < 0 {
+        let Some((row_top, col_left, row_bot, col_right)) =
+            Self::normalized_selection_bounds_with_limits(
+                self.table.get_selection(),
+                self.table.rows().max(0) as usize,
+                self.table.cols().max(0) as usize,
+            )
+        else {
             return None;
-        }
+        };
 
         let full_data = self
             .full_data
@@ -1477,6 +3332,20 @@ impl ResultTableWidget {
         self.table.clone()
     }
 
+    pub fn set_source_sql(&mut self, sql: &str) {
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql.to_string();
+    }
+
+    pub fn set_execute_sql_callback(&mut self, callback: Option<ResultGridSqlExecuteCallback>) {
+        *self
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+    }
+
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
         *self
             .font_profile
@@ -1511,6 +3380,10 @@ impl ResultTableWidget {
 
     /// Cleanup method to release resources before the widget is deleted.
     pub fn cleanup(&mut self) {
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         // Clear the event handler callback to release captured Arc<Mutex<T>> references.
         self.table.handle(|_, _| false);
 
@@ -1555,6 +3428,357 @@ impl ResultTableWidget {
             full_data.clear();
             full_data.shrink_to_fit();
         }
+        self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *self
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+mod row_edit_sql_tests {
+    use super::*;
+
+    #[test]
+    fn sql_literal_from_input_handles_null_numbers_and_expr() {
+        assert_eq!(ResultTableWidget::sql_literal_from_input(""), "NULL");
+        assert_eq!(ResultTableWidget::sql_literal_from_input("NULL"), "NULL");
+        assert_eq!(ResultTableWidget::sql_literal_from_input("42"), "42");
+        assert_eq!(ResultTableWidget::sql_literal_from_input("3.14"), "3.14");
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("=sysdate"),
+            "sysdate"
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("O'Reilly"),
+            "'O''Reilly'"
+        );
+    }
+
+    #[test]
+    fn find_rowid_column_index_accepts_qualified_header() {
+        let headers = vec!["E.ROWID".to_string(), "ENAME".to_string()];
+        assert_eq!(
+            ResultTableWidget::find_rowid_column_index(&headers),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_uses_rowid_alias_resolution() {
+        let sql = "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_uses_quoted_rowid_alias_resolution() {
+        let sql = r#"SELECT "e"."ROWID", "e"."ENAME", "d"."DNAME" FROM EMP "e" JOIN DEPT "d" ON "d"."DEPTNO" = "e"."DEPTNO""#;
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_rejects_ambiguous_multi_table_without_rowid_alias() {
+        let sql = "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
+        let result = ResultTableWidget::resolve_target_table(sql);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compose_edit_script_appends_source_select() {
+        let script = ResultTableWidget::compose_edit_script(
+            "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AAA';",
+            "SELECT ROWID, ENAME FROM EMP;",
+        );
+        assert_eq!(
+            script,
+            "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AAA';\nSELECT ROWID, ENAME FROM EMP"
+        );
+    }
+
+    #[test]
+    fn last_identifier_segment_handles_qualified_and_quoted_identifiers() {
+        assert_eq!(
+            ResultTableWidget::last_identifier_segment("E.ENAME"),
+            "ENAME"
+        );
+        assert_eq!(
+            ResultTableWidget::last_identifier_segment("\"E\".\"EMP.NAME\""),
+            "\"EMP.NAME\""
+        );
+        assert_eq!(
+            ResultTableWidget::last_identifier_segment("  ENAME  "),
+            "ENAME"
+        );
+    }
+
+    #[test]
+    fn editable_column_identifier_uses_base_column_segment() {
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("E.ENAME"),
+            Some("ENAME".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("\"E\".\"User Name\""),
+            Some("\"User Name\"".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("SCOTT.\"A.B\""),
+            Some("\"A.B\"".to_string())
+        );
+        assert_eq!(ResultTableWidget::editable_column_identifier(""), None);
+        assert_eq!(ResultTableWidget::editable_column_identifier("E."), None);
+    }
+
+    #[test]
+    fn quote_qualified_identifier_preserves_dots_inside_quoted_segments() {
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier(r#""SCHEMA.WITH.DOT"."TABLE.WITH.DOT""#),
+            r#""SCHEMA.WITH.DOT"."TABLE.WITH.DOT""#
+        );
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier(r#""TABLE.WITH.DOT""#),
+            r#""TABLE.WITH.DOT""#
+        );
+    }
+
+    #[test]
+    fn quote_qualified_identifier_keeps_unquoted_case_insensitive_identifiers_unquoted() {
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier("scott.emp"),
+            "scott.emp"
+        );
+        assert_eq!(
+            ResultTableWidget::quote_qualified_identifier("MySchema.MyTable"),
+            "MySchema.MyTable"
+        );
+    }
+
+    #[test]
+    fn push_unique_rowid_preserves_case_sensitive_values() {
+        let mut rowids = Vec::new();
+        let mut seen = HashSet::new();
+        ResultTableWidget::push_unique_rowid(&mut rowids, &mut seen, "AAABbb");
+        ResultTableWidget::push_unique_rowid(&mut rowids, &mut seen, "aaabbb");
+        ResultTableWidget::push_unique_rowid(&mut rowids, &mut seen, " AAABbb ");
+        assert_eq!(rowids, vec!["AAABbb".to_string(), "aaabbb".to_string()]);
+    }
+
+    #[test]
+    fn resolve_update_target_cell_prefers_context_and_requires_single_selection_without_it() {
+        assert_eq!(
+            ResultTableWidget::resolve_update_target_cell(
+                (2, 3, 4, 5),
+                10,
+                10,
+                Some((4, 5))
+            ),
+            Some((4, 5))
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_update_target_cell((2, 3, 2, 3), 10, 10, None),
+            Some((2, 3))
+        );
+        assert_eq!(
+            ResultTableWidget::resolve_update_target_cell((2, 3, 4, 3), 10, 10, None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_selection_bounds_with_limits_clamps_to_current_table_size() {
+        let bounds = ResultTableWidget::normalized_selection_bounds_with_limits((2, 3, 8, 9), 3, 4);
+        assert_eq!(bounds, Some((2, 3, 2, 3)));
+    }
+
+    #[test]
+    fn normalized_selection_bounds_with_limits_rejects_no_overlap_selection() {
+        let bounds = ResultTableWidget::normalized_selection_bounds_with_limits((10, 0, 11, 1), 5, 5);
+        assert_eq!(bounds, None);
+    }
+
+    #[test]
+    fn resolve_update_target_cell_rejects_out_of_range_context_cell() {
+        assert_eq!(
+            ResultTableWidget::resolve_update_target_cell((2, 3, 2, 3), 1, 1, Some((3, 0))),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_contains_cell_normalizes_reversed_bounds() {
+        assert!(ResultTableWidget::selection_contains_cell(
+            (5, 6, 2, 3),
+            4,
+            5
+        ));
+        assert!(ResultTableWidget::selection_contains_cell(
+            (5, 6, 2, 3),
+            2,
+            3
+        ));
+        assert!(!ResultTableWidget::selection_contains_cell(
+            (5, 6, 2, 3),
+            1,
+            3
+        ));
+    }
+
+    #[test]
+    fn selection_contains_cell_rejects_negative_or_empty_selection() {
+        assert!(!ResultTableWidget::selection_contains_cell(
+            (-1, -1, -1, -1),
+            0,
+            0
+        ));
+        assert!(!ResultTableWidget::selection_contains_cell(
+            (0, 0, 1, 1),
+            -1,
+            0
+        ));
+    }
+
+    #[test]
+    fn normalized_selection_bounds_reorders_reversed_selection() {
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds((5, 6, 2, 3)),
+            Some((2, 3, 5, 6))
+        );
+    }
+
+    #[test]
+    fn normalized_selection_bounds_rejects_negative_selection() {
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds((-1, 6, 2, 3)),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::normalized_selection_bounds((2, 3, -1, 6)),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_clipboard_rows_normalizes_line_endings_and_trailing_newline() {
+        let rows = ResultTableWidget::parse_clipboard_rows("A\tB\r\n1\t2\r\n");
+        assert_eq!(
+            rows,
+            vec![
+                vec!["A".to_string(), "B".to_string()],
+                vec!["1".to_string(), "2".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_paste_values_to_data_fills_selection_for_single_value() {
+        let mut data = vec![
+            vec!["RID1".to_string(), "A".to_string(), "B".to_string()],
+            vec!["RID2".to_string(), "C".to_string(), "D".to_string()],
+        ];
+        let editable_cols: HashSet<usize> = [1usize, 2usize].into_iter().collect();
+        let changed = ResultTableWidget::apply_paste_values_to_data(
+            &mut data,
+            0,
+            &editable_cols,
+            (0, 1),
+            Some((0, 1, 1, 2)),
+            &[vec!["X".to_string()]],
+        );
+        assert_eq!(changed, 4);
+        assert_eq!(
+            data,
+            vec![
+                vec!["RID1".to_string(), "X".to_string(), "X".to_string()],
+                vec!["RID2".to_string(), "X".to_string(), "X".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_paste_values_to_data_skips_rowid_and_non_editable_columns() {
+        let mut data = vec![vec![
+            "RID1".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ]];
+        let editable_cols: HashSet<usize> = [1usize, 3usize].into_iter().collect();
+        let changed = ResultTableWidget::apply_paste_values_to_data(
+            &mut data,
+            0,
+            &editable_cols,
+            (0, 0),
+            None,
+            &[vec!["R".to_string(), "X".to_string(), "Y".to_string(), "Z".to_string()]],
+        );
+        assert_eq!(changed, 2);
+        assert_eq!(
+            data,
+            vec![vec![
+                "RID1".to_string(),
+                "X".to_string(),
+                "B".to_string(),
+                "Z".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn collect_rowids_in_range_errors_when_selected_row_lacks_rowid_cell() {
+        let full_data = vec![vec!["AAABBB".to_string()], Vec::new()];
+        let result = ResultTableWidget::collect_rowids_in_range(0, 1, 0, &full_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_rowids_in_range_errors_when_selected_row_has_empty_rowid() {
+        let full_data = vec![vec!["AAABBB".to_string()], vec!["   ".to_string()]];
+        let result = ResultTableWidget::collect_rowids_in_range(0, 1, 0, &full_data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn can_show_insert_row_action_requires_resolved_target() {
+        assert!(ResultTableWidget::can_show_insert_row_action(
+            "SELECT ENAME FROM EMP"
+        ));
+        assert!(!ResultTableWidget::can_show_insert_row_action("   "));
+        assert!(!ResultTableWidget::can_show_insert_row_action(
+            "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
+        ));
+    }
+
+    #[test]
+    fn can_show_rowid_edit_actions_requires_rowid_and_resolved_target() {
+        let valid_headers = vec!["ROWID".to_string(), "ENAME".to_string()];
+        assert!(ResultTableWidget::can_show_rowid_edit_actions(
+            &valid_headers,
+            "SELECT ROWID, ENAME FROM EMP"
+        ));
+
+        let missing_rowid_headers = vec!["ENAME".to_string()];
+        assert!(!ResultTableWidget::can_show_rowid_edit_actions(
+            &missing_rowid_headers,
+            "SELECT ENAME FROM EMP"
+        ));
+        assert!(!ResultTableWidget::can_show_rowid_edit_actions(
+            &valid_headers,
+            "   "
+        ));
+        assert!(!ResultTableWidget::can_show_rowid_edit_actions(
+            &valid_headers,
+            "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
+        ));
     }
 }
 
