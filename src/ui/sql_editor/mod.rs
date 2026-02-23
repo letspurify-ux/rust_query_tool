@@ -451,6 +451,7 @@ enum UiActionResult {
     Rollback(Result<(), String>),
     Cancel(Result<(), String>),
     QueryAlreadyRunning,
+    ConnectionBusy,
 }
 
 #[derive(Clone)]
@@ -1300,6 +1301,11 @@ impl SqlEditorWidget {
                                 }
                             }
                             UiActionResult::QueryAlreadyRunning => {
+                                let busy_message = crate::db::format_connection_busy_message();
+                                widget.emit_status(&busy_message);
+                                fltk::dialog::alert_default(&busy_message);
+                            }
+                            UiActionResult::ConnectionBusy => {
                                 let busy_message = crate::db::format_connection_busy_message();
                                 widget.emit_status(&busy_message);
                                 fltk::dialog::alert_default(&busy_message);
