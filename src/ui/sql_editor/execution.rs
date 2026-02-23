@@ -3001,8 +3001,8 @@ impl SqlEditorWidget {
         // Pre-check connection status without holding lock for long
         {
             let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
-                let busy_message = crate::db::format_connection_busy_message();
-                self.emit_status(&busy_message);
+                let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
+                app::awake();
                 return;
             };
 

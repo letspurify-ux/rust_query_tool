@@ -329,7 +329,7 @@ const STATUS_ANIMATION_INTERVAL: f64 = 0.08;
 /// 접속 정보를 상태 표시줄 메시지 끝에 붙는 헬퍼
 fn format_status(msg: &str, conn_info: &Option<crate::db::ConnectionInfo>) -> String {
     match conn_info {
-        Some(info) => format!("{} | {}", msg, info.display_string()),
+        Some(info) => format!("{} | {}", msg, info.name),
         None => msg.to_string(),
     }
 }
@@ -1886,7 +1886,7 @@ impl MainWindow {
                         *s.connection_info
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
-                        s.set_status_message(&format!("Connected | {}", info.display_string()));
+                        s.set_status_message(&format!("Connected | {}", info.name));
                         s.object_browser.refresh();
                         s.sql_editor.focus();
 
@@ -3262,10 +3262,8 @@ impl MainWindow {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                         Some(info.clone());
-                                    s.status_bar.set_label(&format!(
-                                        "Connected | {}",
-                                        info.display_string()
-                                    ));
+                                    s.status_bar
+                                        .set_label(&format!("Connected | {}", info.name));
                                     s.object_browser.refresh();
                                     s.sql_editor.focus();
 
