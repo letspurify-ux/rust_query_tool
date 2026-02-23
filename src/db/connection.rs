@@ -41,7 +41,6 @@ impl ConnectionInfo {
         format!("//{}:{}/{}", self.host, self.port, self.service_name)
     }
 
-
     /// Securely clear the password from memory by overwriting with zeros
     /// then releasing the allocation.
     pub fn clear_password(&mut self) {
@@ -245,9 +244,14 @@ impl Default for DatabaseConnection {
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static ACTIVE_DB_CONNECTION: OnceLock<Mutex<Option<Arc<Connection>>>> = OnceLock::new();
 
 fn db_activity_slot() -> &'static Mutex<Option<String>> {
     ACTIVE_DB_ACTIVITY.get_or_init(|| Mutex::new(None))
+}
+
+fn db_connection_slot() -> &'static Mutex<Option<Arc<Connection>>> {
+    ACTIVE_DB_CONNECTION.get_or_init(|| Mutex::new(None))
 }
 
 fn set_current_db_activity(activity: Option<String>) {
@@ -260,6 +264,38 @@ fn set_current_db_activity(activity: Option<String>) {
             *poisoned.into_inner() = activity;
         }
     }
+}
+
+fn set_current_db_connection(connection: Option<Arc<Connection>>) {
+    match db_connection_slot().lock() {
+        Ok(mut guard) => {
+            *guard = connection;
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: DB connection tracking lock was poisoned; recovering.");
+            *poisoned.into_inner() = connection;
+        }
+    }
+}
+
+pub fn current_db_connection() -> Option<Arc<Connection>> {
+    match db_connection_slot().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            eprintln!("Warning: DB connection tracking lock was poisoned; recovering.");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+pub fn cancel_active_db_activity() -> Result<bool, String> {
+    if let Some(connection) = current_db_connection() {
+        return connection
+            .break_execution()
+            .map(|_| true)
+            .map_err(|err| err.to_string());
+    }
+    Ok(false)
 }
 
 pub fn current_db_activity() -> Option<String> {
@@ -287,6 +323,7 @@ pub struct ConnectionLockGuard<'a> {
 impl<'a> ConnectionLockGuard<'a> {
     fn with_activity(mut self, activity: String) -> Self {
         set_current_db_activity(Some(activity));
+        set_current_db_connection(self.guard.get_connection());
         self.tracks_activity = true;
         self
     }
@@ -310,6 +347,7 @@ impl<'a> Drop for ConnectionLockGuard<'a> {
     fn drop(&mut self) {
         if self.tracks_activity {
             set_current_db_activity(None);
+            set_current_db_connection(None);
         }
     }
 }
@@ -415,5 +453,12 @@ mod tests {
             .require_live_connection()
             .expect_err("must be disconnected");
         assert_eq!(err, NOT_CONNECTED_MESSAGE);
+    }
+
+    #[test]
+    fn cancel_active_db_activity_returns_false_without_tracked_connection() {
+        set_current_db_connection(None);
+        let cancelled = cancel_active_db_activity().expect("cancel should not fail");
+        assert!(!cancelled);
     }
 }
