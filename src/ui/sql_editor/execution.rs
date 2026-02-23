@@ -5009,7 +5009,7 @@ impl SqlEditorWidget {
                                                 "CONNECT",
                                                 &format!(
                                                     "Connected to {}",
-                                                    conn_info.display_string()
+                                                    conn_info.name
                                                 ),
                                             );
                                             if let Some(conn) = conn_opt.as_ref() {
