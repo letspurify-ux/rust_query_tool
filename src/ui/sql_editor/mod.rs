@@ -7,6 +7,7 @@ use fltk::{
     input::IntInput,
     prelude::*,
     text::{TextBuffer, TextEditor, WrapMode},
+    window::Window,
 };
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -63,6 +64,7 @@ const MAX_WORD_UNDO_HISTORY: usize = 500;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditGranularity {
@@ -491,6 +493,23 @@ pub struct SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
+    fn is_main_window_visible() -> bool {
+        app::widget_from_id::<Window>("main_window")
+            .map(|window| window.shown())
+            .unwrap_or(false)
+    }
+
+    fn show_alert_when_main_window_visible(message: String) {
+        if Self::is_main_window_visible() {
+            fltk::dialog::alert_default(&message);
+            return;
+        }
+
+        app::add_timeout3(ALERT_RETRY_INTERVAL_SECONDS, move |_| {
+            SqlEditorWidget::show_alert_when_main_window_visible(message.clone());
+        });
+    }
+
     fn statement_at_cursor_text(&self) -> Option<String> {
         let sql = self.buffer.text();
         let cursor_pos = self.editor.insert_position() as usize;
@@ -845,7 +864,7 @@ impl SqlEditorWidget {
                             } => {
                                 flush_rows(&mut pending_rows, cancelled);
                                 if *timed_out {
-                                    fltk::dialog::alert_default(&format!(
+                                    SqlEditorWidget::show_alert_when_main_window_visible(format!(
                                         "Query timed out!\n\n{}",
                                         result.message
                                     ));
