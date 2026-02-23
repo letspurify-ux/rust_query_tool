@@ -18,7 +18,10 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
+use crate::db::{
+    current_active_db_connection, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection,
+    TableColumnDetail,
+};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
@@ -1782,22 +1785,31 @@ impl SqlEditorWidget {
     }
 
     pub fn cancel_current(&self) {
-        if !*self
-            .query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            SqlEditorWidget::show_alert_dialog("No query is running");
-            return;
-        }
-
         // Set cancel flag immediately so the execution thread can check it
         self.cancel_flag.store(true, Ordering::SeqCst);
 
         let current_query_connection = self.current_query_connection.clone();
         let cancel_flag = self.cancel_flag.clone();
         let sender = self.ui_action_sender.clone();
+        let query_running = *self
+            .query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         thread::spawn(move || {
+            if !query_running {
+                if let Some(db_conn) = current_active_db_connection() {
+                    let _ = db_conn.break_execution();
+                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    app::awake();
+                    return;
+                }
+
+                cancel_flag.store(false, Ordering::SeqCst);
+                let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                app::awake();
+                return;
+            }
+
             // Use separate connection path for cancel (no blocking on main mutex)
             let mut conn =
                 SqlEditorWidget::clone_current_query_connection(&current_query_connection);
