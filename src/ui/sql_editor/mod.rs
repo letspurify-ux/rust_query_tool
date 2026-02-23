@@ -7,12 +7,14 @@ use fltk::{
     input::IntInput,
     prelude::*,
     text::{TextBuffer, TextEditor, WrapMode},
+    window::Window,
 };
 use std::any::Any;
+use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -63,6 +65,13 @@ const MAX_WORD_UNDO_HISTORY: usize = 500;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
+
+#[derive(Default)]
+struct PendingAlertState {
+    queue: VecDeque<String>,
+    pump_scheduled: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditGranularity {
@@ -491,7 +500,83 @@ pub struct SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
-    fn statement_at_cursor_text(&self) -> Option<String> {
+    fn is_main_window_visible() -> bool {
+        app::widget_from_id::<Window>("main_window")
+            .map(|window| window.shown())
+            .unwrap_or(false)
+    }
+
+    fn pending_alert_state() -> &'static Arc<Mutex<PendingAlertState>> {
+        static STATE: OnceLock<Arc<Mutex<PendingAlertState>>> = OnceLock::new();
+        STATE.get_or_init(|| Arc::new(Mutex::new(PendingAlertState::default())))
+    }
+
+    fn schedule_alert_pump(delay_seconds: f64) {
+        app::add_timeout3(delay_seconds, move |_| {
+            SqlEditorWidget::drain_pending_alerts();
+        });
+    }
+
+    fn drain_pending_alerts() {
+        if !Self::is_main_window_visible() {
+            Self::schedule_alert_pump(ALERT_RETRY_INTERVAL_SECONDS);
+            return;
+        }
+
+        let (maybe_message, should_continue) = {
+            let state = Self::pending_alert_state();
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let message = guard.queue.pop_front();
+            let continue_pump = if message.is_some() {
+                !guard.queue.is_empty()
+            } else {
+                guard.pump_scheduled = false;
+                false
+            };
+            (message, continue_pump)
+        };
+
+        let Some(message) = maybe_message else {
+            return;
+        };
+
+        fltk::dialog::alert_default(&message);
+
+        if should_continue {
+            Self::schedule_alert_pump(0.0);
+        } else {
+            let state = Self::pending_alert_state();
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.queue.is_empty() {
+                guard.pump_scheduled = false;
+            } else if !guard.pump_scheduled {
+                guard.pump_scheduled = true;
+                Self::schedule_alert_pump(0.0);
+            }
+        }
+    }
+
+        let should_schedule = {
+            let state = Self::pending_alert_state();
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.queue.push_back(message.to_string());
+            if guard.pump_scheduled {
+                false
+            } else {
+                guard.pump_scheduled = true;
+                true
+            }
+        };
+
+        if should_schedule {
+            Self::schedule_alert_pump(0.0);
+        }
         let sql = self.buffer.text();
         let cursor_pos = self.editor.insert_position() as usize;
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
@@ -845,7 +930,7 @@ impl SqlEditorWidget {
                             } => {
                                 flush_rows(&mut pending_rows, cancelled);
                                 if *timed_out {
-                                    fltk::dialog::alert_default(&format!(
+                                    SqlEditorWidget::show_alert_dialog(&format!(
                                         "Query timed out!\n\n{}",
                                         result.message
                                     ));

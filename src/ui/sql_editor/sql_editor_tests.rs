@@ -29,7 +29,19 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
 }
 
 #[test]
-fn format_sql_preserves_script_commands_and_slashes() {
+    assert!(
+        mod_src.contains("struct PendingAlertState"),
+        "mod.rs should keep a single shared alert queue state"
+    );
+    assert!(
+        mod_src.contains("fn drain_pending_alerts()"),
+        "mod.rs should process alerts through a single drain function"
+    );
+    assert!(
+        !mod_src.contains("fn show_alert_when_main_window_visible"),
+        "legacy per-alert recursive retry helper should not remain"
+    );
+        "mod.rs should call fltk::dialog::alert_default only inside queue drain"
     let cases = [
         (
             "test1.txt",
