@@ -1798,8 +1798,9 @@ impl SqlEditorWidget {
         thread::spawn(move || {
             if !query_running {
                 if let Some(db_conn) = current_active_db_connection() {
-                    let _ = db_conn.break_execution();
-                    let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                    let result = db_conn.break_execution().map_err(|err| err.to_string());
+                    cancel_flag.store(false, Ordering::SeqCst);
+                    let _ = sender.send(UiActionResult::Cancel(result));
                     app::awake();
                     return;
                 }
