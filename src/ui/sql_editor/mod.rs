@@ -71,6 +71,16 @@ fn is_window_shown_and_visible(shown: bool, visible: bool) -> bool {
     shown && visible
 }
 
+fn update_alert_pump_state_after_display(queue_is_empty: bool, pump_scheduled: &mut bool) -> bool {
+    if queue_is_empty {
+        *pump_scheduled = false;
+        false
+    } else {
+        *pump_scheduled = true;
+        true
+    }
+}
+
 #[derive(Default)]
 struct PendingAlertState {
     queue: VecDeque<String>,
@@ -551,14 +561,17 @@ impl SqlEditorWidget {
         if should_continue {
             Self::schedule_alert_pump(0.0);
         } else {
-            let state = Self::pending_alert_state();
-            let mut guard = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.queue.is_empty() {
-                guard.pump_scheduled = false;
-            } else if !guard.pump_scheduled {
-                guard.pump_scheduled = true;
+            let should_schedule = {
+                let state = Self::pending_alert_state();
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                update_alert_pump_state_after_display(
+                    guard.queue.is_empty(),
+                    &mut guard.pump_scheduled,
+                )
+            };
+            if should_schedule {
                 Self::schedule_alert_pump(0.0);
             }
         }

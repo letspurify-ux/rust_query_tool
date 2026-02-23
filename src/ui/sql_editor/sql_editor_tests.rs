@@ -29,6 +29,18 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
 }
 
 #[test]
+fn update_alert_pump_state_after_display_reschedules_when_queue_not_empty() {
+    let mut pump_scheduled = true;
+    let should_schedule = update_alert_pump_state_after_display(false, &mut pump_scheduled);
+    assert!(should_schedule);
+    assert!(pump_scheduled);
+
+    let should_schedule_empty = update_alert_pump_state_after_display(true, &mut pump_scheduled);
+    assert!(!should_schedule_empty);
+    assert!(!pump_scheduled);
+}
+
+#[test]
 fn is_window_shown_and_visible_requires_both_flags() {
     assert!(is_window_shown_and_visible(true, true));
     assert!(!is_window_shown_and_visible(true, false));
