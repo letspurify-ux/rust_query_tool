@@ -176,7 +176,7 @@ impl SqlEditorWidget {
                 let normalized = Self::normalize_statement_for_single_execution(&statement);
                 self.execute_sql(&normalized, false);
             } else {
-                fltk::dialog::alert_default("No SQL at cursor");
+                SqlEditorWidget::show_alert_dialog("No SQL at cursor");
             }
         }
     }
@@ -184,7 +184,7 @@ impl SqlEditorWidget {
     pub fn execute_selected(&self) {
         let mut buffer = self.buffer.clone();
         if !buffer.selected() {
-            fltk::dialog::alert_default("No SQL selected");
+            SqlEditorWidget::show_alert_dialog("No SQL selected");
             return;
         }
 
@@ -473,7 +473,7 @@ impl SqlEditorWidget {
                 }
             }
             _ => {
-                fltk::dialog::alert_default("No SQL selected");
+                SqlEditorWidget::show_alert_dialog("No SQL selected");
                 return;
             }
         };
@@ -3010,7 +3010,7 @@ impl SqlEditorWidget {
             // The execution worker performs full liveness validation.
             if !has_connect_command {
                 if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
-                    fltk::dialog::alert_default("Not connected to database");
+                    SqlEditorWidget::show_alert_dialog("Not connected to database");
                     return;
                 }
             }
@@ -5007,10 +5007,7 @@ impl SqlEditorWidget {
                                                 &sender,
                                                 &session,
                                                 "CONNECT",
-                                                &format!(
-                                                    "Connected to {}",
-                                                    conn_info.name
-                                                ),
+                                                &format!("Connected to {}", conn_info.name),
                                             );
                                             if let Some(conn) = conn_opt.as_ref() {
                                                 let previous_timeout =

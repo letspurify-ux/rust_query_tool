@@ -67,6 +67,20 @@ const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
 
+fn is_window_shown_and_visible(shown: bool, visible: bool) -> bool {
+    shown && visible
+}
+
+fn update_alert_pump_state_after_display(queue_is_empty: bool, pump_scheduled: &mut bool) -> bool {
+    if queue_is_empty {
+        *pump_scheduled = false;
+        false
+    } else {
+        *pump_scheduled = true;
+        true
+    }
+}
+
 #[derive(Default)]
 struct PendingAlertState {
     queue: VecDeque<String>,
@@ -502,7 +516,7 @@ pub struct SqlEditorWidget {
 impl SqlEditorWidget {
     fn is_main_window_visible() -> bool {
         app::widget_from_id::<Window>("main_window")
-            .map(|window| window.shown())
+            .map(|window| is_window_shown_and_visible(window.shown(), window.visible()))
             .unwrap_or(false)
     }
 
@@ -547,19 +561,23 @@ impl SqlEditorWidget {
         if should_continue {
             Self::schedule_alert_pump(0.0);
         } else {
-            let state = Self::pending_alert_state();
-            let mut guard = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.queue.is_empty() {
-                guard.pump_scheduled = false;
-            } else if !guard.pump_scheduled {
-                guard.pump_scheduled = true;
+            let should_schedule = {
+                let state = Self::pending_alert_state();
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                update_alert_pump_state_after_display(
+                    guard.queue.is_empty(),
+                    &mut guard.pump_scheduled,
+                )
+            };
+            if should_schedule {
                 Self::schedule_alert_pump(0.0);
             }
         }
     }
 
+    pub(crate) fn show_alert_dialog(message: &str) {
         let should_schedule = {
             let state = Self::pending_alert_state();
             let mut guard = state
@@ -577,6 +595,9 @@ impl SqlEditorWidget {
         if should_schedule {
             Self::schedule_alert_pump(0.0);
         }
+    }
+
+    fn statement_at_cursor_text(&self) -> Option<String> {
         let sql = self.buffer.text();
         let cursor_pos = self.editor.insert_position() as usize;
         // 실행/인텔리센스/포맷 공통 규칙으로 문장 경계를 계산합니다.
@@ -944,7 +965,7 @@ impl SqlEditorWidget {
                                     &result.message,
                                 ) {
                                     crate::utils::logging::log_error("history", &history_err);
-                                    fltk::dialog::alert_default(&format!(
+                                    SqlEditorWidget::show_alert_dialog(&format!(
                                         "Failed to save query history: {}",
                                         history_err
                                     ));
@@ -1339,7 +1360,9 @@ impl SqlEditorWidget {
                                 }
                                 Err(err) => {
                                     if err.contains("Not connected") {
-                                        fltk::dialog::alert_default("Not connected to database");
+                                        SqlEditorWidget::show_alert_dialog(
+                                            "Not connected to database",
+                                        );
                                     } else {
                                         fltk::dialog::message_default(&format!(
                                             "Object not found or not accessible: {} ({})",
@@ -1388,12 +1411,12 @@ impl SqlEditorWidget {
                             UiActionResult::QueryAlreadyRunning => {
                                 let busy_message = crate::db::format_connection_busy_message();
                                 widget.emit_status(&busy_message);
-                                fltk::dialog::alert_default(&busy_message);
+                                SqlEditorWidget::show_alert_dialog(&busy_message);
                             }
                             UiActionResult::ConnectionBusy => {
                                 let busy_message = crate::db::format_connection_busy_message();
                                 widget.emit_status(&busy_message);
-                                fltk::dialog::alert_default(&busy_message);
+                                SqlEditorWidget::show_alert_dialog(&busy_message);
                             }
                         }
                         if should_reset_cursor {
@@ -1503,7 +1526,7 @@ impl SqlEditorWidget {
 
     pub fn explain_current(&self) {
         let Some(sql) = self.statement_at_cursor_text() else {
-            fltk::dialog::alert_default("No SQL at cursor");
+            SqlEditorWidget::show_alert_dialog("No SQL at cursor");
             return;
         };
 
@@ -1764,7 +1787,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
-            fltk::dialog::alert_default("No query is running");
+            SqlEditorWidget::show_alert_dialog("No query is running");
             return;
         }
 
