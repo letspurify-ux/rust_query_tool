@@ -326,7 +326,7 @@ impl SqlEditorWidget {
                         let sql_id = match normalize_optional_sql_id(&sql_id_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -335,7 +335,7 @@ impl SqlEditorWidget {
                             match parse_optional_non_negative_i32(&child_text, "Child#") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
@@ -419,13 +419,13 @@ impl SqlEditorWidget {
                         let sql_id = match normalize_optional_sql_id(&sql_id_text) {
                             Ok(Some(value)) => value,
                             Ok(None) => {
-                                fltk::dialog::alert_default(
+                                SqlEditorWidget::show_alert_dialog(
                                     "SQL_ID is required for SQL Text lookup.",
                                 );
                                 continue;
                             }
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -569,26 +569,26 @@ impl SqlEditorWidget {
                 }
             }
 
-                    let selection = table_widget.get_selection();
-                    if selection != last_table_selection {
-                        last_table_selection = selection;
-                        let selected_row = selection.0.min(selection.2);
-                        if selected_row >= 0 {
-                            let selected_index = selected_row as usize;
-                            if let Some(row) = result_table.row_values(selected_index) {
-                                if let Some((sql_id, child)) =
-                                    parse_sql_id_child_row(&row, &last_snapshot_columns)
-                                {
-                                    sql_id_input.set_value(&sql_id);
-                                    match child {
-                                        Some(value) => child_input.set_value(&value.to_string()),
-                                        None => child_input.set_value(""),
-                                    }
-                                }
+            let selection = table_widget.get_selection();
+            if selection != last_table_selection {
+                last_table_selection = selection;
+                let selected_row = selection.0.min(selection.2);
+                if selected_row >= 0 {
+                    let selected_index = selected_row as usize;
+                    if let Some(row) = result_table.row_values(selected_index) {
+                        if let Some((sql_id, child)) =
+                            parse_sql_id_child_row(&row, &last_snapshot_columns)
+                        {
+                            sql_id_input.set_value(&sql_id);
+                            match child {
+                                Some(value) => child_input.set_value(&value.to_string()),
+                                None => child_input.set_value(""),
                             }
                         }
                     }
                 }
+            }
+        }
 
         set_cursor(Cursor::Default);
         app::flush();
@@ -844,7 +844,7 @@ impl SqlEditorWidget {
                                     if from_auto {
                                         status.set_label(&format!("Auto refresh skipped: {}", err));
                                     } else {
-                                        fltk::dialog::alert_default(&err);
+                                        SqlEditorWidget::show_alert_dialog(&err);
                                     }
                                     continue;
                                 }
@@ -855,7 +855,7 @@ impl SqlEditorWidget {
                                 if from_auto {
                                     status.set_label(&format!("Auto refresh skipped: {}", err));
                                 } else {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                 }
                                 continue;
                             }
@@ -867,7 +867,7 @@ impl SqlEditorWidget {
                                     if from_auto {
                                         status.set_label(&format!("Auto refresh skipped: {}", err));
                                     } else {
-                                        fltk::dialog::alert_default(&err);
+                                        SqlEditorWidget::show_alert_dialog(&err);
                                     }
                                     continue;
                                 }
@@ -930,21 +930,23 @@ impl SqlEditorWidget {
                     SqlMonitorMessage::KillSessionRequested => {
                         let selected_row = current_selected_row_index(table_widget.get_selection());
                         let Some(row_index) = selected_row else {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Select a SQL Monitor row first (SID/SERIAL# required).",
                             );
                             continue;
                         };
 
                         let Some(row) = result_table.row_values(row_index) else {
-                            fltk::dialog::alert_default("Failed to read selected SQL Monitor row.");
+                            SqlEditorWidget::show_alert_dialog(
+                                "Failed to read selected SQL Monitor row.",
+                            );
                             continue;
                         };
 
                         let Some((instance_id, sid, serial)) =
                             parse_sql_monitor_session_target(&row, &last_snapshot_columns)
                         else {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Selected row does not contain valid INST_ID/SID/SERIAL# values.",
                             );
                             continue;
@@ -1079,7 +1081,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("SQL monitor action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                             }
                         }
                     }
@@ -1372,7 +1374,7 @@ impl SqlEditorWidget {
                             match parse_percentage_thresholds(&warn_text, &critical_text) {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
@@ -2054,7 +2056,7 @@ impl SqlEditorWidget {
                         {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2106,14 +2108,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2178,14 +2180,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2198,7 +2200,7 @@ impl SqlEditorWidget {
                             && comments.is_none()
                             && enabled_state.is_none()
                         {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "At least one attribute change is required for ALTER.",
                             );
                             continue;
@@ -2258,14 +2260,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2317,14 +2319,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2377,14 +2379,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2438,14 +2440,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2501,14 +2503,14 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2563,7 +2565,7 @@ impl SqlEditorWidget {
                         {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2610,14 +2612,14 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&job_text, "Data Pump job") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
                         let normalized_mode = match normalize_datapump_mode(&job_mode_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2627,7 +2629,7 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&schema_text, "Schema") {
                                 Ok(value) => Some(value),
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             }
@@ -2691,14 +2693,14 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&job_text, "Data Pump job") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
                         let normalized_mode = match normalize_datapump_mode(&job_mode_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2708,7 +2710,7 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&schema_text, "Schema") {
                                 Ok(value) => Some(value),
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             }
@@ -2767,7 +2769,7 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -2775,7 +2777,7 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&job_text, "Data Pump job") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
@@ -2927,7 +2929,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Scheduler action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                             }
                         }
                     }
@@ -2945,7 +2947,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Data Pump action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                             }
                         }
                     }
@@ -3339,7 +3341,7 @@ impl SqlEditorWidget {
                 profile_input_for_users.value(),
                 attention_only_check_for_users.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3357,7 +3359,7 @@ impl SqlEditorWidget {
                 profile_input_for_summary.value(),
                 attention_only_check_for_summary.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3375,7 +3377,7 @@ impl SqlEditorWidget {
                 profile_input_for_roles.value(),
                 attention_only_check_for_roles.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3393,7 +3395,7 @@ impl SqlEditorWidget {
                 profile_input_for_sys.value(),
                 attention_only_check_for_sys.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3411,7 +3413,7 @@ impl SqlEditorWidget {
                 profile_input_for_obj.value(),
                 attention_only_check_for_obj.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3429,7 +3431,7 @@ impl SqlEditorWidget {
                 profile_input_for_profiles.value(),
                 attention_only_check_for_profiles.value(),
             ) {
-                fltk::dialog::alert_default(&err);
+                SqlEditorWidget::show_alert_dialog(&err);
                 return;
             }
             app::awake();
@@ -3454,11 +3456,11 @@ impl SqlEditorWidget {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     let role_text = role_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Grant role requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Grant role requires a username.");
                         return;
                     }
                     if role_text.is_empty() {
-                        fltk::dialog::alert_default("Grant role requires a role name.");
+                        SqlEditorWidget::show_alert_dialog("Grant role requires a role name.");
                         return;
                     }
                     sender_quick_run
@@ -3472,11 +3474,11 @@ impl SqlEditorWidget {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     let role_text = role_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Revoke role requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Revoke role requires a username.");
                         return;
                     }
                     if role_text.is_empty() {
-                        fltk::dialog::alert_default("Revoke role requires a role name.");
+                        SqlEditorWidget::show_alert_dialog("Revoke role requires a role name.");
                         return;
                     }
                     sender_quick_run
@@ -3490,11 +3492,15 @@ impl SqlEditorWidget {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     let priv_text = role_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Grant system privilege requires a username.");
+                        SqlEditorWidget::show_alert_dialog(
+                            "Grant system privilege requires a username.",
+                        );
                         return;
                     }
                     if priv_text.is_empty() {
-                        fltk::dialog::alert_default("Grant system privilege requires a privilege.");
+                        SqlEditorWidget::show_alert_dialog(
+                            "Grant system privilege requires a privilege.",
+                        );
                         return;
                     }
                     sender_quick_run
@@ -3508,11 +3514,15 @@ impl SqlEditorWidget {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     let priv_text = role_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Revoke system privilege requires a username.");
+                        SqlEditorWidget::show_alert_dialog(
+                            "Revoke system privilege requires a username.",
+                        );
                         return;
                     }
                     if priv_text.is_empty() {
-                        fltk::dialog::alert_default("Revoke system privilege requires a privilege.");
+                        SqlEditorWidget::show_alert_dialog(
+                            "Revoke system privilege requires a privilege.",
+                        );
                         return;
                     }
                     sender_quick_run
@@ -3526,11 +3536,11 @@ impl SqlEditorWidget {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     let profile_text = profile_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Set profile requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Set profile requires a username.");
                         return;
                     }
                     if profile_text.is_empty() {
-                        fltk::dialog::alert_default("Set profile requires a profile.");
+                        SqlEditorWidget::show_alert_dialog("Set profile requires a profile.");
                         return;
                     }
                     sender_quick_run
@@ -3543,43 +3553,37 @@ impl SqlEditorWidget {
                 6 => {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Lock user requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Lock user requires a username.");
                         return;
                     }
                     sender_quick_run
-                        .send(SecurityMessage::LockUserRequested {
-                            user_text,
-                        })
+                        .send(SecurityMessage::LockUserRequested { user_text })
                         .is_ok()
                 }
                 7 => {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Unlock user requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Unlock user requires a username.");
                         return;
                     }
                     sender_quick_run
-                        .send(SecurityMessage::UnlockUserRequested {
-                            user_text,
-                        })
+                        .send(SecurityMessage::UnlockUserRequested { user_text })
                         .is_ok()
                 }
                 8 => {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     if user_text.is_empty() {
-                        fltk::dialog::alert_default("Expire password requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Expire password requires a username.");
                         return;
                     }
                     sender_quick_run
-                        .send(SecurityMessage::ExpirePasswordRequested {
-                            user_text,
-                        })
+                        .send(SecurityMessage::ExpirePasswordRequested { user_text })
                         .is_ok()
                 }
                 9 => {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     if user_text.trim().is_empty() {
-                        fltk::dialog::alert_default("Create user requires a username");
+                        SqlEditorWidget::show_alert_dialog("Create user requires a username");
                         return;
                     }
                     let confirm = fltk::dialog::choice2_default(
@@ -3595,7 +3599,7 @@ impl SqlEditorWidget {
                         return;
                     };
                     if password.trim().is_empty() {
-                        fltk::dialog::alert_default("Password is required for CREATE USER.");
+                        SqlEditorWidget::show_alert_dialog("Password is required for CREATE USER.");
                         return;
                     }
                     let Some(default_tablespace) =
@@ -3621,7 +3625,7 @@ impl SqlEditorWidget {
                 10 => {
                     let user_text = user_input_for_quick.value().trim().to_string();
                     if user_text.trim().is_empty() {
-                        fltk::dialog::alert_default("Drop user requires a username.");
+                        SqlEditorWidget::show_alert_dialog("Drop user requires a username.");
                         return;
                     }
                     let choice = fltk::dialog::choice2_default(
@@ -3642,7 +3646,7 @@ impl SqlEditorWidget {
                 11 => {
                     let role_text = role_input_for_quick.value().trim().to_string();
                     if role_text.trim().is_empty() {
-                        fltk::dialog::alert_default("Create role requires a role name");
+                        SqlEditorWidget::show_alert_dialog("Create role requires a role name");
                         return;
                     }
                     sender_quick_run
@@ -3652,7 +3656,7 @@ impl SqlEditorWidget {
                 12 => {
                     let role_text = role_input_for_quick.value().trim().to_string();
                     if role_text.trim().is_empty() {
-                        fltk::dialog::alert_default("Drop role requires a role name");
+                        SqlEditorWidget::show_alert_dialog("Drop role requires a role name");
                         return;
                     }
                     sender_quick_run
@@ -3660,7 +3664,7 @@ impl SqlEditorWidget {
                         .is_ok()
                 }
                 _ => {
-                    fltk::dialog::alert_default("Select a quick action first.");
+                    SqlEditorWidget::show_alert_dialog("Select a quick action first.");
                     false
                 }
             };
@@ -3676,11 +3680,11 @@ impl SqlEditorWidget {
             let user_text = user_input_for_grant.value().trim().to_string();
             let role_text = role_input_for_grant.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Grant role requires a username.");
+                SqlEditorWidget::show_alert_dialog("Grant role requires a username.");
                 return;
             }
             if role_text.is_empty() {
-                fltk::dialog::alert_default("Grant role requires a role name.");
+                SqlEditorWidget::show_alert_dialog("Grant role requires a role name.");
                 return;
             }
             let _ = sender_grant.send(SecurityMessage::GrantRoleRequested {
@@ -3697,11 +3701,11 @@ impl SqlEditorWidget {
             let user_text = user_input_for_revoke.value().trim().to_string();
             let role_text = role_input_for_revoke.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Revoke role requires a username.");
+                SqlEditorWidget::show_alert_dialog("Revoke role requires a username.");
                 return;
             }
             if role_text.is_empty() {
-                fltk::dialog::alert_default("Revoke role requires a role name.");
+                SqlEditorWidget::show_alert_dialog("Revoke role requires a role name.");
                 return;
             }
             let _ = sender_revoke.send(SecurityMessage::RevokeRoleRequested {
@@ -3718,11 +3722,11 @@ impl SqlEditorWidget {
             let user_text = user_input_for_grant_sys.value().trim().to_string();
             let priv_text = role_input_for_grant_sys.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Grant system privilege requires a username.");
+                SqlEditorWidget::show_alert_dialog("Grant system privilege requires a username.");
                 return;
             }
             if priv_text.is_empty() {
-                fltk::dialog::alert_default("Grant system privilege requires a privilege.");
+                SqlEditorWidget::show_alert_dialog("Grant system privilege requires a privilege.");
                 return;
             }
             let _ = sender_grant_sys.send(SecurityMessage::GrantSystemPrivRequested {
@@ -3739,11 +3743,11 @@ impl SqlEditorWidget {
             let user_text = user_input_for_revoke_sys.value().trim().to_string();
             let priv_text = role_input_for_revoke_sys.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Revoke system privilege requires a username.");
+                SqlEditorWidget::show_alert_dialog("Revoke system privilege requires a username.");
                 return;
             }
             if priv_text.is_empty() {
-                fltk::dialog::alert_default("Revoke system privilege requires a privilege.");
+                SqlEditorWidget::show_alert_dialog("Revoke system privilege requires a privilege.");
                 return;
             }
             let _ = sender_revoke_sys.send(SecurityMessage::RevokeSystemPrivRequested {
@@ -3760,11 +3764,11 @@ impl SqlEditorWidget {
             let user_text = user_input_for_set_profile.value().trim().to_string();
             let profile_text = profile_input_for_set_profile.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Set profile requires a username.");
+                SqlEditorWidget::show_alert_dialog("Set profile requires a username.");
                 return;
             }
             if profile_text.is_empty() {
-                fltk::dialog::alert_default("Set profile requires a profile.");
+                SqlEditorWidget::show_alert_dialog("Set profile requires a profile.");
                 return;
             }
             let _ = sender_set_profile.send(SecurityMessage::SetProfileRequested {
@@ -3780,14 +3784,14 @@ impl SqlEditorWidget {
         create_user_btn.set_callback(move |_| {
             let user_text = user_input_for_create_user.value();
             if user_text.trim().is_empty() {
-                fltk::dialog::alert_default("Create user requires a username.");
+                SqlEditorWidget::show_alert_dialog("Create user requires a username.");
                 return;
             }
             let Some(password) = prompt_secret_text("User password") else {
                 return;
             };
             if password.trim().is_empty() {
-                fltk::dialog::alert_default("Password is required for CREATE USER.");
+                SqlEditorWidget::show_alert_dialog("Password is required for CREATE USER.");
                 return;
             }
             let Some(default_tablespace) =
@@ -3815,7 +3819,7 @@ impl SqlEditorWidget {
         drop_user_btn.set_callback(move |_| {
             let user_text = user_input_for_drop_user.value().trim().to_string();
             if user_text.trim().is_empty() {
-                fltk::dialog::alert_default("Drop user requires a username.");
+                SqlEditorWidget::show_alert_dialog("Drop user requires a username.");
                 return;
             }
             let choice =
@@ -3835,7 +3839,7 @@ impl SqlEditorWidget {
         create_role_btn.set_callback(move |_| {
             let role_text = role_input_for_create_role.value().trim().to_string();
             if role_text.trim().is_empty() {
-                fltk::dialog::alert_default("Create role requires a role name");
+                SqlEditorWidget::show_alert_dialog("Create role requires a role name");
                 return;
             }
             let _ = sender_create_role.send(SecurityMessage::CreateRoleRequested { role_text });
@@ -3847,7 +3851,7 @@ impl SqlEditorWidget {
         drop_role_btn.set_callback(move |_| {
             let role_text = role_input_for_drop_role.value().trim().to_string();
             if role_text.trim().is_empty() {
-                fltk::dialog::alert_default("Drop role requires a role name");
+                SqlEditorWidget::show_alert_dialog("Drop role requires a role name");
                 return;
             }
             let _ = sender_drop_role.send(SecurityMessage::DropRoleRequested { role_text });
@@ -3859,7 +3863,7 @@ impl SqlEditorWidget {
         lock_user_btn.set_callback(move |_| {
             let user_text = user_input_for_lock_user.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Lock user requires a username.");
+                SqlEditorWidget::show_alert_dialog("Lock user requires a username.");
                 return;
             }
             let _ = sender_lock_user.send(SecurityMessage::LockUserRequested { user_text });
@@ -3871,7 +3875,7 @@ impl SqlEditorWidget {
         unlock_user_btn.set_callback(move |_| {
             let user_text = user_input_for_unlock_user.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Unlock user requires a username.");
+                SqlEditorWidget::show_alert_dialog("Unlock user requires a username.");
                 return;
             }
             let _ = sender_unlock_user.send(SecurityMessage::UnlockUserRequested { user_text });
@@ -3883,10 +3887,11 @@ impl SqlEditorWidget {
         expire_password_btn.set_callback(move |_| {
             let user_text = user_input_for_expire_password.value().trim().to_string();
             if user_text.is_empty() {
-                fltk::dialog::alert_default("Expire password requires a username.");
+                SqlEditorWidget::show_alert_dialog("Expire password requires a username.");
                 return;
             }
-            let _ = sender_expire_password.send(SecurityMessage::ExpirePasswordRequested { user_text });
+            let _ =
+                sender_expire_password.send(SecurityMessage::ExpirePasswordRequested { user_text });
             app::awake();
         });
 
@@ -3927,10 +3932,7 @@ impl SqlEditorWidget {
             profile_input.value(),
             attention_only_check.value(),
         ) {
-            status.set_label(&format!(
-                "Initial security view load failed: {}",
-                err
-            ));
+            status.set_label(&format!("Initial security view load failed: {}", err));
         } else {
             app::awake();
         }
@@ -3953,7 +3955,7 @@ impl SqlEditorWidget {
                         ) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4057,14 +4059,14 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let role = match normalize_required_identifier(&role_text, "Role") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4116,14 +4118,14 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let role = match normalize_required_identifier(&role_text, "Role") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4175,14 +4177,14 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let privilege = match normalize_required_system_privilege(&priv_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4237,14 +4239,14 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let privilege = match normalize_required_system_privilege(&priv_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4299,7 +4301,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4307,7 +4309,7 @@ impl SqlEditorWidget {
                         {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4365,7 +4367,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4373,7 +4375,7 @@ impl SqlEditorWidget {
                         {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4383,7 +4385,7 @@ impl SqlEditorWidget {
                         ) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4393,12 +4395,14 @@ impl SqlEditorWidget {
                         ) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         if password_text.trim().is_empty() {
-                            fltk::dialog::alert_default("Password is required for CREATE USER.");
+                            SqlEditorWidget::show_alert_dialog(
+                                "Password is required for CREATE USER.",
+                            );
                             continue;
                         }
 
@@ -4449,7 +4453,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4506,7 +4510,7 @@ impl SqlEditorWidget {
                         let role = match normalize_required_identifier(&role_text, "Role") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4553,7 +4557,7 @@ impl SqlEditorWidget {
                         let role = match normalize_required_identifier(&role_text, "Role") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4600,7 +4604,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4649,7 +4653,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4696,7 +4700,7 @@ impl SqlEditorWidget {
                         let user = match normalize_required_identifier(&user_text, "User") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -4797,7 +4801,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Security action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                             }
                         }
                     }
@@ -5131,7 +5135,7 @@ impl SqlEditorWidget {
                             ) {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             }
@@ -5226,19 +5230,19 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         if script_text.trim().is_empty() {
-                            fltk::dialog::alert_default("Backup script is required.");
+                            SqlEditorWidget::show_alert_dialog("Backup script is required.");
                             continue;
                         }
 
@@ -5311,19 +5315,19 @@ impl SqlEditorWidget {
                         let owner = match normalize_optional_identifier(&owner_text, "Owner") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let job_name = match normalize_required_identifier(&job_text, "Job") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         if script_text.trim().is_empty() {
-                            fltk::dialog::alert_default("Restore script is required.");
+                            SqlEditorWidget::show_alert_dialog("Restore script is required.");
                             continue;
                         }
 
@@ -5486,7 +5490,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("RMAN action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 if let Some((
                                     queued_mode,
                                     queued_lookback_text,
@@ -5783,7 +5787,7 @@ impl SqlEditorWidget {
                                 ) {
                                     Ok(value) => value,
                                     Err(err) => {
-                                        fltk::dialog::alert_default(&err);
+                                        SqlEditorWidget::show_alert_dialog(&err);
                                         continue;
                                     }
                                 }
@@ -5798,7 +5802,7 @@ impl SqlEditorWidget {
                             ) {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             }
@@ -5814,7 +5818,7 @@ impl SqlEditorWidget {
                                 ) {
                                     Ok(value) => value,
                                     Err(err) => {
-                                        fltk::dialog::alert_default(&err);
+                                        SqlEditorWidget::show_alert_dialog(&err);
                                         continue;
                                     }
                                 }
@@ -5824,7 +5828,7 @@ impl SqlEditorWidget {
                         let sql_id_filter = match normalize_optional_sql_id(&sql_id_text) {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -6400,14 +6404,14 @@ impl SqlEditorWidget {
                             continue;
                         }
                         if !overview_loaded {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Load Data Guard Overview first to verify role before apply control.",
                             );
                             continue;
                         }
                         if !dataguard_role_allows_apply_control(current_database_role.as_deref()) {
                             let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
-                            fltk::dialog::alert_default(&format!(
+                            SqlEditorWidget::show_alert_dialog(&format!(
                                 "Start apply is supported for PHYSICAL STANDBY role (current: {}).",
                                 role
                             ));
@@ -6476,14 +6480,14 @@ impl SqlEditorWidget {
                             continue;
                         }
                         if !overview_loaded {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Load Data Guard Overview first to verify role before apply control.",
                             );
                             continue;
                         }
                         if !dataguard_role_allows_apply_control(current_database_role.as_deref()) {
                             let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
-                            fltk::dialog::alert_default(&format!(
+                            SqlEditorWidget::show_alert_dialog(&format!(
                                 "Stop apply is supported for PHYSICAL STANDBY role (current: {}).",
                                 role
                             ));
@@ -6552,7 +6556,7 @@ impl SqlEditorWidget {
                             continue;
                         }
                         if !overview_loaded {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Load Data Guard Overview first to validate target information.",
                             );
                             continue;
@@ -6560,7 +6564,7 @@ impl SqlEditorWidget {
 
                         let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
                         if role != "PRIMARY" && role != "PHYSICAL STANDBY" {
-                            fltk::dialog::alert_default(&format!(
+                            SqlEditorWidget::show_alert_dialog(&format!(
                                 "Switchover is supported only on PRIMARY or PHYSICAL STANDBY role (current: {}).",
                                 role
                             ));
@@ -6571,12 +6575,12 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&target_text, "Target DB name") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
                         if current_db_unique_name.as_deref() == Some(target.as_str()) {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Target DB_UNIQUE_NAME must be different from current database.",
                             );
                             continue;
@@ -6650,7 +6654,7 @@ impl SqlEditorWidget {
                             continue;
                         }
                         if !overview_loaded {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Load Data Guard Overview first to validate target information.",
                             );
                             continue;
@@ -6658,7 +6662,7 @@ impl SqlEditorWidget {
 
                         let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
                         if role != "PHYSICAL STANDBY" {
-                            fltk::dialog::alert_default(&format!(
+                            SqlEditorWidget::show_alert_dialog(&format!(
                                 "Failover is supported only on PHYSICAL STANDBY role (current: {}).",
                                 role
                             ));
@@ -6669,12 +6673,12 @@ impl SqlEditorWidget {
                             match normalize_required_identifier(&target_text, "Target DB name") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
                         if current_db_unique_name.as_deref() == Some(target.as_str()) {
-                            fltk::dialog::alert_default(
+                            SqlEditorWidget::show_alert_dialog(
                                 "Target DB_UNIQUE_NAME must be different from current database.",
                             );
                             continue;
@@ -6751,7 +6755,7 @@ impl SqlEditorWidget {
 
                         if current_database_role.as_deref() != Some("PRIMARY") {
                             let role = current_database_role.as_deref().unwrap_or("UNKNOWN");
-                            fltk::dialog::alert_default(&format!(
+                            SqlEditorWidget::show_alert_dialog(&format!(
                                 "Force log switch is available only on PRIMARY role (current: {}).",
                                 role
                             ));
@@ -6943,7 +6947,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Data Guard action failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 if let Some((queued_mode, queued_attention_only)) =
                                     pending_load_request.take()
                                 {
@@ -7389,10 +7393,7 @@ fn normalize_required_identifier(value: &str, name: &str) -> Result<String, Stri
 
     let upper = trimmed.to_uppercase();
     if upper.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
-        return Err(format!(
-            "{} must start with a letter, _, $, or #",
-            name
-        ));
+        return Err(format!("{} must start with a letter, _, $, or #", name));
     }
     if !is_ascii_identifier(&upper) {
         return Err(format!("{} must use only letters, digits, _, $, #", name));
@@ -7463,7 +7464,10 @@ fn parse_owner_job_row(row_values: &[String]) -> Option<(String, String)> {
     Some((owner_upper, job_upper))
 }
 
-fn parse_sql_id_child_row(row_values: &[String], columns: &[String]) -> Option<(String, Option<i32>)> {
+fn parse_sql_id_child_row(
+    row_values: &[String],
+    columns: &[String],
+) -> Option<(String, Option<i32>)> {
     let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
     let sql_id = sql_id_text.trim().to_uppercase();
     if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
