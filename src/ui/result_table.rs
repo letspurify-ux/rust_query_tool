@@ -522,14 +522,20 @@ impl ResultTableWidget {
                                     col,
                                 );
                                 if let Some(cell_val) = cell_val_owned {
-                                    Self::show_cell_text_dialog(
-                                        &cell_val,
+                                    let current_font_profile = {
                                         *font_profile_for_handle
                                             .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    };
+                                    let current_font_size = {
                                         *font_size_for_handle
                                             .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    };
+                                    Self::show_cell_text_dialog(
+                                        &cell_val,
+                                        current_font_profile,
+                                        current_font_size,
                                     );
                                     return true;
                                 }
