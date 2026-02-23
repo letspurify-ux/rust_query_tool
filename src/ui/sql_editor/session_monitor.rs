@@ -269,7 +269,7 @@ impl SqlEditorWidget {
                             match parse_positive_u32(&min_elapsed_text, "Min seconds") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
@@ -323,14 +323,14 @@ impl SqlEditorWidget {
                         let sid = match parse_positive_i64(&sid_text, "SID") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
                         let serial = match parse_positive_i64(&serial_text, "SERIAL#") {
                             Ok(value) => value,
                             Err(err) => {
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                                 continue;
                             }
                         };
@@ -339,7 +339,7 @@ impl SqlEditorWidget {
                             match parse_optional_positive_i64(&instance_text, "INST_ID") {
                                 Ok(value) => value,
                                 Err(err) => {
-                                    fltk::dialog::alert_default(&err);
+                                    SqlEditorWidget::show_alert_dialog(&err);
                                     continue;
                                 }
                             };
@@ -474,7 +474,7 @@ impl SqlEditorWidget {
                             }
                             Err(err) => {
                                 status.set_label("Session kill failed");
-                                fltk::dialog::alert_default(&err);
+                                SqlEditorWidget::show_alert_dialog(&err);
                             }
                         }
                     }
