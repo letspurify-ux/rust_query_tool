@@ -252,17 +252,23 @@ fn test_maybe_inject_rowid_for_editing_keeps_existing_rowid() {
 }
 
 #[test]
-fn test_maybe_inject_rowid_for_editing_skips_join_query() {
+fn test_maybe_inject_rowid_for_editing_injects_for_join_query() {
     let sql = "SELECT e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
+    );
 }
 
 #[test]
-fn test_maybe_inject_rowid_for_editing_skips_multi_table_from_comma_join() {
+fn test_maybe_inject_rowid_for_editing_injects_for_multi_table_from_comma_join() {
     let sql = "SELECT ENAME FROM EMP e, DEPT d WHERE e.DEPTNO = d.DEPTNO";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME FROM EMP e, DEPT d WHERE e.DEPTNO = d.DEPTNO"
+    );
 }
 
 #[test]
@@ -273,10 +279,24 @@ fn test_maybe_inject_rowid_for_editing_allows_where_in_comma_values() {
 }
 
 #[test]
-fn test_maybe_inject_rowid_for_editing_skips_with_clause_select() {
+fn test_maybe_inject_rowid_for_editing_injects_for_with_clause_referencing_base_table() {
+    let sql = "WITH dept_avg AS (SELECT DEPTNO, AVG(SAL) avg_sal FROM EMP GROUP BY DEPTNO) SELECT ENAME, SAL FROM EMP e JOIN dept_avg d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "WITH dept_avg AS (SELECT DEPTNO, AVG(SAL) avg_sal FROM EMP GROUP BY DEPTNO) SELECT e.ROWID, ENAME, SAL FROM EMP e JOIN dept_avg d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_with_clause_only_cte_ref() {
+    // When the main SELECT FROM only references a CTE (not a base table), skip.
     let sql = "WITH e AS (SELECT ENAME FROM EMP) SELECT ENAME FROM e";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, sql);
+    assert_eq!(
+        rewritten,
+        "WITH e AS (SELECT ENAME FROM EMP) SELECT e.ROWID, ENAME FROM e"
+    );
 }
 
 #[test]
@@ -346,6 +366,320 @@ fn test_maybe_inject_rowid_for_editing_qualifies_leading_wildcard_with_table_nam
     let sql = "select * from help;";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(rewritten, "select help.ROWID, help.* from help;");
+}
+
+// --- Multi-table / JOIN / CTE / subquery test cases ---
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_left_join() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e LEFT JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e LEFT JOIN DEPT d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_right_join() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e RIGHT JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e RIGHT JOIN DEPT d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_full_outer_join() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e FULL OUTER JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e FULL OUTER JOIN DEPT d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_cross_join() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e CROSS JOIN DEPT d";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e CROSS JOIN DEPT d"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_natural_join() {
+    let sql = "SELECT ENAME, DNAME FROM EMP e NATURAL JOIN DEPT d";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME, DNAME FROM EMP e NATURAL JOIN DEPT d"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_multiple_joins() {
+    let sql = "SELECT e.ENAME, d.DNAME, s.GRADE FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO JOIN SALGRADE s ON e.SAL BETWEEN s.LOSAL AND s.HISAL";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME, s.GRADE FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO JOIN SALGRADE s ON e.SAL BETWEEN s.LOSAL AND s.HISAL"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_without_alias() {
+    let sql = "SELECT ENAME, DNAME FROM EMP JOIN DEPT ON EMP.DEPTNO = DEPT.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT EMP.ROWID, ENAME, DNAME FROM EMP JOIN DEPT ON EMP.DEPTNO = DEPT.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_with_schema_prefix() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM SCOTT.EMP e JOIN SCOTT.DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM SCOTT.EMP e JOIN SCOTT.DEPT d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_with_quoted_alias() {
+    let sql = r#"SELECT "e".ENAME FROM EMP "e" JOIN DEPT "d" ON "e".DEPTNO = "d".DEPTNO"#;
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        r#"SELECT "e".ROWID, "e".ENAME FROM EMP "e" JOIN DEPT "d" ON "e".DEPTNO = "d".DEPTNO"#
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_clause_and_join_to_base_table() {
+    let sql = "WITH recent AS (SELECT DEPTNO FROM DEPT WHERE LOC = 'DALLAS') SELECT e.ENAME FROM EMP e JOIN recent r ON e.DEPTNO = r.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "WITH recent AS (SELECT DEPTNO FROM DEPT WHERE LOC = 'DALLAS') SELECT e.ROWID, e.ENAME FROM EMP e JOIN recent r ON e.DEPTNO = r.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_clause_single_base_table() {
+    let sql = "WITH dept_info AS (SELECT DEPTNO, DNAME FROM DEPT) SELECT e.ENAME, d.DNAME FROM EMP e, dept_info d WHERE e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "WITH dept_info AS (SELECT DEPTNO, DNAME FROM DEPT) SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e, dept_info d WHERE e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_multiple_ctes() {
+    let sql = "WITH cte1 AS (SELECT 1 AS x FROM DUAL), cte2 AS (SELECT 2 AS y FROM DUAL) SELECT ENAME FROM EMP e WHERE e.DEPTNO = 10";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "WITH cte1 AS (SELECT 1 AS x FROM DUAL), cte2 AS (SELECT 2 AS y FROM DUAL) SELECT e.ROWID, ENAME FROM EMP e WHERE e.DEPTNO = 10"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_union() {
+    let sql = "SELECT ENAME FROM EMP UNION SELECT DNAME FROM DEPT";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_union_all() {
+    let sql = "SELECT ENAME FROM EMP UNION ALL SELECT DNAME FROM DEPT";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_intersect() {
+    let sql = "SELECT DEPTNO FROM EMP INTERSECT SELECT DEPTNO FROM DEPT";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_minus() {
+    let sql = "SELECT DEPTNO FROM EMP MINUS SELECT DEPTNO FROM DEPT";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_group_by() {
+    let sql = "SELECT DEPTNO, COUNT(*) FROM EMP GROUP BY DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_connect_by() {
+    let sql = "SELECT EMPNO, MGR, LEVEL FROM EMP CONNECT BY PRIOR EMPNO = MGR START WITH MGR IS NULL";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_subquery_in_where() {
+    let sql = "SELECT ENAME FROM EMP e WHERE DEPTNO IN (SELECT DEPTNO FROM DEPT WHERE LOC = 'DALLAS')";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME FROM EMP e WHERE DEPTNO IN (SELECT DEPTNO FROM DEPT WHERE LOC = 'DALLAS')"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_correlated_subquery() {
+    let sql = "SELECT ENAME, SAL FROM EMP e WHERE SAL > (SELECT AVG(SAL) FROM EMP WHERE DEPTNO = e.DEPTNO)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME, SAL FROM EMP e WHERE SAL > (SELECT AVG(SAL) FROM EMP WHERE DEPTNO = e.DEPTNO)"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_exists_subquery() {
+    let sql = "SELECT ENAME FROM EMP e WHERE EXISTS (SELECT 1 FROM DEPT d WHERE d.DEPTNO = e.DEPTNO)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME FROM EMP e WHERE EXISTS (SELECT 1 FROM DEPT d WHERE d.DEPTNO = e.DEPTNO)"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_scalar_subquery_in_select() {
+    let sql = "SELECT ENAME, (SELECT DNAME FROM DEPT d WHERE d.DEPTNO = e.DEPTNO) AS DEPT_NAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME, (SELECT DNAME FROM DEPT d WHERE d.DEPTNO = e.DEPTNO) AS DEPT_NAME FROM EMP e"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_from_subquery_as_source() {
+    // When FROM clause starts with a subquery, ROWID is not available
+    let sql = "SELECT x.ENAME FROM (SELECT ENAME FROM EMP) x";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_with_as_alias() {
+    let sql = "SELECT e.ENAME FROM EMP AS e JOIN DEPT AS d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME FROM EMP AS e JOIN DEPT AS d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_with_where_clause() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO WHERE e.SAL > 1000";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO WHERE e.SAL > 1000"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_join_wildcard_qualifies_first_table() {
+    let sql = "SELECT * FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.* FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_keeps_existing_qualified_rowid() {
+    let sql = "SELECT e.ROWID, e.ENAME FROM EMP e JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_recursive_cte() {
+    // Recursive CTE with base table in main SELECT
+    let sql = "WITH RECURSIVE mgr_chain AS (SELECT EMPNO, ENAME, MGR FROM EMP WHERE EMPNO = 7369 UNION ALL SELECT e.EMPNO, e.ENAME, e.MGR FROM EMP e JOIN mgr_chain m ON e.EMPNO = m.MGR) SELECT ENAME FROM mgr_chain";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    // Main SELECT is from CTE only, UNION inside CTE is inside parens (not top-level)
+    assert_eq!(
+        rewritten,
+        "WITH RECURSIVE mgr_chain AS (SELECT EMPNO, ENAME, MGR FROM EMP WHERE EMPNO = 7369 UNION ALL SELECT e.EMPNO, e.ENAME, e.MGR FROM EMP e JOIN mgr_chain m ON e.EMPNO = m.MGR) SELECT mgr_chain.ROWID, ENAME FROM mgr_chain"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_quoted_table_name() {
+    let sql = r#"SELECT "Employee Name" FROM "My Table" t"#;
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        r#"SELECT t.ROWID, "Employee Name" FROM "My Table" t"#
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_schema_no_alias() {
+    let sql = "SELECT ENAME FROM HR.EMPLOYEES";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT HR.EMPLOYEES.ROWID, ENAME FROM HR.EMPLOYEES"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_having_without_group_by_keyword() {
+    // HAVING without GROUP BY is unusual but valid in some dialects
+    let sql = "SELECT ENAME FROM EMP e WHERE SAL > 1000 ORDER BY ENAME";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME FROM EMP e WHERE SAL > 1000 ORDER BY ENAME"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_group_by_in_subquery_not_top_level() {
+    // GROUP BY inside subquery should NOT block injection (only top-level GROUP matters)
+    let sql = "SELECT e.ENAME FROM EMP e WHERE e.DEPTNO IN (SELECT DEPTNO FROM EMP GROUP BY DEPTNO HAVING COUNT(*) > 3)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME FROM EMP e WHERE e.DEPTNO IN (SELECT DEPTNO FROM EMP GROUP BY DEPTNO HAVING COUNT(*) > 3)"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_union_in_subquery_not_top_level() {
+    // UNION inside a subquery should NOT block injection
+    let sql = "SELECT e.ENAME FROM EMP e WHERE e.DEPTNO IN (SELECT DEPTNO FROM DEPT UNION SELECT DEPTNO FROM EMP)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME FROM EMP e WHERE e.DEPTNO IN (SELECT DEPTNO FROM DEPT UNION SELECT DEPTNO FROM EMP)"
+    );
 }
 
 #[test]

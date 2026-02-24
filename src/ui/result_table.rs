@@ -3451,6 +3451,61 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn resolve_target_table_resolves_join_with_qualified_rowid() {
+        // This is the SQL after ROWID injection for a JOIN query
+        let sql = "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_resolves_comma_join_with_qualified_rowid() {
+        let sql = "SELECT e.ROWID, ENAME FROM EMP e, DEPT d WHERE e.DEPTNO = d.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_resolves_with_clause_query() {
+        let sql = "WITH dept_avg AS (SELECT DEPTNO, AVG(SAL) avg_sal FROM EMP GROUP BY DEPTNO) SELECT e.ROWID, ENAME FROM EMP e JOIN dept_avg d ON e.DEPTNO = d.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_resolves_left_join_with_qualified_rowid() {
+        let sql = "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e LEFT JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_resolves_schema_qualified_table_with_alias() {
+        let sql = "SELECT e.ROWID, e.ENAME FROM SCOTT.EMP e JOIN SCOTT.DEPT d ON e.DEPTNO = d.DEPTNO";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("SCOTT.EMP".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_table_resolves_single_table_no_alias() {
+        let sql = "SELECT EMP.ROWID, ENAME FROM EMP";
+        assert_eq!(
+            ResultTableWidget::resolve_target_table(sql),
+            Ok("EMP".to_string())
+        );
+    }
+
+    #[test]
     fn compose_edit_script_appends_source_select() {
         let script = ResultTableWidget::compose_edit_script(
             "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AAA';",
@@ -3710,8 +3765,13 @@ mod row_edit_sql_tests {
             "SELECT ENAME FROM EMP"
         ));
         assert!(!ResultTableWidget::can_show_insert_row_action("   "));
+        // Unqualified ROWID in multi-table is ambiguous
         assert!(!ResultTableWidget::can_show_insert_row_action(
             "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
+        ));
+        // Qualified ROWID in multi-table resolves correctly
+        assert!(ResultTableWidget::can_show_insert_row_action(
+            "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
     }
 
@@ -3732,9 +3792,16 @@ mod row_edit_sql_tests {
             &valid_headers,
             "   "
         ));
+        // Unqualified ROWID in multi-table is ambiguous
         assert!(!ResultTableWidget::can_show_rowid_edit_actions(
             &valid_headers,
             "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
+        ));
+        // Qualified ROWID in multi-table resolves correctly
+        let qualified_headers = vec!["E.ROWID".to_string(), "ENAME".to_string()];
+        assert!(ResultTableWidget::can_show_rowid_edit_actions(
+            &qualified_headers,
+            "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
     }
 }

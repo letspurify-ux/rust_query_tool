@@ -1292,59 +1292,80 @@ impl QueryExecutor {
         if !Self::is_select_statement(sql) {
             return sql.to_string();
         }
-        if !Self::leading_keyword(sql)
-            .as_deref()
-            .is_some_and(|keyword| keyword == "SELECT")
-        {
+
+        let leading_kw = Self::leading_keyword(sql);
+        let leading = leading_kw.as_deref();
+
+        // For WITH (CTE) queries, find the main SELECT's FROM clause
+        let effective_sql: &str;
+        let with_prefix_len: usize;
+        if leading == Some("WITH") {
+            if let Some(main_select_idx) = Self::find_main_select_after_with(sql) {
+                effective_sql = &sql[main_select_idx..];
+                with_prefix_len = main_select_idx;
+            } else {
+                return sql.to_string();
+            }
+        } else if leading == Some("SELECT") {
+            effective_sql = sql;
+            with_prefix_len = 0;
+        } else {
             return sql.to_string();
         }
 
-        let Some(from_idx) = Self::find_top_level_keyword(sql, "FROM") else {
+        let Some(from_idx_in_effective) = Self::find_top_level_keyword(effective_sql, "FROM")
+        else {
             return sql.to_string();
         };
 
-        let upper = sql.to_ascii_uppercase();
-        if upper.contains(" GROUP BY ")
-            || upper.contains(" CONNECT BY ")
-            || upper.contains(" START WITH ")
-            || upper.contains(" UNION ")
-            || upper.contains(" INTERSECT ")
-            || upper.contains(" MINUS ")
+        // Skip queries that fundamentally prevent row-level editing.
+        // Check only top-level keywords to avoid false positives from subqueries.
+        if Self::has_top_level_set_operator(effective_sql)
+            || Self::find_top_level_keyword(effective_sql, "GROUP").is_some()
+            || Self::has_top_level_connect_by(effective_sql)
         {
             return sql.to_string();
         }
 
-        if !Self::is_single_table_from_clause(sql, from_idx) {
+        // Extract the first real table reference from the FROM clause.
+        // For multi-table queries (JOINs, comma-joins), use the first table's alias/name.
+        // If the FROM clause starts with a subquery or no table can be identified, skip injection.
+        let Some(rowid_expr) =
+            Self::first_from_table_rowid_expression(effective_sql, from_idx_in_effective)
+        else {
+            return sql.to_string();
+        };
+        let rowid_qualifier = rowid_expr.strip_suffix(".ROWID").unwrap_or("").trim();
+
+        let select_body_start_in_effective = Self::find_select_body_start(effective_sql)
+            .unwrap_or(from_idx_in_effective);
+        if select_body_start_in_effective >= from_idx_in_effective {
             return sql.to_string();
         }
 
-        let rowid_expr = Self::single_table_rowid_expression(sql, from_idx)
-            .unwrap_or_else(|| "ROWID".to_string());
-        let rowid_qualifier = rowid_expr
-            .strip_suffix(".ROWID")
-            .unwrap_or("")
-            .trim();
-
-        let select_body_start = Self::find_select_body_start(sql).unwrap_or(from_idx);
-        if select_body_start >= from_idx {
+        let select_idx_in_effective =
+            Self::find_top_level_keyword(effective_sql, "SELECT").unwrap_or(0);
+        if Self::select_clause_has_distinct_or_unique(
+            effective_sql,
+            select_idx_in_effective,
+            from_idx_in_effective,
+        ) {
             return sql.to_string();
         }
 
-        let select_idx = Self::find_top_level_keyword(sql, "SELECT").unwrap_or(0);
-        if Self::select_clause_has_distinct_or_unique(sql, select_idx, from_idx) {
-            return sql.to_string();
-        }
-
-        let select_list_upper = sql[select_body_start..from_idx].to_ascii_uppercase();
+        let select_list_upper = effective_sql[select_body_start_in_effective..from_idx_in_effective]
+            .to_ascii_uppercase();
         if select_list_upper.contains("ROWID") {
             return sql.to_string();
         }
 
+        // Build the rewritten SQL
         let injection = format!("{rowid_expr}, ");
+        let global_select_body_start = with_prefix_len + select_body_start_in_effective;
         let mut rewritten = String::with_capacity(sql.len().saturating_add(injection.len()));
-        rewritten.push_str(&sql[..select_body_start]);
+        rewritten.push_str(&sql[..global_select_body_start]);
         rewritten.push_str(&injection);
-        let select_body = &sql[select_body_start..];
+        let select_body = &sql[global_select_body_start..];
         if rowid_qualifier.is_empty() {
             rewritten.push_str(select_body);
             return rewritten;
@@ -1361,6 +1382,387 @@ impl QueryExecutor {
             rewritten.push_str(select_body);
         }
         rewritten
+    }
+
+    /// Find the byte index of the main (final) SELECT keyword after a WITH clause.
+    /// This skips over all CTE definitions to find the top-level SELECT that follows.
+    fn find_main_select_after_with(sql: &str) -> Option<usize> {
+        let chars: Vec<(usize, char)> = sql.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        // Skip past the WITH keyword
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            if c.is_ascii_alphabetic() {
+                let start = byte_idx;
+                let mut end_i = i;
+                while end_i < len && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_') {
+                    end_i += 1;
+                }
+                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let word = &sql[start..end_byte];
+                if word.eq_ignore_ascii_case("WITH") {
+                    i = end_i;
+                    break;
+                }
+                i = end_i;
+                continue;
+            }
+            i += 1;
+        }
+
+        // Now scan for top-level SELECT at depth 0
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && c.is_ascii_alphabetic() {
+                let start = byte_idx;
+                let mut end_i = i;
+                while end_i < len && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_') {
+                    end_i += 1;
+                }
+                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let word = &sql[start..end_byte];
+                if word.eq_ignore_ascii_case("SELECT") {
+                    return Some(start);
+                }
+                i = end_i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
+    /// Check if the effective SQL has a top-level set operator (UNION, INTERSECT, MINUS, EXCEPT).
+    fn has_top_level_set_operator(sql: &str) -> bool {
+        Self::find_top_level_keyword(sql, "UNION").is_some()
+            || Self::find_top_level_keyword(sql, "INTERSECT").is_some()
+            || Self::find_top_level_keyword(sql, "MINUS").is_some()
+            || Self::find_top_level_keyword(sql, "EXCEPT").is_some()
+    }
+
+    /// Check if the effective SQL has a top-level CONNECT BY clause.
+    fn has_top_level_connect_by(sql: &str) -> bool {
+        // CONNECT BY and START WITH are Oracle hierarchical query keywords.
+        // find_top_level_keyword finds standalone keywords at depth 0.
+        Self::find_top_level_keyword(sql, "CONNECT").is_some()
+            || Self::find_top_level_keyword(sql, "START").is_some()
+    }
+
+    /// Extract the ROWID expression for the first real (non-subquery) table
+    /// in the FROM clause. Works for single tables, JOINs, and comma-joins.
+    /// Returns `Some("alias.ROWID")` or `Some("TABLE_NAME.ROWID")` or `None`.
+    fn first_from_table_rowid_expression(sql: &str, from_idx: usize) -> Option<String> {
+        let from_body_start = from_idx.saturating_add("FROM".len());
+        if from_body_start >= sql.len() || !sql.is_char_boundary(from_body_start) {
+            return None;
+        }
+
+        let from_clause = &sql[from_body_start..];
+        let trimmed = from_clause.trim_start();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // If FROM starts with '(' it's a subquery - scan past it to check
+        // but first, try to extract table from the first non-subquery reference.
+        Self::extract_first_table_ref_rowid(trimmed)
+    }
+
+    /// Extract the first table reference (name + optional alias) from a FROM clause fragment.
+    /// Handles: plain table, schema.table, quoted identifiers, subqueries (skipped),
+    /// LATERAL keyword, ONLY keyword.
+    fn extract_first_table_ref_rowid(from_body: &str) -> Option<String> {
+        let chars: Vec<(usize, char)> = from_body.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+
+        // Skip leading whitespace
+        while i < len && chars[i].1.is_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            return None;
+        }
+
+        // Skip ONLY keyword if present (e.g., FROM ONLY (table_name))
+        if i < len && chars[i].1.is_ascii_alphabetic() {
+            let word_start = chars[i].0;
+            let mut wi = i;
+            while wi < len && (chars[wi].1.is_ascii_alphanumeric() || chars[wi].1 == '_' || chars[wi].1 == '$' || chars[wi].1 == '#') {
+                wi += 1;
+            }
+            let word_end = if wi < len { chars[wi].0 } else { from_body.len() };
+            let word = &from_body[word_start..word_end];
+            if word.eq_ignore_ascii_case("LATERAL") || word.eq_ignore_ascii_case("ONLY") {
+                i = wi;
+                while i < len && chars[i].1.is_whitespace() {
+                    i += 1;
+                }
+            }
+        }
+
+        if i >= len {
+            return None;
+        }
+
+        // If starts with '(' it's a subquery/inline view — cannot use ROWID directly
+        if chars[i].1 == '(' {
+            return None;
+        }
+
+        // Parse the table name (possibly schema.table)
+        let table_name = Self::parse_identifier_at(&chars, from_body, &mut i)?;
+
+        // Check for schema.table pattern
+        let full_name = if i < len && chars[i].1 == '.' {
+            i += 1; // skip dot
+            if let Some(second_part) = Self::parse_identifier_at(&chars, from_body, &mut i) {
+                format!("{}.{}", table_name, second_part)
+            } else {
+                table_name
+            }
+        } else {
+            table_name
+        };
+
+        // Skip whitespace after table name
+        while i < len && chars[i].1.is_whitespace() {
+            i += 1;
+        }
+
+        // Check for optional alias
+        let alias = Self::parse_optional_alias(&chars, from_body, &mut i);
+
+        if let Some(alias_str) = alias {
+            Some(format!("{alias_str}.ROWID"))
+        } else {
+            Some(format!("{full_name}.ROWID"))
+        }
+    }
+
+    /// Parse an identifier (possibly quoted) at the current position.
+    fn parse_identifier_at(
+        chars: &[(usize, char)],
+        text: &str,
+        pos: &mut usize,
+    ) -> Option<String> {
+        let len = chars.len();
+        if *pos >= len {
+            return None;
+        }
+
+        let start_char = chars[*pos].1;
+
+        if start_char == '"' {
+            // Quoted identifier
+            let start_byte = chars[*pos].0;
+            *pos += 1; // skip opening quote
+            while *pos < len {
+                if chars[*pos].1 == '"' {
+                    if *pos + 1 < len && chars[*pos + 1].1 == '"' {
+                        *pos += 2; // escaped quote
+                        continue;
+                    }
+                    *pos += 1; // closing quote
+                    let end_byte = if *pos < len {
+                        chars[*pos].0
+                    } else {
+                        text.len()
+                    };
+                    return Some(text[start_byte..end_byte].to_string());
+                }
+                *pos += 1;
+            }
+            // Unterminated quote — return what we have
+            return Some(text[start_byte..].to_string());
+        }
+
+        if start_char.is_ascii_alphabetic() || start_char == '_' {
+            let start_byte = chars[*pos].0;
+            while *pos < len
+                && (chars[*pos].1.is_ascii_alphanumeric()
+                    || chars[*pos].1 == '_'
+                    || chars[*pos].1 == '$'
+                    || chars[*pos].1 == '#')
+            {
+                *pos += 1;
+            }
+            let end_byte = if *pos < len {
+                chars[*pos].0
+            } else {
+                text.len()
+            };
+            return Some(text[start_byte..end_byte].to_string());
+        }
+
+        None
+    }
+
+    /// Parse an optional alias after a table name.
+    /// Skips AS keyword if present. Returns None if the next keyword is a
+    /// SQL clause keyword (JOIN, ON, WHERE, etc.) or if no alias follows.
+    fn parse_optional_alias(
+        chars: &[(usize, char)],
+        text: &str,
+        pos: &mut usize,
+    ) -> Option<String> {
+        let len = chars.len();
+        if *pos >= len {
+            return None;
+        }
+
+        // Check what follows the table name
+        let c = chars[*pos].1;
+        if c == ',' || c == ';' || c == ')' {
+            return None;
+        }
+
+        // Try to read a word
+        if c.is_ascii_alphabetic() || c == '_' || c == '"' {
+            let save_pos = *pos;
+            let word = Self::parse_identifier_at(chars, text, pos)?;
+            let word_upper = word.trim_matches('"').to_ascii_uppercase();
+
+            // If the word is a SQL keyword that terminates table references, it's not an alias
+            if Self::is_from_stop_keyword(&word_upper) {
+                *pos = save_pos;
+                return None;
+            }
+
+            // "AS" keyword — skip it and read the actual alias
+            if word_upper == "AS" {
+                while *pos < len && chars[*pos].1.is_whitespace() {
+                    *pos += 1;
+                }
+                if *pos < len {
+                    return Self::parse_identifier_at(chars, text, pos);
+                }
+                return None;
+            }
+
+            // Otherwise this word is the alias
+            return Some(word);
+        }
+
+        None
+    }
+
+    /// Check if a word is a keyword that terminates FROM clause table references.
+    fn is_from_stop_keyword(word_upper: &str) -> bool {
+        matches!(
+            word_upper,
+            "WHERE"
+                | "ORDER"
+                | "GROUP"
+                | "HAVING"
+                | "FETCH"
+                | "OFFSET"
+                | "FOR"
+                | "UNION"
+                | "INTERSECT"
+                | "MINUS"
+                | "EXCEPT"
+                | "CONNECT"
+                | "START"
+                | "PIVOT"
+                | "UNPIVOT"
+                | "MODEL"
+                | "RETURNING"
+                | "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "CROSS"
+                | "NATURAL"
+                | "ON"
+                | "USING"
+                | "PARTITION"
+                | "SAMPLE"
+                | "LATERAL"
+        )
     }
 
     fn find_leading_wildcard_in_select_list(select_body: &str) -> Option<(usize, usize)> {
