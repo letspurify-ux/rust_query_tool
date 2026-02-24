@@ -3732,13 +3732,15 @@ impl MainWindow {
                                         ) {
                                             continue;
                                         }
+                                        let normalized_content =
+                                            MainWindow::normalize_line_endings_for_editor(content);
                                         if let Some(tab_id) =
                                             MainWindow::create_query_editor_tab(&mut s)
                                         {
-                                            s.sql_buffer.set_text(&content);
+                                            s.sql_buffer.set_text(&normalized_content);
                                             s.sql_editor.reset_undo_redo_history();
                                             s.set_tab_file_path(tab_id, Some(path.clone()));
-                                            s.set_tab_pristine_text(tab_id, content);
+                                            s.set_tab_pristine_text(tab_id, normalized_content);
                                             created_editor_for_open = Some(s.sql_editor.clone());
                                             created_right_tile_for_open =
                                                 Some(s.right_tile.clone());
@@ -4187,6 +4189,15 @@ The crash has been recorded in the application log.",
 
         lines.join("\n")
     }
+
+    fn normalize_line_endings_for_editor(mut text: String) -> String {
+        if !text.contains('\r') {
+            return text;
+        }
+
+        text = text.replace("\r\n", "\n");
+        text.replace('\r', "\n")
+    }
 }
 
 #[cfg(test)]
@@ -4214,6 +4225,22 @@ mod tests {
         );
 
         assert_eq!(action, Some("Edit/Find..."));
+    }
+
+    #[test]
+    fn normalize_line_endings_for_editor_converts_crlf_and_cr_to_lf() {
+        let text = String::from("select 1;\r\nselect 2;\rselect 3;");
+        let normalized = MainWindow::normalize_line_endings_for_editor(text);
+
+        assert_eq!(normalized, "select 1;\nselect 2;\nselect 3;");
+    }
+
+    #[test]
+    fn normalize_line_endings_for_editor_keeps_lf_only_content() {
+        let text = String::from("select 1;\nselect 2;");
+        let normalized = MainWindow::normalize_line_endings_for_editor(text.clone());
+
+        assert_eq!(normalized, text);
     }
 }
 
