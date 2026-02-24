@@ -703,6 +703,13 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
 
 fn style_bytes_to_string(styles: Vec<u8>) -> String {
     // Styles use ASCII tags ('A'..'K'), so UTF-8 validation is unnecessary.
+    // In debug builds, verify the invariant so programming errors surface immediately.
+    debug_assert!(
+        styles.iter().all(|&b| b.is_ascii()),
+        "style bytes must be valid ASCII"
+    );
+    // SAFETY: All style bytes are ASCII character codes ('A'..'K') which are
+    // valid single-byte UTF-8 code points.
     unsafe { String::from_utf8_unchecked(styles) }
 }
 
