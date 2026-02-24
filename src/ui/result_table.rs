@@ -1029,8 +1029,8 @@ impl ResultTableWidget {
             return true;
         }
         if !is_editable_column {
-            fltk::dialog::alert_default("Selected column is not editable.");
-            return true;
+            // 편집 불가 컬럼은 alert 없이 false를 반환해 일반 셀 내용 팝업으로 fallthrough
+            return false;
         }
 
         let column_exists = headers
@@ -2552,9 +2552,16 @@ impl ResultTableWidget {
                     let mut column_names = Vec::new();
                     let mut values = Vec::new();
                     for (col_idx, column_id) in session.editable_columns.iter() {
-                        column_names.push(column_id.clone());
                         let value = row.get(*col_idx).cloned().unwrap_or_default();
-                        values.push(Self::sql_literal_from_input(&value));
+                        // 값이 비어 있는 컬럼은 INSERT 목록에서 제외해
+                        // DB가 DEFAULT 값을 적용할 수 있게 한다.
+                        // 명시적으로 NULL을 원할 때는 '=NULL' 또는 단독 NULL 입력 사용.
+                        if value.is_empty() {
+                            continue;
+                        }
+                        let literal = Self::sql_literal_from_input(&value);
+                        column_names.push(column_id.clone());
+                        values.push(literal);
                     }
                     if !column_names.is_empty() {
                         statements.push(format!(
@@ -3059,7 +3066,9 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for row in row_top..=row_bot {
-                result.push('\n');
+                if row > row_top {
+                    result.push('\n');
+                }
                 for (visible_idx, col) in visible_cols.iter().enumerate() {
                     if visible_idx > 0 {
                         result.push('\t');
