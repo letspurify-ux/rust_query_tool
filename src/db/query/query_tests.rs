@@ -241,7 +241,7 @@ SELECT txt FROM t";
 fn test_maybe_inject_rowid_for_editing_injects_for_simple_single_table_select() {
     let sql = "SELECT ENAME, JOB FROM EMP";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, "SELECT ROWID, ENAME, JOB FROM EMP");
+    assert_eq!(rewritten, "SELECT EMP.ROWID, ENAME, JOB FROM EMP");
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn test_maybe_inject_rowid_for_editing_skips_multi_table_from_comma_join() {
 fn test_maybe_inject_rowid_for_editing_allows_where_in_comma_values() {
     let sql = "SELECT ENAME FROM EMP WHERE DEPTNO IN (10, 20)";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, "SELECT ROWID, ENAME FROM EMP WHERE DEPTNO IN (10, 20)");
+    assert_eq!(rewritten, "SELECT EMP.ROWID, ENAME FROM EMP WHERE DEPTNO IN (10, 20)");
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn test_maybe_inject_rowid_for_editing_preserves_leading_hint_position() {
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(
         rewritten,
-        "SELECT /*+ INDEX(emp emp_idx1) */ ROWID, ENAME FROM EMP"
+        "SELECT /*+ INDEX(emp emp_idx1) */ EMP.ROWID, ENAME FROM EMP"
     );
 }
 
@@ -323,8 +323,46 @@ fn test_maybe_inject_rowid_for_editing_preserves_hint_before_all_modifier() {
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(
         rewritten,
-        "SELECT /*+ FULL(emp) */ ALL ROWID, ENAME FROM EMP"
+        "SELECT /*+ FULL(emp) */ ALL EMP.ROWID, ENAME FROM EMP"
     );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_uses_alias_when_present() {
+    let sql = "SELECT ENAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "SELECT e.ROWID, ENAME FROM EMP e");
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_qualifies_help_rowid_without_alias() {
+    let sql = "select * from help;";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "select help.ROWID, * from help;");
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_non_key_preserved_table() {
+    let message = "ORA-01445: cannot select ROWID from, or sample, a join view without a key-preserved table";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_rowid_illegal_here() {
+    let message = "ORA-01446: cannot select ROWID from, or sample, a view with DISTINCT, GROUP BY, etc.";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_invalid_identifier_rowid() {
+    let message = "ORA-00904: \"ROWID\": invalid identifier";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_ignores_other_oracle_errors() {
+    let message = "ORA-00942: table or view does not exist";
+    assert!(!QueryExecutor::is_retryable_rowid_injection_error(message));
 }
 
 #[test]
