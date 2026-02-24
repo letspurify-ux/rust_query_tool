@@ -1318,6 +1318,9 @@ impl QueryExecutor {
             return sql.to_string();
         }
 
+        let rowid_expr = Self::single_table_rowid_expression(sql, from_idx)
+            .unwrap_or_else(|| "ROWID".to_string());
+
         let select_body_start = Self::find_select_body_start(sql).unwrap_or(from_idx);
         if select_body_start >= from_idx {
             return sql.to_string();
@@ -1333,10 +1336,10 @@ impl QueryExecutor {
             return sql.to_string();
         }
 
-        let injection = "ROWID, ";
+        let injection = format!("{rowid_expr}, ");
         let mut rewritten = String::with_capacity(sql.len().saturating_add(injection.len()));
         rewritten.push_str(&sql[..select_body_start]);
-        rewritten.push_str(injection);
+        rewritten.push_str(&injection);
         rewritten.push_str(&sql[select_body_start..]);
         rewritten
     }
@@ -1651,6 +1654,100 @@ impl QueryExecutor {
         }
 
         None
+    }
+
+    fn single_table_rowid_expression(sql: &str, from_idx: usize) -> Option<String> {
+        let from_body_start = from_idx.saturating_add("FROM".len());
+        if from_body_start >= sql.len() || !sql.is_char_boundary(from_body_start) {
+            return None;
+        }
+
+        let from_body_end = Self::find_top_level_keyword(sql, "WHERE")
+            .or_else(|| Self::find_top_level_keyword(sql, "ORDER"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FETCH"))
+            .or_else(|| Self::find_top_level_keyword(sql, "OFFSET"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FOR"))
+            .unwrap_or(sql.len());
+        if from_body_end <= from_body_start || !sql.is_char_boundary(from_body_end) {
+            return None;
+        }
+
+        let from_clause = &sql[from_body_start..from_body_end];
+        let table_ref = from_clause.trim_start();
+        if table_ref.is_empty() {
+            return None;
+        }
+
+        let upper = table_ref.to_ascii_uppercase();
+        if upper.starts_with("(") {
+            return None;
+        }
+
+        let alias_start = if upper.starts_with('"') {
+            let bytes = table_ref.as_bytes();
+            let mut idx = 1usize;
+            while idx < bytes.len() {
+                if bytes[idx] == b'"' {
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'"' {
+                        idx += 2;
+                        continue;
+                    }
+                    idx += 1;
+                    break;
+                }
+                idx += 1;
+            }
+            idx
+        } else {
+            table_ref
+                .char_indices()
+                .find_map(|(idx, ch)| {
+                    if ch.is_whitespace() || ch == ';' {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(table_ref.len())
+        };
+
+        let table_name = table_ref
+            .get(..alias_start)?
+            .trim_end_matches(';')
+            .trim_end();
+        if table_name.is_empty() {
+            return None;
+        }
+
+        let mut alias_source = table_ref.get(alias_start..).unwrap_or("").trim_start();
+        if alias_source.is_empty() {
+            return Some(format!("{table_name}.ROWID"));
+        }
+
+        if alias_source
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
+        {
+            alias_source = alias_source.get(2..).unwrap_or("").trim_start();
+        }
+
+        let alias_len = alias_source
+            .char_indices()
+            .find_map(|(idx, ch)| {
+                if ch.is_whitespace() || ch == ';' {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(alias_source.len());
+        let alias = alias_source.get(..alias_len).unwrap_or("").trim();
+
+        if alias.is_empty() {
+            Some(format!("{table_name}.ROWID"))
+        } else {
+            Some(format!("{alias}.ROWID"))
+        }
     }
 
     fn is_single_table_from_clause(sql: &str, from_idx: usize) -> bool {
