@@ -1465,48 +1465,82 @@ impl QueryExecutor {
     fn find_select_body_start(sql: &str) -> Option<usize> {
         let select_idx = Self::find_top_level_keyword(sql, "SELECT")?;
         let select_end = select_idx.saturating_add("SELECT".len());
-        let mut idx = select_end;
+        let mut idx = Self::skip_select_prefix_whitespace_and_hint(sql, select_end);
 
-        while idx < sql.len() {
-            let mut advanced = false;
-            for (rel, ch) in sql[idx..].char_indices() {
-                if ch.is_whitespace() {
-                    idx = idx.saturating_add(rel + ch.len_utf8());
-                    advanced = true;
-                    break;
-                }
-                idx = idx.saturating_add(rel);
+        for modifier in ["DISTINCT", "UNIQUE", "ALL"] {
+            if Self::starts_with_keyword_at(sql, idx, modifier) {
+                idx = idx.saturating_add(modifier.len());
+                idx = Self::skip_ascii_whitespace(sql, idx);
                 break;
             }
+        }
+
+        Some(idx.min(sql.len()))
+    }
+
+    fn skip_ascii_whitespace(sql: &str, mut idx: usize) -> usize {
+        while idx < sql.len() {
+            let mut advanced = false;
+            if let Some(slice) = sql.get(idx..) {
+                for (rel, ch) in slice.char_indices() {
+                    if ch.is_whitespace() {
+                        idx = idx.saturating_add(rel + ch.len_utf8());
+                        advanced = true;
+                        break;
+                    }
+                    idx = idx.saturating_add(rel);
+                    break;
+                }
+            } else {
+                break;
+            }
+
             if !advanced {
                 break;
             }
         }
 
-        let tail_upper = sql[idx..].to_ascii_uppercase();
-        for modifier in ["DISTINCT", "UNIQUE", "ALL"] {
-            if tail_upper.starts_with(modifier) {
-                idx = idx.saturating_add(modifier.len());
-                while idx < sql.len() {
-                    let mut advanced = false;
-                    for (rel, ch) in sql[idx..].char_indices() {
-                        if ch.is_whitespace() {
-                            idx = idx.saturating_add(rel + ch.len_utf8());
-                            advanced = true;
-                            break;
-                        }
-                        idx = idx.saturating_add(rel);
-                        break;
-                    }
-                    if !advanced {
-                        break;
-                    }
-                }
-                break;
-            }
+        idx
+    }
+
+    fn skip_select_prefix_whitespace_and_hint(sql: &str, start_idx: usize) -> usize {
+        let mut idx = Self::skip_ascii_whitespace(sql, start_idx);
+        let Some(after_prefix) = sql.get(idx..) else {
+            return sql.len();
+        };
+
+        if !after_prefix.starts_with("/*+") {
+            return idx;
         }
 
-        Some(idx)
+        if let Some(end_rel) = after_prefix.find("*/") {
+            idx = idx.saturating_add(end_rel + 2);
+            idx = Self::skip_ascii_whitespace(sql, idx);
+        }
+
+        idx
+    }
+
+    fn starts_with_keyword_at(sql: &str, idx: usize, keyword: &str) -> bool {
+        let Some(tail) = sql.get(idx..) else {
+            return false;
+        };
+
+        if !tail
+            .get(..keyword.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+        {
+            return false;
+        }
+
+        let boundary_idx = idx.saturating_add(keyword.len());
+        if boundary_idx >= sql.len() {
+            return true;
+        }
+
+        sql.get(boundary_idx..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
     }
 
     fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
