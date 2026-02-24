@@ -3209,6 +3209,7 @@ impl ResultTableWidget {
 
     /// Export all data to CSV format
     pub fn export_to_csv(&self) -> String {
+        let line_ending = Self::csv_line_ending();
         let header_line = {
             let headers = self
                 .headers
@@ -3226,7 +3227,7 @@ impl ResultTableWidget {
         let mut csv = String::with_capacity(row_count * 20 + header_line.len() + 1);
 
         csv.push_str(&header_line);
-        csv.push('\n');
+        csv.push_str(line_ending);
 
         let full_data = self
             .full_data
@@ -3239,14 +3240,22 @@ impl ResultTableWidget {
                 }
                 csv.push_str(&Self::escape_csv_field(cell));
             }
-            csv.push('\n');
+            csv.push_str(line_ending);
         }
 
         csv
     }
 
+    fn csv_line_ending() -> &'static str {
+        if cfg!(windows) {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    }
+
     fn escape_csv_field(field: &str) -> String {
-        if field.contains(',') || field.contains('"') || field.contains('\n') {
+        if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
             format!("\"{}\"", field.replace('"', "\"\""))
         } else {
             field.to_string()
@@ -3756,5 +3765,19 @@ mod tests {
             Key::from_char('c'),
             'c',
         ));
+    }
+
+    #[test]
+    fn escape_csv_field_quotes_carriage_return_values() {
+        assert_eq!(
+            ResultTableWidget::escape_csv_field("line1\rline2"),
+            "\"line1\rline2\""
+        );
+    }
+
+    #[test]
+    fn csv_line_ending_matches_target_platform() {
+        let expected = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert_eq!(ResultTableWidget::csv_line_ending(), expected);
     }
 }
