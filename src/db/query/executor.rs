@@ -4921,6 +4921,36 @@ ORDER BY
         Ok(trimmed.to_string())
     }
 
+    fn normalize_required_multiline_text(
+        value: &str,
+        field_name: &str,
+        max_len: usize,
+    ) -> Result<String, OracleError> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} is required",
+                field_name
+            )));
+        }
+        if trimmed.len() > max_len {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} must be {} characters or less",
+                field_name, max_len
+            )));
+        }
+        if trimmed
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\r')
+        {
+            return Err(Self::invalid_security_input_error(format!(
+                "{} cannot contain control characters",
+                field_name
+            )));
+        }
+        Ok(trimmed.to_string())
+    }
+
     fn normalize_optional_non_empty_text(
         value: Option<&str>,
         field_name: &str,
@@ -5214,20 +5244,17 @@ ORDER BY owner, job_name
             Err(err) => fallback_errors.push(format!("all_scheduler_jobs: {err}")),
         }
 
-        let mut user_conditions: Vec<String> = Vec::new();
         if let Some(owner) = owner_filter.as_deref() {
-            user_conditions.push(format!("USER = '{owner}'"));
+            Self::ensure_user_view_matches_target_user(
+                conn,
+                owner,
+                "Scheduler jobs snapshot",
+            )?;
         }
-        if failed_only {
-            user_conditions.push(
-                "(NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))"
-                    .to_string(),
-            );
-        }
-        let user_where_clause = if user_conditions.is_empty() {
-            String::new()
+        let user_where_clause = if failed_only {
+            "WHERE (NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))".to_string()
         } else {
-            format!("WHERE {}", user_conditions.join("\n  AND "))
+            String::new()
         };
         let sql_user = format!(
             r#"
@@ -5578,13 +5605,15 @@ ORDER BY owner_name, job_name
             Err(err) => fallback_errors.push(format!("dba_datapump_jobs: {err}")),
         }
 
-        let user_where = owner_filter
-            .as_deref()
-            .map(|owner| format!("WHERE USER = '{owner}'"))
-            .unwrap_or_default();
+        if let Some(owner) = owner_filter.as_deref() {
+            Self::ensure_user_view_matches_target_user(
+                conn,
+                owner,
+                "Data Pump jobs snapshot",
+            )?;
+        }
 
-        let sql_user = format!(
-            r#"
+        let sql_user = r#"
 SELECT
     USER AS owner,
     job_name,
@@ -5594,10 +5623,8 @@ SELECT
     TO_CHAR(attached_sessions) AS attached_sessions,
     TO_CHAR(datapump_sessions) AS datapump_sessions
 FROM user_datapump_jobs
-{user_where}
 ORDER BY job_name
-"#
-        );
+"#;
         match Self::execute_select(conn, &sql_user, Instant::now()) {
             Ok(result) => Ok(Self::annotate_result_source(result, "user_datapump_jobs")),
             Err(err) => {
@@ -5784,7 +5811,7 @@ END;",
         auto_drop: bool,
     ) -> Result<(), OracleError> {
         let normalized_script =
-            Self::normalize_required_non_empty_text(backup_script, "Backup script", 3000)?;
+            Self::normalize_required_multiline_text(backup_script, "Backup script", 3000)?;
         let shell_command = format!(
             "rman target / <<'SPACE_QUERY_RMAN'\n{}\nEXIT\nSPACE_QUERY_RMAN",
             normalized_script
@@ -5800,7 +5827,7 @@ END;",
         auto_drop: bool,
     ) -> Result<(), OracleError> {
         let normalized_script =
-            Self::normalize_required_non_empty_text(restore_script, "Restore script", 3000)?;
+            Self::normalize_required_multiline_text(restore_script, "Restore script", 3000)?;
         let shell_command = format!(
             "rman target / <<'SPACE_QUERY_RMAN'\n{}\nEXIT\nSPACE_QUERY_RMAN",
             normalized_script
@@ -5817,7 +5844,7 @@ END;",
     ) -> Result<(), OracleError> {
         let qualified_name = Self::normalize_scheduler_qualified_job_name(owner, job_name)?;
         let normalized_command =
-            Self::normalize_required_non_empty_text(shell_command, "Shell command", 3000)?;
+            Self::normalize_required_multiline_text(shell_command, "Shell command", 3000)?;
         let auto_drop_number: i64 = if auto_drop { 1 } else { 0 };
         let mut stmt = conn
             .statement(
@@ -5995,7 +6022,15 @@ ORDER BY username
 "#
                     );
                     match Self::execute_select(conn, &sql_all, Instant::now()) {
-                        Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
+                        Ok(mut result) => {
+                            let warning = "Warning: profile filter not supported by all_users view and was ignored";
+                            result.message = if result.message.trim().is_empty() {
+                                warning.to_string()
+                            } else {
+                                format!("{} | {warning}", result.message)
+                            };
+                            Ok(Self::annotate_result_source(result, "all_users"))
+                        }
                         Err(all_err) => {
                             fallback_errors.push(format!("all_users: {all_err}"));
                             Err(Self::chained_fallback_error(
