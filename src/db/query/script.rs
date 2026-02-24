@@ -1318,42 +1318,25 @@ impl QueryExecutor {
             return sql.to_string();
         };
 
-        // Skip queries that fundamentally prevent row-level editing.
-        // Check only top-level keywords to avoid false positives from subqueries.
-        if Self::has_top_level_set_operator(effective_sql)
-            || Self::has_top_level_identifier_keyword(effective_sql, "GROUP")
-            || Self::has_top_level_connect_by(effective_sql)
-        {
+        if !Self::is_rowid_edit_eligible_query(effective_sql) {
             return sql.to_string();
         }
 
-        // Extract the first real table reference from the FROM clause.
-        // For multi-table queries (JOINs, comma-joins), use the first table's alias/name.
-        // If the FROM clause starts with a subquery or no table can be identified, skip injection.
         let Some(rowid_expr) =
-            Self::first_from_table_rowid_expression(effective_sql, from_idx_in_effective)
+            Self::single_table_rowid_expression(effective_sql, from_idx_in_effective)
         else {
             return sql.to_string();
         };
         let rowid_qualifier = rowid_expr.strip_suffix(".ROWID").unwrap_or("").trim();
 
-        let select_body_start_in_effective = Self::find_select_body_start(effective_sql)
-            .unwrap_or(from_idx_in_effective);
+        let select_body_start_in_effective =
+            Self::find_select_body_start(effective_sql).unwrap_or(from_idx_in_effective);
         if select_body_start_in_effective >= from_idx_in_effective {
             return sql.to_string();
         }
 
-        let select_idx_in_effective =
-            Self::find_top_level_keyword(effective_sql, "SELECT").unwrap_or(0);
-        if Self::select_clause_has_distinct_or_unique(
-            effective_sql,
-            select_idx_in_effective,
-            from_idx_in_effective,
-        ) {
-            return sql.to_string();
-        }
-
-        let select_list_upper = effective_sql[select_body_start_in_effective..from_idx_in_effective]
+        let select_list_upper = effective_sql
+            [select_body_start_in_effective..from_idx_in_effective]
             .to_ascii_uppercase();
         if select_list_upper.contains("ROWID") {
             return sql.to_string();
@@ -1384,6 +1367,345 @@ impl QueryExecutor {
         rewritten
     }
 
+    pub fn is_rowid_edit_eligible_query(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(from_idx) = Self::find_top_level_keyword(trimmed, "FROM") else {
+            return false;
+        };
+        let select_idx = Self::find_top_level_keyword(trimmed, "SELECT").unwrap_or(0);
+        Self::is_rowid_edit_eligible_select(trimmed, select_idx, from_idx)
+    }
+
+    fn is_rowid_edit_eligible_select(sql: &str, select_idx: usize, from_idx: usize) -> bool {
+        if Self::has_top_level_set_operator(sql)
+            || Self::has_top_level_identifier_keyword(sql, "GROUP")
+            || Self::has_top_level_connect_by(sql)
+            || Self::has_top_level_identifier_keyword(sql, "PIVOT")
+            || Self::has_top_level_identifier_keyword(sql, "UNPIVOT")
+            || Self::has_top_level_identifier_keyword(sql, "MODEL")
+            || !Self::is_single_table_from_clause(sql, from_idx)
+            || Self::select_clause_has_distinct_or_unique(sql, select_idx, from_idx)
+            || Self::select_clause_has_top_level_aggregate(sql, select_idx, from_idx)
+            || Self::select_clause_has_top_level_analytic(sql, select_idx, from_idx)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn select_clause_has_top_level_aggregate(
+        sql: &str,
+        select_idx: usize,
+        from_idx: usize,
+    ) -> bool {
+        if from_idx <= select_idx
+            || !sql.is_char_boundary(select_idx)
+            || !sql.is_char_boundary(from_idx)
+        {
+            return false;
+        }
+
+        let select_body_start = Self::find_select_body_start(sql).unwrap_or(select_idx);
+        if select_body_start >= from_idx || !sql.is_char_boundary(select_body_start) {
+            return false;
+        }
+
+        let select_list = &sql[select_body_start..from_idx];
+        let chars: Vec<(usize, char)> = select_list.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (_, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
+                let start = chars[i].0;
+                let mut end_i = i + 1;
+                while end_i < len {
+                    let ch = chars[end_i].1;
+                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
+                        end_i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let end = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    select_list.len()
+                };
+                let word = &select_list[start..end];
+                let mut lookahead = end_i;
+                while lookahead < len && chars[lookahead].1.is_whitespace() {
+                    lookahead += 1;
+                }
+                let has_open_paren = lookahead < len && chars[lookahead].1 == '(';
+                if has_open_paren && Self::is_aggregate_function_name(word) {
+                    return true;
+                }
+                i = end_i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        false
+    }
+
+    fn is_aggregate_function_name(word: &str) -> bool {
+        matches!(
+            word.to_ascii_uppercase().as_str(),
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "LISTAGG"
+                | "JSON_ARRAYAGG"
+                | "JSON_OBJECTAGG"
+                | "STDDEV"
+                | "STDDEV_POP"
+                | "STDDEV_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
+                | "VAR_SAMP"
+                | "MEDIAN"
+                | "CORR"
+                | "COVAR_POP"
+                | "COVAR_SAMP"
+                | "REGR_SLOPE"
+                | "REGR_INTERCEPT"
+                | "REGR_COUNT"
+                | "REGR_R2"
+                | "REGR_AVGX"
+                | "REGR_AVGY"
+                | "REGR_SXX"
+                | "REGR_SYY"
+                | "REGR_SXY"
+        )
+    }
+
+    fn select_clause_has_top_level_analytic(sql: &str, select_idx: usize, from_idx: usize) -> bool {
+        if from_idx <= select_idx
+            || !sql.is_char_boundary(select_idx)
+            || !sql.is_char_boundary(from_idx)
+        {
+            return false;
+        }
+
+        let select_body_start = Self::find_select_body_start(sql).unwrap_or(select_idx);
+        if select_body_start >= from_idx || !sql.is_char_boundary(select_body_start) {
+            return false;
+        }
+
+        let select_list = &sql[select_body_start..from_idx];
+        let chars: Vec<(usize, char)> = select_list.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (_, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
+                let start = chars[i].0;
+                let mut end_i = i + 1;
+                while end_i < len {
+                    let ch = chars[end_i].1;
+                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
+                        end_i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let end = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    select_list.len()
+                };
+                let word = &select_list[start..end];
+                if word.eq_ignore_ascii_case("OVER") {
+                    let mut lookahead = end_i;
+                    while lookahead < len && chars[lookahead].1.is_whitespace() {
+                        lookahead += 1;
+                    }
+                    if lookahead < len && chars[lookahead].1 == '(' {
+                        return true;
+                    }
+                }
+                i = end_i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        false
+    }
+
     /// Find the byte index of the main (final) SELECT keyword after a WITH clause.
     /// This skips over all CTE definitions to find the top-level SELECT that follows.
     fn find_main_select_after_with(sql: &str) -> Option<usize> {
@@ -1402,10 +1724,16 @@ impl QueryExecutor {
             if c.is_ascii_alphabetic() {
                 let start = byte_idx;
                 let mut end_i = i;
-                while end_i < len && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_') {
+                while end_i < len
+                    && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_')
+                {
                     end_i += 1;
                 }
-                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let end_byte = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    sql.len()
+                };
                 let word = &sql[start..end_byte];
                 if word.eq_ignore_ascii_case("WITH") {
                     i = end_i;
@@ -1496,10 +1824,16 @@ impl QueryExecutor {
             if depth == 0 && c.is_ascii_alphabetic() {
                 let start = byte_idx;
                 let mut end_i = i;
-                while end_i < len && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_') {
+                while end_i < len
+                    && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_')
+                {
                     end_i += 1;
                 }
-                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let end_byte = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    sql.len()
+                };
                 let word = &sql[start..end_byte];
                 if word.eq_ignore_ascii_case("SELECT") {
                     return Some(start);
@@ -1595,10 +1929,19 @@ impl QueryExecutor {
         if i < len && chars[i].1.is_ascii_alphabetic() {
             let word_start = chars[i].0;
             let mut wi = i;
-            while wi < len && (chars[wi].1.is_ascii_alphanumeric() || chars[wi].1 == '_' || chars[wi].1 == '$' || chars[wi].1 == '#') {
+            while wi < len
+                && (chars[wi].1.is_ascii_alphanumeric()
+                    || chars[wi].1 == '_'
+                    || chars[wi].1 == '$'
+                    || chars[wi].1 == '#')
+            {
                 wi += 1;
             }
-            let word_end = if wi < len { chars[wi].0 } else { from_body.len() };
+            let word_end = if wi < len {
+                chars[wi].0
+            } else {
+                from_body.len()
+            };
             let word = &from_body[word_start..word_end];
             if word.eq_ignore_ascii_case("LATERAL") || word.eq_ignore_ascii_case("ONLY") {
                 i = wi;
@@ -1648,11 +1991,7 @@ impl QueryExecutor {
     }
 
     /// Parse an identifier (possibly quoted) at the current position.
-    fn parse_identifier_at(
-        chars: &[(usize, char)],
-        text: &str,
-        pos: &mut usize,
-    ) -> Option<String> {
+    fn parse_identifier_at(chars: &[(usize, char)], text: &str, pos: &mut usize) -> Option<String> {
         let len = chars.len();
         if *pos >= len {
             return None;
@@ -1843,7 +2182,8 @@ impl QueryExecutor {
 
             if c == '*' {
                 let wildcard_end = byte_idx.saturating_add(c.len_utf8());
-                if select_body.is_char_boundary(byte_idx) && select_body.is_char_boundary(wildcard_end)
+                if select_body.is_char_boundary(byte_idx)
+                    && select_body.is_char_boundary(wildcard_end)
                 {
                     return Some((byte_idx, wildcard_end));
                 }
@@ -1959,7 +2299,11 @@ impl QueryExecutor {
                     }
                     end_i += 1;
                 }
-                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let end_byte = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    sql.len()
+                };
                 if !sql.is_char_boundary(start_byte) || !sql.is_char_boundary(end_byte) {
                     return false;
                 }
@@ -2154,7 +2498,11 @@ impl QueryExecutor {
                 while end_i < len && chars[end_i].1.is_ascii_alphanumeric() {
                     end_i += 1;
                 }
-                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                let end_byte = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    sql.len()
+                };
                 if sql[start_byte..end_byte].to_ascii_uppercase() == keyword_upper {
                     return Some(start_byte);
                 }

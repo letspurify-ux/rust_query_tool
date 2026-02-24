@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::db::QueryResult;
+use crate::db::{current_active_db_connection, QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::intellisense_context::{self, ScopedTableRef};
@@ -825,7 +825,10 @@ impl ResultTableWidget {
         font_size: u32,
     ) -> Option<String> {
         let Some((x, y, w, h)) = table.find_cell(TableContext::Cell, row, col) else {
-            return fltk::dialog::input_default("Value (blank/NULL -> NULL, '=expr' -> SQL)", current_value);
+            return fltk::dialog::input_default(
+                "Value (blank/NULL -> NULL, '=expr' -> SQL)",
+                current_value,
+            );
         };
 
         let current_group = Group::try_current();
@@ -1002,14 +1005,9 @@ impl ResultTableWidget {
                 .unwrap_or_default()
         };
 
-        let Some(new_value) = Self::show_inline_cell_editor(
-            table,
-            row,
-            col,
-            &current_value,
-            font_profile,
-            font_size,
-        ) else {
+        let Some(new_value) =
+            Self::show_inline_cell_editor(table, row, col, &current_value, font_profile, font_size)
+        else {
             return true;
         };
         if new_value == current_value {
@@ -1083,7 +1081,11 @@ impl ResultTableWidget {
             if target_col >= row.len() {
                 row.resize(target_col + 1, String::new());
             }
-            if row.get(target_col).map(|existing| existing != value).unwrap_or(true) {
+            if row
+                .get(target_col)
+                .map(|existing| existing != value)
+                .unwrap_or(true)
+            {
                 row[target_col] = value.to_string();
                 changed_cells = changed_cells.saturating_add(1);
             }
@@ -1699,7 +1701,8 @@ impl ResultTableWidget {
             return None;
         }
 
-        let (row_start, col_start, row_end, col_end) = Self::normalized_selection_bounds(selection)?;
+        let (row_start, col_start, row_end, col_end) =
+            Self::normalized_selection_bounds(selection)?;
         if row_start >= max_rows || col_start >= max_cols {
             return None;
         }
@@ -1851,6 +1854,9 @@ impl ResultTableWidget {
         if source_sql.trim().is_empty() {
             return false;
         }
+        if !QueryExecutor::is_rowid_edit_eligible_query(source_sql) {
+            return false;
+        }
         Self::resolve_target_table(source_sql).is_ok()
     }
 
@@ -1859,6 +1865,33 @@ impl ResultTableWidget {
             return false;
         }
         Self::find_rowid_column_index(headers).is_some()
+    }
+
+    fn has_update_privilege_for_edit_target(table_name: &str, editable_column: &str) -> bool {
+        let Some(conn) = current_active_db_connection() else {
+            return false;
+        };
+        let sql =
+            format!("UPDATE {table_name} SET {editable_column} = {editable_column} WHERE 1 = 0");
+        conn.execute(&sql, &[]).is_ok()
+    }
+
+    fn has_delete_privilege_for_edit_target(table_name: &str) -> bool {
+        let Some(conn) = current_active_db_connection() else {
+            return false;
+        };
+        let sql = format!("DELETE FROM {table_name} WHERE 1 = 0");
+        conn.execute(&sql, &[]).is_ok()
+    }
+
+    fn has_insert_privilege_for_edit_target(table_name: &str, editable_column: &str) -> bool {
+        let Some(conn) = current_active_db_connection() else {
+            return false;
+        };
+        let sql = format!(
+            "INSERT INTO {table_name} ({editable_column}) SELECT {editable_column} FROM {table_name} WHERE 1 = 0"
+        );
+        conn.execute(&sql, &[]).is_ok()
     }
 
     pub fn is_edit_mode_enabled(&self) -> bool {
@@ -1889,6 +1922,28 @@ impl ResultTableWidget {
         let Some(rowid_col) = Self::find_rowid_column_index(&headers_snapshot) else {
             return false;
         };
+        let source_sql_text = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Ok(table_name) = Self::resolve_target_table(&source_sql_text) else {
+            return false;
+        };
+        let editable_columns: Vec<(usize, String)> = headers_snapshot
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != rowid_col)
+            .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
+            .collect();
+        let Some((_, first_editable_column)) = editable_columns.first() else {
+            return false;
+        };
+        if !Self::has_update_privilege_for_edit_target(&table_name, first_editable_column)
+            || !Self::has_delete_privilege_for_edit_target(&table_name)
+        {
+            return false;
+        }
 
         let rows = self
             .full_data
@@ -1896,7 +1951,11 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut seen = HashSet::new();
         for row in rows.iter() {
-            let Some(rowid) = row.get(rowid_col).map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+            let Some(rowid) = row
+                .get(rowid_col)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            else {
                 return false;
             };
             if !seen.insert(rowid.to_string()) {
@@ -1995,7 +2054,7 @@ impl ResultTableWidget {
             return Err("No result columns available for INSERT.".to_string());
         }
 
-        let (rowid_col, first_edit_col) = {
+        let (rowid_col, first_edit_col, table_name, first_editable_column) = {
             let guard = self
                 .edit_session
                 .lock()
@@ -2006,8 +2065,23 @@ impl ResultTableWidget {
             (
                 session.rowid_col,
                 session.editable_columns.first().map(|(idx, _)| *idx),
+                session.table_name.clone(),
+                session
+                    .editable_columns
+                    .first()
+                    .map(|(_, column)| column.clone())
+                    .unwrap_or_default(),
             )
         };
+
+        if first_editable_column.is_empty()
+            || !Self::has_insert_privilege_for_edit_target(&table_name, &first_editable_column)
+        {
+            return Err(
+                "INSERT requires table INSERT privilege and at least one writable target column."
+                    .to_string(),
+            );
+        }
 
         let new_row_index = {
             let mut full_data = self
@@ -2120,8 +2194,8 @@ impl ResultTableWidget {
     }
 
     pub fn delete_selected_rows_in_edit_mode(&mut self) -> Result<String, String> {
-        let (row_start, row_end) =
-            Self::selected_row_range(&self.table).ok_or_else(|| "Select row(s) to delete.".to_string())?;
+        let (row_start, row_end) = Self::selected_row_range(&self.table)
+            .ok_or_else(|| "Select row(s) to delete.".to_string())?;
 
         let mut removed = 0usize;
         {
@@ -2201,7 +2275,10 @@ impl ResultTableWidget {
 
         if !session.deleted_rowids.is_empty() {
             let delete_where = if session.deleted_rowids.len() == 1 {
-                format!("ROWID = {}", Self::sql_string_literal(&session.deleted_rowids[0]))
+                format!(
+                    "ROWID = {}",
+                    Self::sql_string_literal(&session.deleted_rowids[0])
+                )
             } else {
                 let rowid_literals = session
                     .deleted_rowids
@@ -2326,14 +2403,12 @@ impl ResultTableWidget {
         execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         context_cell: Option<(usize, usize)>,
     ) {
-        let Some((row_index, col_index)) =
-            Self::resolve_update_target_cell(
-                table.get_selection(),
-                table.rows().max(0) as usize,
-                table.cols().max(0) as usize,
-                context_cell,
-            )
-        else {
+        let Some((row_index, col_index)) = Self::resolve_update_target_cell(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+            context_cell,
+        ) else {
             fltk::dialog::alert_default("Select a single cell to update.");
             return;
         };
@@ -3255,7 +3330,11 @@ impl ResultTableWidget {
     }
 
     fn escape_csv_field(field: &str) -> String {
-        if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        if field.contains(',')
+            || field.contains('"')
+            || field.contains('\n')
+            || field.contains('\r')
+        {
             format!("\"{}\"", field.replace('"', "\"\""))
         } else {
             field.to_string()
@@ -3480,7 +3559,8 @@ mod row_edit_sql_tests {
 
     #[test]
     fn resolve_target_table_resolves_left_join_with_qualified_rowid() {
-        let sql = "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e LEFT JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
+        let sql =
+            "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e LEFT JOIN DEPT d ON e.DEPTNO = d.DEPTNO";
         assert_eq!(
             ResultTableWidget::resolve_target_table(sql),
             Ok("EMP".to_string())
@@ -3489,7 +3569,8 @@ mod row_edit_sql_tests {
 
     #[test]
     fn resolve_target_table_resolves_schema_qualified_table_with_alias() {
-        let sql = "SELECT e.ROWID, e.ENAME FROM SCOTT.EMP e JOIN SCOTT.DEPT d ON e.DEPTNO = d.DEPTNO";
+        let sql =
+            "SELECT e.ROWID, e.ENAME FROM SCOTT.EMP e JOIN SCOTT.DEPT d ON e.DEPTNO = d.DEPTNO";
         assert_eq!(
             ResultTableWidget::resolve_target_table(sql),
             Ok("SCOTT.EMP".to_string())
@@ -3588,12 +3669,7 @@ mod row_edit_sql_tests {
     #[test]
     fn resolve_update_target_cell_prefers_context_and_requires_single_selection_without_it() {
         assert_eq!(
-            ResultTableWidget::resolve_update_target_cell(
-                (2, 3, 4, 5),
-                10,
-                10,
-                Some((4, 5))
-            ),
+            ResultTableWidget::resolve_update_target_cell((2, 3, 4, 5), 10, 10, Some((4, 5))),
             Some((4, 5))
         );
         assert_eq!(
@@ -3614,7 +3690,8 @@ mod row_edit_sql_tests {
 
     #[test]
     fn normalized_selection_bounds_with_limits_rejects_no_overlap_selection() {
-        let bounds = ResultTableWidget::normalized_selection_bounds_with_limits((10, 0, 11, 1), 5, 5);
+        let bounds =
+            ResultTableWidget::normalized_selection_bounds_with_limits((10, 0, 11, 1), 5, 5);
         assert_eq!(bounds, None);
     }
 
@@ -3731,7 +3808,12 @@ mod row_edit_sql_tests {
             &editable_cols,
             (0, 0),
             None,
-            &[vec!["R".to_string(), "X".to_string(), "Y".to_string(), "Z".to_string()]],
+            &[vec![
+                "R".to_string(),
+                "X".to_string(),
+                "Y".to_string(),
+                "Z".to_string(),
+            ]],
         );
         assert_eq!(changed, 2);
         assert_eq!(
@@ -3769,8 +3851,8 @@ mod row_edit_sql_tests {
         assert!(!ResultTableWidget::can_show_insert_row_action(
             "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
-        // Qualified ROWID in multi-table resolves correctly
-        assert!(ResultTableWidget::can_show_insert_row_action(
+        // JOIN result sets are not editable even with qualified ROWID.
+        assert!(!ResultTableWidget::can_show_insert_row_action(
             "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
     }
@@ -3797,9 +3879,9 @@ mod row_edit_sql_tests {
             &valid_headers,
             "SELECT ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
-        // Qualified ROWID in multi-table resolves correctly
+        // JOIN result sets are not editable even with qualified ROWID.
         let qualified_headers = vec!["E.ROWID".to_string(), "ENAME".to_string()];
-        assert!(ResultTableWidget::can_show_rowid_edit_actions(
+        assert!(!ResultTableWidget::can_show_rowid_edit_actions(
             &qualified_headers,
             "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
