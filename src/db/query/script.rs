@@ -1321,7 +1321,7 @@ impl QueryExecutor {
         // Skip queries that fundamentally prevent row-level editing.
         // Check only top-level keywords to avoid false positives from subqueries.
         if Self::has_top_level_set_operator(effective_sql)
-            || Self::find_top_level_keyword(effective_sql, "GROUP").is_some()
+            || Self::has_top_level_identifier_keyword(effective_sql, "GROUP")
             || Self::has_top_level_connect_by(effective_sql)
         {
             return sql.to_string();
@@ -1516,18 +1516,43 @@ impl QueryExecutor {
 
     /// Check if the effective SQL has a top-level set operator (UNION, INTERSECT, MINUS, EXCEPT).
     fn has_top_level_set_operator(sql: &str) -> bool {
-        Self::find_top_level_keyword(sql, "UNION").is_some()
-            || Self::find_top_level_keyword(sql, "INTERSECT").is_some()
-            || Self::find_top_level_keyword(sql, "MINUS").is_some()
-            || Self::find_top_level_keyword(sql, "EXCEPT").is_some()
+        Self::has_top_level_identifier_keyword(sql, "UNION")
+            || Self::has_top_level_identifier_keyword(sql, "INTERSECT")
+            || Self::has_top_level_identifier_keyword(sql, "MINUS")
+            || Self::has_top_level_identifier_keyword(sql, "EXCEPT")
     }
 
     /// Check if the effective SQL has a top-level CONNECT BY clause.
     fn has_top_level_connect_by(sql: &str) -> bool {
-        // CONNECT BY and START WITH are Oracle hierarchical query keywords.
-        // find_top_level_keyword finds standalone keywords at depth 0.
-        Self::find_top_level_keyword(sql, "CONNECT").is_some()
-            || Self::find_top_level_keyword(sql, "START").is_some()
+        Self::has_top_level_identifier_keyword(sql, "CONNECT")
+            || Self::has_top_level_identifier_keyword(sql, "START")
+    }
+
+    /// Like `find_top_level_keyword`, but additionally validates that the
+    /// character immediately after the matched word is not `_`, `$`, or `#`.
+    /// `find_top_level_keyword` splits on `is_ascii_alphanumeric()` only,
+    /// so `START_DATE` would match `START`.  This helper rejects such cases.
+    fn has_top_level_identifier_keyword(sql: &str, keyword: &str) -> bool {
+        let Some(idx) = Self::find_top_level_keyword(sql, keyword) else {
+            return false;
+        };
+        let after = idx.saturating_add(keyword.len());
+        if after >= sql.len() {
+            return true;
+        }
+        match sql.as_bytes().get(after) {
+            Some(b'_') | Some(b'$') | Some(b'#') => false,
+            _ => true,
+        }
+    }
+
+    /// Like `find_top_level_keyword`, but validates identifier boundary.
+    fn find_top_level_identifier_keyword(sql: &str, keyword: &str) -> Option<usize> {
+        if Self::has_top_level_identifier_keyword(sql, keyword) {
+            Self::find_top_level_keyword(sql, keyword)
+        } else {
+            None
+        }
     }
 
     /// Extract the ROWID expression for the first real (non-subquery) table
@@ -1701,25 +1726,30 @@ impl QueryExecutor {
 
         // Try to read a word
         if c.is_ascii_alphabetic() || c == '_' || c == '"' {
+            let is_quoted = c == '"';
             let save_pos = *pos;
             let word = Self::parse_identifier_at(chars, text, pos)?;
-            let word_upper = word.trim_matches('"').to_ascii_uppercase();
 
-            // If the word is a SQL keyword that terminates table references, it's not an alias
-            if Self::is_from_stop_keyword(&word_upper) {
-                *pos = save_pos;
-                return None;
-            }
+            // Quoted identifiers (e.g. "WHERE", "JOIN") are never keywords — always valid aliases
+            if !is_quoted {
+                let word_upper = word.to_ascii_uppercase();
 
-            // "AS" keyword — skip it and read the actual alias
-            if word_upper == "AS" {
-                while *pos < len && chars[*pos].1.is_whitespace() {
-                    *pos += 1;
+                // If the word is a SQL keyword that terminates table references, it's not an alias
+                if Self::is_from_stop_keyword(&word_upper) {
+                    *pos = save_pos;
+                    return None;
                 }
-                if *pos < len {
-                    return Self::parse_identifier_at(chars, text, pos);
+
+                // "AS" keyword — skip it and read the actual alias
+                if word_upper == "AS" {
+                    while *pos < len && chars[*pos].1.is_whitespace() {
+                        *pos += 1;
+                    }
+                    if *pos < len {
+                        return Self::parse_identifier_at(chars, text, pos);
+                    }
+                    return None;
                 }
-                return None;
             }
 
             // Otherwise this word is the alias

@@ -682,6 +682,63 @@ fn test_maybe_inject_rowid_for_editing_union_in_subquery_not_top_level() {
     );
 }
 
+// --- Bug regression tests: identifier boundary / quoted alias ---
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_start_date_column_not_blocked() {
+    // Bug fix: START_DATE column must NOT be mistaken for "START WITH" hierarchical keyword
+    let sql = "SELECT e.ENAME, e.START_DATE FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, e.ENAME, e.START_DATE FROM EMP e"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_group_id_column_not_blocked() {
+    // Bug fix: GROUP_ID column must NOT be mistaken for "GROUP BY" keyword
+    let sql = "SELECT GROUP_ID, ENAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, GROUP_ID, ENAME FROM EMP e"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_connect_string_column_not_blocked() {
+    // CONNECT_STRING column must NOT be mistaken for "CONNECT BY"
+    let sql = "SELECT CONNECT_STRING FROM CONFIG c";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT c.ROWID, CONNECT_STRING FROM CONFIG c"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_quoted_keyword_alias() {
+    // Bug fix: quoted alias matching a keyword (e.g. "WHERE") must NOT be rejected
+    let sql = r#"SELECT ENAME FROM EMP "where""#;
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        r#"SELECT "where".ROWID, ENAME FROM EMP "where""#
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_quoted_join_alias() {
+    // Quoted alias "join" must be accepted as an alias
+    let sql = r#"SELECT ENAME FROM EMP "join""#;
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        r#"SELECT "join".ROWID, ENAME FROM EMP "join""#
+    );
+}
+
 #[test]
 fn test_retryable_rowid_injection_error_detects_non_key_preserved_table() {
     let message = "ORA-01445: cannot select ROWID from, or sample, a join view without a key-preserved table";
