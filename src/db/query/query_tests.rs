@@ -287,8 +287,22 @@ fn test_maybe_inject_rowid_for_editing_skips_distinct() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_skips_distinct_with_comment_between_select_and_modifier() {
+    let sql = "SELECT /* keep dedup */ DISTINCT ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_skips_unique() {
     let sql = "SELECT UNIQUE ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_unique_with_newline_and_comment() {
+    let sql = "SELECT\n-- preserve unique semantics\nUNIQUE ENAME FROM EMP";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(rewritten, sql);
 }

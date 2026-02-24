@@ -1324,14 +1324,8 @@ impl QueryExecutor {
         }
 
         let select_idx = Self::find_top_level_keyword(sql, "SELECT").unwrap_or(0);
-        let select_keyword_end = select_idx.saturating_add("SELECT".len());
-        if select_keyword_end <= select_body_start {
-            let modifier_upper = sql[select_keyword_end..select_body_start]
-                .trim()
-                .to_ascii_uppercase();
-            if modifier_upper == "DISTINCT" || modifier_upper == "UNIQUE" {
-                return sql.to_string();
-            }
+        if Self::select_clause_has_distinct_or_unique(sql, select_idx, from_idx) {
+            return sql.to_string();
         }
 
         let select_list_upper = sql[select_body_start..from_idx].to_ascii_uppercase();
@@ -1345,6 +1339,127 @@ impl QueryExecutor {
         rewritten.push_str(injection);
         rewritten.push_str(&sql[select_body_start..]);
         rewritten
+    }
+
+    fn select_clause_has_distinct_or_unique(sql: &str, select_idx: usize, from_idx: usize) -> bool {
+        let select_keyword_end = select_idx.saturating_add("SELECT".len());
+        if select_keyword_end >= from_idx || select_keyword_end >= sql.len() {
+            return false;
+        }
+
+        let chars: Vec<(usize, char)> = sql.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        while i < len && chars[i].0 < select_keyword_end {
+            i += 1;
+        }
+
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            if byte_idx >= from_idx {
+                break;
+            }
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            if c.is_ascii_alphabetic() {
+                let start_byte = byte_idx;
+                let mut end_i = i;
+                while end_i < len && chars[end_i].0 < from_idx {
+                    let token_char = chars[end_i].1;
+                    if !token_char.is_ascii_alphanumeric() && token_char != '_' {
+                        break;
+                    }
+                    end_i += 1;
+                }
+                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                if !sql.is_char_boundary(start_byte) || !sql.is_char_boundary(end_byte) {
+                    return false;
+                }
+
+                let token_upper = sql[start_byte..end_byte].to_ascii_uppercase();
+                if token_upper == "DISTINCT" || token_upper == "UNIQUE" {
+                    return true;
+                }
+                return false;
+            }
+
+            return false;
+        }
+
+        false
     }
 
     fn find_select_body_start(sql: &str) -> Option<usize> {
