@@ -335,10 +335,17 @@ fn test_maybe_inject_rowid_for_editing_uses_alias_when_present() {
 }
 
 #[test]
-fn test_maybe_inject_rowid_for_editing_qualifies_help_rowid_without_alias() {
+fn test_maybe_inject_rowid_for_editing_qualifies_leading_wildcard_with_alias() {
+    let sql = "SELECT * FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "SELECT e.ROWID, e.* FROM EMP e");
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_qualifies_leading_wildcard_with_table_name() {
     let sql = "select * from help;";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, "select help.ROWID, * from help;");
+    assert_eq!(rewritten, "select help.ROWID, help.* from help;");
 }
 
 #[test]

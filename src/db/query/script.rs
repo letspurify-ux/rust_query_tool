@@ -1320,6 +1320,10 @@ impl QueryExecutor {
 
         let rowid_expr = Self::single_table_rowid_expression(sql, from_idx)
             .unwrap_or_else(|| "ROWID".to_string());
+        let rowid_qualifier = rowid_expr
+            .strip_suffix(".ROWID")
+            .unwrap_or("")
+            .trim();
 
         let select_body_start = Self::find_select_body_start(sql).unwrap_or(from_idx);
         if select_body_start >= from_idx {
@@ -1340,8 +1344,84 @@ impl QueryExecutor {
         let mut rewritten = String::with_capacity(sql.len().saturating_add(injection.len()));
         rewritten.push_str(&sql[..select_body_start]);
         rewritten.push_str(&injection);
-        rewritten.push_str(&sql[select_body_start..]);
+        let select_body = &sql[select_body_start..];
+        if rowid_qualifier.is_empty() {
+            rewritten.push_str(select_body);
+            return rewritten;
+        }
+
+        if let Some((wildcard_start, wildcard_end)) =
+            Self::find_leading_wildcard_in_select_list(select_body)
+        {
+            rewritten.push_str(&select_body[..wildcard_start]);
+            rewritten.push_str(rowid_qualifier);
+            rewritten.push_str(".*");
+            rewritten.push_str(&select_body[wildcard_end..]);
+        } else {
+            rewritten.push_str(select_body);
+        }
         rewritten
+    }
+
+    fn find_leading_wildcard_in_select_list(select_body: &str) -> Option<(usize, usize)> {
+        let chars: Vec<(usize, char)> = select_body.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            if c == '*' {
+                let wildcard_end = byte_idx.saturating_add(c.len_utf8());
+                if select_body.is_char_boundary(byte_idx) && select_body.is_char_boundary(wildcard_end)
+                {
+                    return Some((byte_idx, wildcard_end));
+                }
+                return None;
+            }
+
+            return None;
+        }
+
+        None
     }
 
     fn select_clause_has_distinct_or_unique(sql: &str, select_idx: usize, from_idx: usize) -> bool {
