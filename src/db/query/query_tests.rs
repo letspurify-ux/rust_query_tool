@@ -308,6 +308,26 @@ fn test_maybe_inject_rowid_for_editing_skips_unique_with_newline_and_comment() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_preserves_leading_hint_position() {
+    let sql = "SELECT /*+ INDEX(emp emp_idx1) */ ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT /*+ INDEX(emp emp_idx1) */ ROWID, ENAME FROM EMP"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_preserves_hint_before_all_modifier() {
+    let sql = "SELECT /*+ FULL(emp) */ ALL ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT /*+ FULL(emp) */ ALL ROWID, ENAME FROM EMP"
+    );
+}
+
+#[test]
 fn test_is_plain_commit_allows_only_commit_variants() {
     assert!(QueryExecutor::is_plain_commit("COMMIT"));
     assert!(QueryExecutor::is_plain_commit("commit work;"));
