@@ -4,6 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::session::SessionState;
+use crate::utils::logging;
 
 pub const NOT_CONNECTED_MESSAGE: &str = "Not connected to database";
 
@@ -44,15 +45,17 @@ impl ConnectionInfo {
     /// Securely clear the password from memory by overwriting with zeros
     /// then releasing the allocation.
     pub fn clear_password(&mut self) {
-        // Overwrite the existing bytes with zeros before dropping
-        // SAFETY: we write zeros over the valid UTF-8 bytes (zeros are valid UTF-8)
-        let bytes = unsafe { self.password.as_bytes_mut() };
-        for b in bytes.iter_mut() {
-            // Use write_volatile to prevent the compiler from optimizing away the zeroing
-            unsafe { std::ptr::write_volatile(b, 0) };
+        // Overwrite the password bytes with zeros before releasing the allocation.
+        // SAFETY: 0x00 bytes are valid UTF-8 code points, so the String's UTF-8
+        // invariant is preserved during zeroing. We immediately clear and shrink the
+        // Vec to release the underlying allocation that held the password.
+        let vec = unsafe { self.password.as_mut_vec() };
+        for b in vec.iter_mut() {
+            // write_volatile prevents the compiler from optimizing away the zeroing.
+            unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
         }
-        self.password.clear();
-        self.password.shrink_to_fit();
+        vec.clear();
+        vec.shrink_to_fit();
     }
 }
 
@@ -260,7 +263,7 @@ fn set_current_db_activity(activity: Option<String>) {
             *guard = activity;
         }
         Err(poisoned) => {
-            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            logging::log_warning("db::connection", "DB activity lock was poisoned; recovering");
             *poisoned.into_inner() = activity;
         }
     }
@@ -272,7 +275,10 @@ fn set_current_db_connection(connection: Option<Arc<Connection>>) {
             *guard = connection;
         }
         Err(poisoned) => {
-            eprintln!("Warning: DB connection slot lock was poisoned; recovering.");
+            logging::log_warning(
+                "db::connection",
+                "DB connection slot lock was poisoned; recovering",
+            );
             *poisoned.into_inner() = connection;
         }
     }
@@ -282,7 +288,7 @@ pub fn current_db_activity() -> Option<String> {
     match db_activity_slot().lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => {
-            eprintln!("Warning: DB activity lock was poisoned; recovering.");
+            logging::log_warning("db::connection", "DB activity lock was poisoned; recovering");
             poisoned.into_inner().clone()
         }
     }
@@ -292,7 +298,10 @@ pub fn current_active_db_connection() -> Option<Arc<Connection>> {
     match db_connection_slot().lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => {
-            eprintln!("Warning: DB connection slot lock was poisoned; recovering.");
+            logging::log_warning(
+                "db::connection",
+                "DB connection slot lock was poisoned; recovering",
+            );
             poisoned.into_inner().clone()
         }
     }
@@ -350,7 +359,10 @@ pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_>
     let guard = match connection.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            logging::log_warning(
+                "db::connection",
+                "database connection lock was poisoned; recovering",
+            );
             poisoned.into_inner()
         }
     };
@@ -377,7 +389,10 @@ pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLo
         }),
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            logging::log_warning(
+                "db::connection",
+                "database connection lock was poisoned; recovering",
+            );
             Some(ConnectionLockGuard {
                 guard: poisoned.into_inner(),
                 tracks_activity: false,
@@ -401,7 +416,10 @@ pub fn try_lock_connection_with_activity(
         }
         Err(std::sync::TryLockError::WouldBlock) => None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            eprintln!("Warning: database connection lock was poisoned; recovering.");
+            logging::log_warning(
+                "db::connection",
+                "database connection lock was poisoned; recovering",
+            );
             let guard = poisoned.into_inner();
             set_current_db_activity(Some(activity.into()));
             set_current_db_connection(guard.get_connection());

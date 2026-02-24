@@ -1468,98 +1468,84 @@ impl QueryExecutor {
     }
 
     fn find_first_top_level_comma(sql: &str) -> Option<usize> {
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
+        let mut chars = sql.char_indices().peekable();
         let mut depth = 0usize;
         let mut in_single_quote = false;
         let mut in_double_quote = false;
         let mut in_line_comment = false;
         let mut in_block_comment = false;
 
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+        while let Some((byte_idx, c)) = chars.next() {
+            let next = chars.peek().map(|(_, ch)| *ch);
 
             if in_line_comment {
                 if c == '\n' {
                     in_line_comment = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_block_comment {
                 if c == '*' && next == Some('/') {
                     in_block_comment = false;
-                    i += 2;
-                    continue;
+                    chars.next(); // consume '/'
                 }
-                i += 1;
                 continue;
             }
 
             if in_single_quote {
                 if c == '\'' {
                     if next == Some('\'') {
-                        i += 2;
+                        chars.next(); // consume escaped quote
                         continue;
                     }
                     in_single_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_double_quote {
                 if c == '"' {
                     if next == Some('"') {
-                        i += 2;
+                        chars.next(); // consume escaped quote
                         continue;
                     }
                     in_double_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
             if c == '-' && next == Some('-') {
                 in_line_comment = true;
-                i += 2;
+                chars.next(); // consume second '-'
                 continue;
             }
             if c == '/' && next == Some('*') {
                 in_block_comment = true;
-                i += 2;
+                chars.next(); // consume '*'
                 continue;
             }
             if c == '\'' {
                 in_single_quote = true;
-                i += 1;
                 continue;
             }
             if c == '"' {
                 in_double_quote = true;
-                i += 1;
                 continue;
             }
 
             if c == '(' {
                 depth = depth.saturating_add(1);
-                i += 1;
                 continue;
             }
             if c == ')' {
                 depth = depth.saturating_sub(1);
-                i += 1;
                 continue;
             }
 
             if depth == 0 && c == ',' {
                 return Some(byte_idx);
             }
-
-            i += 1;
         }
 
         None
@@ -2462,48 +2448,41 @@ impl QueryExecutor {
     }
 
     fn find_leading_wildcard_in_select_list(select_body: &str) -> Option<(usize, usize)> {
-        let chars: Vec<(usize, char)> = select_body.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
+        let mut chars = select_body.char_indices().peekable();
         let mut in_line_comment = false;
         let mut in_block_comment = false;
 
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+        while let Some((byte_idx, c)) = chars.next() {
+            let next = chars.peek().map(|(_, ch)| *ch);
 
             if in_line_comment {
                 if c == '\n' {
                     in_line_comment = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_block_comment {
                 if c == '*' && next == Some('/') {
                     in_block_comment = false;
-                    i += 2;
-                    continue;
+                    chars.next(); // consume '/'
                 }
-                i += 1;
                 continue;
             }
 
             if c == '-' && next == Some('-') {
                 in_line_comment = true;
-                i += 2;
+                chars.next(); // consume second '-'
                 continue;
             }
 
             if c == '/' && next == Some('*') {
                 in_block_comment = true;
-                i += 2;
+                chars.next(); // consume '*'
                 continue;
             }
 
             if c.is_whitespace() {
-                i += 1;
                 continue;
             }
 
@@ -2966,98 +2945,84 @@ impl QueryExecutor {
             return false;
         }
 
-        let chars: Vec<(usize, char)> = from_clause.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
+        let mut chars = from_clause.char_indices().peekable();
         let mut depth = 0usize;
         let mut in_single_quote = false;
         let mut in_double_quote = false;
         let mut in_line_comment = false;
         let mut in_block_comment = false;
 
-        while i < len {
-            let (_, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+        while let Some((_, c)) = chars.next() {
+            let next = chars.peek().map(|(_, ch)| *ch);
 
             if in_line_comment {
                 if c == '\n' {
                     in_line_comment = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_block_comment {
                 if c == '*' && next == Some('/') {
                     in_block_comment = false;
-                    i += 2;
-                    continue;
+                    chars.next(); // consume '/'
                 }
-                i += 1;
                 continue;
             }
 
             if in_single_quote {
                 if c == '\'' {
                     if next == Some('\'') {
-                        i += 2;
+                        chars.next(); // consume escaped quote
                         continue;
                     }
                     in_single_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_double_quote {
                 if c == '"' {
                     if next == Some('"') {
-                        i += 2;
+                        chars.next(); // consume escaped quote
                         continue;
                     }
                     in_double_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
             if c == '-' && next == Some('-') {
                 in_line_comment = true;
-                i += 2;
+                chars.next(); // consume second '-'
                 continue;
             }
             if c == '/' && next == Some('*') {
                 in_block_comment = true;
-                i += 2;
+                chars.next(); // consume '*'
                 continue;
             }
             if c == '\'' {
                 in_single_quote = true;
-                i += 1;
                 continue;
             }
             if c == '"' {
                 in_double_quote = true;
-                i += 1;
                 continue;
             }
 
             if c == '(' {
                 depth = depth.saturating_add(1);
-                i += 1;
                 continue;
             }
             if c == ')' {
                 depth = depth.saturating_sub(1);
-                i += 1;
                 continue;
             }
 
             if depth == 0 && c == ',' {
                 return false;
             }
-
-            i += 1;
         }
 
         true
