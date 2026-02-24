@@ -119,7 +119,39 @@ struct TableEditSession {
 }
 
 impl ResultTableWidget {
-    /// Returns the character count of the longest line in `text`,
+    /// Returns the display column count for `text` using byte-level UTF-8 analysis.
+    /// ASCII and 2-byte sequences count as 1 column; 3-byte (CJK etc.) and
+    /// 4-byte (emoji etc.) sequences count as 2 columns.
+    fn display_col_count(text: &str) -> usize {
+        let bytes = text.as_bytes();
+        let mut cols = 0usize;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b < 0x80 {
+                cols += 1;
+                i += 1;
+            } else if b < 0xC0 {
+                // Stray continuation byte — skip
+                i += 1;
+            } else if b < 0xE0 {
+                // 2-byte sequence (U+0080..U+07FF): Latin, Greek, etc. — 1 col
+                cols += 1;
+                i += 2;
+            } else if b < 0xF0 {
+                // 3-byte sequence (U+0800..U+FFFF): includes CJK — 2 cols
+                cols += 2;
+                i += 3;
+            } else {
+                // 4-byte sequence (U+10000+): emoji, etc. — 2 cols
+                cols += 2;
+                i += 4;
+            }
+        }
+        cols
+    }
+
+    /// Returns the display column count of the longest line in `text`,
     /// capped at `max_cell_display_chars`. Used for column width estimation
     /// so that multi-line cells are sized by their widest line, not total length.
     fn longest_line_char_count(text: &str, max_cell_display_chars: usize) -> usize {
@@ -127,7 +159,7 @@ impl ResultTableWidget {
             return 0;
         }
         text.lines()
-            .map(|line| line.chars().count().min(max_cell_display_chars))
+            .map(|line| Self::display_col_count(line).min(max_cell_display_chars))
             .max()
             .unwrap_or(0)
     }
@@ -243,9 +275,9 @@ impl ResultTableWidget {
     }
 
     fn estimate_text_width(text: &str, font_size: u32) -> i32 {
-        let char_count = text.chars().count() as i32;
+        let col_count = Self::display_col_count(text) as i32;
         let avg_char_px = ((font_size as i32 * 62) + 99) / 100;
-        let raw = char_count.saturating_mul(avg_char_px) + TABLE_CELL_PADDING * 2 + 2;
+        let raw = col_count.saturating_mul(avg_char_px) + TABLE_CELL_PADDING * 2 + 2;
         raw.clamp(
             Self::min_col_width_for_font(font_size),
             Self::max_col_width_for_font(font_size),
@@ -2290,31 +2322,22 @@ impl ResultTableWidget {
                 .full_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = guard.as_mut() else {
+                return Err("Edit mode is no longer active.".to_string());
+            };
             let new_row_index = full_data.len();
             let mut row = vec![String::new(); headers_len];
             if rowid_col < row.len() {
                 row[rowid_col].clear();
             }
             full_data.push(row);
+            session.row_states.push(EditRowState::Inserted);
             new_row_index
         };
-        {
-            let mut guard = self
-                .edit_session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(session) = guard.as_mut() else {
-                let mut full_data = self
-                    .full_data
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if new_row_index < full_data.len() {
-                    full_data.remove(new_row_index);
-                }
-                return Err("Edit mode is no longer active.".to_string());
-            };
-            session.row_states.push(EditRowState::Inserted);
-        }
 
         self.table.set_rows((new_row_index + 1) as i32);
         self.apply_table_metrics_for_current_font();
@@ -2358,15 +2381,13 @@ impl ResultTableWidget {
                         .full_data
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if new_row_index < full_data.len() {
-                        full_data.remove(new_row_index);
-                    }
-                }
-                {
                     let mut guard = self
                         .edit_session
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if new_row_index < full_data.len() {
+                        full_data.remove(new_row_index);
+                    }
                     if let Some(session) = guard.as_mut() {
                         if new_row_index < session.row_states.len() {
                             session.row_states.remove(new_row_index);
@@ -2556,13 +2577,23 @@ impl ResultTableWidget {
             return Ok("No staged changes to save.".to_string());
         }
 
-        let mut script = statements.join(";\n");
-        script.push(';');
+        // Wrap multiple DML statements in an anonymous PL/SQL block so that
+        // they are treated as a single unit by the executor.  When auto-commit
+        // is enabled this prevents partial commits: the whole block either
+        // succeeds (and the client commits once) or fails (nothing is committed).
+        let dml_script = if statements.len() > 1 {
+            format!("BEGIN\n{};\nEND", statements.join(";\n"))
+        } else {
+            let mut s = statements.join("");
+            s.push(';');
+            s
+        };
         let select_sql = source_sql_text.trim().trim_end_matches(';').trim();
-        if !select_sql.is_empty() {
-            script.push('\n');
-            script.push_str(select_sql);
-        }
+        let script = if select_sql.is_empty() {
+            dml_script
+        } else {
+            format!("{dml_script}\n{select_sql}")
+        };
         Self::try_execute_sql(&self.execute_sql_callback, script)?;
         *self
             .edit_session
