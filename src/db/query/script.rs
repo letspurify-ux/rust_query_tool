@@ -1314,8 +1314,7 @@ impl QueryExecutor {
             return sql.to_string();
         }
 
-        let from_and_after_upper = sql[from_idx..].to_ascii_uppercase();
-        if from_and_after_upper.contains(" JOIN ") || from_and_after_upper.contains(',') {
+        if !Self::is_single_table_from_clause(sql, from_idx) {
             return sql.to_string();
         }
 
@@ -1503,6 +1502,125 @@ impl QueryExecutor {
         }
 
         None
+    }
+
+    fn is_single_table_from_clause(sql: &str, from_idx: usize) -> bool {
+        let from_body_start = from_idx.saturating_add("FROM".len());
+        if from_body_start >= sql.len() || !sql.is_char_boundary(from_body_start) {
+            return false;
+        }
+
+        let from_body_end = Self::find_top_level_keyword(sql, "WHERE")
+            .or_else(|| Self::find_top_level_keyword(sql, "ORDER"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FETCH"))
+            .or_else(|| Self::find_top_level_keyword(sql, "OFFSET"))
+            .or_else(|| Self::find_top_level_keyword(sql, "FOR"))
+            .unwrap_or(sql.len());
+        if from_body_end <= from_body_start || !sql.is_char_boundary(from_body_end) {
+            return false;
+        }
+
+        let from_clause = &sql[from_body_start..from_body_end];
+        let clause_upper = from_clause.to_ascii_uppercase();
+        if clause_upper.contains(" JOIN ") {
+            return false;
+        }
+
+        let chars: Vec<(usize, char)> = from_clause.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (_, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && c == ',' {
+                return false;
+            }
+
+            i += 1;
+        }
+
+        true
     }
 
     fn with_clause_starts_with_select(sql: &str) -> bool {

@@ -259,6 +259,20 @@ fn test_maybe_inject_rowid_for_editing_skips_join_query() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_skips_multi_table_from_comma_join() {
+    let sql = "SELECT ENAME FROM EMP e, DEPT d WHERE e.DEPTNO = d.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_allows_where_in_comma_values() {
+    let sql = "SELECT ENAME FROM EMP WHERE DEPTNO IN (10, 20)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "SELECT ROWID, ENAME FROM EMP WHERE DEPTNO IN (10, 20)");
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_skips_with_clause_select() {
     let sql = "WITH e AS (SELECT ENAME FROM EMP) SELECT ENAME FROM e";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
