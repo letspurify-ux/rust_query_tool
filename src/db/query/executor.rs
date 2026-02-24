@@ -12,6 +12,10 @@ use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem
 pub struct QueryExecutor;
 
 impl QueryExecutor {
+    fn is_cancel_error(err: &OracleError) -> bool {
+        err.to_string().contains("ORA-01013")
+    }
+
     fn tokenized_upper(sql: &str) -> Vec<String> {
         let mut normalized = String::with_capacity(sql.len());
         let chars: Vec<char> = sql.chars().collect();
@@ -1560,6 +1564,9 @@ impl QueryExecutor {
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -1628,6 +1635,9 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -1706,6 +1716,9 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
