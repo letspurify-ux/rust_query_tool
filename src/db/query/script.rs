@@ -1288,6 +1288,212 @@ impl QueryExecutor {
         }
     }
 
+    pub fn maybe_inject_rowid_for_editing(sql: &str) -> String {
+        if !Self::is_select_statement(sql) {
+            return sql.to_string();
+        }
+        if !Self::leading_keyword(sql)
+            .as_deref()
+            .is_some_and(|keyword| keyword == "SELECT")
+        {
+            return sql.to_string();
+        }
+
+        let Some(from_idx) = Self::find_top_level_keyword(sql, "FROM") else {
+            return sql.to_string();
+        };
+
+        let upper = sql.to_ascii_uppercase();
+        if upper.contains(" GROUP BY ")
+            || upper.contains(" CONNECT BY ")
+            || upper.contains(" START WITH ")
+            || upper.contains(" UNION ")
+            || upper.contains(" INTERSECT ")
+            || upper.contains(" MINUS ")
+        {
+            return sql.to_string();
+        }
+
+        let from_and_after_upper = sql[from_idx..].to_ascii_uppercase();
+        if from_and_after_upper.contains(" JOIN ") || from_and_after_upper.contains(',') {
+            return sql.to_string();
+        }
+
+        let select_body_start = Self::find_select_body_start(sql).unwrap_or(from_idx);
+        if select_body_start >= from_idx {
+            return sql.to_string();
+        }
+
+        let select_list_upper = sql[select_body_start..from_idx].to_ascii_uppercase();
+        if select_list_upper.contains("ROWID") {
+            return sql.to_string();
+        }
+
+        let injection = "ROWID, ";
+        let mut rewritten = String::with_capacity(sql.len().saturating_add(injection.len()));
+        rewritten.push_str(&sql[..select_body_start]);
+        rewritten.push_str(injection);
+        rewritten.push_str(&sql[select_body_start..]);
+        rewritten
+    }
+
+    fn find_select_body_start(sql: &str) -> Option<usize> {
+        let select_idx = Self::find_top_level_keyword(sql, "SELECT")?;
+        let select_end = select_idx.saturating_add("SELECT".len());
+        let mut idx = select_end;
+
+        while idx < sql.len() {
+            let mut advanced = false;
+            for (rel, ch) in sql[idx..].char_indices() {
+                if ch.is_whitespace() {
+                    idx = idx.saturating_add(rel + ch.len_utf8());
+                    advanced = true;
+                    break;
+                }
+                idx = idx.saturating_add(rel);
+                break;
+            }
+            if !advanced {
+                break;
+            }
+        }
+
+        let tail_upper = sql[idx..].to_ascii_uppercase();
+        for modifier in ["DISTINCT", "UNIQUE", "ALL"] {
+            if tail_upper.starts_with(modifier) {
+                idx = idx.saturating_add(modifier.len());
+                while idx < sql.len() {
+                    let mut advanced = false;
+                    for (rel, ch) in sql[idx..].char_indices() {
+                        if ch.is_whitespace() {
+                            idx = idx.saturating_add(rel + ch.len_utf8());
+                            advanced = true;
+                            break;
+                        }
+                        idx = idx.saturating_add(rel);
+                        break;
+                    }
+                    if !advanced {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        Some(idx)
+    }
+
+    fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
+        let keyword_upper = keyword.to_ascii_uppercase();
+        let chars: Vec<(usize, char)> = sql.char_indices().collect();
+        let len = chars.len();
+
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (_, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && c.is_ascii_alphabetic() {
+                let start_byte = chars[i].0;
+                let mut end_i = i;
+                while end_i < len && chars[end_i].1.is_ascii_alphanumeric() {
+                    end_i += 1;
+                }
+                let end_byte = if end_i < len { chars[end_i].0 } else { sql.len() };
+                if sql[start_byte..end_byte].to_ascii_uppercase() == keyword_upper {
+                    return Some(start_byte);
+                }
+                i = end_i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
     fn with_clause_starts_with_select(sql: &str) -> bool {
         let stripped = Self::strip_leading_comments(sql);
         let chars: Vec<char> = stripped.chars().collect();

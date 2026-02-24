@@ -238,6 +238,41 @@ SELECT txt FROM t";
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_injects_for_simple_single_table_select() {
+    let sql = "SELECT ENAME, JOB FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "SELECT ROWID, ENAME, JOB FROM EMP");
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_keeps_existing_rowid() {
+    let sql = "SELECT ROWID, ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_join_query() {
+    let sql = "SELECT e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_with_clause_select() {
+    let sql = "WITH e AS (SELECT ENAME FROM EMP) SELECT ENAME FROM e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_handles_distinct() {
+    let sql = "SELECT DISTINCT ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, "SELECT DISTINCT ROWID, ENAME FROM EMP");
+}
+
+#[test]
 fn test_is_plain_commit_allows_only_commit_variants() {
     assert!(QueryExecutor::is_plain_commit("COMMIT"));
     assert!(QueryExecutor::is_plain_commit("commit work;"));
