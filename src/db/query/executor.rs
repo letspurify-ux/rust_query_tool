@@ -12,6 +12,10 @@ use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem
 pub struct QueryExecutor;
 
 impl QueryExecutor {
+    fn is_cancel_error(err: &OracleError) -> bool {
+        err.to_string().contains("ORA-01013")
+    }
+
     fn tokenized_upper(sql: &str) -> Vec<String> {
         let mut normalized = String::with_capacity(sql.len());
         let chars: Vec<char> = sql.chars().collect();
@@ -1559,7 +1563,11 @@ impl QueryExecutor {
         sql: &str,
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
-        let mut stmt = match conn.statement(sql).build() {
+        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1605,7 +1613,7 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok(QueryResult::new_select(
-            sql,
+            &sql_for_execution,
             column_info,
             rows,
             execution_time,
@@ -1626,7 +1634,11 @@ impl QueryExecutor {
         G: FnMut(Vec<String>) -> bool,
     {
         let start = Instant::now();
-        let mut stmt = match conn.statement(sql).build() {
+        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1681,7 +1693,12 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok((
-            QueryResult::new_select_streamed(sql, column_info, row_count, execution_time),
+            QueryResult::new_select_streamed(
+                &sql_for_execution,
+                column_info,
+                row_count,
+                execution_time,
+            ),
             cancelled,
         ))
     }
@@ -1698,7 +1715,11 @@ impl QueryExecutor {
         G: FnMut(Vec<String>) -> bool,
     {
         let start = Instant::now();
-        let mut stmt = match conn.statement(sql).build() {
+        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
+                    if Self::is_cancel_error(&err) {
+                        return Err(err);
+                    }
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1757,7 +1778,12 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok((
-            QueryResult::new_select_streamed(sql, column_info, row_count, execution_time),
+            QueryResult::new_select_streamed(
+                &sql_for_execution,
+                column_info,
+                row_count,
+                execution_time,
+            ),
             cancelled,
         ))
     }
