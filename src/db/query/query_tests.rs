@@ -266,10 +266,17 @@ fn test_maybe_inject_rowid_for_editing_skips_with_clause_select() {
 }
 
 #[test]
-fn test_maybe_inject_rowid_for_editing_handles_distinct() {
+fn test_maybe_inject_rowid_for_editing_skips_distinct() {
     let sql = "SELECT DISTINCT ENAME FROM EMP";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
-    assert_eq!(rewritten, "SELECT DISTINCT ROWID, ENAME FROM EMP");
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_unique() {
+    let sql = "SELECT UNIQUE ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
 }
 
 #[test]

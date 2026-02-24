@@ -1324,6 +1324,17 @@ impl QueryExecutor {
             return sql.to_string();
         }
 
+        let select_idx = Self::find_top_level_keyword(sql, "SELECT").unwrap_or(0);
+        let select_keyword_end = select_idx.saturating_add("SELECT".len());
+        if select_keyword_end <= select_body_start {
+            let modifier_upper = sql[select_keyword_end..select_body_start]
+                .trim()
+                .to_ascii_uppercase();
+            if modifier_upper == "DISTINCT" || modifier_upper == "UNIQUE" {
+                return sql.to_string();
+            }
+        }
+
         let select_list_upper = sql[select_body_start..from_idx].to_ascii_uppercase();
         if select_list_upper.contains("ROWID") {
             return sql.to_string();
