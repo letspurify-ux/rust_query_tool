@@ -91,6 +91,7 @@ pub struct ResultTableWidget {
     source_sql: Arc<Mutex<String>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     edit_session: Arc<Mutex<Option<TableEditSession>>>,
+    hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
 }
 
 #[derive(Default)]
@@ -311,6 +312,7 @@ impl ResultTableWidget {
         for (i, width) in widths.iter().enumerate() {
             self.table.set_col_width(i as i32, *width);
         }
+        self.apply_hidden_rowid_column_width();
     }
 
     fn recalculate_widths_for_current_font(&mut self) {
@@ -381,6 +383,7 @@ impl ResultTableWidget {
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
+        let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -526,6 +529,7 @@ impl ResultTableWidget {
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
         let edit_session_for_handle = edit_session.clone();
+        let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -538,6 +542,7 @@ impl ResultTableWidget {
                             &table_for_handle,
                             &headers_for_handle,
                             &full_data_for_handle,
+                            &hidden_auto_rowid_col_for_handle,
                             &source_sql_for_handle,
                             &execute_sql_callback_for_handle,
                             &edit_session_for_handle,
@@ -662,6 +667,9 @@ impl ResultTableWidget {
                                 &table_for_handle,
                                 &headers_for_handle,
                                 &full_data_for_handle,
+                                *hidden_auto_rowid_col_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
                             );
                             return true;
                         }
@@ -677,8 +685,10 @@ impl ResultTableWidget {
                         if Self::matches_shortcut_key(key, original_key, 'c') {
                             Self::copy_selected_to_clipboard(
                                 &table_for_handle,
-                                &headers_for_handle,
                                 &full_data_for_handle,
+                                *hidden_auto_rowid_col_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
                             );
                             return true;
                         }
@@ -750,14 +760,19 @@ impl ResultTableWidget {
                             &table_for_handle,
                             &headers_for_handle,
                             &full_data_for_handle,
+                            *hidden_auto_rowid_col_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
                         );
                         return true;
                     }
                     if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_to_clipboard(
                             &table_for_handle,
-                            &headers_for_handle,
                             &full_data_for_handle,
+                            *hidden_auto_rowid_col_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
                         );
                         return true;
                     }
@@ -813,6 +828,7 @@ impl ResultTableWidget {
             source_sql,
             execute_sql_callback,
             edit_session,
+            hidden_auto_rowid_col,
         }
     }
 
@@ -1058,6 +1074,51 @@ impl ResultTableWidget {
         rows
     }
 
+    fn resolve_paste_anchor_column(
+        anchor_col: usize,
+        selection: Option<(usize, usize, usize, usize)>,
+        rowid_col: usize,
+        editable_cols: &HashSet<usize>,
+        max_cols: usize,
+    ) -> Option<usize> {
+        if max_cols == 0 {
+            return None;
+        }
+
+        let is_editable_target = |col: usize| col != rowid_col && editable_cols.contains(&col);
+        if anchor_col < max_cols && is_editable_target(anchor_col) {
+            return Some(anchor_col);
+        }
+
+        if let Some((_, col_start, _, col_end)) = selection {
+            let start = col_start.min(max_cols.saturating_sub(1));
+            let end = col_end.min(max_cols.saturating_sub(1));
+            for col in start..=end {
+                if is_editable_target(col) {
+                    return Some(col);
+                }
+            }
+        }
+
+        let start_right = anchor_col.saturating_add(1);
+        if start_right < max_cols {
+            for col in start_right..max_cols {
+                if is_editable_target(col) {
+                    return Some(col);
+                }
+            }
+        }
+
+        let left_end = anchor_col.min(max_cols.saturating_sub(1));
+        for col in 0..=left_end {
+            if is_editable_target(col) {
+                return Some(col);
+            }
+        }
+
+        None
+    }
+
     fn apply_paste_values_to_data(
         full_data: &mut Vec<Vec<String>>,
         rowid_col: usize,
@@ -1153,6 +1214,15 @@ impl ResultTableWidget {
             .iter()
             .map(|(col_idx, _)| *col_idx)
             .collect();
+        let anchor_col = Self::resolve_paste_anchor_column(
+            anchor.1,
+            selection,
+            session.rowid_col,
+            &editable_cols,
+            table.cols().max(0) as usize,
+        )
+        .ok_or_else(|| "No editable target column is selected for paste.".to_string())?;
+        let anchor = (anchor.0, anchor_col);
         let changed_cells = {
             let mut rows = full_data
                 .lock()
@@ -1516,9 +1586,11 @@ impl ResultTableWidget {
         if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
             return trimmed.to_string();
         }
-        Self::sql_string_literal(trimmed)
+        // Preserve user-entered leading/trailing whitespace for string literals.
+        Self::sql_string_literal(input)
     }
 
+    #[allow(dead_code)]
     fn compose_edit_script(dml_sql: &str, source_sql: &str) -> String {
         let dml = dml_sql.trim().trim_end_matches(';').trim();
         let select_sql = source_sql.trim().trim_end_matches(';').trim();
@@ -1540,6 +1612,120 @@ impl ResultTableWidget {
             let normalized = Self::normalize_header_for_lookup(name);
             normalized == "ROWID" || normalized.ends_with(".ROWID")
         })
+    }
+
+    fn detect_auto_hidden_rowid_col(
+        headers: &[String],
+        source_sql: &str,
+        edit_mode_enabled: bool,
+    ) -> Option<usize> {
+        if edit_mode_enabled {
+            return None;
+        }
+        let source_sql = source_sql.trim();
+        if source_sql.is_empty() {
+            return None;
+        }
+        let rowid_col = Self::find_rowid_column_index(headers)?;
+        if rowid_col != 0 {
+            return None;
+        }
+        let rewritten_sql = QueryExecutor::maybe_inject_rowid_for_editing(source_sql);
+        if rewritten_sql == source_sql {
+            return None;
+        }
+        Some(rowid_col)
+    }
+
+    fn hidden_auto_rowid_col_value(&self) -> Option<usize> {
+        *self
+            .hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn apply_hidden_rowid_column_width(&mut self) {
+        let Some(hidden_col) = self.hidden_auto_rowid_col_value() else {
+            return;
+        };
+        if hidden_col >= self.table.cols().max(0) as usize {
+            return;
+        }
+        self.table.set_col_width(hidden_col as i32, 0);
+    }
+
+    fn refresh_table_layout_geometry(&mut self) {
+        // Force FLTK to recompute scroll range and visible viewport
+        // after runtime column width changes.
+        let (x, y, w, h) = (
+            self.table.x(),
+            self.table.y(),
+            self.table.w(),
+            self.table.h(),
+        );
+        self.table.resize(x, y, w, h);
+    }
+
+    fn refresh_auto_rowid_visibility(&mut self) {
+        let headers_snapshot = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let edit_mode_enabled = self.is_edit_mode_enabled();
+        let next_hidden_col =
+            Self::detect_auto_hidden_rowid_col(&headers_snapshot, &source_sql, edit_mode_enabled);
+        let previous_hidden_col = self.hidden_auto_rowid_col_value();
+        if previous_hidden_col == next_hidden_col {
+            self.apply_hidden_rowid_column_width();
+            self.refresh_table_layout_geometry();
+            self.table.redraw();
+            return;
+        }
+
+        *self
+            .hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_hidden_col;
+
+        if previous_hidden_col.is_some() && next_hidden_col.is_none() {
+            self.recalculate_widths_for_current_font();
+        }
+        self.apply_hidden_rowid_column_width();
+        self.refresh_table_layout_geometry();
+        self.table.redraw();
+    }
+
+    fn visible_column_indices_in_range(
+        col_left: usize,
+        col_right: usize,
+        hidden_col: Option<usize>,
+    ) -> Vec<usize> {
+        (col_left..=col_right)
+            .filter(|col| Some(*col) != hidden_col)
+            .collect()
+    }
+
+    fn visible_headers(headers: &[String], hidden_col: Option<usize>) -> Vec<String> {
+        headers
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| Some(*idx) != hidden_col)
+            .map(|(_, header)| header.clone())
+            .collect()
+    }
+
+    fn visible_row_values_internal(row: &[String], hidden_col: Option<usize>) -> Vec<String> {
+        row.iter()
+            .enumerate()
+            .filter(|(idx, _)| Some(*idx) != hidden_col)
+            .map(|(_, value)| value.clone())
+            .collect()
     }
 
     fn strip_identifier_quotes(text: &str) -> String {
@@ -1664,6 +1850,7 @@ impl ResultTableWidget {
         Some((row_start, col_start))
     }
 
+    #[allow(dead_code)]
     fn selected_row(table: &Table) -> Option<usize> {
         Self::selected_anchor_cell(table).map(|(row, _)| row)
     }
@@ -1761,21 +1948,22 @@ impl ResultTableWidget {
     fn try_execute_sql(
         execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         sql: String,
-    ) {
+    ) -> Result<(), String> {
         let callback = execute_sql_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let Some(callback) = callback else {
-            fltk::dialog::alert_default("Edit callback is not connected.");
-            return;
+            return Err("Edit callback is not connected.".to_string());
         };
         let mut cb = callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (*cb)(sql);
+        Ok(())
     }
 
+    #[allow(dead_code)]
     fn rowid_for_row(
         row_index: usize,
         headers: &[String],
@@ -1797,6 +1985,7 @@ impl ResultTableWidget {
         Ok((rowid_col, rowid))
     }
 
+    #[allow(dead_code)]
     fn push_unique_rowid(rowids: &mut Vec<String>, seen: &mut HashSet<String>, rowid_raw: &str) {
         let rowid = rowid_raw.trim();
         if rowid.is_empty() || seen.contains(rowid) {
@@ -1807,6 +1996,7 @@ impl ResultTableWidget {
         rowids.push(rowid_owned);
     }
 
+    #[allow(dead_code)]
     fn selected_rowids(
         table: &Table,
         headers: &[String],
@@ -1820,6 +2010,7 @@ impl ResultTableWidget {
         Self::collect_rowids_in_range(row_start, row_end, rowid_col, full_data)
     }
 
+    #[allow(dead_code)]
     fn collect_rowids_in_range(
         row_start: usize,
         row_end: usize,
@@ -1867,23 +2058,6 @@ impl ResultTableWidget {
         Self::find_rowid_column_index(headers).is_some()
     }
 
-    fn has_update_privilege_for_edit_target(table_name: &str, editable_column: &str) -> bool {
-        let Some(conn) = current_active_db_connection() else {
-            return false;
-        };
-        let sql =
-            format!("UPDATE {table_name} SET {editable_column} = {editable_column} WHERE 1 = 0");
-        conn.execute(&sql, &[]).is_ok()
-    }
-
-    fn has_delete_privilege_for_edit_target(table_name: &str) -> bool {
-        let Some(conn) = current_active_db_connection() else {
-            return false;
-        };
-        let sql = format!("DELETE FROM {table_name} WHERE 1 = 0");
-        conn.execute(&sql, &[]).is_ok()
-    }
-
     fn has_insert_privilege_for_edit_target(table_name: &str, editable_column: &str) -> bool {
         let Some(conn) = current_active_db_connection() else {
             return false;
@@ -1927,21 +2101,16 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let Ok(table_name) = Self::resolve_target_table(&source_sql_text) else {
+        if Self::resolve_target_table(&source_sql_text).is_err() {
             return false;
-        };
+        }
         let editable_columns: Vec<(usize, String)> = headers_snapshot
             .iter()
             .enumerate()
             .filter(|(idx, _)| *idx != rowid_col)
             .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
             .collect();
-        let Some((_, first_editable_column)) = editable_columns.first() else {
-            return false;
-        };
-        if !Self::has_update_privilege_for_edit_target(&table_name, first_editable_column)
-            || !Self::has_delete_privilege_for_edit_target(&table_name)
-        {
+        if editable_columns.is_empty() {
             return false;
         }
 
@@ -2041,6 +2210,7 @@ impl ResultTableWidget {
             row_states,
         });
 
+        self.refresh_auto_rowid_visibility();
         Ok("Edit mode enabled.".to_string())
     }
 
@@ -2345,12 +2515,12 @@ impl ResultTableWidget {
             }
         }
 
-        *self
-            .edit_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-
         if statements.is_empty() {
+            *self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            self.refresh_auto_rowid_visibility();
             return Ok("No staged changes to save.".to_string());
         }
 
@@ -2361,7 +2531,12 @@ impl ResultTableWidget {
             script.push('\n');
             script.push_str(select_sql);
         }
-        Self::try_execute_sql(&self.execute_sql_callback, script);
+        Self::try_execute_sql(&self.execute_sql_callback, script)?;
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.refresh_auto_rowid_visibility();
         Ok(format!("Applied {} staged statement(s).", statements.len()))
     }
 
@@ -2391,10 +2566,12 @@ impl ResultTableWidget {
         self.table.set_rows(new_len as i32);
         self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
+        self.refresh_auto_rowid_visibility();
         self.table.redraw();
         Ok("Cancelled staged edits and restored original rows.".to_string())
     }
 
+    #[allow(dead_code)]
     fn show_update_cell_dialog(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
@@ -2481,9 +2658,12 @@ impl ResultTableWidget {
             Self::sql_string_literal(&rowid_value)
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
-        Self::try_execute_sql(execute_sql_callback, script);
+        if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
+            fltk::dialog::alert_default(&err);
+        }
     }
 
+    #[allow(dead_code)]
     fn show_delete_row_dialog(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
@@ -2548,9 +2728,12 @@ impl ResultTableWidget {
             where_clause
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
-        Self::try_execute_sql(execute_sql_callback, script);
+        if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
+            fltk::dialog::alert_default(&err);
+        }
     }
 
+    #[allow(dead_code)]
     fn show_insert_row_dialog(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
@@ -2632,13 +2815,16 @@ impl ResultTableWidget {
             value_literals.join(", ")
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
-        Self::try_execute_sql(execute_sql_callback, script);
+        if let Err(err) = Self::try_execute_sql(execute_sql_callback, script) {
+            fltk::dialog::alert_default(&err);
+        }
     }
 
     fn show_context_menu(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        hidden_auto_rowid_col: &Arc<Mutex<Option<usize>>>,
         _source_sql: &Arc<Mutex<String>>,
         _execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         _edit_session: &Arc<Mutex<Option<TableEditSession>>>,
@@ -2691,15 +2877,18 @@ impl ResultTableWidget {
         }
 
         if let Some(choice) = menu.popup() {
+            let hidden_col = *hidden_auto_rowid_col
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let choice_label = choice.label().unwrap_or_default();
             match choice_label.as_str() {
                 "Copy" => {
-                    Self::copy_selected_to_clipboard(&table, headers, full_data);
+                    Self::copy_selected_to_clipboard(&table, full_data, hidden_col);
                 }
                 "Copy with Headers" => {
-                    Self::copy_selected_with_headers(&table, headers, full_data);
+                    Self::copy_selected_with_headers(&table, headers, full_data, hidden_col);
                 }
-                "Copy All" => Self::copy_all_to_clipboard(headers, full_data),
+                "Copy All" => Self::copy_all_to_clipboard(headers, full_data, hidden_col),
                 _ => {}
             }
         }
@@ -2709,8 +2898,8 @@ impl ResultTableWidget {
 
     fn copy_selected_to_clipboard(
         table: &Table,
-        _headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        hidden_col: Option<usize>,
     ) -> usize {
         let Some((row_top, col_left, row_bot, col_right)) =
             Self::normalized_selection_bounds_with_limits(
@@ -2723,25 +2912,29 @@ impl ResultTableWidget {
         };
 
         let rows = (row_bot - row_top + 1) as usize;
-        let cols = (col_right - col_left + 1) as usize;
-        let cell_count = rows * cols;
+        let visible_cols = Self::visible_column_indices_in_range(
+            col_left as usize,
+            col_right as usize,
+            hidden_col,
+        );
+        if visible_cols.is_empty() {
+            return 0;
+        }
+        let cell_count = rows * visible_cols.len();
 
         let full_data = full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut result = String::with_capacity(rows * cols * 16);
+        let mut result = String::with_capacity(rows * visible_cols.len() * 16);
         for row in row_top..=row_bot {
             if row > row_top {
                 result.push('\n');
             }
-            for col in col_left..=col_right {
-                if col > col_left {
+            for (visible_idx, col) in visible_cols.iter().enumerate() {
+                if visible_idx > 0 {
                     result.push('\t');
                 }
-                if let Some(val) = full_data
-                    .get(row as usize)
-                    .and_then(|r| r.get(col as usize))
-                {
+                if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
                     result.push_str(val);
                 }
             }
@@ -2759,6 +2952,7 @@ impl ResultTableWidget {
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        hidden_col: Option<usize>,
     ) -> usize {
         let Some((row_top, col_left, row_bot, col_right)) =
             Self::normalized_selection_bounds_with_limits(
@@ -2771,19 +2965,26 @@ impl ResultTableWidget {
         };
 
         let rows = (row_bot - row_top + 1) as usize;
-        let cols = (col_right - col_left + 1) as usize;
-        let cell_count = rows * cols;
-        let mut result = String::with_capacity((rows + 1) * cols * 16);
+        let visible_cols = Self::visible_column_indices_in_range(
+            col_left as usize,
+            col_right as usize,
+            hidden_col,
+        );
+        if visible_cols.is_empty() {
+            return 0;
+        }
+        let cell_count = rows * visible_cols.len();
+        let mut result = String::with_capacity((rows + 1) * visible_cols.len() * 16);
 
         {
             let headers = headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for col in col_left..=col_right {
-                if col > col_left {
+            for (visible_idx, col) in visible_cols.iter().enumerate() {
+                if visible_idx > 0 {
                     result.push('\t');
                 }
-                if let Some(h) = headers.get(col as usize) {
+                if let Some(h) = headers.get(*col) {
                     result.push_str(h);
                 }
             }
@@ -2795,14 +2996,11 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for row in row_top..=row_bot {
-                for col in col_left..=col_right {
-                    if col > col_left {
+                for (visible_idx, col) in visible_cols.iter().enumerate() {
+                    if visible_idx > 0 {
                         result.push('\t');
                     }
-                    if let Some(val) = full_data
-                        .get(row as usize)
-                        .and_then(|r| r.get(col as usize))
-                    {
+                    if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
                         result.push_str(val);
                     }
                 }
@@ -2821,13 +3019,15 @@ impl ResultTableWidget {
     fn copy_all_to_clipboard(
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        hidden_col: Option<usize>,
     ) {
-        let header_line = {
+        let header_values = {
             let headers = headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            headers.join("\t")
+            Self::visible_headers(&headers, hidden_col)
         };
+        let header_line = header_values.join("\t");
 
         let row_count = full_data
             .lock()
@@ -2842,7 +3042,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for row in full_data.iter() {
-            for (i, cell) in row.iter().enumerate() {
+            let visible_row = Self::visible_row_values_internal(row, hidden_col);
+            for (i, cell) in visible_row.iter().enumerate() {
                 if i > 0 {
                     result.push('\t');
                 }
@@ -2895,6 +3096,10 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 vec![vec![result.message.clone()]];
+            *self
+                .hidden_auto_rowid_col
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             self.table.redraw();
             return;
         }
@@ -2910,6 +3115,7 @@ impl ResultTableWidget {
                 .headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
+            self.refresh_auto_rowid_visibility();
             self.table.redraw();
             return;
         }
@@ -2953,6 +3159,7 @@ impl ResultTableWidget {
             .headers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
+        self.refresh_auto_rowid_visibility();
         self.table.redraw();
     }
 
@@ -2988,6 +3195,10 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        *self
+            .hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         // Initialize pending widths based on headers
         let font_size = *self
@@ -3010,6 +3221,7 @@ impl ResultTableWidget {
         for (i, _name) in headers.iter().enumerate() {
             self.table.set_col_width(i as i32, initial_widths[i]);
         }
+        self.apply_hidden_rowid_column_width();
 
         *self
             .headers
@@ -3127,6 +3339,7 @@ impl ResultTableWidget {
                 }
             }
         }
+        self.apply_hidden_rowid_column_width();
 
         // Move data into full_data — zero-copy, no clone!
         self.full_data
@@ -3199,6 +3412,10 @@ impl ResultTableWidget {
             .last_flush
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        *self
+            .hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.table.redraw();
     }
 
@@ -3212,17 +3429,28 @@ impl ResultTableWidget {
         else {
             return 0;
         };
-        let count = Self::copy_selected_to_clipboard(&self.table, &self.headers, &self.full_data);
+        let hidden_col = self.hidden_auto_rowid_col_value();
+        let count = Self::copy_selected_to_clipboard(&self.table, &self.full_data, hidden_col);
         if count > 0 {
             let rows = (row_bot - row_top + 1) as usize;
-            let cols = (col_right - col_left + 1) as usize;
+            let cols = Self::visible_column_indices_in_range(
+                col_left as usize,
+                col_right as usize,
+                hidden_col,
+            )
+            .len();
             println!("Copied {} cells ({} rows x {} cols)", count, rows, cols);
         }
         count
     }
 
     pub fn copy_with_headers(&self) {
-        Self::copy_selected_with_headers(&self.table, &self.headers, &self.full_data);
+        Self::copy_selected_with_headers(
+            &self.table,
+            &self.headers,
+            &self.full_data,
+            self.hidden_auto_rowid_col_value(),
+        );
     }
 
     pub fn select_all(&mut self) {
@@ -3256,20 +3484,25 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let rows = (row_bot - row_top + 1) as usize;
-        let cols = (col_right - col_left + 1) as usize;
-        let mut result = String::with_capacity(rows * cols * 16);
+        let hidden_col = self.hidden_auto_rowid_col_value();
+        let visible_cols = Self::visible_column_indices_in_range(
+            col_left as usize,
+            col_right as usize,
+            hidden_col,
+        );
+        if visible_cols.is_empty() {
+            return None;
+        }
+        let mut result = String::with_capacity(rows * visible_cols.len() * 16);
         for row in row_top..=row_bot {
             if row > row_top {
                 result.push('\n');
             }
-            for col in col_left..=col_right {
-                if col > col_left {
+            for (visible_idx, col) in visible_cols.iter().enumerate() {
+                if visible_idx > 0 {
                     result.push('\t');
                 }
-                if let Some(val) = full_data
-                    .get(row as usize)
-                    .and_then(|r| r.get(col as usize))
-                {
+                if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
                     result.push_str(val);
                 }
             }
@@ -3285,12 +3518,16 @@ impl ResultTableWidget {
     /// Export all data to CSV format
     pub fn export_to_csv(&self) -> String {
         let line_ending = Self::csv_line_ending();
+        let hidden_col = self.hidden_auto_rowid_col_value();
         let header_line = {
             let headers = self
                 .headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let escaped: Vec<String> = headers.iter().map(|h| Self::escape_csv_field(h)).collect();
+            let escaped: Vec<String> = Self::visible_headers(&headers, hidden_col)
+                .iter()
+                .map(|h| Self::escape_csv_field(h))
+                .collect();
             escaped.join(",")
         };
 
@@ -3309,7 +3546,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for row in full_data.iter() {
-            for (i, cell) in row.iter().enumerate() {
+            let visible_row = Self::visible_row_values_internal(row, hidden_col);
+            for (i, cell) in visible_row.iter().enumerate() {
                 if i > 0 {
                     csv.push(',');
                 }
@@ -3350,10 +3588,12 @@ impl ResultTableWidget {
     }
 
     pub fn columns(&self) -> Vec<String> {
-        self.headers
+        let headers = self
+            .headers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        Self::visible_headers(&headers, self.hidden_auto_rowid_col_value())
     }
 
     pub fn row_values(&self, row: usize) -> Option<Vec<String>> {
@@ -3361,7 +3601,9 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(row)
-            .cloned()
+            .map(|row_values| {
+                Self::visible_row_values_internal(row_values, self.hidden_auto_rowid_col_value())
+            })
     }
 
     pub fn get_widget(&self) -> Table {
@@ -3373,6 +3615,7 @@ impl ResultTableWidget {
             .source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql.to_string();
+        self.refresh_auto_rowid_visibility();
     }
 
     pub fn set_execute_sql_callback(&mut self, callback: Option<ResultGridSqlExecuteCallback>) {
@@ -3469,6 +3712,10 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         *self
+            .hidden_auto_rowid_col
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
             .execute_sql_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -3496,12 +3743,30 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn sql_literal_from_input_preserves_significant_string_whitespace() {
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("  padded  "),
+            "'  padded  '"
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input(" = sysdate "),
+            "sysdate"
+        );
+    }
+
+    #[test]
     fn find_rowid_column_index_accepts_qualified_header() {
         let headers = vec!["E.ROWID".to_string(), "ENAME".to_string()];
         assert_eq!(
             ResultTableWidget::find_rowid_column_index(&headers),
             Some(0)
         );
+    }
+
+    #[test]
+    fn find_rowid_column_index_rejects_internal_rowid_alias_without_normalization() {
+        let headers = vec!["SQ_INTERNAL_ROWID".to_string(), "ENAME".to_string()];
+        assert_eq!(ResultTableWidget::find_rowid_column_index(&headers), None);
     }
 
     #[test]
@@ -3828,6 +4093,32 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn resolve_paste_anchor_column_prefers_editable_col_when_anchor_is_rowid() {
+        let editable_cols: HashSet<usize> = [1usize, 2usize].into_iter().collect();
+        let resolved = ResultTableWidget::resolve_paste_anchor_column(
+            0,
+            Some((0, 0, 0, 2)),
+            0,
+            &editable_cols,
+            3,
+        );
+        assert_eq!(resolved, Some(1));
+    }
+
+    #[test]
+    fn resolve_paste_anchor_column_keeps_anchor_when_already_editable() {
+        let editable_cols: HashSet<usize> = [1usize, 3usize].into_iter().collect();
+        let resolved = ResultTableWidget::resolve_paste_anchor_column(
+            3,
+            Some((0, 0, 0, 3)),
+            0,
+            &editable_cols,
+            4,
+        );
+        assert_eq!(resolved, Some(3));
+    }
+
+    #[test]
     fn collect_rowids_in_range_errors_when_selected_row_lacks_rowid_cell() {
         let full_data = vec![vec!["AAABBB".to_string()], Vec::new()];
         let result = ResultTableWidget::collect_rowids_in_range(0, 1, 0, &full_data);
@@ -3885,6 +4176,91 @@ mod row_edit_sql_tests {
             &qualified_headers,
             "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO"
         ));
+        let internal_alias_headers = vec!["SQ_INTERNAL_ROWID".to_string(), "ENAME".to_string()];
+        assert!(!ResultTableWidget::can_show_rowid_edit_actions(
+            &internal_alias_headers,
+            "SELECT ENAME AS SQ_INTERNAL_ROWID, ENAME FROM EMP"
+        ));
+    }
+
+    #[test]
+    fn can_show_rowid_edit_actions_accepts_help_query_with_semicolon() {
+        let headers = vec!["HELP.ROWID".to_string(), "TOPIC".to_string()];
+        assert!(ResultTableWidget::can_show_rowid_edit_actions(
+            &headers,
+            "SELECT help.ROWID, help.* FROM help;"
+        ));
+    }
+
+    #[test]
+    fn detect_auto_hidden_rowid_col_hides_only_auto_injected_rowid() {
+        let headers = vec!["EMP.ROWID".to_string(), "ENAME".to_string()];
+        assert_eq!(
+            ResultTableWidget::detect_auto_hidden_rowid_col(
+                &headers,
+                "SELECT ENAME FROM EMP",
+                false,
+            ),
+            Some(0)
+        );
+
+        assert_eq!(
+            ResultTableWidget::detect_auto_hidden_rowid_col(
+                &headers,
+                "SELECT ROWID, ENAME FROM EMP",
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_auto_hidden_rowid_col_does_not_hide_while_edit_mode_enabled() {
+        let headers = vec!["EMP.ROWID".to_string(), "ENAME".to_string()];
+        assert_eq!(
+            ResultTableWidget::detect_auto_hidden_rowid_col(
+                &headers,
+                "SELECT ENAME FROM EMP",
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn try_execute_sql_returns_error_when_callback_is_missing() {
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(None));
+        let result = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME = 'A'".to_string(),
+        );
+        assert_eq!(result, Err("Edit callback is not connected.".to_string()));
+    }
+
+    #[test]
+    fn try_execute_sql_invokes_registered_callback() {
+        let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_sql_for_cb = captured_sql.clone();
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
+            captured_sql_for_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(sql);
+        })));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(Some(callback)));
+        let sql = "DELETE FROM EMP WHERE ROWID = 'AAABBB'".to_string();
+
+        let result = ResultTableWidget::try_execute_sql(&execute_sql_callback, sql.clone());
+        assert!(result.is_ok());
+        assert_eq!(
+            captured_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[sql]
+        );
     }
 }
 

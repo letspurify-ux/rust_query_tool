@@ -1367,6 +1367,204 @@ impl QueryExecutor {
         rewritten
     }
 
+    pub(crate) fn rowid_safe_execution_sql(_original_sql: &str, rewritten_sql: &str) -> String {
+        if !Self::is_select_statement(rewritten_sql) {
+            return rewritten_sql.to_string();
+        }
+
+        let leading_kw = Self::leading_keyword(rewritten_sql);
+        let leading = leading_kw.as_deref();
+
+        let effective_sql: &str;
+        let with_prefix_len: usize;
+        if leading == Some("WITH") {
+            if let Some(main_select_idx) = Self::find_main_select_after_with(rewritten_sql) {
+                effective_sql = &rewritten_sql[main_select_idx..];
+                with_prefix_len = main_select_idx;
+            } else {
+                return rewritten_sql.to_string();
+            }
+        } else if leading == Some("SELECT") {
+            effective_sql = rewritten_sql;
+            with_prefix_len = 0;
+        } else {
+            return rewritten_sql.to_string();
+        }
+
+        let Some(from_idx_in_effective) = Self::find_top_level_keyword(effective_sql, "FROM")
+        else {
+            return rewritten_sql.to_string();
+        };
+        let global_from_idx = with_prefix_len.saturating_add(from_idx_in_effective);
+        if !rewritten_sql.is_char_boundary(global_from_idx) {
+            return rewritten_sql.to_string();
+        }
+
+        let select_body_start_in_effective =
+            Self::find_select_body_start(effective_sql).unwrap_or(from_idx_in_effective);
+        if select_body_start_in_effective >= from_idx_in_effective {
+            return rewritten_sql.to_string();
+        }
+
+        let global_select_body_start = with_prefix_len + select_body_start_in_effective;
+        if !rewritten_sql.is_char_boundary(global_select_body_start) {
+            return rewritten_sql.to_string();
+        }
+        let select_body = match rewritten_sql.get(global_select_body_start..) {
+            Some(body) => body,
+            None => return rewritten_sql.to_string(),
+        };
+        let first_projection_end_idx =
+            if let Some(first_comma_offset) = Self::find_first_top_level_comma(select_body) {
+                global_select_body_start + first_comma_offset
+            } else {
+                global_from_idx
+            };
+        if !rewritten_sql.is_char_boundary(first_projection_end_idx) {
+            return rewritten_sql.to_string();
+        }
+
+        let leading_expr = rewritten_sql
+            .get(global_select_body_start..first_projection_end_idx)
+            .unwrap_or("")
+            .trim();
+        if leading_expr.is_empty() {
+            return rewritten_sql.to_string();
+        }
+        let Some(leading_expr_token) = Self::leading_projection_token(leading_expr) else {
+            return rewritten_sql.to_string();
+        };
+        let leading_expr_upper = leading_expr_token.to_ascii_uppercase();
+        if leading_expr_upper.starts_with("ROWIDTOCHAR(") {
+            return rewritten_sql.to_string();
+        }
+        if leading_expr_upper != "ROWID" && !leading_expr_upper.ends_with(".ROWID") {
+            return rewritten_sql.to_string();
+        }
+
+        let replacement = format!("ROWIDTOCHAR({leading_expr_token}) AS SQ_INTERNAL_ROWID");
+        let mut normalized =
+            String::with_capacity(rewritten_sql.len().saturating_add(replacement.len()));
+        normalized.push_str(&rewritten_sql[..global_select_body_start]);
+        normalized.push_str(&replacement);
+        normalized.push_str(&rewritten_sql[first_projection_end_idx..]);
+        normalized
+    }
+
+    fn leading_projection_token(expr: &str) -> Option<&str> {
+        let trimmed = expr.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        for (idx, ch) in trimmed.char_indices() {
+            if ch.is_whitespace() {
+                if idx == 0 {
+                    continue;
+                }
+                return trimmed.get(..idx).map(str::trim).filter(|token| !token.is_empty());
+            }
+        }
+        Some(trimmed)
+    }
+
+    fn find_first_top_level_comma(sql: &str) -> Option<usize> {
+        let chars: Vec<(usize, char)> = sql.char_indices().collect();
+        let len = chars.len();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && c == ',' {
+                return Some(byte_idx);
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
     pub fn is_rowid_edit_eligible_query(sql: &str) -> bool {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -1383,6 +1581,7 @@ impl QueryExecutor {
         if Self::has_top_level_set_operator(sql)
             || Self::has_top_level_identifier_keyword(sql, "GROUP")
             || Self::has_top_level_connect_by(sql)
+            || Self::has_top_level_identifier_keyword(sql, "MATCH_RECOGNIZE")
             || Self::has_top_level_identifier_keyword(sql, "PIVOT")
             || Self::has_top_level_identifier_keyword(sql, "UNPIVOT")
             || Self::has_top_level_identifier_keyword(sql, "MODEL")
@@ -1867,6 +2066,9 @@ impl QueryExecutor {
     /// `find_top_level_keyword` splits on `is_ascii_alphanumeric()` only,
     /// so `START_DATE` would match `START`.  This helper rejects such cases.
     fn has_top_level_identifier_keyword(sql: &str, keyword: &str) -> bool {
+        if keyword.contains('_') {
+            return Self::has_top_level_identifier_token(sql, keyword);
+        }
         let Some(idx) = Self::find_top_level_keyword(sql, keyword) else {
             return false;
         };
@@ -1880,7 +2082,128 @@ impl QueryExecutor {
         }
     }
 
+    /// Check if the effective SQL contains a top-level identifier token that
+    /// exactly matches `keyword` (supports underscores in keyword).
+    fn has_top_level_identifier_token(sql: &str, keyword: &str) -> bool {
+        let chars: Vec<(usize, char)> = sql.char_indices().collect();
+        let len = chars.len();
+        let keyword_upper = keyword.to_ascii_uppercase();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+
+        while i < len {
+            let (byte_idx, c) = chars[i];
+            let next = chars.get(i + 1).map(|(_, ch)| *ch);
+
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_block_comment {
+                if c == '*' && next == Some('/') {
+                    in_block_comment = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_single_quote {
+                if c == '\'' {
+                    if next == Some('\'') {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if in_double_quote {
+                if c == '"' {
+                    if next == Some('"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+
+            if c == '-' && next == Some('-') {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            if c == '\'' {
+                in_single_quote = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_double_quote = true;
+                i += 1;
+                continue;
+            }
+
+            if c == '(' {
+                depth = depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            if c == ')' {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+
+            if depth == 0 && c.is_ascii_alphabetic() {
+                let start = byte_idx;
+                let mut end_i = i;
+                while end_i < len {
+                    let ch = chars[end_i].1;
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#') {
+                        end_i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let end_byte = if end_i < len {
+                    chars[end_i].0
+                } else {
+                    sql.len()
+                };
+                if sql[start..end_byte].to_ascii_uppercase() == keyword_upper {
+                    return true;
+                }
+                i = end_i;
+                continue;
+            }
+
+            i += 1;
+        }
+
+        false
+    }
+
     /// Like `find_top_level_keyword`, but validates identifier boundary.
+    #[allow(dead_code)]
     fn find_top_level_identifier_keyword(sql: &str, keyword: &str) -> Option<usize> {
         if Self::has_top_level_identifier_keyword(sql, keyword) {
             Self::find_top_level_keyword(sql, keyword)
@@ -1892,6 +2215,7 @@ impl QueryExecutor {
     /// Extract the ROWID expression for the first real (non-subquery) table
     /// in the FROM clause. Works for single tables, JOINs, and comma-joins.
     /// Returns `Some("alias.ROWID")` or `Some("TABLE_NAME.ROWID")` or `None`.
+    #[allow(dead_code)]
     fn first_from_table_rowid_expression(sql: &str, from_idx: usize) -> Option<String> {
         let from_body_start = from_idx.saturating_add("FROM".len());
         if from_body_start >= sql.len() || !sql.is_char_boundary(from_body_start) {
@@ -1912,6 +2236,7 @@ impl QueryExecutor {
     /// Extract the first table reference (name + optional alias) from a FROM clause fragment.
     /// Handles: plain table, schema.table, quoted identifiers, subqueries (skipped),
     /// LATERAL keyword, ONLY keyword.
+    #[allow(dead_code)]
     fn extract_first_table_ref_rowid(from_body: &str) -> Option<String> {
         let chars: Vec<(usize, char)> = from_body.char_indices().collect();
         let len = chars.len();
@@ -2047,6 +2372,7 @@ impl QueryExecutor {
     /// Parse an optional alias after a table name.
     /// Skips AS keyword if present. Returns None if the next keyword is a
     /// SQL clause keyword (JOIN, ON, WHERE, etc.) or if no alias follows.
+    #[allow(dead_code)]
     fn parse_optional_alias(
         chars: &[(usize, char)],
         text: &str,
@@ -2099,6 +2425,7 @@ impl QueryExecutor {
     }
 
     /// Check if a word is a keyword that terminates FROM clause table references.
+    #[allow(dead_code)]
     fn is_from_stop_keyword(word_upper: &str) -> bool {
         matches!(
             word_upper,
@@ -2533,8 +2860,11 @@ impl QueryExecutor {
         }
 
         let from_clause = &sql[from_body_start..from_body_end];
-        let table_ref = from_clause.trim_start();
+        let table_ref = Self::strip_leading_relation_modifiers(from_clause);
         if table_ref.is_empty() {
+            return None;
+        }
+        if Self::starts_with_relation_invocation(table_ref) {
             return None;
         }
 
@@ -2627,6 +2957,10 @@ impl QueryExecutor {
         }
 
         let from_clause = &sql[from_body_start..from_body_end];
+        let relation_head = Self::strip_leading_relation_modifiers(from_clause);
+        if Self::starts_with_relation_invocation(relation_head) {
+            return false;
+        }
         let clause_upper = from_clause.to_ascii_uppercase();
         if clause_upper.contains(" JOIN ") {
             return false;
@@ -2727,6 +3061,76 @@ impl QueryExecutor {
         }
 
         true
+    }
+
+    fn strip_leading_relation_modifiers(text: &str) -> &str {
+        let mut trimmed = text.trim_start();
+        loop {
+            let Some(rest) = Self::strip_leading_keyword(trimmed, "LATERAL")
+                .or_else(|| Self::strip_leading_keyword(trimmed, "ONLY"))
+            else {
+                break;
+            };
+            trimmed = rest.trim_start();
+        }
+        trimmed
+    }
+
+    fn strip_leading_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+        let trimmed = text.trim_start();
+        if trimmed.len() < keyword.len() {
+            return None;
+        }
+        let prefix = trimmed.get(..keyword.len())?;
+        if !prefix.eq_ignore_ascii_case(keyword) {
+            return None;
+        }
+        let rest = trimmed.get(keyword.len()..).unwrap_or("");
+        let next = rest.chars().next();
+        if next.is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#')) {
+            return None;
+        }
+        Some(rest)
+    }
+
+    fn starts_with_relation_invocation(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+        let len = chars.len();
+        if chars.first().is_some_and(|(_, ch)| *ch == '(') {
+            return true;
+        }
+
+        let mut pos = 0usize;
+        if Self::parse_identifier_at(&chars, trimmed, &mut pos).is_none() {
+            return false;
+        }
+
+        loop {
+            while pos < len && chars[pos].1.is_whitespace() {
+                pos += 1;
+            }
+            if pos >= len || chars[pos].1 != '.' {
+                break;
+            }
+            pos += 1;
+            while pos < len && chars[pos].1.is_whitespace() {
+                pos += 1;
+            }
+            if Self::parse_identifier_at(&chars, trimmed, &mut pos).is_none() {
+                return false;
+            }
+        }
+
+        while pos < len && chars[pos].1.is_whitespace() {
+            pos += 1;
+        }
+
+        pos < len && chars[pos].1 == '('
     }
 
     fn with_clause_starts_with_select(sql: &str) -> bool {

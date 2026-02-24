@@ -362,6 +362,66 @@ fn test_maybe_inject_rowid_for_editing_qualifies_leading_wildcard_with_table_nam
     assert_eq!(rewritten, "select help.ROWID, help.* from help;");
 }
 
+#[test]
+fn test_rowid_safe_execution_sql_rewrites_auto_injected_projection() {
+    let source_sql = "SELECT ENAME FROM EMP e";
+    let injected = QueryExecutor::maybe_inject_rowid_for_editing(source_sql);
+    let safe_sql = QueryExecutor::rowid_safe_execution_sql(source_sql, &injected);
+    assert_eq!(
+        safe_sql,
+        "SELECT ROWIDTOCHAR(e.ROWID) AS SQ_INTERNAL_ROWID, ENAME FROM EMP e"
+    );
+}
+
+#[test]
+fn test_rowid_safe_execution_sql_rewrites_user_rowid_query() {
+    let source_sql = "SELECT ROWID, ENAME FROM EMP";
+    let safe_sql = QueryExecutor::rowid_safe_execution_sql(source_sql, source_sql);
+    assert_eq!(
+        safe_sql,
+        "SELECT ROWIDTOCHAR(ROWID) AS SQ_INTERNAL_ROWID, ENAME FROM EMP"
+    );
+}
+
+#[test]
+fn test_rowid_safe_execution_sql_keeps_non_rowid_internal_alias_projection() {
+    let source_sql = "SELECT ENAME AS SQ_INTERNAL_ROWID, ENAME FROM EMP";
+    let safe_sql = QueryExecutor::rowid_safe_execution_sql(source_sql, source_sql);
+    assert_eq!(safe_sql, source_sql);
+}
+
+#[test]
+fn test_rowid_safe_execution_sql_handles_order_by_wildcard_query() {
+    let source_sql = "SELECT * FROM oqt_run_log ORDER BY run_ts DESC";
+    let injected = QueryExecutor::maybe_inject_rowid_for_editing(source_sql);
+    let safe_sql = QueryExecutor::rowid_safe_execution_sql(source_sql, &injected);
+    assert_eq!(
+        safe_sql,
+        "SELECT ROWIDTOCHAR(oqt_run_log.ROWID) AS SQ_INTERNAL_ROWID, oqt_run_log.* FROM oqt_run_log ORDER BY run_ts DESC"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_table_collection_expression() {
+    let sql = "SELECT * FROM TABLE(oqt_demo_pkg.func_pipe_rows(7000)) ORDER BY sal";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_schema_qualified_relation_invocation() {
+    let sql = "SELECT * FROM oqt_demo_pkg.func_pipe_rows(7000) f";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_lateral_relation_invocation() {
+    let sql = "SELECT * FROM LATERAL oqt_demo_pkg.func_pipe_rows(7000) f";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
 // --- Multi-table / JOIN / CTE / subquery test cases ---
 
 #[test]
@@ -494,7 +554,6 @@ fn test_maybe_inject_rowid_for_editing_skips_connect_by() {
     assert_eq!(rewritten, sql);
 }
 
-
 #[test]
 fn test_maybe_inject_rowid_for_editing_skips_analytic_over_clause() {
     let sql = "SELECT ENAME, ROW_NUMBER() OVER (PARTITION BY DEPTNO ORDER BY SAL DESC) RN FROM EMP";
@@ -504,7 +563,8 @@ fn test_maybe_inject_rowid_for_editing_skips_analytic_over_clause() {
 
 #[test]
 fn test_maybe_inject_rowid_for_editing_skips_pivot_clause() {
-    let sql = "SELECT * FROM (SELECT JOB, DEPTNO, SAL FROM EMP) PIVOT (SUM(SAL) FOR DEPTNO IN (10, 20))";
+    let sql =
+        "SELECT * FROM (SELECT JOB, DEPTNO, SAL FROM EMP) PIVOT (SUM(SAL) FOR DEPTNO IN (10, 20))";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(rewritten, sql);
 }
@@ -512,6 +572,26 @@ fn test_maybe_inject_rowid_for_editing_skips_pivot_clause() {
 #[test]
 fn test_maybe_inject_rowid_for_editing_skips_model_clause() {
     let sql = "SELECT ENAME, DEPTNO, SAL FROM EMP MODEL RETURN UPDATED ROWS DIMENSION BY (DEPTNO) MEASURES (SAL) RULES (SAL[10] = 0)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_match_recognize_clause() {
+    let sql = r#"SELECT *
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY hiredate, empno
+  MEASURES
+    FIRST(ename) AS start_name,
+    LAST(ename)  AS end_name,
+    COUNT(*)     AS run_len
+  ONE ROW PER MATCH
+  PATTERN (a b+)
+  DEFINE
+    b AS b.sal > PREV(b.sal)
+)"#;
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(rewritten, sql);
 }

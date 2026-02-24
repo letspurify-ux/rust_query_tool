@@ -12,10 +12,6 @@ use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem
 pub struct QueryExecutor;
 
 impl QueryExecutor {
-    fn is_cancel_error(err: &OracleError) -> bool {
-        err.to_string().contains("ORA-01013")
-    }
-
     fn can_retry_without_rowid(err: &OracleError) -> bool {
         let message = err.to_string();
         Self::is_retryable_rowid_injection_error(&message)
@@ -25,6 +21,34 @@ impl QueryExecutor {
         message.contains("ORA-01445")
             || message.contains("ORA-01446")
             || (message.contains("ORA-00904") && message.to_ascii_uppercase().contains("ROWID"))
+    }
+
+    fn row_value_to_text(
+        row: &Row,
+        column_type: &OracleType,
+        index: usize,
+    ) -> Result<String, OracleError> {
+        if matches!(column_type, OracleType::Rowid) {
+            // Avoid ROWID -> String conversion through OCI (can segfault in some client/runtime combinations).
+            let Some(sql_value) = row.sql_values().get(index) else {
+                return Ok(String::new());
+            };
+            if sql_value.is_null()? {
+                return Ok("NULL".to_string());
+            }
+            return Ok(String::new());
+        }
+
+        let value: Option<String> = row.get(index)?;
+        Ok(value.unwrap_or_else(|| "NULL".to_string()))
+    }
+
+    fn normalize_result_column_name(name: &str, normalize_internal_rowid_alias: bool) -> String {
+        if normalize_internal_rowid_alias && name.eq_ignore_ascii_case("SQ_INTERNAL_ROWID") {
+            "ROWID".to_string()
+        } else {
+            name.to_string()
+        }
     }
 
     fn tokenized_upper(sql: &str) -> Vec<String> {
@@ -1574,9 +1598,10 @@ impl QueryExecutor {
         sql: &str,
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
-        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut effective_sql = sql_for_execution.as_str();
-        let mut stmt = match conn.statement(effective_sql).build() {
+        let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
+        let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
+        let mut normalize_internal_rowid_alias = sql_for_execution != sql;
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1594,7 +1619,7 @@ impl QueryExecutor {
                             return Err(retry_err);
                         }
                     };
-                    effective_sql = sql;
+                    normalize_internal_rowid_alias = false;
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
@@ -1613,9 +1638,17 @@ impl QueryExecutor {
             .column_info()
             .iter()
             .map(|col| ColumnInfo {
-                name: col.name().to_string(),
+                name: Self::normalize_result_column_name(
+                    col.name(),
+                    normalize_internal_rowid_alias,
+                ),
                 data_type: format!("{:?}", col.oracle_type()),
             })
+            .collect();
+        let column_oracle_types: Vec<OracleType> = result_set
+            .column_info()
+            .iter()
+            .map(|col| col.oracle_type().clone())
             .collect();
 
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -1630,9 +1663,9 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i)?;
-                row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
+            for (i, column_type) in column_oracle_types.iter().enumerate() {
+                let value = Self::row_value_to_text(&row, column_type, i)?;
+                row_data.push(value);
             }
 
             rows.push(row_data);
@@ -1640,7 +1673,7 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok(QueryResult::new_select(
-            effective_sql,
+            sql,
             column_info,
             rows,
             execution_time,
@@ -1661,9 +1694,10 @@ impl QueryExecutor {
         G: FnMut(Vec<String>) -> bool,
     {
         let start = Instant::now();
-        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut effective_sql = sql_for_execution.as_str();
-        let mut stmt = match conn.statement(effective_sql).build() {
+        let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
+        let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
+        let mut normalize_internal_rowid_alias = sql_for_execution != sql;
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1681,7 +1715,7 @@ impl QueryExecutor {
                             return Err(retry_err);
                         }
                     };
-                    effective_sql = sql;
+                    normalize_internal_rowid_alias = false;
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
@@ -1700,9 +1734,17 @@ impl QueryExecutor {
             .column_info()
             .iter()
             .map(|col| ColumnInfo {
-                name: col.name().to_string(),
+                name: Self::normalize_result_column_name(
+                    col.name(),
+                    normalize_internal_rowid_alias,
+                ),
                 data_type: format!("{:?}", col.oracle_type()),
             })
+            .collect();
+        let column_oracle_types: Vec<OracleType> = result_set
+            .column_info()
+            .iter()
+            .map(|col| col.oracle_type().clone())
             .collect();
 
         on_select_start(&column_info);
@@ -1720,9 +1762,9 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i)?;
-                row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
+            for (i, column_type) in column_oracle_types.iter().enumerate() {
+                let value = Self::row_value_to_text(&row, column_type, i)?;
+                row_data.push(value);
             }
 
             let should_continue = on_row(row_data);
@@ -1736,12 +1778,7 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok((
-            QueryResult::new_select_streamed(
-                effective_sql,
-                column_info,
-                row_count,
-                execution_time,
-            ),
+            QueryResult::new_select_streamed(sql, column_info, row_count, execution_time),
             cancelled,
         ))
     }
@@ -1758,9 +1795,10 @@ impl QueryExecutor {
         G: FnMut(Vec<String>) -> bool,
     {
         let start = Instant::now();
-        let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut effective_sql = sql_for_execution.as_str();
-        let mut stmt = match conn.statement(effective_sql).build() {
+        let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
+        let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
+        let mut normalize_internal_rowid_alias = sql_for_execution != sql;
+        let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1786,7 +1824,7 @@ impl QueryExecutor {
                         eprintln!("Database operation failed: {retry_err}");
                         return Err(retry_err);
                     }
-                    effective_sql = sql;
+                    normalize_internal_rowid_alias = false;
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
@@ -1805,9 +1843,17 @@ impl QueryExecutor {
             .column_info()
             .iter()
             .map(|col| ColumnInfo {
-                name: col.name().to_string(),
+                name: Self::normalize_result_column_name(
+                    col.name(),
+                    normalize_internal_rowid_alias,
+                ),
                 data_type: format!("{:?}", col.oracle_type()),
             })
+            .collect();
+        let column_oracle_types: Vec<OracleType> = result_set
+            .column_info()
+            .iter()
+            .map(|col| col.oracle_type().clone())
             .collect();
 
         on_select_start(&column_info);
@@ -1825,9 +1871,9 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i)?;
-                row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
+            for (i, column_type) in column_oracle_types.iter().enumerate() {
+                let value = Self::row_value_to_text(&row, column_type, i)?;
+                row_data.push(value);
             }
 
             let should_continue = on_row(row_data);
@@ -1841,12 +1887,7 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok((
-            QueryResult::new_select_streamed(
-                effective_sql,
-                column_info,
-                row_count,
-                execution_time,
-            ),
+            QueryResult::new_select_streamed(sql, column_info, row_count, execution_time),
             cancelled,
         ))
     }
@@ -1874,9 +1915,14 @@ impl QueryExecutor {
             .column_info()
             .iter()
             .map(|col| ColumnInfo {
-                name: col.name().to_string(),
+                name: Self::normalize_result_column_name(col.name(), false),
                 data_type: format!("{:?}", col.oracle_type()),
             })
+            .collect();
+        let column_oracle_types: Vec<OracleType> = result_set
+            .column_info()
+            .iter()
+            .map(|col| col.oracle_type().clone())
             .collect();
 
         on_select_start(&column_info);
@@ -1894,9 +1940,9 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for i in 0..column_info.len() {
-                let value: Option<String> = row.get(i)?;
-                row_data.push(value.unwrap_or_else(|| "NULL".to_string()));
+            for (i, column_type) in column_oracle_types.iter().enumerate() {
+                let value = Self::row_value_to_text(&row, column_type, i)?;
+                row_data.push(value);
             }
 
             let should_continue = on_row(row_data);

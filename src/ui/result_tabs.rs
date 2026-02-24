@@ -696,10 +696,6 @@ impl ResultTabsWidget {
         }
     }
 
-    pub fn has_current_result_table(&self) -> bool {
-        self.current_table().is_some()
-    }
-
     fn delete_tab(&mut self, mut tab: ResultTab) {
         // FLTK memory management: proper cleanup order is critical
         // 1. Clear callbacks on child widgets to release captured Arc<Mutex<T>> references

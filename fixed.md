@@ -8,6 +8,32 @@
 - **수정**: 파일 상단 주석을 모듈 내부 문서 주석(`//!`)으로 변경.
 - **효과**: 해당 lint 에러는 해소됨.
 
+## 2026-02-24 결과 테이블 그리드 편집 기능 개선
+
+### [중] `Save` 실행 콜백 누락 시 staged edit가 소실되던 문제 수정
+- **증상**: 결과 테이블 편집 모드에서 `Save`를 눌렀을 때 SQL 실행 콜백이 연결되지 않은 경우에도, 에러 반환 없이 세션이 종료되어 staged edit가 사라질 수 있었습니다.
+- **원인**: `try_execute_sql`이 내부에서 알림만 띄우고 성공/실패를 호출자에 반환하지 않았고, `save_edit_mode`가 SQL 전달 성공 여부와 무관하게 `edit_session`을 먼저 해제했습니다.
+- **수정**:
+  - `try_execute_sql`을 `Result<(), String>` 반환으로 변경해 콜백 누락을 명시적으로 전파하도록 수정.
+  - `save_edit_mode`에서 SQL 전달 성공 후에만 `edit_session`을 종료하도록 순서를 조정.
+  - 다이얼로그 기반 편집 경로(`show_update_cell_dialog`, `show_delete_row_dialog`, `show_insert_row_dialog`)도 콜백 오류를 사용자에게 알리도록 보강.
+- **효과**: 실행 경로가 준비되지 않은 상태에서 저장해도 staged edit가 조용히 유실되지 않고, 오류를 확인한 뒤 같은 세션에서 재시도할 수 있습니다.
+
+### [테스트] SQL 실행 콜백 오류 전파 회귀 테스트 추가
+- `try_execute_sql_returns_error_when_callback_is_missing`
+- `try_execute_sql_invokes_registered_callback`
+
+### [중] 문자열 셀 편집 시 앞/뒤 공백이 저장 SQL에서 소실되던 문제 수정
+- **증상**: 결과 테이블 편집 모드에서 문자열 셀 값을 수정할 때, 입력값 앞/뒤 공백이 있어도 `Save` 시 생성되는 SQL literal에서 공백이 제거되어 의도와 다른 값으로 저장될 수 있었습니다.
+- **원인**: `sql_literal_from_input`이 문자열 경로에서도 `trim()`된 값을 그대로 quote 처리해, 문자열의 유효 공백까지 함께 제거했습니다.
+- **수정**:
+  - `sql_literal_from_input`에서 `NULL/수치/표현식(=...)` 판별은 기존처럼 trim 기반으로 유지하고,
+  - 일반 문자열 literal 생성은 원본 입력(`input`)을 quote 하도록 변경해 공백을 보존했습니다.
+- **효과**: 그리드 편집에서 문자열 값의 의미 있는 leading/trailing whitespace가 저장 SQL에 정확히 반영됩니다.
+
+### [테스트] 문자열 공백 보존 회귀 테스트 추가
+- `sql_literal_from_input_preserves_significant_string_whitespace`
+
 ## 2026-02-23 그리드(결과 테이블) 편집 안정화
 
 ### [중] Enter/KPEnter/F2 단축키로 셀 편집 진입 및 빈 삽입 행 롤백 보완
@@ -535,3 +561,14 @@
 ### [테스트] 그리드 편집 단위 테스트 보강
 - `resolved_selection_bounds_with_limits_clamps_to_current_table_size`
 - `resolve_update_target_cell_prefers_context_and_requires_single_selection_without_it`
+
+## 2026-02-24 결과 테이블 그리드 편집 기능 개선 (후속)
+
+### [중] 행 헤더/ROWID 앵커 붙여넣기 시 값이 한 칸 밀려 적용되던 버그 수정
+- **증상**: 편집 모드에서 행 헤더 선택 또는 `ROWID` 컬럼이 선택 앵커인 상태로 다중 셀 붙여넣기를 하면, 첫 값이 `ROWID`에 매핑되며 건너뛰어져 실제 편집 컬럼 반영이 오른쪽으로 밀릴 수 있었습니다.
+- **수정**: 붙여넣기 전에 앵커 컬럼을 보정하는 `resolve_paste_anchor_column`을 추가해, 앵커가 비편집 컬럼/`ROWID`인 경우 선택 범위 내 첫 편집 가능 컬럼을 우선 대상으로 사용하도록 변경했습니다.
+- **효과**: 행 단위 선택(특히 row header 선택)에서도 붙여넣기 컬럼 정렬이 의도와 일치하고, 값 밀림/누락 가능성을 줄였습니다.
+
+### [테스트] 붙여넣기 앵커 보정 회귀 테스트 추가
+- `resolve_paste_anchor_column_prefers_editable_col_when_anchor_is_rowid`
+- `resolve_paste_anchor_column_keeps_anchor_when_already_editable`

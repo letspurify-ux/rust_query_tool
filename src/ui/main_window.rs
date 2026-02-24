@@ -3,7 +3,7 @@ use fltk::{
     button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
     draw::set_cursor,
-    enums::{Align, Cursor, FrameType},
+    enums::{Cursor, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
     input::IntInput,
@@ -69,7 +69,6 @@ pub struct AppState {
     query_timeout_input: IntInput,
     pub result_tabs: ResultTabsWidget,
     result_toolbar: Flex,
-    result_edit_hint: Frame,
     result_edit_check: CheckButton,
     result_insert_btn: Button,
     result_delete_btn: Button,
@@ -112,20 +111,6 @@ fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, 
             button.hide();
         }
         toolbar.fixed(button, 0);
-    }
-}
-
-fn set_result_hint_visibility(toolbar: &mut Flex, hint: &mut Frame, visible: bool) {
-    if visible {
-        toolbar.fixed(hint, RESULT_EDIT_HINT_WIDTH);
-        if !hint.visible() {
-            hint.show();
-        }
-    } else {
-        if hint.visible() {
-            hint.hide();
-        }
-        toolbar.fixed(hint, 0);
     }
 }
 
@@ -363,7 +348,6 @@ impl AppState {
         let can_edit = self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let show_edit_check = can_edit;
-        let show_edit_hint = !can_edit && self.result_tabs.has_current_result_table();
         if show_edit_check {
             self.result_toolbar
                 .fixed(&self.result_edit_check, BUTTON_WIDTH_SMALL);
@@ -378,7 +362,6 @@ impl AppState {
             }
             self.result_toolbar.fixed(&self.result_edit_check, 0);
         }
-        set_result_hint_visibility(&mut self.result_toolbar, &mut self.result_edit_hint, show_edit_hint);
         let desired_checked = edit_active && can_edit;
         if self.result_edit_check.value() != desired_checked {
             self.result_edit_check.set(desired_checked);
@@ -410,7 +393,6 @@ impl AppState {
     }
 }
 
-const RESULT_EDIT_HINT_WIDTH: i32 = 250;
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECTION_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const STATUS_ANIMATION_INTERVAL: f64 = 0.08;
@@ -949,11 +931,6 @@ impl MainWindow {
         let spacer = Frame::default();
         result_toolbar.resizable(&spacer);
 
-        let mut edit_hint_label = Frame::default().with_label("Editable only with ROWID");
-        edit_hint_label.set_label_color(theme::text_secondary());
-        edit_hint_label.set_align(Align::Right | Align::Inside);
-        result_toolbar.fixed(&edit_hint_label, 0);
-
         let mut edit_mode_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Edit");
@@ -995,12 +972,10 @@ impl MainWindow {
         edit_cancel_btn.set_label_color(theme::text_primary());
         edit_cancel_btn.set_frame(FrameType::RFlatBox);
         edit_cancel_btn.set_tooltip("Discard staged edits and restore rows");
-        edit_hint_label.hide();
         edit_insert_btn.hide();
         edit_delete_btn.hide();
         edit_save_btn.hide();
         edit_cancel_btn.hide();
-        result_toolbar.fixed(&edit_hint_label, 0);
         result_toolbar.fixed(&edit_insert_btn, 0);
         result_toolbar.fixed(&edit_delete_btn, 0);
         result_toolbar.fixed(&edit_save_btn, 0);
@@ -1175,7 +1150,6 @@ impl MainWindow {
             query_timeout_input: timeout_input.clone(),
             result_tabs,
             result_toolbar: result_toolbar.clone(),
-            result_edit_hint: edit_hint_label.clone(),
             result_edit_check: edit_mode_check.clone(),
             result_insert_btn: edit_insert_btn.clone(),
             result_delete_btn: edit_delete_btn.clone(),
@@ -1207,7 +1181,8 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let weak_state_for_result_tabs_change = Arc::downgrade(&state);
             s.result_tabs.set_on_change(move || {
-                if let Some(state_for_result_tabs_change) = weak_state_for_result_tabs_change.upgrade()
+                if let Some(state_for_result_tabs_change) =
+                    weak_state_for_result_tabs_change.upgrade()
                 {
                     if let Ok(mut s) = state_for_result_tabs_change.try_lock() {
                         s.refresh_result_edit_controls();
