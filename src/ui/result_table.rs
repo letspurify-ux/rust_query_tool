@@ -2564,36 +2564,15 @@ impl ResultTableWidget {
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
-        source_sql: &Arc<Mutex<String>>,
-        execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
-        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        _source_sql: &Arc<Mutex<String>>,
+        _execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        _edit_session: &Arc<Mutex<Option<TableEditSession>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
 
         let mut table = table.clone();
         let clicked_cell = Self::get_cell_at_mouse(&table);
-        let context_cell = clicked_cell.and_then(|(row, col)| {
-            match (usize::try_from(row), usize::try_from(col)) {
-                (Ok(r), Ok(c)) => Some((r, c)),
-                _ => None,
-            }
-        });
-        let menu_headers_snapshot = headers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let menu_source_sql_text = source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let can_insert_row = Self::can_show_insert_row_action(&menu_source_sql_text);
-        let can_show_rowid_edit_actions =
-            Self::can_show_rowid_edit_actions(&menu_headers_snapshot, &menu_source_sql_text);
-        let in_edit_mode = edit_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some();
         let clicked_row_header = if clicked_cell.is_none() {
             Self::get_row_header_at_mouse(&table)
         } else {
@@ -2629,16 +2608,7 @@ impl ResultTableWidget {
         let mut menu = MenuButton::new(mouse_x, mouse_y, 0, 0, None);
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
-        let mut menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
-        if can_insert_row && !in_edit_mode {
-            menu_items.push("Insert Row");
-        }
-        if can_show_rowid_edit_actions && !in_edit_mode {
-            if context_cell.is_some() {
-                menu_items.push("Update Cell");
-            }
-            menu_items.push("Delete Row");
-        }
+        let menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
         menu.add_choice(&menu_items.join("|"));
 
         if let Some(ref group) = current_group {
@@ -2655,28 +2625,6 @@ impl ResultTableWidget {
                     Self::copy_selected_with_headers(&table, headers, full_data);
                 }
                 "Copy All" => Self::copy_all_to_clipboard(headers, full_data),
-                "Insert Row" => Self::show_insert_row_dialog(
-                    &table,
-                    headers,
-                    full_data,
-                    source_sql,
-                    execute_sql_callback,
-                ),
-                "Update Cell" => Self::show_update_cell_dialog(
-                    &table,
-                    headers,
-                    full_data,
-                    source_sql,
-                    execute_sql_callback,
-                    context_cell,
-                ),
-                "Delete Row" => Self::show_delete_row_dialog(
-                    &table,
-                    headers,
-                    full_data,
-                    source_sql,
-                    execute_sql_callback,
-                ),
                 _ => {}
             }
         }
