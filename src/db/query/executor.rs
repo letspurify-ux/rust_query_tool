@@ -1564,9 +1564,6 @@ impl QueryExecutor {
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-                    if Self::is_cancel_error(&err) {
-                        return Err(err);
-                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -1635,9 +1632,6 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-                    if Self::is_cancel_error(&err) {
-                        return Err(err);
-                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -1716,9 +1710,6 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-                    if Self::is_cancel_error(&err) {
-                        return Err(err);
-                    }
         let mut stmt = match conn.statement(&sql_for_execution).build() {
             Ok(stmt) => stmt,
             Err(err) => {
