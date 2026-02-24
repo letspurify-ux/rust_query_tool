@@ -1119,6 +1119,9 @@ impl ResultTableWidget {
         None
     }
 
+    /// Apply pasted values to the data grid.
+    /// Returns `(changed_cells, skipped_cells)` where `skipped_cells` counts
+    /// editable target cells that fell outside the current table bounds.
     fn apply_paste_values_to_data(
         full_data: &mut Vec<Vec<String>>,
         rowid_col: usize,
@@ -1126,17 +1129,20 @@ impl ResultTableWidget {
         anchor: (usize, usize),
         selection: Option<(usize, usize, usize, usize)>,
         pasted_rows: &[Vec<String>],
-    ) -> usize {
+    ) -> (usize, usize) {
         if pasted_rows.is_empty() {
-            return 0;
+            return (0, 0);
         }
 
         let mut changed_cells = 0usize;
+        let mut skipped_cells = 0usize;
+        let row_count = full_data.len();
         let mut apply_value = |target_row: usize, target_col: usize, value: &str| {
             if target_col == rowid_col || !editable_cols.contains(&target_col) {
                 return;
             }
             let Some(row) = full_data.get_mut(target_row) else {
+                skipped_cells = skipped_cells.saturating_add(1);
                 return;
             };
             if target_col >= row.len() {
@@ -1164,17 +1170,31 @@ impl ResultTableWidget {
                         apply_value(row_idx, col_idx, fill_value);
                     }
                 }
-                return changed_cells;
+                return (changed_cells, skipped_cells);
             }
             apply_value(anchor.0, anchor.1, fill_value);
-            return changed_cells;
+            return (changed_cells, skipped_cells);
         }
 
         for (row_offset, source_row) in pasted_rows.iter().enumerate() {
+            let Some(target_row) = anchor.0.checked_add(row_offset) else {
+                continue;
+            };
+            if target_row >= row_count {
+                // All remaining source rows are out of bounds; count their
+                // editable cells as skipped and stop early.
+                for remaining in pasted_rows.iter().skip(row_offset) {
+                    for (col_offset, _) in remaining.iter().enumerate() {
+                        if let Some(tc) = anchor.1.checked_add(col_offset) {
+                            if tc != rowid_col && editable_cols.contains(&tc) {
+                                skipped_cells = skipped_cells.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
             for (col_offset, source_cell) in source_row.iter().enumerate() {
-                let Some(target_row) = anchor.0.checked_add(row_offset) else {
-                    continue;
-                };
                 let Some(target_col) = anchor.1.checked_add(col_offset) else {
                     continue;
                 };
@@ -1182,7 +1202,7 @@ impl ResultTableWidget {
             }
         }
 
-        changed_cells
+        (changed_cells, skipped_cells)
     }
 
     fn paste_clipboard_text_into_edit_mode(
@@ -1223,7 +1243,7 @@ impl ResultTableWidget {
         )
         .ok_or_else(|| "No editable target column is selected for paste.".to_string())?;
         let anchor = (anchor.0, anchor_col);
-        let changed_cells = {
+        let (changed_cells, skipped_cells) = {
             let mut rows = full_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1240,12 +1260,24 @@ impl ResultTableWidget {
             )
         };
 
-        if changed_cells == 0 {
+        if changed_cells == 0 && skipped_cells == 0 {
             return Err("No editable cells were updated from pasted values.".to_string());
+        }
+        if changed_cells == 0 && skipped_cells > 0 {
+            return Err(format!(
+                "All {} pasted cell(s) fell outside the table bounds.",
+                skipped_cells
+            ));
         }
 
         let mut table = table.clone();
         table.redraw();
+        if skipped_cells > 0 {
+            fltk::dialog::alert_default(&format!(
+                "Pasted {} cell(s), but {} cell(s) were skipped (outside table bounds).",
+                changed_cells, skipped_cells
+            ));
+        }
         Ok(changed_cells)
     }
 
@@ -2336,8 +2368,8 @@ impl ResultTableWidget {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(session) = guard.as_mut() {
-                        if session.row_states.last().is_some() {
-                            session.row_states.pop();
+                        if new_row_index < session.row_states.len() {
+                            session.row_states.remove(new_row_index);
                         }
                     }
                 }
@@ -2996,6 +3028,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for row in row_top..=row_bot {
+                result.push('\n');
                 for (visible_idx, col) in visible_cols.iter().enumerate() {
                     if visible_idx > 0 {
                         result.push('\t');
@@ -3004,7 +3037,6 @@ impl ResultTableWidget {
                         result.push_str(val);
                     }
                 }
-                result.push('\n');
             }
         }
 
@@ -4048,7 +4080,7 @@ mod row_edit_sql_tests {
             Some((0, 1, 1, 2)),
             &[vec!["X".to_string()]],
         );
-        assert_eq!(changed, 4);
+        assert_eq!(changed, (4, 0));
         assert_eq!(
             data,
             vec![
@@ -4080,7 +4112,7 @@ mod row_edit_sql_tests {
                 "Z".to_string(),
             ]],
         );
-        assert_eq!(changed, 2);
+        assert_eq!(changed, (2, 0));
         assert_eq!(
             data,
             vec![vec![
