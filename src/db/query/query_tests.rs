@@ -328,6 +328,30 @@ fn test_maybe_inject_rowid_for_editing_preserves_hint_before_all_modifier() {
 }
 
 #[test]
+fn test_retryable_rowid_injection_error_detects_non_key_preserved_table() {
+    let message = "ORA-01445: cannot select ROWID from, or sample, a join view without a key-preserved table";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_rowid_illegal_here() {
+    let message = "ORA-01446: cannot select ROWID from, or sample, a view with DISTINCT, GROUP BY, etc.";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_invalid_identifier_rowid() {
+    let message = "ORA-00904: \"ROWID\": invalid identifier";
+    assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_ignores_other_oracle_errors() {
+    let message = "ORA-00942: table or view does not exist";
+    assert!(!QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
 fn test_is_plain_commit_allows_only_commit_variants() {
     assert!(QueryExecutor::is_plain_commit("COMMIT"));
     assert!(QueryExecutor::is_plain_commit("commit work;"));

@@ -16,6 +16,17 @@ impl QueryExecutor {
         err.to_string().contains("ORA-01013")
     }
 
+    fn can_retry_without_rowid(err: &OracleError) -> bool {
+        let message = err.to_string();
+        Self::is_retryable_rowid_injection_error(&message)
+    }
+
+    pub(crate) fn is_retryable_rowid_injection_error(message: &str) -> bool {
+        message.contains("ORA-01445")
+            || message.contains("ORA-01446")
+            || (message.contains("ORA-00904") && message.to_ascii_uppercase().contains("ROWID"))
+    }
+
     fn tokenized_upper(sql: &str) -> Vec<String> {
         let mut normalized = String::with_capacity(sql.len());
         let chars: Vec<char> = sql.chars().collect();
@@ -1564,7 +1575,8 @@ impl QueryExecutor {
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut effective_sql = sql_for_execution.as_str();
+        let mut stmt = match conn.statement(effective_sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1574,8 +1586,26 @@ impl QueryExecutor {
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
-                return Err(err);
+                if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
+                    stmt = match conn.statement(sql).build() {
+                        Ok(stmt) => stmt,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    };
+                    effective_sql = sql;
+                    match stmt.query(&[]) {
+                        Ok(result_set) => result_set,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    }
+                } else {
+                    eprintln!("Database operation failed: {err}");
+                    return Err(err);
+                }
             }
         };
 
@@ -1610,7 +1640,7 @@ impl QueryExecutor {
 
         let execution_time = start.elapsed();
         Ok(QueryResult::new_select(
-            &sql_for_execution,
+            effective_sql,
             column_info,
             rows,
             execution_time,
@@ -1632,7 +1662,8 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut effective_sql = sql_for_execution.as_str();
+        let mut stmt = match conn.statement(effective_sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1642,8 +1673,26 @@ impl QueryExecutor {
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
-                return Err(err);
+                if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
+                    stmt = match conn.statement(sql).build() {
+                        Ok(stmt) => stmt,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    };
+                    effective_sql = sql;
+                    match stmt.query(&[]) {
+                        Ok(result_set) => result_set,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    }
+                } else {
+                    eprintln!("Database operation failed: {err}");
+                    return Err(err);
+                }
             }
         };
 
@@ -1688,7 +1737,7 @@ impl QueryExecutor {
         let execution_time = start.elapsed();
         Ok((
             QueryResult::new_select_streamed(
-                &sql_for_execution,
+                effective_sql,
                 column_info,
                 row_count,
                 execution_time,
@@ -1710,7 +1759,8 @@ impl QueryExecutor {
     {
         let start = Instant::now();
         let sql_for_execution = Self::maybe_inject_rowid_for_editing(sql);
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut effective_sql = sql_for_execution.as_str();
+        let mut stmt = match conn.statement(effective_sql).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 eprintln!("Database operation failed: {err}");
@@ -1724,8 +1774,30 @@ impl QueryExecutor {
         let result_set = match stmt.query(&[]) {
             Ok(result_set) => result_set,
             Err(err) => {
-                eprintln!("Database operation failed: {err}");
-                return Err(err);
+                if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
+                    stmt = match conn.statement(sql).build() {
+                        Ok(stmt) => stmt,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    };
+                    if let Err(retry_err) = Self::bind_statement(&mut stmt, binds) {
+                        eprintln!("Database operation failed: {retry_err}");
+                        return Err(retry_err);
+                    }
+                    effective_sql = sql;
+                    match stmt.query(&[]) {
+                        Ok(result_set) => result_set,
+                        Err(retry_err) => {
+                            eprintln!("Database operation failed: {retry_err}");
+                            return Err(retry_err);
+                        }
+                    }
+                } else {
+                    eprintln!("Database operation failed: {err}");
+                    return Err(err);
+                }
             }
         };
 
@@ -1770,7 +1842,7 @@ impl QueryExecutor {
         let execution_time = start.elapsed();
         Ok((
             QueryResult::new_select_streamed(
-                &sql_for_execution,
+                effective_sql,
                 column_info,
                 row_count,
                 execution_time,
