@@ -227,7 +227,9 @@ impl ResultTableWidget {
 
     fn value_represents_null(value: &str, null_text: &str) -> bool {
         let trimmed = value.trim();
-        trimmed.is_empty() || Self::input_matches_null_text(trimmed, null_text)
+        trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("NULL")
+            || Self::input_matches_null_text(trimmed, null_text)
     }
 
     fn row_cell_is_original_null(
@@ -1555,7 +1557,7 @@ impl ResultTableWidget {
                 if active_editor.col >= row_data.len() {
                     row_data.resize(active_editor.col + 1, String::new());
                 }
-                row_data[active_editor.col] = new_value;
+                row_data[active_editor.col] = new_value.clone();
             }
             let mut session_guard = self
                 .edit_session
@@ -1568,7 +1570,7 @@ impl ResultTableWidget {
                     .map(|row_state| {
                         Self::input_maps_to_explicit_null(
                             row_state,
-                            &active_editor.input.value(),
+                            &new_value,
                             &session.null_text,
                         )
                     })
@@ -2377,6 +2379,7 @@ impl ResultTableWidget {
         Ok(Self::sql_string_literal(input))
     }
 
+    #[cfg(test)]
     fn sql_literal_from_input(input: &str) -> Result<String, String> {
         Self::sql_literal_from_input_with_null_text(input, "NULL")
     }
@@ -3558,6 +3561,7 @@ impl ResultTableWidget {
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         source_sql: &Arc<Mutex<String>>,
         execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        null_text: &Arc<Mutex<String>>,
         context_cell: Option<(usize, usize)>,
     ) {
         let Some((row_index, col_index)) = Self::resolve_update_target_cell(
@@ -3630,11 +3634,15 @@ impl ResultTableWidget {
             }
         };
 
+        let current_null_text = null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let sql = format!(
             "UPDATE {} SET {} = {} WHERE ROWID = {}",
             Self::quote_qualified_identifier(&table_name),
             column_identifier,
-            match Self::sql_literal_from_input(&input) {
+            match Self::sql_literal_from_input_with_null_text(&input, &current_null_text) {
                 Ok(value) => value,
                 Err(err) => {
                     fltk::dialog::alert_default(&err);
@@ -3726,6 +3734,7 @@ impl ResultTableWidget {
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         source_sql: &Arc<Mutex<String>>,
         execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+        null_text: &Arc<Mutex<String>>,
     ) {
         let headers_snapshot = headers
             .lock()
@@ -3767,6 +3776,10 @@ impl ResultTableWidget {
                 .get(row_index)
                 .cloned()
         });
+        let current_null_text = null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut value_literals: Vec<String> = Vec::with_capacity(editable_columns.len());
         let mut column_names: Vec<String> = Vec::with_capacity(editable_columns.len());
         for (col_idx, column_identifier) in editable_columns {
@@ -3786,7 +3799,10 @@ impl ResultTableWidget {
                 return;
             };
             column_names.push(column_identifier);
-            let literal = match Self::sql_literal_from_input(&input) {
+            let literal = match Self::sql_literal_from_input_with_null_text(
+                &input,
+                &current_null_text,
+            ) {
                 Ok(value) => value,
                 Err(err) => {
                     fltk::dialog::alert_default(&err);
@@ -4865,7 +4881,27 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(session) = session_guard.as_mut() {
-            session.null_text = normalized;
+            let old_null_text = std::mem::replace(&mut session.null_text, normalized.clone());
+            if old_null_text != normalized {
+                let mut full_data = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (row_idx, row_state) in session.row_states.iter().enumerate() {
+                    let explicit_cols = Self::row_state_explicit_null_cols(row_state);
+                    if explicit_cols.is_empty() {
+                        continue;
+                    }
+                    let Some(row) = full_data.get_mut(row_idx) else {
+                        continue;
+                    };
+                    for &col_idx in explicit_cols {
+                        if col_idx < row.len() && row[col_idx] == old_null_text {
+                            row[col_idx] = normalized.clone();
+                        }
+                    }
+                }
+            }
         }
         self.table.redraw();
     }
@@ -5465,6 +5501,67 @@ mod row_edit_sql_tests {
             ResultTableWidget::sql_literal_from_input_with_null_text("null", "(null)"),
             Ok("'null'".to_string())
         );
+    }
+
+    #[test]
+    fn row_cell_is_original_null_recognizes_executor_null_with_custom_null_text() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "NULL".to_string()],
+        );
+        // null_text is custom "(null)" but the executor stores DB NULLs as "NULL".
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "(null)".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        // Current value is still "NULL" from the executor (user hasn't edited).
+        let current_row = vec!["RID1".to_string(), "NULL".to_string()];
+        assert!(ResultTableWidget::row_cell_is_original_null(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn row_cell_is_original_null_detects_change_from_null_with_custom_null_text() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "NULL".to_string()],
+        );
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "(null)".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        // User changed the cell value from NULL to actual data.
+        let current_row = vec!["RID1".to_string(), "SMITH".to_string()];
+        assert!(!ResultTableWidget::row_cell_is_original_null(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
     }
 
     #[test]
