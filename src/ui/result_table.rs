@@ -2542,6 +2542,13 @@ impl ResultTableWidget {
     }
 
     pub fn save_edit_mode(&mut self) -> Result<String, String> {
+        // If the user clicks Save while an inline editor is still focused,
+        // force focus back to the table first so FLTK commits any pending
+        // in-widget edit state before we snapshot staged rows.
+        if !self.table.was_deleted() {
+            let _ = self.table.take_focus();
+            app::flush();
+        }
         self.commit_active_inline_edit();
 
         let session = self
