@@ -1904,9 +1904,13 @@ impl ResultTableWidget {
         if let Some(expr) = trimmed.strip_prefix('=') {
             return Self::validate_sql_expression_input(expr);
         }
-        if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
-            return Ok(trimmed.to_string());
-        }
+        // Treat non-expression user input as a string literal.
+        //
+        // Previous behavior auto-detected numeric-looking values (e.g. "00123")
+        // and emitted them as numeric SQL literals. On character columns this can
+        // cause implicit conversion and silently lose formatting ("00123" -> "123").
+        // Users can still force a numeric/expression assignment explicitly with
+        // the documented '=expr' syntax.
         // Preserve user-entered leading/trailing whitespace for string literals.
         Ok(Self::sql_string_literal(input))
     }
@@ -4172,11 +4176,15 @@ mod row_edit_sql_tests {
         );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("42"),
-            Ok("42".to_string())
+            Ok("'42'".to_string())
         );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("3.14"),
-            Ok("3.14".to_string())
+            Ok("'3.14'".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("00123"),
+            Ok("'00123'".to_string())
         );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("=sysdate"),
