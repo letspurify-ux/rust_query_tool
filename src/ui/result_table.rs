@@ -38,17 +38,17 @@ fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
     }
 
     if max_chars == 1 {
-        let mut chars = text.chars();
-        return match chars.next() {
-            None => None,
-            Some(_) => {
-                if chars.next().is_some() {
-                    Some(0)
-                } else {
-                    None
-                }
-            }
-        };
+        if text.is_empty() {
+            return None;
+        }
+        // Advance past the first character by scanning for the next char boundary.
+        // If bytes remain after the first character, the text has more than one
+        // character and must be truncated (showing only "…").
+        let mut first_end = 1;
+        while first_end < text.len() && !text.is_char_boundary(first_end) {
+            first_end += 1;
+        }
+        return if first_end < text.len() { Some(0) } else { None };
     }
 
     let keep_chars = max_chars.saturating_sub(1);
@@ -60,7 +60,9 @@ fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
     }
 }
 
-/// Minimum interval between UI updates during streaming
+/// Flush to UI immediately on every received batch (no sender-side delay added here).
+/// Row batching and time-based throttling are handled on the sender side in execution.rs
+/// (PROGRESS_ROWS_INITIAL_BATCH / PROGRESS_ROWS_FLUSH_INTERVAL / PROGRESS_ROWS_MAX_BATCH).
 const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(0);
 /// Maximum rows to buffer before forcing a UI update
 const MAX_BUFFERED_ROWS: usize = 500000;
