@@ -3103,6 +3103,7 @@ impl SqlEditorWidget {
         profile_input.set_color(theme::input_bg());
         profile_input.set_text_color(theme::text_primary());
         profile_input.set_tooltip("Profile filter or target profile");
+        input_row.fixed(&profile_input, 150);
 
         let mut attention_only_check = CheckButton::default().with_label("Attention only");
         attention_only_check.set_label_color(theme::text_primary());
