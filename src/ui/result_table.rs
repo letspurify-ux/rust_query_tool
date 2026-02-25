@@ -1348,6 +1348,7 @@ impl ResultTableWidget {
         full_data: &mut Vec<Vec<String>>,
         rowid_col: usize,
         editable_cols: &HashSet<usize>,
+        max_cols: usize,
         anchor: (usize, usize),
         selection: Option<(usize, usize, usize, usize)>,
         pasted_rows: &[Vec<String>],
@@ -1360,6 +1361,10 @@ impl ResultTableWidget {
         let mut skipped_cells = 0usize;
         let row_count = full_data.len();
         let mut apply_value = |target_row: usize, target_col: usize, value: &str| {
+            if target_col >= max_cols {
+                skipped_cells = skipped_cells.saturating_add(1);
+                return;
+            }
             if target_col == rowid_col || !editable_cols.contains(&target_col) {
                 return;
             }
@@ -1476,6 +1481,7 @@ impl ResultTableWidget {
                 &mut rows,
                 session.rowid_col,
                 &editable_cols,
+                table.cols().max(0) as usize,
                 anchor,
                 selection,
                 &pasted_rows,
@@ -1831,7 +1837,10 @@ impl ResultTableWidget {
             return false;
         }
 
-        if let Some(inner) = trimmed.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+        if let Some(inner) = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
             if inner.is_empty() {
                 return false;
             }
@@ -2752,10 +2761,7 @@ impl ResultTableWidget {
                         .join(", ");
                     format!("ROWID IN ({rowid_literals})")
                 };
-                statements.push(format!(
-                    "DELETE FROM {} WHERE {}",
-                    table_ref, delete_where
-                ));
+                statements.push(format!("DELETE FROM {} WHERE {}", table_ref, delete_where));
             }
         }
 
@@ -4408,6 +4414,7 @@ mod row_edit_sql_tests {
             &mut data,
             0,
             &editable_cols,
+            3,
             (0, 1),
             Some((0, 1, 1, 2)),
             &[vec!["X".to_string()]],
@@ -4435,6 +4442,7 @@ mod row_edit_sql_tests {
             &mut data,
             0,
             &editable_cols,
+            4,
             (0, 0),
             None,
             &[vec![
@@ -4452,6 +4460,36 @@ mod row_edit_sql_tests {
                 "X".to_string(),
                 "B".to_string(),
                 "Z".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn apply_paste_values_to_data_counts_cells_beyond_visible_columns_as_skipped() {
+        let mut data = vec![vec![
+            "RID1".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ]];
+        let editable_cols: HashSet<usize> = [1usize, 2usize, 3usize].into_iter().collect();
+        let changed = ResultTableWidget::apply_paste_values_to_data(
+            &mut data,
+            0,
+            &editable_cols,
+            3,
+            (0, 2),
+            None,
+            &[vec!["X".to_string(), "Y".to_string()]],
+        );
+        assert_eq!(changed, (1, 1));
+        assert_eq!(
+            data,
+            vec![vec![
+                "RID1".to_string(),
+                "A".to_string(),
+                "X".to_string(),
+                "C".to_string(),
             ]]
         );
     }
