@@ -73,7 +73,7 @@ const MAX_BUFFERED_ROWS: usize = 500000;
 /// Stop computing column widths after this many rows (widths stabilize quickly)
 const WIDTH_SAMPLE_ROWS: usize = 5000;
 
-pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String)>>>;
+pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
 
 #[derive(Clone)]
 pub struct ResultTableWidget {
@@ -2274,8 +2274,7 @@ impl ResultTableWidget {
         let mut cb = callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (*cb)(sql);
-        Ok(())
+        (*cb)(sql)
     }
 
     #[allow(dead_code)]
@@ -2893,6 +2892,14 @@ impl ResultTableWidget {
     }
 
     pub fn cancel_edit_mode(&mut self) -> Result<String, String> {
+        if *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Err("Cannot cancel edit mode while save is in progress.".to_string());
+        }
+
         // Discard any pending inline edit without committing — the user is
         // cancelling all staged changes so the editor value must not be
         // written back into the data that is about to be restored.
@@ -3435,6 +3442,8 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
         let save_requested = {
             let mut guard = self
                 .pending_save_request
@@ -3571,6 +3580,8 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
         let save_pending = *self
             .pending_save_request
             .lock()
@@ -4871,6 +4882,7 @@ mod row_edit_sql_tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(sql);
+            Ok(())
         })));
         *widget
             .execute_sql_callback
@@ -4913,6 +4925,7 @@ mod row_edit_sql_tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(sql);
+            Ok(())
         })));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(Some(callback)));
@@ -4927,6 +4940,53 @@ mod row_edit_sql_tests {
                 .as_slice(),
             &[sql]
         );
+    }
+
+    #[test]
+    fn try_execute_sql_propagates_callback_error() {
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(|_sql| {
+            Err("Another query is already running.".to_string())
+        })));
+        let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(Some(callback)));
+
+        let result = ResultTableWidget::try_execute_sql(
+            &execute_sql_callback,
+            "UPDATE EMP SET ENAME='A'".to_string(),
+        );
+        assert_eq!(result, Err("Another query is already running.".to_string()));
+    }
+
+    #[test]
+    fn cancel_edit_mode_returns_error_while_save_is_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.cancel_edit_mode();
+        assert_eq!(
+            result,
+            Err("Cannot cancel edit mode while save is in progress.".to_string())
+        );
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
     }
 }
 

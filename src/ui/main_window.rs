@@ -1196,13 +1196,16 @@ impl MainWindow {
         let grid_edit_callback: ResultGridSqlExecuteCallback =
             Arc::new(Mutex::new(Box::new(move |sql: String| {
                 let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
-                    return;
+                    return Err("Main window is no longer available.".to_string());
                 };
-                state_for_grid_edit
+                let guard = state_for_grid_edit
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_sql_text(&sql);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if guard.sql_editor.is_query_running() {
+                    return Err("Another query is already running.".to_string());
+                }
+                guard.sql_editor.execute_sql_text(&sql);
+                Ok(())
             })));
         {
             state
