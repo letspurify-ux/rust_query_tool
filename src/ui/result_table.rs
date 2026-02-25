@@ -3547,10 +3547,16 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
-        *self
-            .edit_session
+        let save_pending = *self
+            .pending_save_request
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !save_pending {
+            *self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
         let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
@@ -3578,14 +3584,20 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        // edit_session was just cleared above, so edit mode is always false here.
+        // During save execution we keep edit_session alive until a final success/failure
+        // result arrives in display_result().
+        let edit_mode_enabled = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
         // Detect the ROWID column up-front so it stays hidden throughout streaming,
         // not only after set_source_sql() is called at the end.
         *self
             .hidden_auto_rowid_col
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Self::detect_auto_hidden_rowid_col(headers, "", false);
+            Self::detect_auto_hidden_rowid_col(headers, "", edit_mode_enabled);
 
         // Initialize pending widths based on headers
         let font_size = *self
