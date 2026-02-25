@@ -2823,12 +2823,12 @@ impl ResultTableWidget {
         }
 
         if statements.is_empty() {
-            *self
-                .edit_session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            self.refresh_auto_rowid_visibility();
-            return Ok("No staged changes to save.".to_string());
+            // Keep edit mode active when there is nothing to persist yet.
+            // This prevents accidental edit-session termination (for example,
+            // after opening edit mode and pressing Save before making any
+            // changes), which would otherwise leave the user in a confusing
+            // partially edited state without applying anything.
+            return Ok("No staged changes to save. Edit mode is still enabled.".to_string());
         }
 
         // Wrap multiple DML statements in an anonymous PL/SQL block so that
