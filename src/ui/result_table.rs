@@ -1819,7 +1819,45 @@ impl ResultTableWidget {
         if column.is_empty() {
             return None;
         }
+        if !Self::is_valid_identifier_segment(column) {
+            return None;
+        }
         Some(Self::quote_identifier_segment(column))
+    }
+
+    fn is_valid_identifier_segment(segment: &str) -> bool {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if let Some(inner) = trimmed.strip_prefix('"').and_then(|value| value.strip_suffix('"')) {
+            if inner.is_empty() {
+                return false;
+            }
+            let mut chars = inner.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch != '"' {
+                    continue;
+                }
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    continue;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return false;
+        }
+
+        chars.all(|ch| ch == '_' || ch == '$' || ch == '#' || ch.is_ascii_alphanumeric())
     }
 
     fn sql_string_literal(value: &str) -> String {
@@ -4186,6 +4224,18 @@ mod row_edit_sql_tests {
         );
         assert_eq!(ResultTableWidget::editable_column_identifier(""), None);
         assert_eq!(ResultTableWidget::editable_column_identifier("E."), None);
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("COUNT(*)"),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("2ND_COL"),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::editable_column_identifier("\"BROKEN\"NAME\""),
+            None
+        );
     }
 
     #[test]
