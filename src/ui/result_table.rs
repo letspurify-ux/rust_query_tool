@@ -2452,6 +2452,10 @@ impl ResultTableWidget {
     }
 
     pub fn insert_row_in_edit_mode(&mut self) -> Result<String, String> {
+        // Commit any pending inline edit before inserting a new row so that
+        // the previous cell's value is not silently lost.
+        self.commit_active_inline_edit();
+
         let headers_len = self
             .headers
             .lock()
@@ -2591,6 +2595,11 @@ impl ResultTableWidget {
     }
 
     pub fn delete_selected_rows_in_edit_mode(&mut self) -> Result<String, String> {
+        // Commit any pending inline edit before modifying the row set so that
+        // the edited value lands on the correct row and the editor widget is
+        // cleaned up (prevents stale-index writes after rows are removed).
+        self.commit_active_inline_edit();
+
         let (row_start, row_end) = Self::selected_row_range(&self.table)
             .ok_or_else(|| "Select row(s) to delete.".to_string())?;
 
@@ -2680,25 +2689,25 @@ impl ResultTableWidget {
         let mut statements = Vec::new();
 
         if !session.deleted_rowids.is_empty() {
-            let delete_where = if session.deleted_rowids.len() == 1 {
-                format!(
-                    "ROWID = {}",
-                    Self::sql_string_literal(&session.deleted_rowids[0])
-                )
-            } else {
-                let rowid_literals = session
-                    .deleted_rowids
-                    .iter()
-                    .map(|rowid| Self::sql_string_literal(rowid))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("ROWID IN ({rowid_literals})")
-            };
-            statements.push(format!(
-                "DELETE FROM {} WHERE {}",
-                Self::quote_qualified_identifier(&session.table_name),
-                delete_where
-            ));
+            // Oracle limits IN-list to 1000 elements (ORA-01795).  Chunk
+            // deleted ROWIDs so each DELETE stays within the limit.
+            let table_ref = Self::quote_qualified_identifier(&session.table_name);
+            for chunk in session.deleted_rowids.chunks(1000) {
+                let delete_where = if chunk.len() == 1 {
+                    format!("ROWID = {}", Self::sql_string_literal(&chunk[0]))
+                } else {
+                    let rowid_literals = chunk
+                        .iter()
+                        .map(|rowid| Self::sql_string_literal(rowid))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("ROWID IN ({rowid_literals})")
+                };
+                statements.push(format!(
+                    "DELETE FROM {} WHERE {}",
+                    table_ref, delete_where
+                ));
+            }
         }
 
         for (idx, row_state) in session.row_states.iter().enumerate() {
@@ -2794,6 +2803,11 @@ impl ResultTableWidget {
     }
 
     pub fn cancel_edit_mode(&mut self) -> Result<String, String> {
+        // Discard any pending inline edit without committing — the user is
+        // cancelling all staged changes so the editor value must not be
+        // written back into the data that is about to be restored.
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
         let session = self
             .edit_session
             .lock()
