@@ -1481,7 +1481,7 @@ impl QueryExecutor {
 
         if let Some(span) = spans
             .iter()
-            .find(|span| cursor_pos >= span.start && cursor_pos <= span.end)
+            .find(|span| cursor_pos >= span.start && cursor_pos < span.end)
         {
             return Some((span.start, span.end));
         }
