@@ -97,6 +97,7 @@ pub struct ResultTableWidget {
     source_sql: Arc<Mutex<String>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     edit_session: Arc<Mutex<Option<TableEditSession>>>,
+    pending_save_request: Arc<Mutex<bool>>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
 }
@@ -486,6 +487,7 @@ impl ResultTableWidget {
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
+        let pending_save_request: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
 
@@ -951,6 +953,7 @@ impl ResultTableWidget {
             source_sql,
             execute_sql_callback,
             edit_session,
+            pending_save_request,
             hidden_auto_rowid_col,
             active_inline_edit,
         }
@@ -2493,6 +2496,11 @@ impl ResultTableWidget {
         }
 
         *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+
+        *self
             .edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
@@ -2848,13 +2856,23 @@ impl ResultTableWidget {
         } else {
             format!("{dml_script}\n{select_sql}")
         };
-        Self::try_execute_sql(&self.execute_sql_callback, script)?;
         *self
-            .edit_session
+            .pending_save_request
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        self.refresh_auto_rowid_visibility();
-        Ok(format!("Applied {} staged statement(s).", statements.len()))
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        if let Err(err) = Self::try_execute_sql(&self.execute_sql_callback, script) {
+            *self
+                .pending_save_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            return Err(err);
+        }
+
+        Ok(format!(
+            "Saving {} staged statement(s)...",
+            statements.len()
+        ))
     }
 
     pub fn cancel_edit_mode(&mut self) -> Result<String, String> {
@@ -2862,6 +2880,11 @@ impl ResultTableWidget {
         // cancelling all staged changes so the editor value must not be
         // written back into the data that is about to be restored.
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
+        *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
 
         let session = self
             .edit_session
@@ -3382,10 +3405,40 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
-        *self
+        let save_requested = {
+            let mut guard = self
+                .pending_save_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let was_requested = *guard;
+            if was_requested {
+                *guard = false;
+            }
+            was_requested
+        };
+        let is_edit_mode_enabled = self
             .edit_session
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+
+        if save_requested {
+            if result.success {
+                *self
+                    .edit_session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                self.refresh_auto_rowid_visibility();
+            } else if is_edit_mode_enabled {
+                // Save failed: keep staged edits so users can fix and retry.
+                return;
+            }
+        } else {
+            *self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
         *self
             .source_sql
             .lock()
@@ -4051,6 +4104,10 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *self
             .active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -4640,6 +4697,50 @@ mod row_edit_sql_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn display_result_keeps_staged_edits_when_save_request_fails() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let failed = QueryResult {
+            sql: "UPDATE EMP SET ENAME='X'".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-00001".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&failed);
+
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
     }
 
     #[test]
