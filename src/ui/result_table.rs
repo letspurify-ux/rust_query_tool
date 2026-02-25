@@ -918,6 +918,17 @@ impl ResultTableWidget {
                         }
                     }
                 }
+                Event::Resize | Event::Move => {
+                    // Main window/layout resizes can shift the table's viewport without
+                    // reliably invoking the widget resize callback in time for the inline
+                    // editor overlay. Re-anchor the active editor here as well so it stays
+                    // aligned to the edited cell.
+                    Self::reposition_active_inline_editor(
+                        &table_for_handle,
+                        &active_inline_edit_for_handle,
+                    );
+                    false
+                }
                 _ => false,
             }
         });
