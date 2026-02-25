@@ -2747,6 +2747,14 @@ impl ResultTableWidget {
     }
 
     pub fn save_edit_mode(&mut self) -> Result<String, String> {
+        if *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Err("Save is already in progress.".to_string());
+        }
+
         // If the user clicks Save while an inline editor is still focused,
         // force focus back to the table first so FLTK commits any pending
         // in-widget edit state before we snapshot staged rows.
@@ -4995,6 +5003,39 @@ mod row_edit_sql_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
+    }
+
+    #[test]
+    fn save_edit_mode_rejects_when_save_is_already_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        assert!(*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) == false);
+
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.save_edit_mode();
+        assert_eq!(result, Err("Save is already in progress.".to_string()));
+        assert!(*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
     }
 }
 
