@@ -718,6 +718,9 @@ impl ResultTableWidget {
         let null_cell_bg = fltk::enums::Color::from_rgb(24, 88, 80);
         let null_sel_bg = fltk::enums::Color::from_rgb(33, 110, 100);
         let null_cell_fg = fltk::enums::Color::from_rgb(224, 255, 250);
+        let null_edited_bg = fltk::enums::Color::from_rgb(50, 82, 56);
+        let null_edited_sel_bg = fltk::enums::Color::from_rgb(66, 100, 72);
+        let null_edited_fg = fltk::enums::Color::from_rgb(230, 255, 210);
         let header_bg = theme::table_header_bg();
         let header_fg = theme::text_primary();
         let border_color = theme::table_border();
@@ -803,7 +806,16 @@ impl ResultTableWidget {
                         }
                     }
                     let is_null_cell = is_explicit_null_cell || is_original_null_cell;
-                    let (bg, fg) = if is_null_cell {
+                    let (bg, fg) = if is_null_cell && is_edited_cell {
+                        // Explicit null on a modified cell: use a distinct
+                        // hybrid tint so the user can tell apart "originally
+                        // null, untouched" from "explicitly set to null".
+                        if selected {
+                            (null_edited_sel_bg, null_edited_fg)
+                        } else {
+                            (null_edited_bg, null_edited_fg)
+                        }
+                    } else if is_null_cell {
                         if selected {
                             (null_sel_bg, null_cell_fg)
                         } else {
@@ -1551,34 +1563,45 @@ impl ResultTableWidget {
 
         if !active_editor.input.was_deleted() {
             let new_value = active_editor.input.value();
-            let mut full_data = self
-                .full_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(row_data) = full_data.get_mut(active_editor.row) {
-                if active_editor.col >= row_data.len() {
-                    row_data.resize(active_editor.col + 1, String::new());
+            // Update full_data in its own scope so the lock is released
+            // before acquiring edit_session, keeping a consistent lock
+            // order (edit_session → full_data) with the rest of the code.
+            {
+                let mut full_data = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(row_data) = full_data.get_mut(active_editor.row) {
+                    if active_editor.col >= row_data.len() {
+                        row_data.resize(active_editor.col + 1, String::new());
+                    }
+                    row_data[active_editor.col] = new_value.clone();
                 }
-                row_data[active_editor.col] = new_value.clone();
             }
-            let mut session_guard = self
-                .edit_session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(session) = session_guard.as_mut() {
-                let is_explicit_null = session
-                    .row_states
-                    .get(active_editor.row)
-                    .map(|row_state| {
-                        Self::input_maps_to_explicit_null(row_state, &new_value, &session.null_text)
-                    })
-                    .unwrap_or(false);
-                let _ = Self::set_row_cell_explicit_null(
-                    session,
-                    active_editor.row,
-                    active_editor.col,
-                    is_explicit_null,
-                );
+            {
+                let mut session_guard = self
+                    .edit_session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(session) = session_guard.as_mut() {
+                    let is_explicit_null = session
+                        .row_states
+                        .get(active_editor.row)
+                        .map(|row_state| {
+                            Self::input_maps_to_explicit_null(
+                                row_state,
+                                &new_value,
+                                &session.null_text,
+                            )
+                        })
+                        .unwrap_or(false);
+                    let _ = Self::set_row_cell_explicit_null(
+                        session,
+                        active_editor.row,
+                        active_editor.col,
+                        is_explicit_null,
+                    );
+                }
             }
 
             let mut input = active_editor.input.clone();
@@ -3391,6 +3414,13 @@ impl ResultTableWidget {
                         let old_value = original_row.get(*col_idx).cloned().unwrap_or_default();
                         let is_explicit_null =
                             Self::row_cell_is_explicit_null(&session, idx, *col_idx);
+                        // Skip redundant SET col = NULL when the original
+                        // value was already NULL (avoids unnecessary DB I/O).
+                        if is_explicit_null
+                            && Self::value_represents_null(&old_value, &session.null_text)
+                        {
+                            continue;
+                        }
                         if is_explicit_null || new_value != old_value {
                             assignments.push(format!(
                                 "{} = {}",
@@ -4887,15 +4917,40 @@ impl ResultTableWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for (row_idx, row_state) in session.row_states.iter().enumerate() {
                     let explicit_cols = Self::row_state_explicit_null_cols(row_state);
-                    if explicit_cols.is_empty() {
-                        continue;
-                    }
                     let Some(row) = full_data.get_mut(row_idx) else {
                         continue;
                     };
+                    // Update explicit null cells: use value_represents_null
+                    // (case-insensitive) instead of exact match so that
+                    // user-typed variants like "null" are also updated.
                     for &col_idx in explicit_cols {
-                        if col_idx < row.len() && row[col_idx] == old_null_text {
+                        if col_idx < row.len()
+                            && Self::value_represents_null(&row[col_idx], &old_null_text)
+                        {
                             row[col_idx] = normalized.clone();
+                        }
+                    }
+                    // Also update non-explicit null cells that still carry the
+                    // executor's original null marker so that every null cell
+                    // displays the newly configured null_text consistently.
+                    for col_idx in 0..row.len() {
+                        if explicit_cols.contains(&col_idx) {
+                            continue;
+                        }
+                        if Self::value_represents_null(&row[col_idx], &old_null_text) {
+                            // Verify against the original snapshot: only rewrite
+                            // the display value when the original was also null
+                            // (avoids clobbering user-edited data that happens
+                            // to look like a null marker).
+                            if let EditRowState::Existing { rowid, .. } = row_state {
+                                if let Some(orig) = session.original_rows_by_rowid.get(rowid) {
+                                    let orig_val =
+                                        orig.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                                    if Self::value_represents_null(orig_val, &old_null_text) {
+                                        row[col_idx] = normalized.clone();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -5594,6 +5649,110 @@ mod row_edit_sql_tests {
             1,
             &current_row
         ));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn set_null_text_updates_case_variant_explicit_null_cells() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        // User typed "null" (lowercase) which was accepted as explicit null.
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "null".to_string()]];
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "SMITH".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: [1usize].into_iter().collect(),
+            }],
+        });
+
+        // Changing null_text should update even the lowercase variant.
+        widget.set_null_text("(null)");
+
+        let data = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(data[0][1], "(null)");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn set_null_text_updates_original_db_null_cells() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        // Executor stores DB NULL as "NULL".
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "NULL".to_string()]];
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "NULL".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                // Not in explicit_null_cols — this is an untouched original null cell.
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        // Changing null_text should also update non-explicit null cells
+        // whose original value was null.
+        widget.set_null_text("(null)");
+
+        let data = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(data[0][1], "(null)");
     }
 
     #[test]
@@ -6388,6 +6547,10 @@ mod row_edit_sql_tests {
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "save_edit_mode calls app::flush() which requires the FLTK UI thread"
+    )]
     fn save_edit_mode_uses_explicit_null_literal_for_set_null_cells() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -6406,10 +6569,12 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             "SELECT ROWID, ENAME FROM EMP".to_string();
 
+        // Original value is "SMITH" (non-null) so that setting explicit null
+        // produces a real UPDATE rather than being skipped as redundant.
         let mut original_rows_by_rowid = HashMap::new();
         original_rows_by_rowid.insert(
             "AAABBB".to_string(),
-            vec!["AAABBB".to_string(), "NULL".to_string()],
+            vec!["AAABBB".to_string(), "SMITH".to_string()],
         );
         *widget
             .edit_session
@@ -6454,6 +6619,82 @@ mod row_edit_sql_tests {
             statements[0],
             "UPDATE EMP SET ENAME = NULL WHERE ROWID = 'AAABBB';"
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "save_edit_mode calls app::flush() which requires the FLTK UI thread"
+    )]
+    fn save_edit_mode_skips_redundant_null_to_null_update() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "NULL".to_string()]];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+
+        // Original value is already NULL. Explicit null on the same cell
+        // should be recognised as a no-op and skipped.
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "NULL".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: [1usize].into_iter().collect(),
+            }],
+        });
+
+        let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_sql_for_cb = captured_sql.clone();
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
+            captured_sql_for_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(sql);
+            Ok(())
+        })));
+        *widget
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback);
+
+        let save_result = widget.save_edit_mode();
+        assert!(save_result.is_ok());
+
+        // No SQL should have been executed because the change is redundant.
+        let statements = captured_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(statements.is_empty());
     }
 
     #[test]
