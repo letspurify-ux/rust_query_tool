@@ -39,9 +39,7 @@ impl QueryExecutor {
             if sql_value.is_null()? {
                 return Ok("NULL".to_string());
             }
-            return row
-                .get::<usize, String>(index)
-                .or(Ok(String::new()));
+            return row.get::<usize, String>(index).or(Ok(String::new()));
         }
 
         let value: Option<String> = row.get(index)?;
@@ -1646,7 +1644,10 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
@@ -1654,7 +1655,10 @@ impl QueryExecutor {
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -1745,7 +1749,10 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
@@ -1753,7 +1760,10 @@ impl QueryExecutor {
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -1850,19 +1860,28 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
                     if let Err(retry_err) = Self::bind_statement(&mut stmt, binds) {
-                        logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                        logging::log_error(
+                            "executor",
+                            &format!("Database operation failed: {retry_err}"),
+                        );
                         return Err(retry_err);
                     }
                     normalize_internal_rowid_alias = false;
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -5132,6 +5151,17 @@ ORDER BY
         false
     }
 
+    fn should_fallback_from_security_view(err: &OracleError) -> bool {
+        // Security manager fallback should be conservative.
+        // ORA-00904 usually means SQL/column mismatch and should be surfaced instead of masked.
+        let fallback_codes = [942, 1031, 2030];
+        if let Some(code) = Self::extract_ora_error_code(err) {
+            return fallback_codes.contains(&code);
+        }
+
+        false
+    }
+
     fn annotate_result_source(mut result: QueryResult, source_view: &str) -> QueryResult {
         let source_note = format!("Source view: {source_view}");
         result.message = if result.message.trim().is_empty() {
@@ -5291,11 +5321,7 @@ ORDER BY owner, job_name
         }
 
         if let Some(owner) = owner_filter.as_deref() {
-            Self::ensure_user_view_matches_target_user(
-                conn,
-                owner,
-                "Scheduler jobs snapshot",
-            )?;
+            Self::ensure_user_view_matches_target_user(conn, owner, "Scheduler jobs snapshot")?;
         }
         let user_where_clause = if failed_only {
             "WHERE (NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))".to_string()
@@ -5652,11 +5678,7 @@ ORDER BY owner_name, job_name
         }
 
         if let Some(owner) = owner_filter.as_deref() {
-            Self::ensure_user_view_matches_target_user(
-                conn,
-                owner,
-                "Data Pump jobs snapshot",
-            )?;
+            Self::ensure_user_view_matches_target_user(conn, owner, "Data Pump jobs snapshot")?;
         }
 
         let sql_user = r#"
@@ -5941,7 +5963,7 @@ WHERE username = '{normalized_user}'
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_users: {err}"));
@@ -6012,19 +6034,14 @@ ORDER BY username
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_users: {err}"));
             }
         }
 
-        let all_where_clause = Self::build_users_overview_where_clause(
-            username_filter.as_deref(),
-            profile_filter.as_deref(),
-            false,
-        );
-        let all_where_clause_without_profile =
+        let all_where_clause =
             Self::build_users_overview_where_clause(username_filter.as_deref(), None, false);
 
         let sql_all = format!(
@@ -6045,6 +6062,15 @@ ORDER BY username
         );
         match Self::execute_select(conn, &sql_all, Instant::now()) {
             Ok(mut result) => {
+                if profile_filter.is_some() {
+                    let warning =
+                        "Warning: profile filter not supported by all_users view and was ignored";
+                    result.message = if result.message.trim().is_empty() {
+                        warning.to_string()
+                    } else {
+                        format!("{} | {warning}", result.message)
+                    };
+                }
                 if attention_only {
                     let warning =
                         "Warning: attention-only filter requires dba_users view and was ignored";
@@ -6057,59 +6083,11 @@ ORDER BY username
                 Ok(Self::annotate_result_source(result, "all_users"))
             }
             Err(err) => {
-                if profile_filter.is_some() && Self::extract_ora_error_code(&err) == Some(904) {
-                    fallback_errors.push(format!("all_users (with profile filter): {err}"));
-                    let sql_all = format!(
-                        r#"
-SELECT
-    username,
-    'N/A' AS account_status,
-    'N/A' AS profile,
-    'N/A' AS default_tablespace,
-    'N/A' AS temporary_tablespace,
-    NVL(TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS'), '-') AS created_at,
-    '-' AS expiry_at,
-    '-' AS lock_at
-FROM all_users
-{all_where_clause_without_profile}
-ORDER BY username
-"#
-                    );
-                    match Self::execute_select(conn, &sql_all, Instant::now()) {
-                        Ok(mut result) => {
-                            let mut warnings = vec![
-                                "Warning: profile filter not supported by all_users view and was ignored"
-                                    .to_string(),
-                            ];
-                            if attention_only {
-                                warnings.push(
-                                    "Warning: attention-only filter requires dba_users view and was ignored"
-                                        .to_string(),
-                                );
-                            }
-                            let warning_text = warnings.join(" | ");
-                            result.message = if result.message.trim().is_empty() {
-                                warning_text
-                            } else {
-                                format!("{} | {warning_text}", result.message)
-                            };
-                            Ok(Self::annotate_result_source(result, "all_users"))
-                        }
-                        Err(all_err) => {
-                            fallback_errors.push(format!("all_users: {all_err}"));
-                            Err(Self::chained_fallback_error(
-                                "Users overview snapshot",
-                                &fallback_errors,
-                            ))
-                        }
-                    }
-                } else {
-                    fallback_errors.push(format!("all_users: {err}"));
-                    Err(Self::chained_fallback_error(
-                        "Users overview snapshot",
-                        &fallback_errors,
-                    ))
-                }
+                fallback_errors.push(format!("all_users: {err}"));
+                Err(Self::chained_fallback_error(
+                    "Users overview snapshot",
+                    &fallback_errors,
+                ))
             }
         }
     }
@@ -6161,7 +6139,7 @@ ORDER BY granted_role
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_role_privs")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_role_privs: {err}"));
@@ -6211,7 +6189,7 @@ ORDER BY privilege
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_sys_privs")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_sys_privs: {err}"));
@@ -6266,7 +6244,7 @@ ORDER BY owner, table_name, privilege
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_tab_privs")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_tab_privs: {err}"));
@@ -6331,7 +6309,7 @@ ORDER BY profile, resource_type, resource_name
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_profiles")),
             Err(err) => {
-                if !Self::should_fallback_from_global_view(&err) {
+                if !Self::should_fallback_from_security_view(&err) {
                     return Err(err);
                 }
                 fallback_errors.push(format!("dba_profiles: {err}"));
@@ -6581,6 +6559,13 @@ mod dba_feature_tests {
     }
 
     #[test]
+    fn build_users_overview_where_clause_without_profile_excludes_profile_predicate() {
+        let where_clause =
+            QueryExecutor::build_users_overview_where_clause(Some("APP_USER"), None, false);
+        assert_eq!(where_clause, "WHERE username = 'APP_USER'");
+    }
+
+    #[test]
     fn kill_session_sql_uses_immediate_when_requested() {
         let sql = QueryExecutor::build_kill_session_sql(101, 222, None, true);
         assert_eq!(sql, "ALTER SYSTEM KILL SESSION '101,222' IMMEDIATE");
@@ -6690,6 +6675,23 @@ mod dba_feature_tests {
                 panic!("unexpected error: {err}");
             });
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn security_view_fallback_excludes_ora_00904() {
+        #[allow(deprecated)]
+        let invalid_identifier_err =
+            oracle::Error::InternalError("ORA-00904: invalid identifier".to_string());
+        #[allow(deprecated)]
+        let insufficient_privilege_err =
+            oracle::Error::InternalError("ORA-01031: insufficient privileges".to_string());
+
+        assert!(!QueryExecutor::should_fallback_from_security_view(
+            &invalid_identifier_err
+        ));
+        assert!(QueryExecutor::should_fallback_from_security_view(
+            &insufficient_privilege_err
+        ));
     }
 
     #[test]
@@ -7505,7 +7507,10 @@ impl ObjectBrowser {
             let default_value: Option<String> = match row.get(12) {
                 Ok(value) => value,
                 Err(err) => {
-                    logging::log_warning("executor", &format!("Failed to read default_value (ignored): {err}"));
+                    logging::log_warning(
+                        "executor",
+                        &format!("Failed to read default_value (ignored): {err}"),
+                    );
                     None
                 }
             };
