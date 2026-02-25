@@ -133,6 +133,63 @@ struct ActiveInlineEdit {
 }
 
 impl ResultTableWidget {
+    fn clear_active_inline_edit_widget(active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>) {
+        let active_editor = active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(active_editor) = active_editor else {
+            return;
+        };
+
+        let mut input = active_editor.input;
+        if !input.was_deleted() {
+            input.hide();
+            Input::delete(input);
+        }
+    }
+
+    fn reposition_active_inline_editor(
+        table: &Table,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
+    ) {
+        let active_editor = active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(active_editor) = active_editor else {
+            return;
+        };
+
+        if active_editor.input.was_deleted() {
+            *active_inline_edit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return;
+        }
+
+        let row = match i32::try_from(active_editor.row) {
+            Ok(row) => row,
+            Err(_) => return,
+        };
+        let col = match i32::try_from(active_editor.col) {
+            Ok(col) => col,
+            Err(_) => return,
+        };
+
+        let Some((x, y, w, h)) = table.find_cell(TableContext::Cell, row, col) else {
+            return;
+        };
+
+        let input_x = x + 1;
+        let input_y = y + 1;
+        let input_w = (w - 2).max(24);
+        let input_h = (h - 2).max(24);
+        let mut input = active_editor.input.clone();
+        input.resize(input_x, input_y, input_w, input_h);
+        input.redraw();
+    }
+
     /// Returns the display column count for `text` using byte-level UTF-8 analysis.
     /// ASCII and 2-byte sequences count as 1 column; 3-byte (CJK etc.) and
     /// 4-byte (emoji etc.) sequences count as 2 columns.
@@ -578,6 +635,7 @@ impl ResultTableWidget {
         let edit_session_for_handle = edit_session.clone();
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         let active_inline_edit_for_handle = active_inline_edit.clone();
+        let active_inline_edit_for_resize = active_inline_edit.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -862,6 +920,10 @@ impl ResultTableWidget {
                 }
                 _ => false,
             }
+        });
+
+        table.resize_callback(move |table_widget, _, _, _, _| {
+            Self::reposition_active_inline_editor(table_widget, &active_inline_edit_for_resize);
         });
 
         Self {
@@ -3860,8 +3922,11 @@ impl ResultTableWidget {
             .edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        // Clear the event handler callback to release captured Arc<Mutex<T>> references.
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
+        // Clear callbacks to release captured Arc<Mutex<T>> references.
         self.table.handle(|_, _| false);
+        self.table.resize_callback(|_, _, _, _, _| {});
 
         // Set an empty draw_cell to release captured Arc<Mutex<...>> references
         // from the virtual rendering callback.
@@ -3914,6 +3979,10 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
