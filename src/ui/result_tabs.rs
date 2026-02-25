@@ -600,6 +600,12 @@ impl ResultTabsWidget {
             .unwrap_or(false)
     }
 
+    pub fn is_current_save_pending(&self) -> bool {
+        self.current_table()
+            .map(|table| table.is_save_pending())
+            .unwrap_or(false)
+    }
+
     pub fn is_current_edit_mode_enabled(&self) -> bool {
         self.current_table()
             .map(|table| table.is_edit_mode_enabled())

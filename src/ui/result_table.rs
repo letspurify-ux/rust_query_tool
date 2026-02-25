@@ -635,6 +635,7 @@ impl ResultTableWidget {
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
         let edit_session_for_handle = edit_session.clone();
+        let pending_save_request_for_handle = pending_save_request.clone();
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         let active_inline_edit_for_handle = active_inline_edit.clone();
         let active_inline_edit_for_resize = active_inline_edit.clone();
@@ -681,6 +682,7 @@ impl ResultTableWidget {
                                     &headers_for_handle,
                                     &full_data_for_handle,
                                     &edit_session_for_handle,
+                                    &pending_save_request_for_handle,
                                     &active_inline_edit_for_handle,
                                     row,
                                     col,
@@ -842,6 +844,7 @@ impl ResultTableWidget {
                                     &headers_for_handle,
                                     &full_data_for_handle,
                                     &edit_session_for_handle,
+                                    &pending_save_request_for_handle,
                                     &active_inline_edit_for_handle,
                                     row as i32,
                                     col as i32,
@@ -907,6 +910,7 @@ impl ResultTableWidget {
                         &table_for_handle,
                         &full_data_for_handle,
                         &edit_session_for_handle,
+                        &pending_save_request_for_handle,
                         &pasted_text,
                     ) {
                         Ok(_) => true,
@@ -1132,6 +1136,7 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
         active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
         row: i32,
         col: i32,
@@ -1142,6 +1147,14 @@ impl ResultTableWidget {
             (Ok(r), Ok(c)) => (r, c),
             _ => return true,
         };
+
+        let save_pending = *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if save_pending {
+            fltk::dialog::alert_default("Save is in progress. Wait for completion before editing.");
+            return true;
+        }
 
         let (rowid_col, is_editable_column) = {
             let guard = edit_session
@@ -1439,8 +1452,16 @@ impl ResultTableWidget {
         table: &Table,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
         clipboard_text: &str,
     ) -> Result<usize, String> {
+        if *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Err("Cannot paste while save is in progress.".to_string());
+        }
+
         let session = edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2392,6 +2413,13 @@ impl ResultTableWidget {
         )
     }
 
+    pub fn is_save_pending(&self) -> bool {
+        *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn is_edit_mode_enabled(&self) -> bool {
         self.edit_session
             .lock()
@@ -2544,6 +2572,10 @@ impl ResultTableWidget {
     }
 
     pub fn insert_row_in_edit_mode(&mut self) -> Result<String, String> {
+        if self.is_save_pending() {
+            return Err("Cannot insert rows while save is in progress.".to_string());
+        }
+
         // Commit any pending inline edit before inserting a new row so that
         // the previous cell's value is not silently lost.
         self.commit_active_inline_edit();
@@ -2687,6 +2719,10 @@ impl ResultTableWidget {
     }
 
     pub fn delete_selected_rows_in_edit_mode(&mut self) -> Result<String, String> {
+        if self.is_save_pending() {
+            return Err("Cannot delete rows while save is in progress.".to_string());
+        }
+
         // Commit any pending inline edit before modifying the row set so that
         // the edited value lands on the correct row and the editor widget is
         // cleaned up (prevents stale-index writes after rows are removed).
@@ -2747,6 +2783,10 @@ impl ResultTableWidget {
     }
 
     pub fn save_edit_mode(&mut self) -> Result<String, String> {
+        if self.is_save_pending() {
+            return Err("Save is already in progress.".to_string());
+        }
+
         // If the user clicks Save while an inline editor is still focused,
         // force focus back to the table first so FLTK commits any pending
         // in-widget edit state before we snapshot staged rows.
@@ -3598,6 +3638,8 @@ impl ResultTableWidget {
         }
         let col_count = headers.len() as i32;
 
+        let should_reset_grid_data = !save_pending;
+
         // Clear any pending data from previous queries
         self.pending_rows
             .lock()
@@ -3607,10 +3649,12 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.full_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        if should_reset_grid_data {
+            self.full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
         *self
             .last_flush
             .lock()
@@ -3619,10 +3663,12 @@ impl ResultTableWidget {
             .width_sampled_rows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-        self.source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        if should_reset_grid_data {
+            self.source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
         // During save execution we keep edit_session alive until a final success/failure
         // result arrives in display_result().
         let edit_mode_enabled = self
@@ -4963,6 +5009,90 @@ mod row_edit_sql_tests {
             "UPDATE EMP SET ENAME='A'".to_string(),
         );
         assert_eq!(result, Err("Another query is already running.".to_string()));
+    }
+
+    #[test]
+    fn start_streaming_keeps_existing_rows_while_save_is_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
+        widget.start_streaming(&headers);
+
+        let rows = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "AAABBB");
+    }
+
+    #[test]
+    fn save_edit_mode_returns_error_when_save_is_already_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.save_edit_mode();
+        assert_eq!(result, Err("Save is already in progress.".to_string()));
+    }
+
+    #[test]
+    fn insert_and_delete_are_blocked_while_save_is_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert_eq!(
+            widget.insert_row_in_edit_mode(),
+            Err("Cannot insert rows while save is in progress.".to_string())
+        );
+        assert_eq!(
+            widget.delete_selected_rows_in_edit_mode(),
+            Err("Cannot delete rows while save is in progress.".to_string())
+        );
     }
 
     #[test]
