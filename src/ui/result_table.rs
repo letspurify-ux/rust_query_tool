@@ -2360,10 +2360,16 @@ impl ResultTableWidget {
         let Some(conn) = current_active_db_connection() else {
             return false;
         };
-        let sql = format!(
-            "INSERT INTO {table_name} ({editable_column}) SELECT {editable_column} FROM {table_name} WHERE 1 = 0"
-        );
+        let sql = Self::build_insert_privilege_probe_sql(table_name, editable_column);
         conn.execute(&sql, &[]).is_ok()
+    }
+
+    fn build_insert_privilege_probe_sql(table_name: &str, editable_column: &str) -> String {
+        let quoted_table = Self::quote_qualified_identifier(table_name);
+        let quoted_column = Self::quote_qualified_identifier(editable_column);
+        format!(
+            "INSERT INTO {quoted_table} ({quoted_column}) SELECT {quoted_column} FROM {quoted_table} WHERE 1 = 0"
+        )
     }
 
     pub fn is_edit_mode_enabled(&self) -> bool {
@@ -4298,6 +4304,27 @@ mod row_edit_sql_tests {
         assert_eq!(
             ResultTableWidget::editable_column_identifier("\"BROKEN\"NAME\""),
             None
+        );
+    }
+
+    #[test]
+    fn build_insert_privilege_probe_sql_quotes_qualified_table_and_column() {
+        let sql = ResultTableWidget::build_insert_privilege_probe_sql("SCOTT.EMP", "ENAME");
+        assert_eq!(
+            sql,
+            "INSERT INTO SCOTT.EMP (ENAME) SELECT ENAME FROM SCOTT.EMP WHERE 1 = 0"
+        );
+    }
+
+    #[test]
+    fn build_insert_privilege_probe_sql_preserves_quoted_identifiers() {
+        let sql = ResultTableWidget::build_insert_privilege_probe_sql(
+            "\"My Schema\".\"Order Detail\"",
+            "\"User Name\"",
+        );
+        assert_eq!(
+            sql,
+            "INSERT INTO \"My Schema\".\"Order Detail\" (\"User Name\") SELECT \"User Name\" FROM \"My Schema\".\"Order Detail\" WHERE 1 = 0"
         );
     }
 
