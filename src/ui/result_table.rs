@@ -954,6 +954,7 @@ impl ResultTableWidget {
             let finished = finished.clone();
             let cancelled = cancelled.clone();
             let mut input_handle = input.clone();
+            let table_for_mouse_bounds = table.clone();
             input_handle.handle(move |widget, ev| match ev {
                 Event::KeyDown if app::event_key() == Key::Escape => {
                     *cancelled
@@ -964,6 +965,30 @@ impl ResultTableWidget {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
                     widget.hide();
                     true
+                }
+                Event::Move | Event::Drag | Event::Leave => {
+                    if !Self::is_mouse_within_bounds(
+                        app::event_x(),
+                        app::event_y(),
+                        table_for_mouse_bounds.x(),
+                        table_for_mouse_bounds.y(),
+                        table_for_mouse_bounds.w(),
+                        table_for_mouse_bounds.h(),
+                    ) {
+                        let is_finished = *finished
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !is_finished {
+                            *result
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(widget.value());
+                            *finished
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        }
+                    }
+                    false
                 }
                 Event::Unfocus => {
                     let is_finished = *finished
@@ -1159,6 +1184,23 @@ impl ResultTableWidget {
         let lower = Key::from_char(ascii.to_ascii_lowercase());
         let upper = Key::from_char(ascii.to_ascii_uppercase());
         key == lower || key == upper || original_key == lower || original_key == upper
+    }
+
+    fn is_mouse_within_bounds(
+        mouse_x: i32,
+        mouse_y: i32,
+        rect_x: i32,
+        rect_y: i32,
+        rect_w: i32,
+        rect_h: i32,
+    ) -> bool {
+        if rect_w <= 0 || rect_h <= 0 {
+            return false;
+        }
+
+        let right = rect_x.saturating_add(rect_w);
+        let bottom = rect_y.saturating_add(rect_h);
+        mouse_x >= rect_x && mouse_x < right && mouse_y >= rect_y && mouse_y < bottom
     }
 
     fn parse_clipboard_rows(clipboard_text: &str) -> Vec<Vec<String>> {
@@ -4153,6 +4195,29 @@ mod row_edit_sql_tests {
             (0, 0, 1, 1),
             -1,
             0
+        ));
+    }
+
+    #[test]
+    fn is_mouse_within_bounds_includes_top_left_excludes_right_bottom() {
+        assert!(ResultTableWidget::is_mouse_within_bounds(
+            10, 20, 10, 20, 100, 40
+        ));
+        assert!(!ResultTableWidget::is_mouse_within_bounds(
+            110, 20, 10, 20, 100, 40
+        ));
+        assert!(!ResultTableWidget::is_mouse_within_bounds(
+            10, 60, 10, 20, 100, 40
+        ));
+    }
+
+    #[test]
+    fn is_mouse_within_bounds_rejects_non_positive_dimensions() {
+        assert!(!ResultTableWidget::is_mouse_within_bounds(
+            10, 20, 10, 20, 0, 40
+        ));
+        assert!(!ResultTableWidget::is_mouse_within_bounds(
+            10, 20, 10, 20, 100, -1
         ));
     }
 
