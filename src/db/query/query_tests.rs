@@ -935,6 +935,12 @@ fn test_check_named_positional_mix_ignores_block_comment_arrow() {
 }
 
 #[test]
+fn test_check_named_positional_mix_call_is_not_validated_as_exec() {
+    let sql = "CALL test_proc(p_id => 1, 2)";
+    assert!(QueryExecutor::check_named_positional_mix(sql).is_ok());
+}
+
+#[test]
 fn test_create_external_function_as_non_plsql_block_followed_by_select() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_fn(
   p_num NUMBER

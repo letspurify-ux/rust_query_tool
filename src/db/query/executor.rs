@@ -526,14 +526,12 @@ impl QueryExecutor {
         let command_len = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
         let command = &trimmed[..command_len];
 
-        let body = if command.eq_ignore_ascii_case("EXECUTE")
-            || command.eq_ignore_ascii_case("EXEC")
-            || command.eq_ignore_ascii_case("CALL")
-        {
-            trimmed[command_len..].to_string()
-        } else {
-            return None;
-        };
+        let body =
+            if command.eq_ignore_ascii_case("EXECUTE") || command.eq_ignore_ascii_case("EXEC") {
+                trimmed[command_len..].to_string()
+            } else {
+                return None;
+            };
 
         let body = body.trim().trim_end_matches(';').trim();
         if body.is_empty() {
