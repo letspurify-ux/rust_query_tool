@@ -3261,10 +3261,14 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        // edit_session was just cleared above, so edit mode is always false here.
+        // Detect the ROWID column up-front so it stays hidden throughout streaming,
+        // not only after set_source_sql() is called at the end.
         *self
             .hidden_auto_rowid_col
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Self::detect_auto_hidden_rowid_col(headers, "", false);
 
         // Initialize pending widths based on headers
         let font_size = *self
