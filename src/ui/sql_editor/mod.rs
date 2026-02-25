@@ -1006,10 +1006,13 @@ impl SqlEditorWidget {
             if disconnected {
                 // Fail-safe cleanup: if the worker thread exits unexpectedly and the
                 // channel closes before BatchFinished arrives, make sure execution
-                // state/cursor do not stay stuck as "running".
-                SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
-                set_cursor(Cursor::Default);
-                app::flush();
+                // state/cursor do not stay stuck as "running" and downstream
+                // handlers can run orphaned result-grid state recovery.
+                SqlEditorWidget::handle_progress_channel_disconnected(
+                    &progress_callback,
+                    &query_running,
+                    &cancel_flag,
+                );
                 return;
             }
 
@@ -1041,6 +1044,17 @@ impl SqlEditorWidget {
             cancel_flag,
             lifecycle_group,
         );
+    }
+
+    fn handle_progress_channel_disconnected(
+        progress_callback: &Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
+        query_running: &Arc<Mutex<bool>>,
+        cancel_flag: &Arc<AtomicBool>,
+    ) {
+        SqlEditorWidget::finalize_execution_state(query_running, cancel_flag);
+        set_cursor(Cursor::Default);
+        app::flush();
+        SqlEditorWidget::invoke_progress_callback(progress_callback, QueryProgress::BatchFinished);
     }
 
     fn finalize_execution_state(query_running: &Arc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
@@ -2598,8 +2612,8 @@ fn is_string_or_comment_style(style: char) -> bool {
 #[cfg(test)]
 mod execution_state_tests {
     use super::{
-        classify_edit_group, BufferEdit, EditGranularity, EditOperation, SqlEditorWidget,
-        UndoSnapshot, WordUndoRedoState,
+        classify_edit_group, BufferEdit, EditGranularity, EditOperation, QueryProgress,
+        SqlEditorWidget, UndoSnapshot, WordUndoRedoState,
     };
     use fltk::app;
     use std::ptr::NonNull;
@@ -2688,6 +2702,37 @@ mod execution_state_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
         assert!(!cancel_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn handle_progress_channel_disconnected_finalizes_and_emits_batch_finished() {
+        let query_running = Arc::new(Mutex::new(true));
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_callback = observed.clone();
+        let progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>> =
+            Arc::new(Mutex::new(Some(Box::new(move |progress| {
+                observed_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            }))));
+
+        SqlEditorWidget::handle_progress_channel_disconnected(
+            &progress_callback,
+            &query_running,
+            &cancel_flag,
+        );
+
+        assert!(!*query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        let callbacks = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(callbacks.len(), 1);
+        assert!(matches!(callbacks[0], QueryProgress::BatchFinished));
     }
 
     #[test]
