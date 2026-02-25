@@ -48,7 +48,11 @@ fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
         while first_end < text.len() && !text.is_char_boundary(first_end) {
             first_end += 1;
         }
-        return if first_end < text.len() { Some(0) } else { None };
+        return if first_end < text.len() {
+            Some(0)
+        } else {
+            None
+        };
     }
 
     let keep_chars = max_chars.saturating_sub(1);
@@ -94,6 +98,7 @@ pub struct ResultTableWidget {
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     edit_session: Arc<Mutex<Option<TableEditSession>>>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
+    active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
 }
 
 #[derive(Default)]
@@ -118,6 +123,13 @@ struct TableEditSession {
     original_row_order: Vec<String>,
     deleted_rowids: Vec<String>,
     row_states: Vec<EditRowState>,
+}
+
+#[derive(Clone)]
+struct ActiveInlineEdit {
+    row: usize,
+    col: usize,
+    input: Input,
 }
 
 impl ResultTableWidget {
@@ -418,6 +430,7 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(None));
         let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+        let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -564,6 +577,7 @@ impl ResultTableWidget {
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
         let edit_session_for_handle = edit_session.clone();
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
+        let active_inline_edit_for_handle = active_inline_edit.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -607,6 +621,7 @@ impl ResultTableWidget {
                                     &headers_for_handle,
                                     &full_data_for_handle,
                                     &edit_session_for_handle,
+                                    &active_inline_edit_for_handle,
                                     row,
                                     col,
                                     current_font_profile,
@@ -767,6 +782,7 @@ impl ResultTableWidget {
                                     &headers_for_handle,
                                     &full_data_for_handle,
                                     &edit_session_for_handle,
+                                    &active_inline_edit_for_handle,
                                     row as i32,
                                     col as i32,
                                     current_font_profile,
@@ -863,6 +879,7 @@ impl ResultTableWidget {
             execute_sql_callback,
             edit_session,
             hidden_auto_rowid_col,
+            active_inline_edit,
         }
     }
 
@@ -873,6 +890,7 @@ impl ResultTableWidget {
         current_value: &str,
         font_profile: FontProfile,
         font_size: u32,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
     ) -> Option<String> {
         let Some((x, y, w, h)) = table.find_cell(TableContext::Cell, row, col) else {
             return fltk::dialog::input_default(
@@ -902,6 +920,16 @@ impl ResultTableWidget {
         input.set_text_size(font_size as i32);
         input.set_value(current_value);
         input.set_trigger(CallbackTrigger::EnterKeyAlways);
+
+        if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col)) {
+            *active_inline_edit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveInlineEdit {
+                row: row_idx,
+                col: col_idx,
+                input: input.clone(),
+            });
+        }
 
         let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let finished = Arc::new(Mutex::new(false));
@@ -980,6 +1008,9 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        *active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         if !input.was_deleted() {
             Input::delete(input);
         }
@@ -1000,6 +1031,7 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
         row: i32,
         col: i32,
         font_profile: FontProfile,
@@ -1055,9 +1087,15 @@ impl ResultTableWidget {
                 .unwrap_or_default()
         };
 
-        let Some(new_value) =
-            Self::show_inline_cell_editor(table, row, col, &current_value, font_profile, font_size)
-        else {
+        let Some(new_value) = Self::show_inline_cell_editor(
+            table,
+            row,
+            col,
+            &current_value,
+            font_profile,
+            font_size,
+            active_inline_edit,
+        ) else {
             return true;
         };
         if new_value == current_value {
@@ -1080,6 +1118,41 @@ impl ResultTableWidget {
         let mut table = table.clone();
         table.redraw();
         true
+    }
+
+    fn commit_active_inline_edit(&mut self) {
+        let active_editor = self
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(active_editor) = active_editor else {
+            return;
+        };
+
+        if !active_editor.input.was_deleted() {
+            let new_value = active_editor.input.value();
+            let mut full_data = self
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(row_data) = full_data.get_mut(active_editor.row) {
+                if active_editor.col >= row_data.len() {
+                    row_data.resize(active_editor.col + 1, String::new());
+                }
+                row_data[active_editor.col] = new_value;
+            }
+
+            let mut input = active_editor.input.clone();
+            input.hide();
+            Input::delete(input);
+        }
+
+        *self
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.table.redraw();
     }
 
     fn matches_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
@@ -2360,6 +2433,7 @@ impl ResultTableWidget {
                 "",
                 profile,
                 size,
+                &self.active_inline_edit,
             ) {
                 let mut full_data = self
                     .full_data
@@ -2468,6 +2542,8 @@ impl ResultTableWidget {
     }
 
     pub fn save_edit_mode(&mut self) -> Result<String, String> {
+        self.commit_active_inline_edit();
+
         let session = self
             .edit_session
             .lock()
