@@ -1,5 +1,5 @@
 use oracle::sql_type::{OracleType, RefCursor};
-use oracle::{Connection, Error as OracleError, Row, Statement};
+use oracle::{Connection, Error as OracleError, Row, RowId, Statement};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -29,14 +29,19 @@ impl QueryExecutor {
         index: usize,
     ) -> Result<String, OracleError> {
         if matches!(column_type, OracleType::Rowid) {
-            // Avoid ROWID -> String conversion through OCI (can segfault in some client/runtime combinations).
+            // Avoid direct String conversion through OCI for ROWID columns, which can
+            // segfault in some client/runtime combinations. Use oracle::RowId instead,
+            // which follows the safe OCI ROWID descriptor path (OCIRowidToChar).
             let Some(sql_value) = row.sql_values().get(index) else {
                 return Ok(String::new());
             };
             if sql_value.is_null()? {
                 return Ok("NULL".to_string());
             }
-            return Ok(String::new());
+            return row
+                .get::<RowId>(index)
+                .map(|rid| rid.to_string())
+                .or(Ok(String::new()));
         }
 
         let value: Option<String> = row.get(index)?;
@@ -53,19 +58,19 @@ impl QueryExecutor {
 
     fn tokenized_upper(sql: &str) -> Vec<String> {
         let mut normalized = String::with_capacity(sql.len());
-        let chars: Vec<char> = sql.chars().collect();
+        let bytes = sql.as_bytes();
         let mut i = 0usize;
         let mut in_single_quote = false;
         let mut in_double_quote = false;
         let mut in_line_comment = false;
         let mut in_block_comment = false;
 
-        while i < chars.len() {
-            let c = chars[i];
-            let next = chars.get(i + 1).copied();
+        while i < bytes.len() {
+            let b = bytes[i];
+            let next = bytes.get(i + 1).copied();
 
             if in_line_comment {
-                if c == '\n' {
+                if b == b'\n' {
                     in_line_comment = false;
                     normalized.push(' ');
                 }
@@ -74,7 +79,7 @@ impl QueryExecutor {
             }
 
             if in_block_comment {
-                if c == '*' && next == Some('/') {
+                if b == b'*' && next == Some(b'/') {
                     in_block_comment = false;
                     normalized.push(' ');
                     i += 2;
@@ -85,8 +90,8 @@ impl QueryExecutor {
             }
 
             if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
+                if b == b'\'' {
+                    if next == Some(b'\'') {
                         i += 2;
                         continue;
                     }
@@ -97,8 +102,8 @@ impl QueryExecutor {
             }
 
             if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
+                if b == b'"' {
+                    if next == Some(b'"') {
                         i += 2;
                         continue;
                     }
@@ -108,32 +113,52 @@ impl QueryExecutor {
                 continue;
             }
 
-            if c == '-' && next == Some('-') {
+            if b == b'-' && next == Some(b'-') {
                 in_line_comment = true;
                 i += 2;
                 continue;
             }
 
-            if c == '/' && next == Some('*') {
+            if b == b'/' && next == Some(b'*') {
                 in_block_comment = true;
                 i += 2;
                 continue;
             }
 
-            if c == '\'' {
+            if b == b'\'' {
                 in_single_quote = true;
                 i += 1;
                 continue;
             }
 
-            if c == '"' {
+            if b == b'"' {
                 in_double_quote = true;
                 i += 1;
                 continue;
             }
 
-            normalized.push(c);
-            i += 1;
+            // Push current character to normalized using byte offsets.
+            // ASCII bytes are pushed directly; multi-byte UTF-8 characters are
+            // advanced by computing the char length from the first byte pattern.
+            if b.is_ascii() {
+                normalized.push(b as char);
+                i += 1;
+            } else {
+                let ch_len = if b & 0xF8 == 0xF0 {
+                    4
+                } else if b & 0xF0 == 0xE0 {
+                    3
+                } else if b & 0xE0 == 0xC0 {
+                    2
+                } else {
+                    1
+                };
+                let end = (i + ch_len).min(bytes.len());
+                if let Some(s) = sql.get(i..end) {
+                    normalized.push_str(s);
+                }
+                i = end;
+            }
         }
 
         normalized
