@@ -1,5 +1,55 @@
 # 예외 처리 보완 내역
 
+## 2026-02-25 결과 테이블 편집 이벤트 경합 안정화
+
+### [중] `SELECT` 실패/취소 시 staged edit 유실 가능성 수정
+- **증상**: 결과 테이블 편집 모드에서 일반 쿼리 실행 후 `SELECT`가 실패/취소되면, `start_streaming`에서 편집 세션이 먼저 해제되어 staged edit를 복구하지 못할 수 있었습니다.
+- **원인**:
+  - `StatementFinished`의 `SELECT` 경로가 `display_result`를 통과하지 않아 편집 보존/복구 로직이 누락됨.
+  - `start_streaming` 시점에 편집 세션/데이터가 바로 초기화되어 실패 시 되돌릴 원본 상태가 사라짐.
+- **수정**:
+  - `ResultTableWidget`에 쿼리 전환용 백업 상태(`query_edit_backup`)를 추가해, 편집 세션이 있는 상태에서 `SELECT` 스트리밍 시작 시 원본 편집 상태를 저장.
+  - `display_result`에서 일반 쿼리 실패/취소 시 백업이 있으면 편집 세션/헤더/데이터/source SQL을 원복하도록 보강.
+  - `BatchFinished`에서 최종 결과 이벤트가 누락된 경우를 대비해 고아 백업 복구 경로(`clear_orphaned_query_edit_backup`)를 추가.
+  - `main_window`의 `StatementFinished` 처리에서 `SELECT`도 `finish_streaming` 후 `display_result`를 호출하도록 통일.
+  - 더 이상 사용되지 않는 `set_source_sql` 메서드(`result_tabs`, `result_table`) 제거.
+- **효과**: 편집 체크/입력 후 쿼리 실행, 쿼리 취소, 쿼리 실패 이벤트가 교차해도 staged edit가 예기치 않게 소실되지 않고 복구됩니다.
+
+### [테스트] 회귀 테스트 추가
+- `display_result_restores_staged_edits_after_select_failure_during_streaming`
+- `clear_orphaned_query_edit_backup_recovers_select_start_interruption`
+
+### [검증]
+- `cargo test` 전체 통과
+
+## 2026-02-25 결과 테이블 편집 이벤트 경합 안정화 (후속)
+
+### [중] save pending 중 `start_streaming` 진입 시 인라인 편집값 유실/그리드 초기화 가능성 수정
+- **증상**: save 응답 대기 중(`pending_save_request=true`)에 예외적으로 `start_streaming` 이벤트가 들어오면, 활성 인라인 편집 입력값이 커밋되지 않고 위젯이 제거되거나 그리드 상태가 예상치 못하게 초기화될 수 있었습니다.
+- **원인**: `start_streaming`이 save pending일 때 편집 세션 스냅샷을 건너뛰면서 인라인 편집 커밋 경로를 타지 않았고, 스트리밍 초기화 로직이 동일하게 동작했습니다.
+- **수정**:
+  - `start_streaming` 초입에서 save pending 여부와 무관하게 활성 인라인 편집을 먼저 커밋하도록 정리.
+  - save pending 중에는 스트리밍 초기화/행 반영을 건너뛰고 기존 staged 그리드 상태를 유지하도록 가드 추가.
+  - `append_rows`/`flush_pending`에도 save pending 가드를 추가해 out-of-order row 이벤트가 staged 데이터에 섞이지 않도록 보강.
+- **효과**: 편집 입력, 저장 요청, 쿼리 이벤트가 교차해도 마지막 셀 입력 유실 및 그리드 상태 오염 가능성이 줄어듭니다.
+
+### [중] save 응답 매칭을 SQL 시그니처 기반으로 보강
+- **증상**: save 결과 식별을 단일 bool(`pending_save_request`)에 의존하면, 교차 이벤트에서 비-save 결과를 save 결과로 오인할 여지가 있었습니다.
+- **원인**: `display_result`가 pending flag만 보고 save 후처리를 수행했습니다.
+- **수정**:
+  - save 시작 시 실행 SQL의 정규화 시그니처(`pending_save_sql_signature`)를 저장.
+  - `display_result`에서 결과 SQL 시그니처가 일치할 때만 save 응답으로 소비하도록 변경.
+  - `clear_orphaned_save_request`, `clear`, `begin/cancel_edit_mode` 등 상태 전환 지점에서 시그니처를 함께 정리.
+- **효과**: 쿼리 취소/실패/재실행 경계에서 save 상태 오판으로 인한 편집 세션 종료/복구 오류 위험이 낮아집니다.
+
+### [테스트] 회귀 테스트 추가
+- `display_result_ignores_non_matching_result_while_save_is_pending`
+- `canonical_sql_signature_normalizes_whitespace_and_trailing_semicolon`
+- `matches_pending_save_signature_uses_normalized_sql`
+
+### [검증]
+- `cargo test` 전체 통과 (880 passed, 12 ignored)
+
 ## 중(이상) 우선 수정
 
 ### [중] Clippy 경고(문서 주석 위치)로 인한 품질 게이트 실패
@@ -572,3 +622,25 @@
 ### [테스트] 붙여넣기 앵커 보정 회귀 테스트 추가
 - `resolve_paste_anchor_column_prefers_editable_col_when_anchor_is_rowid`
 - `resolve_paste_anchor_column_keeps_anchor_when_already_editable`
+
+## 2026-02-25 결과 테이블 편집 이벤트 경합 안정화
+
+### [중] 쿼리 시작 이벤트에서 인라인 편집 입력값이 유실되던 경로 수정
+- **증상**: 편집 모드에서 셀 인라인 입력 중 쿼리 실행 이벤트(`start_streaming`)가 먼저 들어오면, 활성 입력 위젯을 즉시 삭제하면서 마지막 입력 텍스트가 staged 데이터에 반영되지 않을 수 있었습니다.
+- **원인**: `start_streaming`이 활성 인라인 에디터를 항상 `clear`만 하고, 편집 중 값을 커밋하지 않았습니다.
+- **수정**:
+  - 편집 세션이 살아있는 경우 `start_streaming` 진입 시 `commit_active_inline_edit()`를 먼저 수행하도록 변경.
+  - 편집 세션이 없을 때만 기존처럼 인라인 위젯을 정리(`clear_active_inline_edit_widget`)하도록 분기.
+- **효과**: 편집 입력 + 쿼리 실행/취소/실패 이벤트가 겹쳐도 마지막 셀 입력값이 조용히 사라지는 경로를 차단했습니다.
+
+### [중] 쿼리 실행 중 결과 편집 액션 허용으로 인한 상태 경합 가능성 완화
+- **증상**: 쿼리 실행 중에도 결과 편집 체크/액션 버튼이 활성화될 수 있어, 편집/저장/취소 이벤트가 실행 상태와 충돌할 여지가 있었습니다.
+- **수정**: `refresh_result_edit_controls`에서 `is_any_query_running()` 상태를 반영해, 실행 중에는 결과 편집 체크 및 편집 액션 버튼을 비활성화하도록 조정.
+- **효과**: 쿼리 실행/취소/실패 처리 중 편집 이벤트가 겹치며 발생할 수 있는 UI 상태 경합을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `start_streaming_commits_active_inline_edit_while_save_is_pending`
+  - save pending 상태에서 `start_streaming` 진입 시 활성 인라인 편집값이 `full_data`로 커밋되는지 검증.
+
+### [검증]
+- `cargo test` 전체 통과

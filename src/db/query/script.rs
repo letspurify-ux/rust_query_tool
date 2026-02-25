@@ -1461,7 +1461,10 @@ impl QueryExecutor {
                 if idx == 0 {
                     continue;
                 }
-                return trimmed.get(..idx).map(str::trim).filter(|token| !token.is_empty());
+                return trimmed
+                    .get(..idx)
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty());
             }
         }
         Some(trimmed)

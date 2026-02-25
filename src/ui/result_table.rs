@@ -94,10 +94,13 @@ pub struct ResultTableWidget {
     width_sampled_rows: Arc<Mutex<usize>>,
     font_profile: Arc<Mutex<FontProfile>>,
     font_size: Arc<Mutex<u32>>,
+    null_text: Arc<Mutex<String>>,
     source_sql: Arc<Mutex<String>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     edit_session: Arc<Mutex<Option<TableEditSession>>>,
+    query_edit_backup: Arc<Mutex<Option<QueryEditBackupState>>>,
     pending_save_request: Arc<Mutex<bool>>,
+    pending_save_sql_signature: Arc<Mutex<Option<String>>>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
 }
@@ -111,19 +114,33 @@ struct DragState {
 
 #[derive(Clone)]
 enum EditRowState {
-    Existing { rowid: String },
-    Inserted,
+    Existing {
+        rowid: String,
+        explicit_null_cols: HashSet<usize>,
+    },
+    Inserted {
+        explicit_null_cols: HashSet<usize>,
+    },
 }
 
 #[derive(Clone)]
 struct TableEditSession {
     rowid_col: usize,
     table_name: String,
+    null_text: String,
     editable_columns: Vec<(usize, String)>,
     original_rows_by_rowid: HashMap<String, Vec<String>>,
     original_row_order: Vec<String>,
     deleted_rowids: Vec<String>,
     row_states: Vec<EditRowState>,
+}
+
+#[derive(Clone)]
+struct QueryEditBackupState {
+    headers: Vec<String>,
+    full_data: Vec<Vec<String>>,
+    source_sql: String,
+    edit_session: TableEditSession,
 }
 
 #[derive(Clone)]
@@ -134,6 +151,187 @@ struct ActiveInlineEdit {
 }
 
 impl ResultTableWidget {
+    fn row_state_explicit_null_cols(row_state: &EditRowState) -> &HashSet<usize> {
+        match row_state {
+            EditRowState::Existing {
+                explicit_null_cols, ..
+            }
+            | EditRowState::Inserted { explicit_null_cols } => explicit_null_cols,
+        }
+    }
+
+    fn row_state_explicit_null_cols_mut(row_state: &mut EditRowState) -> &mut HashSet<usize> {
+        match row_state {
+            EditRowState::Existing {
+                explicit_null_cols, ..
+            }
+            | EditRowState::Inserted { explicit_null_cols } => explicit_null_cols,
+        }
+    }
+
+    fn row_cell_is_explicit_null(
+        session: &TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+    ) -> bool {
+        session
+            .row_states
+            .get(row_idx)
+            .map(Self::row_state_explicit_null_cols)
+            .map(|cols| cols.contains(&col_idx))
+            .unwrap_or(false)
+    }
+
+    fn set_row_cell_explicit_null(
+        session: &mut TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        is_explicit_null: bool,
+    ) -> bool {
+        let Some(row_state) = session.row_states.get_mut(row_idx) else {
+            return false;
+        };
+        let cols = Self::row_state_explicit_null_cols_mut(row_state);
+        if is_explicit_null {
+            cols.insert(col_idx)
+        } else {
+            cols.remove(&col_idx)
+        }
+    }
+
+    fn input_matches_null_text(input: &str, null_text: &str) -> bool {
+        let marker = null_text.trim();
+        if marker.is_empty() {
+            return input.is_empty();
+        }
+        if marker.eq_ignore_ascii_case("NULL") {
+            input.eq_ignore_ascii_case("NULL")
+        } else {
+            input == marker
+        }
+    }
+
+    fn input_maps_to_explicit_null(row_state: &EditRowState, input: &str, null_text: &str) -> bool {
+        let trimmed = input.trim();
+        if Self::input_matches_null_text(trimmed, null_text) {
+            return true;
+        }
+        if let Some(expr) = trimmed.strip_prefix('=') {
+            return expr.trim().eq_ignore_ascii_case("NULL");
+        }
+        if trimmed.is_empty() {
+            return matches!(row_state, EditRowState::Existing { .. });
+        }
+        false
+    }
+
+    fn value_represents_null(value: &str, null_text: &str) -> bool {
+        let trimmed = value.trim();
+        trimmed.is_empty() || Self::input_matches_null_text(trimmed, null_text)
+    }
+
+    fn row_cell_is_original_null(
+        session: &TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        current_row: &[String],
+    ) -> bool {
+        let Some(EditRowState::Existing { rowid, .. }) = session.row_states.get(row_idx) else {
+            return false;
+        };
+        let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
+            return false;
+        };
+        let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+        let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+        Self::value_represents_null(original_value, &session.null_text)
+            && Self::value_represents_null(current_value, &session.null_text)
+    }
+
+    fn current_null_text(&self) -> String {
+        self.null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_query_edit_backup(&self, backup: Option<QueryEditBackupState>) {
+        *self
+            .query_edit_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup;
+    }
+
+    fn restore_query_edit_backup(&mut self) -> bool {
+        let backup = self
+            .query_edit_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(backup) = backup else {
+            return false;
+        };
+
+        *self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.headers;
+        *self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.full_data;
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.source_sql;
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backup.edit_session);
+
+        let row_count = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as i32;
+        let col_count = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as i32;
+        self.table.set_rows(row_count);
+        self.table.set_cols(col_count);
+        self.apply_table_metrics_for_current_font();
+        self.recalculate_widths_for_current_font();
+        self.refresh_auto_rowid_visibility();
+        self.table.redraw();
+        true
+    }
+
+    fn stage_query_edit_backup_from_current_state(&self, edit_session: TableEditSession) {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let full_data = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.set_query_edit_backup(Some(QueryEditBackupState {
+            headers,
+            full_data,
+            source_sql,
+            edit_session,
+        }));
+    }
+
     fn clear_active_inline_edit_widget(active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>) {
         let active_editor = active_inline_edit
             .lock()
@@ -483,11 +681,15 @@ impl ResultTableWidget {
         let font_size = Arc::new(Mutex::new(DEFAULT_FONT_SIZE as u32));
         let max_cell_display_chars =
             Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
+        let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
+        let query_edit_backup: Arc<Mutex<Option<QueryEditBackupState>>> =
+            Arc::new(Mutex::new(None));
         let pending_save_request: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let pending_save_sql_signature: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
 
@@ -508,6 +710,12 @@ impl ResultTableWidget {
         let cell_bg = theme::table_cell_bg();
         let cell_fg = theme::text_primary();
         let sel_bg = theme::selection_soft();
+        let edited_cell_bg = fltk::enums::Color::from_rgb(74, 64, 26);
+        let edited_sel_bg = fltk::enums::Color::from_rgb(96, 82, 40);
+        let edited_cell_fg = fltk::enums::Color::from_rgb(255, 236, 183);
+        let null_cell_bg = fltk::enums::Color::from_rgb(24, 88, 80);
+        let null_sel_bg = fltk::enums::Color::from_rgb(33, 110, 100);
+        let null_cell_fg = fltk::enums::Color::from_rgb(224, 255, 250);
         let header_bg = theme::table_header_bg();
         let header_fg = theme::text_primary();
         let border_color = theme::table_border();
@@ -520,6 +728,7 @@ impl ResultTableWidget {
         let font_profile_for_draw = font_profile.clone();
         let font_size_for_draw = font_size.clone();
         let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
+        let edit_session_for_draw = edit_session.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
             let font_profile = *font_profile_for_draw
@@ -568,9 +777,48 @@ impl ResultTableWidget {
                 TableContext::Cell => {
                     draw::push_clip(x, y, w, h);
                     let selected = table_for_draw.is_selected(row, col);
-                    let bg = if selected { sel_bg } else { cell_bg };
+                    let mut is_edited_cell = false;
+                    let mut is_explicit_null_cell = false;
+                    let mut is_original_null_cell = false;
+                    if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col))
+                    {
+                        if let Ok(data) = full_data_for_draw.try_lock() {
+                            if let Some(row_data) = data.get(row_idx) {
+                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                    if let Some(session) = session_guard.as_ref() {
+                                        is_explicit_null_cell =
+                                            Self::row_cell_is_explicit_null(session, row_idx, col_idx);
+                                        is_original_null_cell = Self::row_cell_is_original_null(
+                                            session, row_idx, col_idx, row_data,
+                                        );
+                                        is_edited_cell = Self::is_staged_cell_modified(
+                                            session, row_idx, col_idx, row_data,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let is_null_cell = is_explicit_null_cell || is_original_null_cell;
+                    let (bg, fg) = if is_null_cell {
+                        if selected {
+                            (null_sel_bg, null_cell_fg)
+                        } else {
+                            (null_cell_bg, null_cell_fg)
+                        }
+                    } else if is_edited_cell {
+                        if selected {
+                            (edited_sel_bg, edited_cell_fg)
+                        } else {
+                            (edited_cell_bg, edited_cell_fg)
+                        }
+                    } else if selected {
+                        (sel_bg, cell_fg)
+                    } else {
+                        (cell_bg, cell_fg)
+                    };
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, bg);
-                    draw::set_draw_color(cell_fg);
+                    draw::set_draw_color(fg);
                     draw::set_font(font_profile.normal, font_size);
 
                     if let Ok(data) = full_data_for_draw.try_lock() {
@@ -655,6 +903,7 @@ impl ResultTableWidget {
                             &source_sql_for_handle,
                             &execute_sql_callback_for_handle,
                             &edit_session_for_handle,
+                            &pending_save_request_for_handle,
                         );
                         return true;
                     }
@@ -773,6 +1022,23 @@ impl ResultTableWidget {
                     }
 
                     if ctrl_or_cmd {
+                        if key == Key::Delete || original_key == Key::Delete {
+                            match Self::set_selected_cells_to_null_in_edit_mode(
+                                &table_for_handle,
+                                &full_data_for_handle,
+                                &edit_session_for_handle,
+                                &pending_save_request_for_handle,
+                            ) {
+                                Ok(_) => return true,
+                                Err(err) => {
+                                    if err.is_empty() {
+                                        return false;
+                                    }
+                                    fltk::dialog::alert_default(&err);
+                                    return true;
+                                }
+                            }
+                        }
                         if shift && Self::matches_shortcut_key(key, original_key, 'c') {
                             Self::copy_selected_with_headers(
                                 &table_for_handle,
@@ -879,6 +1145,23 @@ impl ResultTableWidget {
                         );
                         return true;
                     }
+                    if ctrl_or_cmd && (key == Key::Delete || original_key == Key::Delete) {
+                        match Self::set_selected_cells_to_null_in_edit_mode(
+                            &table_for_handle,
+                            &full_data_for_handle,
+                            &edit_session_for_handle,
+                            &pending_save_request_for_handle,
+                        ) {
+                            Ok(_) => return true,
+                            Err(err) => {
+                                if err.is_empty() {
+                                    return false;
+                                }
+                                fltk::dialog::alert_default(&err);
+                                return true;
+                            }
+                        }
+                    }
                     if ctrl_or_cmd && Self::matches_shortcut_key(key, original_key, 'c') {
                         Self::copy_selected_to_clipboard(
                             &table_for_handle,
@@ -954,10 +1237,13 @@ impl ResultTableWidget {
             width_sampled_rows: Arc::new(Mutex::new(0)),
             font_profile,
             font_size,
+            null_text,
             source_sql,
             execute_sql_callback,
             edit_session,
+            query_edit_backup,
             pending_save_request,
+            pending_save_sql_signature,
             hidden_auto_rowid_col,
             active_inline_edit,
         }
@@ -1227,7 +1513,22 @@ impl ResultTableWidget {
             if col_idx >= row_data.len() {
                 row_data.resize(col_idx + 1, String::new());
             }
-            row_data[col_idx] = new_value;
+            row_data[col_idx] = new_value.clone();
+        }
+        {
+            let mut guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(session) = guard.as_mut() {
+                let is_explicit_null = session
+                    .row_states
+                    .get(row_idx)
+                    .map(|row_state| {
+                        Self::input_maps_to_explicit_null(row_state, &new_value, &session.null_text)
+                    })
+                    .unwrap_or(false);
+                let _ = Self::set_row_cell_explicit_null(session, row_idx, col_idx, is_explicit_null);
+            }
         }
         let mut table = table.clone();
         table.redraw();
@@ -1255,6 +1556,29 @@ impl ResultTableWidget {
                     row_data.resize(active_editor.col + 1, String::new());
                 }
                 row_data[active_editor.col] = new_value;
+            }
+            let mut session_guard = self
+                .edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(session) = session_guard.as_mut() {
+                let is_explicit_null = session
+                    .row_states
+                    .get(active_editor.row)
+                    .map(|row_state| {
+                        Self::input_maps_to_explicit_null(
+                            row_state,
+                            &active_editor.input.value(),
+                            &session.null_text,
+                        )
+                    })
+                    .unwrap_or(false);
+                let _ = Self::set_row_cell_explicit_null(
+                    session,
+                    active_editor.row,
+                    active_editor.col,
+                    is_explicit_null,
+                );
             }
 
             let mut input = active_editor.input.clone();
@@ -1358,7 +1682,7 @@ impl ResultTableWidget {
     }
 
     /// Apply pasted values to the data grid.
-    /// Returns `(changed_cells, skipped_cells)` where `skipped_cells` counts
+    /// Returns `(changed_cells, skipped_cells, updated_cells)` where `skipped_cells` counts
     /// editable target cells that fell outside the current table bounds.
     fn apply_paste_values_to_data(
         full_data: &mut Vec<Vec<String>>,
@@ -1368,13 +1692,14 @@ impl ResultTableWidget {
         anchor: (usize, usize),
         selection: Option<(usize, usize, usize, usize)>,
         pasted_rows: &[Vec<String>],
-    ) -> (usize, usize) {
+    ) -> (usize, usize, Vec<(usize, usize)>) {
         if pasted_rows.is_empty() {
-            return (0, 0);
+            return (0, 0, Vec::new());
         }
 
         let mut changed_cells = 0usize;
         let mut skipped_cells = 0usize;
+        let mut updated_cells = Vec::new();
         let row_count = full_data.len();
         let mut apply_value = |target_row: usize, target_col: usize, value: &str| {
             if target_col >= max_cols {
@@ -1398,6 +1723,7 @@ impl ResultTableWidget {
             {
                 row[target_col] = value.to_string();
                 changed_cells = changed_cells.saturating_add(1);
+                updated_cells.push((target_row, target_col));
             }
         };
 
@@ -1413,10 +1739,10 @@ impl ResultTableWidget {
                         apply_value(row_idx, col_idx, fill_value);
                     }
                 }
-                return (changed_cells, skipped_cells);
+                return (changed_cells, skipped_cells, updated_cells);
             }
             apply_value(anchor.0, anchor.1, fill_value);
-            return (changed_cells, skipped_cells);
+            return (changed_cells, skipped_cells, updated_cells);
         }
 
         for (row_offset, source_row) in pasted_rows.iter().enumerate() {
@@ -1445,7 +1771,7 @@ impl ResultTableWidget {
             }
         }
 
-        (changed_cells, skipped_cells)
+        (changed_cells, skipped_cells, updated_cells)
     }
 
     fn paste_clipboard_text_into_edit_mode(
@@ -1498,18 +1824,50 @@ impl ResultTableWidget {
             let mut rows = full_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if rows.len() != session.row_states.len() {
+            let mut session_guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session_mut) = session_guard.as_mut() else {
+                return Err("Enable edit mode first.".to_string());
+            };
+            if rows.len() != session_mut.row_states.len() {
                 return Err("Edit session and table rows are out of sync.".to_string());
             }
-            Self::apply_paste_values_to_data(
+            let (changed_cells, skipped_cells, updated_cells) = Self::apply_paste_values_to_data(
                 &mut rows,
-                session.rowid_col,
+                session_mut.rowid_col,
                 &editable_cols,
                 table.cols().max(0) as usize,
                 anchor,
                 selection,
                 &pasted_rows,
-            )
+            );
+
+            for (row_idx, col_idx) in &updated_cells {
+                let input_value = rows
+                    .get(*row_idx)
+                    .and_then(|row| row.get(*col_idx))
+                    .cloned()
+                    .unwrap_or_default();
+                let is_explicit_null = session_mut
+                    .row_states
+                    .get(*row_idx)
+                    .map(|row_state| {
+                        Self::input_maps_to_explicit_null(
+                            row_state,
+                            &input_value,
+                            &session_mut.null_text,
+                        )
+                    })
+                    .unwrap_or(false);
+                let _ = Self::set_row_cell_explicit_null(
+                    session_mut,
+                    *row_idx,
+                    *col_idx,
+                    is_explicit_null,
+                );
+            }
+            (changed_cells, skipped_cells)
         };
 
         if changed_cells == 0 && skipped_cells == 0 {
@@ -1531,6 +1889,89 @@ impl ResultTableWidget {
             ));
         }
         Ok(changed_cells)
+    }
+
+    fn set_selected_cells_to_null_in_edit_mode(
+        table: &Table,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
+    ) -> Result<usize, String> {
+        if *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Err("Cannot set NULL while save is in progress.".to_string());
+        }
+
+        let selection = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )
+        .ok_or_else(|| "Select cell(s) to set NULL.".to_string())?;
+
+        let (row_start, col_start, row_end, col_end) = selection;
+        let mut changed = 0usize;
+        let mut target_cells = 0usize;
+        {
+            let mut rows = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut session_guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(session) = session_guard.as_mut() else {
+                return Err(String::new());
+            };
+
+            if rows.len() != session.row_states.len() {
+                return Err("Edit session and table rows are out of sync.".to_string());
+            }
+
+            let editable_cols: HashSet<usize> = session
+                .editable_columns
+                .iter()
+                .map(|(col_idx, _)| *col_idx)
+                .collect();
+            let null_marker = session.null_text.clone();
+
+            for row_idx in row_start..=row_end {
+                if row_idx >= rows.len() {
+                    continue;
+                }
+                for col_idx in col_start..=col_end {
+                    if col_idx == session.rowid_col || !editable_cols.contains(&col_idx) {
+                        continue;
+                    }
+                    target_cells = target_cells.saturating_add(1);
+                    let Some(row) = rows.get_mut(row_idx) else {
+                        continue;
+                    };
+                    if col_idx >= row.len() {
+                        row.resize(col_idx + 1, String::new());
+                    }
+                    let value_changed = row
+                        .get(col_idx)
+                        .map(|existing| existing != &null_marker)
+                        .unwrap_or(true);
+                    row[col_idx] = null_marker.clone();
+                    let flag_changed = Self::set_row_cell_explicit_null(session, row_idx, col_idx, true);
+                    if value_changed || flag_changed {
+                        changed = changed.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if target_cells == 0 {
+            return Err("No editable cells were selected for Set Null.".to_string());
+        }
+        if changed > 0 {
+            let mut table = table.clone();
+            table.redraw();
+        }
+        Ok(changed)
     }
 
     /// Get cell at mouse position (returns None if outside cells)
@@ -1917,9 +2358,9 @@ impl ResultTableWidget {
         Ok(normalized.to_string())
     }
 
-    fn sql_literal_from_input(input: &str) -> Result<String, String> {
+    fn sql_literal_from_input_with_null_text(input: &str, null_text: &str) -> Result<String, String> {
         let trimmed = input.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+        if trimmed.is_empty() || Self::input_matches_null_text(trimmed, null_text) {
             return Ok("NULL".to_string());
         }
         if let Some(expr) = trimmed.strip_prefix('=') {
@@ -1936,6 +2377,10 @@ impl ResultTableWidget {
         Ok(Self::sql_string_literal(input))
     }
 
+    fn sql_literal_from_input(input: &str) -> Result<String, String> {
+        Self::sql_literal_from_input_with_null_text(input, "NULL")
+    }
+
     #[allow(dead_code)]
     fn compose_edit_script(dml_sql: &str, source_sql: &str) -> String {
         let dml = dml_sql.trim().trim_end_matches(';').trim();
@@ -1947,6 +2392,30 @@ impl ResultTableWidget {
             return dml.to_string();
         }
         format!("{dml};\n{select_sql}")
+    }
+
+    fn canonical_sql_signature(sql: &str) -> String {
+        let mut normalized = String::with_capacity(sql.len());
+        let mut previous_was_whitespace = false;
+        for ch in sql.trim().trim_end_matches(';').trim().chars() {
+            if ch.is_whitespace() {
+                if !previous_was_whitespace {
+                    normalized.push(' ');
+                    previous_was_whitespace = true;
+                }
+                continue;
+            }
+            normalized.push(ch);
+            previous_was_whitespace = false;
+        }
+        normalized
+    }
+
+    fn matches_pending_save_signature(pending_signature: Option<&str>, result_sql: &str) -> bool {
+        let result_signature = Self::canonical_sql_signature(result_sql);
+        pending_signature
+            .map(|signature| signature == result_signature)
+            .unwrap_or(true)
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -2285,6 +2754,43 @@ impl ResultTableWidget {
         Some((row_start, col_start))
     }
 
+    fn is_staged_cell_modified(
+        session: &TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        current_row: &[String],
+    ) -> bool {
+        if col_idx == session.rowid_col {
+            return false;
+        }
+        if !session
+            .editable_columns
+            .iter()
+            .any(|(editable_col, _)| *editable_col == col_idx)
+        {
+            return false;
+        }
+
+        match session.row_states.get(row_idx) {
+            Some(EditRowState::Existing { rowid, .. }) => {
+                let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
+                    return false;
+                };
+                let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                current_value != original_value || Self::row_cell_is_explicit_null(session, row_idx, col_idx)
+            }
+            Some(EditRowState::Inserted { .. }) => {
+                Self::row_cell_is_explicit_null(session, row_idx, col_idx)
+                    || current_row
+                        .get(col_idx)
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false)
+            }
+            None => false,
+        }
+    }
+
     fn try_execute_sql(
         execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         sql: String,
@@ -2519,6 +3025,7 @@ impl ResultTableWidget {
             return Err("No editable columns were detected in this result set.".to_string());
         }
 
+        let current_null_text = self.current_null_text();
         let full_data_snapshot = self
             .full_data
             .lock()
@@ -2546,13 +3053,20 @@ impl ResultTableWidget {
             }
             original_rows_by_rowid.insert(rowid.clone(), row.clone());
             original_row_order.push(rowid.clone());
-            row_states.push(EditRowState::Existing { rowid });
+            row_states.push(EditRowState::Existing {
+                rowid,
+                explicit_null_cols: HashSet::new(),
+            });
         }
 
         *self
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *self
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         *self
             .edit_session
@@ -2560,6 +3074,7 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col,
             table_name,
+            null_text: current_null_text,
             editable_columns,
             original_rows_by_rowid,
             original_row_order,
@@ -2636,7 +3151,9 @@ impl ResultTableWidget {
                 row[rowid_col].clear();
             }
             full_data.push(row);
-            session.row_states.push(EditRowState::Inserted);
+            session.row_states.push(EditRowState::Inserted {
+                explicit_null_cols: HashSet::new(),
+            });
             new_row_index
         };
 
@@ -2675,7 +3192,26 @@ impl ResultTableWidget {
                     if first_col >= row.len() {
                         row.resize(first_col + 1, String::new());
                     }
-                    row[first_col] = value;
+                    row[first_col] = value.clone();
+                }
+                let mut guard = self
+                    .edit_session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(session) = guard.as_mut() {
+                    let is_explicit_null = session
+                        .row_states
+                        .get(new_row_index)
+                        .map(|row_state| {
+                            Self::input_maps_to_explicit_null(row_state, &value, &session.null_text)
+                        })
+                        .unwrap_or(false);
+                    let _ = Self::set_row_cell_explicit_null(
+                        session,
+                        new_row_index,
+                        first_col,
+                        is_explicit_null,
+                    );
                 }
             } else {
                 {
@@ -2755,7 +3291,7 @@ impl ResultTableWidget {
                 if idx >= full_data.len() || idx >= session.row_states.len() {
                     continue;
                 }
-                if let EditRowState::Existing { rowid } = &session.row_states[idx] {
+                if let EditRowState::Existing { rowid, .. } = &session.row_states[idx] {
                     if deleted_set.insert(rowid.clone()) {
                         session.deleted_rowids.push(rowid.clone());
                     }
@@ -2839,7 +3375,7 @@ impl ResultTableWidget {
                 continue;
             };
             match row_state {
-                EditRowState::Existing { rowid } => {
+                EditRowState::Existing { rowid, .. } => {
                     let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
                         continue;
                     };
@@ -2847,11 +3383,20 @@ impl ResultTableWidget {
                     for (col_idx, column_id) in session.editable_columns.iter() {
                         let new_value = row.get(*col_idx).cloned().unwrap_or_default();
                         let old_value = original_row.get(*col_idx).cloned().unwrap_or_default();
-                        if new_value != old_value {
+                        let is_explicit_null =
+                            Self::row_cell_is_explicit_null(&session, idx, *col_idx);
+                        if is_explicit_null || new_value != old_value {
                             assignments.push(format!(
                                 "{} = {}",
                                 column_id,
-                                Self::sql_literal_from_input(&new_value)?
+                                if is_explicit_null {
+                                    "NULL".to_string()
+                                } else {
+                                    Self::sql_literal_from_input_with_null_text(
+                                        &new_value,
+                                        &session.null_text,
+                                    )?
+                                }
                             ));
                         }
                     }
@@ -2864,18 +3409,27 @@ impl ResultTableWidget {
                         ));
                     }
                 }
-                EditRowState::Inserted => {
+                EditRowState::Inserted { .. } => {
                     let mut column_names = Vec::new();
                     let mut values = Vec::new();
                     for (col_idx, column_id) in session.editable_columns.iter() {
                         let value = row.get(*col_idx).cloned().unwrap_or_default();
+                        let is_explicit_null =
+                            Self::row_cell_is_explicit_null(&session, idx, *col_idx);
                         // 값이 비어 있는 컬럼은 INSERT 목록에서 제외해
                         // DB가 DEFAULT 값을 적용할 수 있게 한다.
                         // 명시적으로 NULL을 원할 때는 '=NULL' 또는 단독 NULL 입력 사용.
-                        if value.is_empty() {
+                        if value.is_empty() && !is_explicit_null {
                             continue;
                         }
-                        let literal = Self::sql_literal_from_input(&value)?;
+                        let literal = if is_explicit_null {
+                            "NULL".to_string()
+                        } else {
+                            Self::sql_literal_from_input_with_null_text(
+                                &value,
+                                &session.null_text,
+                            )?
+                        };
                         column_names.push(column_id.clone());
                         values.push(literal);
                     }
@@ -2916,16 +3470,25 @@ impl ResultTableWidget {
         // (when the original text was a multi-statement script) and can also
         // report the save as failed even after DML already succeeded.
         let script = dml_script;
+        let save_signature = Self::canonical_sql_signature(&script);
         *self
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *self
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(save_signature);
 
         if let Err(err) = Self::try_execute_sql(&self.execute_sql_callback, script) {
             *self
                 .pending_save_request
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            *self
+                .pending_save_sql_signature
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return Err(err);
         }
 
@@ -2953,6 +3516,10 @@ impl ResultTableWidget {
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *self
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
         let session = self
             .edit_session
@@ -3253,7 +3820,8 @@ impl ResultTableWidget {
         hidden_auto_rowid_col: &Arc<Mutex<Option<usize>>>,
         _source_sql: &Arc<Mutex<String>>,
         _execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
-        _edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -3295,7 +3863,57 @@ impl ResultTableWidget {
         let mut menu = MenuButton::new(mouse_x, mouse_y, 0, 0, None);
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
-        let menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
+        let can_set_null = if *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            false
+        } else {
+            let session_guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(session) = session_guard.as_ref() {
+                if let Some((row_start, col_start, row_end, col_end)) =
+                    Self::normalized_selection_bounds_with_limits(
+                        table.get_selection(),
+                        table.rows().max(0) as usize,
+                        table.cols().max(0) as usize,
+                    )
+                {
+                    let editable_cols: HashSet<usize> = session
+                        .editable_columns
+                        .iter()
+                        .map(|(idx, _)| *idx)
+                        .collect();
+                    let mut has_target = false;
+                    for row_idx in row_start..=row_end {
+                        if row_idx >= session.row_states.len() {
+                            continue;
+                        }
+                        for col_idx in col_start..=col_end {
+                            if col_idx == session.rowid_col || !editable_cols.contains(&col_idx) {
+                                continue;
+                            }
+                            has_target = true;
+                            break;
+                        }
+                        if has_target {
+                            break;
+                        }
+                    }
+                    has_target
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let mut menu_items = vec!["Copy", "Copy with Headers", "Copy All"];
+        if can_set_null {
+            menu_items.push("Set Null");
+        }
         menu.add_choice(&menu_items.join("|"));
 
         if let Some(ref group) = current_group {
@@ -3315,6 +3933,18 @@ impl ResultTableWidget {
                     Self::copy_selected_with_headers(&table, headers, full_data, hidden_col);
                 }
                 "Copy All" => Self::copy_all_to_clipboard(headers, full_data, hidden_col),
+                "Set Null" => {
+                    if let Err(err) = Self::set_selected_cells_to_null_in_edit_mode(
+                        &table,
+                        full_data,
+                        edit_session,
+                        pending_save_request,
+                    ) {
+                        if !err.is_empty() {
+                            fltk::dialog::alert_default(&err);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3486,19 +4116,41 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
-        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+        // Query completion can race with an open inline editor focus change.
+        // Commit any pending in-cell value first so failed/cancelled queries
+        // do not silently discard the user's last typed value.
+        self.commit_active_inline_edit();
 
-        let save_requested = {
-            let mut guard = self
+        let (save_requested, save_still_pending) = {
+            let mut pending_guard = self
                 .pending_save_request
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let was_requested = *guard;
-            if was_requested {
-                *guard = false;
+            let mut save_signature = self
+                .pending_save_sql_signature
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if !*pending_guard {
+                *save_signature = None;
+                (false, false)
+            } else {
+                let matches_save =
+                    Self::matches_pending_save_signature(save_signature.as_deref(), &result.sql);
+
+                if matches_save {
+                    *pending_guard = false;
+                    *save_signature = None;
+                    (true, false)
+                } else {
+                    (false, true)
+                }
             }
-            was_requested
         };
+        if save_still_pending {
+            // Ignore out-of-order results while a save response is still pending.
+            return;
+        }
         let is_edit_mode_enabled = self
             .edit_session
             .lock()
@@ -3506,6 +4158,7 @@ impl ResultTableWidget {
             .is_some();
 
         if save_requested {
+            self.set_query_edit_backup(None);
             if result.success {
                 *self
                     .edit_session
@@ -3516,7 +4169,19 @@ impl ResultTableWidget {
                 // Save failed: keep staged edits so users can fix and retry.
                 return;
             }
+        } else if !result.success {
+            if is_edit_mode_enabled {
+                // A regular query failed/cancelled while edit mode is active.
+                // Keep the staged grid data intact so the user can continue editing
+                // or retry explicitly instead of losing in-progress changes.
+                self.set_query_edit_backup(None);
+                return;
+            }
+            if self.restore_query_edit_backup() {
+                return;
+            }
         } else {
+            self.set_query_edit_backup(None);
             *self
                 .edit_session
                 .lock()
@@ -3624,21 +4289,52 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
-        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
-
         let save_pending = *self
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !save_pending {
-            *self
-                .edit_session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        }
-        let col_count = headers.len() as i32;
 
-        let should_reset_grid_data = !save_pending;
+        let edit_session_snapshot = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let had_edit_session = edit_session_snapshot.is_some();
+        if had_edit_session || save_pending {
+            // Query-start events can arrive while an inline editor still has focus.
+            // Persist the typed value first so cancel/failure paths do not drop it.
+            self.commit_active_inline_edit();
+        }
+        if save_pending {
+            if !had_edit_session {
+                Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+            }
+            self.pending_rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            self.pending_widths
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            self.set_query_edit_backup(None);
+            self.table.redraw();
+            return;
+        }
+
+        if let Some(session) = edit_session_snapshot {
+            self.stage_query_edit_backup_from_current_state(session);
+        } else {
+            Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+            self.set_query_edit_backup(None);
+        }
+
+        *self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
         self.pending_rows
@@ -3649,12 +4345,10 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        if should_reset_grid_data {
-            self.full_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
-        }
+        self.full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *self
             .last_flush
             .lock()
@@ -3663,14 +4357,12 @@ impl ResultTableWidget {
             .width_sampled_rows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-        if should_reset_grid_data {
-            self.source_sql
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
-        }
-        // During save execution we keep edit_session alive until a final success/failure
-        // result arrives in display_result().
+        self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        // Edit mode is cleared at query start so the incoming result set is shown
+        // as a fresh, non-edit session until explicitly re-enabled.
         let edit_mode_enabled = self
             .edit_session
             .lock()
@@ -3716,6 +4408,10 @@ impl ResultTableWidget {
 
     /// Append rows to the buffer. UI is updated periodically for performance.
     pub fn append_rows(&mut self, rows: Vec<Vec<String>>) {
+        if self.is_save_pending() {
+            return;
+        }
+
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
         let sampled = *self
             .width_sampled_rows
@@ -3790,6 +4486,14 @@ impl ResultTableWidget {
     /// Data is moved (not cloned) from pending_rows into full_data.
     /// Only the table row count is updated — draw_cell handles rendering on demand.
     pub fn flush_pending(&mut self) {
+        if self.is_save_pending() {
+            self.pending_rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            return;
+        }
+
         let rows_to_add: Vec<Vec<String>> = self
             .pending_rows
             .lock()
@@ -3848,8 +4552,45 @@ impl ResultTableWidget {
         self.table.redraw();
     }
 
+    /// Recover from an interrupted edit-save batch that ended without a final
+    /// statement result (for example, immediate query cancellation). Returns
+    /// true when a stale pending-save flag was cleared.
+    pub fn clear_orphaned_save_request(&mut self) -> bool {
+        let mut pending = self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*pending {
+            return false;
+        }
+        *pending = false;
+        drop(pending);
+        *self
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.refresh_auto_rowid_visibility();
+        self.table.redraw();
+        true
+    }
+
+    /// Recover an edit session that was stashed at select-stream start but
+    /// never finalized by a statement result (for example, abrupt cancellation).
+    pub fn clear_orphaned_query_edit_backup(&mut self) -> bool {
+        if *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return false;
+        }
+        self.restore_query_edit_backup()
+    }
+
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+        self.set_query_edit_backup(None);
         *self
             .edit_session
             .lock()
@@ -3896,6 +4637,18 @@ impl ResultTableWidget {
             .last_flush
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        *self
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *self
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *self
             .hidden_auto_rowid_col
             .lock()
@@ -4094,19 +4847,27 @@ impl ResultTableWidget {
         self.table.clone()
     }
 
-    pub fn set_source_sql(&mut self, sql: &str) {
-        *self
-            .source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql.to_string();
-        self.refresh_auto_rowid_visibility();
-    }
-
     pub fn set_execute_sql_callback(&mut self, callback: Option<ResultGridSqlExecuteCallback>) {
         *self
             .execute_sql_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+    }
+
+    pub fn set_null_text(&mut self, null_text: &str) {
+        let normalized = null_text.to_string();
+        *self
+            .null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = normalized.clone();
+        let mut session_guard = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = session_guard.as_mut() {
+            session.null_text = normalized;
+        }
+        self.table.redraw();
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
@@ -4147,6 +4908,7 @@ impl ResultTableWidget {
             .edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.set_query_edit_backup(None);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
         // Clear callbacks to release captured Arc<Mutex<T>> references.
@@ -4520,6 +5282,192 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn is_staged_cell_modified_for_existing_row_compares_against_original() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "OLD".to_string(), "X".to_string()],
+        );
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string()), (2, "C2".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        let current_row = vec!["RID1".to_string(), "NEW".to_string(), "X".to_string()];
+
+        assert!(ResultTableWidget::is_staged_cell_modified(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+        assert!(!ResultTableWidget::is_staged_cell_modified(
+            &session,
+            0,
+            2,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn is_staged_cell_modified_for_inserted_row_highlights_non_empty_editable_cells() {
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string()), (2, "C2".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Inserted {
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        let current_row = vec!["".to_string(), "VALUE".to_string(), "".to_string()];
+
+        assert!(ResultTableWidget::is_staged_cell_modified(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+        assert!(!ResultTableWidget::is_staged_cell_modified(
+            &session,
+            0,
+            2,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn is_staged_cell_modified_treats_explicit_null_as_modified_even_when_text_matches() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "NULL".to_string()],
+        );
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: [1usize].into_iter().collect(),
+            }],
+        };
+        let current_row = vec!["RID1".to_string(), "NULL".to_string()];
+
+        assert!(ResultTableWidget::is_staged_cell_modified(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn row_cell_is_original_null_returns_true_for_existing_null_cell() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "NULL".to_string()],
+        );
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        let current_row = vec!["RID1".to_string(), "NULL".to_string()];
+
+        assert!(ResultTableWidget::row_cell_is_original_null(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn row_cell_is_original_null_returns_false_when_value_changed_from_null() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "NULL".to_string()],
+        );
+        let session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        let current_row = vec!["RID1".to_string(), "SMITH".to_string()];
+
+        assert!(!ResultTableWidget::row_cell_is_original_null(
+            &session,
+            0,
+            1,
+            &current_row
+        ));
+    }
+
+    #[test]
+    fn input_maps_to_explicit_null_uses_configured_null_text_marker() {
+        let row_state = EditRowState::Existing {
+            rowid: "RID1".to_string(),
+            explicit_null_cols: HashSet::new(),
+        };
+
+        assert!(ResultTableWidget::input_maps_to_explicit_null(
+            &row_state, "(null)", "(null)"
+        ));
+        assert!(!ResultTableWidget::input_maps_to_explicit_null(
+            &row_state, "NULL", "(null)"
+        ));
+        assert!(ResultTableWidget::input_maps_to_explicit_null(
+            &row_state, "=NULL", "(null)"
+        ));
+    }
+
+    #[test]
+    fn sql_literal_from_input_with_null_text_respects_custom_marker() {
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input_with_null_text("(null)", "(null)"),
+            Ok("NULL".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input_with_null_text("null", "(null)"),
+            Ok("'null'".to_string())
+        );
+    }
+
+    #[test]
     fn selection_contains_cell_normalizes_reversed_bounds() {
         assert!(ResultTableWidget::selection_contains_cell(
             (5, 6, 2, 3),
@@ -4623,7 +5571,8 @@ mod row_edit_sql_tests {
             Some((0, 1, 1, 2)),
             &[vec!["X".to_string()]],
         );
-        assert_eq!(changed, (4, 0));
+        assert_eq!((changed.0, changed.1), (4, 0));
+        assert_eq!(changed.2.len(), 4);
         assert_eq!(
             data,
             vec![
@@ -4656,7 +5605,8 @@ mod row_edit_sql_tests {
                 "Z".to_string(),
             ]],
         );
-        assert_eq!(changed, (2, 0));
+        assert_eq!((changed.0, changed.1), (2, 0));
+        assert_eq!(changed.2.len(), 2);
         assert_eq!(
             data,
             vec![vec![
@@ -4686,7 +5636,8 @@ mod row_edit_sql_tests {
             None,
             &[vec!["X".to_string(), "Y".to_string()]],
         );
-        assert_eq!(changed, (1, 1));
+        assert_eq!((changed.0, changed.1), (1, 1));
+        assert_eq!(changed.2.len(), 1);
         assert_eq!(
             data,
             vec![vec![
@@ -4847,6 +5798,10 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn display_result_keeps_staged_edits_when_save_request_fails() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -4855,6 +5810,7 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col: 0,
             table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -4891,6 +5847,343 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_ignores_non_matching_result_while_save_is_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+
+        let unrelated = QueryResult {
+            sql: "DELETE FROM EMP WHERE ROWID = 'ZZZ'".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "1 row deleted".to_string(),
+            is_select: false,
+            success: true,
+        };
+
+        widget.display_result(&unrelated);
+
+        assert!(*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_keeps_staged_edits_when_non_save_query_fails() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+
+        let failed = QueryResult {
+            sql: "SELECT * FROM BROKEN".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-00942".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&failed);
+
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert_eq!(
+            widget
+                .source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_str(),
+            "SELECT ROWID, ENAME FROM EMP"
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_restores_staged_edits_after_select_failure_during_streaming() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "MILLER".to_string()]];
+
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "SCOTT".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        let new_headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
+        widget.start_streaming(&new_headers);
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+
+        let failed = QueryResult {
+            sql: "SELECT DEPTNO, DNAME FROM DEPT".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: true,
+            success: false,
+        };
+        widget.display_result(&failed);
+
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert_eq!(
+            widget
+                .source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_str(),
+            "SELECT ROWID, ENAME FROM EMP"
+        );
+        assert_eq!(
+            widget
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["ROWID".to_string(), "ENAME".to_string()]
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "MILLER".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn clear_orphaned_query_edit_backup_recovers_select_start_interruption() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "MILLER".to_string()]];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        let new_headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
+        widget.start_streaming(&new_headers);
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+
+        assert!(widget.clear_orphaned_query_edit_backup());
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert!(!widget.clear_orphaned_query_edit_backup());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn clear_orphaned_save_request_recovers_interrupted_save_state() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert!(widget.clear_orphaned_save_request());
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn save_edit_mode_executes_only_dml_without_replaying_source_select() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -4920,12 +6213,14 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col: 0,
             table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
             deleted_rowids: Vec::new(),
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
             }],
         });
 
@@ -4957,6 +6252,78 @@ mod row_edit_sql_tests {
         );
         assert!(!statements[0].contains("SELECT ROWID, ENAME FROM EMP"));
         assert!(!statements[0].contains("DELETE FROM AUDIT_LOG"));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn save_edit_mode_uses_explicit_null_literal_for_set_null_cells() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "NULL".to_string()]];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = "SELECT ROWID, ENAME FROM EMP".to_string();
+
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "NULL".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: [1usize].into_iter().collect(),
+            }],
+        });
+
+        let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_sql_for_cb = captured_sql.clone();
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
+            captured_sql_for_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(sql);
+            Ok(())
+        })));
+        *widget
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback);
+
+        let save_result = widget.save_edit_mode();
+        assert!(save_result.is_ok());
+
+        let statements = captured_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "UPDATE EMP SET ENAME = NULL WHERE ROWID = 'AAABBB';"
+        );
     }
 
     #[test]
@@ -5012,6 +6379,10 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn start_streaming_keeps_existing_rows_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -5037,6 +6408,74 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn start_streaming_commits_active_inline_edit_while_save_is_pending() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+        let mut input = Input::default();
+        input.set_value("MILLER");
+        *widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveInlineEdit {
+            row: 0,
+            col: 1,
+            input,
+        });
+
+        let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
+        widget.start_streaming(&headers);
+
+        let rows = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(rows, vec![vec!["AAABBB".to_string(), "MILLER".to_string()]]);
+        assert!(widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn save_edit_mode_returns_error_when_save_is_already_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -5045,6 +6484,7 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col: 0,
             table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -5061,6 +6501,10 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn insert_and_delete_are_blocked_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -5074,6 +6518,7 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col: 0,
             table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -5096,6 +6541,10 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn cancel_edit_mode_returns_error_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -5104,6 +6553,7 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
             rowid_col: 0,
             table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -5168,5 +6618,29 @@ mod tests {
     fn csv_line_ending_matches_target_platform() {
         let expected = if cfg!(windows) { "\r\n" } else { "\n" };
         assert_eq!(ResultTableWidget::csv_line_ending(), expected);
+    }
+
+    #[test]
+    fn canonical_sql_signature_normalizes_whitespace_and_trailing_semicolon() {
+        let left = "  UPDATE   EMP SET ENAME = 'A'  WHERE ROWID = 'AAABBB'; ";
+        let right = "UPDATE EMP\nSET ENAME = 'A' WHERE ROWID = 'AAABBB'";
+        assert_eq!(
+            ResultTableWidget::canonical_sql_signature(left),
+            ResultTableWidget::canonical_sql_signature(right)
+        );
+    }
+
+    #[test]
+    fn matches_pending_save_signature_uses_normalized_sql() {
+        let expected_signature =
+            ResultTableWidget::canonical_sql_signature("UPDATE EMP SET ENAME = 'A';");
+        assert!(ResultTableWidget::matches_pending_save_signature(
+            Some(expected_signature.as_str()),
+            " UPDATE   EMP\nSET ENAME = 'A'  ",
+        ));
+        assert!(!ResultTableWidget::matches_pending_save_signature(
+            Some(expected_signature.as_str()),
+            "DELETE FROM EMP",
+        ));
     }
 }

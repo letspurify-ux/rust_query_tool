@@ -414,6 +414,7 @@ pub enum QueryProgress {
     SelectStart {
         index: usize,
         columns: Vec<String>,
+        null_text: String,
     },
     Rows {
         index: usize,

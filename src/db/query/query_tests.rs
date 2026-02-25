@@ -66,7 +66,6 @@ fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
     );
 }
 
-
 #[test]
 fn test_statement_bounds_at_cursor_prefers_next_statement_on_boundary() {
     let sql = "SELECT 1 FROM dual;
@@ -82,7 +81,6 @@ SELECT 2 FROM dual;";
         "expected second statement at boundary, got: {statement}"
     );
 }
-
 
 #[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {

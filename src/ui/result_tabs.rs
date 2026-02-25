@@ -378,6 +378,13 @@ impl ResultTabsWidget {
             .len()
     }
 
+    pub fn active_result_index(&self) -> Option<usize> {
+        *self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn append_script_output_lines(&mut self, lines: &[String]) {
         let mut script_output = self
             .script_output
@@ -481,7 +488,7 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn start_streaming(&mut self, index: usize, columns: &[String]) {
+    pub fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
         if let Some(tab) = self
             .data
             .lock()
@@ -489,6 +496,7 @@ impl ResultTabsWidget {
             .get(index)
         {
             let mut table = tab.table.clone();
+            table.set_null_text(null_text);
             table.start_streaming(columns);
         }
         self.fire_on_change_callback();
@@ -530,6 +538,42 @@ impl ResultTabsWidget {
         }
     }
 
+    pub fn clear_orphaned_save_requests(&mut self) -> usize {
+        let tables = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cleared = 0usize;
+        for tab in tables.iter() {
+            let mut table = tab.table.clone();
+            if table.clear_orphaned_save_request() {
+                cleared = cleared.saturating_add(1);
+            }
+        }
+        if cleared > 0 {
+            self.fire_on_change_callback();
+        }
+        cleared
+    }
+
+    pub fn clear_orphaned_query_edit_backups(&mut self) -> usize {
+        let tables = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut restored = 0usize;
+        for tab in tables.iter() {
+            let mut table = tab.table.clone();
+            if table.clear_orphaned_query_edit_backup() {
+                restored = restored.saturating_add(1);
+            }
+        }
+        if restored > 0 {
+            self.fire_on_change_callback();
+        }
+        restored
+    }
+
     pub fn align_tab_strip_left(&mut self) {
         self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
@@ -544,19 +588,6 @@ impl ResultTabsWidget {
         {
             let mut table = tab.table.clone();
             table.display_result(result);
-        }
-        self.fire_on_change_callback();
-    }
-
-    pub fn set_source_sql(&mut self, index: usize, sql: &str) {
-        if let Some(tab) = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-        {
-            let mut table = tab.table.clone();
-            table.set_source_sql(sql);
         }
         self.fire_on_change_callback();
     }

@@ -75,6 +75,7 @@ pub struct AppState {
     result_save_btn: Button,
     result_cancel_btn: Button,
     pub result_tab_offset: usize,
+    result_grid_execution_target: Option<usize>,
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
     pub fetch_row_counts: HashMap<usize, usize>,
@@ -348,6 +349,7 @@ impl AppState {
         let can_edit = self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let save_pending = self.result_tabs.is_current_save_pending();
+        let query_running = self.is_any_query_running();
         let show_edit_check = can_edit;
         if show_edit_check {
             self.result_toolbar
@@ -355,7 +357,11 @@ impl AppState {
             if !self.result_edit_check.visible() {
                 self.result_edit_check.show();
             }
-            self.result_edit_check.activate();
+            if query_running || save_pending {
+                self.result_edit_check.deactivate();
+            } else {
+                self.result_edit_check.activate();
+            }
         } else {
             self.result_edit_check.deactivate();
             if self.result_edit_check.visible() {
@@ -369,7 +375,7 @@ impl AppState {
         }
 
         let show_action_buttons = edit_active && can_edit;
-        let actions_enabled = show_action_buttons && !save_pending;
+        let actions_enabled = show_action_buttons && !save_pending && !query_running;
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_insert_btn,
@@ -493,6 +499,10 @@ fn should_restart_health_check_worker(
     health_worker_registered: bool,
 ) -> bool {
     health_channel_disconnected && health_worker_registered
+}
+
+fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
+    target.filter(|idx| *idx < tab_count).unwrap_or(tab_count)
 }
 
 #[derive(Clone, Copy)]
@@ -1173,6 +1183,7 @@ impl MainWindow {
             result_save_btn: edit_save_btn.clone(),
             result_cancel_btn: edit_cancel_btn.clone(),
             result_tab_offset: 0,
+            result_grid_execution_target: None,
             object_browser,
             status_bar,
             fetch_row_counts: HashMap::new(),
@@ -1215,13 +1226,22 @@ impl MainWindow {
                 let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
                     return Err("Main window is no longer available.".to_string());
                 };
-                let guard = state_for_grid_edit
+                let mut guard = state_for_grid_edit
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if guard.sql_editor.is_query_running() {
                     return Err("Another query is already running.".to_string());
                 }
+                let target_tab = guard
+                    .result_tabs
+                    .active_result_index()
+                    .ok_or_else(|| "Open a result tab first.".to_string())?;
+                guard.result_grid_execution_target = Some(target_tab);
                 guard.sql_editor.execute_sql_text(&sql);
+                if !guard.sql_editor.is_query_running() {
+                    guard.result_grid_execution_target = None;
+                    return Err("Failed to start query execution for result-grid edit.".to_string());
+                }
                 Ok(())
             })));
         {
@@ -2176,7 +2196,9 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match progress {
                 QueryProgress::BatchStart => {
-                    s.result_tab_offset = s.result_tabs.tab_count();
+                    let tab_count = s.result_tabs.tab_count();
+                    s.result_tab_offset =
+                        resolve_result_tab_offset(tab_count, s.result_grid_execution_target);
                     s.fetch_row_counts.clear();
                 }
                 QueryProgress::StatementStart { index } => {
@@ -2191,9 +2213,13 @@ impl MainWindow {
                     }
                     s.refresh_result_edit_controls();
                 }
-                QueryProgress::SelectStart { index, columns } => {
+                QueryProgress::SelectStart {
+                    index,
+                    columns,
+                    null_text,
+                } => {
                     let tab_index = s.result_tab_offset + index;
-                    s.result_tabs.start_streaming(tab_index, &columns);
+                    s.result_tabs.start_streaming(tab_index, &columns, &null_text);
                     s.fetch_row_counts.insert(index, 0);
                     s.last_fetch_status_update = Instant::now();
                     let was_running = s.status_animation_running;
@@ -2270,9 +2296,11 @@ impl MainWindow {
                         s.result_tabs.select_script_output();
                     }
                     if result.is_select {
-                        s.result_tabs.set_source_sql(tab_index, &result.sql);
                         s.result_tabs.finish_streaming(tab_index);
+                        s.result_tabs.display_result(tab_index, &result);
                     } else {
+                        s.result_tabs
+                            .start_statement(tab_index, &format!("Result {}", tab_index + 1));
                         s.result_tabs.display_result(tab_index, &result);
                     }
                     s.fetch_row_counts.remove(&index);
@@ -2281,7 +2309,11 @@ impl MainWindow {
                 QueryProgress::BatchFinished => {
                     s.result_tabs.finish_all_streaming();
                     s.result_tabs.align_tab_strip_left();
+                    let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
+                    let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
                     s.fetch_row_counts.clear();
+                    s.result_grid_execution_target = None;
+                    s.result_tab_offset = s.result_tabs.tab_count();
                     // Query execution completed and large temporary buffers may
                     // have been released during result materialization.
                     malloc_trim_process();
@@ -2290,7 +2322,15 @@ impl MainWindow {
                         || current_status.contains("fetching rows")
                         || current_status.contains("connection is busy")
                         || current_status.contains("query is already running");
-                    if needs_reset {
+                    if recovered_save_states > 0 {
+                        s.set_status_message(
+                            "Save was interrupted. Staged edits are still available.",
+                        );
+                    } else if recovered_edit_states > 0 {
+                        s.set_status_message(
+                            "Query ended before completion. Restored staged result-grid edits.",
+                        );
+                    } else if needs_reset {
                         s.set_status_message("Ready");
                     }
                     s.refresh_result_edit_controls();
@@ -4236,6 +4276,22 @@ mod tests {
         let normalized = MainWindow::normalize_line_endings_for_editor(text.clone());
 
         assert_eq!(normalized, text);
+    }
+
+    #[test]
+    fn resolve_result_tab_offset_uses_target_when_it_is_valid() {
+        assert_eq!(resolve_result_tab_offset(5, Some(2)), 2);
+    }
+
+    #[test]
+    fn resolve_result_tab_offset_falls_back_to_tab_count_when_target_is_invalid() {
+        assert_eq!(resolve_result_tab_offset(5, Some(5)), 5);
+        assert_eq!(resolve_result_tab_offset(5, Some(9)), 5);
+    }
+
+    #[test]
+    fn resolve_result_tab_offset_falls_back_to_tab_count_when_target_is_missing() {
+        assert_eq!(resolve_result_tab_offset(5, None), 5);
     }
 }
 

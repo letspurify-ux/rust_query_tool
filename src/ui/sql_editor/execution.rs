@@ -5731,6 +5731,7 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                null_text: null_text.clone(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -5917,6 +5918,7 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                null_text: null_text.clone(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -6224,6 +6226,7 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                null_text: null_text.clone(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -7254,13 +7257,14 @@ impl SqlEditorWidget {
     ) {
         let _ = sender.send(QueryProgress::StatementStart { index });
         app::awake();
+        let (colsep, null_text, _trimspool_enabled) =
+            SqlEditorWidget::current_text_output_settings(session);
         let _ = sender.send(QueryProgress::SelectStart {
             index,
             columns: column_names.clone(),
+            null_text: null_text.clone(),
         });
         app::awake();
-        let (colsep, null_text, _trimspool_enabled) =
-            SqlEditorWidget::current_text_output_settings(session);
         if !column_names.is_empty() {
             SqlEditorWidget::append_spool_output(session, &[column_names.join(&colsep)]);
         }

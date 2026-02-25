@@ -263,7 +263,10 @@ fn set_current_db_activity(activity: Option<String>) {
             *guard = activity;
         }
         Err(poisoned) => {
-            logging::log_warning("db::connection", "DB activity lock was poisoned; recovering");
+            logging::log_warning(
+                "db::connection",
+                "DB activity lock was poisoned; recovering",
+            );
             *poisoned.into_inner() = activity;
         }
     }
@@ -288,7 +291,10 @@ pub fn current_db_activity() -> Option<String> {
     match db_activity_slot().lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => {
-            logging::log_warning("db::connection", "DB activity lock was poisoned; recovering");
+            logging::log_warning(
+                "db::connection",
+                "DB activity lock was poisoned; recovering",
+            );
             poisoned.into_inner().clone()
         }
     }
