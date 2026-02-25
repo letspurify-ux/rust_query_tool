@@ -219,7 +219,7 @@ impl ResultTableWidget {
         if let Some(expr) = trimmed.strip_prefix('=') {
             return expr.trim().eq_ignore_ascii_case("NULL");
         }
-        if trimmed.is_empty() {
+        if input.is_empty() {
             return matches!(row_state, EditRowState::Existing { .. });
         }
         false
@@ -227,7 +227,7 @@ impl ResultTableWidget {
 
     fn value_represents_null(value: &str, null_text: &str) -> bool {
         let trimmed = value.trim();
-        trimmed.is_empty()
+        value.is_empty()
             || trimmed.eq_ignore_ascii_case("NULL")
             || Self::input_matches_null_text(trimmed, null_text)
     }
@@ -788,8 +788,9 @@ impl ResultTableWidget {
                             if let Some(row_data) = data.get(row_idx) {
                                 if let Ok(session_guard) = edit_session_for_draw.try_lock() {
                                     if let Some(session) = session_guard.as_ref() {
-                                        is_explicit_null_cell =
-                                            Self::row_cell_is_explicit_null(session, row_idx, col_idx);
+                                        is_explicit_null_cell = Self::row_cell_is_explicit_null(
+                                            session, row_idx, col_idx,
+                                        );
                                         is_original_null_cell = Self::row_cell_is_original_null(
                                             session, row_idx, col_idx, row_data,
                                         );
@@ -1529,7 +1530,8 @@ impl ResultTableWidget {
                         Self::input_maps_to_explicit_null(row_state, &new_value, &session.null_text)
                     })
                     .unwrap_or(false);
-                let _ = Self::set_row_cell_explicit_null(session, row_idx, col_idx, is_explicit_null);
+                let _ =
+                    Self::set_row_cell_explicit_null(session, row_idx, col_idx, is_explicit_null);
             }
         }
         let mut table = table.clone();
@@ -1568,11 +1570,7 @@ impl ResultTableWidget {
                     .row_states
                     .get(active_editor.row)
                     .map(|row_state| {
-                        Self::input_maps_to_explicit_null(
-                            row_state,
-                            &new_value,
-                            &session.null_text,
-                        )
+                        Self::input_maps_to_explicit_null(row_state, &new_value, &session.null_text)
                     })
                     .unwrap_or(false);
                 let _ = Self::set_row_cell_explicit_null(
@@ -1958,7 +1956,8 @@ impl ResultTableWidget {
                         .map(|existing| existing != &null_marker)
                         .unwrap_or(true);
                     row[col_idx] = null_marker.clone();
-                    let flag_changed = Self::set_row_cell_explicit_null(session, row_idx, col_idx, true);
+                    let flag_changed =
+                        Self::set_row_cell_explicit_null(session, row_idx, col_idx, true);
                     if value_changed || flag_changed {
                         changed = changed.saturating_add(1);
                     }
@@ -2360,9 +2359,12 @@ impl ResultTableWidget {
         Ok(normalized.to_string())
     }
 
-    fn sql_literal_from_input_with_null_text(input: &str, null_text: &str) -> Result<String, String> {
+    fn sql_literal_from_input_with_null_text(
+        input: &str,
+        null_text: &str,
+    ) -> Result<String, String> {
         let trimmed = input.trim();
-        if trimmed.is_empty() || Self::input_matches_null_text(trimmed, null_text) {
+        if input.is_empty() || Self::input_matches_null_text(trimmed, null_text) {
             return Ok("NULL".to_string());
         }
         if let Some(expr) = trimmed.strip_prefix('=') {
@@ -2781,7 +2783,8 @@ impl ResultTableWidget {
                 };
                 let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
                 let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-                current_value != original_value || Self::row_cell_is_explicit_null(session, row_idx, col_idx)
+                current_value != original_value
+                    || Self::row_cell_is_explicit_null(session, row_idx, col_idx)
             }
             Some(EditRowState::Inserted { .. }) => {
                 Self::row_cell_is_explicit_null(session, row_idx, col_idx)
@@ -3428,10 +3431,7 @@ impl ResultTableWidget {
                         let literal = if is_explicit_null {
                             "NULL".to_string()
                         } else {
-                            Self::sql_literal_from_input_with_null_text(
-                                &value,
-                                &session.null_text,
-                            )?
+                            Self::sql_literal_from_input_with_null_text(&value, &session.null_text)?
                         };
                         column_names.push(column_id.clone());
                         values.push(literal);
@@ -3799,16 +3799,14 @@ impl ResultTableWidget {
                 return;
             };
             column_names.push(column_identifier);
-            let literal = match Self::sql_literal_from_input_with_null_text(
-                &input,
-                &current_null_text,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    fltk::dialog::alert_default(&err);
-                    return;
-                }
-            };
+            let literal =
+                match Self::sql_literal_from_input_with_null_text(&input, &current_null_text) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        return;
+                    }
+                };
             value_literals.push(literal);
         }
 
@@ -5504,6 +5502,40 @@ mod row_edit_sql_tests {
     }
 
     #[test]
+    fn sql_literal_from_input_with_null_text_treats_whitespace_as_string_literal() {
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input_with_null_text("   ", "NULL"),
+            Ok("'   '".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input_with_null_text("	", "NULL"),
+            Ok("'	'".to_string())
+        );
+    }
+
+    #[test]
+    fn input_maps_to_explicit_null_does_not_treat_whitespace_as_null() {
+        let row_state = EditRowState::Existing {
+            rowid: "RID1".to_string(),
+            explicit_null_cols: HashSet::new(),
+        };
+
+        assert!(!ResultTableWidget::input_maps_to_explicit_null(
+            &row_state, "   ", "NULL"
+        ));
+        assert!(!ResultTableWidget::input_maps_to_explicit_null(
+            &row_state, "	", "NULL"
+        ));
+    }
+
+    #[test]
+    fn value_represents_null_does_not_treat_whitespace_as_null() {
+        assert!(!ResultTableWidget::value_represents_null("   ", "NULL"));
+        assert!(!ResultTableWidget::value_represents_null("	", "NULL"));
+        assert!(ResultTableWidget::value_represents_null("", "NULL"));
+    }
+
+    #[test]
     fn row_cell_is_original_null_recognizes_executor_null_with_custom_null_text() {
         let mut original_rows = HashMap::new();
         original_rows.insert(
@@ -6371,7 +6403,8 @@ mod row_edit_sql_tests {
         *widget
             .source_sql
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = "SELECT ROWID, ENAME FROM EMP".to_string();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
 
         let mut original_rows_by_rowid = HashMap::new();
         original_rows_by_rowid.insert(
