@@ -2743,11 +2743,6 @@ impl ResultTableWidget {
             .as_ref()
             .cloned()
             .ok_or_else(|| "Enable edit mode first.".to_string())?;
-        let source_sql_text = self
-            .source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         let rows = self
             .full_data
             .lock()
@@ -2856,12 +2851,11 @@ impl ResultTableWidget {
             s.push(';');
             s
         };
-        let select_sql = source_sql_text.trim().trim_end_matches(';').trim();
-        let script = if select_sql.is_empty() {
-            dml_script
-        } else {
-            format!("{dml_script}\n{select_sql}")
-        };
+        // Execute only staged DML during save. Re-running the source SELECT as
+        // part of the same request can execute unintended extra statements
+        // (when the original text was a multi-statement script) and can also
+        // report the save as failed even after DML already succeeded.
+        let script = dml_script;
         *self
             .pending_save_request
             .lock()
@@ -4780,6 +4774,74 @@ mod row_edit_sql_tests {
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
+
+    #[test]
+    fn save_edit_mode_executes_only_dml_without_replaying_source_select() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP; DELETE FROM AUDIT_LOG".to_string();
+
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "SMITH".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+            }],
+        });
+
+        let captured_sql = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_sql_for_cb = captured_sql.clone();
+        let callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Box::new(move |sql| {
+            captured_sql_for_cb
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(sql);
+        })));
+        *widget
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback);
+
+        let save_result = widget.save_edit_mode();
+        assert!(save_result.is_ok());
+
+        let statements = captured_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0],
+            "UPDATE EMP SET ENAME = 'SCOTT' WHERE ROWID = 'AAABBB';"
+        );
+        assert!(!statements[0].contains("SELECT ROWID, ENAME FROM EMP"));
+        assert!(!statements[0].contains("DELETE FROM AUDIT_LOG"));
     }
 
     #[test]
