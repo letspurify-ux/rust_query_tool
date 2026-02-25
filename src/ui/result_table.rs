@@ -1680,22 +1680,16 @@ impl ResultTableWidget {
 
     fn detect_auto_hidden_rowid_col(
         headers: &[String],
-        source_sql: &str,
+        _source_sql: &str,
         edit_mode_enabled: bool,
     ) -> Option<usize> {
         if edit_mode_enabled {
             return None;
         }
-        let source_sql = source_sql.trim();
-        if source_sql.is_empty() {
-            return None;
-        }
+        // Keep ROWID hidden while edit mode is disabled so streaming rows do not
+        // briefly expose the technical column before the source SQL is set.
         let rowid_col = Self::find_rowid_column_index(headers)?;
         if rowid_col != 0 {
-            return None;
-        }
-        let rewritten_sql = QueryExecutor::maybe_inject_rowid_for_editing(source_sql);
-        if rewritten_sql == source_sql {
             return None;
         }
         Some(rowid_col)
@@ -2589,7 +2583,7 @@ impl ResultTableWidget {
         // is enabled this prevents partial commits: the whole block either
         // succeeds (and the client commits once) or fails (nothing is committed).
         let dml_script = if statements.len() > 1 {
-            format!("BEGIN\n{};\nEND", statements.join(";\n"))
+            format!("BEGIN\n{};\nEND;", statements.join(";\n"))
         } else {
             let mut s = statements.join("");
             s.push(';');
@@ -4265,7 +4259,7 @@ mod row_edit_sql_tests {
     }
 
     #[test]
-    fn detect_auto_hidden_rowid_col_hides_only_auto_injected_rowid() {
+    fn detect_auto_hidden_rowid_col_hides_first_rowid_col_when_edit_mode_is_disabled() {
         let headers = vec!["EMP.ROWID".to_string(), "ENAME".to_string()];
         assert_eq!(
             ResultTableWidget::detect_auto_hidden_rowid_col(
@@ -4280,6 +4274,19 @@ mod row_edit_sql_tests {
             ResultTableWidget::detect_auto_hidden_rowid_col(
                 &headers,
                 "SELECT ROWID, ENAME FROM EMP",
+                false,
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn detect_auto_hidden_rowid_col_does_not_hide_when_rowid_is_not_first_col() {
+        let headers = vec!["ENAME".to_string(), "EMP.ROWID".to_string()];
+        assert_eq!(
+            ResultTableWidget::detect_auto_hidden_rowid_col(
+                &headers,
+                "SELECT ENAME, ROWID FROM EMP",
                 false,
             ),
             None
