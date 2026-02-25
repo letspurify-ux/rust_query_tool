@@ -1876,22 +1876,39 @@ impl ResultTableWidget {
         format!("'{}'", value.replace('\'', "''"))
     }
 
-    fn sql_literal_from_input(input: &str) -> String {
+    fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
+        let normalized = expr.trim();
+        if normalized.is_empty() {
+            return Err("SQL expression after '=' cannot be empty.".to_string());
+        }
+
+        if normalized.contains(';')
+            || normalized.contains("--")
+            || normalized.contains("/*")
+            || normalized.contains("*/")
+        {
+            return Err(
+                "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                    .to_string(),
+            );
+        }
+
+        Ok(normalized.to_string())
+    }
+
+    fn sql_literal_from_input(input: &str) -> Result<String, String> {
         let trimmed = input.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
-            return "NULL".to_string();
+            return Ok("NULL".to_string());
         }
         if let Some(expr) = trimmed.strip_prefix('=') {
-            let expr_trimmed = expr.trim();
-            if !expr_trimmed.is_empty() {
-                return expr_trimmed.to_string();
-            }
+            return Self::validate_sql_expression_input(expr);
         }
         if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
         // Preserve user-entered leading/trailing whitespace for string literals.
-        Self::sql_string_literal(input)
+        Ok(Self::sql_string_literal(input))
     }
 
     #[allow(dead_code)]
@@ -2791,7 +2808,7 @@ impl ResultTableWidget {
                             assignments.push(format!(
                                 "{} = {}",
                                 column_id,
-                                Self::sql_literal_from_input(&new_value)
+                                Self::sql_literal_from_input(&new_value)?
                             ));
                         }
                     }
@@ -2815,7 +2832,7 @@ impl ResultTableWidget {
                         if value.is_empty() {
                             continue;
                         }
-                        let literal = Self::sql_literal_from_input(&value);
+                        let literal = Self::sql_literal_from_input(&value)?;
                         column_names.push(column_id.clone());
                         values.push(literal);
                     }
@@ -2999,7 +3016,13 @@ impl ResultTableWidget {
             "UPDATE {} SET {} = {} WHERE ROWID = {}",
             Self::quote_qualified_identifier(&table_name),
             column_identifier,
-            Self::sql_literal_from_input(&input),
+            match Self::sql_literal_from_input(&input) {
+                Ok(value) => value,
+                Err(err) => {
+                    fltk::dialog::alert_default(&err);
+                    return;
+                }
+            },
             Self::sql_string_literal(&rowid_value)
         );
         let script = Self::compose_edit_script(&sql, &source_sql_text);
@@ -3145,7 +3168,14 @@ impl ResultTableWidget {
                 return;
             };
             column_names.push(column_identifier);
-            value_literals.push(Self::sql_literal_from_input(&input));
+            let literal = match Self::sql_literal_from_input(&input) {
+                Ok(value) => value,
+                Err(err) => {
+                    fltk::dialog::alert_default(&err);
+                    return;
+                }
+            };
+            value_literals.push(literal);
         }
 
         if column_names.is_empty() || value_literals.is_empty() {
@@ -4132,17 +4162,29 @@ mod row_edit_sql_tests {
 
     #[test]
     fn sql_literal_from_input_handles_null_numbers_and_expr() {
-        assert_eq!(ResultTableWidget::sql_literal_from_input(""), "NULL");
-        assert_eq!(ResultTableWidget::sql_literal_from_input("NULL"), "NULL");
-        assert_eq!(ResultTableWidget::sql_literal_from_input("42"), "42");
-        assert_eq!(ResultTableWidget::sql_literal_from_input("3.14"), "3.14");
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input(""),
+            Ok("NULL".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("NULL"),
+            Ok("NULL".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("42"),
+            Ok("42".to_string())
+        );
+        assert_eq!(
+            ResultTableWidget::sql_literal_from_input("3.14"),
+            Ok("3.14".to_string())
+        );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("=sysdate"),
-            "sysdate"
+            Ok("sysdate".to_string())
         );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("O'Reilly"),
-            "'O''Reilly'"
+            Ok("'O''Reilly'".to_string())
         );
     }
 
@@ -4150,12 +4192,19 @@ mod row_edit_sql_tests {
     fn sql_literal_from_input_preserves_significant_string_whitespace() {
         assert_eq!(
             ResultTableWidget::sql_literal_from_input("  padded  "),
-            "'  padded  '"
+            Ok("'  padded  '".to_string())
         );
         assert_eq!(
             ResultTableWidget::sql_literal_from_input(" = sysdate "),
-            "sysdate"
+            Ok("sysdate".to_string())
         );
+    }
+
+    #[test]
+    fn sql_literal_from_input_rejects_expression_with_statement_or_comment_delimiters() {
+        assert!(ResultTableWidget::sql_literal_from_input("=sysdate; delete from emp").is_err());
+        assert!(ResultTableWidget::sql_literal_from_input("=sysdate --comment").is_err());
+        assert!(ResultTableWidget::sql_literal_from_input("=/*hint*/sysdate").is_err());
     }
 
     #[test]
