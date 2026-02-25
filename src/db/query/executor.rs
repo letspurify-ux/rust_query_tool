@@ -1,5 +1,5 @@
 use oracle::sql_type::{OracleType, RefCursor};
-use oracle::{Connection, Error as OracleError, Row, RowId, Statement};
+use oracle::{Connection, Error as OracleError, Row, Statement};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -40,8 +40,7 @@ impl QueryExecutor {
                 return Ok("NULL".to_string());
             }
             return row
-                .get::<RowId>(index)
-                .map(|rid| rid.to_string())
+                .get::<usize, String>(index)
                 .or(Ok(String::new()));
         }
 
