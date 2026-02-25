@@ -6012,9 +6012,6 @@ ORDER BY username
         match Self::execute_select(conn, &sql_dba, Instant::now()) {
             Ok(result) => return Ok(Self::annotate_result_source(result, "dba_users")),
             Err(err) => {
-                if attention_only {
-                    return Err(err);
-                }
                 if !Self::should_fallback_from_global_view(&err) {
                     return Err(err);
                 }
@@ -6047,7 +6044,18 @@ ORDER BY username
 "#
         );
         match Self::execute_select(conn, &sql_all, Instant::now()) {
-            Ok(result) => Ok(Self::annotate_result_source(result, "all_users")),
+            Ok(mut result) => {
+                if attention_only {
+                    let warning =
+                        "Warning: attention-only filter requires dba_users view and was ignored";
+                    result.message = if result.message.trim().is_empty() {
+                        warning.to_string()
+                    } else {
+                        format!("{} | {warning}", result.message)
+                    };
+                }
+                Ok(Self::annotate_result_source(result, "all_users"))
+            }
             Err(err) => {
                 if profile_filter.is_some() && Self::extract_ora_error_code(&err) == Some(904) {
                     fallback_errors.push(format!("all_users (with profile filter): {err}"));
@@ -6069,11 +6077,21 @@ ORDER BY username
                     );
                     match Self::execute_select(conn, &sql_all, Instant::now()) {
                         Ok(mut result) => {
-                            let warning = "Warning: profile filter not supported by all_users view and was ignored";
+                            let mut warnings = vec![
+                                "Warning: profile filter not supported by all_users view and was ignored"
+                                    .to_string(),
+                            ];
+                            if attention_only {
+                                warnings.push(
+                                    "Warning: attention-only filter requires dba_users view and was ignored"
+                                        .to_string(),
+                                );
+                            }
+                            let warning_text = warnings.join(" | ");
                             result.message = if result.message.trim().is_empty() {
-                                warning.to_string()
+                                warning_text
                             } else {
-                                format!("{} | {warning}", result.message)
+                                format!("{} | {warning_text}", result.message)
                             };
                             Ok(Self::annotate_result_source(result, "all_users"))
                         }
