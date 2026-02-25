@@ -39,9 +39,7 @@ impl QueryExecutor {
             if sql_value.is_null()? {
                 return Ok("NULL".to_string());
             }
-            return row
-                .get::<usize, String>(index)
-                .or(Ok(String::new()));
+            return row.get::<usize, String>(index).or(Ok(String::new()));
         }
 
         let value: Option<String> = row.get(index)?;
@@ -1646,7 +1644,10 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
@@ -1654,7 +1655,10 @@ impl QueryExecutor {
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -1745,7 +1749,10 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
@@ -1753,7 +1760,10 @@ impl QueryExecutor {
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -1850,19 +1860,28 @@ impl QueryExecutor {
                     stmt = match conn.statement(sql).build() {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     };
                     if let Err(retry_err) = Self::bind_statement(&mut stmt, binds) {
-                        logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                        logging::log_error(
+                            "executor",
+                            &format!("Database operation failed: {retry_err}"),
+                        );
                         return Err(retry_err);
                     }
                     normalize_internal_rowid_alias = false;
                     match stmt.query(&[]) {
                         Ok(result_set) => result_set,
                         Err(retry_err) => {
-                            logging::log_error("executor", &format!("Database operation failed: {retry_err}"));
+                            logging::log_error(
+                                "executor",
+                                &format!("Database operation failed: {retry_err}"),
+                            );
                             return Err(retry_err);
                         }
                     }
@@ -5132,6 +5151,13 @@ ORDER BY
         false
     }
 
+    fn should_retry_user_profiles_without_filter(
+        err: &OracleError,
+        has_profile_filter: bool,
+    ) -> bool {
+        has_profile_filter && Self::extract_ora_error_code(err) == Some(904)
+    }
+
     fn annotate_result_source(mut result: QueryResult, source_view: &str) -> QueryResult {
         let source_note = format!("Source view: {source_view}");
         result.message = if result.message.trim().is_empty() {
@@ -5291,11 +5317,7 @@ ORDER BY owner, job_name
         }
 
         if let Some(owner) = owner_filter.as_deref() {
-            Self::ensure_user_view_matches_target_user(
-                conn,
-                owner,
-                "Scheduler jobs snapshot",
-            )?;
+            Self::ensure_user_view_matches_target_user(conn, owner, "Scheduler jobs snapshot")?;
         }
         let user_where_clause = if failed_only {
             "WHERE (NVL(failure_count, 0) > 0 OR UPPER(NVL(state, '-')) IN ('BROKEN', 'FAILED', 'STOPPED'))".to_string()
@@ -5652,11 +5674,7 @@ ORDER BY owner_name, job_name
         }
 
         if let Some(owner) = owner_filter.as_deref() {
-            Self::ensure_user_view_matches_target_user(
-                conn,
-                owner,
-                "Data Pump jobs snapshot",
-            )?;
+            Self::ensure_user_view_matches_target_user(conn, owner, "Data Pump jobs snapshot")?;
         }
 
         let sql_user = r#"
@@ -6353,11 +6371,47 @@ ORDER BY profile, resource_type, resource_name
         match Self::execute_select(conn, &sql_user, Instant::now()) {
             Ok(result) => Ok(Self::annotate_result_source(result, "user_profiles")),
             Err(err) => {
-                fallback_errors.push(format!("user_profiles: {err}"));
-                Err(Self::chained_fallback_error(
-                    "Profile limits snapshot",
-                    &fallback_errors,
-                ))
+                if Self::should_retry_user_profiles_without_filter(
+                    &err,
+                    normalized_profile_filter.is_some(),
+                ) {
+                    fallback_errors.push(format!("user_profiles (with profile filter): {err}"));
+
+                    let sql_user_without_filter = r#"
+SELECT
+    profile,
+    resource_name,
+    resource_type,
+    limit
+FROM user_profiles
+ORDER BY profile, resource_type, resource_name
+"#;
+                    match Self::execute_select(conn, sql_user_without_filter, Instant::now()) {
+                        Ok(mut result) => {
+                            let warning =
+                                "Warning: profile filter not supported by user_profiles view and was ignored";
+                            result.message = if result.message.trim().is_empty() {
+                                warning.to_string()
+                            } else {
+                                format!("{} | {warning}", result.message)
+                            };
+                            Ok(Self::annotate_result_source(result, "user_profiles"))
+                        }
+                        Err(user_err) => {
+                            fallback_errors.push(format!("user_profiles: {user_err}"));
+                            Err(Self::chained_fallback_error(
+                                "Profile limits snapshot",
+                                &fallback_errors,
+                            ))
+                        }
+                    }
+                } else {
+                    fallback_errors.push(format!("user_profiles: {err}"));
+                    Err(Self::chained_fallback_error(
+                        "Profile limits snapshot",
+                        &fallback_errors,
+                    ))
+                }
             }
         }
     }
@@ -6559,6 +6613,7 @@ ORDER BY profile, resource_type, resource_name
 #[cfg(test)]
 mod dba_feature_tests {
     use super::QueryExecutor;
+    use oracle::Error as OracleError;
 
     #[test]
     fn build_users_overview_where_clause_includes_filters() {
@@ -6791,6 +6846,29 @@ mod dba_feature_tests {
         let valid = QueryExecutor::normalize_scheduler_job_type("plsql_block")
             .unwrap_or_else(|err| panic!("unexpected error: {err}"));
         assert_eq!(valid, "PLSQL_BLOCK");
+    }
+
+    #[test]
+    fn should_retry_user_profiles_without_filter_only_for_invalid_identifier_error() {
+        #[allow(deprecated)]
+        let invalid_identifier =
+            OracleError::InternalError("ORA-00904: \"PROFILE\": invalid identifier".to_string());
+        #[allow(deprecated)]
+        let insufficient_privileges =
+            OracleError::InternalError("ORA-01031: insufficient privileges".to_string());
+
+        assert!(QueryExecutor::should_retry_user_profiles_without_filter(
+            &invalid_identifier,
+            true,
+        ));
+        assert!(!QueryExecutor::should_retry_user_profiles_without_filter(
+            &invalid_identifier,
+            false,
+        ));
+        assert!(!QueryExecutor::should_retry_user_profiles_without_filter(
+            &insufficient_privileges,
+            true,
+        ));
     }
 
     #[test]
@@ -7505,7 +7583,10 @@ impl ObjectBrowser {
             let default_value: Option<String> = match row.get(12) {
                 Ok(value) => value,
                 Err(err) => {
-                    logging::log_warning("executor", &format!("Failed to read default_value (ignored): {err}"));
+                    logging::log_warning(
+                        "executor",
+                        &format!("Failed to read default_value (ignored): {err}"),
+                    );
                     None
                 }
             };
