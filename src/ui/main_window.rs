@@ -347,6 +347,7 @@ impl AppState {
     fn refresh_result_edit_controls(&mut self) {
         let can_edit = self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
+        let save_pending = self.result_tabs.is_current_save_pending();
         let show_edit_check = can_edit;
         if show_edit_check {
             self.result_toolbar
@@ -368,6 +369,7 @@ impl AppState {
         }
 
         let show_action_buttons = edit_active && can_edit;
+        let actions_enabled = show_action_buttons && !save_pending;
         set_result_action_button_visibility(
             &mut self.result_toolbar,
             &mut self.result_insert_btn,
@@ -388,6 +390,21 @@ impl AppState {
             &mut self.result_cancel_btn,
             show_action_buttons,
         );
+        if show_action_buttons {
+            if actions_enabled {
+                self.result_insert_btn.activate();
+                self.result_delete_btn.activate();
+                self.result_save_btn.activate();
+                self.result_cancel_btn.activate();
+                self.result_edit_check.activate();
+            } else {
+                self.result_insert_btn.deactivate();
+                self.result_delete_btn.deactivate();
+                self.result_save_btn.deactivate();
+                self.result_cancel_btn.deactivate();
+                self.result_edit_check.deactivate();
+            }
+        }
         self.result_toolbar.layout();
         self.result_toolbar.redraw();
     }
