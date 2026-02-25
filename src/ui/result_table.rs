@@ -2689,25 +2689,25 @@ impl ResultTableWidget {
         let mut statements = Vec::new();
 
         if !session.deleted_rowids.is_empty() {
-            let delete_where = if session.deleted_rowids.len() == 1 {
-                format!(
-                    "ROWID = {}",
-                    Self::sql_string_literal(&session.deleted_rowids[0])
-                )
-            } else {
-                let rowid_literals = session
-                    .deleted_rowids
-                    .iter()
-                    .map(|rowid| Self::sql_string_literal(rowid))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("ROWID IN ({rowid_literals})")
-            };
-            statements.push(format!(
-                "DELETE FROM {} WHERE {}",
-                Self::quote_qualified_identifier(&session.table_name),
-                delete_where
-            ));
+            // Oracle limits IN-list to 1000 elements (ORA-01795).  Chunk
+            // deleted ROWIDs so each DELETE stays within the limit.
+            let table_ref = Self::quote_qualified_identifier(&session.table_name);
+            for chunk in session.deleted_rowids.chunks(1000) {
+                let delete_where = if chunk.len() == 1 {
+                    format!("ROWID = {}", Self::sql_string_literal(&chunk[0]))
+                } else {
+                    let rowid_literals = chunk
+                        .iter()
+                        .map(|rowid| Self::sql_string_literal(rowid))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("ROWID IN ({rowid_literals})")
+                };
+                statements.push(format!(
+                    "DELETE FROM {} WHERE {}",
+                    table_ref, delete_where
+                ));
+            }
         }
 
         for (idx, row_state) in session.row_states.iter().enumerate() {
