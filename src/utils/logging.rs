@@ -153,7 +153,36 @@ impl AppLog {
 }
 
 fn rename_overwrite(from: &PathBuf, to: &PathBuf) -> Result<(), std::io::Error> {
-    fs::rename(from, to)
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if !to.exists() {
+                return Err(rename_err);
+            }
+
+            if let Err(remove_err) = fs::remove_file(to) {
+                return Err(std::io::Error::new(
+                    remove_err.kind(),
+                    format!(
+                        "Failed to replace destination file {} while finalizing {}: {remove_err}",
+                        to.display(),
+                        from.display()
+                    ),
+                ));
+            }
+
+            fs::rename(from, to).map_err(|retry_err| {
+                std::io::Error::new(
+                    retry_err.kind(),
+                    format!(
+                        "Failed to finalize log file move from {} to {} after removing destination: {retry_err}",
+                        from.display(),
+                        to.display()
+                    ),
+                )
+            })
+        }
+    }
 }
 
 impl Default for AppLog {
