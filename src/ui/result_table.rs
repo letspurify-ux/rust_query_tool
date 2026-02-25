@@ -2452,6 +2452,10 @@ impl ResultTableWidget {
     }
 
     pub fn insert_row_in_edit_mode(&mut self) -> Result<String, String> {
+        // Commit any pending inline edit before inserting a new row so that
+        // the previous cell's value is not silently lost.
+        self.commit_active_inline_edit();
+
         let headers_len = self
             .headers
             .lock()
@@ -2591,6 +2595,11 @@ impl ResultTableWidget {
     }
 
     pub fn delete_selected_rows_in_edit_mode(&mut self) -> Result<String, String> {
+        // Commit any pending inline edit before modifying the row set so that
+        // the edited value lands on the correct row and the editor widget is
+        // cleaned up (prevents stale-index writes after rows are removed).
+        self.commit_active_inline_edit();
+
         let (row_start, row_end) = Self::selected_row_range(&self.table)
             .ok_or_else(|| "Select row(s) to delete.".to_string())?;
 
@@ -2794,6 +2803,11 @@ impl ResultTableWidget {
     }
 
     pub fn cancel_edit_mode(&mut self) -> Result<String, String> {
+        // Discard any pending inline edit without committing — the user is
+        // cancelling all staged changes so the editor value must not be
+        // written back into the data that is about to be restored.
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
+
         let session = self
             .edit_session
             .lock()
