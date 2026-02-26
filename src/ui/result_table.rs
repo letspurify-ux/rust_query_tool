@@ -1591,42 +1591,62 @@ impl ResultTableWidget {
 
         if !active_editor.input.was_deleted() {
             let new_value = active_editor.input.value();
-            // Update full_data in its own scope so the lock is released
-            // before acquiring edit_session, keeping a consistent lock
-            // order (edit_session → full_data) with the rest of the code.
+            // Inline-edit commits are valid only while edit mode is active and
+            // the editor still targets an editable column. Otherwise, discard
+            // the transient input widget without mutating table data.
+            let mut should_apply = false;
             {
-                let mut full_data = full_data
+                let session_guard = edit_session
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(row_data) = full_data.get_mut(active_editor.row) {
-                    if active_editor.col >= row_data.len() {
-                        row_data.resize(active_editor.col + 1, String::new());
-                    }
-                    row_data[active_editor.col] = new_value.clone();
+                if let Some(session) = session_guard.as_ref() {
+                    let is_editable_col = session
+                        .editable_columns
+                        .iter()
+                        .any(|(col_idx, _)| *col_idx == active_editor.col);
+                    should_apply = active_editor.row < session.row_states.len()
+                        && active_editor.col != session.rowid_col
+                        && is_editable_col;
                 }
             }
-            {
-                let mut session_guard = edit_session
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(session) = session_guard.as_mut() {
-                    let is_explicit_null = session
-                        .row_states
-                        .get(active_editor.row)
-                        .map(|row_state| {
-                            Self::input_maps_to_explicit_null(
-                                row_state,
-                                &new_value,
-                                &session.null_text,
-                            )
-                        })
-                        .unwrap_or(false);
-                    let _ = Self::set_row_cell_explicit_null(
-                        session,
-                        active_editor.row,
-                        active_editor.col,
-                        is_explicit_null,
-                    );
+            if should_apply {
+                // Update full_data in its own scope so the lock is released
+                // before acquiring edit_session, keeping a consistent lock
+                // order (edit_session → full_data) with the rest of the code.
+                {
+                    let mut full_data = full_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(row_data) = full_data.get_mut(active_editor.row) {
+                        if active_editor.col >= row_data.len() {
+                            row_data.resize(active_editor.col + 1, String::new());
+                        }
+                        row_data[active_editor.col] = new_value.clone();
+                    }
+                }
+                {
+                    let mut session_guard = edit_session
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(session) = session_guard.as_mut() {
+                        let is_explicit_null = session
+                            .row_states
+                            .get(active_editor.row)
+                            .map(|row_state| {
+                                Self::input_maps_to_explicit_null(
+                                    row_state,
+                                    &new_value,
+                                    &session.null_text,
+                                )
+                            })
+                            .unwrap_or(false);
+                        let _ = Self::set_row_cell_explicit_null(
+                            session,
+                            active_editor.row,
+                            active_editor.col,
+                            is_explicit_null,
+                        );
+                    }
                 }
             }
 
@@ -6602,6 +6622,52 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 .as_slice(),
             &[vec!["AAABBB".to_string(), "MILLER".to_string()]]
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn commit_active_inline_edit_ignores_stale_editor_when_edit_mode_is_inactive() {
+        let widget = ResultTableWidget::new();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+
+        let mut input = Input::default();
+        input.set_value("MILLER");
+        *widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveInlineEdit {
+            row: 0,
+            col: 1,
+            input,
+        });
+
+        ResultTableWidget::commit_active_inline_edit_from_refs(
+            &widget.table,
+            &widget.full_data,
+            &widget.edit_session,
+            &widget.active_inline_edit,
+        );
+
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
+        );
+        assert!(widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 
     #[test]
