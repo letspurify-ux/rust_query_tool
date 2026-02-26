@@ -4473,18 +4473,26 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let had_edit_session = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if had_edit_session || save_pending {
+            // Query-start events can arrive while an inline editor still has focus.
+            // Persist the typed value first so cancel/failure paths do not drop it.
+            self.commit_active_inline_edit();
+        }
+
+        // Capture the edit session snapshot only after inline edits are committed.
+        // This keeps row-level metadata (e.g. explicit NULL markers) consistent
+        // with the staged full_data backup restored after query failure/cancel.
         let edit_session_snapshot = self
             .edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
 
-        let had_edit_session = edit_session_snapshot.is_some();
-        if had_edit_session || save_pending {
-            // Query-start events can arrive while an inline editor still has focus.
-            // Persist the typed value first so cancel/failure paths do not drop it.
-            self.commit_active_inline_edit();
-        }
         if save_pending {
             if !had_edit_session {
                 Self::clear_active_inline_edit_widget(&self.active_inline_edit);
@@ -7449,6 +7457,91 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_none());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn start_streaming_backup_captures_inline_edit_null_flags() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        let mut original_rows_by_rowid = HashMap::new();
+        original_rows_by_rowid.insert(
+            "AAABBB".to_string(),
+            vec!["AAABBB".to_string(), "SCOTT".to_string()],
+        );
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid,
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        let mut input = Input::default();
+        input.set_value("=NULL");
+        *widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveInlineEdit {
+            row: 0,
+            col: 1,
+            input,
+        });
+
+        let new_headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
+        widget.start_streaming(&new_headers);
+
+        let failed = QueryResult {
+            sql: "SELECT DEPTNO, DNAME FROM DEPT".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: true,
+            success: false,
+        };
+        widget.display_result(&failed);
+
+        let session = widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("edit session should be restored from backup");
+        let explicit_null = session
+            .row_states
+            .first()
+            .map(ResultTableWidget::row_state_explicit_null_cols)
+            .map(|cols| cols.contains(&1))
+            .unwrap_or(false);
+        assert!(explicit_null);
     }
 
     #[test]
