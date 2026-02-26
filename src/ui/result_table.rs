@@ -4290,8 +4290,8 @@ impl ResultTableWidget {
             .is_some();
 
         if save_requested {
-            self.set_query_edit_backup(None);
             if result.success {
+                self.set_query_edit_backup(None);
                 *self
                     .edit_session
                     .lock()
@@ -4305,8 +4305,13 @@ impl ResultTableWidget {
                     self.table.redraw();
                     return;
                 }
-            } else if is_edit_mode_enabled {
+            } else {
                 // Save failed: keep staged edits so users can fix and retry.
+                // Even if edit_session was unexpectedly cleared, do not replace
+                // the current grid with a transient error row.
+                if !is_edit_mode_enabled {
+                    let _ = self.restore_query_edit_backup();
+                }
                 return;
             }
         } else if !result.success {
@@ -6228,6 +6233,99 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_restores_backup_when_matching_save_fails_without_live_session() {
+        let mut widget = ResultTableWidget::new();
+
+        let backup_session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: [(
+                "AAABBB".to_string(),
+                vec!["AAABBB".to_string(), "SCOTT".to_string()],
+            )]
+            .into_iter()
+            .collect(),
+            original_row_order: vec!["AAABBB".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        widget.set_query_edit_backup(Some(QueryEditBackupState {
+            headers: vec!["ROWID".to_string(), "ENAME".to_string()],
+            full_data: vec![vec!["AAABBB".to_string(), "MILLER".to_string()]],
+            source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
+            edit_session: backup_session,
+        }));
+
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:99".to_string());
+
+        let failed = QueryResult {
+            sql: "/* SQ_SAVE_REQUEST:99 */
+UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
+                .to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-00001".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&failed);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "MILLER".to_string()]]
+        );
+        assert!(widget
+            .query_edit_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 
     #[test]
