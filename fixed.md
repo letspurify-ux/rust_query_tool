@@ -761,3 +761,19 @@
 
 ### [검증]
 - `cargo test` 전체 통과
+
+## 2026-02-26 결과 테이블 편집 이벤트 경계 보강 (후속 2)
+
+### [중] 편집 모드에서 비저장(non-save) non-select 성공 결과가 staged 편집 상태를 덮어쓰던 버그 수정
+- **증상**: 결과 테이블 편집 모드에서 일반 쿼리 실행 후 `COMMIT/ROLLBACK/DDL` 같은 non-select 문이 성공하면, `display_result`가 편집 세션을 종료하고 결과 그리드를 단일 메시지 행으로 바꿔 staged 편집 데이터가 사라질 수 있었습니다.
+- **수정**:
+  - `display_result`에 분기를 추가해, `save_edit_mode`로 발생한 저장 응답이 아닌 non-select 성공 결과가 편집 모드 중 도착한 경우 편집 세션/스테이징 데이터(`edit_session`, `full_data`, `source_sql`)를 유지하도록 변경했습니다.
+  - 이 경로에서는 pending stream 버퍼만 정리하고 기존 편집 그리드를 유지해, 편집 체크/입력/삭제/취소 상태가 쿼리 실행 성공 이벤트로 의도치 않게 초기화되지 않게 했습니다.
+- **효과**: 편집 중 일반 쿼리 실행 성공 이벤트가 섞여도 결과 테이블 편집 상태가 보존되어, 사용자 입력 유실 가능성을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `display_result_keeps_staged_edits_when_non_save_non_select_query_succeeds`
+  - 편집 모드에서 `COMMIT` 성공 결과 수신 시 edit session과 staged row/source SQL이 유지되는지 검증.
+
+### [검증]
+- `cargo test` 전체 통과

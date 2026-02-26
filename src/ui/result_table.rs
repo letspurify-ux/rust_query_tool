@@ -4506,6 +4506,15 @@ impl ResultTableWidget {
                 self.clear_pending_stream_buffers();
                 return;
             }
+        } else if is_edit_mode_enabled && !result.is_select {
+            self.clear_pending_stream_buffers();
+            // Non-save non-select statements (e.g. COMMIT/ROLLBACK/DDL) can be
+            // executed while a grid edit session is active. Keep staged rows
+            // and edit mode intact so ad-hoc statement success does not
+            // silently discard unsaved result-grid edits.
+            self.set_query_edit_backup(None);
+            self.table.redraw();
+            return;
         } else {
             self.set_query_edit_backup(None);
             *self
@@ -7186,6 +7195,85 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 .as_slice(),
             &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_keeps_staged_edits_when_non_save_non_select_query_succeeds() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        let commit_result = QueryResult {
+            sql: "COMMIT".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Commit complete".to_string(),
+            is_select: false,
+            success: true,
+        };
+
+        widget.display_result(&commit_result);
+
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        assert_eq!(
+            widget
+                .source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_str(),
+            "SELECT ROWID, ENAME FROM EMP"
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
+        );
+        assert_eq!(widget.table.rows(), 1);
+        assert_eq!(widget.table.cols(), 2);
     }
 
     #[test]
