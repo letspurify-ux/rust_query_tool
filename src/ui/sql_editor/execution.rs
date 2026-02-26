@@ -3068,7 +3068,8 @@ impl SqlEditorWidget {
                         match conn_guard.require_live_connection() {
                             Ok(conn) => Some(conn),
                             Err(_) => {
-                                let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                                let _ =
+                                    sender.send(QueryProgress::ConnectionChanged { info: None });
                                 app::awake();
                                 None
                             }
@@ -3082,7 +3083,8 @@ impl SqlEditorWidget {
                         Err(message) => {
                             let message = message.to_string();
                             if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
-                                let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                                let _ =
+                                    sender.send(QueryProgress::ConnectionChanged { info: None });
                                 app::awake();
                             }
                             if script_mode {
@@ -5008,6 +5010,7 @@ impl SqlEditorWidget {
                                     // Use the already-held conn_guard to avoid deadlock
                                     match conn_guard.connect(conn_info.clone()) {
                                         Ok(_) => {
+                                            conn_guard.refresh_tracked_connection();
                                             conn_opt = conn_guard.get_connection();
                                             let sanitized_conn_info =
                                                 SqlEditorWidget::connection_info_for_ui(
@@ -5095,6 +5098,7 @@ impl SqlEditorWidget {
                                             None,
                                         );
                                         conn_guard.disconnect();
+                                        conn_guard.refresh_tracked_connection();
                                         conn_opt = conn_guard.get_connection();
                                         if conn_guard.is_connected() {
                                             conn_name = conn_guard.get_info().name.clone();
@@ -5142,8 +5146,8 @@ impl SqlEditorWidget {
                                         );
                                     }
                                     cleanup.clear_timeout_tracking();
-                                    let _ =
-                                        sender.send(QueryProgress::ConnectionChanged { info: None });
+                                    let _ = sender
+                                        .send(QueryProgress::ConnectionChanged { info: None });
                                     app::awake();
                                 }
                                 ToolCommand::RunScript {

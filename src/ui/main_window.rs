@@ -2536,6 +2536,7 @@ impl MainWindow {
                         };
                         match db_conn.connect(info.clone()) {
                             Ok(_) => {
+                                db_conn.refresh_tracked_connection();
                                 let session = db_conn.session_state();
                                 drop(db_conn);
                                 match session.lock() {
@@ -2586,6 +2587,7 @@ impl MainWindow {
                 };
                 crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
+                db_conn.refresh_tracked_connection();
                 // Release the connection lock before locking AppState.
                 // Session reset is handled inside transition_to_disconnected_state.
                 drop(db_conn);

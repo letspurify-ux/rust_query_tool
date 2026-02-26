@@ -335,6 +335,12 @@ impl<'a> ConnectionLockGuard<'a> {
         self.tracks_activity = true;
         self
     }
+
+    pub fn refresh_tracked_connection(&self) {
+        if self.tracks_activity {
+            set_current_db_connection(self.guard.get_connection());
+        }
+    }
 }
 
 impl<'a> Deref for ConnectionLockGuard<'a> {
