@@ -553,6 +553,10 @@ fn should_ignore_query_progress_when_disconnected(
     !has_live_connection && !has_running_queries
 }
 
+fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
+    !has_running_queries
+}
+
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
     target.filter(|idx| *idx < tab_count).unwrap_or(tab_count)
 }
@@ -2499,31 +2503,38 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                 }
                 QueryProgress::BatchFinished => {
-                    s.result_tabs.finish_all_streaming();
-                    s.result_tabs.align_tab_strip_left();
-                    let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
-                    let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
-                    s.fetch_row_counts.clear();
-                    s.result_grid_execution_target = None;
-                    s.result_tab_offset = s.result_tabs.tab_count();
-                    // Query execution completed and large temporary buffers may
-                    // have been released during result materialization.
-                    malloc_trim_process();
-                    let current_status = s.status_bar.label().to_ascii_lowercase();
-                    let needs_reset = current_status.contains("executing query")
-                        || current_status.contains("fetching rows")
-                        || current_status.contains("connection is busy")
-                        || current_status.contains("query is already running");
-                    if recovered_save_states > 0 {
-                        s.set_status_message(
-                            "Save was interrupted. Staged edits are still available.",
-                        );
-                    } else if recovered_edit_states > 0 {
-                        s.set_status_message(
-                            "Query ended before completion. Restored staged result-grid edits.",
-                        );
-                    } else if needs_reset {
-                        s.set_status_message("Ready");
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+
+                    if should_run_global_batch_cleanup(has_running_queries) {
+                        s.result_tabs.finish_all_streaming();
+                        s.result_tabs.align_tab_strip_left();
+                        let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
+                        let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                        s.fetch_row_counts.clear();
+                        s.result_grid_execution_target = None;
+                        s.result_tab_offset = s.result_tabs.tab_count();
+                        // Query execution completed and large temporary buffers may
+                        // have been released during result materialization.
+                        malloc_trim_process();
+                        let current_status = s.status_bar.label().to_ascii_lowercase();
+                        let needs_reset = current_status.contains("executing query")
+                            || current_status.contains("fetching rows")
+                            || current_status.contains("connection is busy")
+                            || current_status.contains("query is already running");
+                        if recovered_save_states > 0 {
+                            s.set_status_message(
+                                "Save was interrupted. Staged edits are still available.",
+                            );
+                        } else if recovered_edit_states > 0 {
+                            s.set_status_message(
+                                "Query ended before completion. Restored staged result-grid edits.",
+                            );
+                        } else if needs_reset {
+                            s.set_status_message("Ready");
+                        }
                     }
                     s.refresh_result_edit_controls();
                 }
@@ -4501,7 +4512,8 @@ impl Default for MainWindow {
 mod health_check_tests {
     use super::{
         should_apply_disconnect_for_health_check, should_ignore_query_progress_when_disconnected,
-        should_restart_health_check_worker, HealthCheckCurrentConnectionState,
+        should_restart_health_check_worker, should_run_global_batch_cleanup,
+        HealthCheckCurrentConnectionState,
     };
 
     #[test]
@@ -4603,6 +4615,13 @@ mod health_check_tests {
         assert!(should_ignore_query_progress_when_disconnected(false, false));
         assert!(!should_ignore_query_progress_when_disconnected(false, true));
         assert!(!should_ignore_query_progress_when_disconnected(true, false));
+    }
+
+
+    #[test]
+    fn runs_global_batch_cleanup_only_when_no_queries_are_running() {
+        assert!(should_run_global_batch_cleanup(false));
+        assert!(!should_run_global_batch_cleanup(true));
     }
 
     #[test]
