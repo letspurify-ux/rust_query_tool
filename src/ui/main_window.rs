@@ -2509,10 +2509,15 @@ impl MainWindow {
                             .set_label(&format!("Connecting to {}...", info.name));
                     }
                     thread::spawn(move || {
-                        let mut db_conn = lock_connection_with_activity(
+                        let Some(mut db_conn) = try_lock_connection_with_activity(
                             &connection,
                             format!("Connecting to {}", info.name),
-                        );
+                        ) else {
+                            let _ = conn_sender
+                                .send(ConnectionResult::Failure(format_connection_busy_message()));
+                            app::awake();
+                            return;
+                        };
                         match db_conn.connect(info.clone()) {
                             Ok(_) => {
                                 let session = db_conn.session_state();
