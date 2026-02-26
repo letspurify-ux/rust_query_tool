@@ -650,15 +650,14 @@ impl ConnectionDialog {
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
 
-        // Clear password from the returned ConnectionInfo
-        // (it was already saved to keyring if needed)
-        let mut final_result = result
+        // IMPORTANT: Do not clear password here.
+        // The returned ConnectionInfo is consumed immediately by the caller to perform
+        // DB login, and clearing it at this point makes connection impossible.
+        // Password memory cleanup is handled after successful connect in the connection flow.
+        let final_result = result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if let Some(ref mut info) = final_result {
-            info.clear_password();
-        }
         final_result
     }
 }
