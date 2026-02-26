@@ -1989,7 +1989,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(session) = session_guard.as_mut() else {
-                return Err(String::new());
+                return Err("Enable edit mode first.".to_string());
             };
 
             if rows.len() != session.row_states.len() {
@@ -7078,6 +7078,33 @@ mod row_edit_sql_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_none());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn set_null_returns_edit_mode_error_when_session_is_missing() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        widget.table.set_selection(0, 1, 0, 1);
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+
+        let result = ResultTableWidget::set_selected_cells_to_null_in_edit_mode(
+            &widget.table,
+            &widget.full_data,
+            &widget.edit_session,
+            &widget.pending_save_request,
+            &widget.active_inline_edit,
+        );
+
+        assert_eq!(result, Err("Enable edit mode first.".to_string()));
     }
 
     #[test]
