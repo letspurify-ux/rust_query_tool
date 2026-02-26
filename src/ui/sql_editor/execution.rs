@@ -5116,11 +5116,24 @@ impl SqlEditorWidget {
                                             "DISCONNECT",
                                             "Disconnected from database",
                                         );
-                                        cleanup.clear_timeout_tracking();
-                                        let _ = sender
-                                            .send(QueryProgress::ConnectionChanged { info: None });
-                                        app::awake();
                                     } else {
+                                        // Keep script/session/UI state consistent even when the
+                                        // connection was already dropped unexpectedly.
+                                        SqlEditorWidget::set_current_query_connection(
+                                            &current_query_connection,
+                                            None,
+                                        );
+                                        conn_opt = None;
+                                        conn_name.clear();
+                                        match session.lock() {
+                                            Ok(mut guard) => guard.reset(),
+                                            Err(poisoned) => {
+                                                eprintln!(
+                                                "Warning: session state lock was poisoned; recovering."
+                                            );
+                                                poisoned.into_inner().reset();
+                                            }
+                                        }
                                         SqlEditorWidget::emit_script_message(
                                             &sender,
                                             &session,
@@ -5128,6 +5141,10 @@ impl SqlEditorWidget {
                                             "Not connected to any database",
                                         );
                                     }
+                                    cleanup.clear_timeout_tracking();
+                                    let _ =
+                                        sender.send(QueryProgress::ConnectionChanged { info: None });
+                                    app::awake();
                                 }
                                 ToolCommand::RunScript {
                                     path,
