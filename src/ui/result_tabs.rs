@@ -556,23 +556,6 @@ impl ResultTabsWidget {
         cleared
     }
 
-    pub fn clear_orphaned_save_request_at(&mut self, index: usize) -> bool {
-        let cleared = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-            .map(|tab| {
-                let mut table = tab.table.clone();
-                table.clear_orphaned_save_request()
-            })
-            .unwrap_or(false);
-        if cleared {
-            self.fire_on_change_callback();
-        }
-        cleared
-    }
-
     pub fn clear_orphaned_query_edit_backups(&mut self) -> usize {
         let tables = self
             .data
@@ -586,23 +569,6 @@ impl ResultTabsWidget {
             }
         }
         if restored > 0 {
-            self.fire_on_change_callback();
-        }
-        restored
-    }
-
-    pub fn clear_orphaned_query_edit_backup_at(&mut self, index: usize) -> bool {
-        let restored = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(index)
-            .map(|tab| {
-                let mut table = tab.table.clone();
-                table.clear_orphaned_query_edit_backup()
-            })
-            .unwrap_or(false);
-        if restored {
             self.fire_on_change_callback();
         }
         restored
