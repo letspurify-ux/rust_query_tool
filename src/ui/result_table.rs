@@ -4522,6 +4522,21 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
+        if !result.success {
+            self.clear_pending_stream_buffers();
+            self.render_status_message_row(&result.message);
+            self.source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            *self
+                .hidden_auto_rowid_col
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            self.table.redraw();
+            return;
+        }
+
         *self
             .source_sql
             .lock()
@@ -4532,31 +4547,7 @@ impl ResultTableWidget {
         };
         if !result.is_select {
             self.clear_pending_stream_buffers();
-            let font_size = *self
-                .font_size
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let max_cell_display_chars = *self
-                .max_cell_display_chars
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.table.set_rows(1);
-            self.table.set_cols(1);
-            self.apply_table_metrics_for_current_font();
-            let message_width =
-                Self::estimate_display_width(&result.message, font_size, max_cell_display_chars)
-                    .max(200)
-                    .min(1200);
-            self.table.set_col_width(0, message_width);
-            *self
-                .headers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["Result".to_string()];
-            *self
-                .full_data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                vec![vec![result.message.clone()]];
+            self.render_status_message_row(&result.message);
             *self
                 .hidden_auto_rowid_col
                 .lock()
@@ -4623,6 +4614,32 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
+    }
+
+    fn render_status_message_row(&mut self, message: &str) {
+        let font_size = *self
+            .font_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max_cell_display_chars = *self
+            .max_cell_display_chars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.table.set_rows(1);
+        self.table.set_cols(1);
+        self.apply_table_metrics_for_current_font();
+        let message_width = Self::estimate_display_width(message, font_size, max_cell_display_chars)
+            .max(200)
+            .min(1200);
+        self.table.set_col_width(0, message_width);
+        *self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["Result".to_string()];
+        *self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![vec![message.to_string()]];
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
