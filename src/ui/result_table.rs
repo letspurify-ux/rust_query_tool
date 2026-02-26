@@ -926,6 +926,7 @@ impl ResultTableWidget {
                             &execute_sql_callback_for_handle,
                             &edit_session_for_handle,
                             &pending_save_request_for_handle,
+                            &active_inline_edit_for_handle,
                         );
                         return true;
                     }
@@ -1050,6 +1051,7 @@ impl ResultTableWidget {
                                 &full_data_for_handle,
                                 &edit_session_for_handle,
                                 &pending_save_request_for_handle,
+                                &active_inline_edit_for_handle,
                             ) {
                                 Ok(_) => return true,
                                 Err(err) => {
@@ -1173,6 +1175,7 @@ impl ResultTableWidget {
                             &full_data_for_handle,
                             &edit_session_for_handle,
                             &pending_save_request_for_handle,
+                            &active_inline_edit_for_handle,
                         ) {
                             Ok(_) => return true,
                             Err(err) => {
@@ -1216,6 +1219,7 @@ impl ResultTableWidget {
                         &full_data_for_handle,
                         &edit_session_for_handle,
                         &pending_save_request_for_handle,
+                        &active_inline_edit_for_handle,
                         &pasted_text,
                     ) {
                         Ok(_) => true,
@@ -1563,8 +1567,21 @@ impl ResultTableWidget {
     }
 
     fn commit_active_inline_edit(&mut self) {
-        let active_editor = self
-            .active_inline_edit
+        Self::commit_active_inline_edit_from_refs(
+            &self.table,
+            &self.full_data,
+            &self.edit_session,
+            &self.active_inline_edit,
+        );
+    }
+
+    fn commit_active_inline_edit_from_refs(
+        table: &Table,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
+    ) {
+        let active_editor = active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
@@ -1578,8 +1595,7 @@ impl ResultTableWidget {
             // before acquiring edit_session, keeping a consistent lock
             // order (edit_session → full_data) with the rest of the code.
             {
-                let mut full_data = self
-                    .full_data
+                let mut full_data = full_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(row_data) = full_data.get_mut(active_editor.row) {
@@ -1590,8 +1606,7 @@ impl ResultTableWidget {
                 }
             }
             {
-                let mut session_guard = self
-                    .edit_session
+                let mut session_guard = edit_session
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(session) = session_guard.as_mut() {
@@ -1622,11 +1637,11 @@ impl ResultTableWidget {
             }
         }
 
-        *self
-            .active_inline_edit
+        *active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        self.table.redraw();
+        let mut table = table.clone();
+        table.redraw();
     }
 
     fn matches_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
@@ -1815,6 +1830,7 @@ impl ResultTableWidget {
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
         clipboard_text: &str,
     ) -> Result<usize, String> {
         if *pending_save_request
@@ -1823,6 +1839,13 @@ impl ResultTableWidget {
         {
             return Err("Cannot paste while save is in progress.".to_string());
         }
+
+        Self::commit_active_inline_edit_from_refs(
+            table,
+            full_data,
+            edit_session,
+            active_inline_edit,
+        );
 
         let session = edit_session
             .lock()
@@ -1932,6 +1955,7 @@ impl ResultTableWidget {
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
     ) -> Result<usize, String> {
         if *pending_save_request
             .lock()
@@ -1939,6 +1963,13 @@ impl ResultTableWidget {
         {
             return Err("Cannot set NULL while save is in progress.".to_string());
         }
+
+        Self::commit_active_inline_edit_from_refs(
+            table,
+            full_data,
+            edit_session,
+            active_inline_edit,
+        );
 
         let selection = Self::normalized_selection_bounds_with_limits(
             table.get_selection(),
@@ -3907,6 +3938,7 @@ impl ResultTableWidget {
         _execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
+        active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -4024,6 +4056,7 @@ impl ResultTableWidget {
                         full_data,
                         edit_session,
                         pending_save_request,
+                        active_inline_edit,
                     ) {
                         if !err.is_empty() {
                             fltk::dialog::alert_default(&err);
@@ -6972,6 +7005,79 @@ mod row_edit_sql_tests {
             widget.delete_selected_rows_in_edit_mode(),
             Err("Cannot delete rows while save is in progress.".to_string())
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn set_null_commits_active_inline_edit_before_applying_selection() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        widget.table.set_selection(0, 1, 0, 1);
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        let mut input = Input::default();
+        input.set_value("MILLER");
+        *widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveInlineEdit {
+            row: 0,
+            col: 1,
+            input,
+        });
+
+        let changed = ResultTableWidget::set_selected_cells_to_null_in_edit_mode(
+            &widget.table,
+            &widget.full_data,
+            &widget.edit_session,
+            &widget.pending_save_request,
+            &widget.active_inline_edit,
+        )
+        .expect("set null should succeed");
+
+        assert_eq!(changed, 1);
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![vec!["AAABBB".to_string(), "NULL".to_string()]]
+        );
+        assert!(widget
+            .active_inline_edit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 
     #[test]
