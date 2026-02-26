@@ -1146,22 +1146,37 @@ impl QueryHistoryDialog {
     }
 }
 
-/// Truncate SQL for display in list
+/// Truncate SQL for display in list.
+///
+/// All indices are byte offsets; `is_char_boundary` is used before every slice
+/// so multi-byte characters are never split.
 fn truncate_sql(sql: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
 
+    // Normalize whitespace using byte-level ASCII checks for whitespace detection.
+    // Multi-byte characters are copied as complete byte sequences identified by
+    // char boundaries, never sliced mid-character.
     let mut normalized = String::with_capacity(sql.len());
     let mut last_was_whitespace = true;
-    for ch in sql.chars() {
-        if ch.is_whitespace() {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
             if !last_was_whitespace {
                 normalized.push(' ');
                 last_was_whitespace = true;
             }
+            i += 1;
         } else {
-            normalized.push(ch);
+            // Advance to the end of this char using char boundary checks.
+            let char_start = i;
+            i += 1;
+            while i < bytes.len() && !sql.is_char_boundary(i) {
+                i += 1;
+            }
+            normalized.push_str(&sql[char_start..i]);
             last_was_whitespace = false;
         }
     }
@@ -1175,20 +1190,27 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 
     if max_len <= 3 {
-        let keep = max_len.min(3);
-        return "...".chars().take(keep).collect();
+        // Truncate at a char boundary so we don't produce invalid UTF-8.
+        let mut end = max_len.min(normalized.len());
+        while end > 0 && !normalized.is_char_boundary(end) {
+            end -= 1;
+        }
+        return normalized[..end].to_string();
     }
 
     let visible_len = max_len - 3;
+    // `char_indices` yields (byte_offset, char) pairs; truncate_at is a byte offset.
     let mut visible_chars = 0usize;
     let mut truncate_at = normalized.len();
-    for (idx, _) in normalized.char_indices() {
+    for (byte_idx, _ch) in normalized.char_indices() {
         if visible_chars == visible_len {
-            truncate_at = idx;
+            truncate_at = byte_idx;
             break;
         }
         visible_chars += 1;
     }
+
+    debug_assert!(normalized.is_char_boundary(truncate_at));
 
     if visible_chars < visible_len {
         normalized

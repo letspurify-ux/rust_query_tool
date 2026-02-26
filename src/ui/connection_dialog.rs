@@ -650,12 +650,15 @@ impl ConnectionDialog {
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
 
-        // Clear password from the returned ConnectionInfo clone held in config
+        // Clear password from the returned ConnectionInfo
         // (it was already saved to keyring if needed)
-        let final_result = result
+        let mut final_result = result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        if let Some(ref mut info) = final_result {
+            info.clear_password();
+        }
         final_result
     }
 }
