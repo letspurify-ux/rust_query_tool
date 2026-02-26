@@ -2687,7 +2687,8 @@ impl ResultTableWidget {
             && !result.success
             && !result.is_select
             && result.sql.trim().is_empty()
-            && Self::is_execution_abort_message(&result.message)
+            && (Self::is_execution_abort_message(&result.message)
+                || Self::is_connection_loss_message(&result.message))
     }
 
     fn is_execution_abort_message(message: &str) -> bool {
@@ -2698,6 +2699,16 @@ impl ResultTableWidget {
             || lowered.contains("timeout")
             || lowered.contains("ora-01013")
             || lowered.contains("user requested cancel")
+    }
+
+    fn is_connection_loss_message(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        lowered.contains("not connected")
+            || lowered.contains("connection was lost")
+            || lowered.contains("connection lost")
+            || lowered.contains("ora-03113")
+            || lowered.contains("ora-03114")
+            || lowered.contains("dpi-1010")
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -8574,6 +8585,34 @@ mod tests {
 
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
             None, None, &result,
+        ));
+    }
+
+
+    #[test]
+    fn connection_loss_message_matches_not_connected_text() {
+        assert!(ResultTableWidget::is_connection_loss_message(
+            "Not connected to database",
+        ));
+    }
+
+    #[test]
+    fn failed_connection_loss_with_empty_sql_matches_pending_save_fallback() {
+        let result = QueryResult {
+            success: false,
+            message: "Connection was lost unexpectedly: ORA-03114".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: String::new(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:12"),
+            Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &result,
         ));
     }
 
