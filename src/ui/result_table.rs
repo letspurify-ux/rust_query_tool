@@ -3388,6 +3388,11 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len();
+
+        if removed == 0 {
+            return Err("No selected rows were available to delete.".to_string());
+        }
+
         self.table.set_rows(new_len as i32);
         self.apply_table_metrics_for_current_font();
         if new_len > 0 {
@@ -7324,6 +7329,36 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         assert_eq!(
             widget.delete_selected_rows_in_edit_mode(),
             Err("Cannot delete rows while save is in progress.".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn delete_selected_rows_returns_error_when_selection_has_no_staged_rows() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        widget.table.set_selection(0, 0, 0, 0);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+
+        assert_eq!(
+            widget.delete_selected_rows_in_edit_mode(),
+            Err("No selected rows were available to delete.".to_string())
         );
     }
 
