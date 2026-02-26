@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
-use crate::ui::intellisense_context::{self, ScopedTableRef};
-use crate::ui::sql_editor::{SqlEditorWidget, SqlToken};
 use crate::ui::theme;
 
 fn byte_index_after_n_chars(s: &str, n: usize) -> usize {
@@ -2497,23 +2495,7 @@ impl ResultTableWidget {
     }
 
     fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
-        let normalized = expr.trim();
-        if normalized.is_empty() {
-            return Err("SQL expression after '=' cannot be empty.".to_string());
-        }
-
-        if normalized.contains(';')
-            || normalized.contains("--")
-            || normalized.contains("/*")
-            || normalized.contains("*/")
-        {
-            return Err(
-                "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
-                    .to_string(),
-            );
-        }
-
-        Ok(normalized.to_string())
+        crate::ui::sql_editor::query_text::validate_sql_expression_input(expr)
     }
 
     fn sql_literal_from_input_with_null_text(
@@ -2779,117 +2761,8 @@ impl ResultTableWidget {
             .collect()
     }
 
-    fn strip_identifier_quotes(text: &str) -> String {
-        let trimmed = text.trim();
-        if let Some(inner) = trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-            return inner.replace("\"\"", "\"");
-        }
-        trimmed.to_string()
-    }
-
-    fn resolve_target_table_candidates(tables: &[ScopedTableRef]) -> Vec<String> {
-        let mut result = Vec::new();
-        let mut seen = HashSet::new();
-        for table_ref in tables {
-            if table_ref.is_cte {
-                continue;
-            }
-            let key = table_ref.name.to_ascii_uppercase();
-            if seen.insert(key) {
-                result.push(table_ref.name.clone());
-            }
-        }
-        result
-    }
-
-    fn find_rowid_qualifier(tokens: &[SqlToken]) -> Option<String> {
-        let mut depth = 0usize;
-        let mut in_select = false;
-        let mut idx = 0usize;
-
-        while idx < tokens.len() {
-            match tokens.get(idx) {
-                Some(SqlToken::Symbol(sym)) if sym == "(" => {
-                    depth = depth.saturating_add(1);
-                }
-                Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                    depth = depth.saturating_sub(1);
-                }
-                Some(SqlToken::Word(word)) => {
-                    if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
-                        in_select = true;
-                    } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-
-            if in_select && depth == 0 {
-                let qualifier = match (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)) {
-                    (
-                        Some(SqlToken::Word(lhs)),
-                        Some(SqlToken::Symbol(dot)),
-                        Some(SqlToken::Word(rhs)),
-                    ) if dot == "."
-                        && Self::strip_identifier_quotes(rhs).eq_ignore_ascii_case("ROWID") =>
-                    {
-                        Some(Self::strip_identifier_quotes(lhs))
-                    }
-                    _ => None,
-                };
-                if qualifier.is_some() {
-                    return qualifier;
-                }
-            }
-
-            idx += 1;
-        }
-
-        None
-    }
-
     fn resolve_target_table(source_sql: &str) -> Result<String, String> {
-        let sql = source_sql.trim();
-        if sql.is_empty() {
-            return Err(
-                "Cannot edit rows: source SQL is not available for this result.".to_string(),
-            );
-        }
-
-        let tokens = SqlEditorWidget::tokenize_sql(sql);
-        let tables_in_scope = intellisense_context::collect_tables_in_statement(&tokens);
-        let candidates = Self::resolve_target_table_candidates(&tables_in_scope);
-        if candidates.is_empty() {
-            return Err(
-                "Cannot edit rows: no base table was resolved from this query.".to_string(),
-            );
-        }
-
-        if let Some(qualifier) = Self::find_rowid_qualifier(&tokens) {
-            let resolved =
-                intellisense_context::resolve_qualifier_tables(&qualifier, &tables_in_scope);
-            let mut resolved_deduped = Vec::new();
-            let mut seen = HashSet::new();
-            for table in resolved {
-                let key = table.to_ascii_uppercase();
-                if seen.insert(key) {
-                    resolved_deduped.push(table);
-                }
-            }
-            if resolved_deduped.len() == 1 {
-                return Ok(resolved_deduped.remove(0));
-            }
-        }
-
-        if candidates.len() == 1 {
-            return Ok(candidates[0].clone());
-        }
-
-        Err(format!(
-            "Cannot resolve a single edit target table (candidates: {}). Query one table or qualify ROWID with an alias.",
-            candidates.join(", ")
-        ))
+        crate::ui::sql_editor::query_text::resolve_edit_target_table(source_sql)
     }
 
     fn selected_anchor_cell(table: &Table) -> Option<(usize, usize)> {
