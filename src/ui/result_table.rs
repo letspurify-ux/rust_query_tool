@@ -4522,6 +4522,14 @@ impl ResultTableWidget {
             if !had_edit_session {
                 Self::clear_active_inline_edit_widget(&self.active_inline_edit);
             }
+            // Ignore out-of-order SELECT start packets while a save request is
+            // still pending. Since this path does not actually enter streaming,
+            // keep the flag cleared so edit controls are not blocked waiting for
+            // a finish event that may never arrive.
+            *self
+                .streaming_in_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
             self.clear_pending_stream_buffers();
             self.set_query_edit_backup(None);
             self.table.redraw();
@@ -4774,6 +4782,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         self.clear_pending_stream_buffers();
         // Save orphan recovery should not leave stale pre-query snapshots that
         // can be resurrected by a later unrelated batch-finished cleanup.
@@ -4804,6 +4816,10 @@ impl ResultTableWidget {
         }
         // Drop any buffered stream rows from the interrupted query before
         // restoring the backed-up edit dataset.
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         self.clear_pending_stream_buffers();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.restore_query_edit_backup()
@@ -7173,6 +7189,10 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(!*widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
         assert!(widget
             .edit_session
             .lock()
@@ -7484,6 +7504,11 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
         widget.start_streaming(&headers);
+
+        assert!(!*widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
 
         let rows = widget
             .full_data
