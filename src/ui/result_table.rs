@@ -3401,7 +3401,9 @@ impl ResultTableWidget {
         // in-widget edit state before we snapshot staged rows.
         if !self.table.was_deleted() {
             let _ = self.table.take_focus();
-            app::flush();
+            if app::is_ui_thread() {
+                app::flush();
+            }
         }
         self.commit_active_inline_edit();
 
