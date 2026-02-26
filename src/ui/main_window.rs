@@ -2409,19 +2409,22 @@ impl MainWindow {
 
                     // Some cancellation/error paths can finish a statement
                     // without a trailing BatchFinished event. Recover stale
-                    // save/edit transient states here as well so result-grid
-                    // edit controls are not left locked until the next batch.
+                    // save/edit transient states for the current result tab so
+                    // unrelated tabs are not cleared while their own execution
+                    // is still in-flight.
                     // Run orphan recovery BEFORE refreshing edit controls so
                     // that the control state reflects the final pending flags,
                     // not an intermediate snapshot taken before cleanup.
-                    let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
-                    let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                    let recovered_save_state =
+                        s.result_tabs.clear_orphaned_save_request_at(tab_index);
+                    let recovered_edit_state =
+                        s.result_tabs.clear_orphaned_query_edit_backup_at(tab_index);
                     s.refresh_result_edit_controls();
-                    if recovered_save_states > 0 {
+                    if recovered_save_state {
                         s.set_status_message(
                             "Save was interrupted. Staged edits are still available.",
                         );
-                    } else if recovered_edit_states > 0 {
+                    } else if recovered_edit_state {
                         s.set_status_message(
                             "Query ended before completion. Restored staged result-grid edits.",
                         );
