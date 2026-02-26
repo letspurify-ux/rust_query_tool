@@ -96,12 +96,6 @@ impl DatabaseConnection {
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), OracleError> {
-        // Release any existing Oracle connection handle before opening a new one
-        // so the previous connection is closed promptly rather than waiting for
-        // all Arc clones to be dropped.  This prevents silent connection leaks
-        // when the user reconnects without explicitly disconnecting first.
-        self.connection = None;
-
         let conn_str = info.connection_string();
         let connection = Arc::new(
             match Connection::connect(&info.username, &info.password, &conn_str) {
@@ -115,6 +109,9 @@ impl DatabaseConnection {
 
         Self::apply_default_session_settings(connection.as_ref());
 
+        // Swap in the new connection only after a successful handshake.
+        // This preserves the active session when users mistype credentials
+        // during reconnect attempts.
         self.connection = Some(connection);
         self.info = info;
         // Clear password from memory now that the connection is established
