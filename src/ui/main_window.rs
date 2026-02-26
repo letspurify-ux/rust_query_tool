@@ -537,7 +537,15 @@ impl MainWindow {
             .connection_info
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        state.set_status_message("Disconnected");
+        let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
+        let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
+        if recovered_save_states > 0 {
+            state.set_status_message("Disconnected (save interrupted; staged edits preserved)");
+        } else if recovered_edit_states > 0 {
+            state.set_status_message("Disconnected (staged result-grid edits restored)");
+        } else {
+            state.set_status_message("Disconnected");
+        }
         let reset_data = IntellisenseData::new();
         let reset_highlight = HighlightData::new();
         Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
