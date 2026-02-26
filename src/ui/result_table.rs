@@ -2140,7 +2140,27 @@ impl ResultTableWidget {
 
         let row_hit = match row_hit {
             Some(row_hit) => row_hit,
-            None => return None,
+            None => {
+                // set_row_position() 직후에는 FLTK 내부 row_position 값이
+                // 실제 렌더링 viewport와 잠시 어긋나는 경우가 있어,
+                // start_row 이후만 스캔하면 셀 hit-test가 실패할 수 있다.
+                // (사용자가 스크롤을 한 번 더 움직이면 정상화되는 현상)
+                row = 0;
+                while row < start_row {
+                    if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, 0) {
+                        if mouse_y >= cy && mouse_y < cy + ch {
+                            row_hit = Some(row);
+                            break;
+                        }
+                        if cy > mouse_y || cy >= data_bottom {
+                            break;
+                        }
+                    }
+                    row += 1;
+                }
+
+                row_hit?
+            }
         };
 
         let mut col = start_col;
@@ -2199,6 +2219,20 @@ impl ResultTableWidget {
                 }
             } else {
                 break;
+            }
+            row += 1;
+        }
+
+        // get_cell_at_mouse와 동일하게 row_position stale 케이스를 보완한다.
+        row = 0;
+        while row < start_row {
+            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::RowHeader, row, 0) {
+                if mouse_y >= cy && mouse_y < cy + ch {
+                    return Some(row);
+                }
+                if cy > mouse_y || cy >= data_bottom {
+                    break;
+                }
             }
             row += 1;
         }
