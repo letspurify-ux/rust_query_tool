@@ -4266,6 +4266,15 @@ impl ResultTableWidget {
                     *save_signature = None;
                     *save_tag = None;
                     (true, false)
+                } else if !result.success {
+                    // If a save was pending and the execution ended in failure
+                    // before we received a tagged/signature-matching result,
+                    // clear the pending flag immediately so edit controls do
+                    // not stay locked until the BatchFinished recovery path.
+                    *pending_guard = false;
+                    *save_signature = None;
+                    *save_tag = None;
+                    (true, false)
                 } else {
                     (false, true)
                 }
