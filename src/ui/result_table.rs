@@ -2508,12 +2508,12 @@ impl ResultTableWidget {
         let result_signature = Self::canonical_sql_signature(result_sql);
         pending_signature
             .map(|signature| signature == result_signature)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     fn matches_pending_save_tag(pending_tag: Option<&str>, result_sql: &str) -> bool {
         let Some(tag) = pending_tag else {
-            return true;
+            return false;
         };
         result_sql.contains(tag)
     }
@@ -7935,6 +7935,16 @@ mod tests {
             Some("SQ_SAVE_REQUEST:7"),
             "/* SQ_SAVE_REQUEST:9 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
         ));
+    }
+
+    #[test]
+    fn matches_pending_save_matchers_require_registered_tracking_values() {
+        let result_sql = "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'";
+        assert!(!ResultTableWidget::matches_pending_save_signature(
+            None,
+            result_sql,
+        ));
+        assert!(!ResultTableWidget::matches_pending_save_tag(None, result_sql));
     }
 
     #[test]
