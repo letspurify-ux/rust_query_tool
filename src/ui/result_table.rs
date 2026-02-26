@@ -12,6 +12,7 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -101,6 +102,8 @@ pub struct ResultTableWidget {
     query_edit_backup: Arc<Mutex<Option<QueryEditBackupState>>>,
     pending_save_request: Arc<Mutex<bool>>,
     pending_save_sql_signature: Arc<Mutex<Option<String>>>,
+    pending_save_request_tag: Arc<Mutex<Option<String>>>,
+    next_save_request_id: Arc<AtomicU64>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
 }
@@ -346,7 +349,9 @@ impl ResultTableWidget {
         let mut input = active_editor.input;
         if !input.was_deleted() {
             input.hide();
-            Input::delete(input);
+            if app::is_ui_thread() {
+                Input::delete(input);
+            }
         }
     }
 
@@ -692,6 +697,8 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(None));
         let pending_save_request: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let pending_save_sql_signature: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let pending_save_request_tag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let next_save_request_id = Arc::new(AtomicU64::new(1));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
 
@@ -1259,6 +1266,8 @@ impl ResultTableWidget {
             query_edit_backup,
             pending_save_request,
             pending_save_sql_signature,
+            pending_save_request_tag,
+            next_save_request_id,
             hidden_auto_rowid_col,
             active_inline_edit,
         }
@@ -1418,7 +1427,9 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         if !input.was_deleted() {
-            Input::delete(input);
+            if app::is_ui_thread() {
+                Input::delete(input);
+            }
         }
         let mut table = table.clone();
         if !table.was_deleted() {
@@ -1606,7 +1617,9 @@ impl ResultTableWidget {
 
             let mut input = active_editor.input.clone();
             input.hide();
-            Input::delete(input);
+            if app::is_ui_thread() {
+                Input::delete(input);
+            }
         }
 
         *self
@@ -2444,6 +2457,13 @@ impl ResultTableWidget {
         pending_signature
             .map(|signature| signature == result_signature)
             .unwrap_or(true)
+    }
+
+    fn matches_pending_save_tag(pending_tag: Option<&str>, result_sql: &str) -> bool {
+        let Some(tag) = pending_tag else {
+            return true;
+        };
+        result_sql.contains(tag)
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -3498,11 +3518,17 @@ impl ResultTableWidget {
             s.push(';');
             s
         };
+        let request_id = self.next_save_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_tag = format!("SQ_SAVE_REQUEST:{request_id}");
+        let tagged_script = format!(
+            "/* {request_tag} */
+{dml_script}"
+        );
         // Execute only staged DML during save. Re-running the source SELECT as
         // part of the same request can execute unintended extra statements
         // (when the original text was a multi-statement script) and can also
         // report the save as failed even after DML already succeeded.
-        let script = dml_script;
+        let script = tagged_script;
         let save_signature = Self::canonical_sql_signature(&script);
         *self
             .pending_save_request
@@ -3512,6 +3538,10 @@ impl ResultTableWidget {
             .pending_save_sql_signature
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(save_signature);
+        *self
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request_tag);
 
         if let Err(err) = Self::try_execute_sql(&self.execute_sql_callback, script) {
             *self
@@ -3520,6 +3550,10 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
             *self
                 .pending_save_sql_signature
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *self
+                .pending_save_request_tag
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             return Err(err);
@@ -3551,6 +3585,10 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         *self
             .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
@@ -4174,17 +4212,23 @@ impl ResultTableWidget {
                 .pending_save_sql_signature
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut save_tag = self
+                .pending_save_request_tag
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if !*pending_guard {
                 *save_signature = None;
+                *save_tag = None;
                 (false, false)
             } else {
-                let matches_save =
-                    Self::matches_pending_save_signature(save_signature.as_deref(), &result.sql);
+                let matches_save = Self::matches_pending_save_tag(save_tag.as_deref(), &result.sql)
+                    || Self::matches_pending_save_signature(save_signature.as_deref(), &result.sql);
 
                 if matches_save {
                     *pending_guard = false;
                     *save_signature = None;
+                    *save_tag = None;
                     (true, false)
                 } else {
                     (false, true)
@@ -4371,7 +4415,6 @@ impl ResultTableWidget {
             self.stage_query_edit_backup_from_current_state(session);
         } else {
             Self::clear_active_inline_edit_widget(&self.active_inline_edit);
-            self.set_query_edit_backup(None);
         }
 
         *self
@@ -4611,6 +4654,10 @@ impl ResultTableWidget {
         drop(pending);
         *self
             .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.refresh_auto_rowid_visibility();
@@ -6178,6 +6225,11 @@ mod row_edit_sql_tests {
             Some(ResultTableWidget::canonical_sql_signature(
                 "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
             ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:42".to_string());
 
         let unrelated = QueryResult {
             sql: "DELETE FROM EMP WHERE ROWID = 'ZZZ'".to_string(),
@@ -6454,6 +6506,11 @@ mod row_edit_sql_tests {
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:9".to_string());
 
         assert!(widget.clear_orphaned_save_request());
         assert!(!*widget
@@ -6465,6 +6522,11 @@ mod row_edit_sql_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
+        assert!(widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 
     #[test]
@@ -6534,10 +6596,8 @@ mod row_edit_sql_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         assert_eq!(statements.len(), 1);
-        assert_eq!(
-            statements[0],
-            "UPDATE EMP SET ENAME = 'SCOTT' WHERE ROWID = 'AAABBB';"
-        );
+        assert!(statements[0].contains("UPDATE EMP SET ENAME = 'SCOTT' WHERE ROWID = 'AAABBB';"));
+        assert!(statements[0].contains("SQ_SAVE_REQUEST:"));
         assert!(!statements[0].contains("SELECT ROWID, ENAME FROM EMP"));
         assert!(!statements[0].contains("DELETE FROM AUDIT_LOG"));
     }
@@ -7012,6 +7072,17 @@ mod tests {
         assert!(!ResultTableWidget::matches_pending_save_signature(
             Some(expected_signature.as_str()),
             "DELETE FROM EMP",
+        ));
+    }
+    #[test]
+    fn matches_pending_save_tag_detects_embedded_request_marker() {
+        assert!(ResultTableWidget::matches_pending_save_tag(
+            Some("SQ_SAVE_REQUEST:7"),
+            "/* SQ_SAVE_REQUEST:7 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        ));
+        assert!(!ResultTableWidget::matches_pending_save_tag(
+            Some("SQ_SAVE_REQUEST:7"),
+            "/* SQ_SAVE_REQUEST:9 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
         ));
     }
 }
