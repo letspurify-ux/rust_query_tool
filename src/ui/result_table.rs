@@ -3018,6 +3018,10 @@ impl ResultTableWidget {
     }
 
     pub fn can_begin_edit_mode(&self) -> bool {
+        if self.is_save_pending() {
+            return false;
+        }
+
         if self.is_edit_mode_enabled() {
             return true;
         }
@@ -3077,6 +3081,10 @@ impl ResultTableWidget {
     }
 
     pub fn begin_edit_mode(&mut self) -> Result<String, String> {
+        if self.is_save_pending() {
+            return Err("Cannot begin edit mode while save is in progress.".to_string());
+        }
+
         if self.is_edit_mode_enabled() {
             return Ok("Edit mode is already enabled.".to_string());
         }
@@ -7402,7 +7410,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
-    fn begin_edit_mode_clears_stale_pending_save_request_tag() {
+    fn begin_edit_mode_returns_error_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
             .source_sql
@@ -7436,21 +7444,61 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         let result = widget.begin_edit_mode();
 
-        assert_eq!(result, Ok("Edit mode enabled.".to_string()));
-        assert!(!*widget
+        assert_eq!(
+            result,
+            Err("Cannot begin edit mode while save is in progress.".to_string())
+        );
+        assert!(*widget
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
-        assert!(widget
-            .pending_save_sql_signature
+        assert_eq!(
+            widget
+                .pending_save_sql_signature
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some("update emp".to_string())
+        );
+        assert_eq!(
+            widget
+                .pending_save_request_tag
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some("SQ_SAVE_REQUEST:stale".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn can_begin_edit_mode_returns_false_while_save_is_pending() {
+        let widget = ResultTableWidget::new();
+        *widget
+            .source_sql
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none());
-        assert!(widget
-            .pending_save_request_tag
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .headers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert!(!widget.can_begin_edit_mode());
     }
 }
 
