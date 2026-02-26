@@ -1343,7 +1343,7 @@ impl MainWindow {
                 let mut guard = state_for_grid_edit
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if guard.sql_editor.is_query_running() {
+                if guard.is_any_query_running() {
                     return Err("Another query is already running.".to_string());
                 }
                 let target_tab = guard
@@ -2310,12 +2310,42 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match progress {
                 QueryProgress::BatchStart => {
+                    let has_live_connection = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    if should_ignore_query_progress_when_disconnected(
+                        has_live_connection,
+                        has_running_queries,
+                    ) {
+                        return;
+                    }
                     let tab_count = s.result_tabs.tab_count();
                     s.result_tab_offset =
                         resolve_result_tab_offset(tab_count, s.result_grid_execution_target);
                     s.fetch_row_counts.clear();
                 }
                 QueryProgress::StatementStart { index } => {
+                    let has_live_connection = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    if should_ignore_query_progress_when_disconnected(
+                        has_live_connection,
+                        has_running_queries,
+                    ) {
+                        return;
+                    }
                     let tab_index = s.result_tab_offset + index;
                     s.result_tabs
                         .start_statement(tab_index, &format!("Result {}", tab_index + 1));
