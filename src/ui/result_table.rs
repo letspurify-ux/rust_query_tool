@@ -3529,7 +3529,10 @@ impl ResultTableWidget {
         // (when the original text was a multi-statement script) and can also
         // report the save as failed even after DML already succeeded.
         let script = tagged_script;
-        let save_signature = Self::canonical_sql_signature(&script);
+        // Keep SQL-signature matching resilient when downstream execution paths
+        // strip leading comments from the statement text. The request tag comment
+        // is still used separately via `pending_save_request_tag`.
+        let save_signature = Self::canonical_sql_signature(&dml_script);
         *self
             .pending_save_request
             .lock()
@@ -7083,6 +7086,17 @@ mod tests {
         assert!(!ResultTableWidget::matches_pending_save_tag(
             Some("SQ_SAVE_REQUEST:7"),
             "/* SQ_SAVE_REQUEST:9 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        ));
+    }
+
+    #[test]
+    fn save_signature_matches_dml_result_sql_without_request_comment() {
+        let dml_script = "UPDATE EMP SET ENAME = 'SCOTT' WHERE ROWID = 'AAABBB';";
+        let pending_signature = ResultTableWidget::canonical_sql_signature(dml_script);
+        let result_sql = "UPDATE EMP SET ENAME = 'SCOTT' WHERE ROWID = 'AAABBB'";
+        assert!(ResultTableWidget::matches_pending_save_signature(
+            Some(pending_signature.as_str()),
+            result_sql,
         ));
     }
 }
