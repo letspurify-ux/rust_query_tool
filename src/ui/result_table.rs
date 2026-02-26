@@ -3339,6 +3339,7 @@ impl ResultTableWidget {
 
         self.table.set_rows((new_row_index + 1) as i32);
         self.apply_table_metrics_for_current_font();
+        self.table.set_row_position(new_row_index as i32);
 
         if let Some(first_col) = first_edit_col {
             self.table.set_selection(
