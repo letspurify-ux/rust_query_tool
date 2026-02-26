@@ -2219,7 +2219,8 @@ impl MainWindow {
                     null_text,
                 } => {
                     let tab_index = s.result_tab_offset + index;
-                    s.result_tabs.start_streaming(tab_index, &columns, &null_text);
+                    s.result_tabs
+                        .start_streaming(tab_index, &columns, &null_text);
                     s.fetch_row_counts.insert(index, 0);
                     s.last_fetch_status_update = Instant::now();
                     let was_running = s.status_animation_running;
