@@ -101,12 +101,20 @@ fn build_connection_info(
 }
 
 fn resolved_password_for_saved_connection(
+    current_connection_name: &str,
+    selected_connection_name: &str,
     current_input: &str,
     loaded_password: Option<String>,
 ) -> String {
     match loaded_password {
         Some(password) => password,
-        None => current_input.to_string(),
+        None => {
+            if current_connection_name.trim() == selected_connection_name.trim() {
+                current_input.to_string()
+            } else {
+                String::new()
+            }
+        }
     }
 }
 
@@ -342,13 +350,19 @@ impl ConnectionDialog {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(conn) = cfg.get_connection_by_name(&selected) {
+                    let previous_connection_name = name_input_cb.value();
                     name_input_cb.set_value(&conn.name);
                     user_input_cb.set_value(&conn.username);
                     // Load password from OS keyring on demand.
                     let mut keyring_load_failed = false;
                     let password = match AppConfig::get_password_for_connection(&conn.name) {
                         Ok(password_opt) => {
-                            resolved_password_for_saved_connection(&pass_input_cb.value(), password_opt)
+                            resolved_password_for_saved_connection(
+                                &previous_connection_name,
+                                &conn.name,
+                                &pass_input_cb.value(),
+                                password_opt,
+                            )
                         }
                         Err(err) => {
                             keyring_load_failed = true;
@@ -723,6 +737,8 @@ mod tests {
     #[test]
     fn resolved_password_for_saved_connection_prefers_loaded_password() {
         let resolved = super::resolved_password_for_saved_connection(
+            "LOCAL",
+            "LOCAL",
             "existing-input",
             Some("from-keyring".to_string()),
         );
@@ -731,9 +747,26 @@ mod tests {
     }
 
     #[test]
-    fn resolved_password_for_saved_connection_keeps_current_input_when_missing() {
-        let resolved = super::resolved_password_for_saved_connection("typed-password", None);
+    fn resolved_password_for_saved_connection_keeps_current_input_when_missing_for_same_connection() {
+        let resolved = super::resolved_password_for_saved_connection(
+            "LOCAL",
+            "LOCAL",
+            "typed-password",
+            None,
+        );
 
         assert_eq!(resolved, "typed-password");
+    }
+
+    #[test]
+    fn resolved_password_for_saved_connection_clears_input_for_other_connection_when_missing() {
+        let resolved = super::resolved_password_for_saved_connection(
+            "LOCAL",
+            "DEV",
+            "typed-password",
+            None,
+        );
+
+        assert_eq!(resolved, "");
     }
 }
