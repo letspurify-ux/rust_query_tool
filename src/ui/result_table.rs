@@ -2532,7 +2532,11 @@ impl ResultTableWidget {
         // Some cancellation/error paths return an empty SQL string for the
         // finished statement. If we keep waiting for signature matching here,
         // the save-pending lock can survive until a later cleanup event.
-        !result.is_select && result.sql.trim().is_empty()
+        //
+        // Restrict this fallback to failed terminal packets only. Treating a
+        // successful empty-SQL non-select result as a save completion can clear
+        // a real in-flight save on unrelated out-of-order events.
+        !result.success && !result.is_select && result.sql.trim().is_empty()
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -7955,6 +7959,26 @@ mod tests {
         assert!(ResultTableWidget::matches_pending_save_signature(
             Some(pending_signature.as_str()),
             result_sql,
+        ));
+    }
+
+    #[test]
+    fn empty_sql_success_result_does_not_match_pending_save_fallback() {
+        let result = QueryResult {
+            success: true,
+            message: "statement complete".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: String::new(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(!ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:11"),
+            Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &result,
         ));
     }
 }
