@@ -2515,14 +2515,38 @@ impl ResultTableWidget {
         let Some(tag) = pending_tag else {
             return false;
         };
-        result_sql.contains(tag)
+        Self::contains_tag_token(result_sql, tag)
     }
 
     fn matches_pending_save_tag_in_message(pending_tag: Option<&str>, message: &str) -> bool {
         let Some(tag) = pending_tag else {
             return false;
         };
-        message.contains(tag)
+        Self::contains_tag_token(message, tag)
+    }
+
+    fn contains_tag_token(haystack: &str, tag: &str) -> bool {
+        if tag.is_empty() {
+            return false;
+        }
+        haystack.match_indices(tag).any(|(start, _)| {
+            let end = start.saturating_add(tag.len());
+            let prev_ok = haystack
+                .get(..start)
+                .and_then(|prefix| prefix.chars().next_back())
+                .map(|ch| !Self::is_save_tag_identifier_char(ch))
+                .unwrap_or(true);
+            let next_ok = haystack
+                .get(end..)
+                .and_then(|suffix| suffix.chars().next())
+                .map(|ch| !Self::is_save_tag_identifier_char(ch))
+                .unwrap_or(true);
+            prev_ok && next_ok
+        })
+    }
+
+    fn is_save_tag_identifier_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'
     }
 
     fn is_pending_save_terminal_result(
@@ -8138,6 +8162,27 @@ mod tests {
         assert!(!ResultTableWidget::matches_pending_save_tag(
             Some("SQ_SAVE_REQUEST:7"),
             "/* SQ_SAVE_REQUEST:9 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        ));
+    }
+
+
+    #[test]
+    fn matches_pending_save_tag_rejects_identifier_substring_match() {
+        assert!(!ResultTableWidget::matches_pending_save_tag(
+            Some("SQ_SAVE_REQUEST:7"),
+            "/* SQ_SAVE_REQUEST:70 */ UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        ));
+    }
+
+    #[test]
+    fn matches_pending_save_tag_in_message_rejects_identifier_substring_match() {
+        assert!(!ResultTableWidget::matches_pending_save_tag_in_message(
+            Some("SQ_SAVE_REQUEST:7"),
+            "failed request SQ_SAVE_REQUEST:70 due to timeout",
+        ));
+        assert!(ResultTableWidget::matches_pending_save_tag_in_message(
+            Some("SQ_SAVE_REQUEST:7"),
+            "failed request SQ_SAVE_REQUEST:7 due to timeout",
         ));
     }
 
