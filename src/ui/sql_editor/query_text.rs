@@ -382,10 +382,18 @@ pub(crate) fn statement_bounds_in_text(sql: &str, cursor_pos: usize) -> (usize, 
     QueryExecutor::statement_bounds_at_cursor(sql, safe_cursor).unwrap_or((0, sql.len()))
 }
 
+/// SQL 텍스트를 실행 단위(`ScriptItem`)로 분해합니다.
+///
+/// 실행/스크립트 include/연결 가능 여부 판정 등에서 동일한 분해 규칙을 재사용하기 위한
+/// 공통 진입점입니다.
+pub(crate) fn split_script_items(sql: &str) -> Vec<ScriptItem> {
+    QueryExecutor::split_script_items(sql)
+}
+
 /// 쿼리 실행 전 선처리에서 `CONNECT`, `DISCONNECT`, 또는 `@` 스크립트 실행 명령이
 /// 포함되는지 판별합니다. 해당 라인은 기존 연결 유무와 무관하게 실행을 허용합니다.
 pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
-    QueryExecutor::split_script_items(sql)
+    split_script_items(sql)
         .into_iter()
         .any(|item| match item {
             ScriptItem::Statement(_) => false,
@@ -417,7 +425,7 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
 /// commands (PROMPT/SET/SPOOL/DEFINE 등). Statements and DB-dependent commands still
 /// require an existing live connection.
 pub(crate) fn can_execute_while_disconnected(sql: &str) -> bool {
-    let items = QueryExecutor::split_script_items(sql);
+    let items = split_script_items(sql);
     if items.is_empty() {
         return true;
     }
@@ -934,7 +942,7 @@ pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
 /// `QueryExecutor`의 스크립트 분할 규칙을 UI 공통 경로로 위임해
 /// 실행/포맷/인텔리센스에서 동일한 기준의 첫 문장을 사용합니다.
 pub(crate) fn normalize_single_statement(statement: &str) -> String {
-    let items = QueryExecutor::split_script_items(statement);
+    let items = split_script_items(statement);
     if items.len() > 1 {
         if let Some(ScriptItem::Statement(stmt)) = items
             .into_iter()
