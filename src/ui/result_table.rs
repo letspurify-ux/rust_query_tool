@@ -154,6 +154,25 @@ struct ActiveInlineEdit {
 }
 
 impl ResultTableWidget {
+    fn clear_pending_stream_buffers(&self) {
+        self.pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *self
+            .width_sampled_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        *self
+            .last_flush
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
     fn row_state_explicit_null_cols(row_state: &EditRowState) -> &HashSet<usize> {
         match row_state {
             EditRowState::Existing {
@@ -3720,6 +3739,7 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.clear_pending_stream_buffers();
 
         // Cancelling edit mode is an explicit user intent to discard staged
         // state. Drop any saved pre-query backup as well so a later unrelated
@@ -4384,6 +4404,7 @@ impl ResultTableWidget {
 
         if save_requested {
             if result.success {
+                self.clear_pending_stream_buffers();
                 self.set_query_edit_backup(None);
                 *self
                     .edit_session
@@ -4399,6 +4420,7 @@ impl ResultTableWidget {
                 self.table.redraw();
                 return;
             } else {
+                self.clear_pending_stream_buffers();
                 // Save failed: keep staged edits so users can fix and retry.
                 // Even if edit_session was unexpectedly cleared, do not replace
                 // the current grid with a transient error row.
@@ -4409,6 +4431,7 @@ impl ResultTableWidget {
             }
         } else if !result.success {
             if is_edit_mode_enabled {
+                self.clear_pending_stream_buffers();
                 // A regular query failed/cancelled while edit mode is active.
                 // Keep the staged grid data intact so the user can continue editing
                 // or retry explicitly instead of losing in-progress changes.
@@ -4416,6 +4439,7 @@ impl ResultTableWidget {
                 return;
             }
             if self.restore_query_edit_backup() {
+                self.clear_pending_stream_buffers();
                 return;
             }
         } else {
@@ -4434,6 +4458,7 @@ impl ResultTableWidget {
             String::new()
         };
         if !result.is_select {
+            self.clear_pending_stream_buffers();
             let font_size = *self
                 .font_size
                 .lock()
@@ -4483,6 +4508,7 @@ impl ResultTableWidget {
             return;
         }
 
+        self.clear_pending_stream_buffers();
         let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
         let row_count = result.rows.len() as i32;
         let col_count = col_names.len() as i32;
@@ -4556,14 +4582,7 @@ impl ResultTableWidget {
             if !had_edit_session {
                 Self::clear_active_inline_edit_widget(&self.active_inline_edit);
             }
-            self.pending_rows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
-            self.pending_widths
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
+            self.clear_pending_stream_buffers();
             self.set_query_edit_backup(None);
             self.table.redraw();
             return;
@@ -4582,14 +4601,7 @@ impl ResultTableWidget {
         let col_count = headers.len() as i32;
 
         // Clear any pending data from previous queries
-        self.pending_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        self.pending_widths
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.clear_pending_stream_buffers();
         self.full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4818,6 +4830,7 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.clear_pending_stream_buffers();
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
         true
@@ -7943,7 +7956,10 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             &widget.active_inline_edit,
         );
 
-        assert_eq!(result, Err("No staged rows are available for Set Null.".to_string()));
+        assert_eq!(
+            result,
+            Err("No staged rows are available for Set Null.".to_string())
+        );
     }
 
     #[test]
@@ -8118,7 +8134,10 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             "A",
         );
 
-        assert_eq!(result, Err("No staged rows are available for paste.".to_string()));
+        assert_eq!(
+            result,
+            Err("No staged rows are available for paste.".to_string())
+        );
     }
 
     #[test]
@@ -8334,7 +8353,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn matches_pending_save_tag_rejects_identifier_substring_match() {
         assert!(!ResultTableWidget::matches_pending_save_tag(
@@ -8396,7 +8414,6 @@ mod tests {
             &result,
         ));
     }
-
 
     #[test]
     fn failed_cancel_message_with_empty_sql_matches_pending_save_fallback() {
@@ -8476,5 +8493,166 @@ mod tests {
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
             &result,
         ));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+    )]
+    fn clear_orphaned_save_request_also_clears_pending_stream_buffers() {
+        let mut widget = ResultTableWidget::new();
+        widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(vec!["1".to_string()]);
+        widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(120);
+        *widget
+            .width_sampled_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 7;
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert!(widget.clear_orphaned_save_request());
+        assert!(widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert_eq!(
+            *widget
+                .width_sampled_rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+    )]
+    fn cancel_edit_mode_clears_pending_stream_buffers() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::from([(
+                "AA".to_string(),
+                vec!["AA".to_string(), "SMITH".to_string()],
+            )]),
+            original_row_order: vec!["AA".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AA".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AA".to_string(), "MILLER".to_string()]];
+        widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(vec!["stale".to_string()]);
+        widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(111);
+
+        assert!(widget.cancel_edit_mode().is_ok());
+        assert!(widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert!(widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+    )]
+    fn display_result_select_clears_stale_pending_buffers() {
+        let mut widget = ResultTableWidget::new();
+        widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(vec!["old".to_string()]);
+        widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(777);
+
+        let result = QueryResult {
+            sql: "SELECT ENAME FROM EMP".to_string(),
+            columns: vec![crate::db::ColumnInfo {
+                name: "ENAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+            }],
+            rows: vec![vec!["SCOTT".to_string()]],
+            row_count: 1,
+            execution_time: Duration::from_millis(1),
+            message: "ok".to_string(),
+            is_select: true,
+            success: true,
+        };
+
+        widget.display_result(&result);
+
+        assert!(widget
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        let widths = widget
+            .pending_widths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(!widths.is_empty());
+        assert_ne!(widths, vec![777]);
     }
 }
