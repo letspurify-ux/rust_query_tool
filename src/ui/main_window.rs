@@ -599,9 +599,18 @@ impl MainWindow {
         // connection is not visible when connecting to a different database.
         state.object_browser.clear_on_disconnect();
 
-        // Clear result tabs so stale query results from the previous connection
-        // are not left visible after disconnecting.
-        state.result_tabs.clear();
+        // DO NOT clear result_tabs on disconnect.
+        //
+        // Users frequently disconnect and reconnect (e.g. session timeout, switching
+        // environments) and still need to read the query results that were already
+        // fetched. Clearing tabs here would destroy that data silently.
+        //
+        // Staged edit data (pending INSERT/UPDATE/DELETE rows) must also survive
+        // across a disconnect so the user can reconnect and retry the save without
+        // losing their edits.
+        //
+        // If you are tempted to add result_tabs.clear() here — don't.
+        // Let the user close individual tabs manually when they are done with them.
 
         // Reset session state (bind variables, settings, etc.) so they do not
         // leak into a subsequent connection, e.g. when disconnected by the health
@@ -629,6 +638,10 @@ impl MainWindow {
         }
 
         state.refresh_connection_dependent_controls();
+        // Refresh the result-grid edit toolbar after orphan recovery may have
+        // changed pending_save_request, ensuring buttons reflect the final state
+        // rather than any intermediate snapshot from before orphan cleanup.
+        state.refresh_result_edit_controls();
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
@@ -2393,14 +2406,17 @@ impl MainWindow {
                         s.result_tabs.display_result(tab_index, &result);
                     }
                     s.fetch_row_counts.remove(&index);
-                    s.refresh_result_edit_controls();
 
                     // Some cancellation/error paths can finish a statement
                     // without a trailing BatchFinished event. Recover stale
                     // save/edit transient states here as well so result-grid
                     // edit controls are not left locked until the next batch.
+                    // Run orphan recovery BEFORE refreshing edit controls so
+                    // that the control state reflects the final pending flags,
+                    // not an intermediate snapshot taken before cleanup.
                     let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
                     let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                    s.refresh_result_edit_controls();
                     if recovered_save_states > 0 {
                         s.set_status_message(
                             "Save was interrupted. Staged edits are still available.",
