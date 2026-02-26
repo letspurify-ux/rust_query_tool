@@ -584,10 +584,15 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
         let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
+        // Check for active edit sessions after orphan recovery, since recovery
+        // may have restored a session (recovered_edit_states > 0 path).
+        let has_live_edit_session = state.result_tabs.has_any_active_edit_session();
         if recovered_save_states > 0 {
             state.set_status_message("Disconnected (save interrupted; staged edits preserved)");
         } else if recovered_edit_states > 0 {
             state.set_status_message("Disconnected (staged result-grid edits restored)");
+        } else if has_live_edit_session {
+            state.set_status_message("Disconnected (staged result-grid edits preserved)");
         } else {
             state.set_status_message("Disconnected");
         }
@@ -600,8 +605,14 @@ impl MainWindow {
         state.object_browser.clear_on_disconnect();
 
         // Clear result tabs so stale query results from the previous connection
-        // are not left visible after disconnecting.
-        state.result_tabs.clear();
+        // are not left visible after disconnecting — unless staged edit data is
+        // present (either recovered from an in-flight operation or still active
+        // from an ongoing normal edit session), in which case keep the tabs
+        // visible so the user can reconnect and retry without losing changes.
+        // Reuse has_live_edit_session computed above (after orphan recovery).
+        if !has_live_edit_session {
+            state.result_tabs.clear();
+        }
 
         // Reset session state (bind variables, settings, etc.) so they do not
         // leak into a subsequent connection, e.g. when disconnected by the health
@@ -629,6 +640,10 @@ impl MainWindow {
         }
 
         state.refresh_connection_dependent_controls();
+        // Refresh the result-grid edit toolbar after orphan recovery may have
+        // changed pending_save_request, ensuring buttons reflect the final state
+        // rather than any intermediate snapshot from before orphan cleanup.
+        state.refresh_result_edit_controls();
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
@@ -2393,14 +2408,17 @@ impl MainWindow {
                         s.result_tabs.display_result(tab_index, &result);
                     }
                     s.fetch_row_counts.remove(&index);
-                    s.refresh_result_edit_controls();
 
                     // Some cancellation/error paths can finish a statement
                     // without a trailing BatchFinished event. Recover stale
                     // save/edit transient states here as well so result-grid
                     // edit controls are not left locked until the next batch.
+                    // Run orphan recovery BEFORE refreshing edit controls so
+                    // that the control state reflects the final pending flags,
+                    // not an intermediate snapshot taken before cleanup.
                     let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
                     let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                    s.refresh_result_edit_controls();
                     if recovered_save_states > 0 {
                         s.set_status_message(
                             "Save was interrupted. Staged edits are still available.",
