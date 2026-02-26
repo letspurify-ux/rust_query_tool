@@ -1913,6 +1913,9 @@ impl ResultTableWidget {
             if rows.len() != session_mut.row_states.len() {
                 return Err("Edit session and table rows are out of sync.".to_string());
             }
+            if rows.is_empty() {
+                return Err("No staged rows are available for paste.".to_string());
+            }
             let (changed_cells, skipped_cells, updated_cells) = Self::apply_paste_values_to_data(
                 &mut rows,
                 session_mut.rowid_col,
@@ -2015,6 +2018,9 @@ impl ResultTableWidget {
 
             if rows.len() != session.row_states.len() {
                 return Err("Edit session and table rows are out of sync.".to_string());
+            }
+            if rows.is_empty() {
+                return Err("No staged rows are available for Set Null.".to_string());
             }
 
             let editable_cols: HashSet<usize> = session
@@ -3433,8 +3439,14 @@ impl ResultTableWidget {
             if full_data.len() != session.row_states.len() {
                 return Err("Edit session and table rows are out of sync.".to_string());
             }
+            if full_data.is_empty() {
+                return Err("No staged rows are available to delete.".to_string());
+            }
 
             let mut deleted_set: HashSet<String> = session.deleted_rowids.iter().cloned().collect();
+            if row_start >= full_data.len() {
+                return Err("Selected rows are outside the staged row range.".to_string());
+            }
             let end = row_end.min(full_data.len().saturating_sub(1));
             for idx in (row_start..=end).rev() {
                 if idx >= full_data.len() || idx >= session.row_states.len() {
@@ -3689,6 +3701,13 @@ impl ResultTableWidget {
         // written back into the data that is about to be restored.
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
+        let session = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| "Edit mode is not active.".to_string())?;
+
         *self
             .pending_save_request
             .lock()
@@ -3701,12 +3720,6 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let session = self
-            .edit_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .ok_or_else(|| "Edit mode is not active.".to_string())?;
 
         // Cancelling edit mode is an explicit user intent to discard staged
         // state. Drop any saved pre-query backup as well so a later unrelated
@@ -7756,7 +7769,45 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         assert_eq!(
             widget.delete_selected_rows_in_edit_mode(),
-            Err("No selected rows were available to delete.".to_string())
+            Err("No staged rows are available to delete.".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn delete_selected_rows_returns_error_when_selection_is_outside_staged_rows() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(3);
+        widget.table.set_cols(2);
+        widget.table.set_selection(2, 0, 2, 0);
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+
+        assert_eq!(
+            widget.delete_selected_rows_in_edit_mode(),
+            Err("Selected rows are outside the staged row range.".to_string())
         );
     }
 
@@ -7865,6 +7916,41 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn set_null_returns_error_when_no_staged_rows_exist() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        widget.table.set_selection(0, 1, 0, 1);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+
+        let result = ResultTableWidget::set_selected_cells_to_null_in_edit_mode(
+            &widget.table,
+            &widget.full_data,
+            &widget.edit_session,
+            &widget.pending_save_request,
+            &widget.active_inline_edit,
+        );
+
+        assert_eq!(result, Err("No staged rows are available for Set Null.".to_string()));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn cancel_edit_mode_returns_error_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -7945,6 +8031,19 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
     )]
     fn cancel_edit_mode_error_without_session_keeps_existing_query_edit_backup() {
         let mut widget = ResultTableWidget::new();
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("update emp".to_string());
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:test".to_string());
         widget.set_query_edit_backup(Some(QueryEditBackupState {
             headers: vec!["ROWID".to_string(), "ENAME".to_string()],
             full_data: vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]],
@@ -7964,6 +8063,62 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         let result = widget.cancel_edit_mode();
         assert_eq!(result, Err("Edit mode is not active.".to_string()));
         assert!(widget.clear_orphaned_query_edit_backup());
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert_eq!(
+            widget
+                .pending_save_sql_signature
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some("update emp".to_string())
+        );
+        assert_eq!(
+            widget
+                .pending_save_request_tag
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some("SQ_SAVE_REQUEST:test".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn paste_returns_error_when_no_staged_rows_exist() {
+        let mut widget = ResultTableWidget::new();
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        widget.table.set_selection(0, 1, 0, 1);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+
+        let result = ResultTableWidget::paste_clipboard_text_into_edit_mode(
+            &widget.table,
+            &widget.full_data,
+            &widget.edit_session,
+            &widget.pending_save_request,
+            &widget.active_inline_edit,
+            "A",
+        );
+
+        assert_eq!(result, Err("No staged rows are available for paste.".to_string()));
     }
 
     #[test]
