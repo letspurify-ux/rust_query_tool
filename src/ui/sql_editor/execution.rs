@@ -3145,7 +3145,7 @@ impl SqlEditorWidget {
 
                 // Keep conn_guard alive (don't drop it) so the lock is held during execution
 
-                let items = QueryExecutor::split_script_items(&sql_text);
+                let items = super::query_text::split_script_items(&sql_text);
                 if items.is_empty() {
                     return;
                 }
@@ -5181,7 +5181,7 @@ impl SqlEditorWidget {
                                     match fs::read_to_string(&target_path) {
                                         Ok(contents) => {
                                             let script_items =
-                                                QueryExecutor::split_script_items(&contents);
+                                                super::query_text::split_script_items(&contents);
                                             let script_dir = normalized_target_path
                                                 .parent()
                                                 .unwrap_or(&base_dir)
