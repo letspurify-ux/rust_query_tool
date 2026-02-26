@@ -4263,6 +4263,14 @@ impl ResultTableWidget {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 self.refresh_auto_rowid_visibility();
+                if !result.is_select {
+                    // Save requests are internal DML executions for the current
+                    // editable result set. Keep the existing grid rows visible
+                    // after success instead of replacing them with a one-cell
+                    // "Result" message row.
+                    self.table.redraw();
+                    return;
+                }
             } else if is_edit_mode_enabled {
                 // Save failed: keep staged edits so users can fix and retry.
                 return;
@@ -6182,6 +6190,100 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_keeps_grid_rows_after_matching_save_success() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:42".to_string());
+
+        let save_success = QueryResult {
+            sql: "/* SQ_SAVE_REQUEST:42 */
+UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
+                .to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 1,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "1 row updated".to_string(),
+            is_select: false,
+            success: true,
+        };
+
+        widget.display_result(&save_success);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "SCOTT".to_string()]]
+        );
+        assert_eq!(widget.table.rows(), 1);
+        assert_eq!(widget.table.cols(), 2);
     }
 
     #[test]
