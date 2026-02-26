@@ -2596,7 +2596,11 @@ impl ResultTableWidget {
         // it as an unrelated packet unless tag/signature matching succeeds.
         // This prevents a cancelled non-save statement from clearing the
         // current save-pending lock.
-        !result.success
+        // Do not trigger the generic fallback when we have no active tracking
+        // metadata. This avoids clearing save-pending based on an unrelated
+        // abort packet if a stale/partial state forgot both tag/signature.
+        (pending_tag.is_some() || pending_signature.is_some())
+            && !result.success
             && !result.is_select
             && result.sql.trim().is_empty()
             && Self::is_execution_abort_message(&result.message)
@@ -2608,6 +2612,8 @@ impl ResultTableWidget {
             || lowered.contains("query canceled")
             || lowered.contains("timed out")
             || lowered.contains("timeout")
+            || lowered.contains("ora-01013")
+            || lowered.contains("user requested cancel")
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -4831,6 +4837,10 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.clear_pending_stream_buffers();
+        // Save orphan recovery should not leave stale pre-query snapshots that
+        // can be resurrected by a later unrelated batch-finished cleanup.
+        self.set_query_edit_backup(None);
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
         true
@@ -4854,6 +4864,10 @@ impl ResultTableWidget {
         {
             return false;
         }
+        // Drop any buffered stream rows from the interrupted query before
+        // restoring the backed-up edit dataset.
+        self.clear_pending_stream_buffers();
+        Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.restore_query_edit_backup()
     }
 
@@ -8432,6 +8446,38 @@ mod tests {
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
             &result,
+        ));
+    }
+
+    #[test]
+    fn pending_save_fallback_requires_tracking_metadata() {
+        let result = QueryResult {
+            success: false,
+            message: "Query cancelled".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: String::new(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(!ResultTableWidget::is_pending_save_terminal_result(
+            None, None, &result,
+        ));
+    }
+
+    #[test]
+    fn execution_abort_message_matches_ora_01013() {
+        assert!(ResultTableWidget::is_execution_abort_message(
+            "ORA-01013: user requested cancel of current operation",
+        ));
+    }
+
+    #[test]
+    fn execution_abort_message_matches_user_requested_cancel_text() {
+        assert!(ResultTableWidget::is_execution_abort_message(
+            "User requested cancel",
         ));
     }
 
