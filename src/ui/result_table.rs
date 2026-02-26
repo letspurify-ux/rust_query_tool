@@ -4780,6 +4780,10 @@ impl ResultTableWidget {
             .pending_save_sql_signature
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7352,6 +7356,45 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn clear_resets_pending_save_request_tag() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("update emp".to_string());
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:stale".to_string());
+
+        widget.clear();
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 
     #[test]
