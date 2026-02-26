@@ -550,6 +550,31 @@ impl MainWindow {
         let reset_highlight = HighlightData::new();
         Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
 
+        // Clear object browser cache and tree so stale metadata from the previous
+        // connection is not visible when connecting to a different database.
+        state.object_browser.clear_on_disconnect();
+
+        // Clear result tabs so stale query results from the previous connection
+        // are not left visible after disconnecting.
+        state.result_tabs.clear();
+
+        // Reset session state (bind variables, settings, etc.) so they do not
+        // leak into a subsequent connection, e.g. when disconnected by the health
+        // check rather than via an explicit "Disconnect" menu action.
+        if let Ok(conn_guard) = state.connection.try_lock() {
+            let session = conn_guard.session_state();
+            // Drop the connection guard before locking the session to preserve
+            // the single-lock-at-a-time invariant.
+            drop(conn_guard);
+            let lock_result = session.lock();
+            match lock_result {
+                Ok(mut guard) => guard.reset(),
+                Err(poisoned) => {
+                    poisoned.into_inner().reset();
+                }
+            }
+        }
+
         if let Some(message) = error_message {
             crate::utils::logging::log_error("connection", message);
             state

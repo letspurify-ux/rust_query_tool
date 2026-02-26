@@ -1052,8 +1052,12 @@ impl SqlEditorWidget {
         cancel_flag: &Arc<AtomicBool>,
     ) {
         SqlEditorWidget::finalize_execution_state(query_running, cancel_flag);
-        set_cursor(Cursor::Default);
-        app::flush();
+        // Guard UI-thread-only calls so this function is safe to call from
+        // non-UI contexts such as unit tests.
+        if app::is_ui_thread() {
+            set_cursor(Cursor::Default);
+            app::flush();
+        }
         SqlEditorWidget::invoke_progress_callback(progress_callback, QueryProgress::BatchFinished);
     }
 
@@ -1843,6 +1847,15 @@ impl SqlEditorWidget {
                         break;
                     }
                 }
+            }
+
+            // Re-check the cancel flag before breaking the connection. If it is
+            // already false the previous query has already finished and reset it;
+            // breaking the connection now would interrupt a newly-started query.
+            if !cancel_flag.load(Ordering::SeqCst) {
+                let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                app::awake();
+                return;
             }
 
             let result = SqlEditorWidget::break_current_query_connection(conn);

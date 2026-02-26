@@ -2026,6 +2026,18 @@ impl ObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
+    /// Clear the object browser tree and cache without triggering a network refetch.
+    /// Called when the database connection is closed or lost.
+    pub fn clear_on_disconnect(&mut self) {
+        self.clear_items();
+        self.filter_input.set_value("");
+        *self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
+        self.tree.redraw();
+    }
+
     pub fn refresh(&mut self) {
         // First clear items and filter
         self.clear_items();
