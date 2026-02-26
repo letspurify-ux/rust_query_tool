@@ -420,8 +420,9 @@ impl AppState {
         self.result_toolbar.redraw();
     }
 
-    /// Enable or disable toolbar buttons and menu items that require an active
-    /// database connection.  Call this whenever the connection state changes
+    /// Enable or disable connection-dependent toolbar buttons and menu items.
+    /// Execute remains enabled even when disconnected so scripts can CONNECT.
+    /// Call this whenever the connection state changes
     /// (connect, disconnect, or connection lost).
     fn refresh_connection_dependent_controls(&mut self) {
         // If the connection lock is held (query is running) treat the state as
@@ -432,14 +433,17 @@ impl AppState {
             .map(|g| g.is_connected())
             .unwrap_or(true);
 
+        // Regression guard: keep Execute enabled even when disconnected.
+        // Script execution may begin with CONNECT (or @script that contains CONNECT),
+        // so re-coupling this button to `is_connected` would break reconnect workflows.
+        self.execute_btn.activate();
+
         if is_connected {
-            self.execute_btn.activate();
             self.query_cancel_btn.activate();
             self.explain_btn.activate();
             self.commit_btn.activate();
             self.rollback_btn.activate();
         } else {
-            self.execute_btn.deactivate();
             self.query_cancel_btn.deactivate();
             self.explain_btn.deactivate();
             self.commit_btn.deactivate();
@@ -557,8 +561,28 @@ fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
     !has_running_queries
 }
 
+fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), String> {
+    if has_running_queries {
+        Err("A query is running. Wait for completion before editing result rows.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
     target.filter(|idx| *idx < tab_count).unwrap_or(tab_count)
+}
+
+fn resolve_progress_tab_index(
+    tab_count: usize,
+    result_tab_offset: usize,
+    target: Option<usize>,
+    statement_index: usize,
+) -> usize {
+    let base_offset = target
+        .filter(|idx| *idx < tab_count)
+        .unwrap_or_else(|| result_tab_offset.min(tab_count));
+    base_offset.saturating_add(statement_index)
 }
 
 #[derive(Clone, Copy)]
@@ -569,6 +593,20 @@ enum HealthCheckCurrentConnectionState {
 }
 
 impl MainWindow {
+    fn clone_result_tabs_for_edit_action(
+        state: &Arc<Mutex<AppState>>,
+    ) -> Result<ResultTabsWidget, String> {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(err) = validate_result_edit_action_allowed(guard.is_any_query_running()) {
+            guard.set_status_message(&err);
+            guard.refresh_result_edit_controls();
+            return Err(err);
+        }
+        Ok(guard.result_tabs.clone())
+    }
+
     fn start_status_animation_timer(state: &Arc<Mutex<AppState>>) {
         let weak_state = Arc::downgrade(state);
         app::add_timeout3(STATUS_ANIMATION_INTERVAL, move |_| {
@@ -1527,10 +1565,15 @@ impl MainWindow {
                 return;
             };
             let enabled = check.value();
-            let mut result_tabs = match state_for_edit_check.try_lock() {
-                Ok(s) => s.result_tabs.clone(),
-                Err(_) => return,
-            };
+            let mut result_tabs =
+                match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_check) {
+                    Ok(tabs) => tabs,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        app::redraw();
+                        return;
+                    }
+                };
             let action_result = if enabled {
                 result_tabs.begin_current_edit_mode()
             } else if result_tabs.is_current_edit_mode_enabled() {
@@ -1554,7 +1597,6 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             if let Some(err) = error_message {
-                check.clear();
                 fltk::dialog::alert_default(&err);
             }
             app::redraw();
@@ -1565,13 +1607,15 @@ impl MainWindow {
             let Some(state_for_edit_insert) = weak_state_for_edit_insert.upgrade() else {
                 return;
             };
-            let mut result_tabs = {
-                state_for_edit_insert
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .clone()
-            };
+            let mut result_tabs =
+                match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_insert) {
+                    Ok(tabs) => tabs,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        app::redraw();
+                        return;
+                    }
+                };
             let action_result = result_tabs.insert_row_in_current_edit_mode();
             let mut error_message = None;
             {
@@ -1597,13 +1641,15 @@ impl MainWindow {
             let Some(state_for_edit_delete) = weak_state_for_edit_delete.upgrade() else {
                 return;
             };
-            let mut result_tabs = {
-                state_for_edit_delete
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .clone()
-            };
+            let mut result_tabs =
+                match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_delete) {
+                    Ok(tabs) => tabs,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        app::redraw();
+                        return;
+                    }
+                };
             let action_result = result_tabs.delete_selected_rows_in_current_edit_mode();
             let mut error_message = None;
             {
@@ -1629,13 +1675,15 @@ impl MainWindow {
             let Some(state_for_edit_save) = weak_state_for_edit_save.upgrade() else {
                 return;
             };
-            let mut result_tabs = {
-                state_for_edit_save
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .clone()
-            };
+            let mut result_tabs =
+                match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_save) {
+                    Ok(tabs) => tabs,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        app::redraw();
+                        return;
+                    }
+                };
             let save_result = result_tabs.save_current_edit_mode();
             let mut error_message = None;
             {
@@ -1661,13 +1709,15 @@ impl MainWindow {
             let Some(state_for_edit_cancel) = weak_state_for_edit_cancel.upgrade() else {
                 return;
             };
-            let mut result_tabs = {
-                state_for_edit_cancel
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .result_tabs
-                    .clone()
-            };
+            let mut result_tabs =
+                match MainWindow::clone_result_tabs_for_edit_action(&state_for_edit_cancel) {
+                    Ok(tabs) => tabs,
+                    Err(err) => {
+                        fltk::dialog::alert_default(&err);
+                        app::redraw();
+                        return;
+                    }
+                };
             let action_result = result_tabs.cancel_current_edit_mode();
             let mut error_message = None;
             {
@@ -2350,7 +2400,12 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = s.result_tab_offset + index;
+                    let tab_index = resolve_progress_tab_index(
+                        s.result_tabs.tab_count(),
+                        s.result_tab_offset,
+                        s.result_grid_execution_target,
+                        index,
+                    );
                     s.result_tabs
                         .start_statement(tab_index, &format!("Result {}", tab_index + 1));
                     s.fetch_row_counts.remove(&index);
@@ -2381,7 +2436,12 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = s.result_tab_offset + index;
+                    let tab_index = resolve_progress_tab_index(
+                        s.result_tabs.tab_count(),
+                        s.result_tab_offset,
+                        s.result_grid_execution_target,
+                        index,
+                    );
                     s.result_tabs
                         .start_streaming(tab_index, &columns, &null_text);
                     s.fetch_row_counts.insert(index, 0);
@@ -2409,7 +2469,12 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = s.result_tab_offset + index;
+                    let tab_index = resolve_progress_tab_index(
+                        s.result_tabs.tab_count(),
+                        s.result_tab_offset,
+                        s.result_grid_execution_target,
+                        index,
+                    );
                     let rows_len = rows.len();
                     s.result_tabs.append_rows(tab_index, rows);
                     let new_count = {
@@ -2483,7 +2548,12 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = s.result_tab_offset + index;
+                    let tab_index = resolve_progress_tab_index(
+                        s.result_tabs.tab_count(),
+                        s.result_tab_offset,
+                        s.result_grid_execution_target,
+                        index,
+                    );
                     if !result.success && !result.message.trim().is_empty() {
                         let lines: Vec<String> =
                             result.message.lines().map(|l| l.to_string()).collect();
@@ -4499,6 +4569,37 @@ mod tests {
     #[test]
     fn resolve_result_tab_offset_falls_back_to_tab_count_when_target_is_missing() {
         assert_eq!(resolve_result_tab_offset(5, None), 5);
+    }
+
+    #[test]
+    fn validate_result_edit_action_allows_when_no_query_is_running() {
+        assert!(validate_result_edit_action_allowed(false).is_ok());
+    }
+
+    #[test]
+    fn validate_result_edit_action_blocks_when_query_is_running() {
+        assert_eq!(
+            validate_result_edit_action_allowed(true),
+            Err("A query is running. Wait for completion before editing result rows.".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_progress_tab_index_uses_valid_target_for_grid_execution() {
+        assert_eq!(resolve_progress_tab_index(5, 9, Some(2), 0), 2);
+        assert_eq!(resolve_progress_tab_index(5, 9, Some(2), 1), 3);
+    }
+
+    #[test]
+    fn resolve_progress_tab_index_clamps_stale_offset_when_target_is_missing() {
+        assert_eq!(resolve_progress_tab_index(4, 9, None, 0), 4);
+        assert_eq!(resolve_progress_tab_index(4, 9, None, 2), 6);
+    }
+
+    #[test]
+    fn resolve_progress_tab_index_keeps_batch_offset_when_tabs_grow() {
+        assert_eq!(resolve_progress_tab_index(6, 3, None, 0), 3);
+        assert_eq!(resolve_progress_tab_index(6, 3, None, 2), 5);
     }
 }
 

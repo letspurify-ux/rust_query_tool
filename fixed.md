@@ -1,5 +1,103 @@
 # 예외 처리 보완 내역
 
+## 2026-02-26 결과 테이블 편집/저장 이벤트 경합 추가 보완 (save 성공 응답 SQL 누락 케이스)
+
+### [중] save 성공 응답에서 SQL 텍스트가 비어 있으면 pending 잠금이 남을 수 있던 경로 수정
+- **증상**: 결과 테이블 편집 저장(save) 후, 드물게 성공 응답이 `result.sql=""` 형태로 들어오면 기존 판정 로직이 save terminal 결과로 인식하지 못해 `pending_save_request`가 배치 정리 시점까지 유지될 수 있었습니다.
+- **원인**:
+  - 기존 fallback은 `취소/타임아웃/연결손실` 실패 메시지 중심이라, SQL이 누락된 성공 응답은 매칭하지 않았습니다.
+- **수정**:
+  - `ResultTableWidget::is_pending_save_terminal_result`에
+    - `non-select + empty SQL + save tracking metadata 존재` 조건에서,
+    - 성공 메시지가 DML/COMMIT/ROLLBACK/PLSQL 성공류(`row(s) affected`, `statement executed successfully`, `commit complete` 등)일 때도 terminal로 판정하는 분기를 추가했습니다.
+  - 오탐을 줄이기 위해 일반 성공 문구(`statement complete`)는 그대로 미매칭 유지했습니다.
+- **효과**: 편집 입력/삭제/저장 직후 쿼리 성공 이벤트가 SQL 누락 형태로 들어와도 save pending이 즉시 해제되어 편집 체크/삽입/삭제/취소 버튼이 불필요하게 잠기지 않습니다.
+
+### [테스트] 회귀 테스트 추가
+- `display_result_clears_save_pending_for_terminal_success_with_empty_sql`
+- `empty_sql_success_dml_message_matches_pending_save_fallback`
+
+### [테스트 안정화] 누락된 포맷터 회귀 입력 파일 복구
+- `cargo test`에서 실패하던 `format_sql_preserves_mega_torture_script`는 `test/mega_torture.txt` 입력 파일 누락으로 재현되었습니다.
+- `test/test8.txt`와 동일한 스크립트를 `test/mega_torture.txt`로 복구해 테스트 입력을 정상화했습니다.
+
+### [검증]
+- `cargo test`
+
+## 2026-02-26 결과 테이블 편집/쿼리 이벤트 경합 추가 보완 (콜백 큐 경합 시 편집 액션 차단 누락)
+
+### [중] 쿼리 실행 중에도 결과 편집 콜백이 늦게 실행될 수 있던 경로 보강
+- **증상**: 편집 버튼이 비활성화되기 직전에 콜백이 이벤트 큐에 들어간 경우, 쿼리 실행 중인데도 결과 테이블 편집 체크/삽입/삭제/저장/취소 액션이 실행될 수 있었습니다.
+- **원인**:
+  - 기존 보호는 `refresh_result_edit_controls()`의 UI 비활성화 중심이어서, 콜백 실행 시점의 최종 상태를 강제 검증하지 않았습니다.
+- **수정**:
+  - `main_window`에 `validate_result_edit_action_allowed` + `clone_result_tabs_for_edit_action` 가드를 추가해, 편집 콜백 실행 직전에 `is_any_query_running()`을 공통 검증하도록 변경.
+  - 차단 시 상태바 메시지/툴바 상태를 즉시 갱신하고 액션 실행을 중단.
+  - 편집 체크(`CheckButton`) 오류 경로에서 강제 `clear()`를 제거하고, `refresh_result_edit_controls()` 기준으로 실제 상태와 UI를 동기화.
+- **효과**: 편집 체크/입력/삭제/취소와 쿼리 실행/취소/실패 이벤트가 교차해도, 실행 중 쿼리와 결과 편집 상태가 엇갈려 staged 데이터가 예상치 않게 바뀌는 위험을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `validate_result_edit_action_allows_when_no_query_is_running`
+- `validate_result_edit_action_blocks_when_query_is_running`
+
+### [검증]
+- `cargo test validate_result_edit_action`
+- `cargo test`
+
+## 2026-02-26 결과 테이블 편집/실행 이벤트 경합 추가 보완 (조기 실패 시 탭 오프셋 오염)
+
+### [중] `BatchStart` 없이 `StatementFinished`가 먼저 도착하는 조기 실패 경로에서 결과 탭 매핑 보정
+- **증상**: 연결 급단절/초기 실행 실패처럼 `BatchStart` 이전에 `StatementFinished`가 먼저 도착하면, 이전 실행에서 남은 `result_tab_offset`가 재사용되어 결과가 잘못된 탭에 표시되거나 의도치 않은 새 탭이 생성될 수 있었습니다.
+- **원인**:
+  - `StatementStart`/`SelectStart`/`Rows`/`StatementFinished`에서 탭 인덱스를 단순히 `result_tab_offset + index`로 계산해, 배치 시작 이벤트가 누락된 예외 경로에서 stale 오프셋을 그대로 신뢰했습니다.
+- **수정**:
+  - 진행 이벤트별 탭 인덱스 계산 헬퍼(`resolve_progress_tab_index`)를 추가해:
+    - `result_grid_execution_target`가 유효하면 해당 타깃 우선 사용
+    - 그렇지 않으면 `result_tab_offset`을 현재 `tab_count` 범위로 clamp한 뒤 사용
+  - `StatementStart`/`SelectStart`/`Rows`/`StatementFinished` 경로에 공통 적용.
+- **효과**: 편집 체크/입력/삭제/취소 이후 쿼리 실행·취소·실패가 조기 오류와 교차해도, 결과 탭 매핑이 이전 실행 상태에 오염되어 엉뚱한 탭을 덮어쓰는 위험을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `resolve_progress_tab_index_uses_valid_target_for_grid_execution`
+- `resolve_progress_tab_index_clamps_stale_offset_when_target_is_missing`
+- `resolve_progress_tab_index_keeps_batch_offset_when_tabs_grow`
+
+## 2026-02-26 결과 테이블 편집 이벤트 경합 추가 보완 (stale backup 복구 오동작)
+
+### [중] 편집 세션 없이 새 쿼리 시작 후 실패 시, 과거 backup이 복구되던 경로 차단
+- **증상**: 이전 중단 실행에서 남은 `query_edit_backup`이 있는 상태에서, 현재 편집 세션 없이 새 쿼리를 시작한 뒤 실패/취소가 발생하면 오래된 staged edit가 복구될 수 있었습니다.
+- **원인**:
+  - `start_streaming()`이 활성 편집 세션이 없는 경우 기존 `query_edit_backup`를 유지해,
+    이후 `display_result()` 실패 경로가 해당 backup을 현재 실행 실패로 오인해 복구할 수 있었습니다.
+- **수정**:
+  - `start_streaming()`에서 **활성 편집 세션이 없는 경우** stale `query_edit_backup`를 즉시 제거하도록 변경.
+  - 이때만 backup을 제거하고, 편집 세션이 있는 정상 시나리오에서는 기존처럼 backup 스냅샷을 유지.
+- **효과**: 편집 체크/입력/삭제/취소 이후 쿼리 실행·취소·실패 이벤트가 교차해도, 현재 실행과 무관한 과거 staged edit가 예기치 않게 되살아나는 문제를 방지합니다.
+
+### [테스트] 회귀 테스트 추가
+- `start_streaming_without_edit_session_clears_stale_backup_before_failure_result`
+
+## 2026-02-26 결과 테이블 편집/저장 이벤트 경합 추가 보완
+
+### [중] Save 실패/취소 응답의 SQL 형태 변형(블록→단일 statement) 시 pending 잠금이 남을 수 있던 경로 수정
+- **증상**: 결과 테이블 편집 저장 시 다건 DML이 `BEGIN ... END` 블록으로 실행될 때, 실패 응답이 태그/블록 SQL이 아닌 내부 단일 DML SQL로 전달되면 save 완료 매칭이 실패해 `pending_save_request`가 필요 이상 유지될 수 있었습니다.
+- **원인**:
+  - 기존 매칭은 `request tag` 또는 블록 기준 SQL 시그니처 중심이라, 응답 SQL이 내부 statement로 축약되는 경로를 충분히 흡수하지 못했습니다.
+- **수정**:
+  - 저장 시작 시 블록 시그니처와 별도로 각 DML statement의 정규화 시그니처 목록(`pending_save_statement_signatures`)을 함께 보관하도록 확장.
+  - `display_result`의 save terminal 판정에 statement 시그니처 매칭을 추가해, 태그/블록 시그니처가 누락된 실패 응답도 안전하게 save 종료로 처리.
+  - `begin_edit_mode`, `cancel_edit_mode`, `clear`, `clear_orphaned_save_request`, save 콜백 실패 경로 등 상태 전환 지점에서 새 추적 메타데이터를 함께 정리하도록 보강.
+- **효과**: 편집 입력/삭제 후 저장, 쿼리 실패/취소 이벤트가 교차할 때 save pending 잠금이 불필요하게 남아 편집 액션이 막히는 시나리오를 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `display_result_clears_save_pending_when_statement_signature_matches`
+- `pending_save_terminal_matches_statement_signature_when_block_signature_differs`
+- `pending_save_terminal_does_not_match_statement_signature_for_select_packets`
+
+### [검증]
+- `cargo test result_table::`
+- `cargo test`
+
 ## 2026-02-25 결과 테이블 편집 이벤트 경합 안정화
 
 ### [중] `SELECT` 실패/취소 시 staged edit 유실 가능성 수정
@@ -641,6 +739,25 @@
 ### [테스트] 회귀 테스트 추가
 - `start_streaming_commits_active_inline_edit_while_save_is_pending`
   - save pending 상태에서 `start_streaming` 진입 시 활성 인라인 편집값이 `full_data`로 커밋되는지 검증.
+
+### [검증]
+- `cargo test` 전체 통과
+
+## 2026-02-26 결과 테이블 편집 이벤트 경계 보강
+
+### [중] 스트리밍(쿼리 실행/취소/실패 전환 구간) 중 편집 액션이 상태를 변경할 수 있던 경로 차단
+- **증상**: 결과 그리드가 `streaming_in_progress` 상태인 경계 구간에서 `Insert/Delete/Save/Cancel` 편집 액션이 호출되면, 쿼리 이벤트와 편집 이벤트가 교차하며 사용자 의도와 다른 상태 전이가 발생할 여지가 있었습니다.
+- **수정**:
+  - `insert_row_in_edit_mode`에 스트리밍 중 차단 가드 추가
+  - `delete_selected_rows_in_edit_mode`에 스트리밍 중 차단 가드 추가
+  - `save_edit_mode`에 스트리밍 중 차단 가드 추가
+  - `cancel_edit_mode`에 스트리밍 중 차단 가드 추가
+- **효과**: 편집 체크/입력/삭제/취소와 쿼리 실행/취소/실패 이벤트가 겹치는 타이밍에서 결과 테이블 상태가 예기치 않게 변하는 경로를 선제 차단했습니다.
+
+### [테스트] 스트리밍-편집 경합 회귀 케이스 추가
+- `insert_and_delete_are_blocked_while_streaming_is_in_progress`
+- `save_edit_mode_returns_error_while_streaming_is_in_progress`
+- `cancel_edit_mode_returns_error_while_streaming_is_in_progress`
 
 ### [검증]
 - `cargo test` 전체 통과

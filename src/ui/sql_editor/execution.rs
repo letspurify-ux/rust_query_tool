@@ -2982,6 +2982,13 @@ impl SqlEditorWidget {
         Ok(())
     }
 
+    fn requires_connected_session_for_precheck(
+        has_connection_bootstrap_command: bool,
+        can_run_while_disconnected: bool,
+    ) -> bool {
+        !has_connection_bootstrap_command && !can_run_while_disconnected
+    }
+
     fn execute_sql(&self, sql: &str, script_mode: bool) {
         if sql.trim().is_empty() {
             return;
@@ -3002,6 +3009,10 @@ impl SqlEditorWidget {
         // Check if script includes connection bootstrap commands.
         let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
         let can_run_while_disconnected = super::query_text::can_execute_while_disconnected(sql);
+        let requires_connected_session = Self::requires_connected_session_for_precheck(
+            has_connect_command,
+            can_run_while_disconnected,
+        );
 
         // Pre-check connection status without holding lock for long
         {
@@ -3013,7 +3024,9 @@ impl SqlEditorWidget {
 
             // Keep UI responsive: avoid network round-trip checks (ping) on the UI thread.
             // The execution worker performs full liveness validation.
-            if !can_run_while_disconnected {
+            // Regression guard: scripts that contain CONNECT/@START must pass this gate
+            // even when disconnected, so CONNECT can establish a session for later SQL.
+            if requires_connected_session {
                 if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
                     SqlEditorWidget::show_alert_dialog("Not connected to database");
                     return;
@@ -3111,7 +3124,7 @@ impl SqlEditorWidget {
                     conn_name.clear();
                 }
 
-                if !has_connect_command && !can_run_while_disconnected && conn_opt.is_none() {
+                if requires_connected_session && conn_opt.is_none() {
                     let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
                     let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                     app::awake();
@@ -8919,5 +8932,31 @@ mod script_include_guard_tests {
             err.contains("Maximum nested script depth"),
             "unexpected error message: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod disconnected_precheck_gate_tests {
+    use super::SqlEditorWidget;
+
+    #[test]
+    fn precheck_requires_connection_for_non_bootstrap_db_work() {
+        assert!(SqlEditorWidget::requires_connected_session_for_precheck(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn precheck_allows_connect_bootstrap_while_disconnected() {
+        assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
+            true, false
+        ));
+    }
+
+    #[test]
+    fn precheck_allows_local_only_commands_while_disconnected() {
+        assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
+            false, true
+        ));
     }
 }

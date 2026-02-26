@@ -101,6 +101,7 @@ pub struct ResultTableWidget {
     pending_save_request: Arc<Mutex<bool>>,
     pending_save_sql_signature: Arc<Mutex<Option<String>>>,
     pending_save_request_tag: Arc<Mutex<Option<String>>>,
+    pending_save_statement_signatures: Arc<Mutex<Vec<String>>>,
     next_save_request_id: Arc<AtomicU64>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
@@ -724,6 +725,8 @@ impl ResultTableWidget {
         let pending_save_request: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let pending_save_sql_signature: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let pending_save_request_tag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let pending_save_statement_signatures: Arc<Mutex<Vec<String>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let next_save_request_id = Arc::new(AtomicU64::new(1));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
@@ -1298,6 +1301,7 @@ impl ResultTableWidget {
             pending_save_request,
             pending_save_sql_signature,
             pending_save_request_tag,
+            pending_save_statement_signatures,
             next_save_request_id,
             hidden_auto_rowid_col,
             active_inline_edit,
@@ -2661,6 +2665,7 @@ impl ResultTableWidget {
     fn is_pending_save_terminal_result(
         pending_tag: Option<&str>,
         pending_signature: Option<&str>,
+        pending_statement_signatures: &[String],
         result: &QueryResult,
     ) -> bool {
         if Self::matches_pending_save_tag(pending_tag, &result.sql)
@@ -2670,25 +2675,29 @@ impl ResultTableWidget {
             return true;
         }
 
-        // Some cancellation/error paths collapse to a generic
-        // cancellation/timeout message without preserving the tagged SQL text.
-        // If we keep waiting for signature matching here, the save-pending
-        // lock can survive until a later cleanup event.
-        //
-        // Restrict this fallback to failed abort packets with missing SQL.
-        // If an out-of-order failure still carries statement SQL text, treat
-        // it as an unrelated packet unless tag/signature matching succeeds.
-        // This prevents a cancelled non-save statement from clearing the
-        // current save-pending lock.
-        // Do not trigger the generic fallback when we have no active tracking
-        // metadata. This avoids clearing save-pending based on an unrelated
-        // abort packet if a stale/partial state forgot both tag/signature.
-        (pending_tag.is_some() || pending_signature.is_some())
-            && !result.success
+        if !result.is_select && !result.sql.trim().is_empty() {
+            let result_signature = Self::canonical_sql_signature(&result.sql);
+            if !result_signature.is_empty()
+                && pending_statement_signatures
+                    .iter()
+                    .any(|signature| signature == &result_signature)
+            {
+                return true;
+            }
+        }
+
+        // Some terminal packets can lose statement SQL text. Keep fallback
+        // strict (non-select + empty SQL + active save tracking metadata) so
+        // unrelated out-of-order results do not accidentally clear save-pending.
+        let has_tracking_metadata = pending_tag.is_some() || pending_signature.is_some();
+        has_tracking_metadata
             && !result.is_select
             && result.sql.trim().is_empty()
-            && (Self::is_execution_abort_message(&result.message)
-                || Self::is_connection_loss_message(&result.message))
+            && ((!result.success
+                && (Self::is_execution_abort_message(&result.message)
+                    || Self::is_connection_loss_message(&result.message)))
+                || (result.success
+                    && Self::is_non_select_success_completion_message(&result.message)))
     }
 
     fn is_execution_abort_message(message: &str) -> bool {
@@ -2709,6 +2718,17 @@ impl ResultTableWidget {
             || lowered.contains("ora-03113")
             || lowered.contains("ora-03114")
             || lowered.contains("dpi-1010")
+    }
+
+    fn is_non_select_success_completion_message(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        lowered.contains("row(s) affected")
+            || lowered.contains("statement executed successfully")
+            || lowered.contains("commit complete")
+            || lowered.contains("rollback complete")
+            || lowered.contains("pl/sql block executed successfully")
+            || lowered.contains("call executed successfully")
+            || lowered.contains("auto-commit applied")
     }
 
     fn normalize_header_for_lookup(header: &str) -> String {
@@ -3254,6 +3274,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         *self
             .edit_session
@@ -3276,6 +3300,9 @@ impl ResultTableWidget {
     pub fn insert_row_in_edit_mode(&mut self) -> Result<String, String> {
         if self.is_save_pending() {
             return Err("Cannot insert rows while save is in progress.".to_string());
+        }
+        if self.is_streaming_in_progress() {
+            return Err("Cannot insert rows while query rows are still loading.".to_string());
         }
 
         // Commit any pending inline edit before inserting a new row so that
@@ -3431,6 +3458,9 @@ impl ResultTableWidget {
         if self.is_save_pending() {
             return Err("Cannot delete rows while save is in progress.".to_string());
         }
+        if self.is_streaming_in_progress() {
+            return Err("Cannot delete rows while query rows are still loading.".to_string());
+        }
 
         // Commit any pending inline edit before modifying the row set so that
         // the edited value lands on the correct row and the editor widget is
@@ -3505,6 +3535,9 @@ impl ResultTableWidget {
     pub fn save_edit_mode(&mut self) -> Result<String, String> {
         if self.is_save_pending() {
             return Err("Save is already in progress.".to_string());
+        }
+        if self.is_streaming_in_progress() {
+            return Err("Cannot save edits while query rows are still loading.".to_string());
         }
 
         // If the user clicks Save while an inline editor is still focused,
@@ -3670,6 +3703,11 @@ impl ResultTableWidget {
         // strip leading comments from the statement text. The request tag comment
         // is still used separately via `pending_save_request_tag`.
         let save_signature = Self::canonical_sql_signature(&dml_script);
+        let save_statement_signatures: Vec<String> = statements
+            .iter()
+            .map(|statement| Self::canonical_sql_signature(statement))
+            .filter(|signature| !signature.is_empty())
+            .collect();
         *self
             .pending_save_request
             .lock()
@@ -3682,6 +3720,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request_tag);
+        *self
+            .pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = save_statement_signatures;
 
         if let Err(err) = Self::try_execute_sql(&self.execute_sql_callback, script) {
             *self
@@ -3696,6 +3738,10 @@ impl ResultTableWidget {
                 .pending_save_request_tag
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            self.pending_save_statement_signatures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             return Err(err);
         }
 
@@ -3712,6 +3758,9 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
         {
             return Err("Cannot cancel edit mode while save is in progress.".to_string());
+        }
+        if self.is_streaming_in_progress() {
+            return Err("Cannot cancel edit mode while query rows are still loading.".to_string());
         }
 
         // Discard any pending inline edit without committing — the user is
@@ -3738,6 +3787,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.clear_pending_stream_buffers();
 
         // Cancelling edit mode is an explicit user intent to discard staged
@@ -4369,15 +4422,21 @@ impl ResultTableWidget {
                 .pending_save_request_tag
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut save_statement_signatures = self
+                .pending_save_statement_signatures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if !*pending_guard {
                 *save_signature = None;
                 *save_tag = None;
+                save_statement_signatures.clear();
                 (false, false)
             } else {
                 let matches_save = Self::is_pending_save_terminal_result(
                     save_tag.as_deref(),
                     save_signature.as_deref(),
+                    &save_statement_signatures,
                     result,
                 );
 
@@ -4385,6 +4444,7 @@ impl ResultTableWidget {
                     *pending_guard = false;
                     *save_signature = None;
                     *save_tag = None;
+                    save_statement_signatures.clear();
                     (true, false)
                 } else {
                     // While a save is pending, ignore out-of-order statement
@@ -4608,6 +4668,10 @@ impl ResultTableWidget {
         if let Some(session) = edit_session_snapshot {
             self.stage_query_edit_backup_from_current_state(session);
         } else {
+            // A brand-new query started without an active edit session.
+            // Drop any stale backup from older interrupted runs so an unrelated
+            // failure result cannot resurrect obsolete staged edits.
+            self.set_query_edit_backup(None);
             Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         }
 
@@ -4851,6 +4915,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *self
             .streaming_in_progress
             .lock()
@@ -4960,6 +5028,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6730,6 +6802,105 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn display_result_clears_save_pending_for_terminal_success_with_empty_sql() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "MILLER".to_string()]];
+        widget.table.set_rows(1);
+        widget.table.set_cols(2);
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "AAABBB".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:501".to_string());
+
+        let terminal_success = QueryResult {
+            sql: String::new(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 1,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "1 UPDATE row(s) affected".to_string(),
+            is_select: false,
+            success: true,
+        };
+
+        widget.display_result(&terminal_success);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["AAABBB".to_string(), "MILLER".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn display_result_clears_save_pending_when_request_tag_is_only_in_message() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -6794,6 +6965,78 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_clears_save_pending_when_statement_signature_matches() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "BEGIN UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB'; UPDATE EMP SET JOB = 'MANAGER' WHERE ROWID = 'AAABBB'; END;",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:313".to_string());
+        *widget
+            .pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![
+            ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ),
+            ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET JOB = 'MANAGER' WHERE ROWID = 'AAABBB';",
+            ),
+        ];
+
+        let failed = QueryResult {
+            sql: "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB'".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-00001".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&failed);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_save_statement_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[test]
@@ -7742,6 +7985,76 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn start_streaming_without_edit_session_clears_stale_backup_before_failure_result() {
+        let mut widget = ResultTableWidget::new();
+        widget.set_query_edit_backup(Some(QueryEditBackupState {
+            headers: vec!["ROWID".to_string(), "ENAME".to_string()],
+            full_data: vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]],
+            source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
+            edit_session: TableEditSession {
+                rowid_col: 0,
+                table_name: "EMP".to_string(),
+                null_text: "NULL".to_string(),
+                editable_columns: vec![(1, "ENAME".to_string())],
+                original_rows_by_rowid: HashMap::new(),
+                original_row_order: Vec::new(),
+                deleted_rowids: Vec::new(),
+                row_states: vec![EditRowState::Existing {
+                    rowid: "AAABBB".to_string(),
+                    explicit_null_cols: HashSet::new(),
+                }],
+            },
+        }));
+
+        let headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
+        widget.start_streaming(&headers);
+
+        assert!(widget
+            .query_edit_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+
+        let failed = QueryResult {
+            sql: "SELECT DEPTNO, DNAME FROM DEPT".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: true,
+            success: false,
+        };
+        widget.display_result(&failed);
+
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert_eq!(
+            widget
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["Result".to_string()]
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["Query cancelled".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn save_edit_mode_returns_error_when_save_is_already_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -7803,6 +8116,78 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         assert_eq!(
             widget.delete_selected_rows_in_edit_mode(),
             Err("Cannot delete rows while save is in progress.".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn insert_and_delete_are_blocked_while_streaming_is_in_progress() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert_eq!(
+            widget.insert_row_in_edit_mode(),
+            Err("Cannot insert rows while query rows are still loading.".to_string())
+        );
+        assert_eq!(
+            widget.delete_selected_rows_in_edit_mode(),
+            Err("Cannot delete rows while query rows are still loading.".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn save_edit_mode_returns_error_while_streaming_is_in_progress() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.save_edit_mode();
+        assert_eq!(
+            result,
+            Err("Cannot save edits while query rows are still loading.".to_string())
         );
     }
 
@@ -8041,6 +8426,43 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         assert_eq!(
             result,
             Err("Cannot cancel edit mode while save is in progress.".to_string())
+        );
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn cancel_edit_mode_returns_error_while_streaming_is_in_progress() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.cancel_edit_mode();
+        assert_eq!(
+            result,
+            Err("Cannot cancel edit mode while query rows are still loading.".to_string())
         );
         assert!(widget
             .edit_session
@@ -8531,6 +8953,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_save_terminal_matches_statement_signature_when_block_signature_differs() {
+        let block_signature = ResultTableWidget::canonical_sql_signature(
+            "BEGIN UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'; UPDATE EMP SET JOB = 'B' WHERE ROWID = 'AA'; END;",
+        );
+        let statement_signatures = vec![ResultTableWidget::canonical_sql_signature(
+            "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        )];
+        let result = QueryResult {
+            success: false,
+            message: "ORA-00001".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'".to_string(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:42"),
+            Some(block_signature.as_str()),
+            &statement_signatures,
+            &result,
+        ));
+    }
+
+    #[test]
+    fn pending_save_terminal_does_not_match_statement_signature_for_select_packets() {
+        let statement_signatures = vec![ResultTableWidget::canonical_sql_signature(
+            "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA';",
+        )];
+        let result = QueryResult {
+            success: false,
+            message: "unexpected".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: true,
+            sql: "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'".to_string(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(!ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:42"),
+            Some("BEGIN ... END"),
+            &statement_signatures,
+            &result,
+        ));
+    }
+
+    #[test]
     fn empty_sql_success_result_does_not_match_pending_save_fallback() {
         let result = QueryResult {
             success: true,
@@ -8546,6 +9019,28 @@ mod tests {
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:11"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
+            &result,
+        ));
+    }
+
+    #[test]
+    fn empty_sql_success_dml_message_matches_pending_save_fallback() {
+        let result = QueryResult {
+            success: true,
+            message: "1 UPDATE row(s) affected".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: String::new(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:11"),
+            Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }
@@ -8566,6 +9061,7 @@ mod tests {
         assert!(ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }
@@ -8584,7 +9080,10 @@ mod tests {
         };
 
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
-            None, None, &result,
+            None,
+            None,
+            &[],
+            &result,
         ));
     }
 
@@ -8612,6 +9111,7 @@ mod tests {
         assert!(ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }
@@ -8646,6 +9146,7 @@ mod tests {
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }
@@ -8666,6 +9167,7 @@ mod tests {
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }
@@ -8686,6 +9188,7 @@ mod tests {
         assert!(!ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &[],
             &result,
         ));
     }

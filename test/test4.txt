@@ -1,6 +1,3 @@
-CONNECT system/password@localhost:1521/FREE
-
-
 -- =========================================================
 -- exec_procedure_test.sql
 -- 목적: EXEC(=EXECUTE)로 프로시저 호출이 정상 동작하는지 검증
