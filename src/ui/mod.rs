@@ -18,7 +18,7 @@ pub mod sql_editor;
 pub mod syntax_highlight;
 pub mod theme;
 
-use fltk::{app, prelude::WidgetExt, prelude::WindowExt, window::Window};
+use fltk::{app, prelude::WidgetExt, window::Window};
 
 pub use connection_dialog::*;
 pub use find_replace::*;
@@ -36,16 +36,29 @@ pub use sql_editor::*;
 pub use syntax_highlight::*;
 
 pub fn center_on_main(window: &mut Window) {
-    if let Some(main) = app::widget_from_id::<Window>("main_window") {
+    // NOTE: fltk-rs의 center_of()는 참조 위젯이 Window 타입이면
+    // wx/wy를 0으로 고정해 실제 화면 위치를 무시하는 버그가 있음.
+    // 메인 윈도우 좌표를 직접 읽어 set_pos()로 설정한다.
+    let target = if let Some(main) = app::widget_from_id::<Window>("main_window") {
         if main.as_widget_ptr() != window.as_widget_ptr() {
-            window.clone().center_of(&main);
-            return;
+            Some((main.x(), main.y(), main.width(), main.height()))
+        } else {
+            None
         }
-    }
-
-    if let Some(main) = app::first_window() {
-        window.clone().center_of(&main);
+    } else if let Some(main) = app::first_window() {
+        Some((main.x(), main.y(), main.width(), main.height()))
     } else {
-        window.clone().center_screen();
-    }
+        None
+    };
+
+    let (x, y) = if let Some((mx, my, mw, mh)) = target {
+        (mx + (mw - window.width()) / 2, my + (mh - window.height()) / 2)
+    } else {
+        let (sw, sh) = app::screen_size();
+        (
+            ((sw as i32) - window.width()) / 2,
+            ((sh as i32) - window.height()) / 2,
+        )
+    };
+    window.set_pos(x, y);
 }
