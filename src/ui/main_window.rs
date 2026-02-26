@@ -74,6 +74,11 @@ pub struct AppState {
     result_delete_btn: Button,
     result_save_btn: Button,
     result_cancel_btn: Button,
+    execute_btn: Button,
+    query_cancel_btn: Button,
+    explain_btn: Button,
+    commit_btn: Button,
+    rollback_btn: Button,
     pub result_tab_offset: usize,
     result_grid_execution_target: Option<usize>,
     pub object_browser: ObjectBrowserWidget,
@@ -414,6 +419,44 @@ impl AppState {
         self.result_toolbar.layout();
         self.result_toolbar.redraw();
     }
+
+    /// Enable or disable toolbar buttons and menu items that require an active
+    /// database connection.  Call this whenever the connection state changes
+    /// (connect, disconnect, or connection lost).
+    fn refresh_connection_dependent_controls(&mut self) {
+        // If the connection lock is held (query is running) treat the state as
+        // connected so we never disable buttons mid-execution.
+        let is_connected = self
+            .connection
+            .try_lock()
+            .map(|g| g.is_connected())
+            .unwrap_or(true);
+
+        if is_connected {
+            self.execute_btn.activate();
+            self.query_cancel_btn.activate();
+            self.explain_btn.activate();
+            self.commit_btn.activate();
+            self.rollback_btn.activate();
+        } else {
+            self.execute_btn.deactivate();
+            self.query_cancel_btn.deactivate();
+            self.explain_btn.deactivate();
+            self.commit_btn.deactivate();
+            self.rollback_btn.deactivate();
+        }
+
+        // Sync the Disconnect menu item so it is only active when connected.
+        if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
+            if let Some(mut item) = menu.find_item("&File/&Disconnect") {
+                if is_connected {
+                    item.activate();
+                } else {
+                    item.deactivate();
+                }
+            }
+        }
+    }
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -582,6 +625,8 @@ impl MainWindow {
                 .append_script_output_lines(&[message.to_string()]);
             state.result_tabs.select_script_output();
         }
+
+        state.refresh_connection_dependent_controls();
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
@@ -1215,6 +1260,11 @@ impl MainWindow {
             result_delete_btn: edit_delete_btn.clone(),
             result_save_btn: edit_save_btn.clone(),
             result_cancel_btn: edit_cancel_btn.clone(),
+            execute_btn: execute_btn.clone(),
+            query_cancel_btn: cancel_btn.clone(),
+            explain_btn: explain_btn.clone(),
+            commit_btn: commit_btn.clone(),
+            rollback_btn: rollback_btn.clone(),
             result_tab_offset: 0,
             result_grid_execution_target: None,
             object_browser,
@@ -1251,6 +1301,8 @@ impl MainWindow {
                 }
             });
             s.refresh_result_edit_controls();
+            // Set initial button / menu state: not connected at startup.
+            s.refresh_connection_dependent_controls();
         }
 
         let weak_state_for_grid_edit = Arc::downgrade(&state);
@@ -2306,6 +2358,7 @@ impl MainWindow {
                         s.set_status_message(&format!("Connected | {}", info.name));
                         s.object_browser.refresh();
                         s.sql_editor.focus();
+                        s.refresh_connection_dependent_controls();
 
                         let schema_sender = schema_sender_for_progress.clone();
                         let connection = s.connection.clone();
@@ -2512,15 +2565,9 @@ impl MainWindow {
                 };
                 crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
-                let session = db_conn.session_state();
+                // Release the connection lock before locking AppState.
+                // Session reset is handled inside transition_to_disconnected_state.
                 drop(db_conn);
-                match session.lock() {
-                    Ok(mut guard) => guard.reset(),
-                    Err(poisoned) => {
-                        eprintln!("Warning: session state lock was poisoned; recovering.");
-                        poisoned.into_inner().reset();
-                    }
-                }
 
                 let mut s = state
                     .lock()
@@ -3710,6 +3757,7 @@ impl MainWindow {
                                         .set_label(&format!("Connected | {}", info.name));
                                     s.object_browser.refresh();
                                     s.sql_editor.focus();
+                                    s.refresh_connection_dependent_controls();
 
                                     // Start schema update after successful connection
                                     let schema_sender = schema_sender.clone();
