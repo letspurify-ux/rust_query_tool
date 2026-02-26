@@ -393,30 +393,28 @@ pub(crate) fn split_script_items(sql: &str) -> Vec<ScriptItem> {
 /// 쿼리 실행 전 선처리에서 `CONNECT`, `DISCONNECT`, 또는 `@` 스크립트 실행 명령이
 /// 포함되는지 판별합니다. 해당 라인은 기존 연결 유무와 무관하게 실행을 허용합니다.
 pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
-    split_script_items(sql)
-        .into_iter()
-        .any(|item| match item {
-            ScriptItem::Statement(_) => false,
-            ScriptItem::ToolCommand(command) => match command {
-                ToolCommand::Connect { .. }
-                | ToolCommand::Disconnect
-                | ToolCommand::RunScript { .. } => true,
-                ToolCommand::Unsupported { raw, .. } => {
-                    let trimmed = raw.trim();
-                    let upper = trimmed.to_ascii_uppercase();
-                    upper == "CONNECT"
-                        || upper == "CONN"
-                        || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
-                        || upper.starts_with("CONN ")
-                        || upper == "DISCONNECT"
-                        || upper == "DISC"
-                        || upper == "START"
-                        || upper.starts_with("START ")
-                        || trimmed.starts_with('@')
-                }
-                _ => false,
-            },
-        })
+    split_script_items(sql).into_iter().any(|item| match item {
+        ScriptItem::Statement(_) => false,
+        ScriptItem::ToolCommand(command) => match command {
+            ToolCommand::Connect { .. }
+            | ToolCommand::Disconnect
+            | ToolCommand::RunScript { .. } => true,
+            ToolCommand::Unsupported { raw, .. } => {
+                let trimmed = raw.trim();
+                let upper = trimmed.to_ascii_uppercase();
+                upper == "CONNECT"
+                    || upper == "CONN"
+                    || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
+                    || upper.starts_with("CONN ")
+                    || upper == "DISCONNECT"
+                    || upper == "DISC"
+                    || upper == "START"
+                    || upper.starts_with("START ")
+                    || trimmed.starts_with('@')
+            }
+            _ => false,
+        },
+    })
 }
 
 /// Returns true when a script can start execution without an active DB session.
@@ -885,6 +883,17 @@ mod tests {
         assert!(matches!(tokens.first(), Some(SqlToken::Comment(_))));
     }
 
+    #[test]
+    fn validate_sql_expression_input_rejects_multi_statement_expression() {
+        assert!(super::validate_sql_expression_input("sysdate; delete from emp").is_err());
+    }
+
+    #[test]
+    fn resolve_edit_target_table_resolves_rowid_qualified_join() {
+        let sql = "SELECT e.ROWID, e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
+        assert_eq!(super::resolve_edit_target_table(sql), Ok("EMP".to_string()));
+    }
+
     fn normalize_tokens(tokens: Vec<SqlToken>) -> Vec<(&'static str, String)> {
         tokens
             .into_iter()
@@ -956,4 +965,129 @@ pub(crate) fn normalize_single_statement(statement: &str) -> String {
 
 pub(crate) fn split_format_items(sql: &str) -> Vec<FormatItem> {
     QueryExecutor::split_format_items(sql)
+}
+
+pub(crate) fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
+    let normalized = expr.trim();
+    if normalized.is_empty() {
+        return Err("SQL expression after '=' cannot be empty.".to_string());
+    }
+
+    let items = split_script_items(normalized);
+    if items.len() != 1 {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    if !matches!(items.first(), Some(ScriptItem::Statement(_))) {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    if tokenize_sql_spanned(normalized)
+        .iter()
+        .any(|span| matches!(span.token, SqlToken::Comment(_)))
+    {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    Ok(normalized.to_string())
+}
+
+pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, String> {
+    let sql = source_sql.trim();
+    if sql.is_empty() {
+        return Err("Cannot edit rows: source SQL is not available for this result.".to_string());
+    }
+
+    let tokens = tokenize_sql(sql);
+    let tables_in_scope = crate::ui::intellisense_context::collect_tables_in_statement(&tokens);
+    let mut candidates = Vec::new();
+    let mut seen_candidates = std::collections::HashSet::new();
+    for table_ref in &tables_in_scope {
+        if table_ref.is_cte {
+            continue;
+        }
+        let key = table_ref.name.to_ascii_uppercase();
+        if seen_candidates.insert(key) {
+            candidates.push(table_ref.name.clone());
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("Cannot edit rows: no base table was resolved from this query.".to_string());
+    }
+
+    let mut depth = 0usize;
+    let mut in_select = false;
+    let mut idx = 0usize;
+    let mut rowid_qualifier: Option<String> = None;
+    while idx < tokens.len() {
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                depth = depth.saturating_add(1);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+            }
+            Some(SqlToken::Word(word)) => {
+                if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
+                    in_select = true;
+                } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
+                    break;
+                }
+            }
+            _ => {}
+        }
+
+        if in_select && depth == 0 {
+            if let (
+                Some(SqlToken::Word(lhs)),
+                Some(SqlToken::Symbol(dot)),
+                Some(SqlToken::Word(rhs)),
+            ) = (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2))
+            {
+                if dot == "."
+                    && crate::sql_text::strip_identifier_quotes(rhs).eq_ignore_ascii_case("ROWID")
+                {
+                    rowid_qualifier = Some(crate::sql_text::strip_identifier_quotes(lhs));
+                    break;
+                }
+            }
+        }
+
+        idx += 1;
+    }
+
+    if let Some(qualifier) = rowid_qualifier {
+        let resolved =
+            crate::ui::intellisense_context::resolve_qualifier_tables(&qualifier, &tables_in_scope);
+        let mut resolved_deduped = Vec::new();
+        let mut seen_resolved = std::collections::HashSet::new();
+        for table in resolved {
+            let key = table.to_ascii_uppercase();
+            if seen_resolved.insert(key) {
+                resolved_deduped.push(table);
+            }
+        }
+        if resolved_deduped.len() == 1 {
+            return Ok(resolved_deduped.remove(0));
+        }
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates[0].clone());
+    }
+
+    Err(format!(
+        "Cannot resolve a single edit target table (candidates: {}). Query one table or qualify ROWID with an alias.",
+        candidates.join(", ")
+    ))
 }

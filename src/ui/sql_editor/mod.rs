@@ -38,7 +38,7 @@ mod dba_tools;
 mod execution;
 mod intellisense;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
-mod query_text;
+pub(crate) mod query_text;
 mod session_monitor;
 
 #[derive(Clone, Debug)]

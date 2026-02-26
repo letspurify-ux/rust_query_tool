@@ -1058,12 +1058,7 @@ fn peek_word_upper(tokens: &[SqlToken], idx: usize) -> Option<&'static str> {
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
-    } else {
-        trimmed.to_string()
-    }
+    crate::sql_text::strip_identifier_quotes(value)
 }
 
 fn normalize_identifier_for_lookup(value: &str) -> String {

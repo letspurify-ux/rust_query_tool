@@ -85,3 +85,12 @@ pub(crate) fn leading_words_upper(line: &str) -> Vec<String> {
         .filter(|w| !w.is_empty())
         .collect()
 }
+
+/// Strips surrounding double quotes from SQL identifiers and unescapes doubled quotes.
+pub(crate) fn strip_identifier_quotes(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return inner.replace("\"\"", "\"");
+    }
+    trimmed.to_string()
+}
