@@ -4235,16 +4235,12 @@ impl ResultTableWidget {
                     *save_signature = None;
                     *save_tag = None;
                     (true, false)
-                } else if !result.success {
-                    // If a save was pending and the execution ended in failure
-                    // before we received a tagged/signature-matching result,
-                    // clear the pending flag immediately so edit controls do
-                    // not stay locked until the BatchFinished recovery path.
-                    *pending_guard = false;
-                    *save_signature = None;
-                    *save_tag = None;
-                    (true, false)
                 } else {
+                    // While a save is pending, ignore out-of-order statement
+                    // results (both success and failure) that do not match the
+                    // in-flight save request. Clearing the pending flag here on
+                    // an unrelated failure can unlock edit actions even though
+                    // the save is still executing.
                     (false, true)
                 }
             }
@@ -6149,9 +6145,23 @@ mod row_edit_sql_tests {
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:77".to_string());
 
         let failed = QueryResult {
-            sql: "UPDATE EMP SET ENAME='X'".to_string(),
+            sql: "/* SQ_SAVE_REQUEST:77 */
+UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
+                .to_string(),
             columns: Vec::new(),
             rows: Vec::new(),
             row_count: 0,
@@ -6172,6 +6182,75 @@ mod row_edit_sql_tests {
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_keeps_save_pending_for_non_matching_failure() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:42".to_string());
+
+        let unrelated_failure = QueryResult {
+            sql: "SELECT * FROM BROKEN".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-00942".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&unrelated_failure);
+
+        assert!(*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert_eq!(
+            widget
+                .pending_save_request_tag
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            Some("SQ_SAVE_REQUEST:42")
+        );
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
     }
 
     #[test]
