@@ -2518,6 +2518,23 @@ impl ResultTableWidget {
         result_sql.contains(tag)
     }
 
+    fn is_pending_save_terminal_result(
+        pending_tag: Option<&str>,
+        pending_signature: Option<&str>,
+        result: &QueryResult,
+    ) -> bool {
+        if Self::matches_pending_save_tag(pending_tag, &result.sql)
+            || Self::matches_pending_save_signature(pending_signature, &result.sql)
+        {
+            return true;
+        }
+
+        // Some cancellation/error paths return an empty SQL string for the
+        // finished statement. If we keep waiting for signature matching here,
+        // the save-pending lock can survive until a later cleanup event.
+        !result.is_select && result.sql.trim().is_empty()
+    }
+
     fn normalize_header_for_lookup(header: &str) -> String {
         header.replace('"', "").trim().to_ascii_uppercase()
     }
@@ -4271,8 +4288,11 @@ impl ResultTableWidget {
                 *save_tag = None;
                 (false, false)
             } else {
-                let matches_save = Self::matches_pending_save_tag(save_tag.as_deref(), &result.sql)
-                    || Self::matches_pending_save_signature(save_signature.as_deref(), &result.sql);
+                let matches_save = Self::is_pending_save_terminal_result(
+                    save_tag.as_deref(),
+                    save_signature.as_deref(),
+                    result,
+                );
 
                 if matches_save {
                     *pending_guard = false;
@@ -6494,6 +6514,77 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 .as_deref(),
             Some("SQ_SAVE_REQUEST:42")
         );
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn display_result_clears_save_pending_for_terminal_failure_with_empty_sql() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:42".to_string());
+
+        let terminal_failure = QueryResult {
+            sql: String::new(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&terminal_failure);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
         assert!(widget
             .edit_session
             .lock()
