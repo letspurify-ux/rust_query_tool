@@ -3060,7 +3060,22 @@ impl SqlEditorWidget {
                 };
 
                 let mut conn_opt = if has_connect_command {
-                    conn_guard.get_connection()
+                    // Script/bootstrapping commands may run while disconnected,
+                    // but if there is an existing session we still need to verify
+                    // it is alive before reusing it for non-CONNECT statements in
+                    // the same execution batch.
+                    if conn_guard.is_connected() {
+                        match conn_guard.require_live_connection() {
+                            Ok(conn) => Some(conn),
+                            Err(_) => {
+                                let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                                app::awake();
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
                 } else {
                     match conn_guard.require_live_connection() {
                         Ok(conn) => Some(conn),
