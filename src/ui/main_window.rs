@@ -2392,6 +2392,22 @@ impl MainWindow {
                     }
                     s.fetch_row_counts.remove(&index);
                     s.refresh_result_edit_controls();
+
+                    // Some cancellation/error paths can finish a statement
+                    // without a trailing BatchFinished event. Recover stale
+                    // save/edit transient states here as well so result-grid
+                    // edit controls are not left locked until the next batch.
+                    let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
+                    let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                    if recovered_save_states > 0 {
+                        s.set_status_message(
+                            "Save was interrupted. Staged edits are still available.",
+                        );
+                    } else if recovered_edit_states > 0 {
+                        s.set_status_message(
+                            "Query ended before completion. Restored staged result-grid edits.",
+                        );
+                    }
                 }
                 QueryProgress::BatchFinished => {
                     s.result_tabs.finish_all_streaming();
