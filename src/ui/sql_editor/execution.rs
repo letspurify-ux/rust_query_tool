@@ -3060,6 +3060,10 @@ impl SqlEditorWidget {
                         Ok(conn) => Some(conn),
                         Err(message) => {
                             let message = message.to_string();
+                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                                let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                                app::awake();
+                            }
                             if script_mode {
                                 let result = QueryResult::new_error(&sql_text, &message);
                                 SqlEditorWidget::emit_script_result(
@@ -3087,6 +3091,8 @@ impl SqlEditorWidget {
 
                 if !has_connect_command && conn_opt.is_none() {
                     let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
+                    let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                    app::awake();
                     if script_mode {
                         let result = QueryResult::new_error(&sql_text, &message);
                         SqlEditorWidget::emit_script_result(&sender, &conn_name, 0, result, false);
