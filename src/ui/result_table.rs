@@ -2566,11 +2566,14 @@ impl ResultTableWidget {
         // If we keep waiting for signature matching here, the save-pending
         // lock can survive until a later cleanup event.
         //
-        // Restrict this fallback to failed abort packets only. A broad
-        // empty-SQL fallback can clear a real in-flight save on unrelated
-        // out-of-order failures that happen to omit SQL text.
+        // Restrict this fallback to failed abort packets with missing SQL.
+        // If an out-of-order failure still carries statement SQL text, treat
+        // it as an unrelated packet unless tag/signature matching succeeds.
+        // This prevents a cancelled non-save statement from clearing the
+        // current save-pending lock.
         !result.success
             && !result.is_select
+            && result.sql.trim().is_empty()
             && Self::is_execution_abort_message(&result.message)
     }
 
@@ -8241,7 +8244,7 @@ mod tests {
 
 
     #[test]
-    fn failed_cancel_message_matches_pending_save_fallback() {
+    fn failed_cancel_message_with_empty_sql_matches_pending_save_fallback() {
         let result = QueryResult {
             success: false,
             message: "Query cancelled".to_string(),
@@ -8249,11 +8252,31 @@ mod tests {
             rows: Vec::new(),
             row_count: 0,
             is_select: false,
-            sql: "SELECT * FROM EMP".to_string(),
+            sql: String::new(),
             execution_time: Duration::from_millis(0),
         };
 
         assert!(ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:12"),
+            Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &result,
+        ));
+    }
+
+    #[test]
+    fn failed_cancel_with_non_empty_sql_does_not_match_pending_save_fallback() {
+        let result = QueryResult {
+            success: false,
+            message: "Query cancelled".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: "UPDATE DEPT SET DNAME = 'X' WHERE DEPTNO = 10".to_string(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(!ResultTableWidget::is_pending_save_terminal_result(
             Some("SQ_SAVE_REQUEST:12"),
             Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
             &result,
