@@ -3633,6 +3633,10 @@ impl ResultTableWidget {
             .pending_save_request_tag
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        // Cancelling edit mode is an explicit user intent to discard staged
+        // state. Drop any saved pre-query backup as well so a later unrelated
+        // query failure cannot resurrect cancelled edits.
+        self.set_query_edit_backup(None);
 
         let session = self
             .edit_session
@@ -7497,6 +7501,47 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn cancel_edit_mode_clears_stale_query_edit_backup() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        widget.set_query_edit_backup(Some(QueryEditBackupState {
+            headers: vec!["ROWID".to_string(), "ENAME".to_string()],
+            full_data: vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]],
+            source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
+            edit_session: TableEditSession {
+                rowid_col: 0,
+                table_name: "EMP".to_string(),
+                null_text: "NULL".to_string(),
+                editable_columns: vec![(1, "ENAME".to_string())],
+                original_rows_by_rowid: HashMap::new(),
+                original_row_order: Vec::new(),
+                deleted_rowids: Vec::new(),
+                row_states: Vec::new(),
+            },
+        }));
+
+        let result = widget.cancel_edit_mode();
+        assert!(result.is_ok());
+        assert!(!widget.clear_orphaned_query_edit_backup());
     }
 
     #[test]
