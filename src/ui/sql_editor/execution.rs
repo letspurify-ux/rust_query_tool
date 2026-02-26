@@ -112,6 +112,12 @@ impl Drop for QueryExecutionCleanupGuard {
 }
 
 impl SqlEditorWidget {
+    fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
+        let mut sanitized = info.clone();
+        sanitized.clear_password();
+        sanitized
+    }
+
     fn db_activity_label_for_sql(sql: &str, script_mode: bool) -> String {
         let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
         let preview = if compact.is_empty() {
@@ -4988,6 +4994,10 @@ impl SqlEditorWidget {
                                     match conn_guard.connect(conn_info.clone()) {
                                         Ok(_) => {
                                             conn_opt = conn_guard.get_connection();
+                                            let sanitized_conn_info =
+                                                SqlEditorWidget::connection_info_for_ui(
+                                                    conn_guard.get_info(),
+                                                );
                                             if conn_guard.is_connected() {
                                                 conn_name = conn_guard.get_info().name.clone();
                                             } else {
@@ -5048,7 +5058,7 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             let _ = sender.send(QueryProgress::ConnectionChanged {
-                                                info: Some(conn_info.clone()),
+                                                info: Some(sanitized_conn_info),
                                             });
                                             app::awake();
                                         }
