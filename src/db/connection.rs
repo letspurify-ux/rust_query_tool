@@ -137,20 +137,24 @@ impl DatabaseConnection {
     }
 
     pub fn disconnect(&mut self) {
-        let had_connection = self.connection.is_some() || self.connected;
-        self.connection = None;
-        self.connected = false;
-        self.last_disconnect_reason = None;
-        if had_connection {
-            self.connection_generation = self.connection_generation.wrapping_add(1);
-        }
+        self.clear_connection_state(None);
     }
 
     fn mark_disconnected_with_reason(&mut self, reason: impl Into<String>) {
+        self.clear_connection_state(Some(reason.into()));
+    }
+
+    fn clear_connection_state(&mut self, disconnect_reason: Option<String>) {
         let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
         self.connected = false;
-        self.last_disconnect_reason = Some(reason.into());
+        self.last_disconnect_reason = disconnect_reason;
+        self.info = ConnectionInfo::default();
+        self.auto_commit = false;
+        match self.session.lock() {
+            Ok(mut guard) => guard.reset(),
+            Err(poisoned) => poisoned.into_inner().reset(),
+        }
         if had_connection {
             self.connection_generation = self.connection_generation.wrapping_add(1);
         }
@@ -168,6 +172,9 @@ impl DatabaseConnection {
     /// handle so callers can prompt for reconnect before running work.
     pub fn ensure_connection_alive(&mut self) -> bool {
         if !self.connected {
+            if self.connection.is_some() {
+                self.clear_connection_state(Some(NOT_CONNECTED_MESSAGE.to_string()));
+            }
             return false;
         }
 
@@ -321,6 +328,11 @@ pub fn format_connection_busy_message() -> String {
         Some(activity) => format!("Connection is busy. Current DB activity: {}", activity),
         None => "Connection is busy. Try again after the current operation finishes.".to_string(),
     }
+}
+
+pub fn clear_tracked_db_activity() {
+    set_current_db_activity(None);
+    set_current_db_connection(None);
 }
 
 pub struct ConnectionLockGuard<'a> {
@@ -479,5 +491,42 @@ mod tests {
             .require_live_connection()
             .expect_err("must be disconnected");
         assert_eq!(err, NOT_CONNECTED_MESSAGE);
+    }
+
+    #[test]
+    fn disconnect_resets_connection_metadata_and_auto_commit() {
+        let mut conn = DatabaseConnection::new();
+        conn.info = ConnectionInfo::new("Prod", "scott", "pw", "db", 1521, "FREE");
+        conn.connected = true;
+        conn.auto_commit = true;
+        conn.disconnect();
+
+        assert!(!conn.connected);
+        assert!(!conn.auto_commit);
+        assert!(conn.info.name.is_empty());
+        assert!(conn.info.username.is_empty());
+        assert_eq!(conn.info.host, "localhost");
+    }
+
+    #[test]
+    fn disconnect_resets_session_state() {
+        let mut conn = DatabaseConnection::new();
+        conn.connected = true;
+        if let Ok(mut session) = conn.session.lock() {
+            session.continue_on_error = true;
+            session.colsep = ",".to_string();
+        }
+
+        conn.disconnect();
+
+        let (continue_on_error, colsep) = match conn.session.lock() {
+            Ok(guard) => (guard.continue_on_error, guard.colsep.clone()),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                (guard.continue_on_error, guard.colsep.clone())
+            }
+        };
+        assert!(!continue_on_error);
+        assert_eq!(colsep, " | ");
     }
 }

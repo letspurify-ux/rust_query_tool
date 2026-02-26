@@ -3013,7 +3013,7 @@ impl SqlEditorWidget {
 
             // Keep UI responsive: avoid network round-trip checks (ping) on the UI thread.
             // The execution worker performs full liveness validation.
-            if !has_connect_command && !can_run_while_disconnected {
+            if !can_run_while_disconnected {
                 if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
                     SqlEditorWidget::show_alert_dialog("Not connected to database");
                     return;
@@ -5099,61 +5099,45 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 ToolCommand::Disconnect => {
-                                    // Use the already-held conn_guard to avoid deadlock
+                                    // Use the already-held conn_guard to avoid deadlock.
+                                    // Treat stale handles (connection exists but connected flag is false)
+                                    // as a disconnectable state so UI/session state is fully reset.
+                                    let had_connection = conn_guard.is_connected()
+                                        || conn_guard.get_connection().is_some();
+
+                                    // Clear cancel connection before disconnect
+                                    SqlEditorWidget::set_current_query_connection(
+                                        &current_query_connection,
+                                        None,
+                                    );
+                                    conn_guard.disconnect();
+                                    conn_guard.refresh_tracked_connection();
+                                    conn_opt = conn_guard.get_connection();
                                     if conn_guard.is_connected() {
-                                        // Clear cancel connection before disconnect
-                                        SqlEditorWidget::set_current_query_connection(
-                                            &current_query_connection,
-                                            None,
-                                        );
-                                        conn_guard.disconnect();
-                                        conn_guard.refresh_tracked_connection();
-                                        conn_opt = conn_guard.get_connection();
-                                        if conn_guard.is_connected() {
-                                            conn_name = conn_guard.get_info().name.clone();
-                                        } else {
-                                            conn_name.clear();
-                                        }
-                                        match session.lock() {
-                                            Ok(mut guard) => guard.reset(),
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
-                                                poisoned.into_inner().reset();
-                                            }
-                                        }
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            "DISCONNECT",
-                                            "Disconnected from database",
-                                        );
+                                        conn_name = conn_guard.get_info().name.clone();
                                     } else {
-                                        // Keep script/session/UI state consistent even when the
-                                        // connection was already dropped unexpectedly.
-                                        SqlEditorWidget::set_current_query_connection(
-                                            &current_query_connection,
-                                            None,
-                                        );
-                                        conn_opt = None;
                                         conn_name.clear();
-                                        match session.lock() {
-                                            Ok(mut guard) => guard.reset(),
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                "Warning: session state lock was poisoned; recovering."
-                                            );
-                                                poisoned.into_inner().reset();
-                                            }
-                                        }
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            "DISCONNECT",
-                                            "Not connected to any database",
-                                        );
                                     }
+                                    match session.lock() {
+                                        Ok(mut guard) => guard.reset(),
+                                        Err(poisoned) => {
+                                            eprintln!(
+                                            "Warning: session state lock was poisoned; recovering."
+                                        );
+                                            poisoned.into_inner().reset();
+                                        }
+                                    }
+                                    let disconnect_message = if had_connection {
+                                        "Disconnected from database"
+                                    } else {
+                                        "Not connected to any database"
+                                    };
+                                    SqlEditorWidget::emit_script_message(
+                                        &sender,
+                                        &session,
+                                        "DISCONNECT",
+                                        disconnect_message,
+                                    );
                                     cleanup.clear_timeout_tracking();
                                     let _ = sender
                                         .send(QueryProgress::ConnectionChanged { info: None });

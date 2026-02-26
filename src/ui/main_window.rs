@@ -512,17 +512,19 @@ fn should_apply_disconnect_for_health_check(
     checked_connection_generation: u64,
     current_connection_state: HealthCheckCurrentConnectionState,
 ) -> bool {
-    if matches!(
-        current_connection_state,
-        HealthCheckCurrentConnectionState::Unavailable
-    ) {
-        return false;
-    }
-
     let (current_connection_id, current_generation) = match current_connection_state {
         HealthCheckCurrentConnectionState::Present { id, generation } => (Some(id), generation),
         HealthCheckCurrentConnectionState::Absent { generation } => (None, generation),
-        HealthCheckCurrentConnectionState::Unavailable => (None, checked_connection_generation),
+        // If the UI thread cannot grab the lock momentarily, still allow disconnect
+        // handling for health checks that were executed against a concrete
+        // connection id. This avoids stale "connected" UI when the DB session
+        // has already been dropped in the worker.
+        HealthCheckCurrentConnectionState::Unavailable => {
+            if checked_connection_id.is_none() {
+                return false;
+            }
+            (checked_connection_id, checked_connection_generation)
+        }
     };
 
     if checked_connection_generation != current_generation {
@@ -2588,6 +2590,7 @@ impl MainWindow {
                 crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
                 db_conn.refresh_tracked_connection();
+                crate::db::clear_tracked_db_activity();
                 // Release the connection lock before locking AppState.
                 // Session reset is handled inside transition_to_disconnected_state.
                 drop(db_conn);
@@ -3623,6 +3626,7 @@ impl MainWindow {
         {
             let _ = stop_signal.stop_sender.send(());
         }
+        crate::db::clear_tracked_db_activity();
     }
 
     fn start_health_check_worker(
@@ -4477,8 +4481,8 @@ mod health_check_tests {
     }
 
     #[test]
-    fn does_not_apply_disconnect_when_current_connection_lock_is_unavailable() {
-        assert!(!should_apply_disconnect_for_health_check(
+    fn applies_disconnect_when_current_connection_lock_is_unavailable_but_check_had_connection() {
+        assert!(should_apply_disconnect_for_health_check(
             Some(10),
             5,
             HealthCheckCurrentConnectionState::Unavailable,
