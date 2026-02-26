@@ -1799,13 +1799,32 @@ impl SqlEditorWidget {
 
         let current_query_connection = self.current_query_connection.clone();
         let cancel_flag = self.cancel_flag.clone();
+        let query_running = self.query_running.clone();
         let sender = self.ui_action_sender.clone();
-        let query_running = *self
-            .query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         thread::spawn(move || {
-            if !query_running {
+            let mut conn = SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+
+            if !SqlEditorWidget::is_query_running_flag(&query_running) && conn.is_none() {
+                // Execution can still be transitioning into "running" and may not
+                // have published current_query_connection yet. Wait briefly so a
+                // cancel click that races with query start can still interrupt.
+                for _ in 0..40 {
+                    if !cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if SqlEditorWidget::is_query_running_flag(&query_running) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                    conn =
+                        SqlEditorWidget::clone_current_query_connection(&current_query_connection);
+                    if conn.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if !SqlEditorWidget::is_query_running_flag(&query_running) && conn.is_none() {
                 // This editor is idle. Do not attempt to cancel through the
                 // global DB connection because that can interrupt a query that
                 // is currently running in a different editor tab.
@@ -1815,9 +1834,6 @@ impl SqlEditorWidget {
                 return;
             }
 
-            // Use separate connection path for cancel (no blocking on main mutex)
-            let mut conn =
-                SqlEditorWidget::clone_current_query_connection(&current_query_connection);
             if conn.is_none() {
                 // Execution may still be initializing the DB connection.
                 // Wait briefly so a single cancel click can still interrupt reliably.
@@ -1848,6 +1864,12 @@ impl SqlEditorWidget {
             let _ = sender.send(UiActionResult::Cancel(result));
             app::awake();
         });
+    }
+
+    fn is_query_running_flag(query_running: &Arc<Mutex<bool>>) -> bool {
+        *query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn clone_current_query_connection(
