@@ -546,6 +546,13 @@ fn should_restart_health_check_worker(
     health_channel_disconnected && health_worker_registered
 }
 
+fn should_ignore_query_progress_when_disconnected(
+    has_live_connection: bool,
+    has_running_queries: bool,
+) -> bool {
+    !has_live_connection && !has_running_queries
+}
+
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
     target.filter(|idx| *idx < tab_count).unwrap_or(tab_count)
 }
@@ -2325,6 +2332,21 @@ impl MainWindow {
                     columns,
                     null_text,
                 } => {
+                    let has_live_connection = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    if should_ignore_query_progress_when_disconnected(
+                        has_live_connection,
+                        has_running_queries,
+                    ) {
+                        return;
+                    }
                     let tab_index = s.result_tab_offset + index;
                     s.result_tabs
                         .start_streaming(tab_index, &columns, &null_text);
@@ -2338,6 +2360,21 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                 }
                 QueryProgress::Rows { index, rows } => {
+                    let has_live_connection = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    if should_ignore_query_progress_when_disconnected(
+                        has_live_connection,
+                        has_running_queries,
+                    ) {
+                        return;
+                    }
                     let tab_index = s.result_tab_offset + index;
                     let rows_len = rows.len();
                     s.result_tabs.append_rows(tab_index, rows);
@@ -2397,6 +2434,21 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
+                    let has_live_connection = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some();
+                    let has_running_queries = s.sql_editor.is_query_running()
+                        || s.editor_tabs
+                            .iter()
+                            .any(|tab| tab.sql_editor.is_query_running());
+                    if should_ignore_query_progress_when_disconnected(
+                        has_live_connection,
+                        has_running_queries,
+                    ) {
+                        return;
+                    }
                     let tab_index = s.result_tab_offset + index;
                     if !result.success && !result.message.trim().is_empty() {
                         let lines: Vec<String> =
@@ -4418,8 +4470,8 @@ impl Default for MainWindow {
 #[cfg(test)]
 mod health_check_tests {
     use super::{
-        should_apply_disconnect_for_health_check, should_restart_health_check_worker,
-        HealthCheckCurrentConnectionState,
+        should_apply_disconnect_for_health_check, should_ignore_query_progress_when_disconnected,
+        should_restart_health_check_worker, HealthCheckCurrentConnectionState,
     };
 
     #[test]
@@ -4514,6 +4566,13 @@ mod health_check_tests {
     #[test]
     fn does_not_restart_health_worker_when_channel_disconnected_but_worker_not_registered() {
         assert!(!should_restart_health_check_worker(true, false));
+    }
+
+    #[test]
+    fn ignores_query_progress_only_when_fully_disconnected_and_no_running_queries() {
+        assert!(should_ignore_query_progress_when_disconnected(false, false));
+        assert!(!should_ignore_query_progress_when_disconnected(false, true));
+        assert!(!should_ignore_query_progress_when_disconnected(true, false));
     }
 
     #[test]
