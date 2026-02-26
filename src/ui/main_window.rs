@@ -582,6 +582,13 @@ impl MainWindow {
             .connection_info
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        // Disconnection can happen mid-stream (health check failure, network drop,
+        // explicit disconnect while a worker is still unwinding). Ensure every
+        // result grid exits streaming mode immediately so edit controls are not
+        // left disabled waiting for a BatchFinished event that may never arrive.
+        state.result_tabs.finish_all_streaming();
+
         let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
         let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
         if recovered_save_states > 0 {
