@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::db::{current_active_db_connection, QueryExecutor, QueryResult};
+use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::intellisense_context::{self, ScopedTableRef};
@@ -2983,22 +2983,6 @@ impl ResultTableWidget {
         Self::find_rowid_column_index(headers).is_some()
     }
 
-    fn has_insert_privilege_for_edit_target(table_name: &str, editable_column: &str) -> bool {
-        let Some(conn) = current_active_db_connection() else {
-            return false;
-        };
-        let sql = Self::build_insert_privilege_probe_sql(table_name, editable_column);
-        conn.execute(&sql, &[]).is_ok()
-    }
-
-    fn build_insert_privilege_probe_sql(table_name: &str, editable_column: &str) -> String {
-        let quoted_table = Self::quote_qualified_identifier(table_name);
-        let quoted_column = Self::quote_qualified_identifier(editable_column);
-        format!(
-            "INSERT INTO {quoted_table} ({quoted_column}) SELECT {quoted_column} FROM {quoted_table} WHERE 1 = 0"
-        )
-    }
-
     pub fn is_save_pending(&self) -> bool {
         *self
             .pending_save_request
@@ -3184,7 +3168,7 @@ impl ResultTableWidget {
             return Err("No result columns available for INSERT.".to_string());
         }
 
-        let (rowid_col, first_edit_col, table_name, first_editable_column) = {
+        let (rowid_col, first_edit_col) = {
             let guard = self
                 .edit_session
                 .lock()
@@ -3195,23 +3179,8 @@ impl ResultTableWidget {
             (
                 session.rowid_col,
                 session.editable_columns.first().map(|(idx, _)| *idx),
-                session.table_name.clone(),
-                session
-                    .editable_columns
-                    .first()
-                    .map(|(_, column)| column.clone())
-                    .unwrap_or_default(),
             )
         };
-
-        if first_editable_column.is_empty()
-            || !Self::has_insert_privilege_for_edit_target(&table_name, &first_editable_column)
-        {
-            return Err(
-                "INSERT requires table INSERT privilege and at least one writable target column."
-                    .to_string(),
-            );
-        }
 
         let new_row_index = {
             let mut full_data = self
@@ -5358,27 +5327,6 @@ mod row_edit_sql_tests {
         assert_eq!(
             ResultTableWidget::editable_column_identifier("\"BROKEN\"NAME\""),
             None
-        );
-    }
-
-    #[test]
-    fn build_insert_privilege_probe_sql_quotes_qualified_table_and_column() {
-        let sql = ResultTableWidget::build_insert_privilege_probe_sql("SCOTT.EMP", "ENAME");
-        assert_eq!(
-            sql,
-            "INSERT INTO SCOTT.EMP (ENAME) SELECT ENAME FROM SCOTT.EMP WHERE 1 = 0"
-        );
-    }
-
-    #[test]
-    fn build_insert_privilege_probe_sql_preserves_quoted_identifiers() {
-        let sql = ResultTableWidget::build_insert_privilege_probe_sql(
-            "\"My Schema\".\"Order Detail\"",
-            "\"User Name\"",
-        );
-        assert_eq!(
-            sql,
-            "INSERT INTO \"My Schema\".\"Order Detail\" (\"User Name\") SELECT \"User Name\" FROM \"My Schema\".\"Order Detail\" WHERE 1 = 0"
         );
     }
 
