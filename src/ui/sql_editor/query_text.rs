@@ -394,17 +394,88 @@ pub(crate) fn has_connection_bootstrap_command(sql: &str) -> bool {
                 | ToolCommand::Disconnect
                 | ToolCommand::RunScript { .. } => true,
                 ToolCommand::Unsupported { raw, .. } => {
-                    let upper = raw.trim().to_uppercase();
+                    let trimmed = raw.trim();
+                    let upper = trimmed.to_ascii_uppercase();
                     upper == "CONNECT"
+                        || upper == "CONN"
                         || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
                         || upper.starts_with("CONN ")
                         || upper == "DISCONNECT"
                         || upper == "DISC"
-                        || raw.trim_start().starts_with('@')
+                        || upper == "START"
+                        || upper.starts_with("START ")
+                        || trimmed.starts_with('@')
                 }
                 _ => false,
             },
         })
+}
+
+/// Returns true when a script can start execution without an active DB session.
+///
+/// This covers SQL*Plus-style connection bootstrap/control commands and local-only
+/// commands (PROMPT/SET/SPOOL/DEFINE 등). Statements and DB-dependent commands still
+/// require an existing live connection.
+pub(crate) fn can_execute_while_disconnected(sql: &str) -> bool {
+    let items = QueryExecutor::split_script_items(sql);
+    if items.is_empty() {
+        return true;
+    }
+
+    items.into_iter().all(|item| match item {
+        ScriptItem::Statement(_) => false,
+        ScriptItem::ToolCommand(command) => match command {
+            ToolCommand::Connect { .. }
+            | ToolCommand::Disconnect
+            | ToolCommand::RunScript { .. }
+            | ToolCommand::Prompt { .. }
+            | ToolCommand::Pause { .. }
+            | ToolCommand::Accept { .. }
+            | ToolCommand::Define { .. }
+            | ToolCommand::Undefine { .. }
+            | ToolCommand::SetErrorContinue { .. }
+            | ToolCommand::SetAutoCommit { .. }
+            | ToolCommand::SetDefine { .. }
+            | ToolCommand::SetScan { .. }
+            | ToolCommand::SetVerify { .. }
+            | ToolCommand::SetEcho { .. }
+            | ToolCommand::SetTiming { .. }
+            | ToolCommand::SetFeedback { .. }
+            | ToolCommand::SetHeading { .. }
+            | ToolCommand::SetPageSize { .. }
+            | ToolCommand::SetLineSize { .. }
+            | ToolCommand::SetTrimSpool { .. }
+            | ToolCommand::SetTrimOut { .. }
+            | ToolCommand::SetSqlBlankLines { .. }
+            | ToolCommand::SetTab { .. }
+            | ToolCommand::SetColSep { .. }
+            | ToolCommand::SetNull { .. }
+            | ToolCommand::Spool { .. }
+            | ToolCommand::WheneverSqlError { .. }
+            | ToolCommand::WheneverOsError { .. }
+            | ToolCommand::Exit
+            | ToolCommand::Quit => true,
+            ToolCommand::Unsupported { raw, .. } => {
+                let trimmed = raw.trim();
+                let trimmed_upper = trimmed.to_ascii_uppercase();
+                if trimmed.is_empty() {
+                    return true;
+                }
+                trimmed.starts_with('@')
+                    || (trimmed_upper.starts_with("@@"))
+                    || trimmed_upper == "START"
+                    || (trimmed_upper.starts_with("START")
+                        && trimmed_upper
+                            .get(5..)
+                            .is_some_and(|tail| tail.trim_start().starts_with(';')))
+                    || trimmed_upper == "CONNECT"
+                    || trimmed_upper == "CONN"
+                    || trimmed_upper == "DISCONNECT"
+                    || trimmed_upper == "DISC"
+            }
+            _ => false,
+        },
+    })
 }
 
 fn clamp_cursor_to_char_boundary(sql: &str, cursor_pos: usize) -> usize {
@@ -418,8 +489,9 @@ fn clamp_cursor_to_char_boundary(sql: &str, cursor_pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_cursor_to_char_boundary, has_connection_bootstrap_command, statement_at_cursor,
-        statement_bounds_in_text, tokenize_sql,
+        can_execute_while_disconnected, clamp_cursor_to_char_boundary,
+        has_connection_bootstrap_command, statement_at_cursor, statement_bounds_in_text,
+        tokenize_sql,
     };
     use crate::db::SplitState;
     use crate::sql_text;
@@ -750,14 +822,47 @@ mod tests {
 
     #[test]
     fn has_connection_bootstrap_command_detects_connect_and_script_lines() {
-        let sql = "SELECT 1 FROM dual;\nCONNECT scott/tiger@localhost:1521/FREE\n@next.sql";
+        let sql =
+            "SELECT 1 FROM dual;\nCONNECT scott/tiger@localhost:1521/FREE\n@next.sql\nSTART setup.sql";
         assert!(has_connection_bootstrap_command(sql));
+    }
+
+    #[test]
+    fn has_connection_bootstrap_command_detects_start_without_path() {
+        assert!(has_connection_bootstrap_command("START"));
     }
 
     #[test]
     fn has_connection_bootstrap_command_ignores_connect_by_clause() {
         let sql = "SELECT level FROM dual CONNECT BY level <= 10";
         assert!(!has_connection_bootstrap_command(sql));
+    }
+
+    #[test]
+    fn can_execute_while_disconnected_accepts_local_sqlplus_commands() {
+        let sql = "PROMPT hello\nSET ECHO ON\nSPOOL out.log";
+        assert!(can_execute_while_disconnected(sql));
+    }
+
+    #[test]
+    fn can_execute_while_disconnected_accepts_control_commands() {
+        let sql = "CONNECT user/pass@localhost:1521/FREE\nDISCONNECT\n@next.sql";
+        assert!(can_execute_while_disconnected(sql));
+    }
+
+    #[test]
+    fn can_execute_while_disconnected_accepts_start_command_parse_error_path() {
+        assert!(can_execute_while_disconnected("START"));
+    }
+
+    #[test]
+    fn can_execute_while_disconnected_rejects_statements_needing_database() {
+        assert!(!can_execute_while_disconnected("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn can_execute_while_disconnected_rejects_describe_without_connection() {
+        assert!(!can_execute_while_disconnected("DESC dual"));
     }
 
     #[test]
