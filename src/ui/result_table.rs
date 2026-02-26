@@ -4327,14 +4327,14 @@ impl ResultTableWidget {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                 self.refresh_auto_rowid_visibility();
-                if !result.is_select {
-                    // Save requests are internal DML executions for the current
-                    // editable result set. Keep the existing grid rows visible
-                    // after success instead of replacing them with a one-cell
-                    // "Result" message row.
-                    self.table.redraw();
-                    return;
-                }
+                // Save requests are internal executions for the current editable
+                // result set. Keep the staged grid rows visible after success
+                // instead of replacing them with an unrelated statement payload.
+                // In rare out-of-order/cancellation paths Oracle can still
+                // surface a SELECT-shaped terminal packet; treat it the same as
+                // DML success and preserve the existing grid.
+                self.table.redraw();
+                return;
             } else {
                 // Save failed: keep staged edits so users can fix and retry.
                 // Even if edit_session was unexpectedly cleared, do not replace
