@@ -106,6 +106,7 @@ pub struct ResultTableWidget {
     next_save_request_id: Arc<AtomicU64>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
+    streaming_in_progress: Arc<Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -721,6 +722,7 @@ impl ResultTableWidget {
         let next_save_request_id = Arc::new(AtomicU64::new(1));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
+        let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -1294,7 +1296,15 @@ impl ResultTableWidget {
             next_save_request_id,
             hidden_auto_rowid_col,
             active_inline_edit,
+            streaming_in_progress,
         }
+    }
+
+    fn is_streaming_in_progress(&self) -> bool {
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn show_inline_cell_editor(
@@ -3154,6 +3164,9 @@ impl ResultTableWidget {
         if self.is_save_pending() {
             return false;
         }
+        if self.is_streaming_in_progress() {
+            return false;
+        }
 
         if self.is_edit_mode_enabled() {
             return true;
@@ -3216,6 +3229,9 @@ impl ResultTableWidget {
     pub fn begin_edit_mode(&mut self) -> Result<String, String> {
         if self.is_save_pending() {
             return Err("Cannot begin edit mode while save is in progress.".to_string());
+        }
+        if self.is_streaming_in_progress() {
+            return Err("Cannot begin edit mode while query rows are still loading.".to_string());
         }
 
         if self.is_edit_mode_enabled() {
@@ -4388,6 +4404,11 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+
         // Query completion can race with an open inline editor focus change.
         // Commit any pending in-cell value first so failed/cancelled queries
         // do not silently discard the user's last typed value.
@@ -4594,6 +4615,11 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
         let save_pending = *self
             .pending_save_request
             .lock()
@@ -4846,6 +4872,10 @@ impl ResultTableWidget {
 
     /// Call this when streaming is complete to flush any remaining buffered rows
     pub fn finish_streaming(&mut self) {
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         self.flush_pending();
         self.table.redraw();
     }
@@ -4908,6 +4938,10 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        *self
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
         *self
@@ -8318,6 +8352,71 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         *widget
             .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        assert!(!widget.can_begin_edit_mode());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn begin_edit_mode_returns_error_while_streaming_in_progress() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .streaming_in_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
+        let result = widget.begin_edit_mode();
+
+        assert_eq!(
+            result,
+            Err("Cannot begin edit mode while query rows are still loading.".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn can_begin_edit_mode_returns_false_while_streaming_in_progress() {
+        let widget = ResultTableWidget::new();
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT ROWID, ENAME FROM EMP".to_string();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
+        *widget
+            .streaming_in_progress
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
 
