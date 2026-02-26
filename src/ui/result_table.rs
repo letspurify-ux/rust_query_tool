@@ -448,6 +448,7 @@ impl ResultTableWidget {
         let mut dialog = Window::default()
             .with_size(760, 520)
             .with_label("Cell Value");
+        crate::ui::center_on_main(&mut dialog);
         dialog.set_color(theme::panel_raised());
         dialog.make_modal(true);
 
