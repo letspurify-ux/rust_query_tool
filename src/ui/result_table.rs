@@ -4762,6 +4762,14 @@ impl ResultTableWidget {
         {
             return false;
         }
+        if self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return false;
+        }
         self.restore_query_edit_backup()
     }
 
@@ -6937,6 +6945,86 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some());
         assert!(!widget.clear_orphaned_query_edit_backup());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn clear_orphaned_query_edit_backup_does_not_override_active_edit_session() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["ROWID".to_string(), "ENAME".to_string()];
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec![vec!["LIVE01".to_string(), "SCOTT".to_string()]];
+
+        let active_session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "LIVE01".to_string(),
+                    vec!["LIVE01".to_string(), "SMITH".to_string()],
+                );
+                map
+            },
+            original_row_order: vec!["LIVE01".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "LIVE01".to_string(),
+                explicit_null_cols: HashSet::new(),
+            }],
+        };
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(active_session);
+
+        widget.set_query_edit_backup(Some(QueryEditBackupState {
+            headers: vec!["ROWID".to_string(), "ENAME".to_string()],
+            full_data: vec![vec!["OLD01".to_string(), "MILLER".to_string()]],
+            source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
+            edit_session: TableEditSession {
+                rowid_col: 0,
+                table_name: "EMP".to_string(),
+                null_text: "NULL".to_string(),
+                editable_columns: vec![(1, "ENAME".to_string())],
+                original_rows_by_rowid: HashMap::new(),
+                original_row_order: vec!["OLD01".to_string()],
+                deleted_rowids: Vec::new(),
+                row_states: vec![EditRowState::Existing {
+                    rowid: "OLD01".to_string(),
+                    explicit_null_cols: HashSet::new(),
+                }],
+            },
+        }));
+
+        assert!(!widget.clear_orphaned_query_edit_backup());
+
+        let current_rows = widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            current_rows,
+            vec![vec!["LIVE01".to_string(), "SCOTT".to_string()]]
+        );
+        assert!(widget
+            .query_edit_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
     }
 
     #[test]
