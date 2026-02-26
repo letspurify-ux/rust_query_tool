@@ -584,15 +584,10 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
         let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
-        // Check for active edit sessions after orphan recovery, since recovery
-        // may have restored a session (recovered_edit_states > 0 path).
-        let has_live_edit_session = state.result_tabs.has_any_active_edit_session();
         if recovered_save_states > 0 {
             state.set_status_message("Disconnected (save interrupted; staged edits preserved)");
         } else if recovered_edit_states > 0 {
             state.set_status_message("Disconnected (staged result-grid edits restored)");
-        } else if has_live_edit_session {
-            state.set_status_message("Disconnected (staged result-grid edits preserved)");
         } else {
             state.set_status_message("Disconnected");
         }
@@ -604,15 +599,18 @@ impl MainWindow {
         // connection is not visible when connecting to a different database.
         state.object_browser.clear_on_disconnect();
 
-        // Clear result tabs so stale query results from the previous connection
-        // are not left visible after disconnecting — unless staged edit data is
-        // present (either recovered from an in-flight operation or still active
-        // from an ongoing normal edit session), in which case keep the tabs
-        // visible so the user can reconnect and retry without losing changes.
-        // Reuse has_live_edit_session computed above (after orphan recovery).
-        if !has_live_edit_session {
-            state.result_tabs.clear();
-        }
+        // DO NOT clear result_tabs on disconnect.
+        //
+        // Users frequently disconnect and reconnect (e.g. session timeout, switching
+        // environments) and still need to read the query results that were already
+        // fetched. Clearing tabs here would destroy that data silently.
+        //
+        // Staged edit data (pending INSERT/UPDATE/DELETE rows) must also survive
+        // across a disconnect so the user can reconnect and retry the save without
+        // losing their edits.
+        //
+        // If you are tempted to add result_tabs.clear() here — don't.
+        // Let the user close individual tabs manually when they are done with them.
 
         // Reset session state (bind variables, settings, etc.) so they do not
         // leak into a subsequent connection, e.g. when disconnected by the health

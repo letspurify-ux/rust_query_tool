@@ -643,16 +643,6 @@ impl ResultTabsWidget {
             .unwrap_or(false)
     }
 
-    /// Returns true if ANY result tab currently has an active edit session.
-    /// Used by disconnect logic to decide whether to preserve result tabs.
-    pub fn has_any_active_edit_session(&self) -> bool {
-        self.data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|tab| tab.table.is_edit_mode_enabled())
-    }
-
     pub fn begin_current_edit_mode(&mut self) -> Result<String, String> {
         let Some(mut table) = self.current_table() else {
             return Err("Open a result tab first.".to_string());
