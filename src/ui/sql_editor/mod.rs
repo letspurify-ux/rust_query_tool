@@ -18,10 +18,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::db::{
-    current_active_db_connection, ConnectionInfo, QueryExecutor, QueryResult, SharedConnection,
-    TableColumnDetail,
-};
+use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
@@ -1809,14 +1806,9 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         thread::spawn(move || {
             if !query_running {
-                if let Some(db_conn) = current_active_db_connection() {
-                    let result = db_conn.break_execution().map_err(|err| err.to_string());
-                    cancel_flag.store(false, Ordering::SeqCst);
-                    let _ = sender.send(UiActionResult::Cancel(result));
-                    app::awake();
-                    return;
-                }
-
+                // This editor is idle. Do not attempt to cancel through the
+                // global DB connection because that can interrupt a query that
+                // is currently running in a different editor tab.
                 cancel_flag.store(false, Ordering::SeqCst);
                 let _ = sender.send(UiActionResult::Cancel(Ok(())));
                 app::awake();
