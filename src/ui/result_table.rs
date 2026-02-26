@@ -2518,12 +2518,20 @@ impl ResultTableWidget {
         result_sql.contains(tag)
     }
 
+    fn matches_pending_save_tag_in_message(pending_tag: Option<&str>, message: &str) -> bool {
+        let Some(tag) = pending_tag else {
+            return false;
+        };
+        message.contains(tag)
+    }
+
     fn is_pending_save_terminal_result(
         pending_tag: Option<&str>,
         pending_signature: Option<&str>,
         result: &QueryResult,
     ) -> bool {
         if Self::matches_pending_save_tag(pending_tag, &result.sql)
+            || Self::matches_pending_save_tag_in_message(pending_tag, &result.message)
             || Self::matches_pending_save_signature(pending_signature, &result.sql)
         {
             return true;
@@ -6617,6 +6625,77 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn display_result_clears_save_pending_when_request_tag_is_only_in_message() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        });
+        *widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        *widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ResultTableWidget::canonical_sql_signature(
+                "UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';",
+            ));
+        *widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("SQ_SAVE_REQUEST:101".to_string());
+
+        let tagged_in_message = QueryResult {
+            sql: String::new(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "ORA-01013 user requested cancel /* SQ_SAVE_REQUEST:101 */".to_string(),
+            is_select: false,
+            success: false,
+        };
+
+        widget.display_result(&tagged_in_message);
+
+        assert!(!*widget
+            .pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(widget
+            .pending_save_request_tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .pending_save_sql_signature
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        assert!(widget
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn display_result_ignores_non_matching_result_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
         *widget
@@ -8066,10 +8145,11 @@ mod tests {
     fn matches_pending_save_matchers_require_registered_tracking_values() {
         let result_sql = "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'";
         assert!(!ResultTableWidget::matches_pending_save_signature(
-            None,
-            result_sql,
+            None, result_sql,
         ));
-        assert!(!ResultTableWidget::matches_pending_save_tag(None, result_sql));
+        assert!(!ResultTableWidget::matches_pending_save_tag(
+            None, result_sql
+        ));
     }
 
     #[test]
