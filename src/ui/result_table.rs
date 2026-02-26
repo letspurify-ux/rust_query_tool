@@ -125,6 +125,13 @@ enum EditRowState {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalJoinClass {
+    WordLike,
+    Dot,
+    Symbolic,
+}
+
 #[derive(Clone)]
 struct TableEditSession {
     rowid_col: usize,
@@ -2539,20 +2546,71 @@ impl ResultTableWidget {
     }
 
     fn canonical_sql_signature(sql: &str) -> String {
+        let token_spans = crate::ui::sql_editor::query_text::tokenize_sql_spanned(sql);
         let mut normalized = String::with_capacity(sql.len());
-        let mut previous_was_whitespace = false;
-        for ch in sql.trim().trim_end_matches(';').trim().chars() {
-            if ch.is_whitespace() {
-                if !previous_was_whitespace {
-                    normalized.push(' ');
-                    previous_was_whitespace = true;
+        let mut previous_join_class: Option<CanonicalJoinClass> = None;
+
+        for span in token_spans {
+            let token_text = match span.token {
+                crate::ui::sql_editor::SqlToken::Comment(_) => continue,
+                crate::ui::sql_editor::SqlToken::Word(word) => {
+                    if Self::is_quoted_identifier_token(&word) {
+                        word
+                    } else {
+                        word.to_ascii_uppercase()
+                    }
                 }
-                continue;
+                crate::ui::sql_editor::SqlToken::String(text) => text,
+                crate::ui::sql_editor::SqlToken::Symbol(symbol) => symbol,
+            };
+
+            let join_class = Self::canonical_join_class(&token_text);
+            if previous_join_class
+                .zip(Some(join_class))
+                .is_some_and(|(left, right)| {
+                    Self::needs_space_between_canonical_tokens(left, right)
+                })
+            {
+                normalized.push(' ');
             }
-            normalized.push(ch);
-            previous_was_whitespace = false;
+
+            normalized.push_str(&token_text);
+            previous_join_class = Some(join_class);
         }
-        normalized
+
+        normalized.trim_end_matches(';').trim().to_string()
+    }
+
+    fn is_quoted_identifier_token(word: &str) -> bool {
+        word.starts_with('"') && word.ends_with('"')
+    }
+
+    fn canonical_join_class(token_text: &str) -> CanonicalJoinClass {
+        if token_text == "." {
+            return CanonicalJoinClass::Dot;
+        }
+
+        if token_text.chars().all(Self::is_canonical_word_char) {
+            return CanonicalJoinClass::WordLike;
+        }
+
+        CanonicalJoinClass::Symbolic
+    }
+
+    fn is_canonical_word_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#')
+    }
+
+    fn needs_space_between_canonical_tokens(
+        left: CanonicalJoinClass,
+        right: CanonicalJoinClass,
+    ) -> bool {
+        matches!(
+            (left, right),
+            (CanonicalJoinClass::WordLike, CanonicalJoinClass::WordLike)
+                | (CanonicalJoinClass::WordLike, CanonicalJoinClass::Symbolic)
+                | (CanonicalJoinClass::Symbolic, CanonicalJoinClass::WordLike)
+        )
     }
 
     fn matches_pending_save_signature(pending_signature: Option<&str>, result_sql: &str) -> bool {
@@ -8343,6 +8401,26 @@ mod tests {
     fn canonical_sql_signature_normalizes_whitespace_and_trailing_semicolon() {
         let left = "  UPDATE   EMP SET ENAME = 'A'  WHERE ROWID = 'AAABBB'; ";
         let right = "UPDATE EMP\nSET ENAME = 'A' WHERE ROWID = 'AAABBB'";
+        assert_eq!(
+            ResultTableWidget::canonical_sql_signature(left),
+            ResultTableWidget::canonical_sql_signature(right)
+        );
+    }
+
+    #[test]
+    fn canonical_sql_signature_ignores_comments_and_normalizes_keyword_case() {
+        let left = "/* req */ update emp -- inline\nset ename = 'A' where rowid = 'AAABBB';";
+        let right = "UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AAABBB'";
+        assert_eq!(
+            ResultTableWidget::canonical_sql_signature(left),
+            ResultTableWidget::canonical_sql_signature(right)
+        );
+    }
+
+    #[test]
+    fn canonical_sql_signature_preserves_quoted_identifier_and_string_literal_case() {
+        let left = "update \"CamelCase\".emp set ename = 'Mixed Case';";
+        let right = "UPDATE \"CamelCase\".EMP SET ENAME = 'Mixed Case'";
         assert_eq!(
             ResultTableWidget::canonical_sql_signature(left),
             ResultTableWidget::canonical_sql_signature(right)
