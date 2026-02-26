@@ -2999,10 +2999,9 @@ impl SqlEditorWidget {
             return;
         }
 
-        // Check if any line contains a CONNECT, DISCONNECT, or @ command.
-        // These commands should work even when not connected, and in script mode
-        // they can appear on any line (not just the first).
+        // Check if script includes connection bootstrap commands.
         let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
+        let can_run_while_disconnected = super::query_text::can_execute_while_disconnected(sql);
 
         // Pre-check connection status without holding lock for long
         {
@@ -3014,7 +3013,7 @@ impl SqlEditorWidget {
 
             // Keep UI responsive: avoid network round-trip checks (ping) on the UI thread.
             // The execution worker performs full liveness validation.
-            if !has_connect_command {
+            if !has_connect_command && !can_run_while_disconnected {
                 if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
                     SqlEditorWidget::show_alert_dialog("Not connected to database");
                     return;
@@ -3112,7 +3111,7 @@ impl SqlEditorWidget {
                     conn_name.clear();
                 }
 
-                if !has_connect_command && conn_opt.is_none() {
+                if !has_connect_command && !can_run_while_disconnected && conn_opt.is_none() {
                     let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
                     let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                     app::awake();
@@ -5081,10 +5080,20 @@ impl SqlEditorWidget {
                                             app::awake();
                                         }
                                         Err(err) => {
+                                            conn_opt = None;
+                                            conn_name.clear();
+                                            SqlEditorWidget::set_current_query_connection(
+                                                &current_query_connection,
+                                                None,
+                                            );
                                             let error_msg = format!("Connection failed: {}", err);
                                             SqlEditorWidget::emit_script_message(
                                                 &sender, &session, "CONNECT", &error_msg,
                                             );
+                                            let _ = sender.send(QueryProgress::ConnectionChanged {
+                                                info: None,
+                                            });
+                                            app::awake();
                                             command_error = true;
                                         }
                                     }
