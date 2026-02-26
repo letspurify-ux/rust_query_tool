@@ -2561,19 +2561,17 @@ impl ResultTableWidget {
             return true;
         }
 
-        // Some cancellation/error paths return an empty SQL string for the
-        // finished statement, or collapse to a generic cancellation/timeout
-        // message without preserving the tagged SQL text. If we keep waiting
-        // for signature matching here, the save-pending lock can survive until
-        // a later cleanup event.
+        // Some cancellation/error paths collapse to a generic
+        // cancellation/timeout message without preserving the tagged SQL text.
+        // If we keep waiting for signature matching here, the save-pending
+        // lock can survive until a later cleanup event.
         //
-        // Restrict this fallback to failed terminal packets only. Treating a
-        // successful empty-SQL non-select result as a save completion can clear
-        // a real in-flight save on unrelated out-of-order events.
+        // Restrict this fallback to failed abort packets only. A broad
+        // empty-SQL fallback can clear a real in-flight save on unrelated
+        // out-of-order failures that happen to omit SQL text.
         !result.success
             && !result.is_select
-            && (result.sql.trim().is_empty()
-                || Self::is_execution_abort_message(&result.message))
+            && Self::is_execution_abort_message(&result.message)
     }
 
     fn is_execution_abort_message(message: &str) -> bool {
@@ -8272,6 +8270,26 @@ mod tests {
             row_count: 0,
             is_select: false,
             sql: "SELECT * FROM EMP".to_string(),
+            execution_time: Duration::from_millis(0),
+        };
+
+        assert!(!ResultTableWidget::is_pending_save_terminal_result(
+            Some("SQ_SAVE_REQUEST:12"),
+            Some("UPDATE EMP SET ENAME = 'A' WHERE ROWID = 'AA'"),
+            &result,
+        ));
+    }
+
+    #[test]
+    fn failed_empty_sql_non_abort_message_does_not_match_pending_save_fallback() {
+        let result = QueryResult {
+            success: false,
+            message: "ORA-00942: table or view does not exist".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            is_select: false,
+            sql: String::new(),
             execution_time: Duration::from_millis(0),
         };
 
