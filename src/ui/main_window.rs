@@ -561,6 +561,10 @@ fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
     !has_running_queries
 }
 
+fn should_cancel_fallback_editor(fallback_editor_running: bool) -> bool {
+    fallback_editor_running
+}
+
 fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), String> {
     if has_running_queries {
         Err("A query is running. Wait for completion before editing result rows.".to_string())
@@ -714,8 +718,13 @@ impl MainWindow {
             (running_editors, s.sql_editor.clone())
         };
 
-        if running_editors.is_empty() {
+        let fallback_editor_running = fallback_editor.is_query_running();
+
+        if should_cancel_fallback_editor(fallback_editor_running) {
             fallback_editor.cancel_current();
+        }
+
+        if running_editors.is_empty() {
             return;
         }
 
@@ -4612,8 +4621,9 @@ impl Default for MainWindow {
 #[cfg(test)]
 mod health_check_tests {
     use super::{
-        should_apply_disconnect_for_health_check, should_ignore_query_progress_when_disconnected,
-        should_restart_health_check_worker, should_run_global_batch_cleanup,
+        should_apply_disconnect_for_health_check, should_cancel_fallback_editor,
+        should_ignore_query_progress_when_disconnected, should_restart_health_check_worker,
+        should_run_global_batch_cleanup,
         HealthCheckCurrentConnectionState,
     };
 
@@ -4718,6 +4728,21 @@ mod health_check_tests {
         assert!(!should_ignore_query_progress_when_disconnected(true, false));
     }
 
+
+    #[test]
+    fn cancels_fallback_editor_when_it_has_running_query_and_no_running_tabs() {
+        assert!(should_cancel_fallback_editor(true));
+    }
+
+    #[test]
+    fn cancels_fallback_editor_when_both_fallback_and_tab_queries_are_running() {
+        assert!(should_cancel_fallback_editor(true));
+    }
+
+    #[test]
+    fn does_not_cancel_fallback_editor_when_it_is_not_running() {
+        assert!(!should_cancel_fallback_editor(false));
+    }
 
     #[test]
     fn runs_global_batch_cleanup_only_when_no_queries_are_running() {
