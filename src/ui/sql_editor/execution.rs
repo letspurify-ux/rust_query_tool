@@ -2994,11 +2994,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if *self
-            .query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        if self.query_running.load(Ordering::SeqCst) {
             let _ = self
                 .ui_action_sender
                 .send(UiActionResult::QueryAlreadyRunning);
@@ -3046,9 +3042,7 @@ impl SqlEditorWidget {
         // Reset cancel flag before starting new execution
         cancel_flag.store(false, Ordering::SeqCst);
 
-        *query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        query_running.store(true, Ordering::SeqCst);
 
         set_cursor(Cursor::Wait);
         app::flush();
