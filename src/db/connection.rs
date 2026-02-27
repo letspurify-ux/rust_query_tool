@@ -1,4 +1,4 @@
-use oracle::{Connection, Error as OracleError};
+use oracle::{Connection, Error as OracleError, InitParams};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -96,6 +96,7 @@ impl DatabaseConnection {
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), OracleError> {
+        ensure_oracle_client_initialized()?;
         let conn_str = info.connection_string();
         let connection = Arc::new(
             match Connection::connect(&info.username, &info.password, &conn_str) {
@@ -236,6 +237,7 @@ impl DatabaseConnection {
     }
 
     pub fn test_connection(info: &ConnectionInfo) -> Result<(), OracleError> {
+        ensure_oracle_client_initialized()?;
         let conn_str = info.connection_string();
         match Connection::connect(&info.username, &info.password, &conn_str) {
             Ok(_connection) => {}
@@ -257,6 +259,21 @@ impl Default for DatabaseConnection {
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static ORACLE_CLIENT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn ensure_oracle_client_initialized() -> Result<(), OracleError> {
+    let init_result = ORACLE_CLIENT_INIT.get_or_init(|| match InitParams::new().init() {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    });
+
+    match init_result {
+        Ok(()) => Ok(()),
+        Err(message) => Err(OracleError::InternalError(format!(
+            "Failed to initialize Oracle client library: {message}"
+        ))),
+    }
+}
 
 fn db_activity_slot() -> &'static Mutex<Option<String>> {
     ACTIVE_DB_ACTIVITY.get_or_init(|| Mutex::new(None))
