@@ -3875,13 +3875,10 @@ impl MainWindow {
         file_sender: std::sync::mpsc::Sender<FileActionResult>,
         file_receiver: std::sync::mpsc::Receiver<FileActionResult>,
     ) {
-                        let recv_result = {
-                            let r = schema_receiver
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            r.try_recv()
-                        };
-                        match recv_result {
+        let state = self.state.clone();
+
+        // Wrap receivers in Arc<Mutex> to share across timeout callbacks
+        let schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>> =
             Arc::new(Mutex::new(schema_receiver));
         let conn_receiver: Arc<Mutex<std::sync::mpsc::Receiver<ConnectionResult>>> =
             Arc::new(Mutex::new(conn_receiver));
@@ -4129,13 +4126,10 @@ impl MainWindow {
                                             ),
                                             &conn_info,
                                         ));
-                    let recv_result = {
-                        let r = health_receiver
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        r.try_recv()
-                    };
-                    match recv_result {
+                                    }
+                                    Err(err) => {
+                                        fltk::dialog::alert_default(&format!(
+                                            "Failed to export CSV: {}",
                                             err
                                         ));
                                     }
