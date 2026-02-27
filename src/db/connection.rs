@@ -1,4 +1,4 @@
-use oracle::{Connection, Error as OracleError, InitParams};
+use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind, InitParams};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -288,9 +288,10 @@ fn ensure_oracle_client_initialized() -> Result<(), OracleError> {
             ORACLE_CLIENT_INIT_SUCCESS.get_or_init(|| ());
             Ok(())
         }
-        Err(err) => Err(OracleError::InternalError(format!(
-            "Failed to initialize Oracle client library: {err}"
-        ))),
+        Err(err) => Err(OracleError::new(
+            OracleErrorKind::InternalError,
+            format!("Failed to initialize Oracle client library: {err}"),
+        )),
     }
 }
 
