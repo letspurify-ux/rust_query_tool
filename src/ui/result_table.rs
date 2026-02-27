@@ -242,6 +242,7 @@ enum EditRowState {
     Existing {
         rowid: String,
         explicit_null_cols: HashSet<usize>,
+        dirty_cols: HashSet<usize>,
     },
     Inserted {
         explicit_null_cols: HashSet<usize>,
@@ -321,6 +322,49 @@ impl ResultTableWidget {
                 explicit_null_cols, ..
             }
             | EditRowState::Inserted { explicit_null_cols } => explicit_null_cols,
+        }
+    }
+
+    fn row_state_dirty_cols_mut(row_state: &mut EditRowState) -> Option<&mut HashSet<usize>> {
+        match row_state {
+            EditRowState::Existing { dirty_cols, .. } => Some(dirty_cols),
+            EditRowState::Inserted { .. } => None,
+        }
+    }
+
+    fn sync_existing_row_dirty_cell(
+        session: &mut TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        current_value: &str,
+    ) {
+        let is_dirty = session
+            .row_states
+            .get(row_idx)
+            .and_then(|row_state| match row_state {
+                EditRowState::Existing { rowid, .. } => session
+                    .original_rows_by_rowid
+                    .get(rowid)
+                    .map(|original_row| {
+                        let original_value = original_row
+                            .get(col_idx)
+                            .map(|value| value.as_str())
+                            .unwrap_or("");
+                        current_value != original_value
+                    }),
+                EditRowState::Inserted { .. } => Some(false),
+            })
+            .unwrap_or(false);
+
+        if let Some(row_state) = session.row_states.get_mut(row_idx) {
+            let Some(dirty_cols) = Self::row_state_dirty_cols_mut(row_state) else {
+                return;
+            };
+            if is_dirty {
+                dirty_cols.insert(col_idx);
+            } else {
+                dirty_cols.remove(&col_idx);
+            }
         }
     }
 
@@ -412,17 +456,72 @@ impl ResultTableWidget {
             EditRowState::Existing {
                 rowid,
                 explicit_null_cols,
+                dirty_cols,
             } => {
                 let is_explicit_null = explicit_null_cols.contains(&col_idx);
+                let is_dirty = dirty_cols.contains(&col_idx);
                 let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
-                    return (false, is_explicit_null, false);
+                    return (is_dirty || is_explicit_null, is_explicit_null, false);
                 };
                 let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
                 let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
                 let is_original_null =
                     Self::value_represents_null(original_value, &session.null_text)
                         && Self::value_represents_null(current_value, &session.null_text);
-                let is_modified = current_value != original_value || is_explicit_null;
+                let is_modified = current_value != original_value || is_explicit_null || is_dirty;
+                (is_modified, is_explicit_null, is_original_null)
+            }
+            EditRowState::Inserted { explicit_null_cols } => {
+                let is_explicit_null = explicit_null_cols.contains(&col_idx);
+                let has_non_empty_value = current_row
+                    .get(col_idx)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false);
+                (
+                    is_explicit_null || has_non_empty_value,
+                    is_explicit_null,
+                    false,
+                )
+            }
+        }
+    }
+
+    fn cell_edit_state_for_draw(
+        session: &TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        current_row: &[String],
+    ) -> (bool, bool, bool) {
+        if col_idx == session.rowid_col || !Self::is_editable_column(session, col_idx) {
+            return (false, false, false);
+        }
+
+        let Some(row_state) = session.row_states.get(row_idx) else {
+            return (false, false, false);
+        };
+
+        match row_state {
+            EditRowState::Existing {
+                rowid,
+                explicit_null_cols,
+                dirty_cols,
+            } => {
+                let is_explicit_null = explicit_null_cols.contains(&col_idx);
+                let is_dirty = dirty_cols.contains(&col_idx);
+                let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                if !is_dirty && !is_explicit_null {
+                    let is_original_null =
+                        Self::value_represents_null(current_value, &session.null_text);
+                    return (false, false, is_original_null);
+                }
+                let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
+                    return (is_dirty || is_explicit_null, is_explicit_null, false);
+                };
+                let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                let is_original_null =
+                    Self::value_represents_null(original_value, &session.null_text)
+                        && Self::value_represents_null(current_value, &session.null_text);
+                let is_modified = current_value != original_value || is_explicit_null || is_dirty;
                 (is_modified, is_explicit_null, is_original_null)
             }
             EditRowState::Inserted { explicit_null_cols } => {
@@ -1079,7 +1178,7 @@ impl ResultTableWidget {
                                             is_edited_cell,
                                             is_explicit_null_cell,
                                             is_original_null_cell,
-                                        ) = Self::cell_edit_state(
+                                        ) = Self::cell_edit_state_for_draw(
                                             session, row_idx, col_idx, row_data,
                                         );
                                     }
@@ -1771,6 +1870,7 @@ impl ResultTableWidget {
                     .unwrap_or(false);
                 let _ =
                     Self::set_row_cell_explicit_null(session, row_idx, col_idx, is_explicit_null);
+                Self::sync_existing_row_dirty_cell(session, row_idx, col_idx, &new_value);
             }
         }
         let mut table = table.clone();
@@ -1854,6 +1954,12 @@ impl ResultTableWidget {
                             active_editor.row,
                             active_editor.col,
                             is_explicit_null,
+                        );
+                        Self::sync_existing_row_dirty_cell(
+                            session,
+                            active_editor.row,
+                            active_editor.col,
+                            &new_value,
                         );
                     }
                 }
@@ -2157,6 +2263,7 @@ impl ResultTableWidget {
                     *col_idx,
                     is_explicit_null,
                 );
+                Self::sync_existing_row_dirty_cell(session_mut, *row_idx, *col_idx, &input_value);
             }
             (changed_cells, skipped_cells)
         };
@@ -2260,6 +2367,7 @@ impl ResultTableWidget {
                     row[col_idx] = null_marker.clone();
                     let flag_changed =
                         Self::set_row_cell_explicit_null(session, row_idx, col_idx, true);
+                    Self::sync_existing_row_dirty_cell(session, row_idx, col_idx, &null_marker);
                     if value_changed || flag_changed {
                         changed = changed.saturating_add(1);
                     }
@@ -3658,6 +3766,7 @@ impl ResultTableWidget {
             row_states.push(EditRowState::Existing {
                 rowid,
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             });
         }
 
@@ -6052,6 +6161,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         let current_row = vec!["RID1".to_string(), "NEW".to_string(), "X".to_string()];
@@ -6068,6 +6178,57 @@ mod row_edit_sql_tests {
             2,
             &current_row
         ));
+    }
+
+    #[test]
+    fn sync_existing_row_dirty_cell_tracks_dirty_flag_for_draw_fast_path() {
+        let mut original_rows = HashMap::new();
+        original_rows.insert(
+            "RID1".to_string(),
+            vec!["RID1".to_string(), "OLD".to_string()],
+        );
+        let mut session = TableEditSession {
+            rowid_col: 0,
+            table_name: "EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "C1".to_string())],
+            original_rows_by_rowid: original_rows,
+            original_row_order: vec!["RID1".to_string()],
+            deleted_rowids: Vec::new(),
+            row_states: vec![EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            }],
+        };
+
+        ResultTableWidget::sync_existing_row_dirty_cell(&mut session, 0, 1, "NEW");
+        let is_dirty = session
+            .row_states
+            .first()
+            .and_then(|row_state| match row_state {
+                EditRowState::Existing { dirty_cols, .. } => Some(dirty_cols.contains(&1)),
+                EditRowState::Inserted { .. } => None,
+            })
+            .unwrap_or(false);
+        assert!(is_dirty);
+
+        let dirty_row = vec!["RID1".to_string(), "NEW".to_string()];
+        assert!(ResultTableWidget::cell_edit_state_for_draw(&session, 0, 1, &dirty_row).0);
+
+        ResultTableWidget::sync_existing_row_dirty_cell(&mut session, 0, 1, "OLD");
+        let is_dirty = session
+            .row_states
+            .first()
+            .and_then(|row_state| match row_state {
+                EditRowState::Existing { dirty_cols, .. } => Some(dirty_cols.contains(&1)),
+                EditRowState::Inserted { .. } => None,
+            })
+            .unwrap_or(false);
+        assert!(!is_dirty);
+
+        let clean_row = vec!["RID1".to_string(), "OLD".to_string()];
+        assert!(!ResultTableWidget::cell_edit_state_for_draw(&session, 0, 1, &clean_row).0);
     }
 
     #[test]
@@ -6118,6 +6279,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: [1usize].into_iter().collect(),
+                dirty_cols: HashSet::new(),
             }],
         };
         let current_row = vec!["RID1".to_string(), "NULL".to_string()];
@@ -6148,6 +6310,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         let current_row = vec!["RID1".to_string(), "NULL".to_string()];
@@ -6178,6 +6341,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         let current_row = vec!["RID1".to_string(), "SMITH".to_string()];
@@ -6195,6 +6359,7 @@ mod row_edit_sql_tests {
         let row_state = EditRowState::Existing {
             rowid: "RID1".to_string(),
             explicit_null_cols: HashSet::new(),
+            dirty_cols: HashSet::new(),
         };
 
         assert!(ResultTableWidget::input_maps_to_explicit_null(
@@ -6237,6 +6402,7 @@ mod row_edit_sql_tests {
         let row_state = EditRowState::Existing {
             rowid: "RID1".to_string(),
             explicit_null_cols: HashSet::new(),
+            dirty_cols: HashSet::new(),
         };
 
         assert!(!ResultTableWidget::input_maps_to_explicit_null(
@@ -6273,6 +6439,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         // Current value is still "NULL" from the executor (user hasn't edited).
@@ -6303,6 +6470,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "RID1".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         // User changed the cell value from NULL to actual data.
@@ -6352,6 +6520,7 @@ mod row_edit_sql_tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: [1usize].into_iter().collect(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -6404,6 +6573,7 @@ mod row_edit_sql_tests {
                 rowid: "AAABBB".to_string(),
                 // Not in explicit_null_cols — this is an untouched original null cell.
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -6836,6 +7006,7 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         widget.set_query_edit_backup(Some(QueryEditBackupState {
@@ -6944,6 +7115,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
         *widget
@@ -7177,6 +7349,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
         *widget
@@ -7412,6 +7585,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
         *widget
@@ -7568,6 +7742,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -7651,6 +7826,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -7787,6 +7963,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -7843,6 +8020,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "LIVE01".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         };
         *widget
@@ -7865,6 +8043,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: vec![EditRowState::Existing {
                     rowid: "OLD01".to_string(),
                     explicit_null_cols: HashSet::new(),
+                    dirty_cols: HashSet::new(),
                 }],
             },
         }));
@@ -7977,6 +8156,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -8056,6 +8236,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: [1usize].into_iter().collect(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -8135,6 +8316,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: [1usize].into_iter().collect(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -8281,6 +8463,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
         let mut input = Input::default();
@@ -8351,6 +8534,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -8460,6 +8644,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: vec![EditRowState::Existing {
                     rowid: "AAABBB".to_string(),
                     explicit_null_cols: HashSet::new(),
+                    dirty_cols: HashSet::new(),
                 }],
             },
         }));
@@ -8702,6 +8887,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -8745,6 +8931,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             row_states: vec![EditRowState::Existing {
                 rowid: "AAABBB".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
 
@@ -9719,6 +9906,7 @@ mod tests {
             row_states: vec![EditRowState::Existing {
                 rowid: "AA".to_string(),
                 explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
             }],
         });
         *widget
