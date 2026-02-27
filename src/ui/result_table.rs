@@ -782,25 +782,28 @@ impl ResultTableWidget {
             .map(|h| Self::estimate_text_width(h, font_size))
             .collect();
 
-        let mut sampled = 0usize;
-        {
+        let sampled_rows: Vec<Vec<String>> = {
             let full_data = self
                 .full_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for row in full_data.iter().take(WIDTH_SAMPLE_ROWS) {
-                Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
-                sampled += 1;
-            }
+            full_data.iter().take(WIDTH_SAMPLE_ROWS).cloned().collect()
+        };
+
+        for row in &sampled_rows {
+            Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
         }
 
-        if sampled < WIDTH_SAMPLE_ROWS {
-            let pending = self
-                .pending_rows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let remaining = WIDTH_SAMPLE_ROWS - sampled;
-            for row in pending.iter().take(remaining) {
+        if sampled_rows.len() < WIDTH_SAMPLE_ROWS {
+            let remaining = WIDTH_SAMPLE_ROWS - sampled_rows.len();
+            let pending_rows: Vec<Vec<String>> = {
+                let pending = self
+                    .pending_rows
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.iter().take(remaining).cloned().collect()
+            };
+            for row in &pending_rows {
                 Self::update_widths_with_row(&mut widths, row, font_size, max_cell_display_chars);
             }
         }
@@ -924,23 +927,28 @@ impl ResultTableWidget {
                 TableContext::Cell => {
                     draw::push_clip(x, y, w, h);
                     let selected = table_for_draw.is_selected(row, col);
+                    let max_chars = *max_cell_display_chars_for_draw
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let mut is_edited_cell = false;
                     let mut is_explicit_null_cell = false;
                     let mut is_original_null_cell = false;
+                    let mut cell_text: Option<String> = None;
                     if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col))
                     {
-                        if let Ok(data) = full_data_for_draw.try_lock() {
-                            if let Some(row_data) = data.get(row_idx) {
-                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
-                                    if let Some(session) = session_guard.as_ref() {
-                                        (
-                                            is_edited_cell,
-                                            is_explicit_null_cell,
-                                            is_original_null_cell,
-                                        ) = Self::cell_edit_state(
-                                            session, row_idx, col_idx, row_data,
-                                        );
-                                    }
+                        let row_snapshot = full_data_for_draw
+                            .try_lock()
+                            .ok()
+                            .and_then(|data| data.get(row_idx).cloned());
+                        if let Some(row_data) = row_snapshot {
+                            cell_text = row_data.get(col_idx).cloned();
+                            if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                if let Some(session) = session_guard.as_ref() {
+                                    (
+                                        is_edited_cell,
+                                        is_explicit_null_cell,
+                                        is_original_null_cell,
+                                    ) = Self::cell_edit_state(session, row_idx, col_idx, &row_data);
                                 }
                             }
                         }
@@ -976,45 +984,36 @@ impl ResultTableWidget {
                     draw::set_draw_color(fg);
                     draw::set_font(normal_font, font_size);
 
-                    if let Ok(data) = full_data_for_draw.try_lock() {
-                        if let Some(row_data) = data.get(row as usize) {
-                            if let Some(cell_val) = row_data.get(col as usize) {
-                                let max_chars = *max_cell_display_chars_for_draw
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Some(truncated_end) =
-                                    truncated_content_end(cell_val, max_chars)
-                                {
-                                    if truncated_end > 0 {
-                                        let visible = &cell_val[..truncated_end];
-                                        draw::draw_text2(
-                                            visible,
-                                            x + TABLE_CELL_PADDING,
-                                            y,
-                                            w - TABLE_CELL_PADDING * 2,
-                                            h,
-                                            Align::Left,
-                                        );
-                                    }
-                                    draw::draw_text2(
-                                        "…",
-                                        x + TABLE_CELL_PADDING,
-                                        y,
-                                        w - TABLE_CELL_PADDING * 2,
-                                        h,
-                                        Align::Right,
-                                    );
-                                } else {
-                                    draw::draw_text2(
-                                        cell_val,
-                                        x + TABLE_CELL_PADDING,
-                                        y,
-                                        w - TABLE_CELL_PADDING * 2,
-                                        h,
-                                        Align::Left,
-                                    );
-                                }
+                    if let Some(cell_val) = cell_text.as_deref() {
+                        if let Some(truncated_end) = truncated_content_end(cell_val, max_chars) {
+                            if truncated_end > 0 {
+                                let visible = &cell_val[..truncated_end];
+                                draw::draw_text2(
+                                    visible,
+                                    x + TABLE_CELL_PADDING,
+                                    y,
+                                    w - TABLE_CELL_PADDING * 2,
+                                    h,
+                                    Align::Left,
+                                );
                             }
+                            draw::draw_text2(
+                                "…",
+                                x + TABLE_CELL_PADDING,
+                                y,
+                                w - TABLE_CELL_PADDING * 2,
+                                h,
+                                Align::Right,
+                            );
+                        } else {
+                            draw::draw_text2(
+                                cell_val,
+                                x + TABLE_CELL_PADDING,
+                                y,
+                                w - TABLE_CELL_PADDING * 2,
+                                h,
+                                Align::Left,
+                            );
                         }
                     }
 
