@@ -141,10 +141,6 @@ impl DatabaseConnection {
         self.clear_connection_state(None);
     }
 
-    fn mark_disconnected_with_reason(&mut self, reason: impl Into<String>) {
-        self.clear_connection_state(Some(reason.into()));
-    }
-
     fn clear_connection_state(&mut self, disconnect_reason: Option<String>) {
         let had_connection = self.connection.is_some() || self.connected;
         self.connection = None;
@@ -167,40 +163,19 @@ impl DatabaseConnection {
             .unwrap_or_else(|| NOT_CONNECTED_MESSAGE.to_string())
     }
 
-    /// Validate that the current connection is still alive.
-    ///
-    /// Some DB servers terminate idle sessions; in that case we clear the stale
-    /// handle so callers can prompt for reconnect before running work.
-    pub fn ensure_connection_alive(&mut self) -> bool {
+    pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
         if !self.connected {
             if self.connection.is_some() {
                 self.clear_connection_state(Some(NOT_CONNECTED_MESSAGE.to_string()));
             }
-            return false;
+            return Err(self.disconnect_message());
         }
 
-        let Some(conn) = self.connection.as_ref() else {
+        if self.connection.is_none() {
             self.connected = false;
             if self.last_disconnect_reason.is_none() {
                 self.last_disconnect_reason = Some(NOT_CONNECTED_MESSAGE.to_string());
             }
-            return false;
-        };
-
-        match conn.ping() {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!("Detected stale DB connection during ping: {err}");
-                self.mark_disconnected_with_reason(format!(
-                    "Connection was lost unexpectedly: {err}"
-                ));
-                false
-            }
-        }
-    }
-
-    pub fn require_live_connection(&mut self) -> Result<Arc<Connection>, String> {
-        if !self.ensure_connection_alive() {
             return Err(self.disconnect_message());
         }
 
@@ -460,28 +435,6 @@ mod tests {
     #[test]
     fn require_live_connection_returns_default_message_when_never_connected() {
         let mut conn = DatabaseConnection::new();
-        let err = conn
-            .require_live_connection()
-            .expect_err("must be disconnected");
-        assert_eq!(err, NOT_CONNECTED_MESSAGE);
-    }
-
-    #[test]
-    fn require_live_connection_returns_unexpected_disconnect_reason() {
-        let mut conn = DatabaseConnection::new();
-        let reason = "Connection was lost unexpectedly: ORA-03113".to_string();
-        conn.mark_disconnected_with_reason(reason.clone());
-        let err = conn
-            .require_live_connection()
-            .expect_err("must be disconnected");
-        assert_eq!(err, reason);
-    }
-
-    #[test]
-    fn manual_disconnect_clears_unexpected_disconnect_reason() {
-        let mut conn = DatabaseConnection::new();
-        conn.mark_disconnected_with_reason("Connection was lost unexpectedly: ORA-00028");
-        conn.disconnect();
         let err = conn
             .require_live_connection()
             .expect_err("must be disconnected");
