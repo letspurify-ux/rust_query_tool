@@ -1,4 +1,4 @@
-use oracle::{Connection, Error as OracleError};
+use oracle::{Connection, Error as OracleError, InitParams};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -96,6 +96,7 @@ impl DatabaseConnection {
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), OracleError> {
+        ensure_oracle_client_initialized()?;
         let conn_str = info.connection_string();
         let connection = Arc::new(
             match Connection::connect(&info.username, &info.password, &conn_str) {
@@ -236,6 +237,7 @@ impl DatabaseConnection {
     }
 
     pub fn test_connection(info: &ConnectionInfo) -> Result<(), OracleError> {
+        ensure_oracle_client_initialized()?;
         let conn_str = info.connection_string();
         match Connection::connect(&info.username, &info.password, &conn_str) {
             Ok(_connection) => {}
@@ -257,6 +259,40 @@ impl Default for DatabaseConnection {
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static ORACLE_CLIENT_INIT_SUCCESS: OnceLock<()> = OnceLock::new();
+static ORACLE_CLIENT_INIT_ATTEMPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn ensure_oracle_client_initialized() -> Result<(), OracleError> {
+    if ORACLE_CLIENT_INIT_SUCCESS.get().is_some() {
+        return Ok(());
+    }
+
+    let attempt_lock = ORACLE_CLIENT_INIT_ATTEMPT_LOCK.get_or_init(|| Mutex::new(()));
+    let _attempt_guard = match attempt_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            logging::log_warning(
+                "db::connection",
+                "oracle init lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        }
+    };
+
+    if ORACLE_CLIENT_INIT_SUCCESS.get().is_some() {
+        return Ok(());
+    }
+
+    match InitParams::new().init() {
+        Ok(_) => {
+            ORACLE_CLIENT_INIT_SUCCESS.get_or_init(|| ());
+            Ok(())
+        }
+        Err(err) => Err(OracleError::InternalError(format!(
+            "Failed to initialize Oracle client library: {err}"
+        ))),
+    }
+}
 
 fn db_activity_slot() -> &'static Mutex<Option<String>> {
     ACTIVE_DB_ACTIVITY.get_or_init(|| Mutex::new(None))
