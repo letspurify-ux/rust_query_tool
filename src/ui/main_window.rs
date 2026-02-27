@@ -2454,7 +2454,9 @@ impl MainWindow {
                     result_tabs.append_rows(tab_index, rows);
                 }
                 QueryProgress::ScriptOutput { lines } => {
-                    s.result_tabs.append_script_output_lines(&lines);
+                    let mut result_tabs = s.result_tabs.clone();
+                    drop(s);
+                    result_tabs.append_script_output_lines(&lines);
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::AutoCommitChanged { enabled } => {
@@ -2549,11 +2551,17 @@ impl MainWindow {
                             .any(|tab| tab.sql_editor.is_query_running());
 
                     if should_run_global_batch_cleanup(has_running_queries) {
-                        s.result_tabs.finish_all_streaming();
-                        s.result_tabs.align_tab_strip_left();
-                        let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
-                        let recovered_edit_states =
-                            s.result_tabs.clear_orphaned_query_edit_backups();
+                        let mut result_tabs = s.result_tabs.clone();
+                        drop(s);
+
+                        result_tabs.finish_all_streaming();
+                        result_tabs.align_tab_strip_left();
+                        let recovered_save_states = result_tabs.clear_orphaned_save_requests();
+                        let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
+
+                        let mut s = state_for_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.fetch_row_counts.clear();
                         s.result_grid_execution_target = None;
                         s.result_tab_offset = s.result_tabs.tab_count();
@@ -2576,8 +2584,10 @@ impl MainWindow {
                         } else if needs_reset {
                             s.set_status_message("Ready");
                         }
+                        s.refresh_result_edit_controls();
+                    } else {
+                        s.refresh_result_edit_controls();
                     }
-                    s.refresh_result_edit_controls();
                 }
             }
         });
