@@ -259,18 +259,37 @@ impl Default for DatabaseConnection {
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static ORACLE_CLIENT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+static ORACLE_CLIENT_INIT_SUCCESS: OnceLock<()> = OnceLock::new();
+static ORACLE_CLIENT_INIT_ATTEMPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn ensure_oracle_client_initialized() -> Result<(), OracleError> {
-    let init_result = ORACLE_CLIENT_INIT.get_or_init(|| match InitParams::new().init() {
-        Ok(_) => Ok(()),
-        Err(err) => Err(err.to_string()),
-    });
+    if ORACLE_CLIENT_INIT_SUCCESS.get().is_some() {
+        return Ok(());
+    }
 
-    match init_result {
-        Ok(()) => Ok(()),
-        Err(message) => Err(OracleError::InternalError(format!(
-            "Failed to initialize Oracle client library: {message}"
+    let attempt_lock = ORACLE_CLIENT_INIT_ATTEMPT_LOCK.get_or_init(|| Mutex::new(()));
+    let _attempt_guard = match attempt_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            logging::log_warning(
+                "db::connection",
+                "oracle init lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        }
+    };
+
+    if ORACLE_CLIENT_INIT_SUCCESS.get().is_some() {
+        return Ok(());
+    }
+
+    match InitParams::new().init() {
+        Ok(_) => {
+            ORACLE_CLIENT_INIT_SUCCESS.get_or_init(|| ());
+            Ok(())
+        }
+        Err(err) => Err(OracleError::InternalError(format!(
+            "Failed to initialize Oracle client library: {err}"
         ))),
     }
 }
