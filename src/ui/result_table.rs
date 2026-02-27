@@ -295,8 +295,9 @@ impl ResultTableWidget {
                 };
                 let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
                 let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-                let is_original_null = Self::value_represents_null(original_value, &session.null_text)
-                    && Self::value_represents_null(current_value, &session.null_text);
+                let is_original_null =
+                    Self::value_represents_null(original_value, &session.null_text)
+                        && Self::value_represents_null(current_value, &session.null_text);
                 let is_modified = current_value != original_value || is_explicit_null;
                 (is_modified, is_explicit_null, is_original_null)
             }
@@ -306,7 +307,11 @@ impl ResultTableWidget {
                     .get(col_idx)
                     .map(|value| !value.is_empty())
                     .unwrap_or(false);
-                (is_explicit_null || has_non_empty_value, is_explicit_null, false)
+                (
+                    is_explicit_null || has_non_empty_value,
+                    is_explicit_null,
+                    false,
+                )
             }
         }
     }
@@ -318,7 +323,8 @@ impl ResultTableWidget {
         col_idx: usize,
         current_row: &[String],
     ) -> bool {
-        let (_, _, is_original_null) = Self::cell_edit_state(session, row_idx, col_idx, current_row);
+        let (_, _, is_original_null) =
+            Self::cell_edit_state(session, row_idx, col_idx, current_row);
         is_original_null
     }
 
@@ -875,7 +881,9 @@ impl ResultTableWidget {
                                             is_edited_cell,
                                             is_explicit_null_cell,
                                             is_original_null_cell,
-                                        ) = Self::cell_edit_state(session, row_idx, col_idx, row_data);
+                                        ) = Self::cell_edit_state(
+                                            session, row_idx, col_idx, row_data,
+                                        );
                                     }
                                 }
                             }
@@ -1568,7 +1576,10 @@ impl ResultTableWidget {
             let Some(session) = guard.as_ref() else {
                 return false;
             };
-            (session.rowid_col, Self::is_editable_column(session, col_idx))
+            (
+                session.rowid_col,
+                Self::is_editable_column(session, col_idx),
+            )
         };
 
         if col_idx == rowid_col {
@@ -2203,6 +2214,16 @@ impl ResultTableWidget {
                 if cy > mouse_y || cy >= data_bottom {
                     break;
                 }
+
+                // When row_position is temporarily stale, FLTK can return many
+                // off-screen rows before reaching the visible viewport. Use the
+                // observed row height to skip in larger steps.
+                if ch > 0 && cy + ch <= data_top {
+                    let hidden_px = data_top - (cy + ch);
+                    let skip = (hidden_px / ch).max(1);
+                    row = row.saturating_add(skip);
+                    continue;
+                }
             } else {
                 break;
             }
@@ -2234,7 +2255,8 @@ impl ResultTableWidget {
             }
         };
 
-        let mut col = start_col;
+        let scan_start_col = Self::skip_hidden_columns(table, row_hit, start_col, data_left, cols);
+        let mut col = scan_start_col;
         while col < cols {
             if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row_hit, col) {
                 if mouse_x >= cx && mouse_x < cx + cw {
@@ -2242,6 +2264,15 @@ impl ResultTableWidget {
                 }
                 if cx > mouse_x || cx >= data_right {
                     break;
+                }
+
+                // Skip multiple off-screen / already-passed columns at once to
+                // avoid O(total_columns) scans during drag-selection.
+                if cw > 0 && cx + cw <= mouse_x {
+                    let gap_px = mouse_x - (cx + cw);
+                    let skip = (gap_px / cw).max(1);
+                    col = col.saturating_add(skip);
+                    continue;
                 }
             } else {
                 break;
@@ -2281,7 +2312,13 @@ impl ResultTableWidget {
         }
 
         let mut visible_right: Option<i32> = None;
-        let mut col = start_col;
+        let mut col = Self::skip_hidden_columns(
+            table,
+            start_row,
+            start_col,
+            table.x() + table.row_header_width(),
+            cols,
+        );
         while col < cols {
             let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, start_row, col) else {
                 break;
@@ -2420,7 +2457,8 @@ impl ResultTableWidget {
             if hit_row.is_none() {
                 row = 0;
                 while row < start_row {
-                    if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col)
+                    if let Some((_, cy, _, ch)) =
+                        table.find_cell(TableContext::Cell, row, start_col)
                     {
                         if mouse_y >= cy && mouse_y < cy + ch {
                             hit_row = Some(row);
@@ -2444,7 +2482,7 @@ impl ResultTableWidget {
             last_col
         } else {
             let mut hit_col = None;
-            let mut col = start_col;
+            let mut col = Self::skip_hidden_columns(table, row, start_col, data_left, cols);
             while col < cols {
                 if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
                     if mouse_x >= cx && mouse_x < cx + cw {
@@ -2453,6 +2491,13 @@ impl ResultTableWidget {
                     }
                     if cx > mouse_x || cx >= data_right {
                         break;
+                    }
+
+                    if cw > 0 && cx + cw <= mouse_x {
+                        let gap_px = mouse_x - (cx + cw);
+                        let skip = (gap_px / cw).max(1);
+                        col = col.saturating_add(skip);
+                        continue;
                     }
                 } else {
                     break;
@@ -2480,6 +2525,35 @@ impl ResultTableWidget {
         };
 
         Some((row, col))
+    }
+
+    fn skip_hidden_columns(
+        table: &Table,
+        row: i32,
+        start_col: i32,
+        data_left: i32,
+        cols: i32,
+    ) -> i32 {
+        if row < 0 || start_col < 0 || cols <= 0 || start_col >= cols {
+            return start_col;
+        }
+
+        let mut col = start_col;
+        while col < cols {
+            let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) else {
+                break;
+            };
+
+            if cx + cw > data_left || cw <= 0 {
+                break;
+            }
+
+            let hidden_px = data_left - (cx + cw);
+            let skip = (hidden_px / cw).max(1);
+            col = col.saturating_add(skip);
+        }
+
+        col.min(cols.saturating_sub(1))
     }
 
     fn is_unquoted_identifier(text: &str) -> bool {
