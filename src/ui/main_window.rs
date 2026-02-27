@@ -2376,8 +2376,7 @@ impl MainWindow {
                         s.result_grid_execution_target,
                         index,
                     );
-                    s.result_tabs
-                        .start_statement(tab_index, &format!("Result {}", tab_index + 1));
+                    let mut result_tabs = s.result_tabs.clone();
                     s.fetch_row_counts.remove(&index);
                     let was_running = s.status_animation_running;
                     s.start_status_animation("Executing query...");
@@ -2385,6 +2384,8 @@ impl MainWindow {
                         MainWindow::start_status_animation_timer(&state_for_progress);
                     }
                     s.refresh_result_edit_controls();
+                    drop(s);
+                    result_tabs.start_statement(tab_index, &format!("Result {}", tab_index + 1));
                 }
                 QueryProgress::SelectStart {
                     index,
@@ -2408,8 +2409,7 @@ impl MainWindow {
                         s.result_grid_execution_target,
                         index,
                     );
-                    s.result_tabs
-                        .start_streaming(tab_index, &columns, &null_text);
+                    let mut result_tabs = s.result_tabs.clone();
                     s.fetch_row_counts.insert(index, 0);
                     s.last_fetch_status_update = Instant::now();
                     let was_running = s.status_animation_running;
@@ -2418,6 +2418,8 @@ impl MainWindow {
                         MainWindow::start_status_animation_timer(&state_for_progress);
                     }
                     s.refresh_result_edit_controls();
+                    drop(s);
+                    result_tabs.start_streaming(tab_index, &columns, &null_text);
                 }
                 QueryProgress::Rows { index, rows } => {
                     let has_live_connection = s.has_live_connection;
@@ -2438,7 +2440,7 @@ impl MainWindow {
                         index,
                     );
                     let rows_len = rows.len();
-                    s.result_tabs.append_rows(tab_index, rows);
+                    let mut result_tabs = s.result_tabs.clone();
                     let new_count = {
                         let count = s.fetch_row_counts.entry(index).or_insert(0);
                         *count += rows_len;
@@ -2448,6 +2450,8 @@ impl MainWindow {
                         s.update_status_animation(&format!("Fetching rows: {}", new_count));
                         s.last_fetch_status_update = Instant::now();
                     }
+                    drop(s);
+                    result_tabs.append_rows(tab_index, rows);
                 }
                 QueryProgress::ScriptOutput { lines } => {
                     s.result_tabs.append_script_output_lines(&lines);
@@ -2513,23 +2517,30 @@ impl MainWindow {
                         s.result_grid_execution_target,
                         index,
                     );
+                    let mut result_tabs = s.result_tabs.clone();
+                    let mut show_script_output = false;
+                    let mut script_lines: Vec<String> = Vec::new();
                     if !result.success && !result.message.trim().is_empty() {
-                        let lines: Vec<String> =
-                            result.message.lines().map(|l| l.to_string()).collect();
-                        s.result_tabs.append_script_output_lines(&lines);
-                        s.result_tabs.select_script_output();
-                    }
-                    if result.is_select {
-                        s.result_tabs.finish_streaming(tab_index);
-                        s.result_tabs.display_result(tab_index, &result);
-                    } else {
-                        s.result_tabs
-                            .start_statement(tab_index, &format!("Result {}", tab_index + 1));
-                        s.result_tabs.display_result(tab_index, &result);
+                        script_lines = result.message.lines().map(|l| l.to_string()).collect();
+                        show_script_output = true;
                     }
                     s.fetch_row_counts.remove(&index);
 
                     s.refresh_result_edit_controls();
+                    drop(s);
+
+                    if show_script_output {
+                        result_tabs.append_script_output_lines(&script_lines);
+                        result_tabs.select_script_output();
+                    }
+                    if result.is_select {
+                        result_tabs.finish_streaming(tab_index);
+                        result_tabs.display_result(tab_index, &result);
+                    } else {
+                        result_tabs
+                            .start_statement(tab_index, &format!("Result {}", tab_index + 1));
+                        result_tabs.display_result(tab_index, &result);
+                    }
                 }
                 QueryProgress::BatchFinished => {
                     let has_running_queries = s.sql_editor.is_query_running()
