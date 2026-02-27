@@ -273,7 +273,11 @@ impl ObjectBrowserWidget {
             }
 
             let mut disconnected = false;
-            // Process any pending messages
+            // Keep receiver lock scope minimal: drain messages first, then perform UI work.
+            // This prevents long lock hold while rebuilding tree widgets.
+            let mut latest_cache: Option<ObjectCache> = None;
+            let mut completed_count = 0u32;
+
             {
                 let r = receiver
                     .lock()
@@ -281,23 +285,10 @@ impl ObjectBrowserWidget {
                 loop {
                     match r.try_recv() {
                         Ok(RefreshEvent::Cache(cache)) => {
-                            {
-                                *object_cache
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = cache;
-                            }
-                            let filter_text = filter_input.value().to_lowercase();
-                            let cache = object_cache
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
-                            tree.redraw();
+                            latest_cache = Some(cache);
                         }
                         Ok(RefreshEvent::Completed) => {
-                            ObjectBrowserWidget::emit_status_callback(
-                                &status_callback,
-                                "Object browser metadata refresh completed",
-                            );
+                            completed_count = completed_count.saturating_add(1);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -306,6 +297,25 @@ impl ObjectBrowserWidget {
                         }
                     }
                 }
+            }
+
+            if let Some(cache) = latest_cache {
+                {
+                    let mut cache_guard = object_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *cache_guard = cache;
+                    let filter_text = filter_input.value().to_lowercase();
+                    ObjectBrowserWidget::populate_tree(&mut tree, &cache_guard, &filter_text);
+                }
+                tree.redraw();
+            }
+
+            for _ in 0..completed_count {
+                ObjectBrowserWidget::emit_status_callback(
+                    &status_callback,
+                    "Object browser metadata refresh completed",
+                );
             }
 
             if disconnected {
