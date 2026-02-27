@@ -4530,7 +4530,13 @@ impl ResultTableWidget {
         } else {
             String::new()
         };
-        if !result.is_select {
+        let should_render_message_only = !result.is_select
+            || (!result.success
+                && result.is_select
+                && result.rows.is_empty()
+                && result.columns.is_empty());
+
+        if should_render_message_only {
             self.clear_pending_stream_buffers();
             let font_size = *self
                 .font_size
