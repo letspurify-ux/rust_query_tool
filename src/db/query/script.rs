@@ -1425,7 +1425,8 @@ impl QueryExecutor {
                 Some(tail) => tail,
                 None => return rewritten_sql.to_string(),
             };
-            let projection_end = if let Some(comma_offset) = Self::find_first_top_level_comma(tail) {
+            let projection_end = if let Some(comma_offset) = Self::find_first_top_level_comma(tail)
+            {
                 cursor.saturating_add(comma_offset)
             } else {
                 select_list.len()
@@ -1440,7 +1441,9 @@ impl QueryExecutor {
             };
             let projection_trimmed = projection.trim();
             let projection_trimmed_end = projection.trim_end();
-            let trailing_ws_len = projection.len().saturating_sub(projection_trimmed_end.len());
+            let trailing_ws_len = projection
+                .len()
+                .saturating_sub(projection_trimmed_end.len());
             let suffix_ws = if trailing_ws_len == 0 {
                 ""
             } else {
@@ -1449,7 +1452,9 @@ impl QueryExecutor {
                     .unwrap_or("")
             };
 
-            let normalized_projection = if let Some(expr_token) = Self::leading_projection_token(projection_trimmed) {
+            let normalized_projection = if let Some(expr_token) =
+                Self::leading_projection_token(projection_trimmed)
+            {
                 let expr_upper = expr_token.to_ascii_uppercase();
                 if !expr_upper.starts_with("ROWIDTOCHAR(")
                     && (expr_upper == "ROWID" || expr_upper.ends_with(".ROWID"))

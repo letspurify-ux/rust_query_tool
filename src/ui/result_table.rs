@@ -12,9 +12,9 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
@@ -63,14 +63,12 @@ fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
     }
 }
 
-/// Flush to UI immediately on every received batch (no sender-side delay added here).
-/// Row batching and time-based throttling are handled on the sender side in execution.rs
-/// (PROGRESS_ROWS_INITIAL_BATCH / PROGRESS_ROWS_FLUSH_INTERVAL / PROGRESS_ROWS_MAX_BATCH).
-const UI_UPDATE_INTERVAL: Duration = Duration::from_millis(0);
-/// Maximum rows to buffer before forcing a UI update
-const MAX_BUFFERED_ROWS: usize = 500000;
 /// Stop computing column widths after this many rows (widths stabilize quickly)
 const WIDTH_SAMPLE_ROWS: usize = 5000;
+/// Limit stale row-position fallback scans so hit-testing stays responsive on huge datasets.
+const MAX_HITTEST_ROW_BACKTRACK: i32 = 4096;
+/// Limit stale column-position fallback scans for very wide result sets.
+const MAX_HITTEST_COL_BACKTRACK: i32 = 512;
 
 pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
 
@@ -88,13 +86,6 @@ fn mutex_store_bool(flag: &Arc<Mutex<bool>>, value: bool) {
             let mut guard = poisoned.into_inner();
             *guard = value;
         }
-    }
-}
-
-fn mutex_load_u64(value: &Arc<Mutex<u64>>) -> u64 {
-    match value.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
     }
 }
 
@@ -217,6 +208,8 @@ pub struct ResultTableWidget {
     full_data: Arc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
     max_cell_display_chars: Arc<Mutex<usize>>,
+    /// Lock-free mirror of max_cell_display_chars for hot draw path reads.
+    max_cell_display_chars_draw: Arc<AtomicUsize>,
     /// How many rows have been sampled for column width calculation
     width_sampled_rows: Arc<Mutex<usize>>,
     font_settings: Arc<SharedFontSettings>,
@@ -894,6 +887,9 @@ impl ResultTableWidget {
         ));
         let max_cell_display_chars =
             Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
+        let max_cell_display_chars_draw = Arc::new(AtomicUsize::new(
+            RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
+        ));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -947,7 +943,7 @@ impl ResultTableWidget {
         let full_data_for_draw = full_data.clone();
         let table_for_draw = table.clone();
         let font_settings_for_draw = font_settings.clone();
-        let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
+        let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let edit_session_for_draw = edit_session.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
@@ -993,99 +989,119 @@ impl ResultTableWidget {
                 TableContext::Cell => {
                     draw::push_clip(x, y, w, h);
                     let selected = table_for_draw.is_selected(row, col);
-                    let max_chars = *max_cell_display_chars_for_draw
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let max_chars = max_cell_display_chars_for_draw.load(Ordering::Relaxed);
                     let mut is_edited_cell = false;
                     let mut is_explicit_null_cell = false;
                     let mut is_original_null_cell = false;
-                    let mut cell_text: Option<String> = None;
-                    if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col))
-                    {
-                        let row_snapshot = full_data_for_draw
-                            .try_lock()
-                            .ok()
-                            .and_then(|data| data.get(row_idx).cloned());
-                        if let Some(row_data) = row_snapshot {
-                            cell_text = row_data.get(col_idx).cloned();
-                            if let Ok(session_guard) = edit_session_for_draw.try_lock() {
-                                if let Some(session) = session_guard.as_ref() {
-                                    (
-                                        is_edited_cell,
-                                        is_explicit_null_cell,
-                                        is_original_null_cell,
-                                    ) = Self::cell_edit_state(session, row_idx, col_idx, &row_data);
+                    let draw_cell_contents =
+                        |cell_value: Option<&str>,
+                         is_edited_cell: bool,
+                         is_explicit_null_cell: bool,
+                         is_original_null_cell: bool| {
+                            let is_null_cell = is_explicit_null_cell || is_original_null_cell;
+                            let (bg, fg) = if is_null_cell && is_edited_cell {
+                                // Explicit null on a modified cell: use a distinct
+                                // hybrid tint so the user can tell apart "originally
+                                // null, untouched" from "explicitly set to null".
+                                if selected {
+                                    (null_edited_sel_bg, null_edited_fg)
+                                } else {
+                                    (null_edited_bg, null_edited_fg)
+                                }
+                            } else if is_null_cell {
+                                if selected {
+                                    (null_sel_bg, null_cell_fg)
+                                } else {
+                                    (null_cell_bg, null_cell_fg)
+                                }
+                            } else if is_edited_cell {
+                                if selected {
+                                    (edited_sel_bg, edited_cell_fg)
+                                } else {
+                                    (edited_cell_bg, edited_cell_fg)
+                                }
+                            } else if selected {
+                                (sel_bg, cell_fg)
+                            } else {
+                                (cell_bg, cell_fg)
+                            };
+                            draw::draw_box(FrameType::FlatBox, x, y, w, h, bg);
+                            draw::set_draw_color(fg);
+                            draw::set_font(normal_font, font_size);
+
+                            if let Some(cell_val) = cell_value {
+                                if let Some(truncated_end) =
+                                    truncated_content_end(cell_val, max_chars)
+                                {
+                                    if truncated_end > 0 {
+                                        let visible = &cell_val[..truncated_end];
+                                        draw::draw_text2(
+                                            visible,
+                                            x + TABLE_CELL_PADDING,
+                                            y,
+                                            w - TABLE_CELL_PADDING * 2,
+                                            h,
+                                            Align::Left,
+                                        );
+                                    }
+                                    draw::draw_text2(
+                                        "…",
+                                        x + TABLE_CELL_PADDING,
+                                        y,
+                                        w - TABLE_CELL_PADDING * 2,
+                                        h,
+                                        Align::Right,
+                                    );
+                                } else {
+                                    draw::draw_text2(
+                                        cell_val,
+                                        x + TABLE_CELL_PADDING,
+                                        y,
+                                        w - TABLE_CELL_PADDING * 2,
+                                        h,
+                                        Align::Left,
+                                    );
                                 }
                             }
-                        }
-                    }
-                    let is_null_cell = is_explicit_null_cell || is_original_null_cell;
-                    let (bg, fg) = if is_null_cell && is_edited_cell {
-                        // Explicit null on a modified cell: use a distinct
-                        // hybrid tint so the user can tell apart "originally
-                        // null, untouched" from "explicitly set to null".
-                        if selected {
-                            (null_edited_sel_bg, null_edited_fg)
-                        } else {
-                            (null_edited_bg, null_edited_fg)
-                        }
-                    } else if is_null_cell {
-                        if selected {
-                            (null_sel_bg, null_cell_fg)
-                        } else {
-                            (null_cell_bg, null_cell_fg)
-                        }
-                    } else if is_edited_cell {
-                        if selected {
-                            (edited_sel_bg, edited_cell_fg)
-                        } else {
-                            (edited_cell_bg, edited_cell_fg)
-                        }
-                    } else if selected {
-                        (sel_bg, cell_fg)
-                    } else {
-                        (cell_bg, cell_fg)
-                    };
-                    draw::draw_box(FrameType::FlatBox, x, y, w, h, bg);
-                    draw::set_draw_color(fg);
-                    draw::set_font(normal_font, font_size);
 
-                    if let Some(cell_val) = cell_text.as_deref() {
-                        if let Some(truncated_end) = truncated_content_end(cell_val, max_chars) {
-                            if truncated_end > 0 {
-                                let visible = &cell_val[..truncated_end];
-                                draw::draw_text2(
-                                    visible,
-                                    x + TABLE_CELL_PADDING,
-                                    y,
-                                    w - TABLE_CELL_PADDING * 2,
-                                    h,
-                                    Align::Left,
+                            draw::set_draw_color(border_color);
+                            draw::draw_line(x, y + h - 1, x + w, y + h - 1);
+                            draw::draw_line(x + w - 1, y, x + w - 1, y + h);
+                        };
+
+                    if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col))
+                    {
+                        if let Ok(data) = full_data_for_draw.try_lock() {
+                            if let Some(row_data) = data.get(row_idx) {
+                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                    if let Some(session) = session_guard.as_ref() {
+                                        (
+                                            is_edited_cell,
+                                            is_explicit_null_cell,
+                                            is_original_null_cell,
+                                        ) = Self::cell_edit_state(
+                                            session, row_idx, col_idx, row_data,
+                                        );
+                                    }
+                                }
+                                draw_cell_contents(
+                                    row_data.get(col_idx).map(|value| value.as_str()),
+                                    is_edited_cell,
+                                    is_explicit_null_cell,
+                                    is_original_null_cell,
                                 );
+                                draw::pop_clip();
+                                return;
                             }
-                            draw::draw_text2(
-                                "…",
-                                x + TABLE_CELL_PADDING,
-                                y,
-                                w - TABLE_CELL_PADDING * 2,
-                                h,
-                                Align::Right,
-                            );
-                        } else {
-                            draw::draw_text2(
-                                cell_val,
-                                x + TABLE_CELL_PADDING,
-                                y,
-                                w - TABLE_CELL_PADDING * 2,
-                                h,
-                                Align::Left,
-                            );
                         }
                     }
 
-                    draw::set_draw_color(border_color);
-                    draw::draw_line(x, y + h - 1, x + w, y + h - 1);
-                    draw::draw_line(x + w - 1, y, x + w - 1, y + h);
+                    draw_cell_contents(
+                        None,
+                        is_edited_cell,
+                        is_explicit_null_cell,
+                        is_original_null_cell,
+                    );
                     draw::pop_clip();
                 }
                 _ => {}
@@ -1130,13 +1146,13 @@ impl ResultTableWidget {
                     // Left click - start drag selection
                     if button == app::MouseButton::Left as i32 {
                         let _ = table_for_handle.take_focus();
-                        let clicked_cell = Self::get_cell_at_mouse(&table_for_handle);
                         let target_cell = if app::event_clicks() {
-                            clicked_cell.or_else(|| {
-                                Self::resolve_double_click_target_cell(&table_for_handle)
-                            })
+                            // On double-click, prefer the already-selected single cell.
+                            // This avoids running a full mouse hit-test scan twice.
+                            Self::resolve_double_click_target_cell(&table_for_handle)
+                                .or_else(|| Self::get_cell_at_mouse(&table_for_handle))
                         } else {
-                            clicked_cell
+                            Self::get_cell_at_mouse(&table_for_handle)
                         };
 
                         if let Some((row, col)) = target_cell {
@@ -1453,6 +1469,7 @@ impl ResultTableWidget {
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
             full_data,
             max_cell_display_chars,
+            max_cell_display_chars_draw,
             width_sampled_rows: Arc::new(Mutex::new(0_usize)),
             font_settings,
             null_text,
@@ -2260,6 +2277,52 @@ impl ResultTableWidget {
         Ok(changed)
     }
 
+    fn fallback_scan_start(start: i32, max_backtrack: i32) -> i32 {
+        if start <= 0 {
+            return 0;
+        }
+
+        let limit = max_backtrack.max(0);
+        if start <= limit {
+            0
+        } else {
+            start.saturating_sub(limit)
+        }
+    }
+
+    fn estimate_row_hit(
+        table: &Table,
+        context: TableContext,
+        start_row: i32,
+        anchor_col: i32,
+        mouse_y: i32,
+        rows: i32,
+    ) -> Option<i32> {
+        if start_row < 0 || anchor_col < 0 || rows <= 0 || start_row >= rows {
+            return None;
+        }
+
+        let (_, start_y, _, row_h) = table.find_cell(context, start_row, anchor_col)?;
+        if row_h <= 0 {
+            return None;
+        }
+
+        let delta = mouse_y.saturating_sub(start_y);
+        let mut candidate = start_row.saturating_add(delta / row_h);
+        let last_row = rows.saturating_sub(1);
+        candidate = candidate.max(0).min(last_row);
+
+        let (_, candidate_y, _, candidate_h) = table.find_cell(context, candidate, anchor_col)?;
+        if candidate_h > 0
+            && mouse_y >= candidate_y
+            && mouse_y < candidate_y.saturating_add(candidate_h)
+        {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
     /// Get cell at mouse position (returns None if outside cells)
     fn get_cell_at_mouse(table: &Table) -> Option<(i32, i32)> {
         let rows = table.rows();
@@ -2304,31 +2367,40 @@ impl ResultTableWidget {
             }
         }
 
-        let mut row_hit = None;
-        let mut row = start_row;
-        while row < rows {
-            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) {
-                if mouse_y >= cy && mouse_y < cy + ch {
-                    row_hit = Some(row);
-                    break;
-                }
-                if cy > mouse_y || cy >= data_bottom {
-                    break;
-                }
+        let mut row_hit = Self::estimate_row_hit(
+            table,
+            TableContext::Cell,
+            start_row,
+            start_col,
+            mouse_y,
+            rows,
+        );
+        if row_hit.is_none() {
+            let mut row = start_row;
+            while row < rows {
+                if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) {
+                    if mouse_y >= cy && mouse_y < cy.saturating_add(ch) {
+                        row_hit = Some(row);
+                        break;
+                    }
+                    if cy > mouse_y || cy >= data_bottom {
+                        break;
+                    }
 
-                // When row_position is temporarily stale, FLTK can return many
-                // off-screen rows before reaching the visible viewport. Use the
-                // observed row height to skip in larger steps.
-                if ch > 0 && cy + ch <= data_top {
-                    let hidden_px = data_top - (cy + ch);
-                    let skip = (hidden_px / ch).max(1);
-                    row = row.saturating_add(skip);
-                    continue;
+                    // When row_position is temporarily stale, FLTK can return many
+                    // off-screen rows before reaching the visible viewport. Use the
+                    // observed row height to skip in larger steps.
+                    if ch > 0 && cy.saturating_add(ch) <= data_top {
+                        let hidden_px = data_top - cy.saturating_add(ch);
+                        let skip = (hidden_px / ch).max(1);
+                        row = row.saturating_add(skip);
+                        continue;
+                    }
+                } else {
+                    break;
                 }
-            } else {
-                break;
+                row += 1;
             }
-            row += 1;
         }
 
         let row_hit = match row_hit {
@@ -2338,10 +2410,10 @@ impl ResultTableWidget {
                 // 실제 렌더링 viewport와 잠시 어긋나는 경우가 있어,
                 // start_row 이후만 스캔하면 셀 hit-test가 실패할 수 있다.
                 // (사용자가 스크롤을 한 번 더 움직이면 정상화되는 현상)
-                row = 0;
+                let mut row = Self::fallback_scan_start(start_row, MAX_HITTEST_ROW_BACKTRACK);
                 while row < start_row {
                     if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, 0) {
-                        if mouse_y >= cy && mouse_y < cy + ch {
+                        if mouse_y >= cy && mouse_y < cy.saturating_add(ch) {
                             row_hit = Some(row);
                             break;
                         }
@@ -2474,26 +2546,17 @@ impl ResultTableWidget {
 
         let last_row = rows.saturating_sub(1);
         let start_row = table.row_position().max(0).min(last_row);
-        let mut row = start_row;
-        while row < rows {
-            if let Some((_, cy, _, ch)) = table.find_cell(TableContext::RowHeader, row, 0) {
-                if mouse_y >= cy && mouse_y < cy + ch {
-                    return Some(row);
-                }
-                if cy > mouse_y || cy >= data_bottom {
-                    break;
-                }
-            } else {
-                break;
-            }
-            row += 1;
+        if let Some(row) =
+            Self::estimate_row_hit(table, TableContext::RowHeader, start_row, 0, mouse_y, rows)
+        {
+            return Some(row);
         }
 
         // get_cell_at_mouse와 동일하게 row_position stale 케이스를 보완한다.
-        row = 0;
+        let mut row = Self::fallback_scan_start(start_row, MAX_HITTEST_ROW_BACKTRACK);
         while row < start_row {
             if let Some((_, cy, _, ch)) = table.find_cell(TableContext::RowHeader, row, 0) {
-                if mouse_y >= cy && mouse_y < cy + ch {
+                if mouse_y >= cy && mouse_y < cy.saturating_add(ch) {
                     return Some(row);
                 }
                 if cy > mouse_y || cy >= data_bottom {
@@ -2547,30 +2610,22 @@ impl ResultTableWidget {
         } else if mouse_y >= data_bottom {
             last_row
         } else {
-            let mut hit_row = None;
-            let mut row = start_row;
-            while row < rows {
-                if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) {
-                    if mouse_y >= cy && mouse_y < cy + ch {
-                        hit_row = Some(row);
-                        break;
-                    }
-                    if cy > mouse_y || cy >= data_bottom {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-                row += 1;
-            }
+            let mut hit_row = Self::estimate_row_hit(
+                table,
+                TableContext::Cell,
+                start_row,
+                start_col,
+                mouse_y,
+                rows,
+            );
 
             if hit_row.is_none() {
-                row = 0;
+                let mut row = Self::fallback_scan_start(start_row, MAX_HITTEST_ROW_BACKTRACK);
                 while row < start_row {
                     if let Some((_, cy, _, ch)) =
                         table.find_cell(TableContext::Cell, row, start_col)
                     {
-                        if mouse_y >= cy && mouse_y < cy + ch {
+                        if mouse_y >= cy && mouse_y < cy.saturating_add(ch) {
                             hit_row = Some(row);
                             break;
                         }
@@ -2616,7 +2671,7 @@ impl ResultTableWidget {
             }
 
             if hit_col.is_none() {
-                col = 0;
+                col = Self::fallback_scan_start(start_col, MAX_HITTEST_COL_BACKTRACK);
                 while col < start_col {
                     if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
                         if mouse_x >= cx && mouse_x < cx + cw {
@@ -5087,7 +5142,7 @@ impl ResultTableWidget {
         self.table.redraw();
     }
 
-    /// Append rows to the buffer. UI is updated periodically for performance.
+    /// Append rows and flush immediately so each progress message is rendered.
     pub fn append_rows(&mut self, rows: Vec<Vec<String>>) {
         if self.is_save_pending() {
             return;
@@ -5129,23 +5184,7 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(rows);
 
-        // Check if we should flush to UI
-        let should_flush = {
-            let now = Self::current_epoch_millis();
-            let last = mutex_load_u64(&self.last_flush_epoch_ms);
-            let elapsed_ms = now.saturating_sub(last);
-            let buffered_count = self
-                .pending_rows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len();
-            elapsed_ms >= UI_UPDATE_INTERVAL.as_millis() as u64
-                || buffered_count >= MAX_BUFFERED_ROWS
-        };
-
-        if should_flush {
-            self.flush_pending();
-        }
+        self.flush_pending();
     }
 
     /// Flush all pending rows to the UI.
@@ -5626,10 +5665,13 @@ impl ResultTableWidget {
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
+        let next = max_chars.max(1);
         *self
             .max_cell_display_chars
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = max_chars.max(1);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        self.max_cell_display_chars_draw
+            .store(next, Ordering::Relaxed);
         self.recalculate_widths_for_current_font();
         self.table.redraw();
     }
@@ -9223,6 +9265,7 @@ impl Default for ResultTableWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn matches_shortcut_key_accepts_current_ascii_key() {

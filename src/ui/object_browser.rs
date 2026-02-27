@@ -2255,6 +2255,13 @@ impl ObjectBrowserWidget {
 
 impl Drop for ObjectBrowserWidget {
     fn drop(&mut self) {
+        // Clones share the same underlying FLTK widgets and callback slots.
+        // Only the last owner may detach handlers, otherwise dropping a
+        // temporary clone can disable interactions in the live widget.
+        if Arc::strong_count(&self.poll_lifecycle) != 1 {
+            return;
+        }
+
         // Release callback closures early so captured state does not outlive
         // the widget tree unnecessarily.
         self.filter_input.set_callback(|_| {});

@@ -747,25 +747,18 @@ mod tests {
     }
 
     #[test]
-    fn resolved_password_for_saved_connection_keeps_current_input_when_missing_for_same_connection() {
-        let resolved = super::resolved_password_for_saved_connection(
-            "LOCAL",
-            "LOCAL",
-            "typed-password",
-            None,
-        );
+    fn resolved_password_for_saved_connection_keeps_current_input_when_missing_for_same_connection()
+    {
+        let resolved =
+            super::resolved_password_for_saved_connection("LOCAL", "LOCAL", "typed-password", None);
 
         assert_eq!(resolved, "typed-password");
     }
 
     #[test]
     fn resolved_password_for_saved_connection_clears_input_for_other_connection_when_missing() {
-        let resolved = super::resolved_password_for_saved_connection(
-            "LOCAL",
-            "DEV",
-            "typed-password",
-            None,
-        );
+        let resolved =
+            super::resolved_password_for_saved_connection("LOCAL", "DEV", "typed-password", None);
 
         assert_eq!(resolved, "");
     }

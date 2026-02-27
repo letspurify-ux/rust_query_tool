@@ -123,6 +123,7 @@ pub struct AppState {
     pub query_split_adjusted: Arc<Mutex<bool>>,
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
     has_live_connection: bool,
+    pending_connection_metadata_refresh: bool,
     pub config: Arc<Mutex<AppConfig>>,
     pub last_fetch_status_update: Instant,
     status_animation_running: bool,
@@ -609,6 +610,7 @@ impl MainWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state.has_live_connection = false;
+        state.pending_connection_metadata_refresh = false;
 
         // Disconnection can happen mid-stream (network drop,
         // explicit disconnect while a worker is still unwinding). Ensure every
@@ -1331,6 +1333,7 @@ impl MainWindow {
             query_split_adjusted: query_split_adjusted.clone(),
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
+            pending_connection_metadata_refresh: false,
             config: Arc::new(Mutex::new(config)),
             last_fetch_status_update: Instant::now(),
             status_animation_running: false,
@@ -2243,6 +2246,22 @@ impl MainWindow {
         })
     }
 
+    fn start_connection_metadata_refresh(
+        state: &mut AppState,
+        schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
+    ) {
+        state.object_browser.refresh();
+        let schema_sender = schema_sender.clone();
+        let connection = state.connection.clone();
+        thread::spawn(move || {
+            if let Some(update) = MainWindow::load_schema_update_for_current_connection(&connection)
+            {
+                let _ = schema_sender.send(update);
+                app::awake();
+            }
+        });
+    }
+
     fn attach_editor_callbacks(
         state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
@@ -2478,25 +2497,28 @@ impl MainWindow {
                 }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
+                        let has_running_queries = s.sql_editor.is_query_running()
+                            || s.editor_tabs
+                                .iter()
+                                .any(|tab| tab.sql_editor.is_query_running());
                         *s.connection_info
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
                         s.has_live_connection = true;
                         s.set_status_message(&format!("Connected | {}", info.name));
-                        s.object_browser.refresh();
                         s.sql_editor.focus();
                         s.refresh_connection_dependent_controls();
-
-                        let schema_sender = schema_sender_for_progress.clone();
-                        let connection = s.connection.clone();
-                        thread::spawn(move || {
-                            if let Some(update) =
-                                MainWindow::load_schema_update_for_current_connection(&connection)
-                            {
-                                let _ = schema_sender.send(update);
-                                app::awake();
-                            }
-                        });
+                        if has_running_queries {
+                            // CONNECT can appear mid-script. Deferring metadata fetch prevents
+                            // object-browser/schema workers from competing with the active batch.
+                            s.pending_connection_metadata_refresh = true;
+                        } else {
+                            MainWindow::start_connection_metadata_refresh(
+                                &mut s,
+                                &schema_sender_for_progress,
+                            );
+                            s.pending_connection_metadata_refresh = false;
+                        }
                     } else {
                         Self::transition_to_disconnected_state(&mut s, None);
                     }
@@ -2565,6 +2587,13 @@ impl MainWindow {
                         s.fetch_row_counts.clear();
                         s.result_grid_execution_target = None;
                         s.result_tab_offset = s.result_tabs.tab_count();
+                        if s.pending_connection_metadata_refresh && s.has_live_connection {
+                            MainWindow::start_connection_metadata_refresh(
+                                &mut s,
+                                &schema_sender_for_progress,
+                            );
+                            s.pending_connection_metadata_refresh = false;
+                        }
                         // Query execution completed and large temporary buffers may
                         // have been released during result materialization.
                         malloc_trim_process();
@@ -3882,82 +3911,67 @@ impl MainWindow {
                         break;
                     };
                     match r.try_recv() {
-                        Ok(result) => {
-                            match result {
-                                ConnectionResult::Success(info) => {
-                                    crate::utils::logging::log_info(
-                                        "connection",
-                                        &format!("Connected to {}", info.name),
-                                    );
-                                    *s.connection_info
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                        Some(info.clone());
-                                    s.has_live_connection = true;
-                                    s.status_bar
-                                        .set_label(&format!("Connected | {}", info.name));
-                                    s.object_browser.refresh();
-                                    s.sql_editor.focus();
-                                    s.refresh_connection_dependent_controls();
+                        Ok(result) => match result {
+                            ConnectionResult::Success(info) => {
+                                crate::utils::logging::log_info(
+                                    "connection",
+                                    &format!("Connected to {}", info.name),
+                                );
+                                *s.connection_info
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(info.clone());
+                                s.has_live_connection = true;
+                                s.pending_connection_metadata_refresh = false;
+                                s.status_bar
+                                    .set_label(&format!("Connected | {}", info.name));
+                                MainWindow::start_connection_metadata_refresh(
+                                    &mut s,
+                                    &schema_sender,
+                                );
+                                s.sql_editor.focus();
+                                s.refresh_connection_dependent_controls();
+                            }
+                            ConnectionResult::Failure(err) => {
+                                let current_connection = s
+                                    .connection_info
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone();
+                                let current_connection_label =
+                                    current_connection.as_ref().map(|info| info.name.clone());
 
-                                    // Start schema update after successful connection
-                                    let schema_sender = schema_sender.clone();
-                                    let connection = s.connection.clone();
-                                    thread::spawn(move || {
-                                        if let Some(update) =
-                                            MainWindow::load_schema_update_for_current_connection(
-                                                &connection,
-                                            )
-                                        {
-                                            let _ = schema_sender.send(update);
-                                            app::awake();
-                                        }
-                                    });
-                                }
-                                ConnectionResult::Failure(err) => {
-                                    let current_connection = s
-                                        .connection_info
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .clone();
-                                    let current_connection_label =
-                                        current_connection.as_ref().map(|info| info.name.clone());
-
-                                    if let Some(current_label) = current_connection_label {
-                                        crate::utils::logging::log_error(
+                                if let Some(current_label) = current_connection_label {
+                                    crate::utils::logging::log_error(
                                             "connection",
                                             &format!(
                                                 "Connection failed: {} (keeping current connection: {})",
                                                 err, current_label
                                             ),
                                         );
-                                        s.status_bar.set_label(&format_status(
-                                            "Connection failed; keeping current connection",
-                                            &current_connection,
-                                        ));
-                                        let lines = vec![
-                                            format!("Connection failed: {}", err),
-                                            format!(
-                                                "Keeping current connection: {}",
-                                                current_label
-                                            ),
-                                        ];
-                                        s.result_tabs.append_script_output_lines(&lines);
-                                    } else {
-                                        crate::utils::logging::log_error(
-                                            "connection",
-                                            &format!("Connection failed: {}", err),
-                                        );
-                                        s.status_bar.set_label("Connection failed");
-                                        s.result_tabs.append_script_output_lines(&[format!(
-                                            "Connection failed: {}",
-                                            err
-                                        )]);
-                                    }
-                                    s.result_tabs.select_script_output();
+                                    s.status_bar.set_label(&format_status(
+                                        "Connection failed; keeping current connection",
+                                        &current_connection,
+                                    ));
+                                    let lines = vec![
+                                        format!("Connection failed: {}", err),
+                                        format!("Keeping current connection: {}", current_label),
+                                    ];
+                                    s.result_tabs.append_script_output_lines(&lines);
+                                } else {
+                                    crate::utils::logging::log_error(
+                                        "connection",
+                                        &format!("Connection failed: {}", err),
+                                    );
+                                    s.status_bar.set_label("Connection failed");
+                                    s.result_tabs.append_script_output_lines(&[format!(
+                                        "Connection failed: {}",
+                                        err
+                                    )]);
                                 }
+                                s.result_tabs.select_script_output();
                             }
-                        }
+                        },
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             conn_disconnected = true;

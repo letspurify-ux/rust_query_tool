@@ -52,7 +52,10 @@ pub fn center_on_main(window: &mut Window) {
     };
 
     let (x, y) = if let Some((mx, my, mw, mh)) = target {
-        (mx + (mw - window.width()) / 2, my + (mh - window.height()) / 2)
+        (
+            mx + (mw - window.width()) / 2,
+            my + (mh - window.height()) / 2,
+        )
     } else {
         let (sw, sh) = app::screen_size();
         (
