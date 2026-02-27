@@ -2710,6 +2710,14 @@ impl ResultTableWidget {
             || lowered.contains("user requested cancel")
     }
 
+    fn is_query_cancel_message(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        lowered.contains("query cancelled")
+            || lowered.contains("query canceled")
+            || lowered.contains("ora-01013")
+            || lowered.contains("user requested cancel")
+    }
+
     fn is_connection_loss_message(message: &str) -> bool {
         let lowered = message.trim().to_ascii_lowercase();
         lowered.contains("not connected")
@@ -4508,6 +4516,19 @@ impl ResultTableWidget {
             }
             if self.restore_query_edit_backup() {
                 self.clear_pending_stream_buffers();
+                return;
+            }
+            if result.is_select
+                && Self::is_query_cancel_message(&result.message)
+                && self.table.rows() > 0
+            {
+                self.clear_pending_stream_buffers();
+                *self
+                    .source_sql
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = result.sql.clone();
+                self.refresh_auto_rowid_visibility();
+                self.table.redraw();
                 return;
             }
         } else if is_edit_mode_enabled && !result.is_select {
@@ -8083,6 +8104,49 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn display_result_keeps_streamed_rows_when_select_is_cancelled() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["EMPNO".to_string(), "ENAME".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(vec![vec!["7369".to_string(), "SMITH".to_string()]]);
+        widget.finish_streaming();
+
+        let cancelled = QueryResult {
+            sql: "SELECT EMPNO, ENAME FROM EMP".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: true,
+            success: false,
+        };
+
+        widget.display_result(&cancelled);
+
+        assert_eq!(
+            widget
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["EMPNO".to_string(), "ENAME".to_string()]
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[vec!["7369".to_string(), "SMITH".to_string()]]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn start_streaming_without_edit_session_clears_stale_backup_before_failure_result() {
         let mut widget = ResultTableWidget::new();
         widget.set_query_edit_backup(Some(QueryEditBackupState {
@@ -9184,7 +9248,6 @@ mod tests {
             &result,
         ));
     }
-
 
     #[test]
     fn connection_loss_message_matches_not_connected_text() {
