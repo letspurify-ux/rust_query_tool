@@ -113,6 +113,8 @@ struct DragState {
     is_dragging: bool,
     start_row: i32,
     start_col: i32,
+    last_row: i32,
+    last_col: i32,
 }
 
 #[derive(Clone)]
@@ -1021,6 +1023,8 @@ impl ResultTableWidget {
                             state.is_dragging = true;
                             state.start_row = row;
                             state.start_col = col;
+                            state.last_row = row;
+                            state.last_col = col;
                             table_for_handle.set_selection(row, col, row, col);
                             table_for_handle.redraw();
                             return true;
@@ -1037,13 +1041,20 @@ impl ResultTableWidget {
                         if let Some((row, col)) =
                             Self::get_cell_at_mouse_for_drag(&table_for_handle)
                         {
-                            let state = drag_state_for_handle
+                            let mut state = drag_state_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let r1 = state.start_row.min(row);
                             let r2 = state.start_row.max(row);
                             let c1 = state.start_col.min(col);
                             let c2 = state.start_col.max(col);
+
+                            if state.last_row == row && state.last_col == col {
+                                return true;
+                            }
+
+                            state.last_row = row;
+                            state.last_col = col;
                             drop(state);
                             table_for_handle.set_selection(r1, c1, r2, c2);
                             table_for_handle.redraw();
@@ -1058,6 +1069,8 @@ impl ResultTableWidget {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.is_dragging {
                         state.is_dragging = false;
+                        state.last_row = -1;
+                        state.last_col = -1;
                         return true;
                     }
                     false
@@ -2222,6 +2235,9 @@ impl ResultTableWidget {
             return None;
         }
 
+        let data_bottom = table.y() + table.h();
+        let data_right = table.x() + table.w();
+
         let mut visible_bottom: Option<i32> = None;
         let mut row = start_row;
         while row < rows {
@@ -2230,6 +2246,9 @@ impl ResultTableWidget {
             };
             let row_bottom = cy + ch;
             visible_bottom = Some(visible_bottom.map_or(row_bottom, |prev| prev.max(row_bottom)));
+            if row_bottom >= data_bottom {
+                break;
+            }
             row += 1;
         }
 
@@ -2241,6 +2260,9 @@ impl ResultTableWidget {
             };
             let col_right = cx + cw;
             visible_right = Some(visible_right.map_or(col_right, |prev| prev.max(col_right)));
+            if col_right >= data_right {
+                break;
+            }
             col += 1;
         }
 
@@ -2339,25 +2361,52 @@ impl ResultTableWidget {
         let data_right = table_x + table_w;
         let data_bottom = table_y + table_h;
 
-        // Clamp row
         let last_row = rows.saturating_sub(1);
         let last_col = cols.saturating_sub(1);
+        let start_row = table.row_position().max(0).min(last_row);
+        let start_col = table.col_position().max(0).min(last_col);
 
+        // Clamp row
         let row = if mouse_y < data_top {
             0
         } else if mouse_y >= data_bottom {
             last_row
         } else {
-            // Find row by iterating
-            (0..rows)
-                .find(|&r| {
-                    if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, r, 0) {
-                        mouse_y >= cy && mouse_y < cy + ch
-                    } else {
-                        false
+            let mut hit_row = None;
+            let mut row = start_row;
+            while row < rows {
+                if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) {
+                    if mouse_y >= cy && mouse_y < cy + ch {
+                        hit_row = Some(row);
+                        break;
                     }
-                })
-                .unwrap_or(last_row)
+                    if cy > mouse_y || cy >= data_bottom {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                row += 1;
+            }
+
+            if hit_row.is_none() {
+                row = 0;
+                while row < start_row {
+                    if let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col)
+                    {
+                        if mouse_y >= cy && mouse_y < cy + ch {
+                            hit_row = Some(row);
+                            break;
+                        }
+                        if cy > mouse_y || cy >= data_bottom {
+                            break;
+                        }
+                    }
+                    row += 1;
+                }
+            }
+
+            hit_row.unwrap_or(last_row)
         };
 
         // Clamp col
@@ -2366,15 +2415,40 @@ impl ResultTableWidget {
         } else if mouse_x >= data_right {
             last_col
         } else {
-            (0..cols)
-                .find(|&c| {
-                    if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, 0, c) {
-                        mouse_x >= cx && mouse_x < cx + cw
-                    } else {
-                        false
+            let mut hit_col = None;
+            let mut col = start_col;
+            while col < cols {
+                if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
+                    if mouse_x >= cx && mouse_x < cx + cw {
+                        hit_col = Some(col);
+                        break;
                     }
-                })
-                .unwrap_or(last_col)
+                    if cx > mouse_x || cx >= data_right {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                col += 1;
+            }
+
+            if hit_col.is_none() {
+                col = 0;
+                while col < start_col {
+                    if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row, col) {
+                        if mouse_x >= cx && mouse_x < cx + cw {
+                            hit_col = Some(col);
+                            break;
+                        }
+                        if cx > mouse_x || cx >= data_right {
+                            break;
+                        }
+                    }
+                    col += 1;
+                }
+            }
+
+            hit_col.unwrap_or(last_col)
         };
 
         Some((row, col))
