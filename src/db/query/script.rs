@@ -1410,44 +1410,94 @@ impl QueryExecutor {
         if !rewritten_sql.is_char_boundary(global_select_body_start) {
             return rewritten_sql.to_string();
         }
-        let select_body = match rewritten_sql.get(global_select_body_start..) {
-            Some(body) => body,
+        let select_list = match rewritten_sql.get(global_select_body_start..global_from_idx) {
+            Some(select_list) => select_list,
             None => return rewritten_sql.to_string(),
         };
-        let first_projection_end_idx =
-            if let Some(first_comma_offset) = Self::find_first_top_level_comma(select_body) {
-                global_select_body_start + first_comma_offset
-            } else {
-                global_from_idx
+
+        let mut rewritten_select_list = String::with_capacity(select_list.len().saturating_add(64));
+        let mut cursor = 0usize;
+        let mut projection_index = 0usize;
+        let mut changed = false;
+
+        while cursor < select_list.len() {
+            let tail = match select_list.get(cursor..) {
+                Some(tail) => tail,
+                None => return rewritten_sql.to_string(),
             };
-        if !rewritten_sql.is_char_boundary(first_projection_end_idx) {
+            let projection_end = if let Some(comma_offset) = Self::find_first_top_level_comma(tail) {
+                cursor.saturating_add(comma_offset)
+            } else {
+                select_list.len()
+            };
+            if !select_list.is_char_boundary(projection_end) {
+                return rewritten_sql.to_string();
+            }
+
+            let projection = match select_list.get(cursor..projection_end) {
+                Some(projection) => projection,
+                None => return rewritten_sql.to_string(),
+            };
+            let projection_trimmed = projection.trim();
+            let projection_trimmed_end = projection.trim_end();
+            let trailing_ws_len = projection.len().saturating_sub(projection_trimmed_end.len());
+            let suffix_ws = if trailing_ws_len == 0 {
+                ""
+            } else {
+                projection
+                    .get(projection.len().saturating_sub(trailing_ws_len)..)
+                    .unwrap_or("")
+            };
+
+            let normalized_projection = if let Some(expr_token) = Self::leading_projection_token(projection_trimmed) {
+                let expr_upper = expr_token.to_ascii_uppercase();
+                if !expr_upper.starts_with("ROWIDTOCHAR(")
+                    && (expr_upper == "ROWID" || expr_upper.ends_with(".ROWID"))
+                {
+                    changed = true;
+                    if projection_index == 0 {
+                        let mut replaced =
+                            "ROWIDTOCHAR(".to_string() + expr_token + ") AS SQ_INTERNAL_ROWID";
+                        replaced.push_str(suffix_ws);
+                        replaced
+                    } else {
+                        let trailing = projection_trimmed.get(expr_token.len()..).unwrap_or("");
+                        let mut replaced = "ROWIDTOCHAR(".to_string() + expr_token + ")" + trailing;
+                        replaced.push_str(suffix_ws);
+                        replaced
+                    }
+                } else {
+                    projection.trim_start().to_string()
+                }
+            } else {
+                projection.trim_start().to_string()
+            };
+
+            if !rewritten_select_list.is_empty() {
+                rewritten_select_list.push_str(", ");
+            }
+            rewritten_select_list.push_str(&normalized_projection);
+
+            if projection_end == select_list.len() {
+                break;
+            }
+            cursor = projection_end.saturating_add(1);
+            projection_index = projection_index.saturating_add(1);
+        }
+
+        if !changed {
             return rewritten_sql.to_string();
         }
 
-        let leading_expr = rewritten_sql
-            .get(global_select_body_start..first_projection_end_idx)
-            .unwrap_or("")
-            .trim();
-        if leading_expr.is_empty() {
-            return rewritten_sql.to_string();
-        }
-        let Some(leading_expr_token) = Self::leading_projection_token(leading_expr) else {
-            return rewritten_sql.to_string();
-        };
-        let leading_expr_upper = leading_expr_token.to_ascii_uppercase();
-        if leading_expr_upper.starts_with("ROWIDTOCHAR(") {
-            return rewritten_sql.to_string();
-        }
-        if leading_expr_upper != "ROWID" && !leading_expr_upper.ends_with(".ROWID") {
-            return rewritten_sql.to_string();
-        }
-
-        let replacement = format!("ROWIDTOCHAR({leading_expr_token}) AS SQ_INTERNAL_ROWID");
-        let mut normalized =
-            String::with_capacity(rewritten_sql.len().saturating_add(replacement.len()));
+        let mut normalized = String::with_capacity(
+            rewritten_sql
+                .len()
+                .saturating_sub(select_list.len())
+                .saturating_add(rewritten_select_list.len()),
+        );
         normalized.push_str(&rewritten_sql[..global_select_body_start]);
-        normalized.push_str(&replacement);
-        normalized.push_str(&rewritten_sql[first_projection_end_idx..]);
+        normalized.push_str(&rewritten_select_list);
+        normalized.push_str(&rewritten_sql[global_from_idx..]);
         normalized
     }
 

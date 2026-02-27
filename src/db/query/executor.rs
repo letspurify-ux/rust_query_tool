@@ -26,23 +26,12 @@ impl QueryExecutor {
 
     fn row_value_to_text(
         row: &Row,
-        column_type: &OracleType,
+        _column_type: &OracleType,
         index: usize,
     ) -> Result<String, OracleError> {
-        if matches!(column_type, OracleType::Rowid) {
-            // Avoid row.get::<_, String>() for ROWID columns. In some OCI/runtime
-            // combinations this generic conversion path can segfault intermittently.
-            // Reading SqlValue directly keeps conversion on rust-oracle's dedicated
-            // ROWID formatter path.
-            let Some(sql_value) = row.sql_values().get(index) else {
-                return Ok(String::new());
-            };
-            if sql_value.is_null()? {
-                return Ok("NULL".to_string());
-            }
-            return Ok(sql_value.to_string());
-        }
-
+        // ROWID columns should be normalized to ROWIDTOCHAR(...) in
+        // rowid_safe_execution_sql before fetch. Keep this path simple and fail-fast
+        // via OracleError if conversion is not possible.
         let value: Option<String> = row.get(index)?;
         Ok(value.unwrap_or_else(|| "NULL".to_string()))
     }
