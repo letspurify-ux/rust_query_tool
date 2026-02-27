@@ -821,36 +821,23 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
         let edit_session_for_draw = edit_session.clone();
 
-        let mut draw_font_profile = configured_editor_profile();
-        let mut draw_font_size = DEFAULT_FONT_SIZE as i32;
-        let mut draw_max_cell_display_chars = RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize;
-        let mut draw_has_edit_session = false;
-
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
+            let font_profile = *font_profile_for_draw
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let font_size = *font_size_for_draw
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                as i32;
             match ctx {
                 TableContext::StartPage => {
-                    draw_font_profile = *font_profile_for_draw
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    draw_font_size = *font_size_for_draw
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        as i32;
-                    draw_max_cell_display_chars = *max_cell_display_chars_for_draw
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    draw_has_edit_session = edit_session_for_draw
-                        .try_lock()
-                        .ok()
-                        .and_then(|session| session.as_ref().map(|_| ()))
-                        .is_some();
-                    draw::set_font(draw_font_profile.normal, draw_font_size);
+                    draw::set_font(font_profile.normal, font_size);
                 }
                 TableContext::ColHeader => {
                     draw::push_clip(x, y, w, h);
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
-                    draw::set_font(draw_font_profile.bold, draw_font_size);
+                    draw::set_font(font_profile.bold, font_size);
                     if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
@@ -871,7 +858,7 @@ impl ResultTableWidget {
                     draw::push_clip(x, y, w, h);
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
-                    draw::set_font(draw_font_profile.normal, draw_font_size);
+                    draw::set_font(font_profile.normal, font_size);
                     let text = (row + 1).to_string();
                     draw::draw_text2(&text, x, y, w - TABLE_CELL_PADDING, h, Align::Right);
                     draw::set_draw_color(border_color);
@@ -884,22 +871,19 @@ impl ResultTableWidget {
                     let mut is_edited_cell = false;
                     let mut is_explicit_null_cell = false;
                     let mut is_original_null_cell = false;
-                    if draw_has_edit_session {
-                        if let (Ok(row_idx), Ok(col_idx)) =
-                            (usize::try_from(row), usize::try_from(col))
-                        {
-                            if let Ok(data) = full_data_for_draw.try_lock() {
-                                if let Some(row_data) = data.get(row_idx) {
-                                    if let Ok(session_guard) = edit_session_for_draw.try_lock() {
-                                        if let Some(session) = session_guard.as_ref() {
-                                            (
-                                                is_edited_cell,
-                                                is_explicit_null_cell,
-                                                is_original_null_cell,
-                                            ) = Self::cell_edit_state(
-                                                session, row_idx, col_idx, row_data,
-                                            );
-                                        }
+                    if let (Ok(row_idx), Ok(col_idx)) = (usize::try_from(row), usize::try_from(col))
+                    {
+                        if let Ok(data) = full_data_for_draw.try_lock() {
+                            if let Some(row_data) = data.get(row_idx) {
+                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                                    if let Some(session) = session_guard.as_ref() {
+                                        (
+                                            is_edited_cell,
+                                            is_explicit_null_cell,
+                                            is_original_null_cell,
+                                        ) = Self::cell_edit_state(
+                                            session, row_idx, col_idx, row_data,
+                                        );
                                     }
                                 }
                             }
@@ -934,13 +918,16 @@ impl ResultTableWidget {
                     };
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, bg);
                     draw::set_draw_color(fg);
-                    draw::set_font(draw_font_profile.normal, draw_font_size);
+                    draw::set_font(font_profile.normal, font_size);
 
                     if let Ok(data) = full_data_for_draw.try_lock() {
                         if let Some(row_data) = data.get(row as usize) {
                             if let Some(cell_val) = row_data.get(col as usize) {
+                                let max_chars = *max_cell_display_chars_for_draw
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 if let Some(truncated_end) =
-                                    truncated_content_end(cell_val, draw_max_cell_display_chars)
+                                    truncated_content_end(cell_val, max_chars)
                                 {
                                     if truncated_end > 0 {
                                         let visible = &cell_val[..truncated_end];
