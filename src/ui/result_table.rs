@@ -98,6 +98,7 @@ pub struct ResultTableWidget {
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     edit_session: Arc<Mutex<Option<TableEditSession>>>,
     query_edit_backup: Arc<Mutex<Option<QueryEditBackupState>>>,
+    pre_stream_backup: Arc<Mutex<Option<StreamDataBackupState>>>,
     pending_save_request: Arc<Mutex<bool>>,
     pending_save_sql_signature: Arc<Mutex<Option<String>>>,
     pending_save_request_tag: Arc<Mutex<Option<String>>>,
@@ -151,6 +152,13 @@ struct QueryEditBackupState {
     full_data: Vec<Vec<String>>,
     source_sql: String,
     edit_session: TableEditSession,
+}
+
+#[derive(Clone)]
+struct StreamDataBackupState {
+    headers: Vec<String>,
+    full_data: Vec<Vec<String>>,
+    source_sql: String,
 }
 
 #[derive(Clone)]
@@ -291,6 +299,78 @@ impl ResultTableWidget {
             .query_edit_backup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup;
+    }
+
+    fn set_pre_stream_backup(&self, backup: Option<StreamDataBackupState>) {
+        *self
+            .pre_stream_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup;
+    }
+
+    fn stage_pre_stream_backup_from_current_state(&self) {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let full_data = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let source_sql = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.set_pre_stream_backup(Some(StreamDataBackupState {
+            headers,
+            full_data,
+            source_sql,
+        }));
+    }
+
+    fn restore_pre_stream_backup(&mut self) -> bool {
+        let backup = self
+            .pre_stream_backup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(backup) = backup else {
+            return false;
+        };
+
+        *self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.headers;
+        *self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.full_data;
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.source_sql;
+
+        let row_count = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as i32;
+        let col_count = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as i32;
+        self.table.set_rows(row_count);
+        self.table.set_cols(col_count);
+        self.apply_table_metrics_for_current_font();
+        self.recalculate_widths_for_current_font();
+        self.refresh_auto_rowid_visibility();
+        self.table.redraw();
+        true
     }
 
     fn restore_query_edit_backup(&mut self) -> bool {
@@ -721,6 +801,8 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(None));
         let edit_session: Arc<Mutex<Option<TableEditSession>>> = Arc::new(Mutex::new(None));
         let query_edit_backup: Arc<Mutex<Option<QueryEditBackupState>>> =
+            Arc::new(Mutex::new(None));
+        let pre_stream_backup: Arc<Mutex<Option<StreamDataBackupState>>> =
             Arc::new(Mutex::new(None));
         let pending_save_request: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let pending_save_sql_signature: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1298,6 +1380,7 @@ impl ResultTableWidget {
             execute_sql_callback,
             edit_session,
             query_edit_backup,
+            pre_stream_backup,
             pending_save_request,
             pending_save_sql_signature,
             pending_save_request_tag,
@@ -4474,6 +4557,7 @@ impl ResultTableWidget {
             if result.success {
                 self.clear_pending_stream_buffers();
                 self.set_query_edit_backup(None);
+                self.set_pre_stream_backup(None);
                 *self
                     .edit_session
                     .lock()
@@ -4489,6 +4573,7 @@ impl ResultTableWidget {
                 return;
             } else {
                 self.clear_pending_stream_buffers();
+                self.set_pre_stream_backup(None);
                 // Save failed: keep staged edits so users can fix and retry.
                 // Even if edit_session was unexpectedly cleared, do not replace
                 // the current grid with a transient error row.
@@ -4499,6 +4584,7 @@ impl ResultTableWidget {
             }
         } else if !result.success {
             if is_edit_mode_enabled {
+                self.set_pre_stream_backup(None);
                 self.clear_pending_stream_buffers();
                 // A regular query failed/cancelled while edit mode is active.
                 // Keep the staged grid data intact so the user can continue editing
@@ -4506,11 +4592,21 @@ impl ResultTableWidget {
                 self.set_query_edit_backup(None);
                 return;
             }
-            if self.restore_query_edit_backup() {
+            if result.is_select
+                && Self::is_execution_abort_message(&result.message)
+                && self.restore_pre_stream_backup()
+            {
                 self.clear_pending_stream_buffers();
                 return;
             }
+            if self.restore_query_edit_backup() {
+                self.set_pre_stream_backup(None);
+                self.clear_pending_stream_buffers();
+                return;
+            }
+            self.set_pre_stream_backup(None);
         } else if is_edit_mode_enabled && !result.is_select {
+            self.set_pre_stream_backup(None);
             self.clear_pending_stream_buffers();
             // Non-save non-select statements (e.g. COMMIT/ROLLBACK/DDL) can be
             // executed while a grid edit session is active. Keep staged rows
@@ -4521,6 +4617,7 @@ impl ResultTableWidget {
             return;
         } else {
             self.set_query_edit_backup(None);
+            self.set_pre_stream_backup(None);
             *self
                 .edit_session
                 .lock()
@@ -4591,6 +4688,7 @@ impl ResultTableWidget {
             return;
         }
 
+        self.set_pre_stream_backup(None);
         self.clear_pending_stream_buffers();
         let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
         let row_count = result.rows.len() as i32;
@@ -4680,13 +4778,16 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
             self.clear_pending_stream_buffers();
             self.set_query_edit_backup(None);
+            self.set_pre_stream_backup(None);
             self.table.redraw();
             return;
         }
 
         if let Some(session) = edit_session_snapshot {
+            self.set_pre_stream_backup(None);
             self.stage_query_edit_backup_from_current_state(session);
         } else {
+            self.stage_pre_stream_backup_from_current_state();
             // A brand-new query started without an active edit session.
             // Drop any stale backup from older interrupted runs so an unrelated
             // failure result cannot resurrect obsolete staged edits.
@@ -4946,6 +5047,7 @@ impl ResultTableWidget {
         // Save orphan recovery should not leave stale pre-query snapshots that
         // can be resurrected by a later unrelated batch-finished cleanup.
         self.set_query_edit_backup(None);
+        self.set_pre_stream_backup(None);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
@@ -4978,7 +5080,11 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         self.clear_pending_stream_buffers();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
-        self.restore_query_edit_backup()
+        if self.restore_query_edit_backup() {
+            self.set_pre_stream_backup(None);
+            return true;
+        }
+        self.restore_pre_stream_backup()
     }
 
     #[allow(dead_code)]
@@ -4989,6 +5095,7 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
+        self.set_pre_stream_backup(None);
         *self
             .edit_session
             .lock()
@@ -5360,6 +5467,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.set_query_edit_backup(None);
+        self.set_pre_stream_backup(None);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
         // Clear callbacks to release captured Arc<Mutex<T>> references.
@@ -7387,6 +7495,75 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         target_os = "macos",
         ignore = "FLTK widget tests require the process main thread on macOS"
     )]
+    fn display_result_restores_previous_grid_after_select_cancel_during_streaming() {
+        let mut widget = ResultTableWidget::new();
+        *widget
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["EMPNO".to_string(), "ENAME".to_string()];
+        *widget
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            "SELECT EMPNO, ENAME FROM EMP".to_string();
+        *widget
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![
+            vec!["7369".to_string(), "SMITH".to_string()],
+            vec!["7499".to_string(), "ALLEN".to_string()],
+        ];
+
+        widget.start_streaming(&["DEPTNO".to_string(), "DNAME".to_string()]);
+
+        let failed = QueryResult {
+            sql: "SELECT DEPTNO, DNAME FROM DEPT".to_string(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time: std::time::Duration::from_millis(1),
+            message: "Query cancelled".to_string(),
+            is_select: true,
+            success: false,
+        };
+
+        widget.display_result(&failed);
+
+        assert_eq!(
+            widget
+                .source_sql
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_str(),
+            "SELECT EMPNO, ENAME FROM EMP"
+        );
+        assert_eq!(
+            widget
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &["EMPNO".to_string(), "ENAME".to_string()]
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                vec!["7369".to_string(), "SMITH".to_string()],
+                vec!["7499".to_string(), "ALLEN".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
     fn commit_active_inline_edit_ignores_stale_editor_when_edit_mode_is_inactive() {
         let widget = ResultTableWidget::new();
         *widget
@@ -9184,7 +9361,6 @@ mod tests {
             &result,
         ));
     }
-
 
     #[test]
     fn connection_loss_message_matches_not_connected_text() {
