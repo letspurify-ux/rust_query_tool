@@ -257,14 +257,9 @@ impl Default for DatabaseConnection {
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static ACTIVE_DB_CONNECTION: OnceLock<Mutex<Option<Arc<Connection>>>> = OnceLock::new();
 
 fn db_activity_slot() -> &'static Mutex<Option<String>> {
     ACTIVE_DB_ACTIVITY.get_or_init(|| Mutex::new(None))
-}
-
-fn db_connection_slot() -> &'static Mutex<Option<Arc<Connection>>> {
-    ACTIVE_DB_CONNECTION.get_or_init(|| Mutex::new(None))
 }
 
 fn set_current_db_activity(activity: Option<String>) {
@@ -282,21 +277,6 @@ fn set_current_db_activity(activity: Option<String>) {
     }
 }
 
-fn set_current_db_connection(connection: Option<Arc<Connection>>) {
-    match db_connection_slot().lock() {
-        Ok(mut guard) => {
-            *guard = connection;
-        }
-        Err(poisoned) => {
-            logging::log_warning(
-                "db::connection",
-                "DB connection slot lock was poisoned; recovering",
-            );
-            *poisoned.into_inner() = connection;
-        }
-    }
-}
-
 pub fn current_db_activity() -> Option<String> {
     match db_activity_slot().lock() {
         Ok(guard) => guard.clone(),
@@ -304,19 +284,6 @@ pub fn current_db_activity() -> Option<String> {
             logging::log_warning(
                 "db::connection",
                 "DB activity lock was poisoned; recovering",
-            );
-            poisoned.into_inner().clone()
-        }
-    }
-}
-
-pub fn current_active_db_connection() -> Option<Arc<Connection>> {
-    match db_connection_slot().lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => {
-            logging::log_warning(
-                "db::connection",
-                "DB connection slot lock was poisoned; recovering",
             );
             poisoned.into_inner().clone()
         }
@@ -332,7 +299,6 @@ pub fn format_connection_busy_message() -> String {
 
 pub fn clear_tracked_db_activity() {
     set_current_db_activity(None);
-    set_current_db_connection(None);
 }
 
 pub struct ConnectionLockGuard<'a> {
@@ -343,16 +309,11 @@ pub struct ConnectionLockGuard<'a> {
 impl<'a> ConnectionLockGuard<'a> {
     fn with_activity(mut self, activity: String) -> Self {
         set_current_db_activity(Some(activity));
-        set_current_db_connection(self.guard.get_connection());
         self.tracks_activity = true;
         self
     }
 
-    pub fn refresh_tracked_connection(&self) {
-        if self.tracks_activity {
-            set_current_db_connection(self.guard.get_connection());
-        }
-    }
+    pub fn refresh_tracked_connection(&self) {}
 }
 
 impl<'a> Deref for ConnectionLockGuard<'a> {
@@ -373,7 +334,6 @@ impl<'a> Drop for ConnectionLockGuard<'a> {
     fn drop(&mut self) {
         if self.tracks_activity {
             set_current_db_activity(None);
-            set_current_db_connection(None);
         }
     }
 }
@@ -435,7 +395,6 @@ pub fn try_lock_connection_with_activity(
     match connection.try_lock() {
         Ok(guard) => {
             set_current_db_activity(Some(activity.into()));
-            set_current_db_connection(guard.get_connection());
             Some(ConnectionLockGuard {
                 guard,
                 tracks_activity: true,
@@ -449,7 +408,6 @@ pub fn try_lock_connection_with_activity(
             );
             let guard = poisoned.into_inner();
             set_current_db_activity(Some(activity.into()));
-            set_current_db_connection(guard.get_connection());
             Some(ConnectionLockGuard {
                 guard,
                 tracks_activity: true,
