@@ -30,16 +30,17 @@ impl QueryExecutor {
         index: usize,
     ) -> Result<String, OracleError> {
         if matches!(column_type, OracleType::Rowid) {
-            // Avoid direct String conversion through OCI for ROWID columns, which can
-            // segfault in some client/runtime combinations. Use oracle::RowId instead,
-            // which follows the safe OCI ROWID descriptor path (OCIRowidToChar).
+            // Avoid row.get::<_, String>() for ROWID columns. In some OCI/runtime
+            // combinations this generic conversion path can segfault intermittently.
+            // Reading SqlValue directly keeps conversion on rust-oracle's dedicated
+            // ROWID formatter path.
             let Some(sql_value) = row.sql_values().get(index) else {
                 return Ok(String::new());
             };
             if sql_value.is_null()? {
                 return Ok("NULL".to_string());
             }
-            return row.get::<usize, String>(index).or(Ok(String::new()));
+            return Ok(sql_value.to_string());
         }
 
         let value: Option<String> = row.get(index)?;
