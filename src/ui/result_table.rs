@@ -2140,6 +2140,17 @@ impl ResultTableWidget {
         let start_row = table.row_position().max(0).min(last_row);
         let start_col = table.col_position().max(0).min(last_col);
 
+        // Ignore clicks on scrollbar gutters (especially bottom horizontal scrollbar).
+        // When the mouse is outside the currently visible cell viewport, the fallback scan
+        // below can become expensive near the last row because it walks from 0..start_row.
+        if let Some((visible_right, visible_bottom)) =
+            Self::visible_cell_bounds(table, start_row, start_col)
+        {
+            if mouse_x >= visible_right || mouse_y >= visible_bottom {
+                return None;
+            }
+        }
+
         let mut row_hit = None;
         let mut row = start_row;
         while row < rows {
@@ -2198,6 +2209,45 @@ impl ResultTableWidget {
         }
 
         None
+    }
+
+    fn visible_cell_bounds(table: &Table, start_row: i32, start_col: i32) -> Option<(i32, i32)> {
+        if start_row < 0 || start_col < 0 {
+            return None;
+        }
+
+        let rows = table.rows();
+        let cols = table.cols();
+        if start_row >= rows || start_col >= cols {
+            return None;
+        }
+
+        let mut visible_bottom: Option<i32> = None;
+        let mut row = start_row;
+        while row < rows {
+            let Some((_, cy, _, ch)) = table.find_cell(TableContext::Cell, row, start_col) else {
+                break;
+            };
+            let row_bottom = cy + ch;
+            visible_bottom = Some(visible_bottom.map_or(row_bottom, |prev| prev.max(row_bottom)));
+            row += 1;
+        }
+
+        let mut visible_right: Option<i32> = None;
+        let mut col = start_col;
+        while col < cols {
+            let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, start_row, col) else {
+                break;
+            };
+            let col_right = cx + cw;
+            visible_right = Some(visible_right.map_or(col_right, |prev| prev.max(col_right)));
+            col += 1;
+        }
+
+        match (visible_right, visible_bottom) {
+            (Some(right), Some(bottom)) => Some((right, bottom)),
+            _ => None,
+        }
     }
 
     /// Get row index when mouse is over row header area.
