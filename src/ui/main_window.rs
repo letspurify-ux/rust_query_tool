@@ -3621,73 +3621,73 @@ impl MainWindow {
             Self::attach_editor_callbacks(&state, tab_id, schema_sender.clone());
         }
 
-        let mut state_borrow = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut object_browser, mut window) = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (s.object_browser.clone(), s.window.clone())
+        };
 
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
         let schema_refresh_in_progress = Arc::new(AtomicBool::new(false));
         let schema_refresh_guard_for_browser_status = schema_refresh_in_progress.clone();
-        state_borrow
-            .object_browser
-            .set_status_callback(move |message| {
-                let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
-                    return;
-                };
+        object_browser.set_status_callback(move |message| {
+            let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
+                return;
+            };
 
-                let mut should_retry_schema_sync = false;
-                let mut connection_for_retry: Option<SharedConnection> = None;
+            let mut should_retry_schema_sync = false;
+            let mut connection_for_retry: Option<SharedConnection> = None;
 
-                match state_for_status.try_lock() {
-                    Ok(mut s) => {
-                        let conn_info = s
-                            .connection_info
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        s.status_bar.set_label(&format_status(message, &conn_info));
+            match state_for_status.try_lock() {
+                Ok(mut s) => {
+                    let conn_info = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    s.status_bar.set_label(&format_status(message, &conn_info));
 
-                        if message == "Object browser metadata refresh completed"
-                            && conn_info.is_some()
-                        {
-                            should_retry_schema_sync = true;
-                            connection_for_retry = Some(s.connection.clone());
-                        }
-                    }
-                    Err(_) => {}
-                };
-
-                if should_retry_schema_sync {
-                    if let Some(connection) = connection_for_retry {
-                        if schema_refresh_guard_for_browser_status
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_err()
-                        {
-                            return;
-                        }
-
-                        let schema_sender = schema_sender_for_browser_status.clone();
-                        let schema_refresh_guard = schema_refresh_guard_for_browser_status.clone();
-                        thread::spawn(move || {
-                            if let Some(update) =
-                                MainWindow::load_schema_update_for_current_connection(&connection)
-                            {
-                                let _ = schema_sender.send(update);
-                                app::awake();
-                            }
-
-                            schema_refresh_guard.store(false, Ordering::Release);
-                        });
+                    if message == "Object browser metadata refresh completed" && conn_info.is_some()
+                    {
+                        should_retry_schema_sync = true;
+                        connection_for_retry = Some(s.connection.clone());
                     }
                 }
-            });
+                Err(_) => {}
+            };
+
+            if should_retry_schema_sync {
+                if let Some(connection) = connection_for_retry {
+                    if schema_refresh_guard_for_browser_status
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    let schema_sender = schema_sender_for_browser_status.clone();
+                    let schema_refresh_guard = schema_refresh_guard_for_browser_status.clone();
+                    thread::spawn(move || {
+                        if let Some(update) =
+                            MainWindow::load_schema_update_for_current_connection(&connection)
+                        {
+                            let _ = schema_sender.send(update);
+                            app::awake();
+                        }
+
+                        schema_refresh_guard.store(false, Ordering::Release);
+                    });
+                }
+            }
+        });
 
         let weak_state_for_browser = Arc::downgrade(&state);
         let schema_sender_for_browser = schema_sender.clone();
         let file_sender_for_browser = file_sender.clone();
-        state_borrow.object_browser.set_sql_callback(move |action| {
+        object_browser.set_sql_callback(move |action| {
             let Some(state_for_browser) = weak_state_for_browser.upgrade() else {
                 return;
             };
@@ -3746,7 +3746,7 @@ impl MainWindow {
         let schema_sender_for_window = schema_sender.clone();
         let conn_sender_for_window = conn_sender.clone();
         let file_sender_for_window = file_sender.clone();
-        state_borrow.window.handle(move |_w, ev| {
+        window.handle(move |_w, ev| {
             let Some(state_for_window) = weak_state_for_window.upgrade() else {
                 return false;
             };
@@ -3797,7 +3797,6 @@ impl MainWindow {
             }
         });
 
-        drop(state_borrow);
         self.setup_menu_callbacks(
             schema_sender,
             schema_receiver,
