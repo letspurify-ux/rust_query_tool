@@ -16,7 +16,6 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -35,6 +34,38 @@ use crate::ui::{
     QueryTabId, QueryTabsWidget, ResultTabsWidget, SqlAction, SqlEditorWidget,
 };
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
+
+fn try_set_mutex_flag(flag: &Arc<Mutex<bool>>) -> bool {
+    match flag.lock() {
+        Ok(mut guard) => {
+            if *guard {
+                false
+            } else {
+                *guard = true;
+                true
+            }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            if *guard {
+                false
+            } else {
+                *guard = true;
+                true
+            }
+        }
+    }
+}
+
+fn clear_mutex_flag(flag: &Arc<Mutex<bool>>) {
+    match flag.lock() {
+        Ok(mut guard) => *guard = false,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = false;
+        }
+    }
+}
 
 #[derive(Clone)]
 struct SchemaUpdate {
@@ -3631,7 +3662,7 @@ impl MainWindow {
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
-        let schema_refresh_in_progress = Arc::new(AtomicBool::new(false));
+        let schema_refresh_in_progress = Arc::new(Mutex::new(false));
         let schema_refresh_guard_for_browser_status = schema_refresh_in_progress.clone();
         object_browser.set_status_callback(move |message| {
             let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
@@ -3661,10 +3692,7 @@ impl MainWindow {
 
             if should_retry_schema_sync {
                 if let Some(connection) = connection_for_retry {
-                    if schema_refresh_guard_for_browser_status
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
+                    if !try_set_mutex_flag(&schema_refresh_guard_for_browser_status) {
                         return;
                     }
 
@@ -3678,7 +3706,7 @@ impl MainWindow {
                             app::awake();
                         }
 
-                        schema_refresh_guard.store(false, Ordering::Release);
+                        clear_mutex_flag(&schema_refresh_guard);
                     });
                 }
             }

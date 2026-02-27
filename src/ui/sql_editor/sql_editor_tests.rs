@@ -3,7 +3,6 @@ use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_KEYWORD, STYLE_STRING};
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 fn load_test_file(name: &str) -> String {
@@ -1826,11 +1825,11 @@ END;"#;
 
 #[test]
 fn finalize_execution_state_clears_running_and_cancel_flags() {
-    let query_running = Arc::new(AtomicBool::new(true));
-    let cancel_flag = Arc::new(AtomicBool::new(true));
+    let query_running = Arc::new(Mutex::new(true));
+    let cancel_flag = Arc::new(Mutex::new(true));
 
     SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-    assert!(!query_running.load(Ordering::SeqCst));
-    assert!(!cancel_flag.load(Ordering::SeqCst));
+    assert!(!load_mutex_bool(&query_running));
+    assert!(!load_mutex_bool(&cancel_flag));
 }

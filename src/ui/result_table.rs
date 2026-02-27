@@ -12,7 +12,7 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,73 @@ const MAX_BUFFERED_ROWS: usize = 500000;
 const WIDTH_SAMPLE_ROWS: usize = 5000;
 
 pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
+
+fn mutex_load_bool(flag: &Arc<Mutex<bool>>) -> bool {
+    match flag.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn mutex_store_bool(flag: &Arc<Mutex<bool>>, value: bool) {
+    match flag.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+        }
+    }
+}
+
+fn mutex_load_u64(value: &Arc<Mutex<u64>>) -> u64 {
+    match value.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn mutex_store_u64(value: &Arc<Mutex<u64>>, next: u64) {
+    match value.lock() {
+        Ok(mut guard) => *guard = next,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = next;
+        }
+    }
+}
+
+fn mutex_fetch_add_u64(value: &Arc<Mutex<u64>>, delta: u64) -> u64 {
+    match value.lock() {
+        Ok(mut guard) => {
+            let current = *guard;
+            *guard = guard.saturating_add(delta);
+            current
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            let current = *guard;
+            *guard = guard.saturating_add(delta);
+            current
+        }
+    }
+}
+
+fn mutex_load_usize(value: &Arc<Mutex<usize>>) -> usize {
+    match value.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn mutex_store_usize(value: &Arc<Mutex<usize>>, next: usize) {
+    match value.lock() {
+        Ok(mut guard) => *guard = next,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = next;
+        }
+    }
+}
 
 struct SharedFontSettings {
     normal_font: AtomicI32,
@@ -144,14 +211,14 @@ pub struct ResultTableWidget {
     /// Pending column width updates
     pending_widths: Arc<Mutex<Vec<i32>>>,
     /// Last UI update time in epoch milliseconds
-    last_flush_epoch_ms: Arc<AtomicU64>,
+    last_flush_epoch_ms: Arc<Mutex<u64>>,
     /// The sole data store: full original data (non-truncated).
     /// draw_cell reads from here on demand — no data duplication.
     full_data: Arc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
     max_cell_display_chars: Arc<Mutex<usize>>,
     /// How many rows have been sampled for column width calculation
-    width_sampled_rows: Arc<AtomicUsize>,
+    width_sampled_rows: Arc<Mutex<usize>>,
     font_settings: Arc<SharedFontSettings>,
     null_text: Arc<Mutex<String>>,
     source_sql: Arc<Mutex<String>>,
@@ -162,10 +229,10 @@ pub struct ResultTableWidget {
     pending_save_sql_signature: Arc<Mutex<Option<String>>>,
     pending_save_request_tag: Arc<Mutex<Option<String>>>,
     pending_save_statement_signatures: Arc<Mutex<Vec<String>>>,
-    next_save_request_id: Arc<AtomicU64>,
+    next_save_request_id: Arc<Mutex<u64>>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
-    streaming_in_progress: Arc<AtomicBool>,
+    streaming_in_progress: Arc<Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -242,9 +309,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.width_sampled_rows.store(0, Ordering::Relaxed);
-        self.last_flush_epoch_ms
-            .store(Self::current_epoch_millis(), Ordering::Relaxed);
+        mutex_store_usize(&self.width_sampled_rows, 0);
+        mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
     }
 
     fn row_state_explicit_null_cols(row_state: &EditRowState) -> &HashSet<usize> {
@@ -840,10 +906,10 @@ impl ResultTableWidget {
         let pending_save_request_tag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let pending_save_statement_signatures: Arc<Mutex<Vec<String>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let next_save_request_id = Arc::new(AtomicU64::new(1));
+        let next_save_request_id = Arc::new(Mutex::new(1_u64));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
-        let streaming_in_progress: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -1384,10 +1450,10 @@ impl ResultTableWidget {
             headers,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
-            last_flush_epoch_ms: Arc::new(AtomicU64::new(Self::current_epoch_millis())),
+            last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
             full_data,
             max_cell_display_chars,
-            width_sampled_rows: Arc::new(AtomicUsize::new(0)),
+            width_sampled_rows: Arc::new(Mutex::new(0_usize)),
             font_settings,
             null_text,
             source_sql,
@@ -1406,7 +1472,7 @@ impl ResultTableWidget {
     }
 
     fn is_streaming_in_progress(&self) -> bool {
-        self.streaming_in_progress.load(Ordering::Relaxed)
+        mutex_load_bool(&self.streaming_in_progress)
     }
 
     fn show_inline_cell_editor(
@@ -3961,7 +4027,7 @@ impl ResultTableWidget {
             s.push(';');
             s
         };
-        let request_id = self.next_save_request_id.fetch_add(1, Ordering::Relaxed);
+        let request_id = mutex_fetch_add_u64(&self.next_save_request_id, 1);
         let request_tag = format!("SQ_SAVE_REQUEST:{request_id}");
         let tagged_script = format!(
             "/* {request_tag} */
@@ -4672,7 +4738,7 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, false);
 
         // Query completion can race with an open inline editor focus change.
         // Commit any pending in-cell value first so failed/cancelled queries
@@ -4909,7 +4975,7 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
-        self.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, true);
 
         let save_pending = *self
             .pending_save_request
@@ -4944,7 +5010,7 @@ impl ResultTableWidget {
             // still pending. Since this path does not actually enter streaming,
             // keep the flag cleared so edit controls are not blocked waiting for
             // a finish event that may never arrive.
-            self.streaming_in_progress.store(false, Ordering::Relaxed);
+            mutex_store_bool(&self.streaming_in_progress, false);
             self.clear_pending_stream_buffers();
             self.set_query_edit_backup(None);
             self.table.redraw();
@@ -4973,9 +5039,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.last_flush_epoch_ms
-            .store(Self::current_epoch_millis(), Ordering::Relaxed);
-        self.width_sampled_rows.store(0, Ordering::Relaxed);
+        mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
+        mutex_store_usize(&self.width_sampled_rows, 0);
         self.source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5029,7 +5094,7 @@ impl ResultTableWidget {
         }
 
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
-        let sampled = self.width_sampled_rows.load(Ordering::Relaxed);
+        let sampled = mutex_load_usize(&self.width_sampled_rows);
         if sampled < WIDTH_SAMPLE_ROWS {
             let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
             let mut widths = self
@@ -5055,8 +5120,7 @@ impl ResultTableWidget {
                 );
             }
             drop(widths);
-            self.width_sampled_rows
-                .store(sampled + sample_count, Ordering::Relaxed);
+            mutex_store_usize(&self.width_sampled_rows, sampled + sample_count);
         }
 
         // Add rows to pending buffer
@@ -5068,7 +5132,7 @@ impl ResultTableWidget {
         // Check if we should flush to UI
         let should_flush = {
             let now = Self::current_epoch_millis();
-            let last = self.last_flush_epoch_ms.load(Ordering::Relaxed);
+            let last = mutex_load_u64(&self.last_flush_epoch_ms);
             let elapsed_ms = now.saturating_sub(last);
             let buffered_count = self
                 .pending_rows
@@ -5141,14 +5205,13 @@ impl ResultTableWidget {
         self.table.set_rows(new_total);
         self.apply_table_metrics_for_current_font();
 
-        self.last_flush_epoch_ms
-            .store(Self::current_epoch_millis(), Ordering::Relaxed);
+        mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         self.table.redraw();
     }
 
     /// Call this when streaming is complete to flush any remaining buffered rows
     pub fn finish_streaming(&mut self) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, false);
         self.flush_pending();
         self.table.redraw();
     }
@@ -5178,7 +5241,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, false);
         self.clear_pending_stream_buffers();
         // Save orphan recovery should not leave stale pre-query snapshots that
         // can be resurrected by a later unrelated batch-finished cleanup.
@@ -5209,7 +5272,7 @@ impl ResultTableWidget {
         }
         // Drop any buffered stream rows from the interrupted query before
         // restoring the backed-up edit dataset.
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, false);
         self.clear_pending_stream_buffers();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.restore_query_edit_backup()
@@ -5217,7 +5280,7 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        mutex_store_bool(&self.streaming_in_progress, false);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
         *self
@@ -5258,9 +5321,8 @@ impl ResultTableWidget {
             full_data.clear();
             full_data.shrink_to_fit();
         }
-        self.width_sampled_rows.store(0, Ordering::Relaxed);
-        self.last_flush_epoch_ms
-            .store(Self::current_epoch_millis(), Ordering::Relaxed);
+        mutex_store_usize(&self.width_sampled_rows, 0);
+        mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         *self
             .pending_save_request
             .lock()
@@ -7818,7 +7880,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
-        assert!(!widget.streaming_in_progress.load(Ordering::Relaxed));
+        assert!(!mutex_load_bool(&widget.streaming_in_progress));
         assert!(widget
             .edit_session
             .lock()
@@ -8131,7 +8193,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
         widget.start_streaming(&headers);
 
-        assert!(!widget.streaming_in_progress.load(Ordering::Relaxed));
+        assert!(!mutex_load_bool(&widget.streaming_in_progress));
 
         let rows = widget
             .full_data
@@ -8498,7 +8560,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&widget.streaming_in_progress, true);
 
         assert_eq!(
             widget.insert_row_in_edit_mode(),
@@ -8530,7 +8592,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&widget.streaming_in_progress, true);
 
         let result = widget.save_edit_mode();
         assert_eq!(
@@ -8802,7 +8864,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&widget.streaming_in_progress, true);
 
         let result = widget.cancel_edit_mode();
         assert_eq!(
@@ -9114,7 +9176,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&widget.streaming_in_progress, true);
 
         let result = widget.begin_edit_mode();
 
@@ -9146,7 +9208,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        mutex_store_bool(&widget.streaming_in_progress, true);
 
         assert!(!widget.can_begin_edit_mode());
     }
@@ -9566,7 +9628,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(120);
-        widget.width_sampled_rows.store(7, Ordering::Relaxed);
+        mutex_store_usize(&widget.width_sampled_rows, 7);
         *widget
             .pending_save_request
             .lock()
@@ -9583,7 +9645,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
-        assert_eq!(widget.width_sampled_rows.load(Ordering::Relaxed), 0);
+        assert_eq!(mutex_load_usize(&widget.width_sampled_rows), 0);
     }
 
     #[test]

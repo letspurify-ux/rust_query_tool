@@ -10,9 +10,9 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,23 @@ use crate::ui::theme;
 use crate::ui::{center_on_main, configured_ui_font_size, ResultTableWidget};
 
 use super::SqlEditorWidget;
+
+fn load_mutex_bool(flag: &Arc<Mutex<bool>>) -> bool {
+    match flag.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn store_mutex_bool(flag: &Arc<Mutex<bool>>, value: bool) {
+    match flag.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum StorageViewMode {
@@ -754,13 +771,13 @@ impl SqlEditorWidget {
             app::awake();
         });
 
-        let auto_refresh_enabled = Arc::new(AtomicBool::new(false));
+        let auto_refresh_enabled = Arc::new(Mutex::new(false));
         let auto_refresh_enabled_for_toggle = Arc::clone(&auto_refresh_enabled);
         auto_refresh_check.set_callback(move |check| {
-            auto_refresh_enabled_for_toggle.store(check.value(), Ordering::SeqCst);
+            store_mutex_bool(&auto_refresh_enabled_for_toggle, check.value());
         });
 
-        let stop_auto_signal = Arc::new(AtomicBool::new(false));
+        let stop_auto_signal = Arc::new(Mutex::new(false));
         let stop_auto_signal_for_thread = Arc::clone(&stop_auto_signal);
         let auto_refresh_enabled_for_thread = Arc::clone(&auto_refresh_enabled);
         let sender_tick = sender.clone();
@@ -770,12 +787,12 @@ impl SqlEditorWidget {
                     / SQL_MONITOR_AUTO_REFRESH_POLL_MS)
                     .max(1);
             let mut poll_count = 0u64;
-            while !stop_auto_signal_for_thread.load(Ordering::SeqCst) {
+            while !load_mutex_bool(&stop_auto_signal_for_thread) {
                 thread::sleep(Duration::from_millis(SQL_MONITOR_AUTO_REFRESH_POLL_MS));
-                if stop_auto_signal_for_thread.load(Ordering::SeqCst) {
+                if load_mutex_bool(&stop_auto_signal_for_thread) {
                     break;
                 }
-                if auto_refresh_enabled_for_thread.load(Ordering::SeqCst) {
+                if load_mutex_bool(&auto_refresh_enabled_for_thread) {
                     poll_count = poll_count.saturating_add(1);
                     if poll_count >= polls_per_refresh {
                         poll_count = 0;
@@ -1128,7 +1145,7 @@ impl SqlEditorWidget {
             }
         }
 
-        stop_auto_signal.store(true, Ordering::SeqCst);
+        store_mutex_bool(&stop_auto_signal, true);
         let _ = auto_thread.join();
 
         set_cursor(Cursor::Default);
