@@ -2223,9 +2223,9 @@ impl MainWindow {
         data.get_all_columns_for_highlighting()
     }
 
-    fn current_connection_generation(state: &AppState) -> u64 {
-        lock_connection_with_activity(&state.connection, "Checking schema update generation")
-            .connection_generation()
+    fn current_connection_generation(state: &AppState) -> Option<u64> {
+        try_lock_connection_with_activity(&state.connection, "Checking schema update generation")
+            .map(|guard| guard.connection_generation())
     }
 
     fn load_schema_update_for_current_connection(
@@ -3922,7 +3922,13 @@ impl MainWindow {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let current_generation = match state.try_lock() {
-                    Ok(s) => MainWindow::current_connection_generation(&s),
+                    Ok(s) => match MainWindow::current_connection_generation(&s) {
+                        Some(generation) => generation,
+                        None => {
+                            deferred_by_borrow_conflict = true;
+                            0
+                        }
+                    },
                     Err(_) => {
                         deferred_by_borrow_conflict = true;
                         0
