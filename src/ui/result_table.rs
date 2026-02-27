@@ -2,7 +2,7 @@ use fltk::{
     app,
     button::Button,
     draw,
-    enums::{Align, CallbackTrigger, Event, FrameType, Key, Shortcut},
+    enums::{Align, CallbackTrigger, Event, Font, FrameType, Key, Shortcut},
     group::Group,
     input::Input,
     menu::MenuButton,
@@ -12,7 +12,7 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,67 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 
 pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
 
+struct SharedFontSettings {
+    normal_font: AtomicI32,
+    bold_font: AtomicI32,
+    italic_font: AtomicI32,
+    font_size: AtomicU32,
+}
+
+impl SharedFontSettings {
+    fn new(profile: FontProfile, size: u32) -> Self {
+        Self {
+            normal_font: AtomicI32::new(profile.normal.bits()),
+            bold_font: AtomicI32::new(profile.bold.bits()),
+            italic_font: AtomicI32::new(profile.italic.bits()),
+            font_size: AtomicU32::new(size),
+        }
+    }
+
+    fn normal_font(&self) -> Font {
+        usize::try_from(self.normal_font.load(Ordering::Relaxed))
+            .ok()
+            .map(Font::by_index)
+            .unwrap_or(Font::Helvetica)
+    }
+
+    fn bold_font(&self) -> Font {
+        usize::try_from(self.bold_font.load(Ordering::Relaxed))
+            .ok()
+            .map(Font::by_index)
+            .unwrap_or(Font::HelveticaBold)
+    }
+
+    fn italic_font(&self) -> Font {
+        usize::try_from(self.italic_font.load(Ordering::Relaxed))
+            .ok()
+            .map(Font::by_index)
+            .unwrap_or(Font::HelveticaItalic)
+    }
+
+    fn profile(&self) -> FontProfile {
+        FontProfile {
+            name: "Shared",
+            normal: self.normal_font(),
+            bold: self.bold_font(),
+            italic: self.italic_font(),
+        }
+    }
+
+    fn size(&self) -> u32 {
+        self.font_size.load(Ordering::Relaxed)
+    }
+
+    fn update(&self, profile: FontProfile, size: u32) {
+        self.normal_font
+            .store(profile.normal.bits(), Ordering::Relaxed);
+        self.bold_font.store(profile.bold.bits(), Ordering::Relaxed);
+        self.italic_font
+            .store(profile.italic.bits(), Ordering::Relaxed);
+        self.font_size.store(size, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct ResultTableWidget {
     table: Table,
@@ -91,8 +152,7 @@ pub struct ResultTableWidget {
     max_cell_display_chars: Arc<Mutex<usize>>,
     /// How many rows have been sampled for column width calculation
     width_sampled_rows: Arc<Mutex<usize>>,
-    font_profile: Arc<Mutex<FontProfile>>,
-    font_size: Arc<Mutex<u32>>,
+    font_settings: Arc<SharedFontSettings>,
     null_text: Arc<Mutex<String>>,
     source_sql: Arc<Mutex<String>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
@@ -601,10 +661,7 @@ impl ResultTableWidget {
     }
 
     fn apply_table_metrics_for_current_font(&mut self) {
-        let font_size = *self
-            .font_size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let font_size = self.font_settings.size();
         self.table
             .set_row_height_all(Self::row_height_for_font(font_size));
         self.table
@@ -710,10 +767,7 @@ impl ResultTableWidget {
             return;
         }
 
-        let font_size = *self
-            .font_size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let font_size = self.font_settings.size();
         let max_cell_display_chars = *self
             .max_cell_display_chars
             .lock()
@@ -760,8 +814,10 @@ impl ResultTableWidget {
     pub fn with_size(x: i32, y: i32, w: i32, h: i32) -> Self {
         let headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let full_data: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let font_profile = Arc::new(Mutex::new(configured_editor_profile()));
-        let font_size = Arc::new(Mutex::new(DEFAULT_FONT_SIZE as u32));
+        let font_settings = Arc::new(SharedFontSettings::new(
+            configured_editor_profile(),
+            DEFAULT_FONT_SIZE as u32,
+        ));
         let max_cell_display_chars =
             Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
@@ -816,28 +872,23 @@ impl ResultTableWidget {
         let headers_for_draw = headers.clone();
         let full_data_for_draw = full_data.clone();
         let table_for_draw = table.clone();
-        let font_profile_for_draw = font_profile.clone();
-        let font_size_for_draw = font_size.clone();
+        let font_settings_for_draw = font_settings.clone();
         let max_cell_display_chars_for_draw = max_cell_display_chars.clone();
         let edit_session_for_draw = edit_session.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
-            let font_profile = *font_profile_for_draw
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let font_size = *font_size_for_draw
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                as i32;
+            let normal_font = font_settings_for_draw.normal_font();
+            let bold_font = font_settings_for_draw.bold_font();
+            let font_size = font_settings_for_draw.size() as i32;
             match ctx {
                 TableContext::StartPage => {
-                    draw::set_font(font_profile.normal, font_size);
+                    draw::set_font(normal_font, font_size);
                 }
                 TableContext::ColHeader => {
                     draw::push_clip(x, y, w, h);
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
-                    draw::set_font(font_profile.bold, font_size);
+                    draw::set_font(bold_font, font_size);
                     if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
@@ -858,7 +909,7 @@ impl ResultTableWidget {
                     draw::push_clip(x, y, w, h);
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
-                    draw::set_font(font_profile.normal, font_size);
+                    draw::set_font(normal_font, font_size);
                     let text = (row + 1).to_string();
                     draw::draw_text2(&text, x, y, w - TABLE_CELL_PADDING, h, Align::Right);
                     draw::set_draw_color(border_color);
@@ -918,7 +969,7 @@ impl ResultTableWidget {
                     };
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, bg);
                     draw::set_draw_color(fg);
-                    draw::set_font(font_profile.normal, font_size);
+                    draw::set_font(normal_font, font_size);
 
                     if let Ok(data) = full_data_for_draw.try_lock() {
                         if let Some(row_data) = data.get(row as usize) {
@@ -977,8 +1028,7 @@ impl ResultTableWidget {
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
-        let font_profile_for_handle = font_profile.clone();
-        let font_size_for_handle = font_size.clone();
+        let font_settings_for_handle = font_settings.clone();
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
         let edit_session_for_handle = edit_session.clone();
@@ -1016,16 +1066,8 @@ impl ResultTableWidget {
                                 // event loop so the full_data lock is released first.
                                 // Use try_lock() so a streaming flush that is currently
                                 // mutating the backing data never blocks the UI thread.
-                                let current_font_profile = {
-                                    *font_profile_for_handle
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                };
-                                let current_font_size = {
-                                    *font_size_for_handle
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                };
+                                let current_font_profile = font_settings_for_handle.profile();
+                                let current_font_size = font_settings_for_handle.size();
                                 if Self::try_edit_cell_in_edit_mode(
                                     &table_for_handle,
                                     &headers_for_handle,
@@ -1044,16 +1086,8 @@ impl ResultTableWidget {
                                 let cell_val_owned =
                                     Self::try_clone_cell_value(&full_data_for_handle, row, col);
                                 if let Some(cell_val) = cell_val_owned {
-                                    let current_font_profile = {
-                                        *font_profile_for_handle
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    };
-                                    let current_font_size = {
-                                        *font_size_for_handle
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    };
+                                    let current_font_profile = font_settings_for_handle.profile();
+                                    let current_font_size = font_settings_for_handle.size();
                                     Self::show_cell_text_dialog(
                                         &cell_val,
                                         current_font_profile,
@@ -1201,16 +1235,8 @@ impl ResultTableWidget {
                                 .is_some();
 
                         if can_edit {
-                            let current_font_profile = {
-                                *font_profile_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            };
-                            let current_font_size = {
-                                *font_size_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            };
+                            let current_font_profile = font_settings_for_handle.profile();
+                            let current_font_size = font_settings_for_handle.size();
                             if let Some((row, col)) = Self::resolve_update_target_cell(
                                 table_for_handle.get_selection(),
                                 table_for_handle.rows().max(0) as usize,
@@ -1349,8 +1375,7 @@ impl ResultTableWidget {
             full_data,
             max_cell_display_chars,
             width_sampled_rows: Arc::new(Mutex::new(0)),
-            font_profile,
-            font_size,
+            font_settings,
             null_text,
             source_sql,
             execute_sql_callback,
@@ -3602,14 +3627,8 @@ impl ResultTableWidget {
                 new_row_index as i32,
                 first_col as i32,
             );
-            let profile = *self
-                .font_profile
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let size = *self
-                .font_size
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let profile = self.font_settings.profile();
+            let size = self.font_settings.size();
             if let Some(value) = Self::show_inline_cell_editor(
                 &self.table,
                 new_row_index as i32,
@@ -4786,10 +4805,7 @@ impl ResultTableWidget {
 
         if should_render_message_only {
             self.clear_pending_stream_buffers();
-            let font_size = *self
-                .font_size
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let font_size = self.font_settings.size();
             let max_cell_display_chars = *self
                 .max_cell_display_chars
                 .lock()
@@ -4845,10 +4861,7 @@ impl ResultTableWidget {
         self.table.set_cols(col_count);
         self.apply_table_metrics_for_current_font();
 
-        let font_size = *self
-            .font_size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let font_size = self.font_settings.size();
         let max_cell_display_chars = *self
             .max_cell_display_chars
             .lock()
@@ -4978,10 +4991,7 @@ impl ResultTableWidget {
             Self::detect_auto_hidden_rowid_col(headers, "", edit_mode_enabled);
 
         // Initialize pending widths based on headers
-        let font_size = *self
-            .font_size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let font_size = self.font_settings.size();
         let initial_widths: Vec<i32> = headers
             .iter()
             .map(|h| Self::estimate_text_width(h, font_size))
@@ -5024,12 +5034,7 @@ impl ResultTableWidget {
                 .pending_widths
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let min_width = Self::min_col_width_for_font(
-                *self
-                    .font_size
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
+            let min_width = Self::min_col_width_for_font(self.font_settings.size());
             let max_cell_display_chars = *self
                 .max_cell_display_chars
                 .lock()
@@ -5043,10 +5048,7 @@ impl ResultTableWidget {
                 Self::update_widths_with_row(
                     &mut widths,
                     row,
-                    *self
-                        .font_size
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    self.font_settings.size(),
                     max_cell_display_chars,
                 );
             }
@@ -5566,14 +5568,7 @@ impl ResultTableWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        *self
-            .font_profile
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = profile;
-        *self
-            .font_size
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
+        self.font_settings.update(profile, size);
         self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
         // Force FLTK to recalculate the table's internal layout after
