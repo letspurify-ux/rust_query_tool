@@ -491,7 +491,7 @@ pub struct SqlEditorWidget {
     progress_sender: mpsc::Sender<QueryProgress>,
     column_sender: mpsc::Sender<ColumnLoadUpdate>,
     ui_action_sender: mpsc::Sender<UiActionResult>,
-    query_running: Arc<Mutex<bool>>,
+    query_running: Arc<AtomicBool>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     cancel_flag: Arc<AtomicBool>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
@@ -755,7 +755,7 @@ impl SqlEditorWidget {
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
         let (column_sender, column_receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
-        let query_running = Arc::new(Mutex::new(false));
+        let query_running = Arc::new(AtomicBool::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
@@ -859,7 +859,7 @@ impl SqlEditorWidget {
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
         progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
-        query_running: Arc<Mutex<bool>>,
+        query_running: Arc<AtomicBool>,
     ) {
         let execute_callback = self.execute_callback.clone();
         let cancel_flag = self.cancel_flag.clone();
@@ -872,7 +872,7 @@ impl SqlEditorWidget {
         fn schedule_poll(
             receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>>,
             progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
-            query_running: Arc<Mutex<bool>>,
+            query_running: Arc<AtomicBool>,
             execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
             cancel_flag: Arc<AtomicBool>,
             lifecycle_group: Flex,
@@ -1039,7 +1039,7 @@ impl SqlEditorWidget {
 
     fn handle_progress_channel_disconnected(
         progress_callback: &Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
-        query_running: &Arc<Mutex<bool>>,
+        query_running: &Arc<AtomicBool>,
         cancel_flag: &Arc<AtomicBool>,
     ) {
         SqlEditorWidget::finalize_execution_state(query_running, cancel_flag);
@@ -1052,10 +1052,8 @@ impl SqlEditorWidget {
         SqlEditorWidget::invoke_progress_callback(progress_callback, QueryProgress::BatchFinished);
     }
 
-    fn finalize_execution_state(query_running: &Arc<Mutex<bool>>, cancel_flag: &Arc<AtomicBool>) {
-        *query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    fn finalize_execution_state(query_running: &Arc<AtomicBool>, cancel_flag: &Arc<AtomicBool>) {
+        query_running.store(false, Ordering::SeqCst);
         cancel_flag.store(false, Ordering::SeqCst);
     }
 
@@ -1882,10 +1880,8 @@ impl SqlEditorWidget {
         });
     }
 
-    fn is_query_running_flag(query_running: &Arc<Mutex<bool>>) -> bool {
-        *query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn is_query_running_flag(query_running: &Arc<AtomicBool>) -> bool {
+        query_running.load(Ordering::SeqCst)
     }
 
     fn clone_current_query_connection(
@@ -2285,10 +2281,7 @@ impl SqlEditorWidget {
     }
 
     pub fn is_query_running(&self) -> bool {
-        *self
-            .query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.query_running.load(Ordering::SeqCst)
     }
 
     fn apply_history_navigation_text(&mut self, text: &str) {
@@ -2659,14 +2652,12 @@ mod execution_state_tests {
 
     #[test]
     fn finalize_execution_state_clears_running_and_cancel_flags() {
-        let query_running = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(AtomicBool::new(true));
         let cancel_flag = Arc::new(AtomicBool::new(true));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(!query_running.load(Ordering::SeqCst));
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 
@@ -2729,20 +2720,18 @@ mod execution_state_tests {
 
     #[test]
     fn finalize_execution_state_is_idempotent_when_already_reset() {
-        let query_running = Arc::new(Mutex::new(false));
+        let query_running = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
         SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
 
-        assert!(!*query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(!query_running.load(Ordering::SeqCst));
         assert!(!cancel_flag.load(Ordering::SeqCst));
     }
 
     #[test]
     fn handle_progress_channel_disconnected_finalizes_and_emits_batch_finished() {
-        let query_running = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(AtomicBool::new(true));
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_callback = observed.clone();
@@ -2760,9 +2749,7 @@ mod execution_state_tests {
             &cancel_flag,
         );
 
-        assert!(!*query_running
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()));
+        assert!(!query_running.load(Ordering::SeqCst));
         assert!(!cancel_flag.load(Ordering::SeqCst));
         let callbacks = observed
             .lock()
