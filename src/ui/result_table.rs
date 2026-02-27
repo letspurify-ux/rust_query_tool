@@ -213,6 +213,13 @@ impl ResultTableWidget {
             .unwrap_or(false)
     }
 
+    fn is_editable_column(session: &TableEditSession, col_idx: usize) -> bool {
+        session
+            .editable_columns
+            .binary_search_by_key(&col_idx, |(editable_col, _)| *editable_col)
+            .is_ok()
+    }
+
     fn set_row_cell_explicit_null(
         session: &mut TableEditSession,
         row_idx: usize,
@@ -263,22 +270,56 @@ impl ResultTableWidget {
             || Self::input_matches_null_text(trimmed, null_text)
     }
 
+    fn cell_edit_state(
+        session: &TableEditSession,
+        row_idx: usize,
+        col_idx: usize,
+        current_row: &[String],
+    ) -> (bool, bool, bool) {
+        if col_idx == session.rowid_col || !Self::is_editable_column(session, col_idx) {
+            return (false, false, false);
+        }
+
+        let Some(row_state) = session.row_states.get(row_idx) else {
+            return (false, false, false);
+        };
+
+        match row_state {
+            EditRowState::Existing {
+                rowid,
+                explicit_null_cols,
+            } => {
+                let is_explicit_null = explicit_null_cols.contains(&col_idx);
+                let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
+                    return (false, is_explicit_null, false);
+                };
+                let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
+                let is_original_null = Self::value_represents_null(original_value, &session.null_text)
+                    && Self::value_represents_null(current_value, &session.null_text);
+                let is_modified = current_value != original_value || is_explicit_null;
+                (is_modified, is_explicit_null, is_original_null)
+            }
+            EditRowState::Inserted { explicit_null_cols } => {
+                let is_explicit_null = explicit_null_cols.contains(&col_idx);
+                let has_non_empty_value = current_row
+                    .get(col_idx)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false);
+                (is_explicit_null || has_non_empty_value, is_explicit_null, false)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     fn row_cell_is_original_null(
         session: &TableEditSession,
         row_idx: usize,
         col_idx: usize,
         current_row: &[String],
     ) -> bool {
-        let Some(EditRowState::Existing { rowid, .. }) = session.row_states.get(row_idx) else {
-            return false;
-        };
-        let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
-            return false;
-        };
-        let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-        let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-        Self::value_represents_null(original_value, &session.null_text)
-            && Self::value_represents_null(current_value, &session.null_text)
+        let (_, _, is_original_null) = Self::cell_edit_state(session, row_idx, col_idx, current_row);
+        is_original_null
     }
 
     fn current_null_text(&self) -> String {
@@ -830,15 +871,11 @@ impl ResultTableWidget {
                             if let Some(row_data) = data.get(row_idx) {
                                 if let Ok(session_guard) = edit_session_for_draw.try_lock() {
                                     if let Some(session) = session_guard.as_ref() {
-                                        is_explicit_null_cell = Self::row_cell_is_explicit_null(
-                                            session, row_idx, col_idx,
-                                        );
-                                        is_original_null_cell = Self::row_cell_is_original_null(
-                                            session, row_idx, col_idx, row_data,
-                                        );
-                                        is_edited_cell = Self::is_staged_cell_modified(
-                                            session, row_idx, col_idx, row_data,
-                                        );
+                                        (
+                                            is_edited_cell,
+                                            is_explicit_null_cell,
+                                            is_original_null_cell,
+                                        ) = Self::cell_edit_state(session, row_idx, col_idx, row_data);
                                     }
                                 }
                             }
@@ -1531,13 +1568,7 @@ impl ResultTableWidget {
             let Some(session) = guard.as_ref() else {
                 return false;
             };
-            (
-                session.rowid_col,
-                session
-                    .editable_columns
-                    .iter()
-                    .any(|(editable_col, _)| *editable_col == col_idx),
-            )
+            (session.rowid_col, Self::is_editable_column(session, col_idx))
         };
 
         if col_idx == rowid_col {
@@ -1652,10 +1683,7 @@ impl ResultTableWidget {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(session) = session_guard.as_ref() {
-                    let is_editable_col = session
-                        .editable_columns
-                        .iter()
-                        .any(|(col_idx, _)| *col_idx == active_editor.col);
+                    let is_editable_col = Self::is_editable_column(session, active_editor.col);
                     should_apply = active_editor.row < session.row_states.len()
                         && active_editor.col != session.rowid_col
                         && is_editable_col;
@@ -3094,42 +3122,15 @@ impl ResultTableWidget {
         Some((row_start, col_start))
     }
 
+    #[allow(dead_code)]
     fn is_staged_cell_modified(
         session: &TableEditSession,
         row_idx: usize,
         col_idx: usize,
         current_row: &[String],
     ) -> bool {
-        if col_idx == session.rowid_col {
-            return false;
-        }
-        if !session
-            .editable_columns
-            .iter()
-            .any(|(editable_col, _)| *editable_col == col_idx)
-        {
-            return false;
-        }
-
-        match session.row_states.get(row_idx) {
-            Some(EditRowState::Existing { rowid, .. }) => {
-                let Some(original_row) = session.original_rows_by_rowid.get(rowid) else {
-                    return false;
-                };
-                let current_value = current_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-                let original_value = original_row.get(col_idx).map(|v| v.as_str()).unwrap_or("");
-                current_value != original_value
-                    || Self::row_cell_is_explicit_null(session, row_idx, col_idx)
-            }
-            Some(EditRowState::Inserted { .. }) => {
-                Self::row_cell_is_explicit_null(session, row_idx, col_idx)
-                    || current_row
-                        .get(col_idx)
-                        .map(|value| !value.is_empty())
-                        .unwrap_or(false)
-            }
-            None => false,
-        }
+        let (is_modified, _, _) = Self::cell_edit_state(session, row_idx, col_idx, current_row);
+        is_modified
     }
 
     fn try_execute_sql(
