@@ -3155,8 +3155,9 @@ impl SqlEditorWidget {
                         let _ = conn.break_execution();
                     }
                 }
-
-                // Keep conn_guard alive (don't drop it) so the lock is held during execution
+                // Release the shared connection mutex before running statements so
+                // UI/auxiliary workers are not blocked for the full execution window.
+                drop(conn_guard);
 
                 let items = super::query_text::split_script_items(&sql_text);
                 if items.is_empty() {
@@ -3849,7 +3850,7 @@ impl SqlEditorWidget {
                                         }
                                     };
 
-                                    let autocommit_enabled = conn_guard.auto_commit();
+                                    let autocommit_enabled = auto_commit;
 
                                     let serveroutput_line = if server_output.enabled {
                                         if server_output.size == 0 {
@@ -4505,7 +4506,13 @@ impl SqlEditorWidget {
                                     );
                                 }
                                 ToolCommand::SetAutoCommit { enabled } => {
-                                    conn_guard.set_auto_commit(enabled);
+                                    {
+                                        let mut conn_guard = lock_connection_with_activity(
+                                            &shared_connection,
+                                            db_activity.clone(),
+                                        );
+                                        conn_guard.set_auto_commit(enabled);
+                                    }
                                     auto_commit = enabled;
                                     SqlEditorWidget::emit_script_message(
                                         &sender,
@@ -5019,20 +5026,33 @@ impl SqlEditorWidget {
                                         service_name,
                                     };
 
-                                    // Use the already-held conn_guard to avoid deadlock
-                                    match conn_guard.connect(conn_info.clone()) {
-                                        Ok(_) => {
-                                            conn_guard.refresh_tracked_connection();
-                                            conn_opt = conn_guard.get_connection();
-                                            let sanitized_conn_info =
-                                                SqlEditorWidget::connection_info_for_ui(
+                                    let connect_result = {
+                                        let mut conn_guard = lock_connection_with_activity(
+                                            &shared_connection,
+                                            db_activity.clone(),
+                                        );
+                                        match conn_guard.connect(conn_info.clone()) {
+                                            Ok(_) => {
+                                                conn_guard.refresh_tracked_connection();
+                                                let conn_opt_local = conn_guard.get_connection();
+                                                let sanitized = SqlEditorWidget::connection_info_for_ui(
                                                     conn_guard.get_info(),
                                                 );
-                                            if conn_guard.is_connected() {
-                                                conn_name = conn_guard.get_info().name.clone();
-                                            } else {
-                                                conn_name.clear();
+                                                let conn_name_local = if conn_guard.is_connected() {
+                                                    conn_guard.get_info().name.clone()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                Ok((conn_opt_local, sanitized, conn_name_local))
                                             }
+                                            Err(err) => Err(err),
+                                        }
+                                    };
+
+                                    match connect_result {
+                                        Ok((next_conn_opt, sanitized_conn_info, next_conn_name)) => {
+                                            conn_opt = next_conn_opt;
+                                            conn_name = next_conn_name;
                                             // Update cancel connection so break_execution() uses the new connection
                                             if let Some(ref conn) = conn_opt {
                                                 SqlEditorWidget::set_current_query_connection(
@@ -5112,25 +5132,33 @@ impl SqlEditorWidget {
                                     }
                                 }
                                 ToolCommand::Disconnect => {
-                                    // Use the already-held conn_guard to avoid deadlock.
                                     // Treat stale handles (connection exists but connected flag is false)
                                     // as a disconnectable state so UI/session state is fully reset.
-                                    let had_connection = conn_guard.is_connected()
-                                        || conn_guard.get_connection().is_some();
+                                    let (had_connection, next_conn_opt, next_conn_name) = {
+                                        let mut conn_guard = lock_connection_with_activity(
+                                            &shared_connection,
+                                            db_activity.clone(),
+                                        );
+                                        let had_connection = conn_guard.is_connected()
+                                            || conn_guard.get_connection().is_some();
+                                        conn_guard.disconnect();
+                                        conn_guard.refresh_tracked_connection();
+                                        let next_conn_opt = conn_guard.get_connection();
+                                        let next_conn_name = if conn_guard.is_connected() {
+                                            conn_guard.get_info().name.clone()
+                                        } else {
+                                            String::new()
+                                        };
+                                        (had_connection, next_conn_opt, next_conn_name)
+                                    };
 
                                     // Clear cancel connection before disconnect
                                     SqlEditorWidget::set_current_query_connection(
                                         &current_query_connection,
                                         None,
                                     );
-                                    conn_guard.disconnect();
-                                    conn_guard.refresh_tracked_connection();
-                                    conn_opt = conn_guard.get_connection();
-                                    if conn_guard.is_connected() {
-                                        conn_name = conn_guard.get_info().name.clone();
-                                    } else {
-                                        conn_name.clear();
-                                    }
+                                    conn_opt = next_conn_opt;
+                                    conn_name = next_conn_name;
                                     match session.lock() {
                                         Ok(mut guard) => guard.reset(),
                                         Err(poisoned) => {
