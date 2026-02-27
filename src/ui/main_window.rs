@@ -16,6 +16,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -2591,7 +2592,8 @@ impl MainWindow {
                         s.result_tabs.finish_all_streaming();
                         s.result_tabs.align_tab_strip_left();
                         let recovered_save_states = s.result_tabs.clear_orphaned_save_requests();
-                        let recovered_edit_states = s.result_tabs.clear_orphaned_query_edit_backups();
+                        let recovered_edit_states =
+                            s.result_tabs.clear_orphaned_query_edit_backups();
                         s.fetch_row_counts.clear();
                         s.result_grid_execution_target = None;
                         s.result_tab_offset = s.result_tabs.tab_count();
@@ -3626,6 +3628,8 @@ impl MainWindow {
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
+        let schema_refresh_in_progress = Arc::new(AtomicBool::new(false));
+        let schema_refresh_guard_for_browser_status = schema_refresh_in_progress.clone();
         state_borrow
             .object_browser
             .set_status_callback(move |message| {
@@ -3657,7 +3661,15 @@ impl MainWindow {
 
                 if should_retry_schema_sync {
                     if let Some(connection) = connection_for_retry {
+                        if schema_refresh_guard_for_browser_status
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                        {
+                            return;
+                        }
+
                         let schema_sender = schema_sender_for_browser_status.clone();
+                        let schema_refresh_guard = schema_refresh_guard_for_browser_status.clone();
                         thread::spawn(move || {
                             if let Some(update) =
                                 MainWindow::load_schema_update_for_current_connection(&connection)
@@ -3665,6 +3677,8 @@ impl MainWindow {
                                 let _ = schema_sender.send(update);
                                 app::awake();
                             }
+
+                            schema_refresh_guard.store(false, Ordering::Release);
                         });
                     }
                 }
@@ -3907,29 +3921,46 @@ impl MainWindow {
                 let r = schema_receiver
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                loop {
-                    let Ok(mut s) = state.try_lock() else {
+                let current_generation = match state.try_lock() {
+                    Ok(s) => MainWindow::current_connection_generation(&s),
+                    Err(_) => {
                         deferred_by_borrow_conflict = true;
-                        break;
-                    };
-                    match r.try_recv() {
-                        Ok(update) => {
-                            let current_generation = MainWindow::current_connection_generation(&s);
-                            if update.connection_generation != current_generation {
-                                continue;
+                        0
+                    }
+                };
+
+                if !deferred_by_borrow_conflict {
+                    let mut latest_update: Option<SchemaUpdate> = None;
+                    loop {
+                        match r.try_recv() {
+                            Ok(update) => {
+                                if update.connection_generation != current_generation {
+                                    continue;
+                                }
+                                latest_update = Some(update);
                             }
-                            let mut data = update.data;
-                            data.rebuild_indices();
-                            MainWindow::apply_schema_to_all_editors(
-                                &mut s,
-                                &data,
-                                &update.highlight_data,
-                            );
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                schema_disconnected = true;
+                                break;
+                            }
                         }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            schema_disconnected = true;
-                            break;
+                    }
+
+                    if let Some(update) = latest_update {
+                        match state.try_lock() {
+                            Ok(mut s) => {
+                                let mut data = update.data;
+                                data.rebuild_indices();
+                                MainWindow::apply_schema_to_all_editors(
+                                    &mut s,
+                                    &data,
+                                    &update.highlight_data,
+                                );
+                            }
+                            Err(_) => {
+                                deferred_by_borrow_conflict = true;
+                            }
                         }
                     }
                 }
@@ -4623,8 +4654,7 @@ mod health_check_tests {
     use super::{
         should_apply_disconnect_for_health_check, should_cancel_fallback_editor,
         should_ignore_query_progress_when_disconnected, should_restart_health_check_worker,
-        should_run_global_batch_cleanup,
-        HealthCheckCurrentConnectionState,
+        should_run_global_batch_cleanup, HealthCheckCurrentConnectionState,
     };
 
     #[test]
@@ -4727,7 +4757,6 @@ mod health_check_tests {
         assert!(!should_ignore_query_progress_when_disconnected(false, true));
         assert!(!should_ignore_query_progress_when_disconnected(true, false));
     }
-
 
     #[test]
     fn cancels_fallback_editor_when_it_has_running_query_and_no_running_tabs() {
