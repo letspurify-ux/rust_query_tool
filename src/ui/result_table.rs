@@ -12,9 +12,9 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
@@ -143,15 +143,15 @@ pub struct ResultTableWidget {
     pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
     pending_widths: Arc<Mutex<Vec<i32>>>,
-    /// Last UI update time
-    last_flush: Arc<Mutex<Instant>>,
+    /// Last UI update time in epoch milliseconds
+    last_flush_epoch_ms: Arc<AtomicU64>,
     /// The sole data store: full original data (non-truncated).
     /// draw_cell reads from here on demand — no data duplication.
     full_data: Arc<Mutex<Vec<Vec<String>>>>,
     /// Maximum displayed characters per cell; full text remains in full_data for copy/export.
     max_cell_display_chars: Arc<Mutex<usize>>,
     /// How many rows have been sampled for column width calculation
-    width_sampled_rows: Arc<Mutex<usize>>,
+    width_sampled_rows: Arc<AtomicUsize>,
     font_settings: Arc<SharedFontSettings>,
     null_text: Arc<Mutex<String>>,
     source_sql: Arc<Mutex<String>>,
@@ -223,6 +223,16 @@ struct ActiveInlineEdit {
 }
 
 impl ResultTableWidget {
+    fn current_epoch_millis() -> u64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => {
+                let millis = duration.as_millis();
+                u64::try_from(millis).unwrap_or(u64::MAX)
+            }
+            Err(_) => 0,
+        }
+    }
+
     fn clear_pending_stream_buffers(&self) {
         self.pending_rows
             .lock()
@@ -232,14 +242,9 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        *self
-            .width_sampled_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-        *self
-            .last_flush
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        self.width_sampled_rows.store(0, Ordering::Relaxed);
+        self.last_flush_epoch_ms
+            .store(Self::current_epoch_millis(), Ordering::Relaxed);
     }
 
     fn row_state_explicit_null_cols(row_state: &EditRowState) -> &HashSet<usize> {
@@ -1371,10 +1376,10 @@ impl ResultTableWidget {
             headers,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
-            last_flush: Arc::new(Mutex::new(Instant::now())),
+            last_flush_epoch_ms: Arc::new(AtomicU64::new(Self::current_epoch_millis())),
             full_data,
             max_cell_display_chars,
-            width_sampled_rows: Arc::new(Mutex::new(0)),
+            width_sampled_rows: Arc::new(AtomicUsize::new(0)),
             font_settings,
             null_text,
             source_sql,
@@ -4963,14 +4968,9 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        *self
-            .last_flush
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-        *self
-            .width_sampled_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+        self.last_flush_epoch_ms
+            .store(Self::current_epoch_millis(), Ordering::Relaxed);
+        self.width_sampled_rows.store(0, Ordering::Relaxed);
         self.source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5024,10 +5024,7 @@ impl ResultTableWidget {
         }
 
         // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
-        let sampled = *self
-            .width_sampled_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sampled = self.width_sampled_rows.load(Ordering::Relaxed);
         if sampled < WIDTH_SAMPLE_ROWS {
             let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
             let mut widths = self
@@ -5053,10 +5050,8 @@ impl ResultTableWidget {
                 );
             }
             drop(widths);
-            *self
-                .width_sampled_rows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = sampled + sample_count;
+            self.width_sampled_rows
+                .store(sampled + sample_count, Ordering::Relaxed);
         }
 
         // Add rows to pending buffer
@@ -5067,17 +5062,16 @@ impl ResultTableWidget {
 
         // Check if we should flush to UI
         let should_flush = {
-            let elapsed = self
-                .last_flush
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .elapsed();
+            let now = Self::current_epoch_millis();
+            let last = self.last_flush_epoch_ms.load(Ordering::Relaxed);
+            let elapsed_ms = now.saturating_sub(last);
             let buffered_count = self
                 .pending_rows
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len();
-            elapsed >= UI_UPDATE_INTERVAL || buffered_count >= MAX_BUFFERED_ROWS
+            elapsed_ms >= UI_UPDATE_INTERVAL.as_millis() as u64
+                || buffered_count >= MAX_BUFFERED_ROWS
         };
 
         if should_flush {
@@ -5142,10 +5136,8 @@ impl ResultTableWidget {
         self.table.set_rows(new_total);
         self.apply_table_metrics_for_current_font();
 
-        *self
-            .last_flush
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        self.last_flush_epoch_ms
+            .store(Self::current_epoch_millis(), Ordering::Relaxed);
         self.table.redraw();
     }
 
@@ -5273,14 +5265,9 @@ impl ResultTableWidget {
             full_data.clear();
             full_data.shrink_to_fit();
         }
-        *self
-            .width_sampled_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-        *self
-            .last_flush
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        self.width_sampled_rows.store(0, Ordering::Relaxed);
+        self.last_flush_epoch_ms
+            .store(Self::current_epoch_millis(), Ordering::Relaxed);
         *self
             .pending_save_request
             .lock()
@@ -9607,10 +9594,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(120);
-        *widget
-            .width_sampled_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 7;
+        widget.width_sampled_rows.store(7, Ordering::Relaxed);
         *widget
             .pending_save_request
             .lock()
@@ -9627,13 +9611,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
-        assert_eq!(
-            *widget
-                .width_sampled_rows
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            0
-        );
+        assert_eq!(widget.width_sampled_rows.load(Ordering::Relaxed), 0);
     }
 
     #[test]
