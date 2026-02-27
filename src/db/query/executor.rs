@@ -26,22 +26,12 @@ impl QueryExecutor {
 
     fn row_value_to_text(
         row: &Row,
-        column_type: &OracleType,
+        _column_type: &OracleType,
         index: usize,
     ) -> Result<String, OracleError> {
-        if matches!(column_type, OracleType::Rowid) {
-            // Avoid direct String conversion through OCI for ROWID columns, which can
-            // segfault in some client/runtime combinations. Use oracle::RowId instead,
-            // which follows the safe OCI ROWID descriptor path (OCIRowidToChar).
-            let Some(sql_value) = row.sql_values().get(index) else {
-                return Ok(String::new());
-            };
-            if sql_value.is_null()? {
-                return Ok("NULL".to_string());
-            }
-            return row.get::<usize, String>(index).or(Ok(String::new()));
-        }
-
+        // ROWID columns should be normalized to ROWIDTOCHAR(...) in
+        // rowid_safe_execution_sql before fetch. Keep this path simple and fail-fast
+        // via OracleError if conversion is not possible.
         let value: Option<String> = row.get(index)?;
         Ok(value.unwrap_or_else(|| "NULL".to_string()))
     }
