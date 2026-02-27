@@ -15,7 +15,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,7 +67,7 @@ struct ScriptExecutionFrame {
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
-    cancel_flag: Arc<AtomicBool>,
+    cancel_flag: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
     previous_timeout: Option<Duration>,
 }
@@ -77,7 +76,7 @@ impl QueryExecutionCleanupGuard {
     fn new(
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
-        cancel_flag: Arc<AtomicBool>,
+        cancel_flag: Arc<Mutex<bool>>,
     ) -> Self {
         Self {
             sender,
@@ -105,7 +104,7 @@ impl Drop for QueryExecutionCleanupGuard {
             let _ = conn.set_call_timeout(self.previous_timeout);
         }
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
-        self.cancel_flag.store(false, Ordering::SeqCst);
+        SqlEditorWidget::set_shared_flag(&self.cancel_flag, false);
         let _ = self.sender.send(QueryProgress::BatchFinished);
         app::awake();
     }
@@ -2994,7 +2993,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if self.query_running.load(Ordering::SeqCst) {
+        if Self::shared_flag(&self.query_running) {
             let _ = self
                 .ui_action_sender
                 .send(UiActionResult::QueryAlreadyRunning);
@@ -3040,9 +3039,9 @@ impl SqlEditorWidget {
         let cancel_flag = self.cancel_flag.clone();
 
         // Reset cancel flag before starting new execution
-        cancel_flag.store(false, Ordering::SeqCst);
+        Self::set_shared_flag(&cancel_flag, false);
 
-        query_running.store(true, Ordering::SeqCst);
+        Self::set_shared_flag(&query_running, true);
 
         set_cursor(Cursor::Wait);
         app::flush();
@@ -3145,7 +3144,7 @@ impl SqlEditorWidget {
                         &current_query_connection,
                         Some(Arc::clone(conn)),
                     );
-                    if cancel_flag.load(Ordering::SeqCst) {
+                    if Self::shared_flag(&cancel_flag) {
                         let _ = conn.break_execution();
                     }
                 }
@@ -3223,7 +3222,7 @@ impl SqlEditorWidget {
                 }];
 
                 while let Some(frame) = frames.last_mut() {
-                    if stop_execution || cancel_flag.load(Ordering::Relaxed) {
+                    if stop_execution || Self::shared_flag(&cancel_flag) {
                         break;
                     }
 
@@ -5029,9 +5028,10 @@ impl SqlEditorWidget {
                                             Ok(_) => {
                                                 conn_guard.refresh_tracked_connection();
                                                 let conn_opt_local = conn_guard.get_connection();
-                                                let sanitized = SqlEditorWidget::connection_info_for_ui(
-                                                    conn_guard.get_info(),
-                                                );
+                                                let sanitized =
+                                                    SqlEditorWidget::connection_info_for_ui(
+                                                        conn_guard.get_info(),
+                                                    );
                                                 let conn_name_local = if conn_guard.is_connected() {
                                                     conn_guard.get_info().name.clone()
                                                 } else {
@@ -5044,7 +5044,11 @@ impl SqlEditorWidget {
                                     };
 
                                     match connect_result {
-                                        Ok((next_conn_opt, sanitized_conn_info, next_conn_name)) => {
+                                        Ok((
+                                            next_conn_opt,
+                                            sanitized_conn_info,
+                                            next_conn_name,
+                                        )) => {
                                             conn_opt = next_conn_opt;
                                             conn_name = next_conn_name;
                                             // Update cancel connection so break_execution() uses the new connection
@@ -5438,7 +5442,7 @@ impl SqlEditorWidget {
                                     &session,
                                     timing_duration,
                                 );
-                                if cancel_flag.load(Ordering::Relaxed)
+                                if Self::shared_flag(&cancel_flag)
                                     || timed_out
                                     || (!result_success && !continue_on_error)
                                 {
@@ -5508,7 +5512,7 @@ impl SqlEditorWidget {
                                     &session,
                                     timing_duration,
                                 );
-                                if cancel_flag.load(Ordering::Relaxed)
+                                if Self::shared_flag(&cancel_flag)
                                     || timed_out
                                     || (!result_success && !continue_on_error)
                                 {
@@ -5776,7 +5780,7 @@ impl SqlEditorWidget {
                                         .unwrap_or_default();
 
                                 for (cursor_name, mut cursor) in ref_cursors {
-                                    if stop_execution || cancel_flag.load(Ordering::Relaxed) {
+                                    if stop_execution || Self::shared_flag(&cancel_flag) {
                                         break;
                                     }
                                     let index = result_index;
@@ -5822,7 +5826,7 @@ impl SqlEditorWidget {
                                             }
                                         },
                                         &mut |row| {
-                                            if cancel_flag.load(Ordering::Relaxed) {
+                                            if Self::shared_flag(&cancel_flag) {
                                                 return false;
                                             }
                                             if let Some(timeout_duration) = query_timeout {
@@ -5964,7 +5968,7 @@ impl SqlEditorWidget {
                                 }
 
                                 for (idx, mut cursor) in implicit_results.into_iter().enumerate() {
-                                    if stop_execution || cancel_flag.load(Ordering::Relaxed) {
+                                    if stop_execution || Self::shared_flag(&cancel_flag) {
                                         break;
                                     }
                                     let index = result_index;
@@ -6009,7 +6013,7 @@ impl SqlEditorWidget {
                                             }
                                         },
                                         &mut |row| {
-                                            if cancel_flag.load(Ordering::Relaxed) {
+                                            if Self::shared_flag(&cancel_flag) {
                                                 return false;
                                             }
                                             if let Some(timeout_duration) = query_timeout {
@@ -6141,7 +6145,7 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if cancel_flag.load(Ordering::Relaxed)
+                                if Self::shared_flag(&cancel_flag)
                                     || timed_out
                                     || (!result.success && !continue_on_error)
                                 {
@@ -6317,7 +6321,7 @@ impl SqlEditorWidget {
                                             }
                                         },
                                         &mut |row| {
-                                            if cancel_flag.load(Ordering::Relaxed) {
+                                            if Self::shared_flag(&cancel_flag) {
                                                 return false;
                                             }
                                             if let Some(timeout_duration) = query_timeout {
@@ -6564,7 +6568,7 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if cancel_flag.load(Ordering::Relaxed)
+                                if Self::shared_flag(&cancel_flag)
                                     || timed_out
                                     || (!result.success && !continue_on_error)
                                 {
@@ -6870,7 +6874,7 @@ impl SqlEditorWidget {
                                     timing_duration,
                                 );
 
-                                if cancel_flag.load(Ordering::Relaxed)
+                                if Self::shared_flag(&cancel_flag)
                                     || timed_out
                                     || (!result.success && !continue_on_error)
                                 {
@@ -8807,13 +8811,19 @@ mod query_execution_cleanup_tests {
     use super::{QueryExecutionCleanupGuard, QueryProgress};
     use oracle::Connection;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
+
+    fn read_flag(flag: &Arc<Mutex<bool>>) -> bool {
+        match flag.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn cleanup_guard_resets_cancel_and_emits_batch_finished_on_drop() {
         let (sender, receiver) = mpsc::channel();
-        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_flag = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8825,7 +8835,7 @@ mod query_execution_cleanup_tests {
             );
         }
 
-        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!read_flag(&cancel_flag));
         let msg = receiver
             .try_recv()
             .expect("BatchFinished should be emitted");
@@ -8839,7 +8849,7 @@ mod query_execution_cleanup_tests {
     #[test]
     fn cleanup_guard_runs_during_panic_unwind() {
         let (sender, receiver) = mpsc::channel();
-        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_flag = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8854,7 +8864,7 @@ mod query_execution_cleanup_tests {
         }));
 
         assert!(unwind_result.is_err());
-        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!read_flag(&cancel_flag));
         let msg = receiver
             .try_recv()
             .expect("BatchFinished should be emitted");
@@ -8866,7 +8876,7 @@ mod query_execution_cleanup_tests {
         let (sender, receiver) = mpsc::channel();
         drop(receiver);
 
-        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_flag = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8879,13 +8889,13 @@ mod query_execution_cleanup_tests {
         }));
 
         assert!(drop_result.is_ok(), "Drop must ignore send failures");
-        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!read_flag(&cancel_flag));
     }
 
     #[test]
     fn cleanup_guard_recovers_from_poisoned_connection_mutex() {
         let (sender, receiver) = mpsc::channel();
-        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_flag = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8905,7 +8915,7 @@ mod query_execution_cleanup_tests {
             );
         }
 
-        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!read_flag(&cancel_flag));
         let msg = receiver
             .try_recv()
             .expect("BatchFinished should be emitted");

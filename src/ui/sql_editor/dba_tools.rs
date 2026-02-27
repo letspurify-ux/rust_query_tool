@@ -10,9 +10,9 @@ use fltk::{
     prelude::*,
     window::Window,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -122,6 +122,23 @@ static RMAN_JOB_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static RMAN_JOB_NAME_PROCESS_TOKEN: OnceLock<u128> = OnceLock::new();
 
 impl SqlEditorWidget {
+    fn read_shared_flag(flag: &Arc<Mutex<bool>>) -> bool {
+        match flag.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn write_shared_flag(flag: &Arc<Mutex<bool>>, value: bool) {
+        match flag.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = value;
+            }
+        }
+    }
+
     pub fn show_cursor_plan_analyzer(&self) {
         enum CursorPlanMessage {
             LoadRequested {
@@ -754,13 +771,20 @@ impl SqlEditorWidget {
             app::awake();
         });
 
-        let auto_refresh_enabled = Arc::new(AtomicBool::new(false));
+        let auto_refresh_enabled = Arc::new(Mutex::new(false));
         let auto_refresh_enabled_for_toggle = Arc::clone(&auto_refresh_enabled);
         auto_refresh_check.set_callback(move |check| {
-            auto_refresh_enabled_for_toggle.store(check.value(), Ordering::SeqCst);
+            let value = check.value();
+            match auto_refresh_enabled_for_toggle.lock() {
+                Ok(mut guard) => *guard = value,
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    *guard = value;
+                }
+            }
         });
 
-        let stop_auto_signal = Arc::new(AtomicBool::new(false));
+        let stop_auto_signal = Arc::new(Mutex::new(false));
         let stop_auto_signal_for_thread = Arc::clone(&stop_auto_signal);
         let auto_refresh_enabled_for_thread = Arc::clone(&auto_refresh_enabled);
         let sender_tick = sender.clone();
@@ -770,12 +794,12 @@ impl SqlEditorWidget {
                     / SQL_MONITOR_AUTO_REFRESH_POLL_MS)
                     .max(1);
             let mut poll_count = 0u64;
-            while !stop_auto_signal_for_thread.load(Ordering::SeqCst) {
+            while !Self::read_shared_flag(&stop_auto_signal_for_thread) {
                 thread::sleep(Duration::from_millis(SQL_MONITOR_AUTO_REFRESH_POLL_MS));
-                if stop_auto_signal_for_thread.load(Ordering::SeqCst) {
+                if Self::read_shared_flag(&stop_auto_signal_for_thread) {
                     break;
                 }
-                if auto_refresh_enabled_for_thread.load(Ordering::SeqCst) {
+                if Self::read_shared_flag(&auto_refresh_enabled_for_thread) {
                     poll_count = poll_count.saturating_add(1);
                     if poll_count >= polls_per_refresh {
                         poll_count = 0;
@@ -1128,7 +1152,7 @@ impl SqlEditorWidget {
             }
         }
 
-        stop_auto_signal.store(true, Ordering::SeqCst);
+        Self::write_shared_flag(&stop_auto_signal, true);
         let _ = auto_thread.join();
 
         set_cursor(Cursor::Default);

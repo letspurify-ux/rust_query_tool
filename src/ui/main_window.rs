@@ -16,7 +16,6 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -3628,7 +3627,7 @@ impl MainWindow {
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
-        let schema_refresh_in_progress = Arc::new(AtomicBool::new(false));
+        let schema_refresh_in_progress = Arc::new(Mutex::new(false));
         let schema_refresh_guard_for_browser_status = schema_refresh_in_progress.clone();
         state_borrow
             .object_browser
@@ -3661,11 +3660,14 @@ impl MainWindow {
 
                 if should_retry_schema_sync {
                     if let Some(connection) = connection_for_retry {
-                        if schema_refresh_guard_for_browser_status
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_err()
                         {
-                            return;
+                            let mut in_progress = schema_refresh_guard_for_browser_status
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if *in_progress {
+                                return;
+                            }
+                            *in_progress = true;
                         }
 
                         let schema_sender = schema_sender_for_browser_status.clone();
@@ -3678,7 +3680,10 @@ impl MainWindow {
                                 app::awake();
                             }
 
-                            schema_refresh_guard.store(false, Ordering::Release);
+                            let mut in_progress = schema_refresh_guard
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            *in_progress = false;
                         });
                     }
                 }

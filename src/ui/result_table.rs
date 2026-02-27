@@ -12,7 +12,7 @@ use fltk::{
     window::Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -165,7 +165,7 @@ pub struct ResultTableWidget {
     next_save_request_id: Arc<AtomicU64>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
-    streaming_in_progress: Arc<AtomicBool>,
+    streaming_in_progress: Arc<Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -223,6 +223,23 @@ struct ActiveInlineEdit {
 }
 
 impl ResultTableWidget {
+    fn read_shared_bool(flag: &Arc<Mutex<bool>>) -> bool {
+        match flag.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn write_shared_bool(flag: &Arc<Mutex<bool>>, value: bool) {
+        match flag.lock() {
+            Ok(mut guard) => *guard = value,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = value;
+            }
+        }
+    }
+
     fn current_epoch_millis() -> u64 {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(duration) => {
@@ -843,7 +860,7 @@ impl ResultTableWidget {
         let next_save_request_id = Arc::new(AtomicU64::new(1));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
-        let streaming_in_progress: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -1406,7 +1423,7 @@ impl ResultTableWidget {
     }
 
     fn is_streaming_in_progress(&self) -> bool {
-        self.streaming_in_progress.load(Ordering::Relaxed)
+        Self::read_shared_bool(&self.streaming_in_progress)
     }
 
     fn show_inline_cell_editor(
@@ -4672,7 +4689,7 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, false);
 
         // Query completion can race with an open inline editor focus change.
         // Commit any pending in-cell value first so failed/cancelled queries
@@ -4909,7 +4926,7 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
-        self.streaming_in_progress.store(true, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, true);
 
         let save_pending = *self
             .pending_save_request
@@ -4944,7 +4961,7 @@ impl ResultTableWidget {
             // still pending. Since this path does not actually enter streaming,
             // keep the flag cleared so edit controls are not blocked waiting for
             // a finish event that may never arrive.
-            self.streaming_in_progress.store(false, Ordering::Relaxed);
+            Self::write_shared_bool(&self.streaming_in_progress, false);
             self.clear_pending_stream_buffers();
             self.set_query_edit_backup(None);
             self.table.redraw();
@@ -5148,7 +5165,7 @@ impl ResultTableWidget {
 
     /// Call this when streaming is complete to flush any remaining buffered rows
     pub fn finish_streaming(&mut self) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, false);
         self.flush_pending();
         self.table.redraw();
     }
@@ -5178,7 +5195,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, false);
         self.clear_pending_stream_buffers();
         // Save orphan recovery should not leave stale pre-query snapshots that
         // can be resurrected by a later unrelated batch-finished cleanup.
@@ -5209,7 +5226,7 @@ impl ResultTableWidget {
         }
         // Drop any buffered stream rows from the interrupted query before
         // restoring the backed-up edit dataset.
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, false);
         self.clear_pending_stream_buffers();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.restore_query_edit_backup()
@@ -5217,7 +5234,7 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
-        self.streaming_in_progress.store(false, Ordering::Relaxed);
+        Self::write_shared_bool(&self.streaming_in_progress, false);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
         *self
@@ -7818,7 +7835,9 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .pending_save_request
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()));
-        assert!(!widget.streaming_in_progress.load(Ordering::Relaxed));
+        assert!(!ResultTableWidget::read_shared_bool(
+            &widget.streaming_in_progress
+        ));
         assert!(widget
             .edit_session
             .lock()
@@ -8131,7 +8150,9 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
         widget.start_streaming(&headers);
 
-        assert!(!widget.streaming_in_progress.load(Ordering::Relaxed));
+        assert!(!ResultTableWidget::read_shared_bool(
+            &widget.streaming_in_progress
+        ));
 
         let rows = widget
             .full_data
@@ -8498,7 +8519,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        ResultTableWidget::write_shared_bool(&widget.streaming_in_progress, true);
 
         assert_eq!(
             widget.insert_row_in_edit_mode(),
@@ -8530,7 +8551,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        ResultTableWidget::write_shared_bool(&widget.streaming_in_progress, true);
 
         let result = widget.save_edit_mode();
         assert_eq!(
@@ -8802,7 +8823,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             deleted_rowids: Vec::new(),
             row_states: Vec::new(),
         });
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        ResultTableWidget::write_shared_bool(&widget.streaming_in_progress, true);
 
         let result = widget.cancel_edit_mode();
         assert_eq!(
@@ -9114,7 +9135,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        ResultTableWidget::write_shared_bool(&widget.streaming_in_progress, true);
 
         let result = widget.begin_edit_mode();
 
@@ -9146,7 +9167,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             vec![vec!["AAABBB".to_string(), "SCOTT".to_string()]];
-        widget.streaming_in_progress.store(true, Ordering::Relaxed);
+        ResultTableWidget::write_shared_bool(&widget.streaming_in_progress, true);
 
         assert!(!widget.can_begin_edit_mode());
     }
