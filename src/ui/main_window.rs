@@ -122,6 +122,7 @@ pub struct AppState {
     pub right_tile: Tile,
     pub query_split_adjusted: Arc<Mutex<bool>>,
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
+    has_live_connection: bool,
     pub config: Arc<Mutex<AppConfig>>,
     pub last_fetch_status_update: Instant,
     status_animation_running: bool,
@@ -607,6 +608,7 @@ impl MainWindow {
             .connection_info
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        state.has_live_connection = false;
 
         // Disconnection can happen mid-stream (network drop,
         // explicit disconnect while a worker is still unwinding). Ensure every
@@ -1328,6 +1330,7 @@ impl MainWindow {
             right_tile: right_tile.clone(),
             query_split_adjusted: query_split_adjusted.clone(),
             connection_info: Arc::new(Mutex::new(None)),
+            has_live_connection: false,
             config: Arc::new(Mutex::new(config)),
             last_fetch_status_update: Instant::now(),
             status_animation_running: false,
@@ -2339,11 +2342,7 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match progress {
                 QueryProgress::BatchStart => {
-                    let has_live_connection = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some();
+                    let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2360,11 +2359,7 @@ impl MainWindow {
                     s.fetch_row_counts.clear();
                 }
                 QueryProgress::StatementStart { index } => {
-                    let has_live_connection = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some();
+                    let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2396,11 +2391,7 @@ impl MainWindow {
                     columns,
                     null_text,
                 } => {
-                    let has_live_connection = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some();
+                    let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2429,11 +2420,7 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                 }
                 QueryProgress::Rows { index, rows } => {
-                    let has_live_connection = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some();
+                    let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2488,6 +2475,7 @@ impl MainWindow {
                         *s.connection_info
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
+                        s.has_live_connection = true;
                         s.set_status_message(&format!("Connected | {}", info.name));
                         s.object_browser.refresh();
                         s.sql_editor.focus();
@@ -2508,11 +2496,7 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
-                    let has_live_connection = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_some();
+                    let has_live_connection = s.has_live_connection;
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -3888,6 +3872,7 @@ impl MainWindow {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                         Some(info.clone());
+                                    s.has_live_connection = true;
                                     s.status_bar
                                         .set_label(&format!("Connected | {}", info.name));
                                     s.object_browser.refresh();

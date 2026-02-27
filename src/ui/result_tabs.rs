@@ -489,13 +489,13 @@ impl ResultTabsWidget {
     }
 
     pub fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
-        if let Some(tab) = self
+        let table = self
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(index)
-        {
-            let mut table = tab.table.clone();
+            .map(|tab| tab.table.clone());
+        if let Some(mut table) = table {
             table.set_null_text(null_text);
             table.start_streaming(columns);
         }
@@ -503,49 +503,53 @@ impl ResultTabsWidget {
     }
 
     pub fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
-        if let Some(tab) = self
+        let table = self
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(index)
-        {
-            let mut table = tab.table.clone();
+            .map(|tab| tab.table.clone());
+        if let Some(mut table) = table {
             table.append_rows(rows);
         }
     }
 
     pub fn finish_streaming(&mut self, index: usize) {
-        if let Some(tab) = self
+        let table = self
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(index)
-        {
-            let mut table = tab.table.clone();
+            .map(|tab| tab.table.clone());
+        if let Some(mut table) = table {
             table.finish_streaming();
         }
         self.fire_on_change_callback();
     }
 
     pub fn finish_all_streaming(&mut self) {
-        let tables = self
+        let tables: Vec<ResultTableWidget> = self
             .data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for tab in tables.iter() {
-            let mut table = tab.table.clone();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect();
+        for mut table in tables {
             table.finish_streaming();
         }
     }
 
     pub fn clear_orphaned_save_requests(&mut self) -> usize {
-        let tables = self
+        let tables: Vec<ResultTableWidget> = self
             .data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect();
         let mut cleared = 0usize;
-        for tab in tables.iter() {
-            let mut table = tab.table.clone();
+        for mut table in tables {
             if table.clear_orphaned_save_request() {
                 cleared = cleared.saturating_add(1);
             }
@@ -557,13 +561,15 @@ impl ResultTabsWidget {
     }
 
     pub fn clear_orphaned_query_edit_backups(&mut self) -> usize {
-        let tables = self
+        let tables: Vec<ResultTableWidget> = self
             .data
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect();
         let mut restored = 0usize;
-        for tab in tables.iter() {
-            let mut table = tab.table.clone();
+        for mut table in tables {
             if table.clear_orphaned_query_edit_backup() {
                 restored = restored.saturating_add(1);
             }
