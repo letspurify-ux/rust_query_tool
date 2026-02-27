@@ -474,6 +474,7 @@ enum UiActionResult {
     Commit(Result<(), String>),
     Rollback(Result<(), String>),
     Cancel(Result<(), String>),
+    CancelPending,
     QueryAlreadyRunning,
     ConnectionBusy,
 }
@@ -1420,6 +1421,11 @@ impl SqlEditorWidget {
                                     widget.emit_status("Cancel failed");
                                 }
                             }
+                            UiActionResult::CancelPending => {
+                                widget.emit_status(
+                                    "Cancel requested; waiting for query initialization",
+                                );
+                            }
                             UiActionResult::QueryAlreadyRunning => {
                                 let busy_message = crate::db::format_connection_busy_message();
                                 widget.emit_status(&busy_message);
@@ -1855,6 +1861,16 @@ impl SqlEditorWidget {
             // breaking the connection now would interrupt a newly-started query.
             if !cancel_flag.load(Ordering::SeqCst) {
                 let _ = sender.send(UiActionResult::Cancel(Ok(())));
+                app::awake();
+                return;
+            }
+
+            if conn.is_none() {
+                // The worker has not published a break-able connection yet.
+                // Keep cancel requested so execution stops at the first safe
+                // cancellation point, and surface a status update instead of
+                // pretending the DB-level break already happened.
+                let _ = sender.send(UiActionResult::CancelPending);
                 app::awake();
                 return;
             }
