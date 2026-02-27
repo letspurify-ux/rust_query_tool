@@ -2715,8 +2715,12 @@ impl ResultTableWidget {
         lowered.contains("not connected")
             || lowered.contains("connection was lost")
             || lowered.contains("connection lost")
+            || lowered.contains("not logged on")
+            || lowered.contains("end-of-file on communication channel")
             || lowered.contains("ora-03113")
             || lowered.contains("ora-03114")
+            || lowered.contains("ora-03135")
+            || lowered.contains("ora-01012")
             || lowered.contains("dpi-1010")
     }
 
@@ -9186,6 +9190,20 @@ mod tests {
     fn connection_loss_message_matches_not_connected_text() {
         assert!(ResultTableWidget::is_connection_loss_message(
             "Not connected to database",
+        ));
+    }
+
+    #[test]
+    fn connection_loss_message_matches_ora_01012_not_logged_on_text() {
+        assert!(ResultTableWidget::is_connection_loss_message(
+            "ORA-01012: not logged on",
+        ));
+    }
+
+    #[test]
+    fn connection_loss_message_matches_ora_03135_text() {
+        assert!(ResultTableWidget::is_connection_loss_message(
+            "ORA-03135: connection lost contact",
         ));
     }
 
