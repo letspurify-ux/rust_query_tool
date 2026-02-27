@@ -3026,6 +3026,31 @@ impl ResultTableWidget {
         self.table.resize(x, y, w, h);
     }
 
+    fn sync_table_viewport_state(&mut self) {
+        self.refresh_table_layout_geometry();
+
+        let rows = self.table.rows().max(0);
+        if rows > 0 {
+            let last_row = rows - 1;
+            let current_row = self.table.row_position().max(0).min(last_row);
+            self.table.set_row_position(current_row);
+        } else {
+            self.table.set_row_position(0);
+        }
+
+        let cols = self.table.cols().max(0);
+        if cols > 0 {
+            let last_col = cols - 1;
+            let current_col = self.table.col_position().max(0).min(last_col);
+            self.table.set_col_position(current_col);
+        } else {
+            self.table.set_col_position(0);
+        }
+
+        self.table.redraw();
+        app::redraw();
+    }
+
     fn refresh_auto_rowid_visibility(&mut self) {
         let headers_snapshot = self
             .headers
@@ -3043,8 +3068,7 @@ impl ResultTableWidget {
         let previous_hidden_col = self.hidden_auto_rowid_col_value();
         if previous_hidden_col == next_hidden_col {
             self.apply_hidden_rowid_column_width();
-            self.refresh_table_layout_geometry();
-            self.table.redraw();
+            self.sync_table_viewport_state();
             return;
         }
 
@@ -3057,8 +3081,7 @@ impl ResultTableWidget {
             self.recalculate_widths_for_current_font();
         }
         self.apply_hidden_rowid_column_width();
-        self.refresh_table_layout_geometry();
-        self.table.redraw();
+        self.sync_table_viewport_state();
     }
 
     fn visible_column_indices_in_range(
@@ -3570,6 +3593,7 @@ impl ResultTableWidget {
         self.table.set_rows((new_row_index + 1) as i32);
         self.apply_table_metrics_for_current_font();
         self.table.set_row_position(new_row_index as i32);
+        self.sync_table_viewport_state();
 
         if let Some(first_col) = first_edit_col {
             self.table.set_selection(
