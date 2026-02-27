@@ -1065,7 +1065,16 @@ impl ResultTableWidget {
                     // Left click - start drag selection
                     if button == app::MouseButton::Left as i32 {
                         let _ = table_for_handle.take_focus();
-                        if let Some((row, col)) = Self::get_cell_at_mouse(&table_for_handle) {
+                        let clicked_cell = Self::get_cell_at_mouse(&table_for_handle);
+                        let target_cell = if app::event_clicks() {
+                            clicked_cell.or_else(|| {
+                                Self::resolve_double_click_target_cell(&table_for_handle)
+                            })
+                        } else {
+                            clicked_cell
+                        };
+
+                        if let Some((row, col)) = target_cell {
                             if app::event_clicks() {
                                 // Clone the cell value before entering the modal dialog
                                 // event loop so the full_data lock is released first.
@@ -2311,6 +2320,15 @@ impl ResultTableWidget {
         }
 
         None
+    }
+
+    fn resolve_double_click_target_cell(table: &Table) -> Option<(i32, i32)> {
+        let rows = usize::try_from(table.rows().max(0)).ok()?;
+        let cols = usize::try_from(table.cols().max(0)).ok()?;
+        let (row, col) = Self::resolve_update_target_cell(table.get_selection(), rows, cols, None)?;
+        let row = i32::try_from(row).ok()?;
+        let col = i32::try_from(col).ok()?;
+        Some((row, col))
     }
 
     fn visible_cell_bounds(table: &Table, start_row: i32, start_col: i32) -> Option<(i32, i32)> {
