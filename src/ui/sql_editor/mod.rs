@@ -10,7 +10,7 @@ use fltk::{
     window::Window,
 };
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -697,6 +697,7 @@ struct HighlightResult {
 
 #[derive(Clone)]
 struct HighlightWorkerTask {
+    editor_id: u64,
     request: HighlightRequest,
     highlighter: Arc<Mutex<SqlHighlighter>>,
     result_sender: mpsc::Sender<HighlightResult>,
@@ -739,6 +740,7 @@ pub struct SqlEditorWidget {
     highlight_result_sender: mpsc::Sender<HighlightResult>,
     highlight_revision: Arc<AtomicU64>,
     highlight_generation: Arc<AtomicU64>,
+    highlight_editor_id: u64,
 }
 
 impl SqlEditorWidget {
@@ -753,14 +755,54 @@ impl SqlEditorWidget {
         STATE.get_or_init(|| Arc::new(Mutex::new(PendingAlertState::default())))
     }
 
-    fn highlight_worker_sender() -> &'static mpsc::Sender<HighlightWorkerTask> {
-        static WORKER_SENDER: OnceLock<mpsc::Sender<HighlightWorkerTask>> = OnceLock::new();
-        WORKER_SENDER.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<HighlightWorkerTask>();
-            let spawn_result = thread::Builder::new()
-                .name("sql-highlighter-worker-global".to_string())
-                .spawn(move || {
-                    while let Ok(task) = receiver.recv() {
+    fn highlight_worker_sender_state() -> &'static Mutex<Option<mpsc::Sender<HighlightWorkerTask>>>
+    {
+        static WORKER_SENDER: OnceLock<Mutex<Option<mpsc::Sender<HighlightWorkerTask>>>> =
+            OnceLock::new();
+        WORKER_SENDER.get_or_init(|| Mutex::new(None))
+    }
+
+    fn highlight_worker_sender() -> Option<mpsc::Sender<HighlightWorkerTask>> {
+        let sender_state = Self::highlight_worker_sender_state();
+        let mut sender_guard = sender_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if sender_guard.is_none() {
+            *sender_guard = Self::spawn_highlight_worker_sender();
+        }
+
+        sender_guard.as_ref().cloned()
+    }
+
+    fn clear_cached_highlight_worker_sender() {
+        let sender_state = Self::highlight_worker_sender_state();
+        let mut sender_guard = sender_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sender_guard.take();
+    }
+
+    fn spawn_highlight_worker_sender() -> Option<mpsc::Sender<HighlightWorkerTask>> {
+        let (sender, receiver) = mpsc::channel::<HighlightWorkerTask>();
+        let spawn_result = thread::Builder::new()
+            .name("sql-highlighter-worker-global".to_string())
+            .spawn(move || {
+                while let Ok(first_task) = receiver.recv() {
+                    let mut latest_tasks: HashMap<u64, HighlightWorkerTask> = HashMap::new();
+                    latest_tasks.insert(first_task.editor_id, first_task);
+
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(task) => {
+                                latest_tasks.insert(task.editor_id, task);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    for task in latest_tasks.into_values() {
                         let style_text = {
                             let guard = task
                                 .highlighter
@@ -781,15 +823,24 @@ impl SqlEditorWidget {
                             app::awake();
                         }
                     }
-                });
-            if let Err(err) = spawn_result {
+                }
+            });
+
+        match spawn_result {
+            Ok(_) => Some(sender),
+            Err(err) => {
                 crate::utils::logging::log_error(
                     "sql_editor::highlight_worker",
                     &format!("failed to spawn global highlight worker: {}", err),
                 );
+                None
             }
-            sender
-        })
+        }
+    }
+
+    fn next_highlight_editor_id() -> u64 {
+        static EDITOR_ID: AtomicU64 = AtomicU64::new(0);
+        EDITOR_ID.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {
@@ -1084,6 +1135,7 @@ impl SqlEditorWidget {
             highlight_result_sender,
             highlight_revision: highlight_revision.clone(),
             highlight_generation: highlight_generation.clone(),
+            highlight_editor_id: Self::next_highlight_editor_id(),
         };
 
         widget.setup_intellisense();
@@ -2462,7 +2514,17 @@ impl SqlEditorWidget {
     fn enqueue_highlight_request(&self, text: String) {
         let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let generation = self.highlight_generation.load(Ordering::Relaxed);
-        let send_result = Self::highlight_worker_sender().send(HighlightWorkerTask {
+
+        let Some(sender) = Self::highlight_worker_sender() else {
+            crate::utils::logging::log_error(
+                "sql_editor::highlight_worker",
+                "highlight worker unavailable; failed to enqueue request",
+            );
+            return;
+        };
+
+        let send_result = sender.send(HighlightWorkerTask {
+            editor_id: self.highlight_editor_id,
             request: HighlightRequest {
                 revision,
                 generation,
@@ -2471,7 +2533,9 @@ impl SqlEditorWidget {
             highlighter: self.highlighter.clone(),
             result_sender: self.highlight_result_sender.clone(),
         });
+
         if let Err(err) = send_result {
+            Self::clear_cached_highlight_worker_sender();
             crate::utils::logging::log_error(
                 "sql_editor::highlight_worker",
                 &format!("failed to enqueue highlight request: {}", err),
