@@ -523,7 +523,7 @@ impl SqlEditorWidget {
                         Self::format_statement(statement, force_select_list_newline_next);
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     formatted.push_str(&formatted_statement);
-                    if has_code && !Self::statement_ends_with_semicolon(&formatted_statement) {
+                    if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
                         formatted.push(';');
                     }
                     force_select_list_newline_next =
@@ -647,6 +647,10 @@ impl SqlEditorWidget {
 
     fn statement_ends_with_semicolon(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
+        Self::statement_ends_with_semicolon_tokens(&tokens)
+    }
+
+    fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
         for token in tokens.iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,

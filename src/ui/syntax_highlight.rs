@@ -200,7 +200,8 @@ impl SqlHighlighter {
     }
 
     fn rebuild_identifier_lookup(&mut self) {
-        let mut relation_lookup = HashSet::new();
+        let relation_capacity = self.highlight_data.tables.len() + self.highlight_data.views.len();
+        let mut relation_lookup = HashSet::with_capacity(relation_capacity);
         for name in self
             .highlight_data
             .tables
@@ -210,12 +211,11 @@ impl SqlHighlighter {
             relation_lookup.insert(name.to_uppercase());
         }
         self.relation_lookup = relation_lookup;
-        self.column_lookup = self
-            .highlight_data
-            .columns
-            .iter()
-            .map(|name| name.to_uppercase())
-            .collect();
+        let mut column_lookup = HashSet::with_capacity(self.highlight_data.columns.len());
+        for name in &self.highlight_data.columns {
+            column_lookup.insert(name.to_uppercase());
+        }
+        self.column_lookup = column_lookup;
     }
 
     /// Highlights using a windowed range with optional viewport hint.
@@ -291,11 +291,7 @@ impl SqlHighlighter {
             // NOTE: STYLE_DATETIME_LITERAL is intentionally excluded here
             // because an unclosed DATE/TIMESTAMP/INTERVAL literal can span a
             // window boundary and must be re-lexed to detect InSingleQuote.
-            STYLE_DEFAULT
-            | STYLE_KEYWORD
-            | STYLE_FUNCTION
-            | STYLE_NUMBER
-            | STYLE_OPERATOR
+            STYLE_DEFAULT | STYLE_KEYWORD | STYLE_FUNCTION | STYLE_NUMBER | STYLE_OPERATOR
             | STYLE_COLUMN => return LexerState::Normal,
             _ => {}
         }
