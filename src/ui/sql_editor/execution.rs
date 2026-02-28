@@ -593,33 +593,41 @@ impl SqlEditorWidget {
     }
 
     fn is_create_trigger_statement(statement: &str) -> bool {
-        let words: Vec<String> = Self::tokenize_sql(statement)
-            .into_iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.to_uppercase()),
-                _ => None,
-            })
-            .collect();
-        if words.first().map(String::as_str) != Some("CREATE") {
-            return false;
+        let mut word_idx = 0usize;
+        let mut has_trigger_in_prefix = false;
+
+        for token in Self::tokenize_sql(statement) {
+            let SqlToken::Word(word) = token else {
+                continue;
+            };
+
+            if word_idx == 0 && !word.eq_ignore_ascii_case("CREATE") {
+                return false;
+            }
+
+            if word_idx < 8 && word.eq_ignore_ascii_case("TRIGGER") {
+                has_trigger_in_prefix = true;
+            }
+
+            word_idx += 1;
         }
-        words.iter().take(8).any(|word| word == "TRIGGER")
+
+        word_idx > 0 && has_trigger_in_prefix
     }
 
     fn is_alter_trigger_statement(statement: &str) -> bool {
-        let words: Vec<String> = Self::tokenize_sql(statement)
+        let mut words = Self::tokenize_sql(statement)
             .into_iter()
             .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.to_uppercase()),
+                SqlToken::Word(word) => Some(word),
                 _ => None,
-            })
-            .collect();
+            });
+
         matches!(
-            (
-                words.first().map(String::as_str),
-                words.get(1).map(String::as_str)
-            ),
-            (Some("ALTER"), Some("TRIGGER"))
+            (words.next(), words.next()),
+            (Some(first), Some(second))
+                if first.eq_ignore_ascii_case("ALTER")
+                    && second.eq_ignore_ascii_case("TRIGGER")
         )
     }
 
