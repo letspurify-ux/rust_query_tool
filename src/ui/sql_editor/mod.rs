@@ -1476,12 +1476,6 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if should_clear_pending {
-                *pending_intellisense
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            }
-
             if let Some(highlight_columns) = highlight_columns {
                 let should_refresh_highlighting = {
                     let mut highlighter = highlighter
@@ -1503,6 +1497,9 @@ impl SqlEditorWidget {
                 }
             }
 
+            // Refresh intellisense BEFORE clearing pending so that a poll
+            // iteration with mixed results (some tables cached, some failed)
+            // still fires a retry with whatever data is now available.
             if should_refresh_pending {
                 let pending = pending_intellisense
                     .lock()
@@ -1530,6 +1527,14 @@ impl SqlEditorWidget {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                     }
                 }
+            }
+
+            // Clear pending AFTER the refresh above so the retry is not
+            // skipped when all outstanding loads finish in the same poll.
+            if should_clear_pending {
+                *pending_intellisense
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             }
 
             let stale_cleared = {
