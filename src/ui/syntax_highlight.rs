@@ -135,19 +135,6 @@ impl TokenType {
     }
 }
 
-/// Lexer state at a given position in the text.
-/// Used to correctly highlight windows that start mid-token (e.g., inside a block comment).
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum LexerState {
-    #[default]
-    Normal,
-    InBlockComment,
-    InHintComment,
-    InSingleQuote,
-    InQQuote { closing: u8 },
-    InDoubleQuote,
-}
-
 /// Holds additional identifiers for highlighting (tables, views, etc.)
 #[derive(Clone, Default)]
 pub struct HighlightData {
@@ -176,8 +163,6 @@ pub struct SqlHighlighter {
 const HIGHLIGHT_WINDOW_THRESHOLD: usize = 20_000;
 const HIGHLIGHT_WINDOW_RADIUS: usize = 8_000;
 const MAX_HIGHLIGHT_WINDOWS_PER_PASS: usize = 6;
-/// Maximum backward probe distance to determine lexer state at a window boundary.
-const STATE_PROBE_DISTANCE: usize = 32_768;
 
 impl SqlHighlighter {
     pub fn new() -> Self {
@@ -224,26 +209,6 @@ impl SqlHighlighter {
         cursor_pos: usize,
         edited_range: Option<(usize, usize)>,
     ) {
-        self.highlight_buffer_window_viewport(
-            buffer,
-            style_buffer,
-            cursor_pos,
-            edited_range,
-            None,
-        );
-    }
-
-    /// Highlights using a windowed range with optional viewport hint.
-    /// `viewport` is the visible byte range `(start, end)` in the editor;
-    /// when provided the visible area is always included in the highlight pass.
-    pub fn highlight_buffer_window_viewport(
-        &self,
-        buffer: &TextBuffer,
-        style_buffer: &mut TextBuffer,
-        cursor_pos: usize,
-        edited_range: Option<(usize, usize)>,
-        viewport: Option<(usize, usize)>,
-    ) {
         let text_len = buffer.length().max(0) as usize;
         if text_len == 0 {
             style_buffer.set_text("");
@@ -261,19 +226,15 @@ impl SqlHighlighter {
             style_buffer.set_text(&default_styles);
         }
 
-        let ranges =
-            select_highlight_ranges(buffer, text_len, cursor_pos, edited_range, viewport);
+        let ranges = select_highlight_ranges(buffer, text_len, cursor_pos, edited_range);
         for (range_start, range_end) in ranges {
             if range_start >= range_end {
                 continue;
             }
-            let entry_state =
-                self.probe_entry_state(buffer, style_buffer, range_start);
             let Some(window_text) = buffer.text_range(range_start as i32, range_end as i32) else {
                 continue;
             };
-            let (window_styles, _exit_state) =
-                self.generate_styles_with_state(&window_text, entry_state);
+            let window_styles = self.generate_styles(&window_text);
             if window_styles.len() != range_end - range_start {
                 continue;
             }
@@ -281,171 +242,15 @@ impl SqlHighlighter {
         }
     }
 
-    /// Probe backward from `pos` to determine the lexer state at that position.
-    /// Uses the style buffer for a quick check and falls back to re-lexing a
-    /// limited backward window when the position appears to be inside a
-    /// multi-line token (comment, string, quoted identifier).
-    fn probe_entry_state(
-        &self,
-        buffer: &TextBuffer,
-        style_buffer: &TextBuffer,
-        pos: usize,
-    ) -> LexerState {
-        if pos == 0 {
-            return LexerState::Normal;
-        }
-
-        // Quick check: read the style byte immediately before the window.
-        let prev_pos = (pos - 1) as i32;
-        let prev_style = style_buffer
-            .text_range(prev_pos, prev_pos + 1)
-            .and_then(|s| s.bytes().next())
-            .map(|b| b as char)
-            .unwrap_or(STYLE_DEFAULT);
-
-        match prev_style {
-            // These styles never span across window boundaries.
-            STYLE_DEFAULT | STYLE_KEYWORD | STYLE_FUNCTION | STYLE_NUMBER | STYLE_OPERATOR
-            | STYLE_COLUMN | STYLE_DATETIME_LITERAL => return LexerState::Normal,
-            _ => {}
-        }
-
-        // The previous byte looks like a multi-line token (COMMENT, HINT,
-        // STRING, or IDENTIFIER).  Re-lex a backward window to determine the
-        // exact state.
-        let probe_start = pos.saturating_sub(STATE_PROBE_DISTANCE);
-        let Some(probe_text) = buffer.text_range(probe_start as i32, pos as i32) else {
-            return LexerState::Normal;
-        };
-        self.generate_styles_with_state(&probe_text, LexerState::Normal)
-            .1
-    }
-
-    /// Generates the style string for the given text, starting from Normal state.
+    /// Generates the style string for the given text
     ///
     /// IMPORTANT: FLTK TextBuffer uses byte-based indexing, so the style buffer
     /// must have one style character per byte.
     fn generate_styles(&self, text: &str) -> String {
-        self.generate_styles_with_state(text, LexerState::Normal).0
-    }
-
-    /// State-aware version of `generate_styles`.
-    /// Accepts the lexer state at the start of `text` and returns both the
-    /// styled output and the lexer state at the end.
-    fn generate_styles_with_state(
-        &self,
-        text: &str,
-        initial_state: LexerState,
-    ) -> (String, LexerState) {
-        let len = text.len();
-        if len == 0 {
-            return (String::new(), initial_state);
-        }
-        let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; len];
+        let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; text.len()];
         let bytes = text.as_bytes();
         let mut idx = 0usize;
-        let mut exit_state = LexerState::Normal;
 
-        // ── Handle continuation of unclosed multi-line tokens ──────────
-        match initial_state {
-            LexerState::InBlockComment => {
-                loop {
-                    match (bytes.get(idx), bytes.get(idx + 1)) {
-                        (Some(&b'*'), Some(&b'/')) => {
-                            idx += 2;
-                            break;
-                        }
-                        (Some(_), _) => idx += 1,
-                        (None, _) => {
-                            styles[..].fill(STYLE_COMMENT as u8);
-                            return (style_bytes_to_string(styles), LexerState::InBlockComment);
-                        }
-                    }
-                }
-                styles[..idx].fill(STYLE_COMMENT as u8);
-            }
-            LexerState::InHintComment => {
-                loop {
-                    match (bytes.get(idx), bytes.get(idx + 1)) {
-                        (Some(&b'*'), Some(&b'/')) => {
-                            idx += 2;
-                            break;
-                        }
-                        (Some(_), _) => idx += 1,
-                        (None, _) => {
-                            styles[..].fill(STYLE_HINT as u8);
-                            return (style_bytes_to_string(styles), LexerState::InHintComment);
-                        }
-                    }
-                }
-                styles[..idx].fill(STYLE_HINT as u8);
-            }
-            LexerState::InSingleQuote => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b'\'') => {
-                            if bytes.get(idx + 1) == Some(&b'\'') {
-                                idx += 2;
-                            } else {
-                                idx += 1;
-                                break;
-                            }
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_STRING as u8);
-                            return (style_bytes_to_string(styles), LexerState::InSingleQuote);
-                        }
-                    }
-                }
-                styles[..idx].fill(STYLE_STRING as u8);
-            }
-            LexerState::InQQuote { closing } => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b) if b == closing => {
-                            if bytes.get(idx + 1) == Some(&b'\'') {
-                                idx += 2;
-                                break;
-                            }
-                            idx += 1;
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_STRING as u8);
-                            return (style_bytes_to_string(styles), LexerState::InQQuote { closing });
-                        }
-                    }
-                }
-                styles[..idx].fill(STYLE_STRING as u8);
-            }
-            LexerState::InDoubleQuote => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b'"') => {
-                            if bytes.get(idx + 1) == Some(&b'"') {
-                                idx += 2;
-                            } else {
-                                idx += 1;
-                                break;
-                            }
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_IDENTIFIER as u8);
-                            return (
-                                style_bytes_to_string(styles),
-                                LexerState::InDoubleQuote,
-                            );
-                        }
-                    }
-                }
-                styles[..idx].fill(STYLE_IDENTIFIER as u8);
-            }
-            LexerState::Normal => {}
-        }
-
-        // ── Main scanning loop ─────────────────────────────────────────
         while let Some(&byte) = bytes.get(idx) {
             // Check for PROMPT command at the start of a line (SQL*Plus style)
             if idx == 0 || bytes.get(idx.saturating_sub(1)) == Some(&b'\n') {
@@ -467,6 +272,8 @@ impl SqlHighlighter {
                     continue;
                 }
                 if is_connect_keyword(bytes, scan) {
+                    // SQL*Plus CONNECT lines (e.g. CONNECT user/pass@host:1521/FREE)
+                    // contain many punctuation tokens; style only CONNECT keyword.
                     let keyword_end = scan + 7;
                     styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
                     let mut end = scan;
@@ -481,7 +288,7 @@ impl SqlHighlighter {
                 }
             }
 
-            // Single-line comment (--)
+            // Check for single-line comment (--)
             if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
                 let start = idx;
                 idx += 2;
@@ -495,17 +302,16 @@ impl SqlHighlighter {
                 continue;
             }
 
-            // Multi-line comment (/* */) or hint (/*+ */)
+            // Check for multi-line comment (/* */) or hint (/*+ */)
             if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
                 let start = idx;
+                // Check if this is a hint (/*+ ...)
                 let is_hint = bytes.get(idx + 2) == Some(&b'+');
                 idx += 2;
-                let mut closed = false;
                 loop {
                     match (bytes.get(idx), bytes.get(idx + 1)) {
                         (Some(&b'*'), Some(&b'/')) => {
                             idx += 2;
-                            closed = true;
                             break;
                         }
                         (Some(_), _) => idx += 1,
@@ -514,17 +320,10 @@ impl SqlHighlighter {
                 }
                 let style_char = if is_hint { STYLE_HINT } else { STYLE_COMMENT };
                 styles[start..idx].fill(style_char as u8);
-                if !closed {
-                    exit_state = if is_hint {
-                        LexerState::InHintComment
-                    } else {
-                        LexerState::InBlockComment
-                    };
-                }
                 continue;
             }
 
-            // nq-quoted strings: nq'[...]', nq'{...}', etc.
+            // Check for nq-quoted strings: nq'[...]', nq'{...}', etc. (National Character Set)
             if (byte == b'n' || byte == b'N')
                 && (bytes.get(idx + 1) == Some(&b'q') || bytes.get(idx + 1) == Some(&b'Q'))
                 && bytes.get(idx + 2) == Some(&b'\'')
@@ -532,52 +331,41 @@ impl SqlHighlighter {
                 if let Some(&delimiter) = bytes.get(idx + 3) {
                     let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
-                    idx += 4;
-                    let mut closed = false;
+                    idx += 4; // Skip nq'[ and find closing delimiter followed by '
                     while idx < bytes.len() {
                         if bytes.get(idx) == Some(&closing) && bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            closed = true;
+                            idx += 2; // Include ]'
                             break;
                         }
                         idx += 1;
                     }
                     styles[start..idx].fill(STYLE_STRING as u8);
-                    if !closed {
-                        exit_state = LexerState::InQQuote { closing };
-                    }
                     continue;
                 }
             }
 
-            // q-quoted strings: q'[...]', q'{...}', etc.
+            // Check for q-quoted strings: q'[...]', q'{...}', etc.
             if (byte == b'q' || byte == b'Q') && bytes.get(idx + 1) == Some(&b'\'') {
                 if let Some(&delimiter) = bytes.get(idx + 2) {
                     let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
-                    idx += 3;
-                    let mut closed = false;
+                    idx += 3; // Skip q'[ and find closing delimiter followed by '
                     while idx < bytes.len() {
                         if bytes.get(idx) == Some(&closing) && bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            closed = true;
+                            idx += 2; // Include ]'
                             break;
                         }
                         idx += 1;
                     }
                     styles[start..idx].fill(STYLE_STRING as u8);
-                    if !closed {
-                        exit_state = LexerState::InQQuote { closing };
-                    }
                     continue;
                 }
             }
 
-            // String literals ('...')
+            // Check for string literals ('...')
             if byte == b'\'' {
                 let start = idx;
                 idx += 1;
-                let mut closed = false;
                 while let Some(&b) = bytes.get(idx) {
                     if b == b'\'' {
                         if bytes.get(idx + 1) == Some(&b'\'') {
@@ -585,23 +373,18 @@ impl SqlHighlighter {
                             continue;
                         }
                         idx += 1;
-                        closed = true;
                         break;
                     }
                     idx += 1;
                 }
                 styles[start..idx].fill(STYLE_STRING as u8);
-                if !closed {
-                    exit_state = LexerState::InSingleQuote;
-                }
                 continue;
             }
 
-            // Quoted identifiers ("..."), including escaped quotes ("")
+            // Check for quoted identifiers ("..."), including escaped quotes ("")
             if byte == b'"' {
                 let start = idx;
                 idx += 1;
-                let mut closed = false;
                 while let Some(&b) = bytes.get(idx) {
                     if b == b'"' {
                         if bytes.get(idx + 1) == Some(&b'"') {
@@ -609,19 +392,15 @@ impl SqlHighlighter {
                             continue;
                         }
                         idx += 1;
-                        closed = true;
                         break;
                     }
                     idx += 1;
                 }
                 styles[start..idx].fill(STYLE_IDENTIFIER as u8);
-                if !closed {
-                    exit_state = LexerState::InDoubleQuote;
-                }
                 continue;
             }
 
-            // Numbers
+            // Check for numbers
             if byte.is_ascii_digit()
                 || (byte == b'.' && bytes.get(idx + 1).map_or(false, |b| b.is_ascii_digit()))
             {
@@ -642,7 +421,7 @@ impl SqlHighlighter {
                 continue;
             }
 
-            // Identifiers / keywords
+            // Check for identifiers/keywords
             if sql_text::is_identifier_start_byte(byte) {
                 let start = idx;
                 idx += 1;
@@ -655,8 +434,9 @@ impl SqlHighlighter {
                 let word = text.get(start..idx).unwrap_or("");
                 let upper_word = word.to_ascii_uppercase();
 
-                // DATE / TIMESTAMP / INTERVAL literals
+                // Check for DATE/TIMESTAMP/INTERVAL literals (e.g., DATE '2024-01-01')
                 if matches!(upper_word.as_str(), "DATE" | "TIMESTAMP" | "INTERVAL") {
+                    // Skip whitespace to find potential string literal
                     let mut look_ahead = idx;
                     while bytes
                         .get(look_ahead)
@@ -664,19 +444,22 @@ impl SqlHighlighter {
                     {
                         look_ahead += 1;
                     }
+                    // Check if followed by a single quote (string literal)
                     if bytes.get(look_ahead) == Some(&b'\'') {
+                        // Find the end of the string literal
                         look_ahead += 1;
                         while let Some(&b) = bytes.get(look_ahead) {
                             if b == b'\'' {
                                 if bytes.get(look_ahead + 1) == Some(&b'\'') {
-                                    look_ahead += 2;
+                                    look_ahead += 2; // escaped quote
                                     continue;
                                 }
-                                look_ahead += 1;
+                                look_ahead += 1; // include closing quote
                                 break;
                             }
                             look_ahead += 1;
                         }
+                        // Style the keyword and string as datetime literal
                         styles[start..look_ahead].fill(STYLE_DATETIME_LITERAL as u8);
                         idx = look_ahead;
                         continue;
@@ -688,7 +471,7 @@ impl SqlHighlighter {
                 continue;
             }
 
-            // Operators
+            // Check for operators
             if is_operator_byte(byte) {
                 styles[idx] = STYLE_OPERATOR as u8;
                 idx += 1;
@@ -698,7 +481,7 @@ impl SqlHighlighter {
             idx += 1;
         }
 
-        (style_bytes_to_string(styles), exit_state)
+        style_bytes_to_string(styles)
     }
 
     /// Classifies a word as keyword, function, identifier, or default
@@ -757,15 +540,8 @@ fn select_highlight_ranges(
     text_len: usize,
     cursor_pos: usize,
     edited_range: Option<(usize, usize)>,
-    viewport: Option<(usize, usize)>,
 ) -> Vec<(usize, usize)> {
     let mut anchors = vec![cursor_pos.min(text_len)];
-
-    // Always include viewport center as an anchor so visible area is highlighted.
-    if let Some((vp_start, vp_end)) = viewport {
-        let vp_mid = ((vp_start.min(text_len)) + (vp_end.min(text_len))) / 2;
-        anchors.push(vp_mid);
-    }
 
     if let Some((edit_start, edit_end)) = edited_range {
         let mut start = edit_start.min(text_len);
@@ -774,7 +550,10 @@ fn select_highlight_ranges(
             std::mem::swap(&mut start, &mut end);
         }
 
-        // Never return the entire file as one range — always apply windowing.
+        if start == 0 && end == text_len {
+            return vec![(0, text_len)];
+        }
+
         if start == end {
             anchors.push(start);
         } else {
@@ -812,10 +591,6 @@ fn select_highlight_ranges(
         if let Some((edit_start, edit_end)) = edited_range {
             focus_points.push(edit_start.min(text_len));
             focus_points.push(edit_end.min(text_len));
-        }
-        if let Some((vp_start, vp_end)) = viewport {
-            focus_points.push(vp_start.min(text_len));
-            focus_points.push(vp_end.min(text_len));
         }
         merged = prioritize_ranges_for_focus(merged, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
     }

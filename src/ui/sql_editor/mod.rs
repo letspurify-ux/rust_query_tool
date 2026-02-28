@@ -62,9 +62,6 @@ const PROGRESS_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.001;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
-/// Maximum scan radius for stateful delimiter changes (e.g. `'`, `/*`).
-/// Replaces the old full-buffer scan with a bounded 128 KB window.
-const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
@@ -1543,15 +1540,7 @@ impl SqlEditorWidget {
             let mut edited_range = compute_edited_range(pos, ins, del, text_len);
 
             if needs_full_rehighlight(buf, pos, ins, deleted_text) {
-                // Bounded scan around the edit instead of the entire buffer.
-                // The state-aware highlighter will probe backward to determine
-                // correct lexer state (in-comment, in-string, etc.).
-                let edit_pos = pos.max(0) as usize;
-                let scan_start = edit_pos.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
-                let scan_end = edit_pos
-                    .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
-                    .min(text_len);
-                edited_range = Some((scan_start, scan_end));
+                edited_range = Some((0, text_len));
             } else if let Some((start, end)) = edited_range {
                 let inserted_text = inserted_text(buf, pos, ins);
                 if !has_stateful_sql_delimiter(&inserted_text) {
