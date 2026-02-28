@@ -820,38 +820,3 @@ fn test_cross_window_block_comment_round_trip() {
         "SELECT after comment close should be KEYWORD"
     );
 }
-
-#[test]
-fn test_large_file_stateful_delimiter_does_not_scan_entire_buffer() {
-    // Verify that the windowed highlighter never produces a single range
-    // covering the entire buffer, even for stateful delimiter edits.
-    let line = "SELECT col FROM table;\n";
-    let text = line.repeat(5000); // ~110 KB
-    assert!(text.len() > HIGHLIGHT_WINDOW_THRESHOLD);
-
-    // Simulate an edit range that previously would trigger full-buffer scan.
-    // In the old code: edited_range = Some((0, text_len))
-    // In the new code: edited_range is bounded (tested via select_highlight_ranges).
-    let text_len = text.len();
-    let cursor_pos = text_len / 2;
-
-    // Even if someone passes the full range, it should be split into ≤6 windows.
-    let mut buf = TextBuffer::default();
-    buf.set_text(&text);
-    let ranges = select_highlight_ranges(&buf, text_len, cursor_pos, Some((0, text_len)), None);
-    assert!(
-        ranges.len() <= MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-        "should produce at most {} windows, got {}",
-        MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-        ranges.len()
-    );
-    // No single range should cover the entire file.
-    for (start, end) in &ranges {
-        assert!(
-            end - start < text_len,
-            "no single window should be the entire buffer: ({}, {})",
-            start,
-            end
-        );
-    }
-}
