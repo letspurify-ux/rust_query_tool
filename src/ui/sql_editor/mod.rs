@@ -23,7 +23,6 @@ use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{flush_history_writer_with_timeout, QueryHistoryDialog};
-#[cfg(test)]
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
     create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_STRING,
@@ -835,6 +834,22 @@ impl SqlEditorWidget {
                                         task.editor_id, panic_msg
                                     ),
                                 );
+
+                                let fallback_styles =
+                                    SqlEditorWidget::default_style_text_for_len(
+                                        task.request.text.len(),
+                                    );
+                                if task
+                                    .result_sender
+                                    .send(HighlightResult {
+                                        revision: task.request.revision,
+                                        generation: task.request.generation,
+                                        style_text: fallback_styles,
+                                    })
+                                    .is_ok()
+                                {
+                                    app::awake();
+                                }
                             }
                         }
                     }
@@ -856,6 +871,10 @@ impl SqlEditorWidget {
     fn next_highlight_editor_id() -> u64 {
         static EDITOR_ID: AtomicU64 = AtomicU64::new(0);
         EDITOR_ID.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn default_style_text_for_len(len: usize) -> String {
+        std::iter::repeat_n(STYLE_DEFAULT, len).collect()
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {

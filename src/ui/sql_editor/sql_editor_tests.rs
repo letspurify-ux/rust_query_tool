@@ -1,5 +1,5 @@
 use super::*;
-use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_KEYWORD, STYLE_STRING};
+use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_DEFAULT, STYLE_KEYWORD, STYLE_STRING};
 
 use std::fs;
 use std::path::PathBuf;
@@ -44,6 +44,13 @@ fn is_window_shown_and_visible_requires_both_flags() {
     assert!(!is_window_shown_and_visible(true, false));
     assert!(!is_window_shown_and_visible(false, true));
     assert!(!is_window_shown_and_visible(false, false));
+}
+
+#[test]
+fn default_style_text_for_len_matches_requested_length() {
+    let styles = SqlEditorWidget::default_style_text_for_len(8);
+    assert_eq!(styles.chars().count(), 8);
+    assert!(styles.chars().all(|ch| ch == STYLE_DEFAULT));
 }
 
 #[test]
