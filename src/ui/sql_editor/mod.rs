@@ -61,7 +61,12 @@ const MAX_PROGRESS_MESSAGES_PER_POLL: usize = 8000;
 const PROGRESS_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.001;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
+const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
+const LARGE_STATEFUL_INSERT_FULL_RANGE_THRESHOLD: usize = 256_000;
+/// Maximum scan radius for stateful delimiter changes (e.g. `'`, `/*`).
+/// Replaces the old full-buffer scan with a bounded 128 KB window.
+const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
@@ -128,6 +133,7 @@ struct BufferEdit {
     start: usize,
     deleted_len: usize,
     inserted_text: String,
+    deleted_text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,45 +148,56 @@ impl UndoSnapshot {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UndoDelta {
+    start: usize,
+    deleted_text: String,
+    inserted_text: String,
+    before_cursor: usize,
+    after_cursor: usize,
+    group_id: u64,
+}
+
 #[derive(Clone)]
 struct WordUndoRedoState {
-    history: Vec<UndoSnapshot>,
+    anchor: UndoSnapshot,
+    current: UndoSnapshot,
+    deltas: Vec<UndoDelta>,
+    history_total_bytes: usize,
     index: usize,
-    active_group: Option<EditGroup>,
+    active_group: Option<(EditGroup, u64)>,
+    next_group_id: u64,
     applying_history: bool,
 }
 
 impl WordUndoRedoState {
     fn new(initial_text: String) -> Self {
         let initial_cursor = initial_text.len();
+        let initial_snapshot = UndoSnapshot::new(initial_text, initial_cursor);
         Self {
-            history: vec![UndoSnapshot::new(initial_text, initial_cursor)],
+            anchor: initial_snapshot.clone(),
+            current: initial_snapshot,
+            deltas: Vec::new(),
+            history_total_bytes: 0,
             index: 0,
             active_group: None,
+            next_group_id: 1,
             applying_history: false,
         }
     }
 
     fn normalize_index(&mut self) {
-        if self.history.is_empty() {
-            self.history.push(UndoSnapshot::new(String::new(), 0));
-            self.index = 0;
-            self.active_group = None;
-            return;
-        }
-
-        if self.index >= self.history.len() {
-            self.index = self.history.len().saturating_sub(1);
+        if self.index > self.deltas.len() {
+            self.index = self.deltas.len();
             self.active_group = None;
         }
+        self.current.cursor_pos =
+            Self::clamp_to_char_boundary(&self.current.text, self.current.cursor_pos);
     }
 
     #[cfg(test)]
     fn current_snapshot_matches(&self, current_text: &str) -> bool {
-        self.history
-            .get(self.index)
-            .map(|snapshot| snapshot.text == current_text)
-            .unwrap_or(false)
+        self.current.text == current_text
     }
 
     fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
@@ -191,13 +208,17 @@ impl WordUndoRedoState {
         idx
     }
 
-    fn apply_edit_to_snapshot(snapshot: &mut UndoSnapshot, edit: &BufferEdit) {
-        let replace_start = Self::clamp_to_char_boundary(&snapshot.text, edit.start);
+    fn normalized_replace_range(text: &str, edit: &BufferEdit) -> (usize, usize) {
+        let replace_start = Self::clamp_to_char_boundary(text, edit.start);
         let delete_end = replace_start
             .saturating_add(edit.deleted_len)
-            .min(snapshot.text.len());
-        let replace_end =
-            Self::clamp_to_char_boundary(&snapshot.text, delete_end).max(replace_start);
+            .min(text.len());
+        let replace_end = Self::clamp_to_char_boundary(text, delete_end).max(replace_start);
+        (replace_start, replace_end)
+    }
+
+    fn apply_edit_to_snapshot(snapshot: &mut UndoSnapshot, edit: &BufferEdit) {
+        let (replace_start, replace_end) = Self::normalized_replace_range(&snapshot.text, edit);
         snapshot
             .text
             .replace_range(replace_start..replace_end, &edit.inserted_text);
@@ -207,8 +228,37 @@ impl WordUndoRedoState {
         snapshot.cursor_pos = Self::clamp_to_char_boundary(&snapshot.text, cursor);
     }
 
+    fn apply_delta_to_snapshot(snapshot: &mut UndoSnapshot, delta: &UndoDelta, reverse: bool) {
+        let delete_len = if reverse {
+            delta.inserted_text.len()
+        } else {
+            delta.deleted_text.len()
+        };
+        let edit = BufferEdit {
+            start: delta.start,
+            deleted_len: delete_len,
+            inserted_text: if reverse {
+                delta.deleted_text.clone()
+            } else {
+                delta.inserted_text.clone()
+            },
+            deleted_text: if reverse {
+                delta.inserted_text.clone()
+            } else {
+                delta.deleted_text.clone()
+            },
+        };
+        Self::apply_edit_to_snapshot(snapshot, &edit);
+        let cursor = if reverse {
+            delta.before_cursor
+        } else {
+            delta.after_cursor
+        };
+        snapshot.cursor_pos = Self::clamp_to_char_boundary(&snapshot.text, cursor);
+    }
+
     fn should_merge_into_active_group(&self, edit_group: EditGroup, edit: &BufferEdit) -> bool {
-        let Some(active_group) = self.active_group else {
+        let Some((active_group, _)) = self.active_group else {
             return false;
         };
 
@@ -226,30 +276,21 @@ impl WordUndoRedoState {
             return false;
         }
 
-        let current_cursor = self
-            .history
-            .get(self.index)
-            .map(|snapshot| snapshot.cursor_pos)
-            .unwrap_or(0);
-        let current_text = self
-            .history
-            .get(self.index)
-            .map(|snapshot| snapshot.text.as_str())
-            .unwrap_or("");
-        let edit_start = edit.start;
-        let edit_end = edit_start.saturating_add(edit.deleted_len);
-
-        let cursor_line = Self::line_index_at(current_text, current_cursor);
-        let edit_start_line = Self::line_index_at(current_text, edit_start);
-        let edit_end_line = Self::line_index_at(current_text, edit_end);
-        if cursor_line != edit_start_line || cursor_line != edit_end_line {
-            return false;
-        }
+        let current_cursor = self.current.cursor_pos;
+        let current_text = self.current.text.as_str();
+        let (edit_start, edit_end) = Self::normalized_replace_range(current_text, edit);
 
         let near_current_cursor = edit_start <= current_cursor.saturating_add(12)
             && current_cursor <= edit_end.saturating_add(12);
-        let small_edit = edit.deleted_len <= 24 && edit.inserted_text.len() <= 48;
+        let deleted_size = edit.deleted_len.max(edit.deleted_text.len());
+        let small_edit = deleted_size <= 24 && edit.inserted_text.len() <= 48;
         if !near_current_cursor || !small_edit {
+            return false;
+        }
+
+        if !Self::is_same_line(current_text, current_cursor, edit_start)
+            || !Self::is_same_line(current_text, current_cursor, edit_end)
+        {
             return false;
         }
 
@@ -266,12 +307,62 @@ impl WordUndoRedoState {
         true
     }
 
-    fn line_index_at(text: &str, pos: usize) -> usize {
-        let safe_pos = Self::clamp_to_char_boundary(text, pos.min(text.len()));
-        text.as_bytes()[..safe_pos]
+    fn is_same_line(text: &str, left: usize, right: usize) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+
+        let left = Self::clamp_to_char_boundary(text, left.min(text.len()));
+        let right = Self::clamp_to_char_boundary(text, right.min(text.len()));
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        !text.as_bytes()[start..end].contains(&b'\n')
+    }
+
+    fn truncate_redo_history(&mut self) {
+        if self.index >= self.deltas.len() {
+            return;
+        }
+
+        let removed_bytes: usize = self.deltas[self.index..]
             .iter()
-            .filter(|&&b| b == b'\n')
-            .count()
+            .map(|delta| delta.deleted_text.len().saturating_add(delta.inserted_text.len()))
+            .sum();
+        self.deltas.truncate(self.index);
+        self.history_total_bytes = self.history_total_bytes.saturating_sub(removed_bytes);
+        self.active_group = None;
+    }
+
+    fn effective_history_byte_limit(&self) -> usize {
+        MAX_WORD_UNDO_HISTORY_BYTES.max(self.current.text.len().saturating_mul(2))
+    }
+
+    fn trim_history_if_needed(&mut self) {
+        let byte_limit = self.effective_history_byte_limit();
+        while self.deltas.len() > 1
+            && (self.deltas.len() > MAX_WORD_UNDO_HISTORY || self.history_total_bytes > byte_limit)
+        {
+            let removed = self.deltas.remove(0);
+            let removed_len = removed
+                .deleted_text
+                .len()
+                .saturating_add(removed.inserted_text.len());
+            self.history_total_bytes = self.history_total_bytes.saturating_sub(removed_len);
+            if self.index > 0 {
+                Self::apply_delta_to_snapshot(&mut self.anchor, &removed, false);
+                self.index = self.index.saturating_sub(1);
+            }
+        }
+
+        if self.index > self.deltas.len() {
+            self.index = self.deltas.len();
+        }
+        if self.index == 0 {
+            self.active_group = None;
+        }
     }
 
     fn word_span_touching_offset(text: &str, pos: usize) -> Option<(usize, usize)> {
@@ -342,37 +433,58 @@ impl WordUndoRedoState {
         edit_start < word_end && edit_end > word_start
     }
 
+    fn next_group_id(&mut self) -> u64 {
+        let group_id = self.next_group_id;
+        self.next_group_id = self.next_group_id.saturating_add(1);
+        group_id
+    }
+
     fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) {
         self.normalize_index();
+        self.truncate_redo_history();
 
-        let current_index = self.index;
-        if current_index + 1 < self.history.len() {
-            self.history.truncate(current_index + 1);
-        }
+        let before_cursor = self.current.cursor_pos;
+        let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
+        let deleted_text = self
+            .current
+            .text
+            .get(replace_start..replace_end)
+            .map(|text| text.to_string())
+            .unwrap_or_else(String::new);
+        let normalized_edit = BufferEdit {
+            start: replace_start,
+            deleted_len: replace_end.saturating_sub(replace_start),
+            inserted_text: edit.inserted_text.clone(),
+            deleted_text,
+        };
 
-        let mut next_snapshot = self
-            .history
-            .get(current_index)
-            .cloned()
-            .unwrap_or_else(|| UndoSnapshot::new(String::new(), 0));
-        Self::apply_edit_to_snapshot(&mut next_snapshot, edit);
-
-        if self.should_merge_into_active_group(edit_group, edit) {
-            if let Some(snapshot) = self.history.get_mut(current_index) {
-                *snapshot = next_snapshot;
-            } else {
-                self.history.push(next_snapshot);
-                self.index = self.history.len().saturating_sub(1);
-                self.active_group = Some(edit_group);
-            }
+        let merge_group = self.should_merge_into_active_group(edit_group, &normalized_edit);
+        let group_id = if merge_group {
+            self.active_group
+                .map(|(_, id)| id)
+                .unwrap_or_else(|| self.next_group_id())
         } else {
-            self.history.push(next_snapshot);
-            if self.history.len() > MAX_WORD_UNDO_HISTORY {
-                self.history.remove(0);
-            }
-            self.index = self.history.len().saturating_sub(1);
-            self.active_group = Some(edit_group);
-        }
+            self.next_group_id()
+        };
+
+        Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
+        let after_cursor = self.current.cursor_pos;
+
+        let delta = UndoDelta {
+            start: replace_start,
+            deleted_text: normalized_edit.deleted_text.clone(),
+            inserted_text: normalized_edit.inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self
+            .history_total_bytes
+            .saturating_add(delta.deleted_text.len().saturating_add(delta.inserted_text.len()));
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = Some((edit_group, group_id));
+        self.trim_history_if_needed();
     }
 
     #[cfg(test)]
@@ -381,40 +493,104 @@ impl WordUndoRedoState {
         if self.current_snapshot_matches(&current_text) {
             return;
         }
-        let cursor_pos = Self::clamp_to_char_boundary(&current_text, current_text.len());
-        let new_snapshot = UndoSnapshot::new(current_text, cursor_pos);
-
-        let current_index = self.index;
-        if current_index + 1 < self.history.len() {
-            self.history.truncate(current_index + 1);
+        let deleted_len = self.current.text.len();
+        let deleted_text = self.current.text.clone();
+        let edit = BufferEdit {
+            start: 0,
+            deleted_len,
+            inserted_text: current_text,
+            deleted_text,
+        };
+        if self.active_group.map(|(group, _)| group) != Some(edit_group) {
+            self.active_group = None;
         }
+        self.record_edit(&edit, edit_group);
+    }
 
-        if self.active_group == Some(edit_group) {
-            if let Some(existing_snapshot) = self.history.get_mut(current_index) {
-                *existing_snapshot = new_snapshot;
-            } else {
-                self.history.push(new_snapshot);
-                self.index = self.history.len().saturating_sub(1);
-                self.active_group = Some(edit_group);
+    #[cfg(test)]
+    fn history_snapshots(&self) -> Vec<UndoSnapshot> {
+        let mut snapshots = Vec::with_capacity(self.deltas.len().saturating_add(1));
+        let mut snapshot = self.anchor.clone();
+        snapshots.push(snapshot.clone());
+        for (idx, delta) in self.deltas.iter().enumerate() {
+            Self::apply_delta_to_snapshot(&mut snapshot, delta, false);
+            let next_group = self.deltas.get(idx.saturating_add(1)).map(|d| d.group_id);
+            if next_group != Some(delta.group_id) {
+                snapshots.push(snapshot.clone());
             }
-        } else {
-            self.history.push(new_snapshot);
-            if self.history.len() > MAX_WORD_UNDO_HISTORY {
-                self.history.remove(0);
-                self.index = self.history.len().saturating_sub(1);
-            } else {
-                self.index = self.history.len().saturating_sub(1);
-            }
-            self.active_group = Some(edit_group);
         }
+        snapshots
     }
 
     #[cfg(test)]
     fn history_texts(&self) -> Vec<String> {
-        self.history
+        self.history_snapshots()
             .iter()
             .map(|snapshot| snapshot.text.clone())
             .collect()
+    }
+
+    fn take_undo_group(&mut self) -> Vec<UndoDelta> {
+        self.normalize_index();
+        if self.index == 0 {
+            return Vec::new();
+        }
+
+        let Some(target_group_id) = self
+            .deltas
+            .get(self.index.saturating_sub(1))
+            .map(|delta| delta.group_id)
+        else {
+            return Vec::new();
+        };
+
+        let mut group = Vec::new();
+        while self.index > 0 {
+            let Some(delta) = self.deltas.get(self.index.saturating_sub(1)).cloned() else {
+                self.index = self.deltas.len();
+                self.active_group = None;
+                break;
+            };
+            if delta.group_id != target_group_id {
+                break;
+            }
+            self.index = self.index.saturating_sub(1);
+            Self::apply_delta_to_snapshot(&mut self.current, &delta, true);
+            group.push(delta);
+        }
+        if !group.is_empty() {
+            self.active_group = None;
+            self.applying_history = true;
+        }
+        group
+    }
+
+    fn take_redo_group(&mut self) -> Vec<UndoDelta> {
+        self.normalize_index();
+        if self.index >= self.deltas.len() {
+            return Vec::new();
+        }
+        let Some(target_group_id) = self.deltas.get(self.index).map(|delta| delta.group_id) else {
+            return Vec::new();
+        };
+
+        let mut group = Vec::new();
+        while self.index < self.deltas.len() {
+            let Some(delta) = self.deltas.get(self.index).cloned() else {
+                break;
+            };
+            if delta.group_id != target_group_id {
+                break;
+            }
+            Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+            self.index = self.index.saturating_add(1);
+            group.push(delta);
+        }
+        if !group.is_empty() {
+            self.active_group = None;
+            self.applying_history = true;
+        }
+        group
     }
 }
 
@@ -866,6 +1042,7 @@ impl SqlEditorWidget {
                 start: pos.max(0) as usize,
                 deleted_len: del.max(0) as usize,
                 inserted_text: inserted,
+                deleted_text: deleted_text.to_string(),
             };
             state.record_edit(&edit, edit_group);
         });
@@ -1540,7 +1717,18 @@ impl SqlEditorWidget {
             let mut edited_range = compute_edited_range(pos, ins, del, text_len);
 
             if needs_full_rehighlight(buf, pos, ins, deleted_text) {
-                edited_range = Some((0, text_len));
+                let inserted_len = ins.max(0) as usize;
+                if inserted_len < LARGE_STATEFUL_INSERT_FULL_RANGE_THRESHOLD {
+                    // Bounded scan around small stateful edits.
+                    // Large inserts keep their full changed span so long scripts
+                    // receive distributed highlighting coverage in one pass.
+                    let edit_pos = pos.max(0) as usize;
+                    let scan_start = edit_pos.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
+                    let scan_end = edit_pos
+                        .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
+                        .min(text_len);
+                    edited_range = Some((scan_start, scan_end));
+                }
             } else if let Some((start, end)) = edited_range {
                 let inserted_text = inserted_text(buf, pos, ins);
                 if !has_stateful_sql_delimiter(&inserted_text) {
@@ -2073,12 +2261,34 @@ impl SqlEditorWidget {
         let mut state = undo_redo_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut fresh_history = Vec::with_capacity(1);
-        fresh_history.push(UndoSnapshot::new(String::new(), 0));
-        state.history = fresh_history;
+        let fresh_snapshot = UndoSnapshot::new(String::new(), 0);
+        state.anchor = fresh_snapshot.clone();
+        state.current = fresh_snapshot;
+        state.deltas.clear();
+        state.history_total_bytes = 0;
         state.index = 0;
         state.active_group = None;
+        state.next_group_id = 1;
         state.applying_history = false;
+    }
+
+    fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
+        let buffer_len = buffer.length().max(0) as usize;
+        let start = delta.start.min(buffer_len);
+        let delete_len = if reverse {
+            delta.inserted_text.len()
+        } else {
+            delta.deleted_text.len()
+        };
+        let end = start.saturating_add(delete_len).min(buffer_len);
+        let start_i32 = start.min(i32::MAX as usize) as i32;
+        let end_i32 = end.min(i32::MAX as usize) as i32;
+        let replacement = if reverse {
+            delta.deleted_text.as_str()
+        } else {
+            delta.inserted_text.as_str()
+        };
+        buffer.replace(start_i32, end_i32, replacement);
     }
 
     #[allow(dead_code)]
@@ -2191,10 +2401,13 @@ impl SqlEditorWidget {
                 .undo_redo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.history.clear();
-            state.history.push(snapshot);
+            state.anchor = snapshot.clone();
+            state.current = snapshot;
+            state.deltas.clear();
+            state.history_total_bytes = 0;
             state.index = 0;
             state.active_group = None;
+            state.next_group_id = 1;
             state.applying_history = false;
         }
         *self
@@ -2216,37 +2429,24 @@ impl SqlEditorWidget {
     }
 
     pub fn undo(&self) {
-        let next_snapshot = {
+        let (deltas, cursor_pos) = {
             let mut state = self
                 .undo_redo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.normalize_index();
-            if state.index == 0 {
+            let deltas = state.take_undo_group();
+            if deltas.is_empty() {
                 return;
             }
-
-            let next_index = state.index.saturating_sub(1);
-            let Some(snapshot) = state.history.get(next_index).cloned() else {
-                state.index = state.history.len().saturating_sub(1);
-                state.active_group = None;
-                return;
-            };
-
-            state.index = next_index;
-            state.active_group = None;
-            state.applying_history = true;
-            snapshot
+            let cursor_pos = state.current.cursor_pos.min(i32::MAX as usize) as i32;
+            (deltas, cursor_pos)
         };
 
         let mut buffer = self.buffer.clone();
-        buffer.set_text(&next_snapshot.text);
-        self.refresh_highlighting();
+        for delta in &deltas {
+            Self::apply_delta_to_buffer(&mut buffer, delta, true);
+        }
         let mut editor = self.editor.clone();
-        let cursor_pos = next_snapshot
-            .cursor_pos
-            .min(next_snapshot.text.len())
-            .min(i32::MAX as usize) as i32;
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
@@ -2257,37 +2457,24 @@ impl SqlEditorWidget {
     }
 
     pub fn redo(&self) {
-        let next_snapshot = {
+        let (deltas, cursor_pos) = {
             let mut state = self
                 .undo_redo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.normalize_index();
-            let next_index = state.index.saturating_add(1);
-            if next_index >= state.history.len() {
+            let deltas = state.take_redo_group();
+            if deltas.is_empty() {
                 return;
             }
-
-            let Some(snapshot) = state.history.get(next_index).cloned() else {
-                state.index = state.history.len().saturating_sub(1);
-                state.active_group = None;
-                return;
-            };
-
-            state.index = next_index;
-            state.active_group = None;
-            state.applying_history = true;
-            snapshot
+            let cursor_pos = state.current.cursor_pos.min(i32::MAX as usize) as i32;
+            (deltas, cursor_pos)
         };
 
         let mut buffer = self.buffer.clone();
-        buffer.set_text(&next_snapshot.text);
-        self.refresh_highlighting();
+        for delta in &deltas {
+            Self::apply_delta_to_buffer(&mut buffer, delta, false);
+        }
         let mut editor = self.editor.clone();
-        let cursor_pos = next_snapshot
-            .cursor_pos
-            .min(next_snapshot.text.len())
-            .min(i32::MAX as usize) as i32;
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
@@ -2659,12 +2846,21 @@ fn is_string_or_comment_style(style: char) -> bool {
 mod execution_state_tests {
     use super::{
         classify_edit_group, load_mutex_bool, BufferEdit, EditGranularity, EditOperation,
-        QueryProgress, SqlEditorWidget, UndoSnapshot, WordUndoRedoState,
+        QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState,
     };
     use fltk::app;
     use std::ptr::NonNull;
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    fn build_edit(start: usize, deleted_text: &str, inserted_text: &str) -> BufferEdit {
+        BufferEdit {
+            start,
+            deleted_len: deleted_text.len(),
+            inserted_text: inserted_text.to_string(),
+            deleted_text: deleted_text.to_string(),
+        }
+    }
 
     #[test]
     fn finalize_execution_state_clears_running_and_cancel_flags() {
@@ -2680,12 +2876,20 @@ mod execution_state_tests {
     #[test]
     fn reset_word_undo_state_reinitializes_history_safely() {
         let undo_state = Arc::new(Mutex::new(WordUndoRedoState {
-            history: vec![
-                UndoSnapshot::new("SELECT 1".to_string(), 8),
-                UndoSnapshot::new("SELECT 2".to_string(), 8),
-            ],
+            anchor: UndoSnapshot::new("SELECT 1".to_string(), 8),
+            current: UndoSnapshot::new("SELECT 2".to_string(), 8),
+            deltas: vec![UndoDelta {
+                start: 7,
+                deleted_text: "1".to_string(),
+                inserted_text: "2".to_string(),
+                before_cursor: 8,
+                after_cursor: 8,
+                group_id: 1,
+            }],
+            history_total_bytes: "12".len(),
             index: 1,
-            active_group: None,
+            active_group: Some((classify_edit_group(1, 1, "2", "1"), 1)),
+            next_group_id: 2,
             applying_history: true,
         }));
 
@@ -2694,9 +2898,13 @@ mod execution_state_tests {
         let state = undo_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(state.history, vec![UndoSnapshot::new(String::new(), 0)]);
+        assert_eq!(state.anchor, UndoSnapshot::new(String::new(), 0));
+        assert_eq!(state.current, UndoSnapshot::new(String::new(), 0));
+        assert!(state.deltas.is_empty());
+        assert_eq!(state.history_total_bytes, 0);
         assert_eq!(state.index, 0);
         assert!(state.active_group.is_none());
+        assert_eq!(state.next_group_id, 1);
         assert!(!state.applying_history);
     }
 
@@ -2802,18 +3010,15 @@ mod execution_state_tests {
             state.history_texts(),
             vec!["".to_string(), "abc".to_string(), "ab".to_string()]
         );
-        assert_eq!(state.history[2].cursor_pos, 2);
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[2].cursor_pos, 2);
         assert_eq!(state.index, 2);
     }
 
     #[test]
     fn record_edit_sets_cursor_to_end_of_inserted_text() {
         let mut state = WordUndoRedoState::new(String::new());
-        let edit = BufferEdit {
-            start: 0,
-            deleted_len: 0,
-            inserted_text: "한글".to_string(),
-        };
+        let edit = build_edit(0, "", "한글");
 
         state.record_edit(&edit, classify_edit_group(2, 0, "한글", ""));
 
@@ -2821,17 +3026,14 @@ mod execution_state_tests {
             state.history_texts(),
             vec!["".to_string(), "한글".to_string()]
         );
-        assert_eq!(state.history[1].cursor_pos, "한글".len());
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[1].cursor_pos, "한글".len());
     }
 
     #[test]
     fn record_edit_sets_cursor_to_delete_start_for_deletion() {
         let mut state = WordUndoRedoState::new("abcd".to_string());
-        let edit = BufferEdit {
-            start: 1,
-            deleted_len: 2,
-            inserted_text: String::new(),
-        };
+        let edit = build_edit(1, "bc", "");
 
         state.record_edit(&edit, classify_edit_group(0, 2, "", "bc"));
 
@@ -2839,7 +3041,8 @@ mod execution_state_tests {
             state.history_texts(),
             vec!["abcd".to_string(), "ad".to_string()]
         );
-        assert_eq!(state.history[1].cursor_pos, 1);
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[1].cursor_pos, 1);
     }
 
     #[test]
@@ -2847,27 +3050,15 @@ mod execution_state_tests {
         let mut state = WordUndoRedoState::new(String::new());
 
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: 0,
-                inserted_text: "ㅎ".to_string(),
-            },
+            &build_edit(0, "", "ㅎ"),
             classify_edit_group("ㅎ".len() as i32, 0, "ㅎ", ""),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: "ㅎ".len(),
-                inserted_text: "하".to_string(),
-            },
+            &build_edit(0, "ㅎ", "하"),
             classify_edit_group("하".len() as i32, "ㅎ".len() as i32, "하", "ㅎ"),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: "하".len(),
-                inserted_text: "한".to_string(),
-            },
+            &build_edit(0, "하", "한"),
             classify_edit_group("한".len() as i32, "하".len() as i32, "한", "하"),
         );
 
@@ -2875,8 +3066,9 @@ mod execution_state_tests {
             state.history_texts(),
             vec!["".to_string(), "한".to_string()]
         );
-        assert_eq!(state.history[1].cursor_pos, "한".len());
-        assert_eq!(state.index, 1);
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[1].cursor_pos, "한".len());
+        assert_eq!(snapshots.len().saturating_sub(1), 1);
     }
 
     #[test]
@@ -2884,43 +3076,23 @@ mod execution_state_tests {
         let mut state = WordUndoRedoState::new(String::new());
 
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: 0,
-                inserted_text: "ㅎ".to_string(),
-            },
+            &build_edit(0, "", "ㅎ"),
             classify_edit_group("ㅎ".len() as i32, 0, "ㅎ", ""),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: "ㅎ".len(),
-                inserted_text: String::new(),
-            },
+            &build_edit(0, "ㅎ", ""),
             classify_edit_group(0, "ㅎ".len() as i32, "", "ㅎ"),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: 0,
-                inserted_text: "하".to_string(),
-            },
+            &build_edit(0, "", "하"),
             classify_edit_group("하".len() as i32, 0, "하", ""),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: "하".len(),
-                inserted_text: String::new(),
-            },
+            &build_edit(0, "하", ""),
             classify_edit_group(0, "하".len() as i32, "", "하"),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 0,
-                deleted_len: 0,
-                inserted_text: "한".to_string(),
-            },
+            &build_edit(0, "", "한"),
             classify_edit_group("한".len() as i32, 0, "한", ""),
         );
 
@@ -2928,8 +3100,56 @@ mod execution_state_tests {
             state.history_texts(),
             vec!["".to_string(), "한".to_string()]
         );
-        assert_eq!(state.history[1].cursor_pos, "한".len());
-        assert_eq!(state.index, 1);
+        let snapshots = state.history_snapshots();
+        assert_eq!(snapshots[1].cursor_pos, "한".len());
+        assert_eq!(snapshots.len().saturating_sub(1), 1);
+    }
+
+    #[test]
+    fn take_undo_group_reverts_grouped_korean_ime_sequence() {
+        let mut state = WordUndoRedoState::new(String::new());
+        state.record_edit(
+            &build_edit(0, "", "ㅎ"),
+            classify_edit_group("ㅎ".len() as i32, 0, "ㅎ", ""),
+        );
+        state.record_edit(
+            &build_edit(0, "ㅎ", "하"),
+            classify_edit_group("하".len() as i32, "ㅎ".len() as i32, "하", "ㅎ"),
+        );
+        state.record_edit(
+            &build_edit(0, "하", "한"),
+            classify_edit_group("한".len() as i32, "하".len() as i32, "한", "하"),
+        );
+
+        let undo_group = state.take_undo_group();
+
+        assert_eq!(undo_group.len(), 3);
+        assert_eq!(state.current.text, "");
+        assert_eq!(state.index, 0);
+    }
+
+    #[test]
+    fn take_redo_group_reapplies_grouped_korean_ime_sequence() {
+        let mut state = WordUndoRedoState::new(String::new());
+        state.record_edit(
+            &build_edit(0, "", "ㅎ"),
+            classify_edit_group("ㅎ".len() as i32, 0, "ㅎ", ""),
+        );
+        state.record_edit(
+            &build_edit(0, "ㅎ", "하"),
+            classify_edit_group("하".len() as i32, "ㅎ".len() as i32, "하", "ㅎ"),
+        );
+        state.record_edit(
+            &build_edit(0, "하", "한"),
+            classify_edit_group("한".len() as i32, "하".len() as i32, "한", "하"),
+        );
+        let _ = state.take_undo_group();
+
+        let redo_group = state.take_redo_group();
+
+        assert_eq!(redo_group.len(), 3);
+        assert_eq!(state.current.text, "한");
+        assert_eq!(state.index, 3);
     }
 
     #[test]
@@ -2937,19 +3157,11 @@ mod execution_state_tests {
         let mut state = WordUndoRedoState::new("abc\ndef".to_string());
 
         state.record_edit(
-            &BufferEdit {
-                start: 3,
-                deleted_len: 0,
-                inserted_text: "x".to_string(),
-            },
+            &build_edit(3, "", "x"),
             classify_edit_group(1, 0, "x", ""),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 8,
-                deleted_len: 0,
-                inserted_text: "y".to_string(),
-            },
+            &build_edit(8, "", "y"),
             classify_edit_group(1, 0, "y", ""),
         );
 
@@ -2969,19 +3181,11 @@ mod execution_state_tests {
         let mut state = WordUndoRedoState::new("alpha beta".to_string());
 
         state.record_edit(
-            &BufferEdit {
-                start: 5,
-                deleted_len: 0,
-                inserted_text: "x".to_string(),
-            },
+            &build_edit(5, "", "x"),
             classify_edit_group(1, 0, "x", ""),
         );
         state.record_edit(
-            &BufferEdit {
-                start: 11,
-                deleted_len: 0,
-                inserted_text: "y".to_string(),
-            },
+            &build_edit(11, "", "y"),
             classify_edit_group(1, 0, "y", ""),
         );
 

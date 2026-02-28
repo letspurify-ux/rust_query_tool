@@ -640,3 +640,239 @@ fn test_multibyte_text_preserves_byte_length_styles() {
         "multibyte string literal should be string style"
     );
 }
+
+// ── LexerState / generate_styles_with_state tests ─────────────────────
+
+#[test]
+fn test_generate_styles_with_state_normal_matches_generate_styles() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 'hello' FROM dual -- comment";
+    let plain = highlighter.generate_styles(text);
+    let (stateful, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert_eq!(plain, stateful);
+    assert_eq!(exit, LexerState::Normal);
+}
+
+#[test]
+fn test_exit_state_unclosed_block_comment() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT /* unclosed comment";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert_eq!(exit, LexerState::InBlockComment);
+    let comment_start = text.find("/*").unwrap();
+    assert!(
+        styles[comment_start..].chars().all(|c| c == STYLE_COMMENT),
+        "unclosed block comment should be COMMENT style"
+    );
+}
+
+#[test]
+fn test_exit_state_unclosed_hint() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT /*+ FULL(t)";
+    let (_styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert_eq!(exit, LexerState::InHintComment);
+}
+
+#[test]
+fn test_exit_state_unclosed_string() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 'unclosed string";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert_eq!(exit, LexerState::InSingleQuote);
+    let str_start = text.find("'").unwrap();
+    assert!(
+        styles[str_start..].chars().all(|c| c == STYLE_STRING),
+        "unclosed string should be STRING style"
+    );
+}
+
+#[test]
+fn test_exit_state_unclosed_q_quote() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT q'[unclosed q-string";
+    let (_styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert!(
+        matches!(exit, LexerState::InQQuote { closing: b']' }),
+        "expected InQQuote with ']', got {:?}",
+        exit
+    );
+}
+
+#[test]
+fn test_exit_state_unclosed_double_quote() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"SELECT "unclosed_ident"#;
+    let (_styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
+    assert_eq!(exit, LexerState::InDoubleQuote);
+}
+
+#[test]
+fn test_entry_state_in_block_comment_continues() {
+    let highlighter = SqlHighlighter::new();
+    // Simulate a window that starts in the middle of a block comment
+    let text = "still commenting */ SELECT 1";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InBlockComment);
+    assert_eq!(exit, LexerState::Normal);
+    // "still commenting */" should be comment
+    let comment_end = text.find("*/").unwrap() + 2;
+    assert!(
+        styles[..comment_end].chars().all(|c| c == STYLE_COMMENT),
+        "continued block comment should be COMMENT"
+    );
+    // "SELECT" after should be keyword
+    let select_pos = text.find("SELECT").unwrap();
+    assert!(
+        styles[select_pos..select_pos + 6]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "SELECT after comment close should be KEYWORD"
+    );
+}
+
+#[test]
+fn test_entry_state_in_hint_continues() {
+    let highlighter = SqlHighlighter::new();
+    let text = "FULL(t) */ SELECT 1";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InHintComment);
+    assert_eq!(exit, LexerState::Normal);
+    let hint_end = text.find("*/").unwrap() + 2;
+    assert!(
+        styles[..hint_end].chars().all(|c| c == STYLE_HINT),
+        "continued hint should be HINT"
+    );
+}
+
+#[test]
+fn test_entry_state_in_single_quote_continues() {
+    let highlighter = SqlHighlighter::new();
+    let text = "still in string' FROM dual";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InSingleQuote);
+    assert_eq!(exit, LexerState::Normal);
+    let str_end = text.find("'").unwrap() + 1;
+    assert!(
+        styles[..str_end].chars().all(|c| c == STYLE_STRING),
+        "continued string should be STRING"
+    );
+}
+
+#[test]
+fn test_entry_state_in_q_quote_continues() {
+    let highlighter = SqlHighlighter::new();
+    let text = "still in q-string]' FROM dual";
+    let (styles, exit) =
+        highlighter.generate_styles_with_state(text, LexerState::InQQuote { closing: b']' });
+    assert_eq!(exit, LexerState::Normal);
+    let q_end = text.find("]'").unwrap() + 2;
+    assert!(
+        styles[..q_end].chars().all(|c| c == STYLE_STRING),
+        "continued q-quote should be STRING"
+    );
+}
+
+#[test]
+fn test_entry_state_in_double_quote_continues() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"continued_ident" FROM dual"#;
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InDoubleQuote);
+    assert_eq!(exit, LexerState::Normal);
+    let ident_end = text.find('"').unwrap() + 1;
+    assert!(
+        styles[..ident_end].chars().all(|c| c == STYLE_IDENTIFIER),
+        "continued quoted identifier should be IDENTIFIER"
+    );
+}
+
+#[test]
+fn test_entry_state_block_comment_never_closes() {
+    let highlighter = SqlHighlighter::new();
+    let text = "all of this is inside the comment";
+    let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InBlockComment);
+    assert_eq!(exit, LexerState::InBlockComment);
+    assert!(
+        styles.chars().all(|c| c == STYLE_COMMENT),
+        "entire text should be COMMENT when starting InBlockComment and no close"
+    );
+}
+
+#[test]
+fn test_cross_window_block_comment_round_trip() {
+    let highlighter = SqlHighlighter::new();
+    // Window 1: opens comment
+    let window1 = "SELECT 1; /* long comment starts here";
+    let (_s1, state1) = highlighter.generate_styles_with_state(window1, LexerState::Normal);
+    assert_eq!(state1, LexerState::InBlockComment);
+
+    // Window 2: continues comment
+    let window2 = "...still commenting...\nmore comment text";
+    let (_s2, state2) = highlighter.generate_styles_with_state(window2, state1);
+    assert_eq!(state2, LexerState::InBlockComment);
+
+    // Window 3: closes comment
+    let window3 = "end of comment */ SELECT 2 FROM dual";
+    let (s3, state3) = highlighter.generate_styles_with_state(window3, state2);
+    assert_eq!(state3, LexerState::Normal);
+    let select_pos = window3.find("SELECT").unwrap();
+    assert!(
+        s3[select_pos..select_pos + 6]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "SELECT after comment close should be KEYWORD"
+    );
+}
+
+#[test]
+fn test_large_file_stateful_delimiter_does_not_scan_entire_buffer() {
+    // Verify that the windowed highlighter never produces a single range
+    // covering the entire buffer, even for stateful delimiter edits.
+    let line = "SELECT col FROM table;\n";
+    let text = line.repeat(5000); // ~110 KB
+    assert!(text.len() > HIGHLIGHT_WINDOW_THRESHOLD);
+
+    // Simulate an edit range that previously would trigger full-buffer scan.
+    // In the old code: edited_range = Some((0, text_len))
+    // In the new code: edited_range is bounded (tested via select_highlight_ranges).
+    let text_len = text.len();
+    let cursor_pos = text_len / 2;
+
+    // Even if someone passes the full range, it should be split into ≤6 windows.
+    let mut buf = TextBuffer::default();
+    buf.set_text(&text);
+    let ranges = select_highlight_ranges(&buf, text_len, cursor_pos, Some((0, text_len)), None);
+    assert!(
+        ranges.len() <= MAX_HIGHLIGHT_WINDOWS_PER_PASS,
+        "should produce at most {} windows, got {}",
+        MAX_HIGHLIGHT_WINDOWS_PER_PASS,
+        ranges.len()
+    );
+    // No single range should cover the entire file.
+    for (start, end) in &ranges {
+        assert!(
+            end - start < text_len,
+            "no single window should be the entire buffer: ({}, {})",
+            start,
+            end
+        );
+    }
+}
+
+#[test]
+fn test_large_edit_span_expands_window_budget() {
+    let text_len = 1_000_000;
+    let expanded = max_highlight_windows_per_pass(Some((0, text_len)), text_len);
+    assert!(
+        expanded > MAX_HIGHLIGHT_WINDOWS_PER_PASS,
+        "large edit should expand window budget"
+    );
+    assert!(
+        expanded <= MAX_HIGHLIGHT_WINDOWS_PER_PASS_LARGE_EDIT,
+        "expanded budget should respect hard upper bound"
+    );
+}
+
+#[test]
+fn test_small_edit_span_keeps_default_window_budget() {
+    let text_len = 1_000_000;
+    let small = max_highlight_windows_per_pass(Some((10, 200)), text_len);
+    assert_eq!(small, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+}

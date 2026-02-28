@@ -1110,11 +1110,9 @@ impl ResultTableWidget {
                                     let mut row_states = Vec::with_capacity(total_cols);
                                     if let Some(row_data) = data.get(row_idx) {
                                         for col_idx in 0..total_cols {
-                                            row_states.push(
-                                                Self::cell_edit_state_for_draw(
-                                                    session, row_idx, col_idx, row_data,
-                                                ),
-                                            );
+                                            row_states.push(Self::cell_edit_state_for_draw(
+                                                session, row_idx, col_idx, row_data,
+                                            ));
                                         }
                                     } else {
                                         row_states.resize(total_cols, (false, false, false));
@@ -1248,7 +1246,9 @@ impl ResultTableWidget {
                                 // instead of locking edit_session per cell.
                                 if page_edit_cache.active && row_idx >= page_edit_cache.start_row {
                                     let row_offset = row_idx - page_edit_cache.start_row;
-                                    if let Some(row_cache) = page_edit_cache.cell_states.get(row_offset) {
+                                    if let Some(row_cache) =
+                                        page_edit_cache.cell_states.get(row_offset)
+                                    {
                                         if let Some(&state) = row_cache.get(col_idx) {
                                             (
                                                 is_edited_cell,

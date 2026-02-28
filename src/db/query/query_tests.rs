@@ -83,6 +83,48 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_splits_around_tool_command_line() {
+    let sql = "SELECT 1 FROM dual;\nPROMPT section\nSELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds after tool command line");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "expected final SELECT statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("PROMPT"),
+        "tool command line must not leak into SQL statement: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_keeps_multiline_alter_session_set_clause() {
+    let sql = "ALTER SESSION\nSET NLS_DATE_FORMAT = 'YYYY-MM-DD';\nSELECT 1 FROM dual;";
+    let cursor = sql.find("NLS_DATE_FORMAT").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected ALTER SESSION statement bounds");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.contains("ALTER SESSION"),
+        "ALTER SESSION header should be included: {statement}"
+    );
+    assert!(
+        statement.contains("SET NLS_DATE_FORMAT"),
+        "SET clause should remain part of ALTER SESSION: {statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 1 FROM dual"),
+        "next statement should not be included: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");

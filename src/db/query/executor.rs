@@ -8,7 +8,9 @@ use crate::db::session::{BindDataType, BindValue, CompiledObject, SessionState};
 use crate::sql_text;
 use crate::utils::logging;
 
-use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem};
+use super::{
+    ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem, SplitState, ToolCommand,
+};
 
 pub struct QueryExecutor;
 
@@ -1387,57 +1389,6 @@ impl QueryExecutor {
             return None;
         }
 
-        #[derive(Clone)]
-        struct StatementSpan {
-            start: usize,
-            end: usize,
-        }
-
-        let find_statement_start = |sql: &str, from: usize, stmt: &str| -> Option<usize> {
-            let haystack = &sql[from..];
-            for (relative_idx, _) in haystack.match_indices(stmt) {
-                let candidate = from + relative_idx;
-                let separator = sql[from..candidate]
-                    .chars()
-                    .rev()
-                    .find(|ch| !ch.is_whitespace());
-
-                let line_start = sql[..candidate]
-                    .rfind('\n')
-                    .map(|idx| idx + 1)
-                    .unwrap_or(from);
-                let starts_at_line = sql[line_start..candidate].trim().is_empty();
-
-                if separator.is_none()
-                    || matches!(separator, Some(';') | Some('/'))
-                    || starts_at_line
-                {
-                    return Some(candidate);
-                }
-            }
-
-            None
-        };
-
-        let spans_for_sql = |sql: &str| {
-            let mut spans: Vec<StatementSpan> = Vec::new();
-            let mut search_pos = 0usize;
-            for item in Self::split_script_items(sql) {
-                if let ScriptItem::Statement(stmt) = item {
-                    let stmt = stmt.trim();
-                    if stmt.is_empty() {
-                        continue;
-                    }
-                    if let Some(start) = find_statement_start(sql, search_pos, stmt) {
-                        let end = start + stmt.len();
-                        spans.push(StatementSpan { start, end });
-                        search_pos = end;
-                    }
-                }
-            }
-            spans
-        };
-
         let cursor_pos = Self::clamp_to_char_boundary(sql, cursor_pos);
         let line_start = sql[..cursor_pos]
             .rfind('\n')
@@ -1451,41 +1402,635 @@ impl QueryExecutor {
         let trimmed_line = line.trim();
 
         if !trimmed_line.is_empty() {
-            if trimmed_line == "/" {
-                let spans = spans_for_sql(sql);
-                if let Some(prev) = spans.iter().rfind(|span| span.end <= line_start) {
-                    return Some((prev.start, prev.end));
-                }
-            }
-
             if Self::parse_tool_command(trimmed_line).is_some() {
                 return Some((line_start, line_end));
             }
         }
 
-        let spans = spans_for_sql(sql);
+        let spans = Self::collect_statement_spans_for_bounds(sql);
 
         if spans.is_empty() {
             return None;
         }
 
+        if trimmed_line == "/" {
+            if let Some(prev) = spans
+                .iter()
+                .rfind(|(start, end)| *start < *end && *end <= line_start)
+            {
+                return Some(*prev);
+            }
+        }
+
         if let Some(span) = spans
             .iter()
-            .find(|span| cursor_pos >= span.start && cursor_pos < span.end)
+            .find(|(start, end)| cursor_pos >= *start && cursor_pos < *end)
         {
-            return Some((span.start, span.end));
+            return Some(*span);
         }
 
-        let mut previous: Option<&StatementSpan> = None;
+        let mut previous: Option<(usize, usize)> = None;
         for span in spans.iter() {
-            if span.start > cursor_pos {
-                let selected = previous.unwrap_or(span);
-                return Some((selected.start, selected.end));
+            if span.0 > cursor_pos {
+                return Some(previous.unwrap_or(*span));
             }
-            previous = Some(span);
+            previous = Some(*span);
         }
 
-        previous.map(|span| (span.start, span.end))
+        previous
+    }
+
+    fn collect_statement_spans_for_bounds(sql: &str) -> Vec<(usize, usize)> {
+        #[derive(Default)]
+        struct StatementSpanCollector {
+            state: SplitState,
+            spans: Vec<(usize, usize)>,
+            current_start: Option<usize>,
+            current_non_whitespace_start: Option<usize>,
+            current_non_whitespace_end: usize,
+            current_has_non_whitespace: bool,
+            leading_tokens: Vec<String>,
+        }
+
+        impl StatementSpanCollector {
+            fn current_is_empty(&self) -> bool {
+                !self.current_has_non_whitespace
+            }
+
+            fn starts_with_alter_session(&self) -> bool {
+                matches!(
+                    (self.leading_tokens.first(), self.leading_tokens.get(1)),
+                    (Some(first), Some(second)) if first == "ALTER" && second == "SESSION"
+                )
+            }
+
+            fn record_char(&mut self, index: usize, ch: char) {
+                if self.current_start.is_none() {
+                    self.current_start = Some(index);
+                }
+                let char_end = index + ch.len_utf8();
+                if !ch.is_whitespace() {
+                    if self.current_non_whitespace_start.is_none() {
+                        self.current_non_whitespace_start = Some(index);
+                    }
+                    self.current_non_whitespace_end = char_end;
+                    self.current_has_non_whitespace = true;
+                }
+            }
+
+            fn flush_token(&mut self) {
+                if !self.state.token.is_empty() && self.leading_tokens.len() < 2 {
+                    self.leading_tokens
+                        .push(self.state.token.to_ascii_uppercase());
+                }
+                self.state.flush_token();
+            }
+
+            fn clear_current(&mut self) {
+                self.current_start = None;
+                self.current_non_whitespace_start = None;
+                self.current_non_whitespace_end = 0;
+                self.current_has_non_whitespace = false;
+                self.leading_tokens.clear();
+            }
+
+            fn push_current_span(&mut self, sql: &str) {
+                if let Some(start) = self.current_non_whitespace_start {
+                    let end = self.current_non_whitespace_end;
+                    if end > start {
+                        if let Some(span) =
+                            QueryExecutor::trim_statement_span_for_bounds(sql, start, end)
+                        {
+                            self.spans.push(span);
+                        }
+                    }
+                }
+                self.clear_current();
+            }
+
+            fn force_terminate(&mut self, sql: &str) {
+                self.flush_token();
+                self.state.resolve_pending_end_on_eof();
+                self.state.reset_create_state();
+                self.state.in_single_quote = false;
+                self.state.in_double_quote = false;
+                self.state.in_line_comment = false;
+                self.state.in_block_comment = false;
+                self.state.in_q_quote = false;
+                self.state.q_quote_end = None;
+                self.state.pending_end = false;
+                self.state.token.clear();
+                self.state.block_depth = 0;
+                self.state.paren_depth = 0;
+                self.state.case_depth_stack.clear();
+                self.push_current_span(sql);
+            }
+
+            fn finalize(&mut self, sql: &str) {
+                self.flush_token();
+                self.state.resolve_pending_end_on_eof();
+                self.state.reset_create_state();
+                self.push_current_span(sql);
+            }
+
+            fn consume_next_char(
+                iter: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+                base_offset: usize,
+            ) -> Option<(usize, char)> {
+                iter.next()
+                    .map(|(relative, ch)| (base_offset + relative, ch))
+            }
+
+            fn peek_n_char(
+                iter: &std::iter::Peekable<std::str::CharIndices<'_>>,
+                n: usize,
+            ) -> Option<char> {
+                let mut lookahead = iter.clone();
+                for _ in 0..n {
+                    lookahead.next()?;
+                }
+                lookahead.next().map(|(_, ch)| ch)
+            }
+
+            fn process_segment(&mut self, sql: &str, start: usize, end: usize) {
+                if start >= end {
+                    return;
+                }
+
+                let mut iter = sql[start..end].char_indices().peekable();
+                while let Some((relative_idx, c)) = iter.next() {
+                    let index = start + relative_idx;
+                    let next = iter.peek().map(|(_, ch)| *ch);
+
+                    if self.state.in_line_comment {
+                        self.record_char(index, c);
+                        if c == '\n' {
+                            self.state.in_line_comment = false;
+                        }
+                        continue;
+                    }
+
+                    if self.state.in_block_comment {
+                        self.record_char(index, c);
+                        if c == '*' && next == Some('/') {
+                            if let Some((next_idx, next_char)) =
+                                Self::consume_next_char(&mut iter, start)
+                            {
+                                self.record_char(next_idx, next_char);
+                            }
+                            self.state.in_block_comment = false;
+                        }
+                        continue;
+                    }
+
+                    if self.state.in_q_quote {
+                        self.record_char(index, c);
+                        if Some(c) == self.state.q_quote_end() && next == Some('\'') {
+                            if let Some((next_idx, next_char)) =
+                                Self::consume_next_char(&mut iter, start)
+                            {
+                                self.record_char(next_idx, next_char);
+                            }
+                            self.state.in_q_quote = false;
+                            self.state.q_quote_end = None;
+                        }
+                        continue;
+                    }
+
+                    if self.state.in_single_quote {
+                        self.record_char(index, c);
+                        if c == '\'' {
+                            if next == Some('\'') {
+                                if let Some((next_idx, next_char)) =
+                                    Self::consume_next_char(&mut iter, start)
+                                {
+                                    self.record_char(next_idx, next_char);
+                                }
+                            } else {
+                                self.state.in_single_quote = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if self.state.in_double_quote {
+                        self.record_char(index, c);
+                        if c == '"' {
+                            if next == Some('"') {
+                                if let Some((next_idx, next_char)) =
+                                    Self::consume_next_char(&mut iter, start)
+                                {
+                                    self.record_char(next_idx, next_char);
+                                }
+                            } else {
+                                self.state.in_double_quote = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if c == '-' && next == Some('-') {
+                        self.flush_token();
+                        self.state.in_line_comment = true;
+                        self.record_char(index, c);
+                        if let Some((next_idx, next_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(next_idx, next_char);
+                        }
+                        continue;
+                    }
+
+                    if c == '/' && next == Some('*') {
+                        self.flush_token();
+                        self.state.in_block_comment = true;
+                        self.record_char(index, c);
+                        if let Some((next_idx, next_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(next_idx, next_char);
+                        }
+                        continue;
+                    }
+
+                    if (c == 'n' || c == 'N')
+                        && (next == Some('q') || next == Some('Q'))
+                        && Self::peek_n_char(&iter, 1) == Some('\'')
+                        && Self::peek_n_char(&iter, 2).is_some()
+                    {
+                        let Some(delimiter) = Self::peek_n_char(&iter, 2) else {
+                            continue;
+                        };
+                        self.flush_token();
+                        self.state.start_q_quote(delimiter);
+                        self.record_char(index, c);
+                        if let Some((next_idx, next_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(next_idx, next_char);
+                        }
+                        if let Some((quote_idx, quote_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(quote_idx, quote_char);
+                        }
+                        if let Some((delimiter_idx, delimiter_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(delimiter_idx, delimiter_char);
+                        }
+                        continue;
+                    }
+
+                    if (c == 'q' || c == 'Q')
+                        && next == Some('\'')
+                        && Self::peek_n_char(&iter, 1).is_some()
+                    {
+                        let Some(delimiter) = Self::peek_n_char(&iter, 1) else {
+                            continue;
+                        };
+                        self.flush_token();
+                        self.state.start_q_quote(delimiter);
+                        self.record_char(index, c);
+                        if let Some((quote_idx, quote_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(quote_idx, quote_char);
+                        }
+                        if let Some((delimiter_idx, delimiter_char)) =
+                            Self::consume_next_char(&mut iter, start)
+                        {
+                            self.record_char(delimiter_idx, delimiter_char);
+                        }
+                        continue;
+                    }
+
+                    if c == '\'' {
+                        self.flush_token();
+                        self.state.in_single_quote = true;
+                        self.record_char(index, c);
+                        continue;
+                    }
+
+                    if c == '"' {
+                        self.flush_token();
+                        self.state.in_double_quote = true;
+                        self.record_char(index, c);
+                        continue;
+                    }
+
+                    if sql_text::is_identifier_char(c) {
+                        self.state.token.push(c);
+                        self.record_char(index, c);
+                        continue;
+                    }
+
+                    self.flush_token();
+
+                    if c == '(' {
+                        self.state.paren_depth += 1;
+                    } else if c == ')' {
+                        self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+                    }
+
+                    if c == ';' {
+                        self.state.resolve_pending_end_on_terminator();
+                        if self.state.block_depth == 0 {
+                            self.push_current_span(sql);
+                            self.state.reset_create_state();
+                        } else if self.state.should_split_on_semicolon() {
+                            self.state.reset_create_state();
+                            self.state.block_depth = 0;
+                            self.state.case_depth_stack.clear();
+                            self.push_current_span(sql);
+                        } else {
+                            self.record_char(index, c);
+                        }
+                        continue;
+                    }
+
+                    self.record_char(index, c);
+                }
+            }
+        }
+
+        let mut collector = StatementSpanCollector::default();
+        let mut sqlblanklines_enabled = true;
+        let mut line_start = 0usize;
+
+        while line_start < sql.len() {
+            let remaining = &sql[line_start..];
+            let newline_relative = remaining.find('\n');
+            let line_end = newline_relative
+                .map(|offset| line_start + offset)
+                .unwrap_or(sql.len());
+            let next_line_start = newline_relative
+                .map(|offset| line_start + offset + 1)
+                .unwrap_or(sql.len());
+            let has_newline = newline_relative.is_some();
+            let line = &sql[line_start..line_end];
+            let trimmed = line.trim();
+
+            if !sqlblanklines_enabled
+                && trimmed.is_empty()
+                && collector.state.is_idle()
+                && collector.state.block_depth == 0
+                && !collector.current_is_empty()
+            {
+                collector.force_terminate(sql);
+                line_start = next_line_start;
+                continue;
+            }
+
+            if collector.state.is_idle()
+                && collector.state.in_create_plsql
+                && collector.state.block_depth == 0
+                && !collector.current_is_empty()
+                && !collector.state.is_trigger
+                && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
+            {
+                collector.force_terminate(sql);
+            }
+
+            if collector.state.is_idle() && trimmed == "/" && collector.state.block_depth == 0 {
+                if !collector.current_is_empty() {
+                    collector.force_terminate(sql);
+                }
+                line_start = next_line_start;
+                continue;
+            }
+
+            if collector.state.is_idle()
+                && trimmed == ";"
+                && collector.state.in_create_plsql
+                && collector.state.block_depth == 0
+                && !collector.current_is_empty()
+            {
+                collector.force_terminate(sql);
+                line_start = next_line_start;
+                continue;
+            }
+
+            let is_alter_session_set_clause = collector.starts_with_alter_session()
+                && (trimmed.eq_ignore_ascii_case("SET")
+                    || Self::starts_with_ignore_ascii_case(trimmed, "SET "));
+
+            if collector.state.is_idle()
+                && !collector.current_is_empty()
+                && collector.state.block_depth == 0
+                && !is_alter_session_set_clause
+                && Self::line_might_be_tool_command_for_bounds(trimmed)
+            {
+                if let Some(command) = Self::parse_tool_command(trimmed) {
+                    collector.force_terminate(sql);
+                    if let ToolCommand::SetSqlBlankLines { enabled } = command {
+                        sqlblanklines_enabled = enabled;
+                    }
+                    line_start = next_line_start;
+                    continue;
+                }
+            }
+
+            if collector.state.is_idle()
+                && collector.current_is_empty()
+                && collector.state.block_depth == 0
+                && Self::line_might_be_tool_command_for_bounds(trimmed)
+            {
+                if let Some(command) = Self::parse_tool_command(trimmed) {
+                    if let ToolCommand::SetSqlBlankLines { enabled } = command {
+                        sqlblanklines_enabled = enabled;
+                    }
+                    line_start = next_line_start;
+                    continue;
+                }
+            }
+
+            let process_end = if has_newline { line_end + 1 } else { line_end };
+            collector.process_segment(sql, line_start, process_end);
+            line_start = next_line_start;
+        }
+
+        collector.finalize(sql);
+        collector.spans
+    }
+
+    fn line_starts_new_statement_keyword_for_bounds(trimmed: &str) -> bool {
+        Self::starts_with_ignore_ascii_case(trimmed, "CREATE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "ALTER")
+            || Self::starts_with_ignore_ascii_case(trimmed, "DROP")
+            || Self::starts_with_ignore_ascii_case(trimmed, "TRUNCATE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "GRANT")
+            || Self::starts_with_ignore_ascii_case(trimmed, "REVOKE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "COMMIT")
+            || Self::starts_with_ignore_ascii_case(trimmed, "ROLLBACK")
+            || Self::starts_with_ignore_ascii_case(trimmed, "SAVEPOINT")
+            || Self::starts_with_ignore_ascii_case(trimmed, "SELECT")
+            || Self::starts_with_ignore_ascii_case(trimmed, "INSERT")
+            || Self::starts_with_ignore_ascii_case(trimmed, "UPDATE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "DELETE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "MERGE")
+            || Self::starts_with_ignore_ascii_case(trimmed, "WITH")
+    }
+
+    fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+        if text.len() < prefix.len() {
+            return false;
+        }
+        text.bytes()
+            .zip(prefix.bytes())
+            .take(prefix.len())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+    }
+
+    fn line_might_be_tool_command_for_bounds(trimmed: &str) -> bool {
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.starts_with('@') {
+            return true;
+        }
+
+        let first = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(';');
+        if first.is_empty() {
+            return false;
+        }
+
+        first.eq_ignore_ascii_case("VAR")
+            || first.eq_ignore_ascii_case("VARIABLE")
+            || first.eq_ignore_ascii_case("PRINT")
+            || first.eq_ignore_ascii_case("SET")
+            || first.eq_ignore_ascii_case("SHOW")
+            || first.eq_ignore_ascii_case("DESC")
+            || first.eq_ignore_ascii_case("DESCRIBE")
+            || first.eq_ignore_ascii_case("PROMPT")
+            || first.eq_ignore_ascii_case("PAUSE")
+            || first.eq_ignore_ascii_case("ACCEPT")
+            || first.eq_ignore_ascii_case("DEFINE")
+            || first.eq_ignore_ascii_case("UNDEFINE")
+            || first.eq_ignore_ascii_case("COLUMN")
+            || first.eq_ignore_ascii_case("CLEAR")
+            || first.eq_ignore_ascii_case("BREAK")
+            || first.eq_ignore_ascii_case("COMPUTE")
+            || first.eq_ignore_ascii_case("SPOOL")
+            || first.eq_ignore_ascii_case("WHENEVER")
+            || first.eq_ignore_ascii_case("EXIT")
+            || first.eq_ignore_ascii_case("QUIT")
+            || first.eq_ignore_ascii_case("CONNECT")
+            || first.eq_ignore_ascii_case("CONN")
+            || first.eq_ignore_ascii_case("DISCONNECT")
+            || first.eq_ignore_ascii_case("DISC")
+            || first.eq_ignore_ascii_case("START")
+    }
+
+    fn trim_statement_span_for_bounds(
+        sql: &str,
+        mut start: usize,
+        mut end: usize,
+    ) -> Option<(usize, usize)> {
+        start = Self::trim_start_whitespace_for_bounds(sql, start, end);
+        end = Self::trim_end_whitespace_for_bounds(sql, start, end);
+        if start >= end {
+            return None;
+        }
+
+        loop {
+            start = Self::trim_start_whitespace_for_bounds(sql, start, end);
+            if start >= end {
+                return None;
+            }
+
+            let remaining = &sql[start..end];
+            if remaining.starts_with("/*") {
+                let block_end = remaining.find("*/")?;
+                start += block_end + 2;
+                continue;
+            }
+
+            let line_end_relative = remaining.find('\n').unwrap_or(remaining.len());
+            let first_line = &remaining[..line_end_relative];
+            if Self::is_sqlplus_comment_line_for_bounds(first_line) {
+                start += line_end_relative;
+                if start < end && sql.as_bytes().get(start) == Some(&b'\n') {
+                    start += 1;
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        loop {
+            end = Self::trim_end_whitespace_for_bounds(sql, start, end);
+            if start >= end {
+                return None;
+            }
+
+            let remaining = &sql[start..end];
+            if remaining.ends_with("*/") {
+                if let Some(block_start) = remaining.rfind("/*") {
+                    end = start + block_start;
+                    continue;
+                }
+            }
+
+            let last_line_start = remaining.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+            let last_line = &remaining[last_line_start..];
+            if Self::is_sqlplus_comment_line_for_bounds(last_line) {
+                end = start + last_line_start;
+                continue;
+            }
+
+            break;
+        }
+
+        if start < end {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    fn trim_start_whitespace_for_bounds(sql: &str, start: usize, end: usize) -> usize {
+        if start >= end {
+            return end;
+        }
+
+        sql[start..end]
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(offset, _)| start + offset)
+            .unwrap_or(end)
+    }
+
+    fn trim_end_whitespace_for_bounds(sql: &str, start: usize, end: usize) -> usize {
+        if start >= end {
+            return start;
+        }
+
+        sql[start..end]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(offset, ch)| start + offset + ch.len_utf8())
+            .unwrap_or(start)
+    }
+
+    fn is_sqlplus_comment_line_for_bounds(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--") {
+            return true;
+        }
+
+        matches!(
+            trimmed.split_whitespace().next(),
+            Some(first)
+                if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
+        )
     }
 
     /// Enable DBMS_OUTPUT for the session
