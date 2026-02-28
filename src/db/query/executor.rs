@@ -26,11 +26,7 @@ impl QueryExecutor {
             || (message.contains("ORA-00904") && message.to_ascii_uppercase().contains("ROWID"))
     }
 
-    fn row_value_to_text(
-        row: &Row,
-        _column_type: &OracleType,
-        index: usize,
-    ) -> Result<String, OracleError> {
+    fn row_value_to_text(row: &Row, index: usize) -> Result<String, OracleError> {
         // ROWID columns should be normalized to ROWIDTOCHAR(...) in
         // rowid_safe_execution_sql before fetch. Keep this path simple and fail-fast
         // via OracleError if conversion is not possible.
@@ -2213,11 +2209,7 @@ impl QueryExecutor {
                 data_type: format!("{:?}", col.oracle_type()),
             })
             .collect();
-        let column_oracle_types: Vec<OracleType> = result_set
-            .column_info()
-            .iter()
-            .map(|col| col.oracle_type().clone())
-            .collect();
+        let column_count = column_info.len();
 
         let mut rows: Vec<Vec<String>> = Vec::new();
 
@@ -2231,8 +2223,8 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for (i, column_type) in column_oracle_types.iter().enumerate() {
-                let value = Self::row_value_to_text(&row, column_type, i)?;
+            for i in 0..column_count {
+                let value = Self::row_value_to_text(&row, i)?;
                 row_data.push(value);
             }
 
@@ -2318,11 +2310,7 @@ impl QueryExecutor {
                 data_type: format!("{:?}", col.oracle_type()),
             })
             .collect();
-        let column_oracle_types: Vec<OracleType> = result_set
-            .column_info()
-            .iter()
-            .map(|col| col.oracle_type().clone())
-            .collect();
+        let column_count = column_info.len();
 
         on_select_start(&column_info);
 
@@ -2339,8 +2327,8 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for (i, column_type) in column_oracle_types.iter().enumerate() {
-                let value = Self::row_value_to_text(&row, column_type, i)?;
+            for i in 0..column_count {
+                let value = Self::row_value_to_text(&row, i)?;
                 row_data.push(value);
             }
 
@@ -2436,11 +2424,7 @@ impl QueryExecutor {
                 data_type: format!("{:?}", col.oracle_type()),
             })
             .collect();
-        let column_oracle_types: Vec<OracleType> = result_set
-            .column_info()
-            .iter()
-            .map(|col| col.oracle_type().clone())
-            .collect();
+        let column_count = column_info.len();
 
         on_select_start(&column_info);
 
@@ -2457,8 +2441,8 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for (i, column_type) in column_oracle_types.iter().enumerate() {
-                let value = Self::row_value_to_text(&row, column_type, i)?;
+            for i in 0..column_count {
+                let value = Self::row_value_to_text(&row, i)?;
                 row_data.push(value);
             }
 
@@ -2505,11 +2489,7 @@ impl QueryExecutor {
                 data_type: format!("{:?}", col.oracle_type()),
             })
             .collect();
-        let column_oracle_types: Vec<OracleType> = result_set
-            .column_info()
-            .iter()
-            .map(|col| col.oracle_type().clone())
-            .collect();
+        let column_count = column_info.len();
 
         on_select_start(&column_info);
 
@@ -2526,8 +2506,8 @@ impl QueryExecutor {
             };
             let mut row_data: Vec<String> = Vec::with_capacity(column_info.len());
 
-            for (i, column_type) in column_oracle_types.iter().enumerate() {
-                let value = Self::row_value_to_text(&row, column_type, i)?;
+            for i in 0..column_count {
+                let value = Self::row_value_to_text(&row, i)?;
                 row_data.push(value);
             }
 
