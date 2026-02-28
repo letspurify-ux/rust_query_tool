@@ -204,13 +204,11 @@ impl SqlEditorWidget {
                             ColumnLoadWorkerMessage::Task(task) => {
                                 let task_sender = task.sender.clone();
                                 let task_table_key = task.table_key.clone();
-                                let result =
-                                    panic::catch_unwind(AssertUnwindSafe(|| {
-                                        Self::process_column_load_task(task);
-                                    }));
+                                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                    Self::process_column_load_task(task);
+                                }));
                                 if let Err(payload) = result {
-                                    let panic_msg =
-                                        Self::panic_payload_to_string(payload.as_ref());
+                                    let panic_msg = Self::panic_payload_to_string(payload.as_ref());
                                     crate::utils::logging::log_error(
                                         "sql_editor::intellisense::column_loader",
                                         &format!(
@@ -2598,12 +2596,61 @@ impl SqlEditorWidget {
     ) -> (String, usize) {
         let cursor_byte = Self::clamp_to_char_boundary_local(text, cursor_byte.min(text.len()));
         let before_cursor = text.get(..cursor_byte).unwrap_or("");
-        let normalized_full = Self::normalize_intellisense_context_text(text);
-        let normalized_before = Self::normalize_intellisense_context_text(before_cursor);
-        let normalized_cursor = normalized_before.len().min(normalized_full.len());
-        let normalized_cursor =
-            Self::clamp_to_char_boundary_local(&normalized_full, normalized_cursor);
-        (normalized_full, normalized_cursor)
+        let stripped_cursor = Self::strip_sqlplus_prompt_prefixes(before_cursor).len();
+        let text = Self::strip_sqlplus_prompt_prefixes(text);
+        let cursor_byte = stripped_cursor.min(text.len());
+        let mut normalized = String::with_capacity(text.len());
+        let mut raw_offset = 0usize;
+        let mut normalized_cursor = 0usize;
+        let mut cursor_recorded = false;
+        let mut skipping_prefix = true;
+
+        for segment in text.split_inclusive('\n') {
+            let segment_start = raw_offset;
+            raw_offset += segment.len();
+
+            let (line, line_end) = if let Some(stripped) = segment.strip_suffix('\n') {
+                (stripped, "\n")
+            } else {
+                (segment, "")
+            };
+
+            if skipping_prefix {
+                let trimmed = line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with("--")
+                    || Self::is_sqlplus_command_line(trimmed)
+                {
+                    if !cursor_recorded && cursor_byte <= raw_offset {
+                        normalized_cursor = normalized.len();
+                        cursor_recorded = true;
+                    }
+                    continue;
+                }
+                skipping_prefix = false;
+            }
+
+            if !cursor_recorded && cursor_byte <= raw_offset {
+                let cursor_in_segment =
+                    cursor_byte.saturating_sub(segment_start).min(segment.len());
+                let cursor_in_line = cursor_in_segment.min(line.len());
+                normalized_cursor = normalized.len() + cursor_in_line;
+                cursor_recorded = true;
+            }
+
+            normalized.push_str(line);
+            normalized.push_str(line_end);
+        }
+
+        if !cursor_recorded {
+            normalized_cursor = normalized.len();
+        }
+
+        let normalized_cursor = Self::clamp_to_char_boundary_local(
+            &normalized,
+            normalized_cursor.min(normalized.len()),
+        );
+        (normalized, normalized_cursor)
     }
 
     fn strip_sqlplus_prompt_prefixes(text: &str) -> String {
