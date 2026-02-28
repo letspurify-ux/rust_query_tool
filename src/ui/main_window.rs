@@ -4224,6 +4224,7 @@ impl MainWindow {
                 // Clean up result tabs to release FLTK widget callbacks and data buffers
                 result_tabs.clear();
             }
+            crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
             if let Err(err) = crate::ui::query_history::flush_history_writer() {
                 eprintln!("Query history flush on exit failed: {err}");
             }

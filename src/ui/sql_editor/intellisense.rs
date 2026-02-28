@@ -32,14 +32,20 @@ const MAX_MERGED_SUGGESTIONS: usize = 50;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 const COLUMN_LOAD_WORKER_COUNT: usize = 4;
 
+#[derive(Clone)]
 struct ColumnLoadTask {
     table_key: String,
     connection: SharedConnection,
     sender: mpsc::Sender<ColumnLoadUpdate>,
 }
 
+enum ColumnLoadWorkerMessage {
+    Task(ColumnLoadTask),
+    Shutdown,
+}
+
 struct ColumnLoadWorkerPool {
-    worker_senders: Vec<mpsc::Sender<ColumnLoadTask>>,
+    worker_senders: Vec<mpsc::Sender<ColumnLoadWorkerMessage>>,
     next_worker: AtomicUsize,
 }
 
@@ -49,7 +55,16 @@ impl ColumnLoadWorkerPool {
             return Err(task);
         }
         let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_senders.len();
-        self.worker_senders[index].send(task).map_err(|err| err.0)
+        let task_for_err = task.clone();
+        self.worker_senders[index]
+            .send(ColumnLoadWorkerMessage::Task(task))
+            .map_err(|_| task_for_err)
+    }
+
+    fn shutdown(&self) {
+        for sender in &self.worker_senders {
+            let _ = sender.send(ColumnLoadWorkerMessage::Shutdown);
+        }
     }
 }
 
@@ -161,12 +176,17 @@ impl SqlEditorWidget {
         let mut worker_senders = Vec::new();
 
         for idx in 0..COLUMN_LOAD_WORKER_COUNT {
-            let (sender, receiver) = mpsc::channel::<ColumnLoadTask>();
+            let (sender, receiver) = mpsc::channel::<ColumnLoadWorkerMessage>();
             let spawn_result = thread::Builder::new()
                 .name(format!("intellisense-column-worker-{idx}"))
                 .spawn(move || {
-                    while let Ok(task) = receiver.recv() {
-                        Self::process_column_load_task(task);
+                    while let Ok(message) = receiver.recv() {
+                        match message {
+                            ColumnLoadWorkerMessage::Task(task) => {
+                                Self::process_column_load_task(task)
+                            }
+                            ColumnLoadWorkerMessage::Shutdown => break,
+                        }
                     }
                 });
 
@@ -188,6 +208,12 @@ impl SqlEditorWidget {
 
     fn enqueue_column_load_task(task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
         Self::column_load_worker_pool().enqueue(task)
+    }
+
+    pub(crate) fn shutdown_column_load_workers() {
+        if let Some(pool) = COLUMN_LOAD_WORKER_POOL.get() {
+            pool.shutdown();
+        }
     }
 
     fn process_column_load_task(task: ColumnLoadTask) {
