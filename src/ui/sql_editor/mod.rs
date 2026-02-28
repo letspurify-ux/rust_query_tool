@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -684,13 +684,21 @@ enum UiActionResult {
 #[derive(Clone)]
 struct HighlightRequest {
     revision: u64,
+    generation: u64,
     text: String,
 }
 
 #[derive(Clone)]
 struct HighlightResult {
     revision: u64,
+    generation: u64,
     style_text: String,
+}
+
+#[derive(Default)]
+struct HighlightQueueState {
+    pending_request: Option<HighlightRequest>,
+    shutdown: bool,
 }
 
 #[derive(Clone)]
@@ -727,8 +735,10 @@ pub struct SqlEditorWidget {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
     last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
-    highlight_request_state: Arc<(Mutex<Option<HighlightRequest>>, Condvar)>,
+    highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
     highlight_revision: Arc<AtomicU64>,
+    highlight_generation: Arc<AtomicU64>,
+    highlight_worker_stopped: Arc<AtomicBool>,
 }
 
 impl SqlEditorWidget {
@@ -997,8 +1007,10 @@ impl SqlEditorWidget {
         let keyup_debounce_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
         let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
         let highlight_request_state =
-            Arc::new((Mutex::new(None::<HighlightRequest>), Condvar::new()));
+            Arc::new((Mutex::new(HighlightQueueState::default()), Condvar::new()));
         let highlight_revision = Arc::new(AtomicU64::new(0));
+        let highlight_generation = Arc::new(AtomicU64::new(0));
+        let highlight_worker_stopped = Arc::new(AtomicBool::new(false));
 
         let mut widget = Self {
             group,
@@ -1035,6 +1047,8 @@ impl SqlEditorWidget {
             last_explain_plan,
             highlight_request_state: highlight_request_state.clone(),
             highlight_revision: highlight_revision.clone(),
+            highlight_generation: highlight_generation.clone(),
+            highlight_worker_stopped: highlight_worker_stopped.clone(),
         };
 
         widget.setup_intellisense();
@@ -1049,6 +1063,7 @@ impl SqlEditorWidget {
             highlight_request_state,
             highlight_result_sender,
             widget.highlighter.clone(),
+            highlight_worker_stopped,
         );
 
         widget
@@ -1292,8 +1307,9 @@ impl SqlEditorWidget {
         let intellisense_data = self.intellisense_data.clone();
         let editor = self.editor.clone();
         let buffer = self.buffer.clone();
-        let style_buffer = self.style_buffer.clone();
         let highlighter = self.highlighter.clone();
+        let highlight_generation = self.highlight_generation.clone();
+        let widget = self.clone();
         let intellisense_popup = self.intellisense_popup.clone();
         let completion_range = self.completion_range.clone();
         let column_sender = self.column_sender.clone();
@@ -1314,8 +1330,9 @@ impl SqlEditorWidget {
             intellisense_data: Arc<Mutex<IntellisenseData>>,
             editor: TextEditor,
             buffer: TextBuffer,
-            style_buffer: TextBuffer,
             highlighter: Arc<Mutex<SqlHighlighter>>,
+            highlight_generation: Arc<AtomicU64>,
+            widget: SqlEditorWidget,
             intellisense_popup: Arc<Mutex<IntellisensePopup>>,
             completion_range: Arc<Mutex<Option<(usize, usize)>>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -1375,6 +1392,7 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1400,18 +1418,8 @@ impl SqlEditorWidget {
                 };
 
                 if should_refresh_highlighting {
-                    let cursor_pos = editor.insert_position().max(0) as usize;
-                    let viewport = editor_viewport_range(&editor, &buffer);
-                    highlighter
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .highlight_buffer_window_viewport(
-                            &buffer,
-                            &mut style_buffer.clone(),
-                            cursor_pos,
-                            None,
-                            viewport,
-                        );
+                    highlight_generation.fetch_add(1, Ordering::Relaxed);
+                    widget.refresh_highlighting();
                 }
             }
 
@@ -1490,8 +1498,9 @@ impl SqlEditorWidget {
                     intellisense_data.clone(),
                     editor.clone(),
                     buffer.clone(),
-                    style_buffer.clone(),
                     highlighter.clone(),
+                    highlight_generation.clone(),
+                    widget.clone(),
                     intellisense_popup.clone(),
                     completion_range.clone(),
                     column_sender.clone(),
@@ -1508,8 +1517,9 @@ impl SqlEditorWidget {
             intellisense_data,
             editor,
             buffer,
-            style_buffer,
             highlighter,
+            highlight_generation,
+            widget,
             intellisense_popup,
             completion_range,
             column_sender,
@@ -1530,6 +1540,7 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1682,6 +1693,7 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1717,6 +1729,7 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1739,12 +1752,14 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
             if let Some(result) = latest_result {
                 let current_revision = widget.highlight_revision.load(Ordering::Relaxed);
-                if result.revision == current_revision {
+                let current_generation = widget.highlight_generation.load(Ordering::Relaxed);
+                if result.revision == current_revision && result.generation == current_generation {
                     let mut style_buffer = widget.style_buffer.clone();
                     style_buffer.set_text(&result.style_text);
                     let mut editor = widget.editor.clone();
@@ -1762,24 +1777,30 @@ impl SqlEditorWidget {
     }
 
     fn spawn_highlight_worker(
-        highlight_request_state: Arc<(Mutex<Option<HighlightRequest>>, Condvar)>,
+        highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
         highlight_result_sender: mpsc::Sender<HighlightResult>,
         highlighter: Arc<Mutex<SqlHighlighter>>,
+        highlight_worker_stopped: Arc<AtomicBool>,
     ) {
+        let worker_stopped_for_thread = highlight_worker_stopped.clone();
         let spawn_result = thread::Builder::new()
             .name("sql-highlighter-worker".to_string())
             .spawn(move || loop {
                 let request = {
                     let (queue_lock, queue_signal) = &*highlight_request_state;
-                    let mut pending = queue_lock
+                    let mut queue_state = queue_lock
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while pending.is_none() {
-                        pending = queue_signal
-                            .wait(pending)
+                    while !queue_state.shutdown && queue_state.pending_request.is_none() {
+                        queue_state = queue_signal
+                            .wait(queue_state)
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                     }
-                    let Some(request) = pending.take() else {
+                    if queue_state.shutdown {
+                        worker_stopped_for_thread.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let Some(request) = queue_state.pending_request.take() else {
                         continue;
                     };
                     request
@@ -1795,10 +1816,12 @@ impl SqlEditorWidget {
                 if highlight_result_sender
                     .send(HighlightResult {
                         revision: request.revision,
+                        generation: request.generation,
                         style_text,
                     })
                     .is_err()
                 {
+                    worker_stopped_for_thread.store(true, Ordering::Relaxed);
                     break;
                 }
 
@@ -1806,6 +1829,7 @@ impl SqlEditorWidget {
             });
 
         if let Err(err) = spawn_result {
+            highlight_worker_stopped.store(true, Ordering::Relaxed);
             crate::utils::logging::log_error(
                 "sql_editor::highlight_worker",
                 &format!("failed to spawn highlight worker: {}", err),
@@ -1826,6 +1850,7 @@ impl SqlEditorWidget {
             last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32, i32)>>>,
         ) {
             if widget.group.was_deleted() || editor.was_deleted() {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -2343,6 +2368,9 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(HighlightData::new());
+        self.highlight_generation.fetch_add(1, Ordering::Relaxed);
+
+        self.request_highlight_worker_shutdown();
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");
@@ -2417,6 +2445,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(data);
+        self.highlight_generation.fetch_add(1, Ordering::Relaxed);
         self.refresh_highlighting();
     }
 
@@ -2471,16 +2500,45 @@ impl SqlEditorWidget {
     }
 
     fn enqueue_highlight_request(&self, text: String) {
+        if self.highlight_worker_stopped.load(Ordering::Relaxed) {
+            return;
+        }
+
         let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let request = HighlightRequest { revision, text };
+        let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let request = HighlightRequest {
+            revision,
+            generation,
+            text,
+        };
         let (queue_lock, queue_signal) = &*self.highlight_request_state;
         {
-            let mut pending = queue_lock
+            let mut queue_state = queue_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *pending = Some(request);
+            if queue_state.shutdown {
+                self.highlight_worker_stopped.store(true, Ordering::Relaxed);
+                return;
+            }
+            queue_state.pending_request = Some(request);
         }
         queue_signal.notify_one();
+    }
+
+    fn request_highlight_worker_shutdown(&self) {
+        if self.highlight_worker_stopped.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        let (queue_lock, queue_signal) = &*self.highlight_request_state;
+        {
+            let mut queue_state = queue_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue_state.shutdown = true;
+            queue_state.pending_request = None;
+        }
+        queue_signal.notify_all();
     }
 
     #[allow(dead_code)]
