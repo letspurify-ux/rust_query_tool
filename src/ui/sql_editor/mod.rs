@@ -803,24 +803,39 @@ impl SqlEditorWidget {
                     }
 
                     for task in latest_tasks.into_values() {
-                        let style_text = {
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
                             let guard = task
                                 .highlighter
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             guard.generate_styles_for_text(&task.request.text)
-                        };
+                        }));
 
-                        if task
-                            .result_sender
-                            .send(HighlightResult {
-                                revision: task.request.revision,
-                                generation: task.request.generation,
-                                style_text,
-                            })
-                            .is_ok()
-                        {
-                            app::awake();
+                        match result {
+                            Ok(style_text) => {
+                                if task
+                                    .result_sender
+                                    .send(HighlightResult {
+                                        revision: task.request.revision,
+                                        generation: task.request.generation,
+                                        style_text,
+                                    })
+                                    .is_ok()
+                                {
+                                    app::awake();
+                                }
+                            }
+                            Err(payload) => {
+                                let panic_msg =
+                                    SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                                crate::utils::logging::log_error(
+                                    "sql_editor::highlight_worker",
+                                    &format!(
+                                        "highlight worker panicked for editor {}: {}",
+                                        task.editor_id, panic_msg
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -1919,25 +1934,40 @@ impl SqlEditorWidget {
         set_cursor(Cursor::Wait);
         app::flush();
         thread::spawn(move || {
-            // Try to acquire connection lock without blocking
-            let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
-                &connection,
-                "Generating explain plan",
-            ) else {
-                // Query is already running, notify user
-                let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+            let sender_fallback = sender.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                // Try to acquire connection lock without blocking
+                let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
+                    &connection,
+                    "Generating explain plan",
+                ) else {
+                    // Query is already running, notify user
+                    let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                };
+
+                let result = match conn_guard.require_live_connection() {
+                    Ok(db_conn) => QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
+                        .map_err(|err| err.to_string()),
+                    Err(message) => Err(message.to_string()),
+                };
+
+                let _ = sender.send(UiActionResult::ExplainPlan(result));
                 app::awake();
-                return;
-            };
-
-            let result = match conn_guard.require_live_connection() {
-                Ok(db_conn) => QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
-                    .map_err(|err| err.to_string()),
-                Err(message) => Err(message.to_string()),
-            };
-
-            let _ = sender.send(UiActionResult::ExplainPlan(result));
-            app::awake();
+            }));
+            if let Err(payload) = result {
+                let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "sql_editor::explain",
+                    &format!("explain thread panicked: {}", panic_msg),
+                );
+                let _ = sender_fallback.send(UiActionResult::ExplainPlan(Err(format!(
+                    "Internal error: {}",
+                    panic_msg
+                ))));
+                app::awake();
+            }
         });
     }
 
@@ -2119,23 +2149,38 @@ impl SqlEditorWidget {
         set_cursor(Cursor::Wait);
         app::flush();
         thread::spawn(move || {
-            // Try to acquire connection lock without blocking
-            let Some(mut conn_guard) =
-                crate::db::try_lock_connection_with_activity(&connection, "Commit transaction")
-            else {
-                // Query is already running, notify user
-                let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+            let sender_fallback = sender.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                // Try to acquire connection lock without blocking
+                let Some(mut conn_guard) =
+                    crate::db::try_lock_connection_with_activity(&connection, "Commit transaction")
+                else {
+                    // Query is already running, notify user
+                    let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                };
+
+                let result = match conn_guard.require_live_connection() {
+                    Ok(db_conn) => db_conn.commit().map_err(|err| err.to_string()),
+                    Err(message) => Err(message.to_string()),
+                };
+
+                let _ = sender.send(UiActionResult::Commit(result));
                 app::awake();
-                return;
-            };
-
-            let result = match conn_guard.require_live_connection() {
-                Ok(db_conn) => db_conn.commit().map_err(|err| err.to_string()),
-                Err(message) => Err(message.to_string()),
-            };
-
-            let _ = sender.send(UiActionResult::Commit(result));
-            app::awake();
+            }));
+            if let Err(payload) = result {
+                let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "sql_editor::commit",
+                    &format!("commit thread panicked: {}", panic_msg),
+                );
+                let _ = sender_fallback.send(UiActionResult::Commit(Err(format!(
+                    "Internal error: {}",
+                    panic_msg
+                ))));
+                app::awake();
+            }
         });
     }
 
@@ -2145,23 +2190,38 @@ impl SqlEditorWidget {
         set_cursor(Cursor::Wait);
         app::flush();
         thread::spawn(move || {
-            // Try to acquire connection lock without blocking
-            let Some(mut conn_guard) =
-                crate::db::try_lock_connection_with_activity(&connection, "Rollback transaction")
-            else {
-                // Query is already running, notify user
-                let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+            let sender_fallback = sender.clone();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                // Try to acquire connection lock without blocking
+                let Some(mut conn_guard) =
+                    crate::db::try_lock_connection_with_activity(&connection, "Rollback transaction")
+                else {
+                    // Query is already running, notify user
+                    let _ = sender.send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                };
+
+                let result = match conn_guard.require_live_connection() {
+                    Ok(db_conn) => db_conn.rollback().map_err(|err| err.to_string()),
+                    Err(message) => Err(message.to_string()),
+                };
+
+                let _ = sender.send(UiActionResult::Rollback(result));
                 app::awake();
-                return;
-            };
-
-            let result = match conn_guard.require_live_connection() {
-                Ok(db_conn) => db_conn.rollback().map_err(|err| err.to_string()),
-                Err(message) => Err(message.to_string()),
-            };
-
-            let _ = sender.send(UiActionResult::Rollback(result));
-            app::awake();
+            }));
+            if let Err(payload) = result {
+                let panic_msg = SqlEditorWidget::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "sql_editor::rollback",
+                    &format!("rollback thread panicked: {}", panic_msg),
+                );
+                let _ = sender_fallback.send(UiActionResult::Rollback(Err(format!(
+                    "Internal error: {}",
+                    panic_msg
+                ))));
+                app::awake();
+            }
         });
     }
 
