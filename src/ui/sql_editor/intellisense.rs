@@ -203,7 +203,30 @@ impl SqlEditorWidget {
                     while let Ok(message) = receiver.recv() {
                         match message {
                             ColumnLoadWorkerMessage::Task(task) => {
-                                Self::process_column_load_task(task)
+                                let task_sender = task.sender.clone();
+                                let task_table_key = task.table_key.clone();
+                                let result =
+                                    panic::catch_unwind(AssertUnwindSafe(|| {
+                                        Self::process_column_load_task(task);
+                                    }));
+                                if let Err(payload) = result {
+                                    let panic_msg =
+                                        Self::panic_payload_to_string(payload.as_ref());
+                                    crate::utils::logging::log_error(
+                                        "sql_editor::intellisense::column_loader",
+                                        &format!(
+                                            "column worker panicked processing {}: {}",
+                                            task_table_key, panic_msg
+                                        ),
+                                    );
+                                    // Send empty result to unblock columns_loading tracking
+                                    let _ = task_sender.send(ColumnLoadUpdate {
+                                        table: task_table_key,
+                                        columns: Vec::new(),
+                                        cache_columns: false,
+                                    });
+                                    app::awake();
+                                }
                             }
                             ColumnLoadWorkerMessage::Shutdown => break,
                         }
@@ -3191,29 +3214,45 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("quick-describe".to_string())
             .spawn(move || {
-                // Try to acquire connection lock without blocking
-                let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
-                    &connection,
-                    format!("Quick describe {}", object_name_for_thread),
-                ) else {
-                    // Query is already running, notify user
-                    let _ = sender_for_thread.send(UiActionResult::QueryAlreadyRunning);
+                let sender_fallback = sender_for_thread.clone();
+                let object_name_fallback = object_name_for_thread.clone();
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    // Try to acquire connection lock without blocking
+                    let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
+                        &connection,
+                        format!("Quick describe {}", object_name_for_thread),
+                    ) else {
+                        // Query is already running, notify user
+                        let _ = sender_for_thread.send(UiActionResult::QueryAlreadyRunning);
+                        app::awake();
+                        return;
+                    };
+
+                    let result = match conn_guard.require_live_connection() {
+                        Ok(db_conn) => {
+                            Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
+                        }
+                        Err(message) => Err(message.to_string()),
+                    };
+
+                    let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
+                        object_name: object_name_for_thread,
+                        result,
+                    });
                     app::awake();
-                    return;
-                };
-
-                let result = match conn_guard.require_live_connection() {
-                    Ok(db_conn) => {
-                        Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
-                    }
-                    Err(message) => Err(message.to_string()),
-                };
-
-                let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
-                    object_name: object_name_for_thread,
-                    result,
-                });
-                app::awake();
+                }));
+                if let Err(payload) = result {
+                    let panic_msg = Self::panic_payload_to_string(payload.as_ref());
+                    crate::utils::logging::log_error(
+                        "sql_editor::intellisense::quick_describe",
+                        &format!("quick describe thread panicked: {}", panic_msg),
+                    );
+                    let _ = sender_fallback.send(UiActionResult::QuickDescribe {
+                        object_name: object_name_fallback,
+                        result: Err(format!("Internal error: {}", panic_msg)),
+                    });
+                    app::awake();
+                }
             });
 
         if let Err(err) = spawn_result {
