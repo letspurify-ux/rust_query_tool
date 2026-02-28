@@ -13,10 +13,9 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
@@ -696,10 +695,11 @@ struct HighlightResult {
     style_text: String,
 }
 
-#[derive(Default)]
-struct HighlightQueueState {
-    pending_request: Option<HighlightRequest>,
-    shutdown: bool,
+#[derive(Clone)]
+struct HighlightWorkerTask {
+    request: HighlightRequest,
+    highlighter: Arc<Mutex<SqlHighlighter>>,
+    result_sender: mpsc::Sender<HighlightResult>,
 }
 
 #[derive(Clone)]
@@ -736,11 +736,9 @@ pub struct SqlEditorWidget {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
     last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
-    highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
+    highlight_result_sender: mpsc::Sender<HighlightResult>,
     highlight_revision: Arc<AtomicU64>,
     highlight_generation: Arc<AtomicU64>,
-    highlight_worker_stopped: Arc<AtomicBool>,
-    highlight_worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl SqlEditorWidget {
@@ -753,6 +751,45 @@ impl SqlEditorWidget {
     fn pending_alert_state() -> &'static Arc<Mutex<PendingAlertState>> {
         static STATE: OnceLock<Arc<Mutex<PendingAlertState>>> = OnceLock::new();
         STATE.get_or_init(|| Arc::new(Mutex::new(PendingAlertState::default())))
+    }
+
+    fn highlight_worker_sender() -> &'static mpsc::Sender<HighlightWorkerTask> {
+        static WORKER_SENDER: OnceLock<mpsc::Sender<HighlightWorkerTask>> = OnceLock::new();
+        WORKER_SENDER.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<HighlightWorkerTask>();
+            let spawn_result = thread::Builder::new()
+                .name("sql-highlighter-worker-global".to_string())
+                .spawn(move || {
+                    while let Ok(task) = receiver.recv() {
+                        let style_text = {
+                            let guard = task
+                                .highlighter
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            guard.generate_styles_for_text(&task.request.text)
+                        };
+
+                        if task
+                            .result_sender
+                            .send(HighlightResult {
+                                revision: task.request.revision,
+                                generation: task.request.generation,
+                                style_text,
+                            })
+                            .is_ok()
+                        {
+                            app::awake();
+                        }
+                    }
+                });
+            if let Err(err) = spawn_result {
+                crate::utils::logging::log_error(
+                    "sql_editor::highlight_worker",
+                    &format!("failed to spawn global highlight worker: {}", err),
+                );
+            }
+            sender
+        })
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {
@@ -1008,12 +1045,8 @@ impl SqlEditorWidget {
         let keyup_debounce_generation = Arc::new(Mutex::new(0_u64));
         let keyup_debounce_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
         let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
-        let highlight_request_state =
-            Arc::new((Mutex::new(HighlightQueueState::default()), Condvar::new()));
         let highlight_revision = Arc::new(AtomicU64::new(0));
         let highlight_generation = Arc::new(AtomicU64::new(0));
-        let highlight_worker_stopped = Arc::new(AtomicBool::new(false));
-        let highlight_worker_handle = Arc::new(Mutex::new(None::<JoinHandle<()>>));
 
         let mut widget = Self {
             group,
@@ -1048,11 +1081,9 @@ impl SqlEditorWidget {
             keyup_debounce_generation,
             keyup_debounce_handle,
             last_explain_plan,
-            highlight_request_state: highlight_request_state.clone(),
+            highlight_result_sender,
             highlight_revision: highlight_revision.clone(),
             highlight_generation: highlight_generation.clone(),
-            highlight_worker_stopped: highlight_worker_stopped.clone(),
-            highlight_worker_handle: highlight_worker_handle.clone(),
         };
 
         widget.setup_intellisense();
@@ -1063,13 +1094,6 @@ impl SqlEditorWidget {
         widget.setup_column_loader(column_receiver);
         widget.setup_ui_action_handler(ui_action_receiver);
         widget.setup_highlight_worker(highlight_result_receiver);
-        SqlEditorWidget::spawn_highlight_worker(
-            highlight_request_state,
-            highlight_result_sender,
-            widget.highlighter.clone(),
-            highlight_worker_stopped,
-            highlight_worker_handle,
-        );
 
         widget
     }
@@ -1397,7 +1421,6 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1545,7 +1568,6 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1698,7 +1720,6 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1734,7 +1755,6 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1757,7 +1777,6 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1781,76 +1800,6 @@ impl SqlEditorWidget {
         schedule_poll(receiver, widget);
     }
 
-    fn spawn_highlight_worker(
-        highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
-        highlight_result_sender: mpsc::Sender<HighlightResult>,
-        highlighter: Arc<Mutex<SqlHighlighter>>,
-        highlight_worker_stopped: Arc<AtomicBool>,
-        highlight_worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    ) {
-        let worker_stopped_for_thread = highlight_worker_stopped.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sql-highlighter-worker".to_string())
-            .spawn(move || loop {
-                let request = {
-                    let (queue_lock, queue_signal) = &*highlight_request_state;
-                    let mut queue_state = queue_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while !queue_state.shutdown && queue_state.pending_request.is_none() {
-                        queue_state = queue_signal
-                            .wait(queue_state)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    }
-                    if queue_state.shutdown {
-                        worker_stopped_for_thread.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    let Some(request) = queue_state.pending_request.take() else {
-                        continue;
-                    };
-                    request
-                };
-
-                let style_text = {
-                    let guard = highlighter
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.generate_styles_for_text(&request.text)
-                };
-
-                if highlight_result_sender
-                    .send(HighlightResult {
-                        revision: request.revision,
-                        generation: request.generation,
-                        style_text,
-                    })
-                    .is_err()
-                {
-                    worker_stopped_for_thread.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                app::awake();
-            });
-
-        match spawn_result {
-            Ok(handle) => {
-                let mut guard = highlight_worker_handle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *guard = Some(handle);
-            }
-            Err(err) => {
-                highlight_worker_stopped.store(true, Ordering::Relaxed);
-                crate::utils::logging::log_error(
-                    "sql_editor::highlight_worker",
-                    &format!("failed to spawn highlight worker: {}", err),
-                );
-            }
-        }
-    }
-
     fn setup_viewport_highlight_poll(&self) {
         let widget = self.clone();
         let editor = self.editor.clone();
@@ -1864,7 +1813,6 @@ impl SqlEditorWidget {
             last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32, i32)>>>,
         ) {
             if widget.group.was_deleted() || editor.was_deleted() {
-                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -2384,8 +2332,6 @@ impl SqlEditorWidget {
             .set_highlight_data(HighlightData::new());
         self.highlight_generation.fetch_add(1, Ordering::Relaxed);
 
-        self.request_highlight_worker_shutdown();
-
         self.buffer.set_text("");
         self.style_buffer.set_text("");
         self.completion_range
@@ -2514,60 +2460,22 @@ impl SqlEditorWidget {
     }
 
     fn enqueue_highlight_request(&self, text: String) {
-        if self.highlight_worker_stopped.load(Ordering::Relaxed) {
-            return;
-        }
-
         let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let generation = self.highlight_generation.load(Ordering::Relaxed);
-        let request = HighlightRequest {
-            revision,
-            generation,
-            text,
-        };
-        let (queue_lock, queue_signal) = &*self.highlight_request_state;
-        {
-            let mut queue_state = queue_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if queue_state.shutdown {
-                self.highlight_worker_stopped.store(true, Ordering::Relaxed);
-                return;
-            }
-            queue_state.pending_request = Some(request);
-        }
-        queue_signal.notify_one();
-    }
-
-    fn request_highlight_worker_shutdown(&self) {
-        if self.highlight_worker_stopped.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        let (queue_lock, queue_signal) = &*self.highlight_request_state;
-        {
-            let mut queue_state = queue_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            queue_state.shutdown = true;
-            queue_state.pending_request = None;
-        }
-        queue_signal.notify_all();
-
-        let handle = {
-            let mut guard = self
-                .highlight_worker_handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.take()
-        };
-        if let Some(handle) = handle {
-            if let Err(err) = handle.join() {
-                crate::utils::logging::log_error(
-                    "sql_editor::highlight_worker",
-                    &format!("highlight worker join failed: {:?}", err),
-                );
-            }
+        let send_result = Self::highlight_worker_sender().send(HighlightWorkerTask {
+            request: HighlightRequest {
+                revision,
+                generation,
+                text,
+            },
+            highlighter: self.highlighter.clone(),
+            result_sender: self.highlight_result_sender.clone(),
+        });
+        if let Err(err) = send_result {
+            crate::utils::logging::log_error(
+                "sql_editor::highlight_worker",
+                &format!("failed to enqueue highlight request: {}", err),
+            );
         }
     }
 
