@@ -288,13 +288,15 @@ impl SqlHighlighter {
 
         match prev_style {
             // These styles never span across window boundaries.
+            // NOTE: STYLE_DATETIME_LITERAL is intentionally excluded here
+            // because an unclosed DATE/TIMESTAMP/INTERVAL literal can span a
+            // window boundary and must be re-lexed to detect InSingleQuote.
             STYLE_DEFAULT
             | STYLE_KEYWORD
             | STYLE_FUNCTION
             | STYLE_NUMBER
             | STYLE_OPERATOR
-            | STYLE_COLUMN
-            | STYLE_DATETIME_LITERAL => return LexerState::Normal,
+            | STYLE_COLUMN => return LexerState::Normal,
             _ => {}
         }
 
@@ -658,6 +660,7 @@ impl SqlHighlighter {
                     }
                     if bytes.get(look_ahead) == Some(&b'\'') {
                         look_ahead += 1;
+                        let mut closed = false;
                         while let Some(&b) = bytes.get(look_ahead) {
                             if b == b'\'' {
                                 if bytes.get(look_ahead + 1) == Some(&b'\'') {
@@ -665,12 +668,16 @@ impl SqlHighlighter {
                                     continue;
                                 }
                                 look_ahead += 1;
+                                closed = true;
                                 break;
                             }
                             look_ahead += 1;
                         }
                         styles[start..look_ahead].fill(STYLE_DATETIME_LITERAL as u8);
                         idx = look_ahead;
+                        if !closed {
+                            exit_state = LexerState::InSingleQuote;
+                        }
                         continue;
                     }
                 }
