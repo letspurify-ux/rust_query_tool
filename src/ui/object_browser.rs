@@ -9,6 +9,7 @@ use fltk::{
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
@@ -63,8 +64,12 @@ struct ObjectCache {
 
 #[derive(Clone)]
 enum RefreshEvent {
-    Cache(ObjectCache),
-    Completed,
+    Finished(ObjectCache),
+}
+
+#[derive(Clone, Copy)]
+enum RefreshRequest {
+    Metadata,
 }
 
 enum ObjectActionResult {
@@ -111,7 +116,7 @@ pub struct ObjectBrowserWidget {
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
     poll_lifecycle: Arc<()>,
-    refresh_sender: std::sync::mpsc::Sender<RefreshEvent>,
+    refresh_request_sender: Sender<RefreshRequest>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
 }
 
@@ -185,7 +190,15 @@ impl ObjectBrowserWidget {
         let poll_lifecycle = Arc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
+        let (refresh_request_sender, refresh_request_receiver) =
+            std::sync::mpsc::channel::<RefreshRequest>();
         let (action_sender, action_receiver) = std::sync::mpsc::channel::<ObjectActionResult>();
+
+        Self::spawn_refresh_worker(
+            refresh_request_receiver,
+            refresh_sender.clone(),
+            connection.clone(),
+        );
 
         let mut widget = Self {
             flex,
@@ -196,7 +209,7 @@ impl ObjectBrowserWidget {
             poll_lifecycle,
             sql_callback,
             status_callback,
-            refresh_sender,
+            refresh_request_sender,
             action_sender,
         };
         widget.setup_callbacks();
@@ -257,7 +270,7 @@ impl ObjectBrowserWidget {
             Arc::new(Mutex::new(refresh_receiver));
 
         fn schedule_poll(
-            receiver: Arc<Mutex<std::sync::mpsc::Receiver<RefreshEvent>>>,
+            receiver: Arc<Mutex<Receiver<RefreshEvent>>>,
             mut tree: Tree,
             object_cache: Arc<Mutex<ObjectCache>>,
             filter_input: Input,
@@ -276,7 +289,6 @@ impl ObjectBrowserWidget {
             // Keep receiver lock scope minimal: drain messages first, then perform UI work.
             // This prevents long lock hold while rebuilding tree widgets.
             let mut latest_cache: Option<ObjectCache> = None;
-            let mut completed_count = 0u32;
 
             {
                 let r = receiver
@@ -284,14 +296,11 @@ impl ObjectBrowserWidget {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 loop {
                     match r.try_recv() {
-                        Ok(RefreshEvent::Cache(cache)) => {
+                        Ok(RefreshEvent::Finished(cache)) => {
                             latest_cache = Some(cache);
                         }
-                        Ok(RefreshEvent::Completed) => {
-                            completed_count = completed_count.saturating_add(1);
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
                             disconnected = true;
                             break;
                         }
@@ -309,9 +318,6 @@ impl ObjectBrowserWidget {
                     ObjectBrowserWidget::populate_tree(&mut tree, &cache_guard, &filter_text);
                 }
                 tree.redraw();
-            }
-
-            for _ in 0..completed_count {
                 ObjectBrowserWidget::emit_status_callback(
                     &status_callback,
                     "Object browser metadata refresh completed",
@@ -2058,70 +2064,86 @@ impl ObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = ObjectCache::default();
         self.emit_status("Refreshing object browser metadata");
 
-        let sender = self.refresh_sender.clone();
-        let connection = self.connection.clone();
+        let _ = self.refresh_request_sender.send(RefreshRequest::Metadata);
+    }
 
+    fn spawn_refresh_worker(
+        refresh_request_receiver: Receiver<RefreshRequest>,
+        refresh_sender: Sender<RefreshEvent>,
+        connection: SharedConnection,
+    ) {
         thread::spawn(move || {
-            // Acquire connection lock and hold it during all queries
-            let mut conn_guard =
-                lock_connection_with_activity(&connection, "Refreshing object browser metadata");
-            let Ok(db_conn) = conn_guard.require_live_connection() else {
-                return;
-            };
-            // Keep conn_guard alive (don't drop it) so the lock is held during execution
-
-            let mut cache = ObjectCache::default();
-            let send_update = |sender: &std::sync::mpsc::Sender<RefreshEvent>,
-                               cache: &ObjectCache| {
-                let _ = sender.send(RefreshEvent::Cache(cache.clone()));
-                app::awake();
-            };
-
-            if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
-                cache.tables = tables;
-                send_update(&sender, &cache);
+            while let Ok(request) = Self::recv_latest_refresh_request(&refresh_request_receiver) {
+                match request {
+                    RefreshRequest::Metadata => {
+                        if let Some(cache) = Self::load_metadata_cache(&connection) {
+                            let _ = refresh_sender.send(RefreshEvent::Finished(cache));
+                            app::awake();
+                        }
+                    }
+                }
             }
-
-            if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
-                cache.views = views;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
-                cache.procedures = procedures;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
-                cache.functions = functions;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
-                cache.sequences = sequences;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
-                cache.triggers = triggers;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
-                cache.synonyms = synonyms;
-                send_update(&sender, &cache);
-            }
-
-            if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
-                cache.packages = packages;
-                send_update(&sender, &cache);
-            }
-
-            let _ = sender.send(RefreshEvent::Completed);
-            app::awake();
-
-            // conn_guard drops here, releasing the lock
         });
+    }
+
+    fn recv_latest_refresh_request(
+        refresh_request_receiver: &Receiver<RefreshRequest>,
+    ) -> Result<RefreshRequest, RecvError> {
+        let mut latest_request = refresh_request_receiver.recv()?;
+        loop {
+            match refresh_request_receiver.try_recv() {
+                Ok(next_request) => {
+                    latest_request = next_request;
+                }
+                Err(TryRecvError::Empty) => return Ok(latest_request),
+                Err(TryRecvError::Disconnected) => return Ok(latest_request),
+            }
+        }
+    }
+
+    fn load_metadata_cache(connection: &SharedConnection) -> Option<ObjectCache> {
+        // Acquire connection lock and hold it during all queries.
+        let mut conn_guard =
+            lock_connection_with_activity(connection, "Refreshing object browser metadata");
+        let Ok(db_conn) = conn_guard.require_live_connection() else {
+            return None;
+        };
+
+        let mut cache = ObjectCache::default();
+
+        if let Ok(tables) = ObjectBrowser::get_tables(db_conn.as_ref()) {
+            cache.tables = tables;
+        }
+
+        if let Ok(views) = ObjectBrowser::get_views(db_conn.as_ref()) {
+            cache.views = views;
+        }
+
+        if let Ok(procedures) = ObjectBrowser::get_procedures(db_conn.as_ref()) {
+            cache.procedures = procedures;
+        }
+
+        if let Ok(functions) = ObjectBrowser::get_functions(db_conn.as_ref()) {
+            cache.functions = functions;
+        }
+
+        if let Ok(sequences) = ObjectBrowser::get_sequences(db_conn.as_ref()) {
+            cache.sequences = sequences;
+        }
+
+        if let Ok(triggers) = ObjectBrowser::get_triggers(db_conn.as_ref()) {
+            cache.triggers = triggers;
+        }
+
+        if let Ok(synonyms) = ObjectBrowser::get_synonyms(db_conn.as_ref()) {
+            cache.synonyms = synonyms;
+        }
+
+        if let Ok(packages) = ObjectBrowser::get_packages(db_conn.as_ref()) {
+            cache.packages = packages;
+        }
+
+        Some(cache)
     }
 
     fn clear_items(&mut self) {
