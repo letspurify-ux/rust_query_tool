@@ -235,6 +235,10 @@ struct DragState {
     start_col: i32,
     last_row: i32,
     last_col: i32,
+    /// Cached mouse pixel position from last drag event to skip redundant
+    /// `get_cell_at_mouse_for_drag` when the pointer hasn't moved.
+    last_mouse_x: i32,
+    last_mouse_y: i32,
 }
 
 #[derive(Clone)]
@@ -281,6 +285,20 @@ struct ActiveInlineEdit {
     row: usize,
     col: usize,
     input: Input,
+}
+
+/// Per-page cache of edit state tuples populated once during `StartPage` and
+/// read back per-cell during `Cell` rendering.  This eliminates repeated mutex
+/// acquisitions and per-cell `cell_edit_state_for_draw` computations.
+/// Captured as a plain owned value inside the `FnMut` draw_cell closure.
+struct DrawPageEditCache {
+    /// Whether an active edit session existed when the page was last computed.
+    active: bool,
+    /// First visible row index – used as offset into `cell_states`.
+    start_row: usize,
+    /// Per visible-row, per column: (is_edited, is_explicit_null, is_original_null).
+    /// Indexed as `cell_states[row_idx - start_row][col_idx]`.
+    cell_states: Vec<Vec<(bool, bool, bool)>>,
 }
 
 impl ResultTableWidget {
@@ -657,15 +675,15 @@ impl ResultTableWidget {
         table: &Table,
         active_inline_edit: &Arc<Mutex<Option<ActiveInlineEdit>>>,
     ) {
-        let active_editor = active_inline_edit
+        let guard = active_inline_edit
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let Some(active_editor) = active_editor else {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active_editor) = guard.as_ref() else {
             return;
         };
 
         if active_editor.input.was_deleted() {
+            drop(guard);
             *active_inline_edit
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -689,7 +707,10 @@ impl ResultTableWidget {
         let input_y = y + 1;
         let input_w = (w - 2).max(24);
         let input_h = (h - 2).max(24);
+        // Clone only the lightweight FLTK widget handle, then drop the lock
+        // before calling resize/redraw to minimize lock hold time.
         let mut input = active_editor.input.clone();
+        drop(guard);
         input.resize(input_x, input_y, input_w, input_h);
         input.redraw();
     }
@@ -1045,6 +1066,15 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let edit_session_for_draw = edit_session.clone();
 
+        // Page-level cache for edit state: populated once per StartPage,
+        // looked up per Cell.  Captured as a plain owned value since the
+        // draw_cell closure is FnMut (no interior mutability needed).
+        let mut page_edit_cache = DrawPageEditCache {
+            active: false,
+            start_row: 0,
+            cell_states: Vec::new(),
+        };
+
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
             let normal_font = font_settings_for_draw.normal_font();
             let bold_font = font_settings_for_draw.bold_font();
@@ -1052,6 +1082,48 @@ impl ResultTableWidget {
             match ctx {
                 TableContext::StartPage => {
                     draw::set_font(normal_font, font_size);
+
+                    // Pre-compute edit states for all visible cells on this page.
+                    page_edit_cache.active = false;
+                    page_edit_cache.cell_states.clear();
+
+                    let total_rows = table_for_draw.rows().max(0) as usize;
+                    let total_cols = table_for_draw.cols().max(0) as usize;
+                    if total_rows == 0 || total_cols == 0 {
+                        return;
+                    }
+                    let start_row = (table_for_draw.row_position().max(0) as usize).min(total_rows);
+                    let table_h = table_for_draw.h();
+                    let row_h = table_for_draw.row_height(start_row as i32).max(1);
+                    let visible_row_count =
+                        ((table_h / row_h) as usize + 2).min(total_rows - start_row);
+                    let end_row = start_row + visible_row_count;
+
+                    page_edit_cache.start_row = start_row;
+
+                    if let Ok(session_guard) = edit_session_for_draw.try_lock() {
+                        if let Some(session) = session_guard.as_ref() {
+                            page_edit_cache.active = true;
+                            if let Ok(data) = full_data_for_draw.try_lock() {
+                                page_edit_cache.cell_states.reserve(visible_row_count);
+                                for row_idx in start_row..end_row {
+                                    let mut row_states = Vec::with_capacity(total_cols);
+                                    if let Some(row_data) = data.get(row_idx) {
+                                        for col_idx in 0..total_cols {
+                                            row_states.push(
+                                                Self::cell_edit_state_for_draw(
+                                                    session, row_idx, col_idx, row_data,
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        row_states.resize(total_cols, (false, false, false));
+                                    }
+                                    page_edit_cache.cell_states.push(row_states);
+                                }
+                            }
+                        }
+                    }
                 }
                 TableContext::ColHeader => {
                     draw::push_clip(x, y, w, h);
@@ -1172,15 +1244,18 @@ impl ResultTableWidget {
                     {
                         if let Ok(data) = full_data_for_draw.try_lock() {
                             if let Some(row_data) = data.get(row_idx) {
-                                if let Ok(session_guard) = edit_session_for_draw.try_lock() {
-                                    if let Some(session) = session_guard.as_ref() {
-                                        (
-                                            is_edited_cell,
-                                            is_explicit_null_cell,
-                                            is_original_null_cell,
-                                        ) = Self::cell_edit_state_for_draw(
-                                            session, row_idx, col_idx, row_data,
-                                        );
+                                // Look up pre-computed edit state from the page cache
+                                // instead of locking edit_session per cell.
+                                if page_edit_cache.active && row_idx >= page_edit_cache.start_row {
+                                    let row_offset = row_idx - page_edit_cache.start_row;
+                                    if let Some(row_cache) = page_edit_cache.cell_states.get(row_offset) {
+                                        if let Some(&state) = row_cache.get(col_idx) {
+                                            (
+                                                is_edited_cell,
+                                                is_explicit_null_cell,
+                                                is_original_null_cell,
+                                            ) = state;
+                                        }
                                     }
                                 }
                                 draw_cell_contents(
@@ -1306,11 +1381,21 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
-                    let is_dragging = drag_state_for_handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_dragging;
+                    let (is_dragging, mouse_unchanged) = {
+                        let state = drag_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mx = app::event_x();
+                        let my = app::event_y();
+                        (
+                            state.is_dragging,
+                            state.last_mouse_x == mx && state.last_mouse_y == my,
+                        )
+                    };
                     if is_dragging {
+                        if mouse_unchanged {
+                            return true;
+                        }
                         if let Some((row, col)) =
                             Self::get_cell_at_mouse_for_drag(&table_for_handle)
                         {
@@ -1321,6 +1406,9 @@ impl ResultTableWidget {
                             let r2 = state.start_row.max(row);
                             let c1 = state.start_col.min(col);
                             let c2 = state.start_col.max(col);
+
+                            state.last_mouse_x = app::event_x();
+                            state.last_mouse_y = app::event_y();
 
                             if state.last_row == row && state.last_col == col {
                                 return true;
@@ -3953,7 +4041,7 @@ impl ResultTableWidget {
             }
         }
 
-        self.table.redraw();
+        // Redraw is already performed by sync_table_viewport_state() above.
         Ok("Inserted a new staged row.".to_string())
     }
 
