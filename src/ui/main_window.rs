@@ -131,6 +131,7 @@ pub struct AppState {
     status_animation_frame: usize,
     schema_sender: Option<std::sync::mpsc::Sender<SchemaUpdate>>,
     file_sender: Option<std::sync::mpsc::Sender<FileActionResult>>,
+    schema_refresh_in_progress: Arc<Mutex<bool>>,
 }
 
 fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, visible: bool) {
@@ -1341,6 +1342,7 @@ impl MainWindow {
             status_animation_frame: 0,
             schema_sender: None,
             file_sender: None,
+            schema_refresh_in_progress: Arc::new(Mutex::new(false)),
         }));
 
         {
@@ -2250,15 +2252,21 @@ impl MainWindow {
         state: &mut AppState,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
     ) {
+        if !try_set_mutex_flag(&state.schema_refresh_in_progress) {
+            return;
+        }
+
         state.object_browser.refresh();
         let schema_sender = schema_sender.clone();
         let connection = state.connection.clone();
+        let schema_refresh_guard = state.schema_refresh_in_progress.clone();
         thread::spawn(move || {
             if let Some(update) = MainWindow::load_schema_update_for_current_connection(&connection)
             {
                 let _ = schema_sender.send(update);
                 app::awake();
             }
+            clear_mutex_flag(&schema_refresh_guard);
         });
     }
 
@@ -3630,8 +3638,11 @@ impl MainWindow {
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
         let schema_sender_for_browser_status = schema_sender.clone();
-        let schema_refresh_in_progress = Arc::new(Mutex::new(false));
-        let schema_refresh_guard_for_browser_status = schema_refresh_in_progress.clone();
+        let schema_refresh_guard_for_browser_status = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .schema_refresh_in_progress
+            .clone();
         object_browser.set_status_callback(move |message| {
             let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
                 return;

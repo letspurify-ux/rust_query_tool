@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use oracle::Connection;
@@ -46,6 +47,7 @@ enum ColumnLoadWorkerMessage {
 
 struct ColumnLoadWorkerPool {
     worker_senders: Vec<mpsc::Sender<ColumnLoadWorkerMessage>>,
+    worker_handles: Mutex<Vec<JoinHandle<()>>>,
     next_worker: AtomicUsize,
 }
 
@@ -64,6 +66,23 @@ impl ColumnLoadWorkerPool {
     fn shutdown(&self) {
         for sender in &self.worker_senders {
             let _ = sender.send(ColumnLoadWorkerMessage::Shutdown);
+        }
+
+        let handles = {
+            let mut guard = match self.worker_handles.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                crate::utils::logging::log_error(
+                    "sql_editor::intellisense::column_loader",
+                    &format!("column worker join failed: {:?}", err),
+                );
+            }
         }
     }
 }
@@ -174,6 +193,7 @@ impl SqlEditorWidget {
 
     fn build_column_load_worker_pool() -> ColumnLoadWorkerPool {
         let mut worker_senders = Vec::new();
+        let mut worker_handles = Vec::new();
 
         for idx in 0..COLUMN_LOAD_WORKER_COUNT {
             let (sender, receiver) = mpsc::channel::<ColumnLoadWorkerMessage>();
@@ -190,18 +210,23 @@ impl SqlEditorWidget {
                     }
                 });
 
-            if spawn_result.is_ok() {
-                worker_senders.push(sender);
-            } else if let Err(err) = spawn_result {
-                crate::utils::logging::log_error(
-                    "sql_editor::intellisense::column_loader",
-                    &format!("failed to spawn column worker {idx}: {err}"),
-                );
+            match spawn_result {
+                Ok(handle) => {
+                    worker_senders.push(sender);
+                    worker_handles.push(handle);
+                }
+                Err(err) => {
+                    crate::utils::logging::log_error(
+                        "sql_editor::intellisense::column_loader",
+                        &format!("failed to spawn column worker {idx}: {err}"),
+                    );
+                }
             }
         }
 
         ColumnLoadWorkerPool {
             worker_senders,
+            worker_handles: Mutex::new(worker_handles),
             next_worker: AtomicUsize::new(0),
         }
     }

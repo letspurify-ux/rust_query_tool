@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, TableColumnDetail};
@@ -739,6 +740,7 @@ pub struct SqlEditorWidget {
     highlight_revision: Arc<AtomicU64>,
     highlight_generation: Arc<AtomicU64>,
     highlight_worker_stopped: Arc<AtomicBool>,
+    highlight_worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl SqlEditorWidget {
@@ -1011,6 +1013,7 @@ impl SqlEditorWidget {
         let highlight_revision = Arc::new(AtomicU64::new(0));
         let highlight_generation = Arc::new(AtomicU64::new(0));
         let highlight_worker_stopped = Arc::new(AtomicBool::new(false));
+        let highlight_worker_handle = Arc::new(Mutex::new(None::<JoinHandle<()>>));
 
         let mut widget = Self {
             group,
@@ -1049,6 +1052,7 @@ impl SqlEditorWidget {
             highlight_revision: highlight_revision.clone(),
             highlight_generation: highlight_generation.clone(),
             highlight_worker_stopped: highlight_worker_stopped.clone(),
+            highlight_worker_handle: highlight_worker_handle.clone(),
         };
 
         widget.setup_intellisense();
@@ -1064,6 +1068,7 @@ impl SqlEditorWidget {
             highlight_result_sender,
             widget.highlighter.clone(),
             highlight_worker_stopped,
+            highlight_worker_handle,
         );
 
         widget
@@ -1781,6 +1786,7 @@ impl SqlEditorWidget {
         highlight_result_sender: mpsc::Sender<HighlightResult>,
         highlighter: Arc<Mutex<SqlHighlighter>>,
         highlight_worker_stopped: Arc<AtomicBool>,
+        highlight_worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     ) {
         let worker_stopped_for_thread = highlight_worker_stopped.clone();
         let spawn_result = thread::Builder::new()
@@ -1828,12 +1834,20 @@ impl SqlEditorWidget {
                 app::awake();
             });
 
-        if let Err(err) = spawn_result {
-            highlight_worker_stopped.store(true, Ordering::Relaxed);
-            crate::utils::logging::log_error(
-                "sql_editor::highlight_worker",
-                &format!("failed to spawn highlight worker: {}", err),
-            );
+        match spawn_result {
+            Ok(handle) => {
+                let mut guard = highlight_worker_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *guard = Some(handle);
+            }
+            Err(err) => {
+                highlight_worker_stopped.store(true, Ordering::Relaxed);
+                crate::utils::logging::log_error(
+                    "sql_editor::highlight_worker",
+                    &format!("failed to spawn highlight worker: {}", err),
+                );
+            }
         }
     }
 
@@ -2539,6 +2553,22 @@ impl SqlEditorWidget {
             queue_state.pending_request = None;
         }
         queue_signal.notify_all();
+
+        let handle = {
+            let mut guard = self
+                .highlight_worker_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            if let Err(err) = handle.join() {
+                crate::utils::logging::log_error(
+                    "sql_editor::highlight_worker",
+                    &format!("highlight worker join failed: {:?}", err),
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
