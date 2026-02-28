@@ -2613,6 +2613,7 @@ impl SqlEditorWidget {
     fn enqueue_highlight_request(&self, text: String) {
         let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let text_len = text.len();
 
         let task = HighlightWorkerTask {
             editor_id: self.highlight_editor_id,
@@ -2630,6 +2631,7 @@ impl SqlEditorWidget {
                 "sql_editor::highlight_worker",
                 "highlight worker unavailable; failed to enqueue request",
             );
+            self.enqueue_default_highlight_result(revision, generation, text_len);
             return;
         };
 
@@ -2650,6 +2652,7 @@ impl SqlEditorWidget {
                     "sql_editor::highlight_worker",
                     &format!("failed to enqueue highlight request after retry: {}", err),
                 );
+                self.enqueue_default_highlight_result(revision, generation, text_len);
             }
         } else {
             Self::clear_cached_highlight_worker_sender();
@@ -2657,6 +2660,18 @@ impl SqlEditorWidget {
                 "sql_editor::highlight_worker",
                 "highlight worker unavailable after retry; request dropped",
             );
+            self.enqueue_default_highlight_result(revision, generation, text_len);
+        }
+    }
+
+    fn enqueue_default_highlight_result(&self, revision: u64, generation: u64, text_len: usize) {
+        let fallback = HighlightResult {
+            revision,
+            generation,
+            style_text: Self::default_style_text_for_len(text_len),
+        };
+        if self.highlight_result_sender.send(fallback).is_ok() {
+            app::awake();
         }
     }
 
