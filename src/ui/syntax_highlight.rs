@@ -317,6 +317,10 @@ impl SqlHighlighter {
         self.generate_styles_with_state(text, LexerState::Normal).0
     }
 
+    pub fn generate_styles_for_text(&self, text: &str) -> String {
+        self.generate_styles(text)
+    }
+
     /// State-aware version of `generate_styles`.
     /// Accepts the lexer state at the start of `text` and returns both the
     /// styled output and the lexer state at the end.

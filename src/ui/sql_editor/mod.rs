@@ -13,7 +13,8 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -22,9 +23,10 @@ use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{flush_history_writer_with_timeout, QueryHistoryDialog};
+#[cfg(test)]
+use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
-    create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_DEFAULT,
-    STYLE_STRING,
+    create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_STRING,
 };
 use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistory, QueryHistoryEntry};
@@ -329,7 +331,12 @@ impl WordUndoRedoState {
 
         let removed_bytes: usize = self.deltas[self.index..]
             .iter()
-            .map(|delta| delta.deleted_text.len().saturating_add(delta.inserted_text.len()))
+            .map(|delta| {
+                delta
+                    .deleted_text
+                    .len()
+                    .saturating_add(delta.inserted_text.len())
+            })
             .sum();
         self.deltas.truncate(self.index);
         self.history_total_bytes = self.history_total_bytes.saturating_sub(removed_bytes);
@@ -478,9 +485,12 @@ impl WordUndoRedoState {
             after_cursor,
             group_id,
         };
-        self.history_total_bytes = self
-            .history_total_bytes
-            .saturating_add(delta.deleted_text.len().saturating_add(delta.inserted_text.len()));
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
         self.deltas.push(delta);
         self.index = self.deltas.len();
         self.active_group = Some((edit_group, group_id));
@@ -672,6 +682,26 @@ enum UiActionResult {
 }
 
 #[derive(Clone)]
+struct HighlightRequest {
+    revision: u64,
+    generation: u64,
+    text: String,
+}
+
+#[derive(Clone)]
+struct HighlightResult {
+    revision: u64,
+    generation: u64,
+    style_text: String,
+}
+
+#[derive(Default)]
+struct HighlightQueueState {
+    pending_request: Option<HighlightRequest>,
+    shutdown: bool,
+}
+
+#[derive(Clone)]
 pub struct SqlEditorWidget {
     group: Flex,
     editor: TextEditor,
@@ -705,6 +735,10 @@ pub struct SqlEditorWidget {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
     last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
+    highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
+    highlight_revision: Arc<AtomicU64>,
+    highlight_generation: Arc<AtomicU64>,
+    highlight_worker_stopped: Arc<AtomicBool>,
 }
 
 impl SqlEditorWidget {
@@ -947,6 +981,8 @@ impl SqlEditorWidget {
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
         let (column_sender, column_receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
+        let (highlight_result_sender, highlight_result_receiver) =
+            mpsc::channel::<HighlightResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -970,6 +1006,11 @@ impl SqlEditorWidget {
         let keyup_debounce_generation = Arc::new(Mutex::new(0_u64));
         let keyup_debounce_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
         let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
+        let highlight_request_state =
+            Arc::new((Mutex::new(HighlightQueueState::default()), Condvar::new()));
+        let highlight_revision = Arc::new(AtomicU64::new(0));
+        let highlight_generation = Arc::new(AtomicU64::new(0));
+        let highlight_worker_stopped = Arc::new(AtomicBool::new(false));
 
         let mut widget = Self {
             group,
@@ -1004,6 +1045,10 @@ impl SqlEditorWidget {
             keyup_debounce_generation,
             keyup_debounce_handle,
             last_explain_plan,
+            highlight_request_state: highlight_request_state.clone(),
+            highlight_revision: highlight_revision.clone(),
+            highlight_generation: highlight_generation.clone(),
+            highlight_worker_stopped: highlight_worker_stopped.clone(),
         };
 
         widget.setup_intellisense();
@@ -1013,6 +1058,13 @@ impl SqlEditorWidget {
         widget.setup_progress_handler(progress_receiver, progress_callback, query_running);
         widget.setup_column_loader(column_receiver);
         widget.setup_ui_action_handler(ui_action_receiver);
+        widget.setup_highlight_worker(highlight_result_receiver);
+        SqlEditorWidget::spawn_highlight_worker(
+            highlight_request_state,
+            highlight_result_sender,
+            widget.highlighter.clone(),
+            highlight_worker_stopped,
+        );
 
         widget
     }
@@ -1255,8 +1307,9 @@ impl SqlEditorWidget {
         let intellisense_data = self.intellisense_data.clone();
         let editor = self.editor.clone();
         let buffer = self.buffer.clone();
-        let style_buffer = self.style_buffer.clone();
         let highlighter = self.highlighter.clone();
+        let highlight_generation = self.highlight_generation.clone();
+        let widget = self.clone();
         let intellisense_popup = self.intellisense_popup.clone();
         let completion_range = self.completion_range.clone();
         let column_sender = self.column_sender.clone();
@@ -1277,8 +1330,9 @@ impl SqlEditorWidget {
             intellisense_data: Arc<Mutex<IntellisenseData>>,
             editor: TextEditor,
             buffer: TextBuffer,
-            style_buffer: TextBuffer,
             highlighter: Arc<Mutex<SqlHighlighter>>,
+            highlight_generation: Arc<AtomicU64>,
+            widget: SqlEditorWidget,
             intellisense_popup: Arc<Mutex<IntellisensePopup>>,
             completion_range: Arc<Mutex<Option<(usize, usize)>>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -1338,6 +1392,7 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1363,18 +1418,8 @@ impl SqlEditorWidget {
                 };
 
                 if should_refresh_highlighting {
-                    let cursor_pos = editor.insert_position().max(0) as usize;
-                    let viewport = editor_viewport_range(&editor, &buffer);
-                    highlighter
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .highlight_buffer_window_viewport(
-                            &buffer,
-                            &mut style_buffer.clone(),
-                            cursor_pos,
-                            None,
-                            viewport,
-                        );
+                    highlight_generation.fetch_add(1, Ordering::Relaxed);
+                    widget.refresh_highlighting();
                 }
             }
 
@@ -1453,8 +1498,9 @@ impl SqlEditorWidget {
                     intellisense_data.clone(),
                     editor.clone(),
                     buffer.clone(),
-                    style_buffer.clone(),
                     highlighter.clone(),
+                    highlight_generation.clone(),
+                    widget.clone(),
                     intellisense_popup.clone(),
                     completion_range.clone(),
                     column_sender.clone(),
@@ -1471,8 +1517,9 @@ impl SqlEditorWidget {
             intellisense_data,
             editor,
             buffer,
-            style_buffer,
             highlighter,
+            highlight_generation,
+            widget,
             intellisense_popup,
             completion_range,
             column_sender,
@@ -1493,6 +1540,7 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
         ) {
             if widget.group.was_deleted() {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1645,6 +1693,7 @@ impl SqlEditorWidget {
             }
 
             if disconnected {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -1657,99 +1706,135 @@ impl SqlEditorWidget {
     }
 
     fn setup_syntax_highlighting(&self) {
-        let highlighter = self.highlighter.clone();
-        let mut style_buffer = self.style_buffer.clone();
         let mut buffer = self.buffer.clone();
-        let editor_for_viewport = self.editor.clone();
+        let widget = self.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
-        buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
+        buffer.add_modify_callback2(move |buf, _pos, _ins, _del, _restyled, _deleted_text| {
             intellisense_parse_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-
-            // Synchronize style_buffer length with text buffer
-            // highlight_buffer_window will reset if lengths differ, but we do incremental
-            // updates here to maintain consistency for small edits
-            let text_len = buf.length();
-            let style_len = style_buffer.length();
-
-            if del > 0 && ins == 0 {
-                // Pure deletion
-                if pos >= 0 && pos < style_len {
-                    let del_end = (pos + del).min(style_len);
-                    if pos < del_end {
-                        style_buffer.remove(pos, del_end);
-                    }
-                }
-            } else if ins > 0 && del == 0 {
-                // Pure insertion
-                if pos >= 0 {
-                    let insert_pos = pos.min(style_buffer.length());
-                    let insert_styles: String = std::iter::repeat(STYLE_DEFAULT)
-                        .take(ins as usize)
-                        .collect();
-                    style_buffer.insert(insert_pos, &insert_styles);
-                }
-            } else if ins > 0 && del > 0 {
-                // Replacement: remove then insert
-                if pos >= 0 && pos < style_len {
-                    let del_end = (pos + del).min(style_len);
-                    if pos < del_end {
-                        style_buffer.remove(pos, del_end);
-                    }
-                }
-                if pos >= 0 {
-                    let insert_pos = pos.min(style_buffer.length());
-                    let insert_styles: String = std::iter::repeat(STYLE_DEFAULT)
-                        .take(ins as usize)
-                        .collect();
-                    style_buffer.insert(insert_pos, &insert_styles);
-                }
-            }
-
-            // Final length check - if still mismatched, let highlight_buffer_window handle it
-            // This provides a safety net for edge cases
-            let final_style_len = style_buffer.length();
-            if final_style_len != text_len {
-                // Length mismatch detected - highlight_buffer_window will reset
-                // This can happen with complex multi-byte character operations
-            }
-
-            let text_len = buf.length().max(0) as usize;
-            let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
-            let mut edited_range = compute_edited_range(pos, ins, del, text_len);
-            let viewport = editor_viewport_range(&editor_for_viewport, buf);
-
-            if needs_full_rehighlight(buf, pos, ins, deleted_text) {
-                // Bounded scan around the edit instead of the entire buffer.
-                // The state-aware highlighter will probe backward to determine
-                // correct lexer state (in-comment, in-string, etc.).
-                let edit_pos = pos.max(0) as usize;
-                let scan_start = edit_pos.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
-                let scan_end = edit_pos
-                    .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
-                    .min(text_len);
-                edited_range = Some((scan_start, scan_end));
-            } else if let Some((start, end)) = edited_range {
-                let inserted_text = inserted_text(buf, pos, ins);
-                if !has_stateful_sql_delimiter(&inserted_text) {
-                    edited_range = Some(expand_connected_word_range(buf, start, end));
-                }
-            }
-
-            highlighter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .highlight_buffer_window_viewport(
-                    buf,
-                    &mut style_buffer,
-                    cursor_pos,
-                    edited_range,
-                    viewport,
-                );
+            widget.enqueue_highlight_request(buf.text());
         });
         self.refresh_highlighting();
+    }
+
+    fn setup_highlight_worker(&self, highlight_result_receiver: mpsc::Receiver<HighlightResult>) {
+        let receiver: Arc<Mutex<mpsc::Receiver<HighlightResult>>> =
+            Arc::new(Mutex::new(highlight_result_receiver));
+        let widget = self.clone();
+
+        fn schedule_poll(
+            receiver: Arc<Mutex<mpsc::Receiver<HighlightResult>>>,
+            widget: SqlEditorWidget,
+        ) {
+            if widget.group.was_deleted() {
+                widget.request_highlight_worker_shutdown();
+                return;
+            }
+
+            let mut disconnected = false;
+            let mut latest_result: Option<HighlightResult> = None;
+            {
+                let r = receiver
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                loop {
+                    match r.try_recv() {
+                        Ok(result) => latest_result = Some(result),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if disconnected {
+                widget.request_highlight_worker_shutdown();
+                return;
+            }
+
+            if let Some(result) = latest_result {
+                let current_revision = widget.highlight_revision.load(Ordering::Relaxed);
+                let current_generation = widget.highlight_generation.load(Ordering::Relaxed);
+                if result.revision == current_revision && result.generation == current_generation {
+                    let mut style_buffer = widget.style_buffer.clone();
+                    style_buffer.set_text(&result.style_text);
+                    let mut editor = widget.editor.clone();
+                    editor.redraw();
+                    app::redraw();
+                }
+            }
+
+            app::add_timeout3(PROGRESS_POLL_INTERVAL_SECONDS, move |_| {
+                schedule_poll(receiver.clone(), widget.clone());
+            });
+        }
+
+        schedule_poll(receiver, widget);
+    }
+
+    fn spawn_highlight_worker(
+        highlight_request_state: Arc<(Mutex<HighlightQueueState>, Condvar)>,
+        highlight_result_sender: mpsc::Sender<HighlightResult>,
+        highlighter: Arc<Mutex<SqlHighlighter>>,
+        highlight_worker_stopped: Arc<AtomicBool>,
+    ) {
+        let worker_stopped_for_thread = highlight_worker_stopped.clone();
+        let spawn_result = thread::Builder::new()
+            .name("sql-highlighter-worker".to_string())
+            .spawn(move || loop {
+                let request = {
+                    let (queue_lock, queue_signal) = &*highlight_request_state;
+                    let mut queue_state = queue_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !queue_state.shutdown && queue_state.pending_request.is_none() {
+                        queue_state = queue_signal
+                            .wait(queue_state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if queue_state.shutdown {
+                        worker_stopped_for_thread.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let Some(request) = queue_state.pending_request.take() else {
+                        continue;
+                    };
+                    request
+                };
+
+                let style_text = {
+                    let guard = highlighter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.generate_styles_for_text(&request.text)
+                };
+
+                if highlight_result_sender
+                    .send(HighlightResult {
+                        revision: request.revision,
+                        generation: request.generation,
+                        style_text,
+                    })
+                    .is_err()
+                {
+                    worker_stopped_for_thread.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                app::awake();
+            });
+
+        if let Err(err) = spawn_result {
+            highlight_worker_stopped.store(true, Ordering::Relaxed);
+            crate::utils::logging::log_error(
+                "sql_editor::highlight_worker",
+                &format!("failed to spawn highlight worker: {}", err),
+            );
+        }
     }
 
     fn setup_viewport_highlight_poll(&self) {
@@ -1765,6 +1850,7 @@ impl SqlEditorWidget {
             last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32, i32)>>>,
         ) {
             if widget.group.was_deleted() || editor.was_deleted() {
+                widget.request_highlight_worker_shutdown();
                 return;
             }
 
@@ -2282,6 +2368,9 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(HighlightData::new());
+        self.highlight_generation.fetch_add(1, Ordering::Relaxed);
+
+        self.request_highlight_worker_shutdown();
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");
@@ -2356,6 +2445,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(data);
+        self.highlight_generation.fetch_add(1, Ordering::Relaxed);
         self.refresh_highlighting();
     }
 
@@ -2409,26 +2499,51 @@ impl SqlEditorWidget {
         self.editor.redraw();
     }
 
+    fn enqueue_highlight_request(&self, text: String) {
+        if self.highlight_worker_stopped.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let request = HighlightRequest {
+            revision,
+            generation,
+            text,
+        };
+        let (queue_lock, queue_signal) = &*self.highlight_request_state;
+        {
+            let mut queue_state = queue_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue_state.shutdown {
+                self.highlight_worker_stopped.store(true, Ordering::Relaxed);
+                return;
+            }
+            queue_state.pending_request = Some(request);
+        }
+        queue_signal.notify_one();
+    }
+
+    fn request_highlight_worker_shutdown(&self) {
+        if self.highlight_worker_stopped.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        let (queue_lock, queue_signal) = &*self.highlight_request_state;
+        {
+            let mut queue_state = queue_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue_state.shutdown = true;
+            queue_state.pending_request = None;
+        }
+        queue_signal.notify_all();
+    }
+
     #[allow(dead_code)]
     pub fn refresh_highlighting(&self) {
-        let viewport = editor_viewport_range(&self.editor, &self.buffer);
-        self.highlighter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .highlight_buffer_window_viewport(
-                &self.buffer,
-                &mut self.style_buffer.clone(),
-                self.editor.insert_position().max(0) as usize,
-                None,
-                viewport,
-            );
-        let mut editor = self.editor.clone();
-        if let Some((start, end)) = viewport {
-            let start_i32 = start.min(i32::MAX as usize) as i32;
-            let end_i32 = end.min(i32::MAX as usize) as i32;
-            editor.redisplay_range(start_i32, end_i32);
-        }
-        editor.redraw();
+        self.enqueue_highlight_request(self.buffer.text());
     }
 
     #[allow(dead_code)]
@@ -2832,7 +2947,9 @@ fn editor_viewport_range(editor: &TextEditor, buffer: &TextBuffer) -> Option<(us
 
     // FLTK scroll_row is 1-based in practice; normalize to 0-based line count.
     let top_row = editor.scroll_row().max(1).saturating_sub(1);
-    let start_pos = editor.skip_lines(0, top_row, true).clamp(0, buffer.length());
+    let start_pos = editor
+        .skip_lines(0, top_row, true)
+        .clamp(0, buffer.length());
     let visible_rows = (h / text_size).max(1).saturating_add(2);
     let end_pos = editor
         .skip_lines(start_pos, visible_rows, true)
@@ -3246,14 +3363,8 @@ mod execution_state_tests {
     fn record_edit_does_not_merge_word_edits_across_lines() {
         let mut state = WordUndoRedoState::new("abc\ndef".to_string());
 
-        state.record_edit(
-            &build_edit(3, "", "x"),
-            classify_edit_group(1, 0, "x", ""),
-        );
-        state.record_edit(
-            &build_edit(8, "", "y"),
-            classify_edit_group(1, 0, "y", ""),
-        );
+        state.record_edit(&build_edit(3, "", "x"), classify_edit_group(1, 0, "x", ""));
+        state.record_edit(&build_edit(8, "", "y"), classify_edit_group(1, 0, "y", ""));
 
         assert_eq!(
             state.history_texts(),
@@ -3270,14 +3381,8 @@ mod execution_state_tests {
     fn record_edit_does_not_merge_word_edits_for_different_words_same_line() {
         let mut state = WordUndoRedoState::new("alpha beta".to_string());
 
-        state.record_edit(
-            &build_edit(5, "", "x"),
-            classify_edit_group(1, 0, "x", ""),
-        );
-        state.record_edit(
-            &build_edit(11, "", "y"),
-            classify_edit_group(1, 0, "y", ""),
-        );
+        state.record_edit(&build_edit(5, "", "x"), classify_edit_group(1, 0, "x", ""));
+        state.record_edit(&build_edit(11, "", "y"), classify_edit_group(1, 0, "y", ""));
 
         assert_eq!(
             state.history_texts(),
