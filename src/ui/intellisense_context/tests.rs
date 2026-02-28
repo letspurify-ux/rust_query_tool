@@ -6,22 +6,25 @@ fn tokenize(sql: &str) -> Vec<SqlToken> {
 }
 
 /// Helper: tokenize SQL up to `|` marker (cursor position).
-/// Returns (tokens_before_cursor, full_tokens).
-fn split_at_cursor(sql: &str) -> (Vec<SqlToken>, Vec<SqlToken>) {
+/// Returns (full_tokens, cursor_token_len).
+fn split_at_cursor(sql: &str) -> (Vec<SqlToken>, usize) {
+    use crate::ui::sql_editor::query_text::tokenize_sql_spanned;
+
     let cursor_pos = sql
         .find('|')
         .expect("SQL must contain '|' as cursor marker");
     let before = &sql[..cursor_pos];
     let after = &sql[cursor_pos + 1..];
     let full = format!("{}{}", before, after);
-    let before_tokens = tokenize(before);
-    let full_tokens = tokenize(&full);
-    (before_tokens, full_tokens)
+    let token_spans = tokenize_sql_spanned(&full);
+    let cursor_token_len = token_spans.partition_point(|span| span.end <= cursor_pos);
+    let full_tokens = token_spans.into_iter().map(|span| span.token).collect();
+    (full_tokens, cursor_token_len)
 }
 
 fn analyze(sql: &str) -> CursorContext {
-    let (before, full) = split_at_cursor(sql);
-    analyze_cursor_context(&before, &full)
+    let (full, cursor_token_len) = split_at_cursor(sql);
+    analyze_cursor_context(&full, cursor_token_len)
 }
 
 fn table_names(ctx: &CursorContext) -> Vec<String> {
@@ -1253,6 +1256,25 @@ fn extract_nested_function_with_alias() {
     assert_eq!(cols, vec!["result"]);
 }
 
+#[test]
+fn extract_table_function_columns_from_xmltable_columns_clause() {
+    let tokens = tokenize(
+        "'/root/dept' PASSING t.payload COLUMNS \
+         deptno NUMBER PATH '@deptno', \
+         name VARCHAR2(30) PATH 'name/text()', \
+         loc VARCHAR2(30) PATH 'loc/text()'",
+    );
+    let cols = extract_table_function_columns(&tokens);
+    assert_eq!(cols, vec!["deptno", "name", "loc"]);
+}
+
+#[test]
+fn extract_table_function_columns_skips_select_subquery_bodies() {
+    let tokens = tokenize("SELECT id, XMLTABLE('/x' PASSING t.payload COLUMNS c NUMBER PATH '/x') FROM t");
+    let cols = extract_table_function_columns(&tokens);
+    assert!(cols.is_empty());
+}
+
 // ─── CTE body token capture tests ───────────────────────────────────────
 
 #[test]
@@ -1266,8 +1288,11 @@ fn cte_body_tokens_captured() {
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case("emp_base"))
         .unwrap();
-    assert!(!cte.body_tokens.is_empty());
-    let cols = extract_select_list_columns(&cte.body_tokens);
+    assert!(!cte.body_range.is_empty());
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        cte.body_range,
+    ));
     assert_eq!(cols, vec!["empno", "ename", "deptno"]);
 }
 
@@ -1299,7 +1324,10 @@ fn cte_chain_columns_inferred() {
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case("dept_agg"))
         .unwrap();
-    let cols = extract_select_list_columns(&dept_agg.body_tokens);
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        dept_agg.body_range,
+    ));
     assert_eq!(cols, vec!["deptno", "emp_cnt", "avg_sal"]);
 }
 
@@ -1319,7 +1347,10 @@ fn cte_emp_base_columns_inferred() {
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case("emp_base"))
         .unwrap();
-    let cols = extract_select_list_columns(&emp_base.body_tokens);
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        emp_base.body_range,
+    ));
     assert_eq!(cols, vec!["empno", "ename", "deptno", "sal", "hiredate"]);
 }
 
@@ -1334,7 +1365,10 @@ fn subquery_alias_columns_captured() {
         .iter()
         .find(|s| s.alias.eq_ignore_ascii_case("sub"))
         .unwrap();
-    let cols = extract_select_list_columns(&subq.body_tokens);
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        subq.body_range,
+    ));
     assert_eq!(cols, vec!["id", "name", "age"]);
 }
 
@@ -1343,7 +1377,10 @@ fn subquery_without_alias_columns_captured() {
     let ctx = analyze("SELECT | FROM (SELECT id, name FROM users)");
     assert_eq!(ctx.subqueries.len(), 1);
     let subq = &ctx.subqueries[0];
-    let cols = extract_select_list_columns(&subq.body_tokens);
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        subq.body_range,
+    ));
     assert_eq!(cols, vec!["id", "name"]);
 }
 
@@ -1357,7 +1394,10 @@ fn subquery_alias_with_expressions() {
         .iter()
         .find(|s| s.alias.eq_ignore_ascii_case("v"))
         .unwrap();
-    let cols = extract_select_list_columns(&subq.body_tokens);
+    let cols = extract_select_list_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        subq.body_range,
+    ));
     assert_eq!(cols, vec!["dept_id", "cnt", "max_sal"]);
 }
 

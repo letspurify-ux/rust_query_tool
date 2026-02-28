@@ -56,46 +56,6 @@ pub(crate) fn is_depth(depths: &[usize], idx: usize, depth: usize) -> bool {
     depth_at(depths, idx) == depth
 }
 
-/// Extracts tokens inside a parenthesized block beginning at `open_idx`.
-///
-/// Returns the inner tokens (excluding the opening and matching closing
-/// parentheses) and the index immediately after the closing token.
-/// If the block is unterminated, returns all remaining tokens and the final
-/// index.
-pub(crate) fn extract_parenthesized_tokens(
-    tokens: &[SqlToken],
-    open_idx: usize,
-) -> Option<(Vec<SqlToken>, usize)> {
-    match tokens.get(open_idx) {
-        Some(SqlToken::Symbol(sym)) if sym == "(" => {}
-        _ => return None,
-    }
-
-    let mut depth = 1usize;
-    let mut idx = open_idx + 1;
-    let mut inner: Vec<SqlToken> = Vec::new();
-
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            SqlToken::Symbol(sym) if sym == "(" => {
-                depth += 1;
-                inner.push(tokens[idx].clone());
-            }
-            SqlToken::Symbol(sym) if sym == ")" => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some((inner, idx + 1));
-                }
-                inner.push(tokens[idx].clone());
-            }
-            _ => inner.push(tokens[idx].clone()),
-        }
-        idx += 1;
-    }
-
-    Some((inner, idx))
-}
-
 /// Splits tokens by a top-level delimiter symbol (예: `,`) while ignoring nested
 /// parenthesis depth.
 ///

@@ -95,10 +95,8 @@ impl SqlEditorWidget {
     const INTELLISENSE_POPUP_WIDTH: i32 = 320;
     const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
 
-    fn is_insert_column_list_context(statement_text: &str, cursor_in_statement: usize) -> bool {
-        let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
-        let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
-
+    fn is_insert_column_list_context(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+        let cursor_token_len = cursor_token_len.min(tokens.len());
         let mut seen_insert = false;
         let mut seen_into = false;
         let mut seen_target = false;
@@ -106,8 +104,8 @@ impl SqlEditorWidget {
         let mut depth = 0usize;
         let mut column_list_depth: Option<usize> = None;
 
-        for span in &token_spans[..split_idx] {
-            match &span.token {
+        for token in &tokens[..cursor_token_len] {
+            match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
                     if word.eq_ignore_ascii_case("INSERT") {
@@ -166,12 +164,11 @@ impl SqlEditorWidget {
 
     fn classify_intellisense_context(
         deep_ctx: &intellisense_context::CursorContext,
-        statement_text: &str,
-        cursor_in_statement: usize,
+        tokens: &[SqlToken],
     ) -> SqlContext {
         let insert_column_list_context =
             matches!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause)
-                && Self::is_insert_column_list_context(statement_text, cursor_in_statement);
+                && Self::is_insert_column_list_context(tokens, deep_ctx.cursor_token_len);
 
         if deep_ctx.phase.is_table_context() && !insert_column_list_context {
             SqlContext::TableName
@@ -1549,34 +1546,38 @@ impl SqlEditorWidget {
                 .map(|entry| entry.context.clone())
         };
 
-        let deep_ctx = if let Some(context) = cached_context {
-            context
-        } else {
-            let full_token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
-            let split_idx =
-                full_token_spans.partition_point(|span| span.end <= cursor_in_statement);
-            let full_tokens: Vec<SqlToken> = full_token_spans
-                .iter()
-                .map(|span| span.token.clone())
-                .collect();
-            let before_tokens: Vec<SqlToken> = full_token_spans[..split_idx]
-                .iter()
-                .map(|span| span.token.clone())
-                .collect();
-            let parsed = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
-            *intellisense_parse_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(IntellisenseParseCacheEntry {
-                    statement_text: statement_text.clone(),
-                    cursor_in_statement,
-                    context: parsed.clone(),
-                });
-            parsed
-        };
+        let deep_ctx: Arc<intellisense_context::CursorContext> =
+            if let Some(context) = cached_context {
+                context
+            } else {
+                let full_token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
+                let mut split_idx = 0usize;
+                let mut full_tokens: Vec<SqlToken> = Vec::with_capacity(full_token_spans.len());
+                for span in full_token_spans {
+                    if span.end <= cursor_in_statement {
+                        split_idx = split_idx.saturating_add(1);
+                    }
+                    full_tokens.push(span.token);
+                }
+                let parsed = Arc::new(intellisense_context::analyze_cursor_context(
+                    &full_tokens,
+                    split_idx,
+                ));
+                *intellisense_parse_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(IntellisenseParseCacheEntry {
+                        statement_text: statement_text.clone(),
+                        cursor_in_statement,
+                        context: parsed.clone(),
+                    });
+                parsed
+            };
 
-        let context =
-            Self::classify_intellisense_context(&deep_ctx, &statement_text, cursor_in_statement);
+        let context = Self::classify_intellisense_context(
+            deep_ctx.as_ref(),
+            deep_ctx.statement_tokens.as_ref(),
+        );
 
         // Resolve column tables using deep context
         let column_tables = if let Some(ref q) = qualifier {
@@ -1600,69 +1601,81 @@ impl SqlEditorWidget {
             return;
         }
 
-        // Register CTE/subquery alias columns (text-based, with wildcard expansion
-        // from base table metadata when possible).
         let mut virtual_wildcard_dependencies: HashMap<String, Vec<String>> = HashMap::new();
-        let mut virtual_table_columns: HashMap<String, Vec<String>> = HashMap::new();
+        if include_columns {
+            // Register CTE/subquery alias columns only when column completion is needed.
+            let mut virtual_table_columns: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Register CTE columns
-        for cte in &deep_ctx.ctes {
-            let mut columns = if !cte.explicit_columns.is_empty() {
-                cte.explicit_columns.clone()
-            } else if !cte.body_tokens.is_empty() {
-                intellisense_context::extract_select_list_columns(&cte.body_tokens)
-            } else {
-                Vec::new()
-            };
-            if cte.explicit_columns.is_empty() && !cte.body_tokens.is_empty() {
+            // Register CTE columns.
+            for cte in &deep_ctx.ctes {
+                let body_tokens = intellisense_context::token_range_slice(
+                    deep_ctx.statement_tokens.as_ref(),
+                    cte.body_range,
+                );
+                let mut columns = if !cte.explicit_columns.is_empty() {
+                    cte.explicit_columns.clone()
+                } else if !cte.body_range.is_empty() {
+                    intellisense_context::extract_select_list_columns(body_tokens)
+                } else {
+                    Vec::new()
+                };
+                if cte.explicit_columns.is_empty() && !cte.body_range.is_empty() {
+                    let body_tables_in_scope =
+                        intellisense_context::collect_tables_in_statement(body_tokens);
+                    let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
+                        body_tokens,
+                        &body_tables_in_scope,
+                        intellisense_data,
+                        column_sender,
+                        connection,
+                    );
+                    if !wildcard_tables.is_empty() {
+                        virtual_wildcard_dependencies
+                            .insert(cte.name.to_uppercase(), wildcard_tables);
+                    }
+                    columns.extend(wildcard_columns);
+                }
+                Self::dedup_column_names_case_insensitive(&mut columns);
+                if !columns.is_empty() {
+                    virtual_table_columns.insert(cte.name.clone(), columns);
+                }
+            }
+
+            // Register subquery alias columns.
+            for subq in &deep_ctx.subqueries {
+                let body_tokens = intellisense_context::token_range_slice(
+                    deep_ctx.statement_tokens.as_ref(),
+                    subq.body_range,
+                );
+                let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+                if columns.is_empty() {
+                    columns = intellisense_context::extract_table_function_columns(body_tokens);
+                }
                 let body_tables_in_scope =
-                    intellisense_context::collect_tables_in_statement(&cte.body_tokens);
+                    intellisense_context::collect_tables_in_statement(body_tokens);
                 let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
-                    &cte.body_tokens,
+                    body_tokens,
                     &body_tables_in_scope,
                     intellisense_data,
                     column_sender,
                     connection,
                 );
                 if !wildcard_tables.is_empty() {
-                    virtual_wildcard_dependencies.insert(cte.name.to_uppercase(), wildcard_tables);
+                    virtual_wildcard_dependencies
+                        .insert(subq.alias.to_uppercase(), wildcard_tables);
                 }
                 columns.extend(wildcard_columns);
+                Self::dedup_column_names_case_insensitive(&mut columns);
+                if !columns.is_empty() {
+                    virtual_table_columns.insert(subq.alias.clone(), columns);
+                }
             }
-            Self::dedup_column_names_case_insensitive(&mut columns);
-            if !columns.is_empty() {
-                virtual_table_columns.insert(cte.name.clone(), columns);
-            }
-        }
+            intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .replace_virtual_table_columns(virtual_table_columns);
 
-        // Register subquery alias columns
-        for subq in &deep_ctx.subqueries {
-            let mut columns = intellisense_context::extract_select_list_columns(&subq.body_tokens);
-            let body_tables_in_scope =
-                intellisense_context::collect_tables_in_statement(&subq.body_tokens);
-            let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
-                &subq.body_tokens,
-                &body_tables_in_scope,
-                intellisense_data,
-                column_sender,
-                connection,
-            );
-            if !wildcard_tables.is_empty() {
-                virtual_wildcard_dependencies.insert(subq.alias.to_uppercase(), wildcard_tables);
-            }
-            columns.extend(wildcard_columns);
-            Self::dedup_column_names_case_insensitive(&mut columns);
-            if !columns.is_empty() {
-                virtual_table_columns.insert(subq.alias.clone(), columns);
-            }
-        }
-        intellisense_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace_virtual_table_columns(virtual_table_columns);
-
-        // Load columns from DB for real tables (skip virtual tables)
-        if include_columns {
+            // Load columns from DB for real tables (skip virtual tables).
             for table in &column_tables {
                 let is_virtual = deep_ctx
                     .ctes
@@ -1683,7 +1696,7 @@ impl SqlEditorWidget {
             }
         }
 
-        let columns_loading = {
+        let columns_loading = if include_columns {
             let data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1693,6 +1706,8 @@ impl SqlEditorWidget {
                 &virtual_wildcard_dependencies,
                 &data,
             )
+        } else {
+            false
         };
 
         let suggestions = {
@@ -1716,7 +1731,8 @@ impl SqlEditorWidget {
                 )
             }
         };
-        let context_alias_suggestions = Self::collect_context_alias_suggestions(&prefix, &deep_ctx);
+        let context_alias_suggestions =
+            Self::collect_context_alias_suggestions(&prefix, deep_ctx.as_ref());
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_alias_suggestions,
@@ -2074,6 +2090,30 @@ impl SqlEditorWidget {
         false
     }
 
+    fn bounded_text_window(buffer: &TextBuffer, start: i32, end: i32) -> (String, i32) {
+        let buffer_len = buffer.length().max(0);
+        let start = start.clamp(0, buffer_len);
+        let end = end.clamp(start, buffer_len);
+        if start >= end {
+            return (String::new(), start);
+        }
+
+        if let Some(text) = buffer.text_range(start, end) {
+            return (text, start);
+        }
+
+        // Rare fallback for invalid UTF-8 boundary offsets from editor events.
+        let fallback_start = buffer.line_start(start).max(0).min(end);
+        let fallback_end = buffer.line_end(end).max(fallback_start).min(buffer_len);
+        if fallback_start < fallback_end {
+            if let Some(text) = buffer.text_range(fallback_start, fallback_end) {
+                return (text, fallback_start);
+            }
+        }
+
+        (String::new(), start)
+    }
+
     fn word_at_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize, usize) {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
@@ -2082,9 +2122,11 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_WORD_WINDOW).max(0);
         let end = (cursor_pos + INTELLISENSE_WORD_WINDOW).min(buffer_len);
-        let start = buffer.line_start(start).max(0);
-        let end = buffer.line_end(end).max(start);
-        let text = buffer.text_range(start, end).unwrap_or_default();
+        let (text, start) = Self::bounded_text_window(buffer, start, end);
+        if text.is_empty() {
+            let cursor = cursor_pos.max(0) as usize;
+            return (String::new(), cursor, cursor);
+        }
         let rel_cursor =
             Self::clamp_to_char_boundary_local(&text, (cursor_pos - start).max(0) as usize);
         let (word, rel_start, rel_end) = get_word_at_cursor(&text, rel_cursor);
@@ -2477,12 +2519,19 @@ impl SqlEditorWidget {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
-        let full_text = buffer.text();
-        let cursor_pos = Self::clamp_to_char_boundary_local(&full_text, cursor_pos as usize) as i32;
-        let start = Self::clamp_to_char_boundary_local(&full_text, start as usize) as i32;
-        let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
-        let (stmt_start, _) = Self::statement_bounds_in_text(&text, text.len());
-        text.get(stmt_start..).unwrap_or("").to_string()
+        let (window, window_start) = Self::bounded_text_window(buffer, start, cursor_pos);
+        if window.is_empty() {
+            return String::new();
+        }
+
+        let mut rel_cursor = (cursor_pos - window_start).max(0) as usize;
+        if rel_cursor > window.len() {
+            rel_cursor = window.len();
+        }
+        let rel_cursor = Self::clamp_to_char_boundary_local(&window, rel_cursor);
+        let before_cursor = window.get(..rel_cursor).unwrap_or("");
+        let (stmt_start, _) = Self::statement_bounds_in_text(before_cursor, before_cursor.len());
+        before_cursor.get(stmt_start..).unwrap_or("").to_string()
     }
 
     fn clamp_to_char_boundary_local(text: &str, idx: usize) -> usize {
@@ -2511,15 +2560,15 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start_candidate = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
         let end_candidate = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
-        let start = buffer.line_start(start_candidate).max(0);
-        let end = buffer.line_end(end_candidate).max(start);
-        let Some(text) = buffer.text_range(start, end) else {
+        let (text, start) = Self::bounded_text_window(buffer, start_candidate, end_candidate);
+        if text.is_empty() {
             return (String::new(), 0);
-        };
+        }
         let mut rel_cursor = (cursor_pos - start).max(0) as usize;
         if rel_cursor > text.len() {
             rel_cursor = text.len();
         }
+        rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
         let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
         let statement = text.get(stmt_start..stmt_end).unwrap_or("").to_string();
         let cursor_in_statement = rel_cursor.saturating_sub(stmt_start).min(statement.len());
@@ -2760,14 +2809,13 @@ impl SqlEditorWidget {
         let start = word_start
             .saturating_sub(INTELLISENSE_QUALIFIER_WINDOW as usize)
             .min(word_start);
-        let start = buffer.line_start(start as i32).max(0) as usize;
-        let text = buffer
-            .text_range(start as i32, word_start as i32)
-            .unwrap_or_default();
-        let mut rel_word_start = word_start - start;
+        let (text, start) =
+            Self::bounded_text_window(buffer, start as i32, (word_start as i32).max(0));
+        let mut rel_word_start = (word_start as i32 - start).max(0) as usize;
         if rel_word_start > text.len() {
             rel_word_start = text.len();
         }
+        rel_word_start = Self::clamp_to_char_boundary_local(&text, rel_word_start);
         Self::qualifier_before_word_in_text(&text, rel_word_start)
     }
 
@@ -3427,9 +3475,10 @@ SELECT empno, ename, sa FROM oqt_emp ORDER BY empno;";
             sql.get(stmt_start..stmt_end).unwrap_or(""),
         );
 
-        let before_tokens = SqlEditorWidget::tokenize_sql(&context_text);
-        let full_tokens = SqlEditorWidget::tokenize_sql(&statement_text);
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= context_text.len());
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         assert_eq!(
             deep_ctx.phase,
@@ -3595,15 +3644,11 @@ SELECT * FROM cte
 
         let full_token_spans = super::query_text::tokenize_sql_spanned(&normalized);
         let split_idx = full_token_spans.partition_point(|span| span.end <= normalized_cursor);
-        let before_tokens: Vec<SqlToken> = full_token_spans[..split_idx]
-            .iter()
-            .map(|span| span.token.clone())
-            .collect();
         let full_tokens: Vec<SqlToken> = full_token_spans
-            .iter()
-            .map(|span| span.token.clone())
+            .into_iter()
+            .map(|span| span.token)
             .collect();
-        let ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
         assert_eq!(ctx.phase, intellisense_context::SqlPhase::SelectList);
         assert!(
             ctx.tables_in_scope
@@ -3638,9 +3683,10 @@ FROM d
             sql.get(stmt_start..stmt_end).unwrap_or(""),
         );
 
-        let before_tokens = SqlEditorWidget::tokenize_sql(&context_text);
-        let full_tokens = SqlEditorWidget::tokenize_sql(&statement_text);
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= context_text.len());
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         assert!(
             deep_ctx
@@ -3661,10 +3707,14 @@ FROM d
 
         let mut data = IntellisenseData::new();
         for cte in &deep_ctx.ctes {
+            let body_tokens = intellisense_context::token_range_slice(
+                deep_ctx.statement_tokens.as_ref(),
+                cte.body_range,
+            );
             let mut columns = if !cte.explicit_columns.is_empty() {
                 cte.explicit_columns.clone()
-            } else if !cte.body_tokens.is_empty() {
-                intellisense_context::extract_select_list_columns(&cte.body_tokens)
+            } else if !cte.body_range.is_empty() {
+                intellisense_context::extract_select_list_columns(body_tokens)
             } else {
                 Vec::new()
             };
@@ -4099,13 +4149,10 @@ FROM d
 
     #[test]
     fn collect_context_alias_suggestions_includes_table_aliases_and_ctes() {
-        let before = SqlEditorWidget::tokenize_sql(
-            "WITH recent_emp AS (SELECT empno FROM emp) SELECT  FROM emp e",
-        );
         let full = SqlEditorWidget::tokenize_sql(
             "WITH recent_emp AS (SELECT empno FROM emp) SELECT  FROM emp e",
         );
-        let ctx = intellisense_context::analyze_cursor_context(&before, &full);
+        let ctx = intellisense_context::analyze_cursor_context(&full, full.len());
 
         let suggestions = SqlEditorWidget::collect_context_alias_suggestions("", &ctx);
         let upper: Vec<String> = suggestions.into_iter().map(|s| s.to_uppercase()).collect();
@@ -4171,6 +4218,87 @@ FROM d
     }
 
     #[test]
+    fn xmltable_alias_qualified_column_suggestions_include_columns_clause_names() {
+        let sql_with_cursor = r#"
+SELECT
+  x.|,
+  x.name
+FROM oqt_t_xml t,
+     XMLTABLE(
+       '/root/dept'
+       PASSING t.payload
+       COLUMNS
+         deptno NUMBER       PATH '@deptno',
+         name   VARCHAR2(30) PATH 'name/text()',
+         loc    VARCHAR2(30) PATH 'loc/text()'
+     ) x
+ORDER BY x.deptno
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+        let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
+        let cursor_in_statement = cursor.saturating_sub(stmt_start);
+        let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("x", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["x".to_string()]);
+
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+
+        for subq in &deep_ctx.subqueries {
+            let body_tokens = intellisense_context::token_range_slice(
+                deep_ctx.statement_tokens.as_ref(),
+                subq.body_range,
+            );
+            let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+            if columns.is_empty() {
+                columns = intellisense_context::extract_table_function_columns(body_tokens);
+            }
+            let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
+            let (wildcard_columns, _wildcard_tables) = SqlEditorWidget::expand_virtual_table_wildcards(
+                body_tokens,
+                &body_tables_in_scope,
+                &data,
+                &sender,
+                &connection,
+            );
+            columns.extend(wildcard_columns);
+            SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
+            if !columns.is_empty() {
+                lock_or_recover(&data).set_virtual_table_columns(&subq.alias, columns);
+            }
+        }
+
+        let mut guard = lock_or_recover(&data);
+        let suggestions = guard.get_column_suggestions("", Some(&column_tables));
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("deptno")),
+            "expected deptno suggestion, got: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("name")),
+            "expected name suggestion, got: {:?}",
+            suggestions
+        );
+        assert!(
+            suggestions.iter().any(|c| c.eq_ignore_ascii_case("loc")),
+            "expected loc suggestion, got: {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
     fn cte_chain_qualified_column_suggestions_include_wildcard_expansion() {
         let sql_with_cursor = r#"
 WITH
@@ -4215,13 +4343,13 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             .find('|')
             .expect("cursor marker should exist");
         let sql = sql_with_cursor.replace('|', "");
-        let before = &sql[..cursor];
-
-        let before_tokens = SqlEditorWidget::tokenize_sql(before);
         let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
         let statement_text = sql.get(stmt_start..stmt_end).unwrap_or("");
-        let full_tokens = SqlEditorWidget::tokenize_sql(statement_text);
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let cursor_in_statement = cursor.saturating_sub(stmt_start);
+        let token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor_in_statement);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         let column_tables =
             intellisense_context::resolve_qualifier_tables("f", &deep_ctx.tables_in_scope);
@@ -4236,19 +4364,23 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
         let connection = create_shared_connection();
 
         for cte in &deep_ctx.ctes {
+            let body_tokens = intellisense_context::token_range_slice(
+                deep_ctx.statement_tokens.as_ref(),
+                cte.body_range,
+            );
             let mut columns = if !cte.explicit_columns.is_empty() {
                 cte.explicit_columns.clone()
-            } else if !cte.body_tokens.is_empty() {
-                intellisense_context::extract_select_list_columns(&cte.body_tokens)
+            } else if !cte.body_range.is_empty() {
+                intellisense_context::extract_select_list_columns(body_tokens)
             } else {
                 Vec::new()
             };
-            if cte.explicit_columns.is_empty() && !cte.body_tokens.is_empty() {
+            if cte.explicit_columns.is_empty() && !cte.body_range.is_empty() {
                 let body_tables_in_scope =
-                    intellisense_context::collect_tables_in_statement(&cte.body_tokens);
+                    intellisense_context::collect_tables_in_statement(body_tokens);
                 let (wildcard_columns, _wildcard_tables) =
                     SqlEditorWidget::expand_virtual_table_wildcards(
-                        &cte.body_tokens,
+                        body_tokens,
                         &body_tables_in_scope,
                         &data,
                         &sender,
@@ -4514,18 +4646,19 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
         let token_spans = super::query_text::tokenize_sql_spanned(&sql);
         let split_idx = token_spans.partition_point(|span| span.end <= cursor);
-        let before_tokens: Vec<SqlToken> = token_spans[..split_idx]
-            .iter()
-            .map(|span| span.token.clone())
-            .collect();
-        let full_tokens: Vec<SqlToken> =
-            token_spans.iter().map(|span| span.token.clone()).collect();
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
-        assert!(SqlEditorWidget::is_insert_column_list_context(&sql, cursor));
+        assert!(SqlEditorWidget::is_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
 
-        let context = SqlEditorWidget::classify_intellisense_context(&deep_ctx, &sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
         assert_eq!(context, SqlContext::ColumnName);
     }
 
@@ -4539,20 +4672,19 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
         let token_spans = super::query_text::tokenize_sql_spanned(&sql);
         let split_idx = token_spans.partition_point(|span| span.end <= cursor);
-        let before_tokens: Vec<SqlToken> = token_spans[..split_idx]
-            .iter()
-            .map(|span| span.token.clone())
-            .collect();
-        let full_tokens: Vec<SqlToken> =
-            token_spans.iter().map(|span| span.token.clone()).collect();
-        let deep_ctx = intellisense_context::analyze_cursor_context(&before_tokens, &full_tokens);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
         assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
         assert!(!SqlEditorWidget::is_insert_column_list_context(
-            &sql, cursor
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
         ));
 
-        let context = SqlEditorWidget::classify_intellisense_context(&deep_ctx, &sql, cursor);
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
         assert_eq!(context, SqlContext::TableName);
     }
 }

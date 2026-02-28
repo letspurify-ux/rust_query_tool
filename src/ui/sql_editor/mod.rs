@@ -660,7 +660,7 @@ pub(crate) struct PendingIntellisense {
 pub(crate) struct IntellisenseParseCacheEntry {
     statement_text: String,
     cursor_in_statement: usize,
-    context: crate::ui::intellisense_context::CursorContext,
+    context: Arc<crate::ui::intellisense_context::CursorContext>,
 }
 
 #[derive(Clone)]
@@ -877,10 +877,9 @@ impl SqlEditorWidget {
                                     ),
                                 );
 
-                                let fallback_kind =
-                                    SqlEditorWidget::fallback_highlight_result_kind(
-                                        &fallback_request_kind,
-                                    );
+                                let fallback_kind = SqlEditorWidget::fallback_highlight_result_kind(
+                                    &fallback_request_kind,
+                                );
                                 if task
                                     .result_sender
                                     .send(HighlightResult {
@@ -2742,6 +2741,13 @@ impl SqlEditorWidget {
     ) {
         let text_len = buf.length().max(0) as usize;
         if !Self::should_use_windowed_highlighting(text_len) {
+            if ins > 0 || del > 0 {
+                let mut style_buffer = self.style_buffer.clone();
+                Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, ins, del);
+                if !Self::ensure_style_buffer_len(&mut style_buffer, text_len) {
+                    return;
+                }
+            }
             self.enqueue_highlight_request(buf.text());
             return;
         }

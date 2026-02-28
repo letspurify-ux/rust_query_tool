@@ -1736,13 +1736,16 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
 // Uses the deep context analyzer for accurate depth-aware detection.
 pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
     use crate::ui::intellisense_context::{self, SqlPhase};
-    use crate::ui::sql_editor::SqlEditorWidget;
+    use crate::ui::sql_editor::query_text::tokenize_sql_spanned;
 
     let end = normalize_cursor_pos(text, cursor_pos);
-    let before = &text[..end];
-    let tokens = SqlEditorWidget::tokenize_sql(before);
-    let full_tokens = SqlEditorWidget::tokenize_sql(text);
-    let ctx = intellisense_context::analyze_cursor_context(&tokens, &full_tokens);
+    let token_spans = tokenize_sql_spanned(text);
+    let split_idx = token_spans.partition_point(|span| span.end <= end);
+    let full_tokens = token_spans
+        .into_iter()
+        .map(|span| span.token)
+        .collect::<Vec<_>>();
+    let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
     match ctx.phase {
         SqlPhase::FromClause

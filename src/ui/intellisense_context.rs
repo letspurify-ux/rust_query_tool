@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::sql_text;
 use crate::ui::sql_depth::{
-    apply_paren_token, extract_parenthesized_tokens, is_top_level_depth, paren_depths,
-    split_top_level_symbol_groups,
+    apply_paren_token, is_top_level_depth, paren_depths, split_top_level_symbol_groups,
 };
 use crate::ui::sql_editor::SqlToken;
 
@@ -75,23 +75,44 @@ pub struct ScopedTableRef {
 pub struct CteDefinition {
     pub name: String,
     pub explicit_columns: Vec<String>,
-    /// Tokens inside the CTE body parentheses (the SELECT statement).
-    pub body_tokens: Vec<SqlToken>,
+    /// Token range inside `CursorContext.statement_tokens` for the CTE body.
+    pub body_range: TokenRange,
 }
 
-/// A subquery alias with its body tokens, for column inference.
+/// A subquery alias with its body token range, for column inference.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SubqueryDefinition {
     pub alias: String,
-    pub body_tokens: Vec<SqlToken>,
+    pub body_range: TokenRange,
     pub depth: usize,
+}
+
+/// Inclusive-exclusive token range `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TokenRange {
+    pub fn empty() -> Self {
+        Self { start: 0, end: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
 }
 
 /// Result of deep context analysis at cursor position.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct CursorContext {
+    /// Full token stream for the normalized statement.
+    pub statement_tokens: Arc<[SqlToken]>,
+    /// Number of tokens located before/at cursor in `statement_tokens`.
+    pub cursor_token_len: usize,
     /// Current SQL phase at cursor position
     pub phase: SqlPhase,
     /// Current parenthesis nesting depth (0 = top level)
@@ -122,20 +143,21 @@ enum CteState {
 /// Analyze the SQL text from statement start to cursor position.
 /// Returns a `CursorContext` describing the phase, depth, and available tables.
 ///
-/// `before_cursor` is the SQL text from statement start up to cursor.
-/// `full_statement` is the complete statement text (for collecting all table references).
-/// `tokenize` is used to tokenize the SQL.
+/// `full_statement` is the complete statement token stream.
+/// `cursor_token_len` is the count of tokens before/at cursor.
 pub fn analyze_cursor_context(
-    before_cursor: &[SqlToken],
     full_statement: &[SqlToken],
+    cursor_token_len: usize,
 ) -> CursorContext {
-    let phase_analysis = analyze_phase(before_cursor);
+    let clamped_cursor_token_len = cursor_token_len.min(full_statement.len());
+    let statement_tokens: Arc<[SqlToken]> = full_statement.to_vec().into();
+    let phase_analysis = analyze_phase(&statement_tokens[..clamped_cursor_token_len]);
     let table_analysis = collect_tables_deep(
-        full_statement,
+        statement_tokens.as_ref(),
         &phase_analysis.visible_scope_chain,
-        before_cursor.len(),
+        clamped_cursor_token_len,
     );
-    let ctes = parse_ctes(full_statement);
+    let ctes = parse_ctes(statement_tokens.as_ref());
 
     let mut tables_in_scope = table_analysis.tables;
     for cte in &ctes {
@@ -153,6 +175,8 @@ pub fn analyze_cursor_context(
     }
 
     CursorContext {
+        statement_tokens,
+        cursor_token_len: clamped_cursor_token_len,
         phase: phase_analysis.phase,
         depth: phase_analysis.depth,
         tables_in_scope,
@@ -588,13 +612,15 @@ fn collect_tables_deep(
                         } else {
                             0
                         };
-                        // Capture body tokens for column inference
-                        let body_tokens: Vec<SqlToken> =
-                            tokens[start_idx..idx].iter().cloned().collect();
+                        // Capture body token range for column inference.
+                        let body_range = TokenRange {
+                            start: start_idx,
+                            end: idx,
+                        };
                         all_subqueries.push(ParsedSubquery {
                             subquery: SubqueryDefinition {
                                 alias: alias.clone(),
-                                body_tokens,
+                                body_range,
                                 depth: depth.saturating_sub(1),
                             },
                             scope_id: parent_scope_id,
@@ -626,12 +652,14 @@ fn collect_tables_deep(
                         0
                     };
                     let generated_name = anonymous_subquery_name(start_idx, depth);
-                    let body_tokens: Vec<SqlToken> =
-                        tokens[start_idx..idx].iter().cloned().collect();
+                    let body_range = TokenRange {
+                        start: start_idx,
+                        end: idx,
+                    };
                     all_subqueries.push(ParsedSubquery {
                         subquery: SubqueryDefinition {
                             alias: generated_name.clone(),
-                            body_tokens,
+                            body_range,
                             depth: depth.saturating_sub(1),
                         },
                         scope_id: parent_scope_id,
@@ -908,6 +936,56 @@ fn collect_tables_deep(
     }
 }
 
+pub fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
+    let start = range.start.min(tokens.len());
+    let end = range.end.min(tokens.len());
+    if start >= end {
+        &tokens[0..0]
+    } else {
+        &tokens[start..end]
+    }
+}
+
+fn extract_parenthesized_range(
+    tokens: &[SqlToken],
+    open_idx: usize,
+) -> Option<(TokenRange, usize)> {
+    match tokens.get(open_idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => {}
+        _ => return None,
+    }
+
+    let mut depth = 1usize;
+    let mut idx = open_idx + 1;
+    while idx < tokens.len() {
+        match &tokens[idx] {
+            SqlToken::Symbol(sym) if sym == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(sym) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((
+                        TokenRange {
+                            start: open_idx + 1,
+                            end: idx,
+                        },
+                        idx + 1,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    Some((
+        TokenRange {
+            start: open_idx.saturating_add(1).min(tokens.len()),
+            end: tokens.len(),
+        },
+        tokens.len(),
+    ))
+}
+
 /// Parse CTE definitions from WITH clause.
 fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
     let mut ctes = Vec::new();
@@ -978,8 +1056,9 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         // Check for explicit column list: cte_name(col1, col2)
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
-                if let Some((expr_tokens, next_idx)) = extract_parenthesized_tokens(tokens, idx) {
-                    let expr_depths = paren_depths(&expr_tokens);
+                if let Some((expr_range, next_idx)) = extract_parenthesized_range(tokens, idx) {
+                    let expr_tokens = token_range_slice(tokens, expr_range);
+                    let expr_depths = paren_depths(expr_tokens);
                     idx = next_idx;
                     for (expr_idx, token) in expr_tokens.iter().enumerate() {
                         if !is_top_level_depth(&expr_depths, expr_idx) {
@@ -1000,15 +1079,13 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             }
         }
 
-        // Capture CTE body tokens (balanced parens)
-        let mut body_tokens = Vec::new();
+        // Capture CTE body token range (balanced parens).
+        let mut body_range = TokenRange::empty();
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
-                if let Some((tokens_in_parens, next_idx)) =
-                    extract_parenthesized_tokens(tokens, idx)
-                {
+                if let Some((captured_range, next_idx)) = extract_parenthesized_range(tokens, idx) {
                     idx = next_idx;
-                    body_tokens.extend(tokens_in_parens);
+                    body_range = captured_range;
                 }
             }
         }
@@ -1016,7 +1093,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         ctes.push(CteDefinition {
             name: cte_name,
             explicit_columns,
-            body_tokens,
+            body_range,
         });
 
         // Check for comma (another CTE) or end
@@ -1468,6 +1545,91 @@ pub fn extract_select_list_wildcard_tables(
     tables
 }
 
+/// Extract column names from table-function `COLUMNS` clauses such as
+/// `XMLTABLE(... COLUMNS col1 NUMBER PATH '...', col2 VARCHAR2(30) PATH '...')`.
+/// Returns discovered column names in appearance order.
+pub fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let token_depths = paren_depths(tokens);
+    let mut columns_start = None;
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            // If this body is a normal subquery (SELECT ...), let SELECT-list
+            // extraction handle it instead of mixing in function-internal tokens.
+            if word.eq_ignore_ascii_case("SELECT") {
+                return Vec::new();
+            }
+            if word.eq_ignore_ascii_case("COLUMNS") {
+                columns_start = Some(idx.saturating_add(1));
+                break;
+            }
+        }
+    }
+
+    let Some(columns_start) = columns_start else {
+        return Vec::new();
+    };
+
+    let mut columns = Vec::new();
+    let mut seen = HashSet::new();
+    for item_tokens in split_top_level_symbol_groups(&tokens[columns_start..], ",") {
+        if let Some(column) = resolve_table_function_column_name(&item_tokens) {
+            let key = column.to_ascii_uppercase();
+            if seen.insert(key) {
+                columns.push(column);
+            }
+        }
+    }
+
+    columns
+}
+
+fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
+    let first_word = item_tokens.iter().copied().find_map(|token| match token {
+        SqlToken::Comment(_) => None,
+        SqlToken::Word(word) => Some(word.as_str()),
+        _ => None,
+    })?;
+
+    let upper = first_word.to_ascii_uppercase();
+    if is_table_function_item_leading_keyword(&upper) {
+        return None;
+    }
+    if !is_identifier_word_token(first_word) {
+        return None;
+    }
+
+    Some(strip_identifier_quotes(first_word))
+}
+
+fn is_table_function_item_leading_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "NESTED"
+            | "PATH"
+            | "COLUMNS"
+            | "EXISTS"
+            | "FOR"
+            | "ORDINALITY"
+            | "ERROR"
+            | "NULL"
+            | "DEFAULT"
+            | "ON"
+            | "FORMAT"
+            | "WRAPPER"
+            | "WITHOUT"
+            | "WITH"
+            | "CONDITIONAL"
+            | "UNCONDITIONAL"
+            | "KEEP"
+            | "OMIT"
+            | "QUOTES"
+    )
+}
+
 fn extract_select_list_tokens(tokens: &[SqlToken]) -> &[SqlToken] {
     let start = select_list_start_index(tokens);
     let end = select_list_end_index(tokens, start);
@@ -1756,7 +1918,7 @@ mod wildcard_resolution_tests {
         let sql =
             "SELECT schema_a.emp.* FROM schema_a.emp e JOIN dept emp ON e.deptno = emp.deptno";
         let tokens = SqlEditorWidget::tokenize_sql(sql);
-        let ctx = analyze_cursor_context(&tokens, &tokens);
+        let ctx = analyze_cursor_context(&tokens, tokens.len());
 
         let wildcard_tables = extract_select_list_wildcard_tables(&tokens, &ctx.tables_in_scope);
 
