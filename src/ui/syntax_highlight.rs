@@ -178,8 +178,6 @@ pub struct SqlHighlighter {
 const HIGHLIGHT_WINDOW_THRESHOLD: usize = 20_000;
 const HIGHLIGHT_WINDOW_RADIUS: usize = 8_000;
 const MAX_HIGHLIGHT_WINDOWS_PER_PASS: usize = 6;
-const MAX_HIGHLIGHT_WINDOWS_PER_PASS_LARGE_EDIT: usize = 64;
-const LARGE_EDIT_SPAN_THRESHOLD: usize = 256_000;
 /// Maximum backward probe distance to determine lexer state at a window boundary.
 const STATE_PROBE_DISTANCE: usize = 32_768;
 
@@ -218,17 +216,6 @@ impl SqlHighlighter {
             .iter()
             .map(|name| name.to_uppercase())
             .collect();
-    }
-
-    /// Highlights using a windowed range from the buffer to avoid full-buffer scans.
-    pub fn highlight_buffer_window(
-        &self,
-        buffer: &TextBuffer,
-        style_buffer: &mut TextBuffer,
-        cursor_pos: usize,
-        edited_range: Option<(usize, usize)>,
-    ) {
-        self.highlight_buffer_window_viewport(buffer, style_buffer, cursor_pos, edited_range, None);
     }
 
     /// Highlights using a windowed range with optional viewport hint.
@@ -760,7 +747,6 @@ fn select_highlight_ranges(
     edited_range: Option<(usize, usize)>,
     viewport: Option<(usize, usize)>,
 ) -> Vec<(usize, usize)> {
-    let max_windows_per_pass = max_highlight_windows_per_pass(edited_range, text_len);
     let mut anchors = vec![cursor_pos.min(text_len)];
 
     // Always include viewport center as an anchor so visible area is highlighted.
@@ -783,7 +769,7 @@ fn select_highlight_ranges(
             let span = end - start;
             let step = (HIGHLIGHT_WINDOW_RADIUS * 2).max(1);
             let mut windows = span.div_ceil(step).max(1);
-            windows = windows.min(max_windows_per_pass.saturating_sub(1).max(1));
+            windows = windows.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS.saturating_sub(1).max(1));
 
             for i in 0..=windows {
                 let offset = span.saturating_mul(i) / windows;
@@ -809,7 +795,7 @@ fn select_highlight_ranges(
         merged.push((start, end));
     }
 
-    if merged.len() > max_windows_per_pass {
+    if merged.len() > MAX_HIGHLIGHT_WINDOWS_PER_PASS {
         let mut focus_points = vec![cursor_pos.min(text_len)];
         if let Some((edit_start, edit_end)) = edited_range {
             focus_points.push(edit_start.min(text_len));
@@ -819,33 +805,10 @@ fn select_highlight_ranges(
             focus_points.push(vp_start.min(text_len));
             focus_points.push(vp_end.min(text_len));
         }
-        merged = prioritize_ranges_for_focus(merged, &focus_points, max_windows_per_pass);
+        merged = prioritize_ranges_for_focus(merged, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
     }
 
     merged
-}
-
-fn max_highlight_windows_per_pass(edited_range: Option<(usize, usize)>, text_len: usize) -> usize {
-    let Some((edit_start, edit_end)) = edited_range else {
-        return MAX_HIGHLIGHT_WINDOWS_PER_PASS;
-    };
-
-    let mut start = edit_start.min(text_len);
-    let mut end = edit_end.min(text_len);
-    if start > end {
-        std::mem::swap(&mut start, &mut end);
-    }
-    let span = end.saturating_sub(start);
-    if span < LARGE_EDIT_SPAN_THRESHOLD {
-        return MAX_HIGHLIGHT_WINDOWS_PER_PASS;
-    }
-
-    let step = (HIGHLIGHT_WINDOW_RADIUS * 2).max(1);
-    let needed = span.div_ceil(step).max(1);
-    needed.clamp(
-        MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-        MAX_HIGHLIGHT_WINDOWS_PER_PASS_LARGE_EDIT,
-    )
 }
 
 fn prioritize_ranges_for_focus(

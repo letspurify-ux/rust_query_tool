@@ -441,8 +441,6 @@ impl SqlEditorWidget {
         let intellisense_popup = self.intellisense_popup.clone();
         let connection = self.connection.clone();
         let column_sender = self.column_sender.clone();
-        let highlighter = self.highlighter.clone();
-        let style_buffer = self.style_buffer.clone();
         let suppress_enter = Arc::new(Mutex::new(false));
         let suppress_nav = Arc::new(Mutex::new(false));
         let nav_anchor = Arc::new(Mutex::new(None::<i32>));
@@ -524,8 +522,6 @@ impl SqlEditorWidget {
         let intellisense_popup_for_handle = intellisense_popup.clone();
         let column_sender_for_handle = column_sender.clone();
         let connection_for_handle = connection.clone();
-        let highlighter_for_handle = highlighter.clone();
-        let mut style_buffer_for_handle = style_buffer.clone();
         let suppress_enter_for_handle = suppress_enter.clone();
         let suppress_nav_for_handle = suppress_nav.clone();
         let nav_anchor_for_handle = nav_anchor.clone();
@@ -542,7 +538,21 @@ impl SqlEditorWidget {
         let dnd_file_drop_pending_for_handle = Arc::new(Mutex::new(false));
 
         editor.handle(move |ed, ev| {
+            let schedule_viewport_refresh = |widget: &SqlEditorWidget| {
+                let widget = widget.clone();
+                app::add_timeout3(0.0, move |_| {
+                    widget.refresh_highlighting();
+                });
+            };
             match ev {
+                Event::MouseWheel => {
+                    schedule_viewport_refresh(&widget_for_shortcuts);
+                    false
+                }
+                Event::Released => {
+                    schedule_viewport_refresh(&widget_for_shortcuts);
+                    false
+                }
                 Event::DndEnter | Event::DndDrag => {
                     *dnd_file_drop_pending_for_handle
                         .lock()
@@ -751,19 +761,7 @@ impl SqlEditorWidget {
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
                                     // Update syntax highlighting after insertion
-                                    let cursor_pos = Self::raw_cursor_position(
-                                        &buffer_for_handle,
-                                        ed.insert_position(),
-                                    ) as usize;
-                                    highlighter_for_handle
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .highlight_buffer_window(
-                                            &buffer_for_handle,
-                                            &mut style_buffer_for_handle,
-                                            cursor_pos,
-                                            None,
-                                        );
+                                    widget_for_shortcuts.refresh_highlighting();
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
                                     *suppress_enter_for_handle
@@ -1065,6 +1063,7 @@ impl SqlEditorWidget {
                             &keyup_debounce_generation_for_handle,
                             &keyup_debounce_handle_for_handle,
                         );
+                        widget_for_shortcuts.refresh_highlighting();
                         return false;
                     }
 
@@ -1244,6 +1243,9 @@ impl SqlEditorWidget {
                             &column_sender_for_handle,
                             &connection_for_handle,
                         );
+                    }
+                    if matches!(key, Key::Up | Key::Down) {
+                        widget_for_shortcuts.refresh_highlighting();
                     }
                     false
                 }

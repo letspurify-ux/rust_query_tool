@@ -63,10 +63,10 @@ const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
-const LARGE_STATEFUL_INSERT_FULL_RANGE_THRESHOLD: usize = 256_000;
 /// Maximum scan radius for stateful delimiter changes (e.g. `'`, `/*`).
 /// Replaces the old full-buffer scan with a bounded 128 KB window.
 const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
+const VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS: f64 = 0.08;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
@@ -1009,6 +1009,7 @@ impl SqlEditorWidget {
         widget.setup_intellisense();
         widget.setup_word_undo_redo();
         widget.setup_syntax_highlighting();
+        widget.setup_viewport_highlight_poll();
         widget.setup_progress_handler(progress_receiver, progress_callback, query_running);
         widget.setup_column_loader(column_receiver);
         widget.setup_ui_action_handler(ui_action_receiver);
@@ -1363,14 +1364,16 @@ impl SqlEditorWidget {
 
                 if should_refresh_highlighting {
                     let cursor_pos = editor.insert_position().max(0) as usize;
+                    let viewport = editor_viewport_range(&editor, &buffer);
                     highlighter
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .highlight_buffer_window(
+                        .highlight_buffer_window_viewport(
                             &buffer,
                             &mut style_buffer.clone(),
                             cursor_pos,
                             None,
+                            viewport,
                         );
                 }
             }
@@ -1657,6 +1660,7 @@ impl SqlEditorWidget {
         let highlighter = self.highlighter.clone();
         let mut style_buffer = self.style_buffer.clone();
         let mut buffer = self.buffer.clone();
+        let editor_for_viewport = self.editor.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             intellisense_parse_cache
@@ -1715,20 +1719,18 @@ impl SqlEditorWidget {
             let text_len = buf.length().max(0) as usize;
             let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
             let mut edited_range = compute_edited_range(pos, ins, del, text_len);
+            let viewport = editor_viewport_range(&editor_for_viewport, buf);
 
             if needs_full_rehighlight(buf, pos, ins, deleted_text) {
-                let inserted_len = ins.max(0) as usize;
-                if inserted_len < LARGE_STATEFUL_INSERT_FULL_RANGE_THRESHOLD {
-                    // Bounded scan around small stateful edits.
-                    // Large inserts keep their full changed span so long scripts
-                    // receive distributed highlighting coverage in one pass.
-                    let edit_pos = pos.max(0) as usize;
-                    let scan_start = edit_pos.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
-                    let scan_end = edit_pos
-                        .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
-                        .min(text_len);
-                    edited_range = Some((scan_start, scan_end));
-                }
+                // Bounded scan around the edit instead of the entire buffer.
+                // The state-aware highlighter will probe backward to determine
+                // correct lexer state (in-comment, in-string, etc.).
+                let edit_pos = pos.max(0) as usize;
+                let scan_start = edit_pos.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
+                let scan_end = edit_pos
+                    .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
+                    .min(text_len);
+                edited_range = Some((scan_start, scan_end));
             } else if let Some((start, end)) = edited_range {
                 let inserted_text = inserted_text(buf, pos, ins);
                 if !has_stateful_sql_delimiter(&inserted_text) {
@@ -1739,9 +1741,66 @@ impl SqlEditorWidget {
             highlighter
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .highlight_buffer_window(buf, &mut style_buffer, cursor_pos, edited_range);
+                .highlight_buffer_window_viewport(
+                    buf,
+                    &mut style_buffer,
+                    cursor_pos,
+                    edited_range,
+                    viewport,
+                );
         });
         self.refresh_highlighting();
+    }
+
+    fn setup_viewport_highlight_poll(&self) {
+        let widget = self.clone();
+        let editor = self.editor.clone();
+        let buffer = self.buffer.clone();
+        let last_viewport_state = Arc::new(Mutex::new(None::<(bool, i32, i32, i32, i32, i32)>));
+
+        fn schedule_poll(
+            widget: SqlEditorWidget,
+            editor: TextEditor,
+            buffer: TextBuffer,
+            last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32, i32)>>>,
+        ) {
+            if widget.group.was_deleted() || editor.was_deleted() {
+                return;
+            }
+
+            let visible = editor.visible_r();
+            let top_row = editor.scroll_row();
+            let left_col = editor.scroll_col();
+            let w = editor.w();
+            let h = editor.h();
+            let text_len = buffer.length();
+            let current_state = (visible, top_row, left_col, w, h, text_len);
+            let should_refresh = {
+                let mut previous = last_viewport_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let changed = previous.map_or(true, |state| state != current_state);
+                if changed {
+                    *previous = Some(current_state);
+                }
+                changed
+            };
+
+            if should_refresh {
+                widget.refresh_highlighting();
+            }
+
+            app::add_timeout3(VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS, move |_| {
+                schedule_poll(
+                    widget.clone(),
+                    editor.clone(),
+                    buffer.clone(),
+                    last_viewport_state.clone(),
+                );
+            });
+        }
+
+        schedule_poll(widget, editor, buffer, last_viewport_state);
     }
 
     pub fn explain_current(&self) {
@@ -2297,17 +2356,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(data);
-        // Re-highlight current text
-        let mut style_buffer = self.style_buffer.clone();
-        self.highlighter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .highlight_buffer_window(
-                &self.buffer,
-                &mut style_buffer,
-                self.editor.insert_position().max(0) as usize,
-                None,
-            );
+        self.refresh_highlighting();
     }
 
     pub fn get_highlighter(&self) -> Arc<Mutex<SqlHighlighter>> {
@@ -2362,15 +2411,24 @@ impl SqlEditorWidget {
 
     #[allow(dead_code)]
     pub fn refresh_highlighting(&self) {
+        let viewport = editor_viewport_range(&self.editor, &self.buffer);
         self.highlighter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .highlight_buffer_window(
+            .highlight_buffer_window_viewport(
                 &self.buffer,
                 &mut self.style_buffer.clone(),
                 self.editor.insert_position().max(0) as usize,
                 None,
+                viewport,
             );
+        let mut editor = self.editor.clone();
+        if let Some((start, end)) = viewport {
+            let start_i32 = start.min(i32::MAX as usize) as i32;
+            let end_i32 = end.min(i32::MAX as usize) as i32;
+            editor.redisplay_range(start_i32, end_i32);
+        }
+        editor.redraw();
     }
 
     #[allow(dead_code)]
@@ -2753,6 +2811,38 @@ fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (u
         window_start.saturating_add(rel_start).min(text_len),
         window_start.saturating_add(rel_end).min(text_len),
     )
+}
+
+fn editor_viewport_range(editor: &TextEditor, buffer: &TextBuffer) -> Option<(usize, usize)> {
+    let text_len = buffer.length().max(0) as usize;
+    if text_len == 0 {
+        return Some((0, 0));
+    }
+
+    if !editor.visible_r() {
+        return None;
+    }
+
+    let mut editor = editor.clone();
+    let h = editor.h();
+    let text_size = editor.text_size().max(1);
+    if h <= 0 {
+        return None;
+    }
+
+    // FLTK scroll_row is 1-based in practice; normalize to 0-based line count.
+    let top_row = editor.scroll_row().max(1).saturating_sub(1);
+    let start_pos = editor.skip_lines(0, top_row, true).clamp(0, buffer.length());
+    let visible_rows = (h / text_size).max(1).saturating_add(2);
+    let end_pos = editor
+        .skip_lines(start_pos, visible_rows, true)
+        .clamp(start_pos, buffer.length());
+
+    let line_start = buffer.line_start(start_pos).max(0) as usize;
+    let line_end = buffer.line_end(end_pos).max(0) as usize;
+    let start = line_start.min(text_len);
+    let end = line_end.min(text_len).max(start);
+    Some((start, end))
 }
 
 fn infer_cursor_after_edit(pos: i32, ins: i32, text_len: usize) -> usize {

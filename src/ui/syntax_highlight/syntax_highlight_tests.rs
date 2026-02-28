@@ -855,24 +855,3 @@ fn test_large_file_stateful_delimiter_does_not_scan_entire_buffer() {
         );
     }
 }
-
-#[test]
-fn test_large_edit_span_expands_window_budget() {
-    let text_len = 1_000_000;
-    let expanded = max_highlight_windows_per_pass(Some((0, text_len)), text_len);
-    assert!(
-        expanded > MAX_HIGHLIGHT_WINDOWS_PER_PASS,
-        "large edit should expand window budget"
-    );
-    assert!(
-        expanded <= MAX_HIGHLIGHT_WINDOWS_PER_PASS_LARGE_EDIT,
-        "expanded budget should respect hard upper bound"
-    );
-}
-
-#[test]
-fn test_small_edit_span_keeps_default_window_budget() {
-    let text_len = 1_000_000;
-    let small = max_highlight_windows_per_pass(Some((10, 200)), text_len);
-    assert_eq!(small, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
-}
