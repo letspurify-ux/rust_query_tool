@@ -647,10 +647,12 @@ impl SqlHighlighter {
                     idx += 1;
                 }
                 let word = text.get(start..idx).unwrap_or("");
-                let upper_word = word.to_ascii_uppercase();
 
                 // DATE / TIMESTAMP / INTERVAL literals
-                if matches!(upper_word.as_str(), "DATE" | "TIMESTAMP" | "INTERVAL") {
+                if word.eq_ignore_ascii_case("DATE")
+                    || word.eq_ignore_ascii_case("TIMESTAMP")
+                    || word.eq_ignore_ascii_case("INTERVAL")
+                {
                     let mut look_ahead = idx;
                     while bytes
                         .get(look_ahead)

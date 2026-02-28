@@ -110,8 +110,7 @@ impl SqlEditorWidget {
             match &span.token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
-                    let upper = word.to_uppercase();
-                    if upper == "INSERT" {
+                    if word.eq_ignore_ascii_case("INSERT") {
                         seen_insert = true;
                         seen_into = false;
                         seen_target = false;
@@ -125,12 +124,12 @@ impl SqlEditorWidget {
                         continue;
                     }
 
-                    if upper == "INTO" && !seen_into {
+                    if word.eq_ignore_ascii_case("INTO") && !seen_into {
                         seen_into = true;
                         continue;
                     }
 
-                    if upper == "VALUES" {
+                    if word.eq_ignore_ascii_case("VALUES") {
                         seen_values = true;
                         continue;
                     }
