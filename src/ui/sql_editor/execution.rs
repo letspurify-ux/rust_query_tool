@@ -518,15 +518,16 @@ impl SqlEditorWidget {
 
             match item {
                 FormatItem::Statement(statement) => {
+                    let statement_tokens = Self::tokenize_sql(statement);
                     let formatted_statement =
                         Self::format_statement(statement, force_select_list_newline_next);
-                    let has_code = Self::statement_has_code(statement);
+                    let has_code = Self::statement_has_code(statement, &statement_tokens);
                     formatted.push_str(&formatted_statement);
                     if has_code && !Self::statement_ends_with_semicolon(&formatted_statement) {
                         formatted.push(';');
                     }
                     force_select_list_newline_next =
-                        Self::statement_has_unbalanced_paren(statement);
+                        Self::statement_has_unbalanced_paren(&statement_tokens);
                 }
                 FormatItem::ToolCommand(command) => {
                     formatted.push_str(&Self::format_tool_command(command));
@@ -631,7 +632,7 @@ impl SqlEditorWidget {
         )
     }
 
-    fn statement_has_code(statement: &str) -> bool {
+    fn statement_has_code(statement: &str, tokens: &[SqlToken]) -> bool {
         let trimmed = statement.trim_start();
         if let Some(first_word) = trimmed.split_whitespace().next() {
             if first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK") {
@@ -639,7 +640,6 @@ impl SqlEditorWidget {
             }
         }
 
-        let tokens = Self::tokenize_sql(statement);
         tokens
             .iter()
             .any(|token| !matches!(token, SqlToken::Comment(_)))
@@ -657,9 +657,8 @@ impl SqlEditorWidget {
         false
     }
 
-    fn statement_has_unbalanced_paren(statement: &str) -> bool {
-        let tokens = Self::tokenize_sql(statement);
-        paren_depth_after(&tokens) > 0
+    fn statement_has_unbalanced_paren(tokens: &[SqlToken]) -> bool {
+        paren_depth_after(tokens) > 0
     }
 
     fn format_tool_command(command: &ToolCommand) -> String {
