@@ -158,6 +158,21 @@ pub struct HighlightData {
     pub columns: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct WindowHighlightRequest {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub entry_state: LexerState,
+}
+
+#[derive(Clone)]
+pub struct WindowHighlightResult {
+    pub start: usize,
+    pub end: usize,
+    pub styles: String,
+}
+
 impl HighlightData {
     pub fn new() -> Self {
         Self {
@@ -176,8 +191,11 @@ pub struct SqlHighlighter {
 }
 
 const HIGHLIGHT_WINDOW_THRESHOLD: usize = 20_000;
+pub(crate) const WINDOWED_HIGHLIGHT_THRESHOLD: usize = HIGHLIGHT_WINDOW_THRESHOLD;
 const HIGHLIGHT_WINDOW_RADIUS: usize = 8_000;
 const MAX_HIGHLIGHT_WINDOWS_PER_PASS: usize = 6;
+const LARGE_EDIT_SPAN_FOCUS_THRESHOLD: usize = 128_000;
+const MAX_HIGHLIGHT_WINDOWS_FOR_LARGE_EDIT: usize = 3;
 /// Maximum backward probe distance to determine lexer state at a window boundary.
 const STATE_PROBE_DISTANCE: usize = 32_768;
 
@@ -221,6 +239,7 @@ impl SqlHighlighter {
     /// Highlights using a windowed range with optional viewport hint.
     /// `viewport` is the visible byte range `(start, end)` in the editor;
     /// when provided the visible area is always included in the highlight pass.
+    #[allow(dead_code)]
     pub fn highlight_buffer_window_viewport(
         &self,
         buffer: &TextBuffer,
@@ -246,7 +265,37 @@ impl SqlHighlighter {
             style_buffer.set_text(&default_styles);
         }
 
+        let requests = self.prepare_window_highlight_requests(
+            buffer,
+            style_buffer,
+            cursor_pos,
+            edited_range,
+            viewport,
+        );
+        let results = self.generate_window_styles(requests);
+        for window in results {
+            if window.start >= window.end {
+                continue;
+            }
+            style_buffer.replace(window.start as i32, window.end as i32, &window.styles);
+        }
+    }
+
+    pub fn prepare_window_highlight_requests(
+        &self,
+        buffer: &TextBuffer,
+        style_buffer: &TextBuffer,
+        cursor_pos: usize,
+        edited_range: Option<(usize, usize)>,
+        viewport: Option<(usize, usize)>,
+    ) -> Vec<WindowHighlightRequest> {
+        let text_len = buffer.length().max(0) as usize;
+        if text_len == 0 {
+            return Vec::new();
+        }
+
         let ranges = select_highlight_ranges(buffer, text_len, cursor_pos, edited_range, viewport);
+        let mut requests = Vec::with_capacity(ranges.len());
         for (range_start, range_end) in ranges {
             if range_start >= range_end {
                 continue;
@@ -255,13 +304,38 @@ impl SqlHighlighter {
             let Some(window_text) = buffer.text_range(range_start as i32, range_end as i32) else {
                 continue;
             };
-            let (window_styles, _exit_state) =
-                self.generate_styles_with_state(&window_text, entry_state);
-            if window_styles.len() != range_end - range_start {
+            requests.push(WindowHighlightRequest {
+                start: range_start,
+                end: range_end,
+                text: window_text,
+                entry_state,
+            });
+        }
+        requests
+    }
+
+    pub fn generate_window_styles(
+        &self,
+        requests: Vec<WindowHighlightRequest>,
+    ) -> Vec<WindowHighlightResult> {
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let expected_len = request.end.saturating_sub(request.start);
+            if expected_len == 0 {
                 continue;
             }
-            style_buffer.replace(range_start as i32, range_end as i32, &window_styles);
+            let (styles, _exit_state) =
+                self.generate_styles_with_state(&request.text, request.entry_state);
+            if styles.len() != expected_len {
+                continue;
+            }
+            results.push(WindowHighlightResult {
+                start: request.start,
+                end: request.end,
+                styles,
+            });
         }
+        results
     }
 
     /// Probe backward from `pos` to determine the lexer state at that position.
@@ -757,6 +831,7 @@ fn select_highlight_ranges(
     viewport: Option<(usize, usize)>,
 ) -> Vec<(usize, usize)> {
     let mut anchors = vec![cursor_pos.min(text_len)];
+    let mut large_edit_focus_only = false;
 
     // Always include viewport center as an anchor so visible area is highlighted.
     if let Some((vp_start, vp_end)) = viewport {
@@ -776,13 +851,22 @@ fn select_highlight_ranges(
             anchors.push(start);
         } else {
             let span = end - start;
-            let step = (HIGHLIGHT_WINDOW_RADIUS * 2).max(1);
-            let mut windows = span.div_ceil(step).max(1);
-            windows = windows.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS.saturating_sub(1).max(1));
+            if span >= LARGE_EDIT_SPAN_FOCUS_THRESHOLD {
+                // Very large edits can span the whole document (paste/load).
+                // Keep anchors focused near current cursor/viewport instead of
+                // distributing windows across the entire edit span.
+                large_edit_focus_only = true;
+                anchors.push(start);
+                anchors.push(end);
+            } else {
+                let step = (HIGHLIGHT_WINDOW_RADIUS * 2).max(1);
+                let mut windows = span.div_ceil(step).max(1);
+                windows = windows.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS.saturating_sub(1).max(1));
 
-            for i in 0..=windows {
-                let offset = span.saturating_mul(i) / windows;
-                anchors.push(start + offset);
+                for i in 0..=windows {
+                    let offset = span.saturating_mul(i) / windows;
+                    anchors.push(start + offset);
+                }
             }
         }
     }
@@ -804,7 +888,18 @@ fn select_highlight_ranges(
         merged.push((start, end));
     }
 
-    if merged.len() > MAX_HIGHLIGHT_WINDOWS_PER_PASS {
+    if large_edit_focus_only {
+        let mut focus_points = vec![cursor_pos.min(text_len)];
+        if let Some((vp_start, vp_end)) = viewport {
+            let clamped_start = vp_start.min(text_len);
+            let clamped_end = vp_end.min(text_len);
+            focus_points.push(clamped_start);
+            focus_points.push(clamped_end);
+            focus_points.push((clamped_start + clamped_end) / 2);
+        }
+        let max_ranges = MAX_HIGHLIGHT_WINDOWS_FOR_LARGE_EDIT.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+        merged = prioritize_ranges_for_focus(merged, &focus_points, max_ranges.max(1));
+    } else if merged.len() > MAX_HIGHLIGHT_WINDOWS_PER_PASS {
         let mut focus_points = vec![cursor_pos.min(text_len)];
         if let Some((edit_start, edit_end)) = edited_range {
             focus_points.push(edit_start.min(text_len));

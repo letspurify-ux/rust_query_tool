@@ -25,7 +25,8 @@ use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{flush_history_writer_with_timeout, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
-    create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_STRING,
+    create_style_table_with, HighlightData, SqlHighlighter, WindowHighlightRequest,
+    WindowHighlightResult, STYLE_COMMENT, STYLE_STRING, WINDOWED_HIGHLIGHT_THRESHOLD,
 };
 use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistory, QueryHistoryEntry};
@@ -64,9 +65,12 @@ const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
+const MAX_CONNECTED_WORD_EXPANSION_SPAN: usize = 16_384;
+const MAX_CONNECTED_WORD_SCAN_WINDOW_BYTES: usize = 32_768;
 /// Maximum scan radius for stateful delimiter changes (e.g. `'`, `/*`).
 /// Replaces the old full-buffer scan with a bounded 128 KB window.
 const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
+const DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT: usize = 16_384;
 const VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS: f64 = 0.08;
 const EDITOR_TOP_PADDING: i32 = 4;
 const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
@@ -684,14 +688,36 @@ enum UiActionResult {
 struct HighlightRequest {
     revision: u64,
     generation: u64,
-    text: String,
+    kind: HighlightRequestKind,
+}
+
+#[derive(Clone)]
+enum HighlightRequestKind {
+    FullText {
+        text: String,
+    },
+    Windowed {
+        text_len: usize,
+        windows: Vec<WindowHighlightRequest>,
+    },
 }
 
 #[derive(Clone)]
 struct HighlightResult {
     revision: u64,
     generation: u64,
-    style_text: String,
+    kind: HighlightResultKind,
+}
+
+#[derive(Clone)]
+enum HighlightResultKind {
+    FullText {
+        style_text: String,
+    },
+    Windowed {
+        text_len: usize,
+        windows: Vec<WindowHighlightResult>,
+    },
 }
 
 #[derive(Clone)]
@@ -802,22 +828,38 @@ impl SqlEditorWidget {
                     }
 
                     for task in latest_tasks.into_values() {
-                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let request = task.request;
+                        let revision = request.revision;
+                        let generation = request.generation;
+                        let fallback_request_kind = request.kind.clone();
+                        let result = panic::catch_unwind(AssertUnwindSafe(move || {
                             let guard = task
                                 .highlighter
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            guard.generate_styles_for_text(&task.request.text)
+                            match request.kind {
+                                HighlightRequestKind::FullText { text } => {
+                                    HighlightResultKind::FullText {
+                                        style_text: guard.generate_styles_for_text(&text),
+                                    }
+                                }
+                                HighlightRequestKind::Windowed { text_len, windows } => {
+                                    HighlightResultKind::Windowed {
+                                        text_len,
+                                        windows: guard.generate_window_styles(windows),
+                                    }
+                                }
+                            }
                         }));
 
                         match result {
-                            Ok(style_text) => {
+                            Ok(kind) => {
                                 if task
                                     .result_sender
                                     .send(HighlightResult {
-                                        revision: task.request.revision,
-                                        generation: task.request.generation,
-                                        style_text,
+                                        revision,
+                                        generation,
+                                        kind,
                                     })
                                     .is_ok()
                                 {
@@ -835,16 +877,16 @@ impl SqlEditorWidget {
                                     ),
                                 );
 
-                                let fallback_styles =
-                                    SqlEditorWidget::default_style_text_for_len(
-                                        task.request.text.len(),
+                                let fallback_kind =
+                                    SqlEditorWidget::fallback_highlight_result_kind(
+                                        &fallback_request_kind,
                                     );
                                 if task
                                     .result_sender
                                     .send(HighlightResult {
-                                        revision: task.request.revision,
-                                        generation: task.request.generation,
-                                        style_text: fallback_styles,
+                                        revision,
+                                        generation,
+                                        kind: fallback_kind,
                                     })
                                     .is_ok()
                                 {
@@ -875,6 +917,49 @@ impl SqlEditorWidget {
 
     fn default_style_text_for_len(len: usize) -> String {
         std::iter::repeat_n(STYLE_DEFAULT, len).collect()
+    }
+
+    fn text_len_to_i32(text_len: usize) -> Option<i32> {
+        i32::try_from(text_len).ok()
+    }
+
+    fn ensure_style_buffer_len(style_buffer: &mut TextBuffer, text_len: usize) -> bool {
+        let Some(expected_len) = Self::text_len_to_i32(text_len) else {
+            crate::utils::logging::log_error(
+                "sql_editor::highlight_worker",
+                "text too large to represent in FLTK TextBuffer length",
+            );
+            return false;
+        };
+
+        if style_buffer.length() != expected_len {
+            style_buffer.set_text(&Self::default_style_text_for_len(text_len));
+        }
+        true
+    }
+
+    fn fallback_highlight_result_kind(request_kind: &HighlightRequestKind) -> HighlightResultKind {
+        match request_kind {
+            HighlightRequestKind::FullText { text } => HighlightResultKind::FullText {
+                style_text: Self::default_style_text_for_len(text.len()),
+            },
+            HighlightRequestKind::Windowed { text_len, windows } => {
+                let mut fallback_windows = Vec::with_capacity(windows.len());
+                for window in windows {
+                    let start = window.start.min(*text_len);
+                    let end = window.end.min(*text_len).max(start);
+                    fallback_windows.push(WindowHighlightResult {
+                        start,
+                        end,
+                        styles: Self::default_style_text_for_len(end.saturating_sub(start)),
+                    });
+                }
+                HighlightResultKind::Windowed {
+                    text_len: *text_len,
+                    windows: fallback_windows,
+                }
+            }
+        }
     }
 
     fn schedule_alert_pump(delay_seconds: f64) {
@@ -1248,24 +1333,23 @@ impl SqlEditorWidget {
             let mut pending_rows: Vec<(usize, Vec<Vec<String>>)> = Vec::new();
             let mut pending_row_index_map: HashMap<usize, usize> = HashMap::new();
 
-            let flush_rows = |
-                pending_rows: &mut Vec<(usize, Vec<Vec<String>>)>,
-                pending_row_index_map: &mut HashMap<usize, usize>,
-            | {
-                if pending_rows.is_empty() {
-                    return;
-                }
-                // IMPORTANT: Do not drop buffered rows when cancel is requested.
-                // Users expect rows fetched before cancel to remain visible, and
-                // cancel only stops additional fetches from the worker side.
-                for (index, rows) in pending_rows.drain(..) {
-                    SqlEditorWidget::invoke_progress_callback(
-                        &progress_callback,
-                        QueryProgress::Rows { index, rows },
-                    );
-                }
-                pending_row_index_map.clear();
-            };
+            let flush_rows =
+                |pending_rows: &mut Vec<(usize, Vec<Vec<String>>)>,
+                 pending_row_index_map: &mut HashMap<usize, usize>| {
+                    if pending_rows.is_empty() {
+                        return;
+                    }
+                    // IMPORTANT: Do not drop buffered rows when cancel is requested.
+                    // Users expect rows fetched before cancel to remain visible, and
+                    // cancel only stops additional fetches from the worker side.
+                    for (index, rows) in pending_rows.drain(..) {
+                        SqlEditorWidget::invoke_progress_callback(
+                            &progress_callback,
+                            QueryProgress::Rows { index, rows },
+                        );
+                    }
+                    pending_row_index_map.clear();
+                };
             // Process any pending messages
             loop {
                 if processed >= MAX_PROGRESS_MESSAGES_PER_POLL {
@@ -1841,12 +1925,12 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let widget = self.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
-        buffer.add_modify_callback2(move |buf, _pos, _ins, _del, _restyled, _deleted_text| {
+        buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             intellisense_parse_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            widget.enqueue_highlight_request(buf.text());
+            widget.handle_buffer_highlight_update(buf, pos, ins, del, deleted_text);
         });
         self.refresh_highlighting();
     }
@@ -1891,7 +1975,34 @@ impl SqlEditorWidget {
                 let current_generation = widget.highlight_generation.load(Ordering::Relaxed);
                 if result.revision == current_revision && result.generation == current_generation {
                     let mut style_buffer = widget.style_buffer.clone();
-                    style_buffer.set_text(&result.style_text);
+                    match result.kind {
+                        HighlightResultKind::FullText { style_text } => {
+                            style_buffer.set_text(&style_text);
+                        }
+                        HighlightResultKind::Windowed { text_len, windows } => {
+                            if SqlEditorWidget::ensure_style_buffer_len(&mut style_buffer, text_len)
+                            {
+                                for window in windows {
+                                    if window.start >= window.end || window.end > text_len {
+                                        continue;
+                                    }
+                                    if window.styles.len()
+                                        != window.end.saturating_sub(window.start)
+                                    {
+                                        continue;
+                                    }
+                                    let (Ok(start), Ok(end)) =
+                                        (i32::try_from(window.start), i32::try_from(window.end))
+                                    else {
+                                        continue;
+                                    };
+                                    if end > start {
+                                        style_buffer.replace(start, end, &window.styles);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut editor = widget.editor.clone();
                     editor.redraw();
                     app::redraw();
@@ -1910,13 +2021,13 @@ impl SqlEditorWidget {
         let widget = self.clone();
         let editor = self.editor.clone();
         let buffer = self.buffer.clone();
-        let last_viewport_state = Arc::new(Mutex::new(None::<(bool, i32, i32, i32, i32, i32)>));
+        let last_viewport_state = Arc::new(Mutex::new(None::<(bool, i32, i32, i32, i32)>));
 
         fn schedule_poll(
             widget: SqlEditorWidget,
             editor: TextEditor,
             buffer: TextBuffer,
-            last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32, i32)>>>,
+            last_viewport_state: Arc<Mutex<Option<(bool, i32, i32, i32, i32)>>>,
         ) {
             if widget.group.was_deleted() || editor.was_deleted() {
                 return;
@@ -1928,7 +2039,7 @@ impl SqlEditorWidget {
             let w = editor.w();
             let h = editor.h();
             let text_len = buffer.length();
-            let current_state = (visible, top_row, left_col, w, h, text_len);
+            let current_state = (visible, top_row, left_col, w, h);
             let should_refresh = {
                 let mut previous = last_viewport_state
                     .lock()
@@ -1941,7 +2052,9 @@ impl SqlEditorWidget {
             };
 
             if should_refresh {
-                widget.refresh_highlighting();
+                if SqlEditorWidget::should_use_windowed_highlighting(text_len.max(0) as usize) {
+                    widget.refresh_highlighting();
+                }
             }
 
             app::add_timeout3(VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS, move |_| {
@@ -2227,9 +2340,10 @@ impl SqlEditorWidget {
             let sender_fallback = sender.clone();
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 // Try to acquire connection lock without blocking
-                let Some(mut conn_guard) =
-                    crate::db::try_lock_connection_with_activity(&connection, "Rollback transaction")
-                else {
+                let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
+                    &connection,
+                    "Rollback transaction",
+                ) else {
                     // Query is already running, notify user
                     let _ = sender.send(UiActionResult::QueryAlreadyRunning);
                     app::awake();
@@ -2610,28 +2724,144 @@ impl SqlEditorWidget {
         self.editor.redraw();
     }
 
-    fn enqueue_highlight_request(&self, text: String) {
-        let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let generation = self.highlight_generation.load(Ordering::Relaxed);
-        let text_len = text.len();
+    fn should_use_windowed_highlighting(text_len: usize) -> bool {
+        text_len > WINDOWED_HIGHLIGHT_THRESHOLD
+    }
 
-        let task = HighlightWorkerTask {
-            editor_id: self.highlight_editor_id,
-            request: HighlightRequest {
-                revision,
-                generation,
-                text,
-            },
-            highlighter: self.highlighter.clone(),
-            result_sender: self.highlight_result_sender.clone(),
+    fn invalidate_pending_highlight_results(&self) {
+        self.highlight_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn handle_buffer_highlight_update(
+        &self,
+        buf: &TextBuffer,
+        pos: i32,
+        ins: i32,
+        del: i32,
+        deleted_text: &str,
+    ) {
+        let text_len = buf.length().max(0) as usize;
+        if !Self::should_use_windowed_highlighting(text_len) {
+            self.enqueue_highlight_request(buf.text());
+            return;
+        }
+
+        self.invalidate_pending_highlight_results();
+
+        let edited_range = Self::expanded_edited_range_for_windowed_highlight(
+            buf,
+            pos,
+            ins,
+            del,
+            deleted_text,
+            text_len,
+        );
+        let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
+        // Edit updates already include cursor and edited anchors, so avoid
+        // per-keystroke viewport probing (skip_lines) on very large buffers.
+        self.apply_windowed_highlighting(cursor_pos, edited_range, None, Some((pos, ins, del)));
+    }
+
+    fn expanded_edited_range_for_windowed_highlight(
+        buf: &TextBuffer,
+        pos: i32,
+        ins: i32,
+        del: i32,
+        deleted_text: &str,
+        text_len: usize,
+    ) -> Option<(usize, usize)> {
+        let (range_start, range_end) = compute_edited_range(pos, ins, del, text_len)?;
+        let (mut expanded_start, mut expanded_end) =
+            expand_connected_word_range(buf, range_start, range_end);
+
+        if needs_full_rehighlight(buf, pos, ins, deleted_text) {
+            expanded_start = expanded_start.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
+            expanded_end = expanded_end
+                .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
+                .min(text_len);
+        }
+
+        Some(normalize_highlight_range(
+            expanded_start,
+            expanded_end,
+            text_len,
+        ))
+    }
+
+    fn apply_windowed_highlighting(
+        &self,
+        cursor_pos: usize,
+        edited_range: Option<(usize, usize)>,
+        viewport: Option<(usize, usize)>,
+        edit_delta: Option<(i32, i32, i32)>,
+    ) {
+        let text_len = self.buffer.length().max(0) as usize;
+        let cursor = cursor_pos.min(text_len);
+        let edited_range =
+            edited_range.map(|(start, end)| normalize_highlight_range(start, end, text_len));
+        let viewport = viewport.map(|(start, end)| normalize_highlight_range(start, end, text_len));
+
+        let mut style_buffer = self.style_buffer.clone();
+        if let Some((pos, ins, del)) = edit_delta {
+            Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, ins, del);
+        }
+        if !Self::ensure_style_buffer_len(&mut style_buffer, text_len) {
+            return;
+        }
+
+        let window_requests = {
+            let highlighter = self
+                .highlighter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            highlighter.prepare_window_highlight_requests(
+                &self.buffer,
+                &style_buffer,
+                cursor,
+                edited_range,
+                viewport,
+            )
         };
 
+        let mut editor = self.editor.clone();
+        editor.redraw();
+        app::redraw();
+
+        if window_requests.is_empty() {
+            return;
+        }
+        self.enqueue_windowed_highlight_request(text_len, window_requests);
+    }
+
+    fn apply_style_buffer_edit_delta(style_buffer: &mut TextBuffer, pos: i32, ins: i32, del: i32) {
+        if ins <= 0 && del <= 0 {
+            return;
+        }
+
+        let style_len = style_buffer.length().max(0);
+        let start = pos.clamp(0, style_len);
+        let delete_len = del.max(0);
+        let delete_end = start.saturating_add(delete_len).min(style_len);
+        if delete_end > start {
+            style_buffer.remove(start, delete_end);
+        }
+
+        if ins > 0 {
+            let default_styles = Self::default_style_text_for_len(ins as usize);
+            style_buffer.replace(start, start, &default_styles);
+        }
+    }
+
+    fn enqueue_worker_task_with_retry(&self, task: HighlightWorkerTask) {
+        let revision = task.request.revision;
+        let generation = task.request.generation;
+        let fallback_kind = task.request.kind.clone();
         let Some(sender) = Self::highlight_worker_sender() else {
             crate::utils::logging::log_error(
                 "sql_editor::highlight_worker",
                 "highlight worker unavailable; failed to enqueue request",
             );
-            self.enqueue_default_highlight_result(revision, generation, text_len);
+            self.enqueue_fallback_highlight_result(revision, generation, &fallback_kind);
             return;
         };
 
@@ -2652,7 +2882,7 @@ impl SqlEditorWidget {
                     "sql_editor::highlight_worker",
                     &format!("failed to enqueue highlight request after retry: {}", err),
                 );
-                self.enqueue_default_highlight_result(revision, generation, text_len);
+                self.enqueue_fallback_highlight_result(revision, generation, &fallback_kind);
             }
         } else {
             Self::clear_cached_highlight_worker_sender();
@@ -2660,23 +2890,87 @@ impl SqlEditorWidget {
                 "sql_editor::highlight_worker",
                 "highlight worker unavailable after retry; request dropped",
             );
-            self.enqueue_default_highlight_result(revision, generation, text_len);
+            self.enqueue_fallback_highlight_result(revision, generation, &fallback_kind);
         }
     }
 
-    fn enqueue_default_highlight_result(&self, revision: u64, generation: u64, text_len: usize) {
+    fn enqueue_fallback_highlight_result(
+        &self,
+        revision: u64,
+        generation: u64,
+        request_kind: &HighlightRequestKind,
+    ) {
         let fallback = HighlightResult {
             revision,
             generation,
-            style_text: Self::default_style_text_for_len(text_len),
+            kind: Self::fallback_highlight_result_kind(request_kind),
         };
         if self.highlight_result_sender.send(fallback).is_ok() {
             app::awake();
         }
     }
 
+    fn enqueue_highlight_request(&self, text: String) {
+        let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let request_kind = HighlightRequestKind::FullText { text };
+        let task = HighlightWorkerTask {
+            editor_id: self.highlight_editor_id,
+            request: HighlightRequest {
+                revision,
+                generation,
+                kind: request_kind,
+            },
+            highlighter: self.highlighter.clone(),
+            result_sender: self.highlight_result_sender.clone(),
+        };
+
+        self.enqueue_worker_task_with_retry(task);
+    }
+
+    fn enqueue_windowed_highlight_request(
+        &self,
+        text_len: usize,
+        window_requests: Vec<WindowHighlightRequest>,
+    ) {
+        if window_requests.is_empty() {
+            return;
+        }
+
+        let revision = self.highlight_revision.load(Ordering::Relaxed);
+        let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let task = HighlightWorkerTask {
+            editor_id: self.highlight_editor_id,
+            request: HighlightRequest {
+                revision,
+                generation,
+                kind: HighlightRequestKind::Windowed {
+                    text_len,
+                    windows: window_requests,
+                },
+            },
+            highlighter: self.highlighter.clone(),
+            result_sender: self.highlight_result_sender.clone(),
+        };
+
+        self.enqueue_worker_task_with_retry(task);
+    }
+
     #[allow(dead_code)]
     pub fn refresh_highlighting(&self) {
+        let text_len = self.buffer.length().max(0) as usize;
+        if Self::should_use_windowed_highlighting(text_len) {
+            self.invalidate_pending_highlight_results();
+            let cursor_pos = self
+                .editor
+                .insert_position()
+                .clamp(0, self.buffer.length())
+                .max(0) as usize;
+            let viewport = editor_viewport_range(&self.editor, &self.buffer);
+            self.apply_windowed_highlighting(cursor_pos, None, viewport, None);
+            return;
+        }
+
         self.enqueue_highlight_request(self.buffer.text());
     }
 
@@ -3027,6 +3321,15 @@ fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<S
     data.get_all_columns_for_highlighting()
 }
 
+fn normalize_highlight_range(start: usize, end: usize, text_len: usize) -> (usize, usize) {
+    let mut bounded_start = start.min(text_len);
+    let mut bounded_end = end.min(text_len);
+    if bounded_start > bounded_end {
+        std::mem::swap(&mut bounded_start, &mut bounded_end);
+    }
+    (bounded_start, bounded_end)
+}
+
 fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (usize, usize) {
     let text_len = buf.length().max(0) as usize;
     if text_len == 0 {
@@ -3035,10 +3338,20 @@ fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (u
 
     let bounded_start = start.min(text_len);
     let bounded_end = end.min(text_len).max(bounded_start);
+    let changed_span = bounded_end.saturating_sub(bounded_start);
+    if changed_span > MAX_CONNECTED_WORD_EXPANSION_SPAN {
+        // Large paste/load paths can make `text_range` copy massive buffers.
+        // Skip word-boundary expansion and keep the raw edited range.
+        return (bounded_start, bounded_end);
+    }
+
     let window_start = bounded_start.saturating_sub(HIGHLIGHT_RANGE_EXPANSION_WINDOW);
     let window_end = bounded_end
         .saturating_add(HIGHLIGHT_RANGE_EXPANSION_WINDOW)
         .min(text_len);
+    if window_end.saturating_sub(window_start) > MAX_CONNECTED_WORD_SCAN_WINDOW_BYTES {
+        return (bounded_start, bounded_end);
+    }
 
     let Some(window_text) = buf.text_range(window_start as i32, window_end as i32) else {
         return (bounded_start, bounded_end);
@@ -3117,25 +3430,32 @@ fn compute_edited_range(pos: i32, ins: i32, del: i32, text_len: usize) -> Option
 }
 
 fn needs_full_rehighlight(buf: &TextBuffer, pos: i32, ins: i32, deleted_text: &str) -> bool {
-    let mut changed_text = String::new();
-
     if !deleted_text.is_empty() {
-        changed_text.push_str(deleted_text);
-    }
-
-    if ins > 0 && pos >= 0 {
-        let insert_end = pos.saturating_add(ins).min(buf.length());
-        if let Some(inserted_text) = buf.text_range(pos, insert_end) {
-            changed_text.push_str(&inserted_text);
+        if deleted_text.len() > DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT {
+            return true;
+        }
+        if has_stateful_sql_delimiter(deleted_text) {
+            return true;
         }
     }
 
-    if changed_text.is_empty() {
-        return false;
-    }
+    if ins > 0 {
+        if pos < 0 {
+            return true;
+        }
+        let insert_len = ins.max(0) as usize;
+        if insert_len > DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT {
+            return true;
+        }
 
-    if has_stateful_sql_delimiter(&changed_text) {
-        return true;
+        let insert_end = pos.saturating_add(ins).min(buf.length());
+        if let Some(inserted_text) = buf.text_range(pos, insert_end) {
+            if has_stateful_sql_delimiter(&inserted_text) {
+                return true;
+            }
+        } else {
+            return true;
+        }
     }
 
     if pos < 0 {
@@ -3148,7 +3468,6 @@ fn needs_full_rehighlight(buf: &TextBuffer, pos: i32, ins: i32, deleted_text: &s
         .saturating_add(2)
         .min(buf.length());
     let nearby = buf.text_range(sample_start, sample_end).unwrap_or_default();
-
     has_stateful_sql_delimiter(&nearby)
 }
 

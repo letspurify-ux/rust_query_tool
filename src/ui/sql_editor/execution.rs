@@ -55,6 +55,8 @@ const PROGRESS_ROWS_INITIAL_BATCH: usize = 100;
 const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const PROGRESS_ROWS_MAX_BATCH: usize = 100_000;
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
+// For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
+const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ScriptExecutionFrame {
@@ -293,6 +295,15 @@ impl SqlEditorWidget {
         }
 
         let source_pos = Self::clamp_to_char_boundary(source, original_pos as usize);
+        if source.len() >= CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES {
+            if source.is_empty() || formatted.is_empty() {
+                return 0;
+            }
+            let scaled_pos =
+                (source_pos as u128).saturating_mul(formatted.len() as u128) / source.len() as u128;
+            return Self::clamp_to_char_boundary(formatted, scaled_pos as usize) as i32;
+        }
+
         let source_prefix = &source[..source_pos];
         let mut formatted_prefix = Self::format_sql_basic(source_prefix);
         if preserve_selection_terminator {
@@ -504,7 +515,7 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn format_sql_basic(sql: &str) -> String {
-        let mut formatted = String::new();
+        let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = super::query_text::split_format_items(sql);
         if items.is_empty() {
             return String::new();
@@ -1045,32 +1056,14 @@ impl SqlEditorWidget {
 
         let mut idx = 0;
         while idx < tokens.len() {
-            let token = tokens[idx].clone();
-            let next_word_upper = tokens[idx + 1..].iter().find_map(|t| match t {
-                SqlToken::Word(w) => Some(w.to_uppercase()),
+            let next_word = tokens[idx + 1..].iter().find_map(|t| match t {
+                SqlToken::Word(w) => Some(w.as_str()),
                 _ => None,
             });
-            let end_qualifier = {
-                let mut qualifier = None;
-                for t in &tokens[idx + 1..] {
-                    match t {
-                        SqlToken::Comment(comment) => {
-                            if comment.contains('\n') {
-                                break;
-                            }
-                        }
-                        SqlToken::Word(w) => {
-                            qualifier = Some(w.to_uppercase());
-                            break;
-                        }
-                        SqlToken::Symbol(sym) if sym == ";" => break,
-                        _ => break,
-                    }
-                }
-                qualifier
-            };
+            let next_word_is =
+                |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
 
-            match token {
+            match &tokens[idx] {
                 SqlToken::Word(word) => {
                     let upper = word.to_uppercase();
                     let in_sql_case_clause = matches!(
@@ -1089,7 +1082,7 @@ impl SqlEditorWidget {
                     let is_keyword = SQL_KEYWORDS.iter().any(|&kw| kw == upper);
                     let is_or_in_create = upper == "OR"
                         && matches!(prev_word_upper.as_deref(), Some("CREATE"))
-                        && matches!(next_word_upper.as_deref(), Some("REPLACE"));
+                        && next_word_is("REPLACE");
                     let is_insert_into =
                         upper == "INTO" && matches!(prev_word_upper.as_deref(), Some("INSERT"));
                     let is_merge_into =
@@ -1102,6 +1095,25 @@ impl SqlEditorWidget {
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = upper == "WHEN" && pending_exit_condition;
                     if upper == "END" {
+                        let end_qualifier = {
+                            let mut qualifier = None;
+                            for t in &tokens[idx + 1..] {
+                                match t {
+                                    SqlToken::Comment(comment) => {
+                                        if comment.contains('\n') {
+                                            break;
+                                        }
+                                    }
+                                    SqlToken::Word(w) => {
+                                        qualifier = Some(w.to_uppercase());
+                                        break;
+                                    }
+                                    SqlToken::Symbol(sym) if sym == ";" => break,
+                                    _ => break,
+                                }
+                            }
+                            qualifier
+                        };
                         // Check if this is END LOOP, END IF, END CASE, etc.
                         let mut end_tail: Vec<String> = Vec::new();
                         if let Some(qualifier) = end_qualifier.as_deref() {
@@ -1325,7 +1337,7 @@ impl SqlEditorWidget {
                     } else if create_pending && (upper == "OR" || upper == "REPLACE") {
                         // part of CREATE OR REPLACE
                     } else if create_pending && upper == "PACKAGE" {
-                        if matches!(next_word_upper.as_deref(), Some("BODY")) {
+                        if next_word_is("BODY") {
                             create_object = Some("PACKAGE_BODY".to_string());
                         } else {
                             create_object = Some("PACKAGE".to_string());
@@ -1410,19 +1422,14 @@ impl SqlEditorWidget {
                             && !matches!(current_clause.as_deref(), Some("SELECT"))
                         {
                             newline_after_keyword = true;
-                        } else if upper == "ELSE"
-                            && in_sql_case_clause
-                            && matches!(next_word_upper.as_deref(), Some("CASE"))
-                        {
+                        } else if upper == "ELSE" && in_sql_case_clause && next_word_is("CASE") {
                             // Keep ELSE CASE from collapsing into one long SQL expression line.
                             newline_after_keyword = true;
                         }
                     } else if upper == "THEN" {
                         if in_plsql_block && !matches!(current_clause.as_deref(), Some("SELECT")) {
                             newline_after_keyword = true;
-                        } else if in_sql_case_clause
-                            && matches!(next_word_upper.as_deref(), Some("CASE"))
-                        {
+                        } else if in_sql_case_clause && next_word_is("CASE") {
                             // Nested CASE in SQL expressions should start on its own line.
                             newline_after_keyword = true;
                         }
@@ -1443,7 +1450,7 @@ impl SqlEditorWidget {
                         }
                         join_modifier_active = false;
                     } else if join_modifiers.contains(&upper.as_str()) {
-                        if matches!(next_word_upper.as_deref(), Some("JOIN" | "OUTER")) {
+                        if next_word_is("JOIN") || next_word_is("OUTER") {
                             newline_with(
                                 &mut out,
                                 base_indent(
@@ -1459,9 +1466,7 @@ impl SqlEditorWidget {
                             join_modifier_active = true;
                         }
                     } else if upper == outer_keyword {
-                        if matches!(next_word_upper.as_deref(), Some("JOIN"))
-                            && !join_modifier_active
-                        {
+                        if next_word_is("JOIN") && !join_modifier_active {
                             newline_with(
                                 &mut out,
                                 base_indent(
@@ -1656,7 +1661,7 @@ impl SqlEditorWidget {
 
                     if create_table_paren_expected
                         && upper == "AS"
-                        && matches!(next_word_upper.as_deref(), Some("SELECT" | "WITH"))
+                        && (next_word_is("SELECT") || next_word_is("WITH"))
                     {
                         create_table_paren_expected = false;
                     }
@@ -1960,10 +1965,7 @@ impl SqlEditorWidget {
                             between_pending = false;
                             pending_exit_condition = false;
                             if pending_package_member_separator
-                                && matches!(
-                                    next_word_upper.as_deref(),
-                                    Some("PROCEDURE" | "FUNCTION")
-                                )
+                                && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
                             {
                                 out.push_str("\n\n");
                             }
@@ -2019,10 +2021,12 @@ impl SqlEditorWidget {
                             }
 
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
-                            let is_subquery = matches!(
-                                next_word_upper.as_deref(),
-                                Some("SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
-                            );
+                            let is_subquery = next_word_is("SELECT")
+                                || next_word_is("WITH")
+                                || next_word_is("INSERT")
+                                || next_word_is("UPDATE")
+                                || next_word_is("DELETE")
+                                || next_word_is("MERGE");
                             if needs_space {
                                 out.push(' ');
                             }
@@ -2163,8 +2167,7 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        let formatted = out.trim_end().to_string();
-        Self::apply_parser_depth_indentation(&formatted)
+        Self::apply_parser_depth_indentation(out.trim_end())
     }
 
     fn apply_parser_depth_indentation(formatted: &str) -> String {
@@ -2236,7 +2239,7 @@ impl SqlEditorWidget {
                 continue;
             }
 
-            let trimmed_upper = trimmed.to_uppercase();
+            let trimmed_upper = trimmed.to_ascii_uppercase();
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(|prev| prev.ends_with('('));
@@ -8439,6 +8442,25 @@ END oqt_mega_pkg;"#;
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
             "Mapped cursor should stay near the same token after reformat, got: {}",
             mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_large_source_uses_fast_path_and_keeps_utf8_boundary() {
+        let source = "x".repeat(super::CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES + 128);
+        let formatted = "SELECT\n    1\nFROM DUAL;";
+        let source_pos = (source.len() / 2) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format(&source, formatted, source_pos, false)
+            as usize;
+
+        assert!(
+            mapped <= formatted.len(),
+            "mapped cursor should stay in bounds"
+        );
+        assert!(
+            formatted.is_char_boundary(mapped),
+            "mapped cursor should stay on UTF-8 boundary"
         );
     }
 
