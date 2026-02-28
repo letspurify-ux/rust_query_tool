@@ -2599,15 +2599,7 @@ impl SqlEditorWidget {
         let revision = self.highlight_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let generation = self.highlight_generation.load(Ordering::Relaxed);
 
-        let Some(sender) = Self::highlight_worker_sender() else {
-            crate::utils::logging::log_error(
-                "sql_editor::highlight_worker",
-                "highlight worker unavailable; failed to enqueue request",
-            );
-            return;
-        };
-
-        let send_result = sender.send(HighlightWorkerTask {
+        let task = HighlightWorkerTask {
             editor_id: self.highlight_editor_id,
             request: HighlightRequest {
                 revision,
@@ -2616,13 +2608,39 @@ impl SqlEditorWidget {
             },
             highlighter: self.highlighter.clone(),
             result_sender: self.highlight_result_sender.clone(),
-        });
+        };
 
-        if let Err(err) = send_result {
+        let Some(sender) = Self::highlight_worker_sender() else {
+            crate::utils::logging::log_error(
+                "sql_editor::highlight_worker",
+                "highlight worker unavailable; failed to enqueue request",
+            );
+            return;
+        };
+
+        if sender.send(task.clone()).is_ok() {
+            return;
+        }
+
+        Self::clear_cached_highlight_worker_sender();
+        crate::utils::logging::log_error(
+            "sql_editor::highlight_worker",
+            "failed to enqueue highlight request; retrying with a new worker",
+        );
+
+        if let Some(retry_sender) = Self::highlight_worker_sender() {
+            if let Err(err) = retry_sender.send(task) {
+                Self::clear_cached_highlight_worker_sender();
+                crate::utils::logging::log_error(
+                    "sql_editor::highlight_worker",
+                    &format!("failed to enqueue highlight request after retry: {}", err),
+                );
+            }
+        } else {
             Self::clear_cached_highlight_worker_sender();
             crate::utils::logging::log_error(
                 "sql_editor::highlight_worker",
-                &format!("failed to enqueue highlight request: {}", err),
+                "highlight worker unavailable after retry; request dropped",
             );
         }
     }
