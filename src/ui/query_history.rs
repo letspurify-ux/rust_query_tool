@@ -1317,6 +1317,26 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 }
 
+/// Case-insensitive substring search. Uses a fast byte-level comparison when
+/// the haystack is ASCII (common for SQL, timestamps, connection names),
+/// falling back to Unicode case folding only when necessary.
+fn contains_lower(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() {
+        let h = haystack.as_bytes();
+        let n = needle_lower.as_bytes();
+        if n.len() > h.len() {
+            return false;
+        }
+        h.windows(n.len())
+            .any(|w| w.iter().zip(n.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b))
+    } else {
+        fold_for_case_insensitive(haystack).contains(needle_lower)
+    }
+}
+
 fn history_entry_matches_filter(
     entry: &QueryHistoryEntry,
     search_lower: &str,
@@ -1330,20 +1350,20 @@ fn history_entry_matches_filter(
         return true;
     }
 
-    if fold_for_case_insensitive(&entry.sql).contains(search_lower) {
+    if contains_lower(&entry.sql, search_lower) {
         return true;
     }
 
-    if fold_for_case_insensitive(&entry.connection_name).contains(search_lower) {
+    if contains_lower(&entry.connection_name, search_lower) {
         return true;
     }
 
-    if fold_for_case_insensitive(&entry.timestamp).contains(search_lower) {
+    if contains_lower(&entry.timestamp, search_lower) {
         return true;
     }
 
     match entry.error_message.as_deref() {
-        Some(message) => fold_for_case_insensitive(message).contains(search_lower),
+        Some(message) => contains_lower(message, search_lower),
         None => false,
     }
 }
@@ -1385,7 +1405,7 @@ fn populate_history_browser(
 #[cfg(test)]
 mod query_history_tests {
     use super::{
-        history_entry_matches_filter, materialize_history_entry, parse_error_line,
+        contains_lower, history_entry_matches_filter, materialize_history_entry, parse_error_line,
         sanitize_history_message, sanitize_history_sql, truncate_sql, PendingHistoryEntry,
         QueryHistoryEntry, REDACTED_SECRET,
     };
@@ -1490,6 +1510,21 @@ CREATE USER app IDENTIFIED BY real_secret;";
         assert!(sanitized.contains("IDENTIFIED BY keep_me"));
         assert!(sanitized.contains(&format!("IDENTIFIED BY {}", REDACTED_SECRET)));
         assert!(!sanitized.contains("real_secret"));
+    }
+
+    #[test]
+    fn contains_lower_ascii_fast_path() {
+        assert!(contains_lower("SELECT * FROM EMPLOYEES", "employees"));
+        assert!(contains_lower("HRDEV", "hrdev"));
+        assert!(!contains_lower("HRDEV", "orders"));
+        assert!(contains_lower("", ""));
+        assert!(!contains_lower("", "x"));
+    }
+
+    #[test]
+    fn contains_lower_unicode_fallback() {
+        assert!(contains_lower("SELECT '프로시저' FROM dual", "프로시저"));
+        assert!(!contains_lower("SELECT '프로시저' FROM dual", "테스트"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_DIR_NAME: &str = "space_query";
@@ -13,6 +13,7 @@ const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 5000;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
+const LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS: u64 = 200;
 
 fn app_data_base_dir() -> Option<PathBuf> {
     if let Some(path) = dirs::data_dir() {
@@ -30,6 +31,14 @@ fn log_writer_response_timeout() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
+}
+
+fn log_writer_save_debounce() -> Duration {
+    std::env::var("SPACE_QUERY_LOG_SAVE_DEBOUNCE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,54 +210,108 @@ fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
     let (sender, receiver) = mpsc::channel::<LogCommand>();
     thread::spawn(move || {
         let mut log = AppLog::load();
+        let save_debounce = log_writer_save_debounce();
+        let mut save_pending = false;
         let apply_command =
             |log: &mut AppLog,
              command: LogCommand,
-             needs_save: &mut bool,
-             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>| {
+             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>|
+             -> bool {
                 match command {
                     LogCommand::Write(entry) => {
                         log.add_entry(entry);
-                        *needs_save = true;
+                        true
                     }
                     LogCommand::Clear => {
                         log.entries.clear();
-                        *needs_save = true;
+                        true
                     }
                     LogCommand::Flush(reply) => {
                         flush_replies.push(reply);
+                        false
                     }
-                };
+                }
             };
         loop {
             let cmd = match receiver.recv() {
                 Ok(cmd) => cmd,
                 Err(_) => break,
             };
-            let previous_state = log.clone();
-            let mut needs_save = false;
+
+            let mut channel_connected = true;
+            let mut mutated_in_batch = false;
             let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
             let mut persist_result: Result<(), String> = Ok(());
-            apply_command(&mut log, cmd, &mut needs_save, &mut flush_replies);
-            while let Ok(next) = receiver.try_recv() {
-                apply_command(&mut log, next, &mut needs_save, &mut flush_replies);
+
+            if apply_command(&mut log, cmd, &mut flush_replies) {
+                save_pending = true;
+                mutated_in_batch = true;
             }
-            if needs_save {
+
+            while let Ok(next) = receiver.try_recv() {
+                if apply_command(&mut log, next, &mut flush_replies) {
+                    save_pending = true;
+                    mutated_in_batch = true;
+                }
+            }
+
+            // Small debounce window to coalesce bursts of log writes into
+            // one disk write while keeping Flush responsive.
+            if save_pending && mutated_in_batch && flush_replies.is_empty() {
+                let mut save_deadline = Instant::now() + save_debounce;
+                loop {
+                    if !flush_replies.is_empty() {
+                        break;
+                    }
+                    let now = Instant::now();
+                    if now >= save_deadline {
+                        break;
+                    }
+
+                    let wait_for = save_deadline.saturating_duration_since(now);
+                    match receiver.recv_timeout(wait_for) {
+                        Ok(next) => {
+                            if apply_command(&mut log, next, &mut flush_replies) {
+                                save_pending = true;
+                                save_deadline = Instant::now() + save_debounce;
+                            }
+                            while let Ok(pending_next) = receiver.try_recv() {
+                                if apply_command(&mut log, pending_next, &mut flush_replies) {
+                                    save_pending = true;
+                                    save_deadline = Instant::now() + save_debounce;
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            channel_connected = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if save_pending {
                 match log.save() {
                     Ok(()) => {
                         persist_result = Ok(());
+                        save_pending = false;
                     }
                     Err(err) => {
                         let msg = format!("Log save error: {err}");
                         eprintln!("{msg}");
-                        log = previous_state;
                         persist_result = Err(msg);
+                        // Keep entries in memory; they will be retried on the next save cycle.
                     }
                 }
             }
 
             for reply in flush_replies {
                 let _ = reply.send(persist_result.clone());
+            }
+
+            if !channel_connected {
+                break;
             }
         }
     });
