@@ -15,6 +15,7 @@ use crate::utils::credential_store;
 const APP_DIR_NAME: &str = "space_query";
 const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
+const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -406,7 +407,8 @@ impl QueryHistory {
             None
         };
 
-        if let Some(history) = loaded {
+        if let Some(mut history) = loaded {
+            history.queries.truncate(MAX_QUERY_HISTORY_ENTRIES);
             if loaded_from_legacy {
                 if let Err(err) = history.save() {
                     crate::utils::logging::log_warning(
@@ -502,8 +504,8 @@ impl QueryHistory {
 
     pub fn add_entry(&mut self, entry: QueryHistoryEntry) {
         self.queries.push_front(entry);
-        // Keep only last 1000 queries
-        self.queries.truncate(1000);
+        // Keep only last 100 queries
+        self.queries.truncate(MAX_QUERY_HISTORY_ENTRIES);
     }
 }
 
