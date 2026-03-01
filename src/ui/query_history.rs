@@ -206,7 +206,7 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
             }
 
             for reply in snapshot_replies {
-                let _ = reply.send(history.queries.clone());
+                let _ = reply.send(history.queries.iter().cloned().collect());
             }
 
             for reply in flush_replies {
@@ -799,12 +799,12 @@ fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
                         }
                     }
                 }
-                (QueryHistory::load().queries, true)
+                (QueryHistory::load().queries.into(), true)
             }
         }
     } else {
         // Writer thread dead – fall back to disk
-        (QueryHistory::load().queries, true)
+        (QueryHistory::load().queries.into(), true)
     }
 }
 

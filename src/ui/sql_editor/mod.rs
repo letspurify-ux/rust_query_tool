@@ -3174,7 +3174,7 @@ impl SqlEditorWidget {
             if loaded.queries.is_empty() {
                 return;
             }
-            *history_entries = Some(loaded.queries);
+            *history_entries = Some(loaded.queries.into());
             *original = Some(self.buffer.text());
         }
 
