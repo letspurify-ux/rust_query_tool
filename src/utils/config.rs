@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -258,7 +259,7 @@ impl Default for AppConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueryHistory {
-    pub queries: Vec<QueryHistoryEntry>,
+    pub queries: VecDeque<QueryHistoryEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -287,7 +288,7 @@ impl QueryHistory {
 
     pub fn new() -> Self {
         Self {
-            queries: Vec::new(),
+            queries: VecDeque::new(),
         }
     }
 
@@ -500,7 +501,7 @@ impl QueryHistory {
     }
 
     pub fn add_entry(&mut self, entry: QueryHistoryEntry) {
-        self.queries.insert(0, entry);
+        self.queries.push_front(entry);
         // Keep only last 1000 queries
         self.queries.truncate(1000);
     }

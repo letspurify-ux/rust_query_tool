@@ -1,5 +1,6 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -76,13 +77,13 @@ pub struct LogEntry {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppLog {
-    pub entries: Vec<LogEntry>,
+    pub entries: VecDeque<LogEntry>,
 }
 
 impl AppLog {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: VecDeque::new(),
         }
     }
 
@@ -156,7 +157,7 @@ impl AppLog {
     }
 
     pub fn add_entry(&mut self, entry: LogEntry) {
-        self.entries.insert(0, entry);
+        self.entries.push_front(entry);
         self.entries.truncate(MAX_LOG_ENTRIES);
     }
 }
@@ -375,8 +376,8 @@ pub fn flush_log_writer() -> Result<(), String> {
 
 /// In-memory ring buffer so the UI can show recent entries without
 /// re-reading the file every time the dialog is opened.
-fn in_memory_log() -> &'static Mutex<Vec<LogEntry>> {
-    static BUFFER: OnceLock<Mutex<Vec<LogEntry>>> = OnceLock::new();
+fn in_memory_log() -> &'static Mutex<VecDeque<LogEntry>> {
+    static BUFFER: OnceLock<Mutex<VecDeque<LogEntry>>> = OnceLock::new();
     BUFFER.get_or_init(|| {
         let log = AppLog::load();
         Mutex::new(log.entries)
@@ -393,7 +394,7 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
 
     // Update in-memory buffer
     if let Ok(mut buf) = in_memory_log().lock() {
-        buf.insert(0, entry.clone());
+        buf.push_front(entry.clone());
         buf.truncate(MAX_LOG_ENTRIES);
     }
 
@@ -430,7 +431,7 @@ pub fn log_debug(source: &str, message: &str) {
 pub fn get_log_entries() -> Vec<LogEntry> {
     in_memory_log()
         .lock()
-        .map(|buf| buf.clone())
+        .map(|buf| buf.iter().cloned().collect())
         .unwrap_or_default()
 }
 
