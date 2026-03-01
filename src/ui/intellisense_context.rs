@@ -78,6 +78,8 @@ pub struct ScopedTableRef {
 pub struct CteDefinition {
     pub name: String,
     pub explicit_columns: Vec<String>,
+    /// Token range for explicit column list inside `WITH cte(col1, col2) ...`.
+    pub explicit_column_range: Option<TokenRange>,
     /// Token range inside `CursorContext.statement_tokens` for the CTE body.
     pub body_range: TokenRange,
 }
@@ -1077,11 +1079,13 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         idx += 1;
 
         let mut explicit_columns = Vec::new();
+        let mut explicit_column_range = None;
 
         // Check for explicit column list: cte_name(col1, col2)
         if let Some(SqlToken::Symbol(s)) = tokens.get(idx) {
             if s == "(" {
                 if let Some((expr_range, next_idx)) = extract_parenthesized_range(tokens, idx) {
+                    explicit_column_range = Some(expr_range);
                     let expr_tokens = token_range_slice(tokens, expr_range);
                     let expr_depths = paren_depths(expr_tokens);
                     idx = next_idx;
@@ -1118,6 +1122,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         ctes.push(CteDefinition {
             name: cte_name,
             explicit_columns,
+            explicit_column_range,
             body_range,
         });
 

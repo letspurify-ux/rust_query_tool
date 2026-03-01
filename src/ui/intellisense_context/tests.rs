@@ -1485,6 +1485,20 @@ fn extract_nested_function_with_alias() {
 }
 
 #[test]
+fn extract_scalar_subquery_with_alias() {
+    let tokens = tokenize(
+        "SELECT \
+           oh.order_id, \
+           (SELECT SUM(oi.qty*oi.unit_price) \
+            FROM oqt_t_order_item oi \
+            WHERE oi.order_id = oh.order_id) AS amt \
+         FROM oqt_t_order_hdr oh",
+    );
+    let cols = extract_select_list_columns(&tokens);
+    assert_eq!(cols, vec!["order_id", "amt"]);
+}
+
+#[test]
 fn extract_table_function_columns_from_xmltable_columns_clause() {
     let tokens = tokenize(
         "'/root/dept' PASSING t.payload COLUMNS \

@@ -251,6 +251,56 @@ fn test_match_recognize_keywords_highlighting() {
 }
 
 #[test]
+fn test_path_in_recursive_cte_column_list_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "WITH r (node_id, parent_id, node_name, lvl, path) AS (\n\
+  SELECT node_id, parent_id, node_name, 1 AS lvl, '/'||node_name AS path\n\
+  FROM oqt_t_tree\n\
+)\n\
+SELECT r.path FROM r";
+    let styles = highlighter.generate_styles(text);
+
+    let cte_path_start = text.find("path) AS").unwrap();
+    assert!(
+        styles[cte_path_start..cte_path_start + 4]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "CTE explicit column name `path` should not be keyword"
+    );
+
+    let alias_path_start = text.find("AS path").unwrap() + 3;
+    assert!(
+        styles[alias_path_start..alias_path_start + 4]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "SELECT alias `path` should not be keyword"
+    );
+
+    let qualified_path_start = text.find("r.path").unwrap() + 2;
+    assert!(
+        styles[qualified_path_start..qualified_path_start + 4]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "qualified column `r.path` should not be keyword"
+    );
+}
+
+#[test]
+fn test_path_keyword_in_xmltable_remains_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT * FROM XMLTABLE('/x' PASSING payload COLUMNS id NUMBER PATH '$.id') t";
+    let styles = highlighter.generate_styles(text);
+
+    let path_start = text.find("PATH").unwrap();
+    assert!(
+        styles[path_start..path_start + 4]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "XMLTABLE PATH clause should stay keyword style"
+    );
+}
+
+#[test]
 fn test_windowed_highlighting_limits_scope() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT col FROM table;\n".repeat(2000);

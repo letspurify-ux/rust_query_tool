@@ -756,7 +756,12 @@ impl SqlHighlighter {
                     }
                 }
 
-                let token_type = self.classify_word(word);
+                let token_type =
+                    if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
+                        self.classify_non_keyword_word(word)
+                    } else {
+                        self.classify_word(word)
+                    };
                 styles[start..idx].fill(token_type.to_style_byte());
                 continue;
             }
@@ -794,6 +799,27 @@ impl SqlHighlighter {
         }
 
         // Check if it's a known identifier (table, view, column)
+        if self.relation_lookup.contains(upper) {
+            return TokenType::Identifier;
+        }
+        if self.column_lookup.contains(upper) {
+            return TokenType::Column;
+        }
+
+        TokenType::Default
+    }
+
+    fn classify_non_keyword_word(&self, word: &str) -> TokenType {
+        let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+            Cow::Owned(word.to_ascii_uppercase())
+        } else {
+            Cow::Borrowed(word)
+        };
+        let upper = upper.as_ref();
+
+        if ORACLE_FUNCTIONS_SET.contains(upper) {
+            return TokenType::Function;
+        }
         if self.relation_lookup.contains(upper) {
             return TokenType::Identifier;
         }
@@ -1044,6 +1070,54 @@ fn is_connect_by_continuation(bytes: &[u8], connect_end: usize) -> bool {
         bytes.get(by_end),
         None | Some(b' ') | Some(b'\t') | Some(b'\n')
     )
+}
+
+fn skip_trivia_and_comments(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() {
+        while matches!(bytes.get(idx), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            idx += 1;
+        }
+
+        if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-') {
+            idx += 2;
+            while let Some(&b) = bytes.get(idx) {
+                idx += 1;
+                if b == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if bytes.get(idx) == Some(&b'/') && bytes.get(idx + 1) == Some(&b'*') {
+            idx += 2;
+            while idx < bytes.len() {
+                if bytes.get(idx) == Some(&b'*') && bytes.get(idx + 1) == Some(&b'/') {
+                    idx += 2;
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    idx
+}
+
+fn is_path_keyword_usage(bytes: &[u8], word_end: usize) -> bool {
+    let look_ahead = skip_trivia_and_comments(bytes, word_end);
+    match bytes.get(look_ahead) {
+        Some(b'\'') => true,
+        Some(b'q' | b'Q') => bytes.get(look_ahead + 1) == Some(&b'\''),
+        Some(b'n' | b'N') => {
+            matches!(bytes.get(look_ahead + 1), Some(b'q' | b'Q'))
+                && bytes.get(look_ahead + 2) == Some(&b'\'')
+        }
+        _ => false,
+    }
 }
 
 fn style_bytes_to_string(styles: Vec<u8>) -> String {

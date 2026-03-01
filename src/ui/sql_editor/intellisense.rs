@@ -162,6 +162,76 @@ impl SqlEditorWidget {
         !seen_values && column_list_depth.is_some()
     }
 
+    fn is_cursor_inside_cte_explicit_column_list(
+        deep_ctx: &intellisense_context::CursorContext,
+        cte: &intellisense_context::CteDefinition,
+    ) -> bool {
+        let cursor_token_idx = deep_ctx
+            .cursor_token_len
+            .min(deep_ctx.statement_tokens.len());
+        cte.explicit_column_range
+            .is_some_and(|range| cursor_token_idx >= range.start && cursor_token_idx <= range.end)
+    }
+
+    fn is_with_cte_column_list_context(deep_ctx: &intellisense_context::CursorContext) -> bool {
+        deep_ctx
+            .ctes
+            .iter()
+            .any(|cte| Self::is_cursor_inside_cte_explicit_column_list(deep_ctx, cte))
+    }
+
+    fn collect_cte_virtual_columns_for_completion(
+        deep_ctx: &intellisense_context::CursorContext,
+        cte: &intellisense_context::CteDefinition,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            cte.body_range,
+        );
+        let cursor_in_explicit_list =
+            Self::is_cursor_inside_cte_explicit_column_list(deep_ctx, cte);
+        let prefer_body_projection = cursor_in_explicit_list && !cte.body_range.is_empty();
+
+        // While editing WITH cte(col1, ...), prefer body projection columns as completion
+        // candidates even when an explicit list is already partially typed.
+        let mut columns = if prefer_body_projection {
+            intellisense_context::extract_select_list_columns(body_tokens)
+        } else if !cte.explicit_columns.is_empty() {
+            cte.explicit_columns.clone()
+        } else if !cte.body_range.is_empty() {
+            intellisense_context::extract_select_list_columns(body_tokens)
+        } else {
+            Vec::new()
+        };
+
+        let mut wildcard_tables = Vec::new();
+        if (cte.explicit_columns.is_empty() || prefer_body_projection) && !cte.body_range.is_empty()
+        {
+            let body_tables_in_scope =
+                intellisense_context::collect_tables_in_statement(body_tokens);
+            let (wildcard_columns, deps) = Self::expand_virtual_table_wildcards(
+                body_tokens,
+                &body_tables_in_scope,
+                intellisense_data,
+                column_sender,
+                connection,
+            );
+            if !deps.is_empty() {
+                wildcard_tables = deps;
+            }
+            columns.extend(wildcard_columns);
+        }
+
+        columns.extend(
+            intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens),
+        );
+        Self::dedup_column_names_case_insensitive(&mut columns);
+        (columns, wildcard_tables)
+    }
+
     fn classify_intellisense_context(
         deep_ctx: &intellisense_context::CursorContext,
         tokens: &[SqlToken],
@@ -169,12 +239,14 @@ impl SqlEditorWidget {
         let insert_column_list_context =
             matches!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause)
                 && Self::is_insert_column_list_context(tokens, deep_ctx.cursor_token_len);
+        let with_cte_column_list_context = Self::is_with_cte_column_list_context(deep_ctx);
 
         if deep_ctx.phase.is_table_context() && !insert_column_list_context {
             SqlContext::TableName
         } else if deep_ctx.phase.is_column_context()
             || matches!(deep_ctx.phase, intellisense_context::SqlPhase::PivotClause)
             || insert_column_list_context
+            || with_cte_column_list_context
         {
             if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
                 SqlContext::ColumnOrAll
@@ -1608,39 +1680,16 @@ impl SqlEditorWidget {
 
             // Register CTE columns.
             for cte in &deep_ctx.ctes {
-                let body_tokens = intellisense_context::token_range_slice(
-                    deep_ctx.statement_tokens.as_ref(),
-                    cte.body_range,
+                let (columns, wildcard_tables) = Self::collect_cte_virtual_columns_for_completion(
+                    deep_ctx.as_ref(),
+                    cte,
+                    intellisense_data,
+                    column_sender,
+                    connection,
                 );
-                let mut columns = if !cte.explicit_columns.is_empty() {
-                    cte.explicit_columns.clone()
-                } else if !cte.body_range.is_empty() {
-                    intellisense_context::extract_select_list_columns(body_tokens)
-                } else {
-                    Vec::new()
-                };
-                if cte.explicit_columns.is_empty() && !cte.body_range.is_empty() {
-                    let body_tables_in_scope =
-                        intellisense_context::collect_tables_in_statement(body_tokens);
-                    let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
-                        body_tokens,
-                        &body_tables_in_scope,
-                        intellisense_data,
-                        column_sender,
-                        connection,
-                    );
-                    if !wildcard_tables.is_empty() {
-                        virtual_wildcard_dependencies
-                            .insert(cte.name.to_uppercase(), wildcard_tables);
-                    }
-                    columns.extend(wildcard_columns);
+                if !wildcard_tables.is_empty() {
+                    virtual_wildcard_dependencies.insert(cte.name.to_uppercase(), wildcard_tables);
                 }
-                columns.extend(
-                    intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
-                        body_tokens,
-                    ),
-                );
-                Self::dedup_column_names_case_insensitive(&mut columns);
                 if !columns.is_empty() {
                     virtual_table_columns.insert(cte.name.clone(), columns);
                 }
@@ -1753,15 +1802,7 @@ impl SqlEditorWidget {
             }
         };
         if include_columns && qualifier.is_none() {
-            let mut derived_columns =
-                intellisense_context::extract_oracle_unpivot_generated_columns(
-                    deep_ctx.statement_tokens.as_ref(),
-                );
-            derived_columns.extend(
-                intellisense_context::extract_oracle_model_generated_columns(
-                    deep_ctx.statement_tokens.as_ref(),
-                ),
-            );
+            let derived_columns = Self::collect_derived_columns_for_context(deep_ctx.as_ref());
             suggestions =
                 Self::merge_suggestions_with_derived_columns(suggestions, &prefix, derived_columns);
         }
@@ -2102,6 +2143,31 @@ impl SqlEditorWidget {
 
         base.truncate(MAX_MERGED_SUGGESTIONS);
         base
+    }
+
+    fn collect_derived_columns_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let mut derived_columns = intellisense_context::extract_oracle_unpivot_generated_columns(
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        derived_columns.extend(
+            intellisense_context::extract_oracle_model_generated_columns(
+                deep_ctx.statement_tokens.as_ref(),
+            ),
+        );
+
+        if matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        ) {
+            derived_columns.extend(intellisense_context::extract_select_list_columns(
+                deep_ctx.statement_tokens.as_ref(),
+            ));
+        }
+
+        Self::dedup_column_names_case_insensitive(&mut derived_columns);
+        derived_columns
     }
 
     fn maybe_prefetch_columns_for_word(
@@ -4834,6 +4900,84 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
+    fn classify_intellisense_context_treats_with_cte_column_list_as_column_context() {
+        let sql_with_cursor = "WITH r (|) AS (SELECT node_id FROM oqt_t_tree) SELECT * FROM r";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(SqlEditorWidget::is_with_cte_column_list_context(&deep_ctx));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn cte_column_list_completion_prefers_body_projection_columns() {
+        let sql_with_cursor = r#"
+WITH r (node_id, |) AS (
+  SELECT NODE_ID, parent_id, node_name, 1 AS lvl, '/'||node_name AS path
+  FROM oqt_t_tree
+  WHERE parent_id IS NULL
+  UNION ALL
+  SELECT t.NODE_ID, t.parent_id, t.node_name, r.lvl + 1,
+         r.path || '/' || t.node_name
+  FROM oqt_t_tree t
+  JOIN r ON t.PARENT_ID = r.node_id
+)
+SELECT * FROM r
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let cte = deep_ctx
+            .ctes
+            .iter()
+            .find(|cte| cte.name.eq_ignore_ascii_case("r"))
+            .expect("expected CTE r");
+        assert!(SqlEditorWidget::is_cursor_inside_cte_explicit_column_list(
+            &deep_ctx, cte
+        ));
+
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+
+        let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
+            &deep_ctx,
+            cte,
+            &data,
+            &sender,
+            &connection,
+        );
+
+        for expected in ["node_id", "parent_id", "node_name", "lvl", "path"] {
+            assert!(
+                columns.iter().any(|col| col.eq_ignore_ascii_case(expected)),
+                "expected `{expected}` in CTE explicit-column completion candidates: {:?}",
+                columns
+            );
+        }
+    }
+
+    #[test]
     fn classify_intellisense_context_treats_model_clause_as_column_context() {
         let sql_with_cursor = "WITH m AS ( \
              SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt \
@@ -4952,6 +5096,41 @@ MATCH_RECOGNIZE (
                 .any(|c| c.eq_ignore_ascii_case("sum_plus_100")),
             "expected sum_plus_100 in merged suggestions, got: {:?}",
             merged
+        );
+    }
+
+    #[test]
+    fn collect_derived_columns_for_order_by_includes_select_aliases() {
+        let sql_with_cursor = "SELECT \
+             oh.order_id, \
+             oh.cust_name, \
+             oh.order_dt, \
+             (SELECT SUM(oi.qty*oi.unit_price) FROM oqt_t_order_item oi WHERE oi.ORDER_ID = oh.order_id) AS amt \
+           FROM oqt_t_order_hdr oh \
+           ORDER BY \
+             (SELECT COUNT(*) FROM oqt_t_order_item oi WHERE oi.order_id = oh.order_id) DESC, \
+             | DESC NULLS LAST \
+           FETCH FIRST 3 ROWS ONLY";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        );
+
+        let derived = SqlEditorWidget::collect_derived_columns_for_context(&deep_ctx);
+        assert!(
+            derived.iter().any(|c| c.eq_ignore_ascii_case("amt")),
+            "expected select-list alias `amt` in derived columns: {:?}",
+            derived
         );
     }
 
