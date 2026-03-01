@@ -578,6 +578,27 @@ impl WordUndoRedoState {
         group
     }
 
+    fn undo_cursor_after_group(&self, group: &[UndoDelta]) -> usize {
+        let Some(latest_delta) = group.first() else {
+            return self.current.cursor_pos;
+        };
+
+        // Undo cursor policy:
+        // - Undoing a deletion should land at the end of restored text.
+        // - Undoing an insertion (and other edit kinds) should land at the
+        //   previous cursor position before that edit.
+        let cursor =
+            if latest_delta.inserted_text.is_empty() && !latest_delta.deleted_text.is_empty() {
+                latest_delta
+                    .start
+                    .saturating_add(latest_delta.deleted_text.len())
+            } else {
+                latest_delta.before_cursor
+            }
+            .min(self.current.text.len());
+        Self::clamp_to_char_boundary(&self.current.text, cursor)
+    }
+
     fn take_redo_group(&mut self) -> Vec<UndoDelta> {
         self.normalize_index();
         if self.index >= self.deltas.len() {
@@ -3045,7 +3066,9 @@ impl SqlEditorWidget {
             if deltas.is_empty() {
                 return;
             }
-            let cursor_pos = state.current.cursor_pos.min(i32::MAX as usize) as i32;
+            let cursor_pos = state
+                .undo_cursor_after_group(&deltas)
+                .min(i32::MAX as usize) as i32;
             (deltas, cursor_pos)
         };
 
@@ -3792,6 +3815,37 @@ mod execution_state_tests {
         assert_eq!(undo_group.len(), 3);
         assert_eq!(state.current.text, "");
         assert_eq!(state.index, 0);
+    }
+
+    #[test]
+    fn undo_cursor_after_group_moves_to_end_of_restored_text_for_deletion() {
+        let mut state = WordUndoRedoState::new("abcdef".to_string());
+        // Simulate an out-of-cursor edit (e.g. programmatic replace) where
+        // the current cursor is far from the edited span.
+        state.current.cursor_pos = 6;
+        state.record_edit(
+            &build_edit(1, "bc", ""),
+            classify_edit_group(0, 2, "", "bc"),
+        );
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(state.current.text, "abcdef");
+        assert_eq!(state.current.cursor_pos, 6);
+
+        let undo_cursor = state.undo_cursor_after_group(&undo_group);
+        assert_eq!(undo_cursor, 3);
+    }
+
+    #[test]
+    fn undo_cursor_after_group_restores_previous_cursor_for_insertion() {
+        let mut state = WordUndoRedoState::new("abc".to_string());
+        state.record_edit(&build_edit(3, "", "x"), classify_edit_group(1, 0, "x", ""));
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(state.current.text, "abc");
+
+        let undo_cursor = state.undo_cursor_after_group(&undo_group);
+        assert_eq!(undo_cursor, 3);
     }
 
     #[test]
