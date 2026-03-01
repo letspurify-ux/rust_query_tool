@@ -273,6 +273,12 @@ enum SortDirection {
     Descending,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SortNumericValue {
+    Integer(i128),
+    Float(f64),
+}
+
 impl SortDirection {
     fn toggled(self) -> Self {
         match self {
@@ -633,16 +639,48 @@ impl ResultTableWidget {
         }
     }
 
-    fn parse_sort_number(value: &str) -> Option<f64> {
+    fn parse_sort_number(value: &str) -> Option<SortNumericValue> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
         }
-        let parsed = trimmed.parse::<f64>().ok()?;
-        if !parsed.is_finite() {
-            return None;
+        if let Ok(integer) = trimmed.parse::<i128>() {
+            return Some(SortNumericValue::Integer(integer));
         }
-        Some(parsed)
+
+        let parsed = trimmed.parse::<f64>().ok()?;
+        if parsed.is_finite() {
+            Some(SortNumericValue::Float(parsed))
+        } else {
+            None
+        }
+    }
+
+    fn compare_numeric_sort_values(
+        left: SortNumericValue,
+        right: SortNumericValue,
+    ) -> std::cmp::Ordering {
+        match (left, right) {
+            (SortNumericValue::Integer(lhs), SortNumericValue::Integer(rhs)) => lhs.cmp(&rhs),
+            (SortNumericValue::Float(lhs), SortNumericValue::Float(rhs)) => {
+                lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (SortNumericValue::Integer(lhs), SortNumericValue::Float(rhs)) => {
+                if rhs.fract() == 0.0 && rhs >= i128::MIN as f64 && rhs <= i128::MAX as f64 {
+                    return lhs.cmp(&(rhs as i128));
+                }
+                (lhs as f64)
+                    .partial_cmp(&rhs)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (SortNumericValue::Float(lhs), SortNumericValue::Integer(rhs)) => {
+                Self::compare_numeric_sort_values(
+                    SortNumericValue::Integer(rhs),
+                    SortNumericValue::Float(lhs),
+                )
+                .reverse()
+            }
+        }
     }
 
     fn compare_row_values_for_sort(
@@ -655,7 +693,7 @@ impl ResultTableWidget {
         let left_number = Self::parse_sort_number(left_value);
         let right_number = Self::parse_sort_number(right_value);
         match (left_number, right_number) {
-            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(lhs), Some(rhs)) => Self::compare_numeric_sort_values(lhs, rhs),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => left_value.cmp(right_value),
@@ -10049,6 +10087,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_row_values_for_sort_handles_large_integers_without_precision_loss() {
+        let left = vec!["9007199254740993".to_string()];
+        let right = vec!["9007199254740992".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(&left, &right, 0),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn compare_row_values_for_sort_handles_scientific_notation_against_integer() {
+        let left = vec!["1e3".to_string()];
+        let right = vec!["999".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(&left, &right, 0),
+            std::cmp::Ordering::Greater
+        );
+    }
     #[test]
     fn sort_row_entries_reorders_rows_and_row_states_together() {
         let mut rows = vec![
