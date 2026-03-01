@@ -1164,6 +1164,92 @@ fn pivot_clause_phase() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
+#[test]
+fn pivot_clause_sum_argument_phase() {
+    let ctx = analyze(
+        "WITH s AS (SELECT DEPTNO, job, sal FROM oqt_t_emp) \
+         SELECT * FROM s PIVOT (SUM(|) AS sum_sal FOR DEPTNO IN (10 AS D10))",
+    );
+    assert_eq!(ctx.phase, SqlPhase::PivotClause);
+}
+
+#[test]
+fn pivot_clause_for_expression_phase() {
+    let ctx = analyze(
+        "WITH s AS (SELECT DEPTNO, job, sal FROM oqt_t_emp) \
+         SELECT * FROM s PIVOT (SUM(sal) AS sum_sal FOR | IN (10 AS D10))",
+    );
+    assert_eq!(ctx.phase, SqlPhase::PivotClause);
+}
+
+#[test]
+fn match_recognize_partition_by_phase_is_column_context() {
+    let ctx = analyze(
+        "SELECT * FROM oqt_t_emp \
+         MATCH_RECOGNIZE (PARTITION BY | ORDER BY hiredate PATTERN (a b+) DEFINE b AS b.sal > PREV(b.sal))",
+    );
+    assert_eq!(ctx.phase, SqlPhase::MatchRecognizeClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn match_recognize_pattern_variables_extracted() {
+    let tokens = tokenize(
+        "SELECT * FROM oqt_t_emp \
+         MATCH_RECOGNIZE (PARTITION BY deptno ORDER BY hiredate PATTERN (a b+) DEFINE b AS b.sal > PREV(b.sal))",
+    );
+    let vars = extract_match_recognize_pattern_variables(&tokens);
+    assert_eq!(vars, vec!["a", "b"]);
+}
+
+#[test]
+fn match_recognize_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp MATCH_RECOGNIZE (PATTERN (a)) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|t| t.alias.as_deref() != Some("MATCH_RECOGNIZE")),
+        "MATCH_RECOGNIZE should not be parsed as table alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|t| (&t.name, &t.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
+         PIVOT (SUM(SAL) FOR DEPTNO IN (10 AS D10, 20 AS D20, 30 AS D30))",
+    );
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["job", "D10", "D20", "D30"]);
+}
+
+#[test]
+fn extract_oracle_unpivot_generated_columns_from_clause() {
+    let tokens = tokenize(
+        "SELECT * FROM p \
+         UNPIVOT (sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30'))",
+    );
+    let cols = extract_oracle_unpivot_generated_columns(&tokens);
+    assert_eq!(cols, vec!["sum_sal", "dept_tag"]);
+}
+
+#[test]
+fn extract_oracle_unpivot_projection_with_nested_pivot_source() {
+    let tokens = tokenize(
+        "SELECT * FROM ( \
+            SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
+            PIVOT (SUM(SAL) FOR DEPTNO IN (10 AS D10, 20 AS D20, 30 AS D30)) \
+         ) \
+         UNPIVOT (sum_sal FOR dept_tag IN (D10 AS '10', D20 AS '20', D30 AS '30'))",
+    );
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["job", "sum_sal", "dept_tag"]);
+}
+
 // ─── SELECT list column extraction tests ─────────────────────────────────
 
 #[test]

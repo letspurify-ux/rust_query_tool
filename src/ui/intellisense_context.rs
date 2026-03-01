@@ -23,6 +23,7 @@ pub enum SqlPhase {
     SetClause,
     ConnectByClause,
     StartWithClause,
+    MatchRecognizeClause,
     ValuesClause,
     UpdateTarget,
     DeleteTarget,
@@ -44,6 +45,7 @@ impl SqlPhase {
                 | SqlPhase::SetClause
                 | SqlPhase::ConnectByClause
                 | SqlPhase::StartWithClause
+                | SqlPhase::MatchRecognizeClause
         )
     }
 
@@ -227,7 +229,10 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 depth += 1;
                 let inherited_phase = if parent_phase.is_column_context()
-                    || matches!(parent_phase, SqlPhase::ValuesClause | SqlPhase::IntoClause)
+                    || matches!(
+                        parent_phase,
+                        SqlPhase::ValuesClause | SqlPhase::IntoClause | SqlPhase::PivotClause
+                    )
                 {
                     parent_phase
                 } else {
@@ -430,6 +435,9 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "VALUES" => {
                         phase_stack[depth] = SqlPhase::ValuesClause;
+                    }
+                    "MATCH_RECOGNIZE" => {
+                        phase_stack[depth] = SqlPhase::MatchRecognizeClause;
                     }
                     "PIVOT" | "UNPIVOT" => {
                         phase_stack[depth] = SqlPhase::PivotClause;
@@ -864,6 +872,10 @@ fn collect_tables_deep(
                     }
                     "VALUES" => {
                         phase_stack[depth] = SqlPhase::ValuesClause;
+                        expect_table = false;
+                    }
+                    "MATCH_RECOGNIZE" => {
+                        phase_stack[depth] = SqlPhase::MatchRecognizeClause;
                         expect_table = false;
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
@@ -1374,6 +1386,7 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "PIVOT"
             | "UNPIVOT"
             | "MODEL"
+            | "MATCH_RECOGNIZE"
             | "USING"
     )
 }
@@ -1413,6 +1426,7 @@ fn is_alias_breaker(word: &str) -> bool {
             | "PIVOT"
             | "UNPIVOT"
             | "MODEL"
+            | "MATCH_RECOGNIZE"
             | "SELECT"
             | "FROM"
             | "INTO"
@@ -1585,6 +1599,645 @@ pub fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
     }
 
     columns
+}
+
+#[derive(Debug, Default)]
+struct PivotClauseColumns {
+    clause_index: usize,
+    for_columns: Vec<String>,
+    aggregate_columns: Vec<String>,
+    generated_columns: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct UnpivotClauseColumns {
+    clause_index: usize,
+    source_columns: Vec<String>,
+    measure_columns: Vec<String>,
+    for_columns: Vec<String>,
+}
+
+/// Extract Oracle PIVOT/UNPIVOT-projected columns from a query token stream.
+/// This is primarily used when the SELECT list contains `*` and normal
+/// select-list extraction cannot determine output columns.
+pub fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let pivot = parse_top_level_pivot_clause(tokens);
+    let unpivot = parse_top_level_unpivot_clause(tokens);
+    if pivot.is_none() && unpivot.is_none() {
+        return Vec::new();
+    }
+
+    let first_clause_idx = match (pivot.as_ref(), unpivot.as_ref()) {
+        (Some(p), Some(u)) => Some(p.clause_index.min(u.clause_index)),
+        (Some(p), None) => Some(p.clause_index),
+        (None, Some(u)) => Some(u.clause_index),
+        (None, None) => None,
+    };
+
+    let mut columns = if let Some(clause_idx) = first_clause_idx {
+        infer_source_columns_before_clause(tokens, clause_idx)
+    } else {
+        Vec::new()
+    };
+
+    if let Some(pivot_info) = pivot {
+        remove_columns_case_insensitive(&mut columns, &pivot_info.for_columns);
+        remove_columns_case_insensitive(&mut columns, &pivot_info.aggregate_columns);
+        columns.extend(pivot_info.generated_columns);
+    }
+
+    if let Some(unpivot_info) = unpivot {
+        remove_columns_case_insensitive(&mut columns, &unpivot_info.source_columns);
+        columns.extend(unpivot_info.measure_columns);
+        columns.extend(unpivot_info.for_columns);
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+/// Extract Oracle UNPIVOT-introduced columns (measure + FOR target).
+pub fn extract_oracle_unpivot_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let Some(unpivot_info) = parse_top_level_unpivot_clause(tokens) else {
+        return Vec::new();
+    };
+
+    let mut columns = unpivot_info.measure_columns;
+    columns.extend(unpivot_info.for_columns);
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+/// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)`.
+/// Example: `PATTERN (a b+)` -> `["a", "b"]`.
+pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
+    let Some(match_idx) = find_top_level_word_index(tokens, "MATCH_RECOGNIZE") else {
+        return Vec::new();
+    };
+
+    let clause_open_idx = next_non_comment_index(tokens, match_idx.saturating_add(1));
+    let Some(SqlToken::Symbol(sym)) = tokens.get(clause_open_idx) else {
+        return Vec::new();
+    };
+    if sym != "(" {
+        return Vec::new();
+    }
+
+    let Some((clause_range, _)) = extract_parenthesized_range(tokens, clause_open_idx) else {
+        return Vec::new();
+    };
+    let clause_tokens = token_range_slice(tokens, clause_range);
+    let token_depths = paren_depths(clause_tokens);
+
+    let mut pattern_idx = None;
+    for (idx, token) in clause_tokens.iter().enumerate() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            if word.eq_ignore_ascii_case("PATTERN") {
+                pattern_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let Some(pattern_idx) = pattern_idx else {
+        return Vec::new();
+    };
+    let pattern_open_idx = next_non_comment_index(clause_tokens, pattern_idx.saturating_add(1));
+    let Some(SqlToken::Symbol(sym)) = clause_tokens.get(pattern_open_idx) else {
+        return Vec::new();
+    };
+    if sym != "(" {
+        return Vec::new();
+    }
+
+    let Some((pattern_range, _)) = extract_parenthesized_range(clause_tokens, pattern_open_idx)
+    else {
+        return Vec::new();
+    };
+
+    let mut variables = Vec::new();
+    let pattern_tokens = token_range_slice(clause_tokens, pattern_range);
+    for token in pattern_tokens {
+        if let SqlToken::Word(word) = token {
+            if !is_identifier_word_token(word) {
+                continue;
+            }
+            let upper = word.to_ascii_uppercase();
+            if is_match_recognize_pattern_keyword(&upper) {
+                continue;
+            }
+            variables.push(strip_identifier_quotes(word));
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut variables);
+    variables
+}
+
+fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) -> Vec<String> {
+    let analysis = collect_tables_deep(tokens, &[0], tokens.len());
+    let mut selected_subquery: Option<&SubqueryDefinition> = None;
+
+    for subq in &analysis.subqueries {
+        if subq.depth != 0 || subq.body_range.end > clause_idx {
+            continue;
+        }
+        if selected_subquery
+            .as_ref()
+            .map_or(true, |existing| subq.body_range.end > existing.body_range.end)
+        {
+            selected_subquery = Some(subq);
+        }
+    }
+
+    if let Some(subq) = selected_subquery {
+        let body_tokens = token_range_slice(tokens, subq.body_range);
+        let mut columns = extract_select_list_columns(body_tokens);
+        if columns.is_empty() {
+            columns = extract_table_function_columns(body_tokens);
+        }
+        if columns.is_empty() {
+            columns = extract_oracle_pivot_unpivot_projection_columns(body_tokens);
+        }
+        dedup_columns_case_insensitive(&mut columns);
+        return columns;
+    }
+
+    let mut columns = extract_select_list_columns(tokens);
+    if columns.is_empty() {
+        columns = extract_table_function_columns(tokens);
+    }
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumns> {
+    let pivot_idx = find_top_level_word_index(tokens, "PIVOT")?;
+    let mut idx = next_non_comment_index(tokens, pivot_idx.saturating_add(1));
+
+    if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+        if word.eq_ignore_ascii_case("XML") {
+            idx = next_non_comment_index(tokens, idx.saturating_add(1));
+        }
+    }
+
+    let open_idx = match tokens.get(idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => idx,
+        _ => return None,
+    };
+
+    let (range, _) = extract_parenthesized_range(tokens, open_idx)?;
+    let clause_tokens = token_range_slice(tokens, range);
+    let (for_idx, in_idx) = find_clause_for_in_indices(clause_tokens)?;
+
+    let aggregate_columns = parse_pivot_aggregate_columns(&clause_tokens[..for_idx]);
+    let for_columns = parse_identifier_segment(&clause_tokens[for_idx + 1..in_idx]);
+    let generated_columns = parse_pivot_generated_columns_from_in_segment(&clause_tokens[in_idx + 1..]);
+
+    let mut result = PivotClauseColumns {
+        clause_index: pivot_idx,
+        for_columns,
+        aggregate_columns,
+        generated_columns,
+    };
+    dedup_columns_case_insensitive(&mut result.for_columns);
+    dedup_columns_case_insensitive(&mut result.aggregate_columns);
+    dedup_columns_case_insensitive(&mut result.generated_columns);
+    Some(result)
+}
+
+fn parse_top_level_unpivot_clause(tokens: &[SqlToken]) -> Option<UnpivotClauseColumns> {
+    let unpivot_idx = find_top_level_word_index(tokens, "UNPIVOT")?;
+    let mut idx = next_non_comment_index(tokens, unpivot_idx.saturating_add(1));
+
+    if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+        if word.eq_ignore_ascii_case("INCLUDE") || word.eq_ignore_ascii_case("EXCLUDE") {
+            idx = next_non_comment_index(tokens, idx.saturating_add(1));
+            if let Some(SqlToken::Word(nulls)) = tokens.get(idx) {
+                if nulls.eq_ignore_ascii_case("NULLS") {
+                    idx = next_non_comment_index(tokens, idx.saturating_add(1));
+                }
+            }
+        }
+    }
+
+    let open_idx = match tokens.get(idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => idx,
+        _ => return None,
+    };
+
+    let (range, _) = extract_parenthesized_range(tokens, open_idx)?;
+    let clause_tokens = token_range_slice(tokens, range);
+    let (for_idx, in_idx) = find_clause_for_in_indices(clause_tokens)?;
+
+    let measure_columns = parse_unpivot_output_segment(&clause_tokens[..for_idx]);
+    let for_columns = parse_unpivot_output_segment(&clause_tokens[for_idx + 1..in_idx]);
+    let source_columns = parse_unpivot_source_columns_from_in_segment(&clause_tokens[in_idx + 1..]);
+
+    let mut result = UnpivotClauseColumns {
+        clause_index: unpivot_idx,
+        source_columns,
+        measure_columns,
+        for_columns,
+    };
+    dedup_columns_case_insensitive(&mut result.source_columns);
+    dedup_columns_case_insensitive(&mut result.measure_columns);
+    dedup_columns_case_insensitive(&mut result.for_columns);
+    Some(result)
+}
+
+fn find_top_level_word_index(tokens: &[SqlToken], keyword: &str) -> Option<usize> {
+    let token_depths = paren_depths(tokens);
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if !is_top_level_depth(&token_depths, idx) {
+            idx += 1;
+            continue;
+        }
+        if let SqlToken::Word(word) = &tokens[idx] {
+            if word.eq_ignore_ascii_case(keyword) {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn find_clause_for_in_indices(clause_tokens: &[SqlToken]) -> Option<(usize, usize)> {
+    let token_depths = paren_depths(clause_tokens);
+    let mut for_idx = None;
+    let mut in_idx = None;
+    let mut idx = 0usize;
+
+    while idx < clause_tokens.len() {
+        if !is_top_level_depth(&token_depths, idx) {
+            idx += 1;
+            continue;
+        }
+        if let SqlToken::Word(word) = &clause_tokens[idx] {
+            if for_idx.is_none() && word.eq_ignore_ascii_case("FOR") {
+                for_idx = Some(idx);
+            } else if for_idx.is_some() && word.eq_ignore_ascii_case("IN") {
+                in_idx = Some(idx);
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    match (for_idx, in_idx) {
+        (Some(for_pos), Some(in_pos)) if for_pos < in_pos => Some((for_pos, in_pos)),
+        _ => None,
+    }
+}
+
+fn parse_pivot_aggregate_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        if let SqlToken::Word(func_name) = token {
+            if !is_identifier_word_token(func_name) {
+                idx += 1;
+                continue;
+            }
+
+            let open_idx = next_non_comment_index(tokens, idx.saturating_add(1));
+            let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
+                idx += 1;
+                continue;
+            };
+            if sym != "(" {
+                idx += 1;
+                continue;
+            }
+
+            if let Some((args_range, next_idx)) = extract_parenthesized_range(tokens, open_idx) {
+                let args_tokens = token_range_slice(tokens, args_range);
+                for arg_item in split_top_level_symbol_groups(args_tokens, ",") {
+                    if let Some(column) = parse_identifier_from_expression_tokens(&arg_item) {
+                        columns.push(column);
+                    }
+                }
+                idx = next_idx;
+                continue;
+            }
+        }
+
+        idx += 1;
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn parse_identifier_from_expression_tokens(tokens: &[&SqlToken]) -> Option<String> {
+    let meaningful: Vec<&SqlToken> = tokens
+        .iter()
+        .copied()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect();
+    if meaningful.is_empty() {
+        return None;
+    }
+
+    for token in meaningful.iter().rev().copied() {
+        if let SqlToken::Word(word) = token {
+            if !is_identifier_word_token(word) {
+                continue;
+            }
+            let upper = word.to_ascii_uppercase();
+            if is_expression_keyword(&upper) {
+                continue;
+            }
+            return Some(strip_identifier_quotes(word));
+        }
+    }
+
+    None
+}
+
+fn is_expression_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "AS"
+            | "DISTINCT"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "NULL"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "IN"
+            | "IS"
+            | "LIKE"
+            | "BETWEEN"
+            | "OVER"
+            | "PARTITION"
+            | "ORDER"
+            | "BY"
+            | "ROWS"
+            | "RANGE"
+            | "CURRENT"
+            | "ROW"
+            | "UNBOUNDED"
+            | "PRECEDING"
+            | "FOLLOWING"
+    )
+}
+
+fn is_match_recognize_pattern_keyword(word: &str) -> bool {
+    matches!(word, "PERMUTE" | "SUBSET")
+}
+
+fn parse_identifier_segment(tokens: &[SqlToken]) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut meaningful_start = None;
+    for (idx, token) in tokens.iter().enumerate() {
+        if !matches!(token, SqlToken::Comment(_)) {
+            meaningful_start = Some(idx);
+            break;
+        }
+    }
+    let Some(start_idx) = meaningful_start else {
+        return columns;
+    };
+
+    if matches!(tokens.get(start_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        if let Some((range, _)) = extract_parenthesized_range(tokens, start_idx) {
+            columns = parse_identifier_words_top_level(token_range_slice(tokens, range));
+            dedup_columns_case_insensitive(&mut columns);
+            return columns;
+        }
+    }
+
+    if let Some(name) = parse_first_identifier_word(tokens) {
+        columns.push(name);
+    }
+    columns
+}
+
+fn parse_first_identifier_word(tokens: &[SqlToken]) -> Option<String> {
+    for token in tokens {
+        if let SqlToken::Word(word) = token {
+            if is_identifier_word_token(word) {
+                return Some(strip_identifier_quotes(word));
+            }
+        }
+    }
+    None
+}
+
+fn parse_identifier_words_top_level(tokens: &[SqlToken]) -> Vec<String> {
+    let token_depths = paren_depths(tokens);
+    let mut columns = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            if !is_identifier_word_token(word) {
+                continue;
+            }
+            let upper = word.to_ascii_uppercase();
+            if upper == "AS" {
+                continue;
+            }
+            columns.push(strip_identifier_quotes(word));
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn parse_pivot_generated_columns_from_in_segment(tokens: &[SqlToken]) -> Vec<String> {
+    let open_idx = next_non_comment_index(tokens, 0);
+    let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
+        return Vec::new();
+    };
+    if sym != "(" {
+        return Vec::new();
+    }
+
+    let Some((range, _)) = extract_parenthesized_range(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let in_list_tokens = token_range_slice(tokens, range);
+    let mut columns = Vec::new();
+
+    for item_tokens in split_top_level_symbol_groups(in_list_tokens, ",") {
+        if let Some(column) = parse_pivot_in_item_output_column(&item_tokens) {
+            columns.push(column);
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String> {
+    let meaningful: Vec<&SqlToken> = item_tokens
+        .iter()
+        .copied()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect();
+    if meaningful.is_empty() {
+        return None;
+    }
+
+    let mut idx = 0usize;
+    while idx < meaningful.len() {
+        if let SqlToken::Word(word) = meaningful[idx] {
+            if word.eq_ignore_ascii_case("AS") {
+                let mut alias_idx = idx.saturating_add(1);
+                while alias_idx < meaningful.len() {
+                    if let SqlToken::Word(alias) = meaningful[alias_idx] {
+                        if is_identifier_word_token(alias) {
+                            return Some(strip_identifier_quotes(alias));
+                        }
+                    }
+                    if !matches!(meaningful[alias_idx], SqlToken::Comment(_)) {
+                        break;
+                    }
+                    alias_idx += 1;
+                }
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    if let Some(SqlToken::Word(last_word)) = meaningful.last().copied() {
+        if is_identifier_word_token(last_word) {
+            return Some(strip_identifier_quotes(last_word));
+        }
+    }
+
+    if let Some(SqlToken::Word(first_word)) = meaningful.first().copied() {
+        if is_identifier_word_token(first_word) {
+            return Some(strip_identifier_quotes(first_word));
+        }
+    }
+
+    None
+}
+
+fn parse_unpivot_output_segment(tokens: &[SqlToken]) -> Vec<String> {
+    let start_idx = next_non_comment_index(tokens, 0);
+    if start_idx >= tokens.len() {
+        return Vec::new();
+    }
+
+    if matches!(tokens.get(start_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        if let Some((range, _)) = extract_parenthesized_range(tokens, start_idx) {
+            let mut columns = parse_identifier_words_top_level(token_range_slice(tokens, range));
+            dedup_columns_case_insensitive(&mut columns);
+            return columns;
+        }
+    }
+
+    if let Some(column) = parse_first_identifier_word(&tokens[start_idx..]) {
+        return vec![column];
+    }
+
+    Vec::new()
+}
+
+fn parse_unpivot_source_columns_from_in_segment(tokens: &[SqlToken]) -> Vec<String> {
+    let open_idx = next_non_comment_index(tokens, 0);
+    let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
+        return Vec::new();
+    };
+    if sym != "(" {
+        return Vec::new();
+    }
+
+    let Some((range, _)) = extract_parenthesized_range(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let list_tokens = token_range_slice(tokens, range);
+    let mut columns = Vec::new();
+
+    for item_tokens in split_top_level_symbol_groups(list_tokens, ",") {
+        columns.extend(parse_unpivot_in_item_source_columns(&item_tokens));
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn parse_unpivot_in_item_source_columns(item_tokens: &[&SqlToken]) -> Vec<String> {
+    let meaningful: Vec<&SqlToken> = item_tokens
+        .iter()
+        .copied()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect();
+    if meaningful.is_empty() {
+        return Vec::new();
+    }
+
+    let starts_with_tuple =
+        matches!(meaningful.first().copied(), Some(SqlToken::Symbol(sym)) if sym == "(");
+    let target_depth = if starts_with_tuple { 1usize } else { 0usize };
+    let mut depth = 0usize;
+    let mut columns = Vec::new();
+
+    for token in meaningful {
+        match token {
+            SqlToken::Symbol(sym) if sym == "(" => {
+                depth = depth.saturating_add(1);
+            }
+            SqlToken::Symbol(sym) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+            }
+            SqlToken::Word(word) => {
+                if depth == 0 && word.eq_ignore_ascii_case("AS") {
+                    break;
+                }
+                if depth == target_depth && is_identifier_word_token(word) {
+                    columns.push(strip_identifier_quotes(word));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn next_non_comment_index(tokens: &[SqlToken], start: usize) -> usize {
+    let mut idx = start.min(tokens.len());
+    while idx < tokens.len() {
+        if !matches!(tokens[idx], SqlToken::Comment(_)) {
+            break;
+        }
+        idx += 1;
+    }
+    idx
+}
+
+fn dedup_columns_case_insensitive(columns: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    columns.retain(|column| seen.insert(column.to_ascii_uppercase()));
+}
+
+fn remove_columns_case_insensitive(columns: &mut Vec<String>, remove: &[String]) {
+    if columns.is_empty() || remove.is_empty() {
+        return;
+    }
+    let remove_set: HashSet<String> = remove.iter().map(|name| name.to_ascii_uppercase()).collect();
+    columns.retain(|column| !remove_set.contains(&column.to_ascii_uppercase()));
 }
 
 fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<String> {

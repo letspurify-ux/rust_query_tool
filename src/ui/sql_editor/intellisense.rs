@@ -172,7 +172,10 @@ impl SqlEditorWidget {
 
         if deep_ctx.phase.is_table_context() && !insert_column_list_context {
             SqlContext::TableName
-        } else if deep_ctx.phase.is_column_context() || insert_column_list_context {
+        } else if deep_ctx.phase.is_column_context()
+            || matches!(deep_ctx.phase, intellisense_context::SqlPhase::PivotClause)
+            || insert_column_list_context
+        {
             if matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList) {
                 SqlContext::ColumnOrAll
             } else {
@@ -1580,11 +1583,8 @@ impl SqlEditorWidget {
         );
 
         // Resolve column tables using deep context
-        let column_tables = if let Some(ref q) = qualifier {
-            intellisense_context::resolve_qualifier_tables(q, &deep_ctx.tables_in_scope)
-        } else {
-            intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope)
-        };
+        let column_tables =
+            Self::resolve_column_tables_for_context(qualifier.as_deref(), deep_ctx.as_ref());
 
         let include_columns = qualifier.is_some()
             || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
@@ -1635,6 +1635,11 @@ impl SqlEditorWidget {
                     }
                     columns.extend(wildcard_columns);
                 }
+                columns.extend(
+                    intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
+                        body_tokens,
+                    ),
+                );
                 Self::dedup_column_names_case_insensitive(&mut columns);
                 if !columns.is_empty() {
                     virtual_table_columns.insert(cte.name.clone(), columns);
@@ -1665,6 +1670,11 @@ impl SqlEditorWidget {
                         .insert(subq.alias.to_uppercase(), wildcard_tables);
                 }
                 columns.extend(wildcard_columns);
+                columns.extend(
+                    intellisense_context::extract_oracle_pivot_unpivot_projection_columns(
+                        body_tokens,
+                    ),
+                );
                 Self::dedup_column_names_case_insensitive(&mut columns);
                 if !columns.is_empty() {
                     virtual_table_columns.insert(subq.alias.clone(), columns);
@@ -1710,7 +1720,7 @@ impl SqlEditorWidget {
             false
         };
 
-        let suggestions = {
+        let mut suggestions = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1731,6 +1741,15 @@ impl SqlEditorWidget {
                 )
             }
         };
+        if include_columns && qualifier.is_none() {
+            suggestions = Self::merge_suggestions_with_derived_columns(
+                suggestions,
+                &prefix,
+                intellisense_context::extract_oracle_unpivot_generated_columns(
+                    deep_ctx.statement_tokens.as_ref(),
+                ),
+            );
+        }
         let context_alias_suggestions =
             Self::collect_context_alias_suggestions(&prefix, deep_ctx.as_ref());
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
@@ -1933,6 +1952,63 @@ impl SqlEditorWidget {
             return base;
         }
         Self::merge_suggestions_with_context_aliases(base, aliases, prefer_aliases)
+    }
+
+    fn resolve_column_tables_for_context(
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let Some(qualifier) = qualifier else {
+            return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
+        };
+
+        let resolved =
+            intellisense_context::resolve_qualifier_tables(qualifier, &deep_ctx.tables_in_scope);
+        let unresolved_direct = resolved.len() == 1 && resolved[0].eq_ignore_ascii_case(qualifier);
+        if !unresolved_direct {
+            return resolved;
+        }
+
+        let pattern_vars = intellisense_context::extract_match_recognize_pattern_variables(
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        if pattern_vars
+            .iter()
+            .any(|var| var.eq_ignore_ascii_case(qualifier))
+        {
+            return intellisense_context::resolve_all_scope_tables(&deep_ctx.tables_in_scope);
+        }
+
+        resolved
+    }
+
+    fn merge_suggestions_with_derived_columns(
+        mut base: Vec<String>,
+        prefix: &str,
+        derived_columns: Vec<String>,
+    ) -> Vec<String> {
+        if derived_columns.is_empty() {
+            base.truncate(MAX_MERGED_SUGGESTIONS);
+            return base;
+        }
+
+        let prefix_upper = prefix.to_uppercase();
+        let mut seen: HashSet<String> = base.iter().map(|item| item.to_uppercase()).collect();
+
+        for column in derived_columns {
+            let upper = column.to_uppercase();
+            if !prefix_upper.is_empty()
+                && (!upper.starts_with(prefix_upper.as_str()) || upper == prefix_upper)
+            {
+                continue;
+            }
+            if seen.insert(upper) {
+                base.push(column);
+            }
+        }
+
+        base.truncate(MAX_MERGED_SUGGESTIONS);
+        base
     }
 
     fn maybe_prefetch_columns_for_word(
@@ -4660,6 +4736,52 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             deep_ctx.statement_tokens.as_ref(),
         );
         assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn resolve_column_tables_maps_match_recognize_pattern_variable_to_scope_tables() {
+        let sql_with_cursor = r#"
+SELECT *
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY hiredate, empno
+  MEASURES
+    FIRST(ename) AS start_name,
+    LAST(ename) AS end_name
+  ONE ROW PER MATCH
+  PATTERN (a b+)
+  DEFINE
+    b AS b.| > PREV(b.sal)
+)
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let column_tables =
+            SqlEditorWidget::resolve_column_tables_for_context(Some("b"), &deep_ctx);
+        assert!(
+            column_tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case("oqt_t_emp")),
+            "pattern variable b should resolve to source tables, got: {:?}",
+            column_tables
+        );
+        assert!(
+            !column_tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case("b")),
+            "pattern variable should not fall back to raw qualifier table key: {:?}",
+            column_tables
+        );
     }
 
     #[test]

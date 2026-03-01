@@ -118,6 +118,24 @@ fn test_connect_line_with_leading_whitespace_disables_rest_highlighting() {
 }
 
 #[test]
+fn test_connect_by_prior_keywords_are_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT node_id FROM oqt_t_tree CONNECT BY PRIOR node_id = parent_id";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CONNECT", "BY", "PRIOR"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
+}
+
+#[test]
 fn test_prompt_keyword_with_large_start_is_safe() {
     assert!(!is_prompt_keyword(b"PROMPT", usize::MAX));
 }
@@ -212,6 +230,24 @@ fn test_minus_keyword_highlighting() {
             .all(|c| c == STYLE_KEYWORD),
         "MINUS should be highlighted as keyword"
     );
+}
+
+#[test]
+fn test_match_recognize_keywords_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT * FROM oqt_t_emp MATCH_RECOGNIZE (ONE ROW PER MATCH PATTERN (a b+))";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["MATCH_RECOGNIZE", "ONE", "PER", "MATCH", "PATTERN"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
 }
 
 #[test]

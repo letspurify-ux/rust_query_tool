@@ -532,16 +532,18 @@ impl SqlHighlighter {
                 }
                 if is_connect_keyword(bytes, scan) {
                     let keyword_end = scan + 7;
-                    styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
-                    let mut end = scan;
-                    while let Some(&b) = bytes.get(end) {
-                        if b == b'\n' {
-                            break;
+                    if !is_connect_by_continuation(bytes, keyword_end) {
+                        styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
+                        let mut end = scan;
+                        while let Some(&b) = bytes.get(end) {
+                            if b == b'\n' {
+                                break;
+                            }
+                            end += 1;
                         }
-                        end += 1;
+                        idx = end;
+                        continue;
                     }
-                    idx = end;
-                    continue;
                 }
             }
 
@@ -1014,6 +1016,32 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
     }
     matches!(
         bytes.get(end),
+        None | Some(b' ') | Some(b'\t') | Some(b'\n')
+    )
+}
+
+fn is_connect_by_continuation(bytes: &[u8], connect_end: usize) -> bool {
+    let mut idx = connect_end.min(bytes.len());
+    while matches!(bytes.get(idx), Some(b' ' | b'\t')) {
+        idx += 1;
+    }
+
+    let Some(by_end) = idx.checked_add(2) else {
+        return false;
+    };
+    if bytes.len() < by_end {
+        return false;
+    }
+    if !bytes[idx..by_end]
+        .iter()
+        .zip(b"BY")
+        .all(|(b, c)| b.to_ascii_uppercase() == *c)
+    {
+        return false;
+    }
+
+    matches!(
+        bytes.get(by_end),
         None | Some(b' ') | Some(b'\t') | Some(b'\n')
     )
 }
