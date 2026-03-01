@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const APP_DIR_NAME: &str = "space_query";
 const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
-const MAX_LOG_ENTRIES: usize = 5000;
+const MAX_LOG_ENTRIES: usize = 100;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS: u64 = 200;
 
@@ -120,7 +120,10 @@ impl AppLog {
             if path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<Self>(&content) {
-                        Ok(log) => return log,
+                        Ok(mut log) => {
+                            log.entries.truncate(MAX_LOG_ENTRIES);
+                            return log;
+                        }
                         Err(err) => {
                             eprintln!("Failed to parse app log file {}: {}", path.display(), err);
                             Self::preserve_corrupt_log_file(&path);
