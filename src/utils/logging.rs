@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const APP_DIR_NAME: &str = "space_query";
 const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
-const MAX_LOG_ENTRIES: usize = 5000;
+const MAX_LOG_ENTRIES: usize = 100;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS: u64 = 200;
 

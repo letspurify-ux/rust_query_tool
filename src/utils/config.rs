@@ -501,8 +501,8 @@ impl QueryHistory {
 
     pub fn add_entry(&mut self, entry: QueryHistoryEntry) {
         self.queries.insert(0, entry);
-        // Keep only last 1000 queries
-        self.queries.truncate(1000);
+        // Keep only last 100 queries
+        self.queries.truncate(100);
     }
 }
 
