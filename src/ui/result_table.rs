@@ -667,9 +667,7 @@ impl ResultTableWidget {
             }
             (SortNumericValue::Integer(lhs), SortNumericValue::Float(rhs)) => {
                 if rhs.fract() == 0.0 && rhs >= i128::MIN as f64 && rhs <= i128::MAX as f64 {
-                    if let Ok(rhs_int) = rhs.to_string().parse::<i128>() {
-                        return lhs.cmp(&rhs_int);
-                    }
+                    return lhs.cmp(&(rhs as i128));
                 }
                 (lhs as f64)
                     .partial_cmp(&rhs)
