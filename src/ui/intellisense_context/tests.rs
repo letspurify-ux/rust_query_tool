@@ -1005,6 +1005,24 @@ fn lateral_subquery_can_see_outer_table_scope() {
 }
 
 #[test]
+fn cross_apply_subquery_can_see_outer_table_scope() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp jt CROSS APPLY (SELECT jt.| FROM dual) it");
+    let names = table_names(&ctx);
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_emp")),
+        "cross apply subquery should inherit outer scope table: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|name| name.eq_ignore_ascii_case("dual")),
+        "cross apply subquery should keep local table scope: {:?}",
+        names
+    );
+}
+
+#[test]
 fn cross_apply_subquery_exposes_alias_in_outer_scope() {
     let ctx = analyze("SELECT a.| FROM t1 CROSS APPLY (SELECT id FROM t2) a");
     let names = table_names(&ctx);
@@ -1183,6 +1201,50 @@ fn pivot_clause_for_expression_phase() {
 }
 
 #[test]
+fn model_clause_dimension_by_phase_is_column_context() {
+    let ctx = analyze(
+        "WITH m AS ( \
+           SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt \
+           FROM oqt_t_emp \
+           GROUP BY deptno \
+         ) \
+         SELECT deptno, sum_sal, cnt \
+         FROM m \
+         MODEL \
+           DIMENSION BY (|) \
+           MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+           RULES ( \
+             avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2), \
+             sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+           )",
+    );
+    assert_eq!(ctx.phase, SqlPhase::ModelClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn model_clause_rules_expression_phase_is_column_context() {
+    let ctx = analyze(
+        "WITH m AS ( \
+           SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt \
+           FROM oqt_t_emp \
+           GROUP BY deptno \
+         ) \
+         SELECT deptno, sum_sal, cnt \
+         FROM m \
+         MODEL \
+           DIMENSION BY (deptno) \
+           MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+           RULES ( \
+             avg_sal_calc[ANY] = ROUND(|[CV()] / NULLIF(cnt[CV()], 0), 2), \
+             sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+           )",
+    );
+    assert_eq!(ctx.phase, SqlPhase::ModelClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn match_recognize_partition_by_phase_is_column_context() {
     let ctx = analyze(
         "SELECT * FROM oqt_t_emp \
@@ -1218,6 +1280,69 @@ fn match_recognize_keyword_is_not_parsed_as_table_alias() {
 }
 
 #[test]
+fn json_table_arguments_can_resolve_left_relation_alias() {
+    let ctx = analyze(
+        "SELECT * \
+         FROM oqt_t_json j \
+         CROSS JOIN JSON_TABLE(j.|, '$' COLUMNS (order_id NUMBER PATH '$.order_id')) jt",
+    );
+    let resolved = resolve_qualifier_tables("j", &ctx.tables_in_scope);
+    assert!(
+        resolved
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_json")),
+        "json_table argument should resolve left table alias: {:?}",
+        resolved
+    );
+}
+
+#[test]
+fn extract_table_function_columns_includes_nested_columns_clause() {
+    let ctx = analyze(
+        "SELECT jt.| \
+         FROM oqt_t_json j \
+         CROSS JOIN JSON_TABLE( \
+           j.payload, \
+           '$' \
+           COLUMNS ( \
+             order_id NUMBER PATH '$.order_id', \
+             NESTED PATH '$.items[*]' \
+             COLUMNS ( \
+               sku VARCHAR2(30) PATH '$.sku', \
+               qty NUMBER PATH '$.qty', \
+               price NUMBER PATH '$.price' \
+             ) \
+           ) \
+         ) jt",
+    );
+
+    let subq = ctx
+        .subqueries
+        .iter()
+        .find(|s| s.alias.eq_ignore_ascii_case("jt"))
+        .expect("expected json_table alias jt");
+    let cols = extract_table_function_columns(token_range_slice(
+        ctx.statement_tokens.as_ref(),
+        subq.body_range,
+    ));
+
+    for expected in ["order_id", "sku", "qty", "price"] {
+        assert!(
+            cols.iter().any(|c| c.eq_ignore_ascii_case(expected)),
+            "expected nested json_table column `{expected}` in {:?}",
+            cols
+        );
+    }
+}
+
+#[test]
+fn extract_select_list_leading_qualifiers_reads_incomplete_references() {
+    let tokens = tokenize("SELECT jt., jt., jt. FROM dual");
+    let qualifiers = extract_select_list_leading_qualifiers(&tokens);
+    assert_eq!(qualifiers, vec!["jt"]);
+}
+
+#[test]
 fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
@@ -1235,6 +1360,23 @@ fn extract_oracle_unpivot_generated_columns_from_clause() {
     );
     let cols = extract_oracle_unpivot_generated_columns(&tokens);
     assert_eq!(cols, vec!["sum_sal", "dept_tag"]);
+}
+
+#[test]
+fn extract_oracle_model_generated_columns_from_measures_clause() {
+    let tokens = tokenize(
+        "SELECT deptno, sum_sal \
+         FROM m \
+         MODEL \
+           DIMENSION BY (deptno) \
+           MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+           RULES ( \
+             avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2), \
+             sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+           )",
+    );
+    let cols = extract_oracle_model_generated_columns(&tokens);
+    assert_eq!(cols, vec!["sum_sal", "cnt", "avg_sal_calc", "sum_plus_100"]);
 }
 
 #[test]
@@ -1356,7 +1498,8 @@ fn extract_table_function_columns_from_xmltable_columns_clause() {
 
 #[test]
 fn extract_table_function_columns_skips_select_subquery_bodies() {
-    let tokens = tokenize("SELECT id, XMLTABLE('/x' PASSING t.payload COLUMNS c NUMBER PATH '/x') FROM t");
+    let tokens =
+        tokenize("SELECT id, XMLTABLE('/x' PASSING t.payload COLUMNS c NUMBER PATH '/x') FROM t");
     let cols = extract_table_function_columns(&tokens);
     assert!(cols.is_empty());
 }

@@ -1653,11 +1653,22 @@ impl SqlEditorWidget {
                     subq.body_range,
                 );
                 let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+                let body_tables_in_scope =
+                    intellisense_context::collect_tables_in_statement(body_tokens);
                 if columns.is_empty() {
                     columns = intellisense_context::extract_table_function_columns(body_tokens);
                 }
-                let body_tables_in_scope =
-                    intellisense_context::collect_tables_in_statement(body_tokens);
+                if columns.is_empty() {
+                    columns = Self::infer_columns_from_partial_select_qualifiers(
+                        body_tokens,
+                        &body_tables_in_scope,
+                        &deep_ctx.tables_in_scope,
+                        &virtual_table_columns,
+                        intellisense_data,
+                        column_sender,
+                        connection,
+                    );
+                }
                 let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
                     body_tokens,
                     &body_tables_in_scope,
@@ -1742,13 +1753,17 @@ impl SqlEditorWidget {
             }
         };
         if include_columns && qualifier.is_none() {
-            suggestions = Self::merge_suggestions_with_derived_columns(
-                suggestions,
-                &prefix,
+            let mut derived_columns =
                 intellisense_context::extract_oracle_unpivot_generated_columns(
+                    deep_ctx.statement_tokens.as_ref(),
+                );
+            derived_columns.extend(
+                intellisense_context::extract_oracle_model_generated_columns(
                     deep_ctx.statement_tokens.as_ref(),
                 ),
             );
+            suggestions =
+                Self::merge_suggestions_with_derived_columns(suggestions, &prefix, derived_columns);
         }
         let context_alias_suggestions =
             Self::collect_context_alias_suggestions(&prefix, deep_ctx.as_ref());
@@ -1952,6 +1967,84 @@ impl SqlEditorWidget {
             return base;
         }
         Self::merge_suggestions_with_context_aliases(base, aliases, prefer_aliases)
+    }
+
+    fn infer_columns_from_partial_select_qualifiers(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> Vec<String> {
+        let qualifiers = intellisense_context::extract_select_list_leading_qualifiers(body_tokens);
+        if qualifiers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut columns = Vec::new();
+        for qualifier in qualifiers {
+            let mut tables =
+                intellisense_context::resolve_qualifier_tables(&qualifier, body_tables_in_scope);
+            let unresolved_direct =
+                tables.len() == 1 && tables[0].eq_ignore_ascii_case(qualifier.as_str());
+            if unresolved_direct {
+                let outer_tables = intellisense_context::resolve_qualifier_tables(
+                    &qualifier,
+                    outer_tables_in_scope,
+                );
+                let outer_unresolved_direct = outer_tables.len() == 1
+                    && outer_tables[0].eq_ignore_ascii_case(qualifier.as_str());
+                if !outer_unresolved_direct {
+                    tables = outer_tables;
+                }
+            }
+
+            for table in tables {
+                if let Some(virtual_cols) =
+                    Self::find_virtual_columns_case_insensitive(virtual_table_columns, &table)
+                {
+                    columns.extend(virtual_cols.iter().cloned());
+                    continue;
+                }
+
+                let mut table_columns = {
+                    let data = intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    data.get_columns_for_table(&table)
+                };
+                if table_columns.is_empty() {
+                    Self::request_table_columns(
+                        &table,
+                        intellisense_data,
+                        column_sender,
+                        connection,
+                    );
+                    table_columns = {
+                        let data = intellisense_data
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        data.get_columns_for_table(&table)
+                    };
+                }
+                columns.extend(table_columns);
+            }
+        }
+
+        Self::dedup_column_names_case_insensitive(&mut columns);
+        columns
+    }
+
+    fn find_virtual_columns_case_insensitive<'a>(
+        virtual_table_columns: &'a HashMap<String, Vec<String>>,
+        table: &str,
+    ) -> Option<&'a [String]> {
+        virtual_table_columns
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .map(|(_, cols)| cols.as_slice())
     }
 
     fn resolve_column_tables_for_context(
@@ -4340,14 +4433,16 @@ ORDER BY x.deptno
             if columns.is_empty() {
                 columns = intellisense_context::extract_table_function_columns(body_tokens);
             }
-            let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
-            let (wildcard_columns, _wildcard_tables) = SqlEditorWidget::expand_virtual_table_wildcards(
-                body_tokens,
-                &body_tables_in_scope,
-                &data,
-                &sender,
-                &connection,
-            );
+            let body_tables_in_scope =
+                intellisense_context::collect_tables_in_statement(body_tokens);
+            let (wildcard_columns, _wildcard_tables) =
+                SqlEditorWidget::expand_virtual_table_wildcards(
+                    body_tokens,
+                    &body_tables_in_scope,
+                    &data,
+                    &sender,
+                    &connection,
+                );
             columns.extend(wildcard_columns);
             SqlEditorWidget::dedup_column_names_case_insensitive(&mut columns);
             if !columns.is_empty() {
@@ -4739,10 +4834,45 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
+    fn classify_intellisense_context_treats_model_clause_as_column_context() {
+        let sql_with_cursor = "WITH m AS ( \
+             SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt \
+             FROM oqt_t_emp \
+             GROUP BY deptno \
+           ) \
+           SELECT deptno, sum_sal, cnt \
+           FROM m \
+           MODEL \
+             DIMENSION BY (|) \
+             MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+             RULES ( \
+               avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2), \
+               sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+             )";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::ModelClause);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
     fn resolve_column_tables_maps_match_recognize_pattern_variable_to_scope_tables() {
         let sql_with_cursor = r#"
-SELECT *
-FROM oqt_t_emp
+	SELECT *
+	FROM oqt_t_emp
 MATCH_RECOGNIZE (
   PARTITION BY deptno
   ORDER BY hiredate, empno
@@ -4782,6 +4912,127 @@ MATCH_RECOGNIZE (
             "pattern variable should not fall back to raw qualifier table key: {:?}",
             column_tables
         );
+    }
+
+    #[test]
+    fn merge_derived_columns_includes_model_measure_aliases() {
+        let tokens = SqlEditorWidget::tokenize_sql(
+            "SELECT deptno, sum_sal \
+             FROM m \
+             MODEL \
+               DIMENSION BY (deptno) \
+               MEASURES (sum_sal, cnt, 0 AS avg_sal_calc, 0 AS sum_plus_100) \
+               RULES ( \
+                 avg_sal_calc[ANY] = ROUND(sum_sal[CV()] / NULLIF(cnt[CV()], 0), 2), \
+                 sum_plus_100[ANY] = sum_sal[CV()] + 100 \
+               )",
+        );
+
+        let mut derived_columns =
+            intellisense_context::extract_oracle_unpivot_generated_columns(&tokens);
+        derived_columns
+            .extend(intellisense_context::extract_oracle_model_generated_columns(&tokens));
+
+        let merged = SqlEditorWidget::merge_suggestions_with_derived_columns(
+            vec!["deptno".to_string(), "sum_sal".to_string()],
+            "",
+            derived_columns,
+        );
+
+        assert!(
+            merged
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("avg_sal_calc")),
+            "expected avg_sal_calc in merged suggestions, got: {:?}",
+            merged
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("sum_plus_100")),
+            "expected sum_plus_100 in merged suggestions, got: {:?}",
+            merged
+        );
+    }
+
+    #[test]
+    fn infer_columns_from_partial_select_qualifier_uses_virtual_table_columns() {
+        let sql_with_cursor = r#"
+SELECT
+  jt.order_id,
+  it.|,
+  (it.qty * it.price) AS line_amt
+FROM oqt_t_json j
+CROSS JOIN JSON_TABLE(
+  j.payload,
+  '$'
+  COLUMNS (
+    order_id NUMBER PATH '$.order_id',
+    NESTED PATH '$.items[*]'
+    COLUMNS (
+      sku   VARCHAR2(30) PATH '$.sku',
+      qty   NUMBER       PATH '$.qty',
+      price NUMBER       PATH '$.price'
+    )
+  )
+) jt
+CROSS APPLY (
+  SELECT jt., jt., jt. FROM dual
+) it
+"#;
+
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        let it_subq = deep_ctx
+            .subqueries
+            .iter()
+            .find(|s| s.alias.eq_ignore_ascii_case("it"))
+            .expect("expected apply subquery alias it");
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            it_subq.body_range,
+        );
+        let body_tables_in_scope = intellisense_context::collect_tables_in_statement(body_tokens);
+
+        let mut virtual_table_columns = HashMap::new();
+        virtual_table_columns.insert(
+            "jt".to_string(),
+            vec![
+                "order_id".to_string(),
+                "sku".to_string(),
+                "qty".to_string(),
+                "price".to_string(),
+            ],
+        );
+
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let inferred = SqlEditorWidget::infer_columns_from_partial_select_qualifiers(
+            body_tokens,
+            &body_tables_in_scope,
+            &deep_ctx.tables_in_scope,
+            &virtual_table_columns,
+            &data,
+            &sender,
+            &connection,
+        );
+
+        for expected in ["order_id", "sku", "qty", "price"] {
+            assert!(
+                inferred.iter().any(|c| c.eq_ignore_ascii_case(expected)),
+                "expected inferred column `{expected}` in {:?}",
+                inferred
+            );
+        }
     }
 
     #[test]
