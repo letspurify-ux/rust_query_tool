@@ -582,20 +582,23 @@ impl WordUndoRedoState {
         let Some(latest_delta) = group.first() else {
             return self.current.cursor_pos;
         };
+        let earliest_delta = group.last().unwrap_or(latest_delta);
 
         // Undo cursor policy:
-        // - Undoing a deletion should land at the end of restored text.
-        // - Undoing an insertion (and other edit kinds) should land at the
-        //   previous cursor position before that edit.
-        let cursor =
-            if latest_delta.inserted_text.is_empty() && !latest_delta.deleted_text.is_empty() {
-                latest_delta
-                    .start
-                    .saturating_add(latest_delta.deleted_text.len())
-            } else {
-                latest_delta.before_cursor
-            }
-            .min(self.current.text.len());
+        // - Undoing a single deletion should land at the end of restored text.
+        // - Undoing grouped edits should restore the cursor before the group's
+        //   first edit (earliest delta), not before the latest sub-edit.
+        let is_single_deletion_undo = group.len() == 1
+            && latest_delta.inserted_text.is_empty()
+            && !latest_delta.deleted_text.is_empty();
+        let cursor = if is_single_deletion_undo {
+            latest_delta
+                .start
+                .saturating_add(latest_delta.deleted_text.len())
+        } else {
+            earliest_delta.before_cursor
+        }
+        .min(self.current.text.len());
         Self::clamp_to_char_boundary(&self.current.text, cursor)
     }
 
@@ -3846,6 +3849,23 @@ mod execution_state_tests {
 
         let undo_cursor = state.undo_cursor_after_group(&undo_group);
         assert_eq!(undo_cursor, 3);
+    }
+
+    #[test]
+    fn undo_cursor_after_group_uses_group_start_for_grouped_insertion_with_trailing_text() {
+        let mut state = WordUndoRedoState::new("xyz".to_string());
+        state.current.cursor_pos = 0;
+        state.record_edit(&build_edit(0, "", "a"), classify_edit_group(1, 0, "a", ""));
+        state.record_edit(&build_edit(1, "", "s"), classify_edit_group(1, 0, "s", ""));
+        state.record_edit(&build_edit(2, "", "d"), classify_edit_group(1, 0, "d", ""));
+        state.record_edit(&build_edit(3, "", "f"), classify_edit_group(1, 0, "f", ""));
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 4);
+        assert_eq!(state.current.text, "xyz");
+
+        let undo_cursor = state.undo_cursor_after_group(&undo_group);
+        assert_eq!(undo_cursor, 0);
     }
 
     #[test]

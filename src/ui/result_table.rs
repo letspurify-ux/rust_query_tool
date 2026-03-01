@@ -69,6 +69,9 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 const MAX_HITTEST_ROW_BACKTRACK: i32 = 4096;
 /// Limit stale column-position fallback scans for very wide result sets.
 const MAX_HITTEST_COL_BACKTRACK: i32 = 512;
+const HEADER_SORT_CLICK_MOVE_TOLERANCE_PX: u32 = 4;
+const SORT_ASC_MARK: &str = "▲";
+const SORT_DESC_MARK: &str = "▼";
 
 pub type ResultGridSqlExecuteCallback = Arc<Mutex<Box<dyn FnMut(String) -> Result<(), String>>>>;
 
@@ -226,6 +229,7 @@ pub struct ResultTableWidget {
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
     streaming_in_progress: Arc<Mutex<bool>>,
+    sort_state: Arc<Mutex<Option<ColumnSortState>>>,
 }
 
 #[derive(Default)]
@@ -239,6 +243,9 @@ struct DragState {
     /// `get_cell_at_mouse_for_drag` when the pointer hasn't moved.
     last_mouse_x: i32,
     last_mouse_y: i32,
+    header_sort_candidate_col: Option<i32>,
+    header_sort_start_x: i32,
+    header_sort_start_y: i32,
 }
 
 #[derive(Clone)]
@@ -260,6 +267,27 @@ enum CanonicalJoinClass {
     Symbolic,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ColumnSortState {
+    col_idx: usize,
+    direction: SortDirection,
+}
+
 #[derive(Clone)]
 struct TableEditSession {
     rowid_col: usize,
@@ -278,6 +306,7 @@ struct QueryEditBackupState {
     full_data: Vec<Vec<String>>,
     source_sql: String,
     edit_session: TableEditSession,
+    sort_state: Option<ColumnSortState>,
 }
 
 #[derive(Clone)]
@@ -576,6 +605,137 @@ impl ResultTableWidget {
             .clone()
     }
 
+    fn current_sort_state(&self) -> Option<ColumnSortState> {
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn clear_sort_state(&self) {
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn sort_marker_for_column(
+        sort_state: Option<ColumnSortState>,
+        col_idx: usize,
+    ) -> Option<&'static str> {
+        let state = sort_state?;
+        if state.col_idx != col_idx {
+            return None;
+        }
+        match state.direction {
+            SortDirection::Ascending => Some(SORT_ASC_MARK),
+            SortDirection::Descending => Some(SORT_DESC_MARK),
+        }
+    }
+
+    fn parse_sort_number(value: &str) -> Option<f64> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let parsed = trimmed.parse::<f64>().ok()?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    fn compare_row_values_for_sort(
+        left: &[String],
+        right: &[String],
+        col_idx: usize,
+    ) -> std::cmp::Ordering {
+        let left_value = left.get(col_idx).map(|value| value.as_str()).unwrap_or("");
+        let right_value = right.get(col_idx).map(|value| value.as_str()).unwrap_or("");
+        let left_number = Self::parse_sort_number(left_value);
+        let right_number = Self::parse_sort_number(right_value);
+        match (left_number, right_number) {
+            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left_value.cmp(right_value),
+        }
+    }
+
+    fn sort_row_entries(
+        rows: &mut Vec<Vec<String>>,
+        row_states: Option<&mut Vec<EditRowState>>,
+        col_idx: usize,
+        direction: SortDirection,
+    ) -> bool {
+        match row_states {
+            Some(states) => {
+                if states.len() != rows.len() {
+                    return false;
+                }
+                let moved_rows = std::mem::take(rows);
+                let moved_states = std::mem::take(states);
+                let mut paired: Vec<(Vec<String>, EditRowState)> =
+                    moved_rows.into_iter().zip(moved_states).collect();
+                paired.sort_by(|(left, _), (right, _)| {
+                    let ordering = Self::compare_row_values_for_sort(left, right, col_idx);
+                    match direction {
+                        SortDirection::Ascending => ordering,
+                        SortDirection::Descending => ordering.reverse(),
+                    }
+                });
+                rows.reserve(paired.len());
+                states.reserve(paired.len());
+                for (row, state) in paired {
+                    rows.push(row);
+                    states.push(state);
+                }
+                true
+            }
+            None => {
+                rows.sort_by(|left, right| {
+                    let ordering = Self::compare_row_values_for_sort(left, right, col_idx);
+                    match direction {
+                        SortDirection::Ascending => ordering,
+                        SortDirection::Descending => ordering.reverse(),
+                    }
+                });
+                true
+            }
+        }
+    }
+
+    fn apply_sort_to_table_data(
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        col_idx: usize,
+        direction: SortDirection,
+    ) -> bool {
+        let mut session_guard = edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rows_guard = full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let row_states = session_guard
+            .as_mut()
+            .map(|session| &mut session.row_states);
+        Self::sort_row_entries(&mut rows_guard, row_states, col_idx, direction)
+    }
+
+    fn next_sort_state(current: Option<ColumnSortState>, col_idx: usize) -> ColumnSortState {
+        match current {
+            Some(state) if state.col_idx == col_idx => ColumnSortState {
+                col_idx,
+                direction: state.direction.toggled(),
+            },
+            _ => ColumnSortState {
+                col_idx,
+                direction: SortDirection::Ascending,
+            },
+        }
+    }
+
     fn set_query_edit_backup(&self, backup: Option<QueryEditBackupState>) {
         *self
             .query_edit_backup
@@ -609,6 +769,10 @@ impl ResultTableWidget {
             .edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backup.edit_session);
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.sort_state;
 
         let row_count = self
             .full_data
@@ -650,6 +814,7 @@ impl ResultTableWidget {
             full_data,
             source_sql,
             edit_session,
+            sort_state: self.current_sort_state(),
         }));
     }
 
@@ -1026,6 +1191,7 @@ impl ResultTableWidget {
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
         let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -1065,6 +1231,7 @@ impl ResultTableWidget {
         let font_settings_for_draw = font_settings.clone();
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let edit_session_for_draw = edit_session.clone();
+        let sort_state_for_draw = sort_state.clone();
 
         // Page-level cache for edit state: populated once per StartPage,
         // looked up per Cell.  Captured as a plain owned value since the
@@ -1128,6 +1295,8 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(bold_font, font_size);
+                    let sort_snapshot =
+                        sort_state_for_draw.try_lock().ok().and_then(|guard| *guard);
                     if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
@@ -1138,6 +1307,18 @@ impl ResultTableWidget {
                                 h,
                                 Align::Left,
                             );
+                            if let Some(marker) =
+                                Self::sort_marker_for_column(sort_snapshot, col as usize)
+                            {
+                                draw::draw_text2(
+                                    marker,
+                                    x + TABLE_CELL_PADDING,
+                                    y,
+                                    w - TABLE_CELL_PADDING * 2,
+                                    h,
+                                    Align::Right,
+                                );
+                            }
                         }
                     }
                     draw::set_draw_color(border_color);
@@ -1296,6 +1477,8 @@ impl ResultTableWidget {
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         let active_inline_edit_for_handle = active_inline_edit.clone();
         let active_inline_edit_for_resize = active_inline_edit.clone();
+        let sort_state_for_handle = sort_state.clone();
+        let streaming_in_progress_for_handle = streaming_in_progress.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -1320,6 +1503,26 @@ impl ResultTableWidget {
                     // Left click - start drag selection
                     if button == app::MouseButton::Left as i32 {
                         let _ = table_for_handle.take_focus();
+                        if let Some(col) = Self::get_col_header_at_mouse(&table_for_handle) {
+                            if col >= 0 {
+                                let mut state = drag_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                state.header_sort_candidate_col = Some(col);
+                                state.header_sort_start_x = app::event_x();
+                                state.header_sort_start_y = app::event_y();
+                                state.is_dragging = false;
+                                state.last_row = -1;
+                                state.last_col = -1;
+                                return true;
+                            }
+                        }
+                        {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.header_sort_candidate_col = None;
+                        }
                         let target_cell = if app::event_clicks() {
                             // On double-click, prefer the already-selected single cell.
                             // This avoids running a full mouse hit-test scan twice.
@@ -1381,7 +1584,13 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Drag => {
-                    let (is_dragging, mouse_unchanged) = {
+                    let (
+                        is_dragging,
+                        mouse_unchanged,
+                        header_sort_candidate,
+                        header_start_x,
+                        header_start_y,
+                    ) = {
                         let state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1390,8 +1599,28 @@ impl ResultTableWidget {
                         (
                             state.is_dragging,
                             state.last_mouse_x == mx && state.last_mouse_y == my,
+                            state.header_sort_candidate_col,
+                            state.header_sort_start_x,
+                            state.header_sort_start_y,
                         )
                     };
+                    if header_sort_candidate.is_some() {
+                        let moved_beyond = Self::pointer_moved_beyond_tolerance(
+                            header_start_x,
+                            header_start_y,
+                            app::event_x(),
+                            app::event_y(),
+                            HEADER_SORT_CLICK_MOVE_TOLERANCE_PX,
+                        );
+                        if moved_beyond {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.header_sort_candidate_col = None;
+                        } else {
+                            return true;
+                        }
+                    }
                     if is_dragging {
                         if mouse_unchanged {
                             return true;
@@ -1425,13 +1654,49 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Released => {
-                    let mut state = drag_state_for_handle
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if state.is_dragging {
-                        state.is_dragging = false;
-                        state.last_row = -1;
-                        state.last_col = -1;
+                    let (header_sort_candidate, was_dragging) = {
+                        let mut state = drag_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let header_candidate = state.header_sort_candidate_col.take();
+                        let dragging = state.is_dragging;
+                        if dragging {
+                            state.is_dragging = false;
+                            state.last_row = -1;
+                            state.last_col = -1;
+                        }
+                        (header_candidate, dragging)
+                    };
+                    if let Some(col) = header_sort_candidate {
+                        if col >= 0
+                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
+                            // Streaming append mutates full_data incrementally, so block
+                            // column sort until the result set is finalized.
+                            && !mutex_load_bool(&streaming_in_progress_for_handle)
+                        {
+                            let col_idx = col as usize;
+                            let next_state = {
+                                let current = *sort_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                Self::next_sort_state(current, col_idx)
+                            };
+                            if Self::apply_sort_to_table_data(
+                                &full_data_for_handle,
+                                &edit_session_for_handle,
+                                col_idx,
+                                next_state.direction,
+                            ) {
+                                *sort_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(next_state);
+                                table_for_handle.redraw();
+                            }
+                        }
+                        return true;
+                    }
+                    if was_dragging {
                         return true;
                     }
                     false
@@ -1672,6 +1937,7 @@ impl ResultTableWidget {
             hidden_auto_rowid_col,
             active_inline_edit,
             streaming_in_progress,
+            sort_state,
         }
     }
 
@@ -2519,6 +2785,49 @@ impl ResultTableWidget {
         }
     }
 
+    fn estimate_col_hit(
+        table: &Table,
+        context: TableContext,
+        anchor_row: i32,
+        start_col: i32,
+        mouse_x: i32,
+        cols: i32,
+    ) -> Option<i32> {
+        if anchor_row < 0 || start_col < 0 || cols <= 0 || start_col >= cols {
+            return None;
+        }
+
+        let (start_x, _, start_w, _) = table.find_cell(context, anchor_row, start_col)?;
+        if start_w <= 0 {
+            return None;
+        }
+
+        let delta = mouse_x.saturating_sub(start_x);
+        let mut candidate = start_col.saturating_add(delta / start_w);
+        let last_col = cols.saturating_sub(1);
+        candidate = candidate.max(0).min(last_col);
+
+        let (candidate_x, _, candidate_w, _) = table.find_cell(context, anchor_row, candidate)?;
+        if candidate_w > 0
+            && mouse_x >= candidate_x
+            && mouse_x < candidate_x.saturating_add(candidate_w)
+        {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    fn pointer_moved_beyond_tolerance(
+        start_x: i32,
+        start_y: i32,
+        current_x: i32,
+        current_y: i32,
+        tolerance_px: u32,
+    ) -> bool {
+        start_x.abs_diff(current_x) > tolerance_px || start_y.abs_diff(current_y) > tolerance_px
+    }
+
     /// Get cell at mouse position (returns None if outside cells)
     fn get_cell_at_mouse(table: &Table) -> Option<(i32, i32)> {
         let rows = table.rows();
@@ -2760,6 +3069,90 @@ impl ResultTableWidget {
                 }
             }
             row += 1;
+        }
+
+        None
+    }
+
+    fn get_col_header_at_mouse(table: &Table) -> Option<i32> {
+        let cols = table.cols();
+        if cols <= 0 {
+            return None;
+        }
+
+        let mouse_x = app::event_x();
+        let mouse_y = app::event_y();
+
+        let table_x = table.x();
+        let table_y = table.y();
+        let table_w = table.w();
+        let data_left = table_x + table.row_header_width();
+        let data_right = table_x + table_w;
+        let header_bottom = table_y + table.col_header_height();
+
+        if mouse_x < data_left
+            || mouse_x >= data_right
+            || mouse_y < table_y
+            || mouse_y >= header_bottom
+        {
+            return None;
+        }
+
+        let rows = table.rows();
+        let anchor_row = if rows > 0 {
+            let last_row = rows.saturating_sub(1);
+            table.row_position().max(0).min(last_row)
+        } else {
+            0
+        };
+        let last_col = cols.saturating_sub(1);
+        let start_col = table.col_position().max(0).min(last_col);
+
+        if let Some(col) = Self::estimate_col_hit(
+            table,
+            TableContext::ColHeader,
+            anchor_row,
+            start_col,
+            mouse_x,
+            cols,
+        ) {
+            return Some(col);
+        }
+
+        let mut col = start_col;
+        while col < cols {
+            if let Some((cx, _, cw, _)) = table.find_cell(TableContext::ColHeader, anchor_row, col)
+            {
+                if cw > 0 && mouse_x >= cx && mouse_x < cx.saturating_add(cw) {
+                    return Some(col);
+                }
+                if cx > mouse_x || cx >= data_right {
+                    break;
+                }
+                if cw > 0 && cx.saturating_add(cw) <= mouse_x {
+                    let gap_px = mouse_x - cx.saturating_add(cw);
+                    let skip = (gap_px / cw).max(1);
+                    col = col.saturating_add(skip);
+                    continue;
+                }
+            } else {
+                break;
+            }
+            col += 1;
+        }
+
+        col = Self::fallback_scan_start(start_col, MAX_HITTEST_COL_BACKTRACK);
+        while col < start_col {
+            if let Some((cx, _, cw, _)) = table.find_cell(TableContext::ColHeader, anchor_row, col)
+            {
+                if cw > 0 && mouse_x >= cx && mouse_x < cx.saturating_add(cw) {
+                    return Some(col);
+                }
+                if cx > mouse_x || cx >= data_right {
+                    break;
+                }
+            }
+            col += 1;
         }
 
         None
@@ -5123,6 +5516,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
+        self.clear_sort_state();
         *self
             .source_sql
             .lock()
@@ -5268,7 +5662,6 @@ impl ResultTableWidget {
             self.table.redraw();
             return;
         }
-
         if let Some(session) = edit_session_snapshot {
             self.stage_query_edit_backup_from_current_state(session);
         } else {
@@ -5278,6 +5671,7 @@ impl ResultTableWidget {
             self.set_query_edit_backup(None);
             Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         }
+        self.clear_sort_state();
 
         *self
             .edit_session
@@ -5519,6 +5913,7 @@ impl ResultTableWidget {
         mutex_store_bool(&self.streaming_in_progress, false);
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
+        self.clear_sort_state();
         *self
             .edit_session
             .lock()
@@ -5880,6 +6275,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.set_query_edit_backup(None);
+        self.clear_sort_state();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
         // Clear callbacks to release captured Arc<Mutex<T>> references.
@@ -7102,6 +7498,7 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             full_data: vec![vec!["AAABBB".to_string(), "MILLER".to_string()]],
             source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
             edit_session: backup_session,
+            sort_state: None,
         }));
 
         *widget
@@ -8134,6 +8531,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                     dirty_cols: HashSet::new(),
                 }],
             },
+            sort_state: None,
         }));
 
         assert!(!widget.clear_orphaned_query_edit_backup());
@@ -8735,6 +9133,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                     dirty_cols: HashSet::new(),
                 }],
             },
+            sort_state: None,
         }));
 
         let headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
@@ -9229,6 +9628,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 deleted_rowids: Vec::new(),
                 row_states: Vec::new(),
             },
+            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -9270,6 +9670,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 deleted_rowids: Vec::new(),
                 row_states: Vec::new(),
             },
+            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -9572,6 +9973,191 @@ mod tests {
     fn csv_line_ending_matches_target_platform() {
         let expected = if cfg!(windows) { "\r\n" } else { "\n" };
         assert_eq!(ResultTableWidget::csv_line_ending(), expected);
+    }
+
+    #[test]
+    fn sort_marker_for_column_reflects_sort_direction() {
+        let asc = Some(ColumnSortState {
+            col_idx: 1,
+            direction: SortDirection::Ascending,
+        });
+        let desc = Some(ColumnSortState {
+            col_idx: 1,
+            direction: SortDirection::Descending,
+        });
+        assert_eq!(
+            ResultTableWidget::sort_marker_for_column(asc, 1),
+            Some(SORT_ASC_MARK)
+        );
+        assert_eq!(
+            ResultTableWidget::sort_marker_for_column(desc, 1),
+            Some(SORT_DESC_MARK)
+        );
+        assert_eq!(ResultTableWidget::sort_marker_for_column(desc, 0), None);
+        assert_eq!(ResultTableWidget::sort_marker_for_column(None, 1), None);
+    }
+
+    #[test]
+    fn next_sort_state_toggles_and_resets_for_new_column() {
+        let first = ResultTableWidget::next_sort_state(None, 2);
+        assert_eq!(
+            first,
+            ColumnSortState {
+                col_idx: 2,
+                direction: SortDirection::Ascending
+            }
+        );
+        let second = ResultTableWidget::next_sort_state(Some(first), 2);
+        assert_eq!(
+            second,
+            ColumnSortState {
+                col_idx: 2,
+                direction: SortDirection::Descending
+            }
+        );
+        let third = ResultTableWidget::next_sort_state(Some(second), 0);
+        assert_eq!(
+            third,
+            ColumnSortState {
+                col_idx: 0,
+                direction: SortDirection::Ascending
+            }
+        );
+    }
+
+    #[test]
+    fn compare_row_values_for_sort_uses_numeric_order_for_numbers() {
+        let left = vec!["2".to_string()];
+        let right = vec!["10".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(&left, &right, 0),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_row_values_for_sort_places_numbers_before_text() {
+        let number_row = vec!["42".to_string()];
+        let text_row = vec!["ABC".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(&number_row, &text_row, 0),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(&text_row, &number_row, 0),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sort_row_entries_reorders_rows_and_row_states_together() {
+        let mut rows = vec![
+            vec!["2".to_string(), "B".to_string()],
+            vec!["1".to_string(), "A".to_string()],
+            vec!["3".to_string(), "A".to_string()],
+        ];
+        let mut states = vec![
+            EditRowState::Existing {
+                rowid: "RID2".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+            EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+            EditRowState::Existing {
+                rowid: "RID3".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+        ];
+
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut rows,
+            Some(&mut states),
+            1,
+            SortDirection::Ascending,
+        ));
+
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "A".to_string()],
+                vec!["3".to_string(), "A".to_string()],
+                vec!["2".to_string(), "B".to_string()],
+            ]
+        );
+        let rowids: Vec<String> = states
+            .iter()
+            .map(|state| match state {
+                EditRowState::Existing { rowid, .. } => rowid.clone(),
+                EditRowState::Inserted { .. } => "INSERTED".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            rowids,
+            vec!["RID1".to_string(), "RID3".to_string(), "RID2".to_string()]
+        );
+    }
+
+    #[test]
+    fn sort_row_entries_rejects_out_of_sync_row_states() {
+        let mut rows = vec![vec!["2".to_string()], vec!["1".to_string()]];
+        let mut states = vec![EditRowState::Existing {
+            rowid: "RID2".to_string(),
+            explicit_null_cols: HashSet::new(),
+            dirty_cols: HashSet::new(),
+        }];
+        let original_rows = rows.clone();
+        let original_states_len = states.len();
+
+        assert!(!ResultTableWidget::sort_row_entries(
+            &mut rows,
+            Some(&mut states),
+            0,
+            SortDirection::Ascending,
+        ));
+
+        assert_eq!(rows, original_rows);
+        assert_eq!(states.len(), original_states_len);
+    }
+
+    #[test]
+    fn sort_row_entries_sorts_numeric_values_numerically() {
+        let mut rows = vec![
+            vec!["10".to_string()],
+            vec!["2".to_string()],
+            vec!["1".to_string()],
+        ];
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut rows,
+            None,
+            0,
+            SortDirection::Ascending,
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["10".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_moved_beyond_tolerance_uses_pixel_threshold() {
+        assert!(!ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 103, 104, 4
+        ));
+        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 106, 100, 4
+        ));
+        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 100, 106, 4
+        ));
     }
 
     #[test]
