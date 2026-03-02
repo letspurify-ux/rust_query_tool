@@ -530,8 +530,11 @@ impl SqlEditorWidget {
             match item {
                 FormatItem::Statement(statement) => {
                     let statement_tokens = Self::tokenize_sql(statement);
-                    let formatted_statement =
-                        Self::format_statement(statement, force_select_list_newline_next);
+                    let formatted_statement = Self::format_statement(
+                        statement,
+                        &statement_tokens,
+                        force_select_list_newline_next,
+                    );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     formatted.push_str(&formatted_statement);
                     if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
@@ -914,7 +917,11 @@ impl SqlEditorWidget {
         }
     }
 
-    fn format_statement(statement: &str, force_select_list_newline_on_start: bool) -> String {
+    fn format_statement(
+        statement: &str,
+        tokens: &[SqlToken],
+        force_select_list_newline_on_start: bool,
+    ) -> String {
         if let Some(formatted) = Self::format_create_table(statement) {
             return formatted;
         }
@@ -959,7 +966,6 @@ impl SqlEditorWidget {
         let block_start_keywords = ["DECLARE", "IF", "REPEAT"];
         let block_end_qualifiers = ["LOOP", "IF", "CASE", "REPEAT"]; // END LOOP, END IF, END CASE, END REPEAT
 
-        let tokens = Self::tokenize_sql(statement);
         let mut out = String::new();
         let mut indent_level = 0usize;
         let mut suppress_comma_break_depth = 0usize;
