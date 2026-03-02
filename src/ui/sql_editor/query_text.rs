@@ -56,13 +56,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         }
     };
 
-    let peek_n_char = |iter: &std::iter::Peekable<std::str::CharIndices<'_>>, n: usize| {
-        let mut lookahead = iter.clone();
-        for _ in 0..n {
-            lookahead.next()?;
-        }
-        lookahead.next().map(|(_, ch)| ch)
-    };
+    let bytes = sql.as_bytes();
 
     while let Some((idx, c)) = iter.next() {
         let next = iter.peek().map(|(_, ch)| *ch);
@@ -213,12 +207,13 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         if (c == 'n' || c == 'N')
             && (next == Some('q') || next == Some('Q'))
-            && peek_n_char(&iter, 1) == Some('\'')
-            && peek_n_char(&iter, 2).is_some()
+            && bytes.get(idx + 2) == Some(&b'\'')
+            && bytes.get(idx + 3).is_some()
         {
-            let Some(delimiter) = peek_n_char(&iter, 2) else {
-                continue;
-            };
+            // SAFETY: idx+3 is a valid byte position and q-quote delimiters
+            // are always single-byte characters in Oracle syntax.
+            let del_byte = bytes[idx + 3];
+            let delimiter = del_byte as char;
             let Some(next_char) = next else {
                 continue;
             };
@@ -239,10 +234,11 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if (c == 'q' || c == 'Q') && next == Some('\'') && peek_n_char(&iter, 1).is_some() {
-            let Some(delimiter) = peek_n_char(&iter, 1) else {
-                continue;
-            };
+        if (c == 'q' || c == 'Q') && next == Some('\'') && bytes.get(idx + 2).is_some() {
+            // SAFETY: idx+2 is a valid byte position and q-quote delimiters
+            // are always single-byte characters in Oracle syntax.
+            let del_byte = bytes[idx + 2];
+            let delimiter = del_byte as char;
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
             current.push(c);
