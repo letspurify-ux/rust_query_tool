@@ -72,6 +72,13 @@ enum RefreshRequest {
     Metadata,
 }
 
+const REFRESH_TREE_BATCH_SIZE: usize = 300;
+
+struct PendingTreeRefresh {
+    paths: Vec<String>,
+    next_index: usize,
+}
+
 enum ObjectActionResult {
     TableStructure {
         table_name: String,
@@ -115,6 +122,7 @@ pub struct ObjectBrowserWidget {
     status_callback: StatusCallback,
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
+    pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
@@ -187,6 +195,7 @@ impl ObjectBrowserWidget {
         let sql_callback: SqlExecuteCallback = Arc::new(Mutex::new(None));
         let status_callback: StatusCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
+        let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
@@ -206,6 +215,7 @@ impl ObjectBrowserWidget {
             connection,
             filter_input,
             object_cache,
+            pending_tree_refresh,
             poll_lifecycle,
             sql_callback,
             status_callback,
@@ -228,6 +238,7 @@ impl ObjectBrowserWidget {
         self.filter_input.set_text_size(ui_size);
         self.tree.set_item_label_font(profile.normal);
         self.tree.set_item_label_size(ui_size);
+        let canceled_pending_refresh = self.clear_pending_tree_refresh();
         let filter_text = self.filter_input.value().to_lowercase();
         let cache_snapshot = self
             .object_cache
@@ -242,19 +253,38 @@ impl ObjectBrowserWidget {
         self.flex.layout();
         self.filter_input.redraw();
         self.tree.redraw();
+        if canceled_pending_refresh {
+            self.emit_status("Object browser metadata refresh completed");
+        }
     }
 
     fn setup_filter_callback(&mut self) {
         let mut tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
+        let pending_tree_refresh = self.pending_tree_refresh.clone();
+        let status_callback = self.status_callback.clone();
 
         self.filter_input.set_callback(move |input| {
+            let canceled_pending_refresh = {
+                let mut pending = pending_tree_refresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let had_pending = pending.is_some();
+                *pending = None;
+                had_pending
+            };
             let filter_text = input.value().to_lowercase();
             let cache = object_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             ObjectBrowserWidget::populate_tree(&mut tree, &cache, &filter_text);
             tree.redraw();
+            if canceled_pending_refresh {
+                ObjectBrowserWidget::emit_status_callback(
+                    &status_callback,
+                    "Object browser metadata refresh completed",
+                );
+            }
         });
     }
 
@@ -262,6 +292,7 @@ impl ObjectBrowserWidget {
         let tree = self.tree.clone();
         let object_cache = self.object_cache.clone();
         let filter_input = self.filter_input.clone();
+        let pending_tree_refresh = self.pending_tree_refresh.clone();
 
         let lifecycle = Arc::downgrade(&self.poll_lifecycle);
 
@@ -274,6 +305,7 @@ impl ObjectBrowserWidget {
             mut tree: Tree,
             object_cache: Arc<Mutex<ObjectCache>>,
             filter_input: Input,
+            pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
             status_callback: StatusCallback,
             lifecycle: Weak<()>,
         ) {
@@ -309,14 +341,58 @@ impl ObjectBrowserWidget {
             }
 
             if let Some(cache) = latest_cache {
+                let filter_text = filter_input.value().to_lowercase();
+                let paths = ObjectBrowserWidget::collect_tree_paths(&cache, &filter_text);
+
                 {
                     let mut cache_guard = object_cache
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *cache_guard = cache;
-                    let filter_text = filter_input.value().to_lowercase();
-                    ObjectBrowserWidget::populate_tree(&mut tree, &cache_guard, &filter_text);
                 }
+
+                ObjectBrowserWidget::clear_tree_items(&mut tree);
+                {
+                    let mut pending = pending_tree_refresh
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *pending = Some(PendingTreeRefresh {
+                        paths,
+                        next_index: 0,
+                    });
+                }
+            }
+
+            let mut next_paths = Vec::new();
+            let mut finished_refresh = false;
+            {
+                let mut pending = pending_tree_refresh
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(task) = pending.as_mut() {
+                    let end = task
+                        .next_index
+                        .saturating_add(REFRESH_TREE_BATCH_SIZE)
+                        .min(task.paths.len());
+                    if task.next_index < end {
+                        next_paths.extend(task.paths[task.next_index..end].iter().cloned());
+                        task.next_index = end;
+                    }
+                    if task.next_index >= task.paths.len() {
+                        *pending = None;
+                        finished_refresh = true;
+                    }
+                }
+            }
+
+            if !next_paths.is_empty() {
+                for path in next_paths {
+                    tree.add(&path);
+                }
+                tree.redraw();
+            }
+
+            if finished_refresh {
                 tree.redraw();
                 ObjectBrowserWidget::emit_status_callback(
                     &status_callback,
@@ -335,6 +411,7 @@ impl ObjectBrowserWidget {
                     tree.clone(),
                     object_cache.clone(),
                     filter_input.clone(),
+                    pending_tree_refresh.clone(),
                     status_callback.clone(),
                     lifecycle.clone(),
                 );
@@ -347,6 +424,7 @@ impl ObjectBrowserWidget {
             tree,
             object_cache,
             filter_input,
+            pending_tree_refresh,
             self.status_callback.clone(),
             lifecycle,
         );
@@ -2041,6 +2119,7 @@ impl ObjectBrowserWidget {
     /// Clear the object browser tree and cache without triggering a network refetch.
     /// Called when the database connection is closed or lost.
     pub fn clear_on_disconnect(&mut self) {
+        self.clear_pending_tree_refresh();
         self.clear_items();
         self.filter_input.set_value("");
         *self
@@ -2051,6 +2130,7 @@ impl ObjectBrowserWidget {
     }
 
     pub fn refresh(&mut self) {
+        self.clear_pending_tree_refresh();
         // First clear items and filter
         self.clear_items();
         self.filter_input.set_value("");
@@ -2146,6 +2226,16 @@ impl ObjectBrowserWidget {
         Self::clear_tree_items(&mut self.tree);
     }
 
+    fn clear_pending_tree_refresh(&self) -> bool {
+        let mut pending = self
+            .pending_tree_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let had_pending = pending.is_some();
+        *pending = None;
+        had_pending
+    }
+
     fn clear_tree_items(tree: &mut Tree) {
         let categories = [
             "Tables",
@@ -2196,40 +2286,46 @@ impl ObjectBrowserWidget {
 
     fn populate_tree(tree: &mut Tree, cache: &ObjectCache, filter_text: &str) {
         Self::clear_tree_items(tree);
+        for path in Self::collect_tree_paths(cache, filter_text) {
+            tree.add(&path);
+        }
+    }
 
+    fn collect_tree_paths(cache: &ObjectCache, filter_text: &str) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
         for table in &cache.tables {
             if filter_text.is_empty() || table.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Tables/{}", table));
+                paths.push(format!("Tables/{}", table));
             }
         }
         for view in &cache.views {
             if filter_text.is_empty() || view.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Views/{}", view));
+                paths.push(format!("Views/{}", view));
             }
         }
-        for proc in &cache.procedures {
-            if filter_text.is_empty() || proc.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Procedures/{}", proc));
+        for procedure in &cache.procedures {
+            if filter_text.is_empty() || procedure.to_lowercase().contains(filter_text) {
+                paths.push(format!("Procedures/{}", procedure));
             }
         }
         for func in &cache.functions {
             if filter_text.is_empty() || func.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Functions/{}", func));
+                paths.push(format!("Functions/{}", func));
             }
         }
         for seq in &cache.sequences {
             if filter_text.is_empty() || seq.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Sequences/{}", seq));
+                paths.push(format!("Sequences/{}", seq));
             }
         }
         for trig in &cache.triggers {
             if filter_text.is_empty() || trig.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Triggers/{}", trig));
+                paths.push(format!("Triggers/{}", trig));
             }
         }
         for syn in &cache.synonyms {
             if filter_text.is_empty() || syn.to_lowercase().contains(filter_text) {
-                tree.add(&format!("Synonyms/{}", syn));
+                paths.push(format!("Synonyms/{}", syn));
             }
         }
 
@@ -2251,16 +2347,18 @@ impl ObjectBrowserWidget {
                 .collect();
 
             if package_matches || !matching_routines.is_empty() {
-                tree.add(&format!("Packages/{}", package));
+                paths.push(format!("Packages/{}", package));
                 for routine in matching_routines {
                     if routine.routine_type == "FUNCTION" {
-                        tree.add(&format!("Packages/{}/Functions/{}", package, routine.name));
+                        paths.push(format!("Packages/{}/Functions/{}", package, routine.name));
                     } else {
-                        tree.add(&format!("Packages/{}/Procedures/{}", package, routine.name));
+                        paths.push(format!("Packages/{}/Procedures/{}", package, routine.name));
                     }
                 }
             }
         }
+
+        paths
     }
 
     #[allow(dead_code)]

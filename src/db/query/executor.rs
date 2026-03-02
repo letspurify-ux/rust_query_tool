@@ -1397,49 +1397,64 @@ impl QueryExecutor {
         let line = &sql[line_start..line_end];
         let trimmed_line = line.trim();
 
-        if !trimmed_line.is_empty()
-            && Self::parse_tool_command(trimmed_line).is_some() {
-                return Some((line_start, line_end));
-            }
-
-        let spans = Self::collect_statement_spans_for_bounds(sql);
-
-        if spans.is_empty() {
-            return None;
+        if !trimmed_line.is_empty() && Self::parse_tool_command(trimmed_line).is_some() {
+            return Some((line_start, line_end));
         }
 
-        if trimmed_line == "/" {
-            if let Some(prev) = spans
-                .iter()
-                .rfind(|(start, end)| *start < *end && *end <= line_start)
-            {
-                return Some(*prev);
-            }
-        }
-
-        if let Some(span) = spans
-            .iter()
-            .find(|(start, end)| cursor_pos >= *start && cursor_pos < *end)
-        {
-            return Some(*span);
-        }
-
-        let mut previous: Option<(usize, usize)> = None;
-        for span in spans.iter() {
-            if span.0 > cursor_pos {
-                return Some(previous.unwrap_or(*span));
-            }
-            previous = Some(*span);
-        }
-
-        previous
+        let slash_line_start = if trimmed_line == "/" {
+            Some(line_start)
+        } else {
+            None
+        };
+        Self::find_statement_bounds_for_cursor(sql, cursor_pos, slash_line_start)
     }
 
-    fn collect_statement_spans_for_bounds(sql: &str) -> Vec<(usize, usize)> {
+    fn find_statement_bounds_for_cursor(
+        sql: &str,
+        cursor_pos: usize,
+        slash_line_start: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let mut previous: Option<(usize, usize)> = None;
+        let mut slash_previous: Option<(usize, usize)> = None;
+        let mut resolved: Option<(usize, usize)> = None;
+
+        Self::walk_statement_spans_for_bounds(sql, |span| {
+            if let Some(line_start) = slash_line_start {
+                if span.1 <= line_start {
+                    slash_previous = Some(span);
+                    return true;
+                }
+                return span.0 <= line_start;
+            }
+
+            if cursor_pos >= span.0 && cursor_pos < span.1 {
+                resolved = Some(span);
+                return false;
+            }
+
+            if span.0 > cursor_pos {
+                resolved = Some(previous.unwrap_or(span));
+                return false;
+            }
+
+            previous = Some(span);
+            true
+        });
+
+        if slash_line_start.is_some() {
+            return slash_previous;
+        }
+
+        resolved.or(previous)
+    }
+
+    fn walk_statement_spans_for_bounds<F>(sql: &str, mut on_span: F)
+    where
+        F: FnMut((usize, usize)) -> bool,
+    {
         #[derive(Default)]
         struct StatementSpanCollector {
             state: SplitState,
-            spans: Vec<(usize, usize)>,
             current_start: Option<usize>,
             current_non_whitespace_start: Option<usize>,
             current_non_whitespace_end: usize,
@@ -1489,21 +1504,20 @@ impl QueryExecutor {
                 self.leading_tokens.clear();
             }
 
-            fn push_current_span(&mut self, sql: &str) {
+            fn push_current_span(&mut self, sql: &str) -> Option<(usize, usize)> {
                 if let Some(start) = self.current_non_whitespace_start {
                     let end = self.current_non_whitespace_end;
                     if end > start {
-                        if let Some(span) =
-                            QueryExecutor::trim_statement_span_for_bounds(sql, start, end)
-                        {
-                            self.spans.push(span);
-                        }
+                        let span = QueryExecutor::trim_statement_span_for_bounds(sql, start, end);
+                        self.clear_current();
+                        return span;
                     }
                 }
                 self.clear_current();
+                None
             }
 
-            fn force_terminate(&mut self, sql: &str) {
+            fn force_terminate(&mut self, sql: &str) -> Option<(usize, usize)> {
                 self.flush_token();
                 self.state.resolve_pending_end_on_eof();
                 self.state.reset_create_state();
@@ -1518,14 +1532,14 @@ impl QueryExecutor {
                 self.state.block_depth = 0;
                 self.state.paren_depth = 0;
                 self.state.case_depth_stack.clear();
-                self.push_current_span(sql);
+                self.push_current_span(sql)
             }
 
-            fn finalize(&mut self, sql: &str) {
+            fn finalize(&mut self, sql: &str) -> Option<(usize, usize)> {
                 self.flush_token();
                 self.state.resolve_pending_end_on_eof();
                 self.state.reset_create_state();
-                self.push_current_span(sql);
+                self.push_current_span(sql)
             }
 
             fn consume_next_char(
@@ -1547,9 +1561,18 @@ impl QueryExecutor {
                 lookahead.next().map(|(_, ch)| ch)
             }
 
-            fn process_segment(&mut self, sql: &str, start: usize, end: usize) {
+            fn process_segment<F>(
+                &mut self,
+                sql: &str,
+                start: usize,
+                end: usize,
+                on_span: &mut F,
+            ) -> bool
+            where
+                F: FnMut((usize, usize)) -> bool,
+            {
                 if start >= end {
-                    return;
+                    return true;
                 }
 
                 let mut iter = sql[start..end].char_indices().peekable();
@@ -1731,13 +1754,21 @@ impl QueryExecutor {
                     if c == ';' {
                         self.state.resolve_pending_end_on_terminator();
                         if self.state.block_depth == 0 {
-                            self.push_current_span(sql);
+                            if let Some(span) = self.push_current_span(sql) {
+                                if !on_span(span) {
+                                    return false;
+                                }
+                            }
                             self.state.reset_create_state();
                         } else if self.state.should_split_on_semicolon() {
                             self.state.reset_create_state();
                             self.state.block_depth = 0;
                             self.state.case_depth_stack.clear();
-                            self.push_current_span(sql);
+                            if let Some(span) = self.push_current_span(sql) {
+                                if !on_span(span) {
+                                    return false;
+                                }
+                            }
                         } else {
                             self.record_char(index, c);
                         }
@@ -1746,6 +1777,8 @@ impl QueryExecutor {
 
                     self.record_char(index, c);
                 }
+
+                true
             }
         }
 
@@ -1772,7 +1805,11 @@ impl QueryExecutor {
                 && collector.state.block_depth == 0
                 && !collector.current_is_empty()
             {
-                collector.force_terminate(sql);
+                if let Some(span) = collector.force_terminate(sql) {
+                    if !on_span(span) {
+                        return;
+                    }
+                }
                 line_start = next_line_start;
                 continue;
             }
@@ -1784,12 +1821,20 @@ impl QueryExecutor {
                 && !collector.state.is_trigger
                 && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
             {
-                collector.force_terminate(sql);
+                if let Some(span) = collector.force_terminate(sql) {
+                    if !on_span(span) {
+                        return;
+                    }
+                }
             }
 
             if collector.state.is_idle() && trimmed == "/" && collector.state.block_depth == 0 {
                 if !collector.current_is_empty() {
-                    collector.force_terminate(sql);
+                    if let Some(span) = collector.force_terminate(sql) {
+                        if !on_span(span) {
+                            return;
+                        }
+                    }
                 }
                 line_start = next_line_start;
                 continue;
@@ -1801,7 +1846,11 @@ impl QueryExecutor {
                 && collector.state.block_depth == 0
                 && !collector.current_is_empty()
             {
-                collector.force_terminate(sql);
+                if let Some(span) = collector.force_terminate(sql) {
+                    if !on_span(span) {
+                        return;
+                    }
+                }
                 line_start = next_line_start;
                 continue;
             }
@@ -1817,7 +1866,11 @@ impl QueryExecutor {
                 && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
-                    collector.force_terminate(sql);
+                    if let Some(span) = collector.force_terminate(sql) {
+                        if !on_span(span) {
+                            return;
+                        }
+                    }
                     if let ToolCommand::SetSqlBlankLines { enabled } = command {
                         sqlblanklines_enabled = enabled;
                     }
@@ -1841,12 +1894,15 @@ impl QueryExecutor {
             }
 
             let process_end = if has_newline { line_end + 1 } else { line_end };
-            collector.process_segment(sql, line_start, process_end);
+            if !collector.process_segment(sql, line_start, process_end, &mut on_span) {
+                return;
+            }
             line_start = next_line_start;
         }
 
-        collector.finalize(sql);
-        collector.spans
+        if let Some(span) = collector.finalize(sql) {
+            let _ = on_span(span);
+        }
     }
 
     fn line_starts_new_statement_keyword_for_bounds(trimmed: &str) -> bool {
@@ -7448,8 +7504,7 @@ impl ObjectBrowser {
             let cut = common_indent.min(line.len());
             out.push_str(&line[cut..]);
         }
-        out.trim_start_matches([' ', '\t'])
-            .to_string()
+        out.trim_start_matches([' ', '\t']).to_string()
     }
 
     pub fn get_tables(conn: &Connection) -> Result<Vec<String>, OracleError> {

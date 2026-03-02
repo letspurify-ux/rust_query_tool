@@ -630,7 +630,9 @@ impl MainWindow {
         }
         let reset_data = IntellisenseData::new();
         let reset_highlight = HighlightData::new();
-        Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
+        let editors_to_refresh =
+            Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
+        Self::schedule_schema_highlight_refresh(editors_to_refresh);
 
         // Clear object browser cache and tree so stale metadata from the previous
         // connection is not visible when connecting to a different database.
@@ -2163,7 +2165,7 @@ impl MainWindow {
         state: &mut AppState,
         data: &IntellisenseData,
         highlight_data: &HighlightData,
-    ) {
+    ) -> Vec<SqlEditorWidget> {
         let mut combined_highlight = highlight_data.clone();
         let columns_from_intellisense = Self::collect_highlight_columns(data);
         if !columns_from_intellisense.is_empty() {
@@ -2183,6 +2185,7 @@ impl MainWindow {
         state.schema_intellisense_data = data.clone();
         state.schema_highlight_data = combined_highlight.clone();
 
+        let mut editors_to_refresh = Vec::with_capacity(state.editor_tabs.len());
         for tab in &mut state.editor_tabs {
             *tab.sql_editor
                 .get_intellisense_data()
@@ -2193,8 +2196,39 @@ impl MainWindow {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .set_highlight_data(combined_highlight.clone());
-            tab.sql_editor.refresh_highlighting();
+            editors_to_refresh.push(tab.sql_editor.clone());
         }
+
+        editors_to_refresh
+    }
+
+    fn schedule_schema_highlight_refresh(editors: Vec<SqlEditorWidget>) {
+        if editors.is_empty() {
+            return;
+        }
+        let shared_editors = Arc::new(editors);
+        app::add_timeout3(0.0, move |_| {
+            MainWindow::refresh_editor_highlight_batch(shared_editors.clone(), 0);
+        });
+    }
+
+    fn refresh_editor_highlight_batch(editors: Arc<Vec<SqlEditorWidget>>, index: usize) {
+        let Some(editor) = editors.get(index).cloned() else {
+            return;
+        };
+
+        if !editor.get_editor().was_deleted() {
+            editor.refresh_highlighting();
+        }
+
+        let next_index = index.saturating_add(1);
+        if next_index >= editors.len() {
+            return;
+        }
+
+        app::add_timeout3(0.0, move |_| {
+            MainWindow::refresh_editor_highlight_batch(editors.clone(), next_index);
+        });
     }
 
     fn collect_highlight_columns(data: &IntellisenseData) -> Vec<String> {
@@ -3883,21 +3917,26 @@ impl MainWindow {
                         }
                     }
 
+                    let mut editors_to_refresh: Option<Vec<SqlEditorWidget>> = None;
                     if let Some(update) = latest_update {
                         match state.try_lock() {
                             Ok(mut s) => {
                                 let mut data = update.data;
                                 data.rebuild_indices();
-                                MainWindow::apply_schema_to_all_editors(
+                                editors_to_refresh = Some(MainWindow::apply_schema_to_all_editors(
                                     &mut s,
                                     &data,
                                     &update.highlight_data,
-                                );
+                                ));
                             }
                             Err(_) => {
                                 deferred_by_borrow_conflict = true;
                             }
                         }
+                    }
+
+                    if let Some(editors) = editors_to_refresh {
+                        MainWindow::schedule_schema_highlight_refresh(editors);
                     }
                 }
             }
