@@ -1112,7 +1112,7 @@ impl IntellisenseData {
             .filter(|key| {
                 self.column_loading_started_at
                     .get(*key)
-                    .map_or(true, |started| now.duration_since(*started) >= stale_after)
+                    .is_none_or(|started| now.duration_since(*started) >= stale_after)
             })
             .cloned()
             .collect();

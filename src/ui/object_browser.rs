@@ -196,7 +196,7 @@ impl ObjectBrowserWidget {
 
         Self::spawn_refresh_worker(
             refresh_request_receiver,
-            refresh_sender.clone(),
+            refresh_sender,
             connection.clone(),
         );
 
@@ -734,8 +734,8 @@ impl ObjectBrowserWidget {
                         return true;
                     }
 
-                    if mouse_button == fltk::app::MouseButton::Left as i32 {
-                        if fltk::app::event_clicks() {
+                    if mouse_button == fltk::app::MouseButton::Left as i32
+                        && fltk::app::event_clicks() {
                             let clicked_item = t
                                 .find_clicked(false)
                                 .or_else(|| t.find_clicked(true))
@@ -755,7 +755,7 @@ impl ObjectBrowserWidget {
                                 }) = Self::get_item_info(&item)
                                 {
                                     if object_type == "PACKAGES" {
-                                        let package_name = object_name.clone();
+                                        let package_name = object_name;
                                         let should_fetch = {
                                             let cache = object_cache
                                                 .lock()
@@ -800,7 +800,7 @@ impl ObjectBrowserWidget {
                                                             )
                                                             .map_err(|err| err.to_string())
                                                         }
-                                                        Err(message) => Err(message.to_string()),
+                                                        Err(message) => Err(message),
                                                     };
 
                                                 let _ = sender.send(
@@ -827,7 +827,6 @@ impl ObjectBrowserWidget {
                                 }
                             }
                         }
-                    }
 
                     false
                 }
@@ -882,10 +881,7 @@ impl ObjectBrowserWidget {
             Some(label) => label.trim().to_string(),
             None => return None,
         };
-        let parent = match item.parent() {
-            Some(parent) => parent,
-            None => return None,
-        };
+        let parent = item.parent()?;
         let parent_label = match parent.label() {
             Some(label) => label.trim().to_string(),
             None => return None,
@@ -1047,7 +1043,7 @@ impl ObjectBrowserWidget {
 
         // Build the call expression (with or without arguments)
         let call_str = if call_args.is_empty() {
-            format!("{}", qualified_name)
+            qualified_name.to_string()
         } else {
             let mut s = format!("{}(\n", qualified_name);
             for (idx, arg) in call_args.iter().enumerate() {
@@ -1392,7 +1388,7 @@ impl ObjectBrowserWidget {
                             drop(conn_guard);
                             let sql = format!("SELECT * FROM {} WHERE ROWNUM <= 100", object_name);
                             ObjectBrowserWidget::emit_sql_callback(
-                                &sql_callback,
+                                sql_callback,
                                 SqlAction::Execute(sql),
                             );
                         }
@@ -1444,7 +1440,7 @@ impl ObjectBrowserWidget {
                                         )
                                     })
                                     .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message.to_string()),
+                                    Err(message) => Err(message),
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -1507,7 +1503,7 @@ impl ObjectBrowserWidget {
                                         )
                                     })
                                     .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message.to_string()),
+                                    Err(message) => Err(message),
                                 };
 
                                 let _ = sender.send(ObjectActionResult::RoutineScript {
@@ -1645,7 +1641,7 @@ impl ObjectBrowserWidget {
                                         &table_name,
                                     )
                                     .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message.to_string()),
+                                    Err(message) => Err(message),
                                 };
                                 let _ = sender.send(ObjectActionResult::TableStructure {
                                     table_name,
@@ -1681,7 +1677,7 @@ impl ObjectBrowserWidget {
                                         &table_name,
                                     )
                                     .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message.to_string()),
+                                    Err(message) => Err(message),
                                 };
                                 let _ = sender
                                     .send(ObjectActionResult::TableIndexes { table_name, result });
@@ -1715,7 +1711,7 @@ impl ObjectBrowserWidget {
                                         &table_name,
                                     )
                                     .map_err(|err| err.to_string()),
-                                    Err(message) => Err(message.to_string()),
+                                    Err(message) => Err(message),
                                 };
                                 let _ = sender.send(ObjectActionResult::TableConstraints {
                                     table_name,
@@ -1886,7 +1882,7 @@ impl ObjectBrowserWidget {
                                             _ => return,
                                         }
                                         .map_err(|err| err.to_string()),
-                                        Err(message) => Err(message.to_string()),
+                                        Err(message) => Err(message),
                                     };
                                     let _ = sender.send(ObjectActionResult::Ddl(result));
                                     app::awake();

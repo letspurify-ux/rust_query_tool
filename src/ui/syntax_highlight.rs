@@ -514,7 +514,7 @@ impl SqlHighlighter {
             // Check for PROMPT command at the start of a line (SQL*Plus style)
             if idx == 0 || bytes.get(idx.saturating_sub(1)) == Some(&b'\n') {
                 let mut scan = idx;
-                while bytes.get(scan).map_or(false, |&b| b == b' ' || b == b'\t') {
+                while bytes.get(scan).is_some_and(|&b| b == b' ' || b == b'\t') {
                     scan += 1;
                 }
                 if is_prompt_keyword(bytes, scan) {
@@ -689,7 +689,7 @@ impl SqlHighlighter {
 
             // Numbers
             if byte.is_ascii_digit()
-                || (byte == b'.' && bytes.get(idx + 1).map_or(false, |b| b.is_ascii_digit()))
+                || (byte == b'.' && bytes.get(idx + 1).is_some_and(|b| b.is_ascii_digit()))
             {
                 let start = idx;
                 let mut has_dot = byte == b'.';
@@ -714,7 +714,7 @@ impl SqlHighlighter {
                 idx += 1;
                 while bytes
                     .get(idx)
-                    .map_or(false, |&b| sql_text::is_identifier_byte(b))
+                    .is_some_and(|&b| sql_text::is_identifier_byte(b))
                 {
                     idx += 1;
                 }
@@ -728,7 +728,7 @@ impl SqlHighlighter {
                     let mut look_ahead = idx;
                     while bytes
                         .get(look_ahead)
-                        .map_or(false, |&b| b == b' ' || b == b'\t')
+                        .is_some_and(|&b| b == b' ' || b == b'\t')
                     {
                         look_ahead += 1;
                     }
@@ -969,10 +969,8 @@ fn range_focus_distance(start: usize, end: usize, focus_points: &[usize]) -> usi
         .map(|&point| {
             if point < start {
                 start - point
-            } else if point > end {
-                point - end
             } else {
-                0
+                point.saturating_sub(end)
             }
         })
         .min()

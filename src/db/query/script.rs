@@ -205,19 +205,10 @@ impl SplitState {
         // We use nested_subprogram to track when IS should start a block.
         // For the first AS/IS in CREATE, we use block_depth==0 as indicator.
         // For COMPOUND TRIGGER timing points, pending_timing_point_is indicates IS starts a block.
-        let is_block_starting_as_is = if matches!(upper, "AS" | "IS") {
-            if self.pending_timing_point_is {
-                true // COMPOUND TRIGGER timing point (BEFORE/AFTER ... IS)
-            } else if self.nested_subprogram {
-                true // Nested PROCEDURE/FUNCTION inside DECLARE
-            } else if self.in_create_plsql && self.block_depth == 0 {
-                true // First AS/IS in CREATE statement
-            } else {
-                false // Expression like "IS NULL" - not a block start
-            }
-        } else {
-            false
-        };
+        let is_block_starting_as_is = matches!(upper, "AS" | "IS")
+            && (self.pending_timing_point_is
+                || self.nested_subprogram
+                || (self.in_create_plsql && self.block_depth == 0));
 
         if is_block_starting_as_is {
             self.block_depth += 1;
@@ -293,7 +284,7 @@ impl SplitState {
         }
 
         // Return the uppercase buffer so its capacity is reused on the next call.
-        drop(upper);
+        let _ = upper;
         self.token_upper_buf = upper_buf;
         self.token.clear();
     }
@@ -925,7 +916,7 @@ impl QueryExecutor {
 
             if with_cte_depth > 0 {
                 let starts_main_select = leading_word
-                    .is_some_and(|word| is_with_main_query_keyword(word))
+                    .is_some_and(&is_with_main_query_keyword)
                     && with_cte_paren <= 0;
                 if starts_main_select {
                     depth = depth.saturating_sub(1);
@@ -1068,20 +1059,17 @@ impl QueryExecutor {
                         if word == "SELECT" {
                             subquery_paren_depth += 1;
                         }
-                    } else if j >= chars.len() {
-                        pending_subquery_paren += 1;
-                    } else if chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-' {
-                        pending_subquery_paren += 1;
-                    } else if chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*' {
+                    } else if j >= chars.len()
+                        || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
+                        || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
+                    {
                         pending_subquery_paren += 1;
                     }
                     if with_cte_depth > 0 {
                         with_cte_paren += 1;
                     }
                 } else if c == ')' {
-                    if subquery_paren_depth > 0 {
-                        subquery_paren_depth -= 1;
-                    }
+                    subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     if with_cte_depth > 0 {
                         with_cte_paren -= 1;
                     }
@@ -1110,7 +1098,7 @@ impl QueryExecutor {
             }
 
             if pending_with
-                && leading_word.is_some_and(|word| is_with_main_query_keyword(word))
+                && leading_word.is_some_and(&is_with_main_query_keyword)
                 && with_cte_paren <= 0
             {
                 with_cte_depth = 0;
@@ -2130,10 +2118,10 @@ impl QueryExecutor {
         if after >= sql.len() {
             return true;
         }
-        match sql.as_bytes().get(after) {
-            Some(b'_') | Some(b'$') | Some(b'#') => false,
-            _ => true,
-        }
+        !matches!(
+            sql.as_bytes().get(after),
+            Some(b'_') | Some(b'$') | Some(b'#')
+        )
     }
 
     /// Check if the effective SQL contains a top-level identifier token that
@@ -2713,24 +2701,16 @@ impl QueryExecutor {
 
     fn skip_ascii_whitespace(sql: &str, mut idx: usize) -> usize {
         while idx < sql.len() {
-            let mut advanced = false;
-            if let Some(slice) = sql.get(idx..) {
-                for (rel, ch) in slice.char_indices() {
-                    if ch.is_whitespace() {
-                        idx = idx.saturating_add(rel + ch.len_utf8());
-                        advanced = true;
-                        break;
-                    }
-                    idx = idx.saturating_add(rel);
-                    break;
-                }
-            } else {
+            let Some(slice) = sql.get(idx..) else {
+                break;
+            };
+            let Some((_, ch)) = slice.char_indices().next() else {
+                break;
+            };
+            if !ch.is_whitespace() {
                 break;
             }
-
-            if !advanced {
-                break;
-            }
+            idx = idx.saturating_add(ch.len_utf8());
         }
 
         idx
@@ -3501,7 +3481,7 @@ impl QueryExecutor {
                     let mut comment = String::new();
                     comment.push_str(line);
                     if !trimmed.contains("*/") {
-                        while let Some(next_line) = lines.next() {
+                        for next_line in lines.by_ref() {
                             comment.push('\n');
                             comment.push_str(next_line);
                             if next_line.contains("*/") {

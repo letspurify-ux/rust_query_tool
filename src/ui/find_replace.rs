@@ -353,7 +353,7 @@ impl FindReplaceDialog {
         }
 
         // Close callback
-        let sender_for_close = sender.clone();
+        let sender_for_close = sender;
         close_btn.set_callback(move |_| {
             let _ = sender_for_close.send(DialogMessage::Close);
             app::awake();
@@ -364,7 +364,7 @@ impl FindReplaceDialog {
         let mut buffer = buffer.clone();
         let mut editor = editor.clone();
         let find_input_state = find_input.clone();
-        let replace_input_state = replace_input.clone();
+        let replace_input_state = replace_input;
         let case_check_state = case_check.clone();
         let search_pos_state = search_pos.clone();
         let last_search_text_state = last_search_text.clone();
@@ -668,9 +668,7 @@ fn find_next_match(
         return None;
     }
     let start_pos = normalize_search_pos(text, start_pos) as usize;
-    let Some(haystack) = text.get(start_pos..) else {
-        return None;
-    };
+    let haystack = text.get(start_pos..)?;
     if case_sensitive {
         let pos = haystack.find(search_text)?;
         let match_start = start_pos + pos;

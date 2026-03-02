@@ -1397,11 +1397,10 @@ impl QueryExecutor {
         let line = &sql[line_start..line_end];
         let trimmed_line = line.trim();
 
-        if !trimmed_line.is_empty() {
-            if Self::parse_tool_command(trimmed_line).is_some() {
+        if !trimmed_line.is_empty()
+            && Self::parse_tool_command(trimmed_line).is_some() {
                 return Some((line_start, line_end));
             }
-        }
 
         let spans = Self::collect_statement_spans_for_bounds(sql);
 
@@ -3700,7 +3699,7 @@ ORDER BY
         conn: &Connection,
         limit_rows: u32,
     ) -> Result<QueryResult, OracleError> {
-        let normalized_limit = limit_rows.max(1).min(500);
+        let normalized_limit = limit_rows.clamp(1, 500);
         let sql_gv = format!(
             r#"
 SELECT * FROM (
@@ -6202,7 +6201,7 @@ SELECT
 FROM user_datapump_jobs
 ORDER BY job_name
 "#;
-        match Self::execute_select(conn, &sql_user, Instant::now()) {
+        match Self::execute_select(conn, sql_user, Instant::now()) {
             Ok(result) => Ok(Self::annotate_result_source(result, "user_datapump_jobs")),
             Err(err) => {
                 fallback_errors.push(format!("user_datapump_jobs: {err}"));
@@ -7449,7 +7448,7 @@ impl ObjectBrowser {
             let cut = common_indent.min(line.len());
             out.push_str(&line[cut..]);
         }
-        out.trim_start_matches(|c| c == ' ' || c == '\t')
+        out.trim_start_matches([' ', '\t'])
             .to_string()
     }
 

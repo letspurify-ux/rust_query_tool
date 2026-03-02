@@ -441,11 +441,7 @@ impl SqlEditorWidget {
 
             if all_commented {
                 let uncommented = trimmed.strip_prefix("--").unwrap_or(trimmed);
-                let uncommented = if uncommented.starts_with(' ') {
-                    &uncommented[1..]
-                } else {
-                    uncommented
-                };
+                let uncommented = uncommented.strip_prefix(' ').unwrap_or(uncommented);
                 new_lines.push(format!("{}{}", prefix, uncommented));
             } else if trimmed.starts_with("--") {
                 new_lines.push(line.to_string());
@@ -1100,6 +1096,12 @@ impl SqlEditorWidget {
                     let mut newline_after_keyword = false;
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = upper == "WHEN" && pending_exit_condition;
+                    let is_trigger_event_keyword =
+                        trigger_header_active && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
+                    let is_trigger_or_on_keyword =
+                        trigger_header_active && matches!(upper.as_str(), "OR" | "ON");
+                    let suppress_order_clause_break =
+                        suppress_comma_break_depth > 0 && upper == "ORDER";
                     if upper == "END" {
                         let end_qualifier = {
                             let mut qualifier = None;
@@ -1271,8 +1273,7 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if trigger_header_active
-                        && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE")
+                    } else if is_trigger_event_keyword
                         && matches!(prev_word_upper.as_deref(), Some("BEFORE" | "AFTER" | "OF"))
                     {
                         // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
@@ -1280,9 +1281,8 @@ impl SqlEditorWidget {
                         && !is_insert_into
                         && !is_merge_into
                         && !is_start_with
-                        && !(suppress_comma_break_depth > 0 && upper == "ORDER")
-                        && !(trigger_header_active
-                            && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE"))
+                        && !suppress_order_clause_break
+                        && !is_trigger_event_keyword
                     {
                         newline_with(
                             &mut out,
@@ -1318,7 +1318,7 @@ impl SqlEditorWidget {
                         && !is_or_in_create
                         && !is_between_and
                         && !is_exit_when
-                        && !(trigger_header_active && matches!(upper.as_str(), "OR" | "ON"))
+                        && !is_trigger_or_on_keyword
                     {
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         if upper == "WHEN"
@@ -1598,7 +1598,7 @@ impl SqlEditorWidget {
                         // BEGIN handling: check if we're inside a DECLARE block
                         let inside_declare = block_stack
                             .last()
-                            .map_or(false, |s| s == "DECLARE" || s == "PACKAGE_BODY");
+                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
                         if inside_declare {
                             // DECLARE ... BEGIN - BEGIN is at same level as DECLARE
                             // Don't increase indent, just newline at current level
@@ -1638,7 +1638,7 @@ impl SqlEditorWidget {
                     if is_keyword {
                         out.push_str(&upper);
                     } else {
-                        out.push_str(&word);
+                        out.push_str(word);
                     }
                     needs_space = true;
                     if upper == "SELECT" {
@@ -1683,7 +1683,7 @@ impl SqlEditorWidget {
                             in_plsql_block = true;
                         }
                     } else if upper == "BEGIN" {
-                        let inside_declare = block_stack.last().map_or(false, |s| s == "DECLARE");
+                        let inside_declare = block_stack.last().is_some_and(|s| s == "DECLARE");
                         if inside_declare {
                             // Replace DECLARE with BEGIN on the stack (same block continues)
                             block_stack.pop();
@@ -1775,7 +1775,7 @@ impl SqlEditorWidget {
                     if needs_space {
                         out.push(' ');
                     }
-                    out.push_str(&literal);
+                    out.push_str(literal);
                     needs_space = true;
                     if literal.contains('\n') {
                         at_line_start = true;
@@ -2115,8 +2115,9 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
-                            } else if suppress_comma_break_depth > 0 {
-                                suppress_comma_break_depth -= 1;
+                            } else {
+                                suppress_comma_break_depth =
+                                    suppress_comma_break_depth.saturating_sub(1);
                             }
                             if close_case_paren_on_newline {
                                 newline_with(
@@ -2150,16 +2151,16 @@ impl SqlEditorWidget {
                             if needs_space && !(sym == "&" && out.ends_with('&')) {
                                 out.push(' ');
                             }
-                            out.push_str(&sym);
+                            out.push_str(sym);
                             // For bind variables (:name) and assignment (:=), don't add space after colon
                             // Check if this is ":" and next token is a Word (bind variable)
                             let is_bind_var_colon = sym == ":"
                                 && tokens
                                     .get(idx + 1)
-                                    .map_or(false, |t| matches!(t, SqlToken::Word(_)));
+                                    .is_some_and(|t| matches!(t, SqlToken::Word(_)));
                             // For substitution variables (&var, &&var), don't add space after &
                             let is_ampersand_prefix = sym == "&"
-                                && tokens.get(idx + 1).map_or(false, |t| {
+                                && tokens.get(idx + 1).is_some_and(|t| {
                                     matches!(t, SqlToken::Word(_))
                                         || matches!(t, SqlToken::Symbol(s) if s == "&")
                                 });
@@ -2709,7 +2710,7 @@ impl SqlEditorWidget {
 
             let mut tokens_iter = column.iter().peekable();
             let name_token = tokens_iter.next();
-            let name = name_token.map(|t| Self::token_text(t)).unwrap_or_default();
+            let name = name_token.map(Self::token_text).unwrap_or_default();
 
             let mut type_tokens: Vec<SqlToken> = Vec::new();
             let mut rest_tokens: Vec<SqlToken> = Vec::new();
@@ -3041,12 +3042,11 @@ impl SqlEditorWidget {
             // The execution worker performs full liveness validation.
             // Regression guard: scripts that contain CONNECT/@START must pass this gate
             // even when disconnected, so CONNECT can establish a session for later SQL.
-            if requires_connected_session {
-                if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+            if requires_connected_session
+                && (!conn_guard.is_connected() || conn_guard.get_connection().is_none()) {
                     SqlEditorWidget::show_alert_dialog("Not connected to database");
                     return;
                 }
-            }
         } // Release lock early for the pre-check
 
         let shared_connection = self.connection.clone();
@@ -3106,7 +3106,6 @@ impl SqlEditorWidget {
                     match conn_guard.require_live_connection() {
                         Ok(conn) => Some(conn),
                         Err(message) => {
-                            let message = message.to_string();
                             if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
                                 let _ =
                                     sender.send(QueryProgress::ConnectionChanged { info: None });
@@ -3553,8 +3552,7 @@ impl SqlEditorWidget {
                                             if enable_result.is_err()
                                                 && size.is_some()
                                                 && desired_size != default_size
-                                            {
-                                                if QueryExecutor::enable_dbms_output(
+                                                && QueryExecutor::enable_dbms_output(
                                                     conn.as_ref(),
                                                     Some(default_size),
                                                 )
@@ -3567,7 +3565,6 @@ impl SqlEditorWidget {
                                                     );
                                                     enable_result = Ok(());
                                                 }
-                                            }
 
                                             match enable_result {
                                                 Ok(()) => {
@@ -5667,7 +5664,7 @@ impl SqlEditorWidget {
                                             app::awake();
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
-                                                &[message.clone()],
+                                                std::slice::from_ref(&message),
                                             );
                                             let result =
                                                 QueryResult::new_error(&sql_text, &message);
@@ -5965,7 +5962,7 @@ impl SqlEditorWidget {
                                                 );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
-                                                &[message.clone()],
+                                                std::slice::from_ref(&message),
                                             );
                                             let _ = sender.send(QueryProgress::StatementFinished {
                                                 index,
@@ -6130,7 +6127,7 @@ impl SqlEditorWidget {
                                                 );
                                             SqlEditorWidget::append_spool_output(
                                                 &session,
-                                                &[message.clone()],
+                                                std::slice::from_ref(&message),
                                             );
                                             let _ = sender.send(QueryProgress::StatementFinished {
                                                 index,
@@ -6514,7 +6511,7 @@ impl SqlEditorWidget {
                                 if !result.message.trim().is_empty() {
                                     SqlEditorWidget::append_spool_output(
                                         &session,
-                                        &[result.message.clone()],
+                                        std::slice::from_ref(&result.message),
                                     );
                                 }
                                 if result.success {
@@ -6959,7 +6956,7 @@ impl SqlEditorWidget {
         let _ = sender.send(QueryProgress::StatementStart { index });
         app::awake();
         if !message.trim().is_empty() {
-            SqlEditorWidget::append_spool_output(session, &[message.clone()]);
+            SqlEditorWidget::append_spool_output(session, std::slice::from_ref(&message));
         }
         let result = QueryResult {
             sql: sql.to_string(),
@@ -7290,7 +7287,7 @@ impl SqlEditorWidget {
                 } else {
                     row[0] = "SUM".to_string();
                     let mut has_any_numeric = false;
-                    for idx in 1..column_count {
+                    for (idx, cell) in row.iter_mut().enumerate().take(column_count).skip(1) {
                         if state
                             .compute_seen_numeric
                             .get(idx)
@@ -7298,7 +7295,7 @@ impl SqlEditorWidget {
                             .unwrap_or(false)
                         {
                             let total = state.compute_sums.get(idx).copied().unwrap_or(0.0);
-                            row[idx] = SqlEditorWidget::format_number(total);
+                            *cell = SqlEditorWidget::format_number(total);
                             has_any_numeric = true;
                         }
                     }
@@ -8060,7 +8057,7 @@ impl SqlEditorWidget {
         let max_lines = if size == 0 {
             10_000
         } else {
-            (size / 80).max(1).min(10_000)
+            (size / 80).clamp(1, 10_000)
         };
         let lines = QueryExecutor::get_dbms_output(conn, max_lines)?;
         if lines.is_empty() {
@@ -8890,7 +8887,7 @@ mod query_execution_cleanup_tests {
 
         let unwind_result = panic::catch_unwind(AssertUnwindSafe({
             let cancel_flag = cancel_flag.clone();
-            let current_query_connection = current_query_connection.clone();
+            let current_query_connection = current_query_connection;
             move || {
                 let _guard =
                     QueryExecutionCleanupGuard::new(sender, current_query_connection, cancel_flag);
@@ -8921,7 +8918,7 @@ mod query_execution_cleanup_tests {
         let drop_result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
-                current_query_connection.clone(),
+                current_query_connection,
                 cancel_flag.clone(),
             );
         }));
@@ -8951,7 +8948,7 @@ mod query_execution_cleanup_tests {
         {
             let _guard = QueryExecutionCleanupGuard::new(
                 sender,
-                current_query_connection.clone(),
+                current_query_connection,
                 cancel_flag.clone(),
             );
         }

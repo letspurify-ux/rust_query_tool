@@ -397,7 +397,7 @@ impl SqlEditorWidget {
         };
 
         if let Some(mut cb) = callback {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| cb()));
+            let result = panic::catch_unwind(AssertUnwindSafe(&mut cb));
             let mut slot = match callback_slot.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -660,24 +660,24 @@ impl SqlEditorWidget {
         }
 
         // Handle keyboard events for triggering intellisense and syntax highlighting
-        let mut buffer_for_handle = buffer.clone();
-        let intellisense_data_for_handle = intellisense_data.clone();
-        let intellisense_popup_for_handle = intellisense_popup.clone();
-        let column_sender_for_handle = column_sender.clone();
-        let connection_for_handle = connection.clone();
-        let suppress_enter_for_handle = suppress_enter.clone();
-        let suppress_nav_for_handle = suppress_nav.clone();
-        let nav_anchor_for_handle = nav_anchor.clone();
-        let completion_range_for_handle = completion_range.clone();
+        let mut buffer_for_handle = buffer;
+        let intellisense_data_for_handle = intellisense_data;
+        let intellisense_popup_for_handle = intellisense_popup;
+        let column_sender_for_handle = column_sender;
+        let connection_for_handle = connection;
+        let suppress_enter_for_handle = suppress_enter;
+        let suppress_nav_for_handle = suppress_nav;
+        let nav_anchor_for_handle = nav_anchor;
+        let completion_range_for_handle = completion_range;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
         let replace_callback_for_handle = self.replace_callback.clone();
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
-        let ctrl_enter_handled_for_handle = ctrl_enter_handled.clone();
-        let pending_intellisense_for_handle = pending_intellisense.clone();
-        let intellisense_parse_cache_for_handle = intellisense_parse_cache.clone();
-        let keyup_debounce_generation_for_handle = keyup_debounce_generation.clone();
-        let keyup_debounce_handle_for_handle = keyup_debounce_handle.clone();
+        let ctrl_enter_handled_for_handle = ctrl_enter_handled;
+        let pending_intellisense_for_handle = pending_intellisense;
+        let intellisense_parse_cache_for_handle = intellisense_parse_cache;
+        let keyup_debounce_generation_for_handle = keyup_debounce_generation;
+        let keyup_debounce_handle_for_handle = keyup_debounce_handle;
         let dnd_file_drop_pending_for_handle = Arc::new(Mutex::new(false));
 
         editor.handle(move |ed, ev| {
@@ -1642,7 +1642,7 @@ impl SqlEditorWidget {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(IntellisenseParseCacheEntry {
-                        statement_text: statement_text.clone(),
+                        statement_text,
                         cursor_in_statement,
                         context: parsed.clone(),
                     });
@@ -2234,7 +2234,7 @@ impl SqlEditorWidget {
         };
 
         let task = ColumnLoadTask {
-            table_key: table_key.clone(),
+            table_key,
             connection: connection.clone(),
             sender: column_sender.clone(),
         };
@@ -3575,7 +3575,7 @@ impl SqlEditorWidget {
                         Ok(db_conn) => {
                             Self::describe_object(db_conn.as_ref(), &word, qualifier.as_deref())
                         }
-                        Err(message) => Err(message.to_string()),
+                        Err(message) => Err(message),
                     };
 
                     let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
@@ -4432,7 +4432,7 @@ FROM d
         let aliases = vec!["e".to_string(), "x".to_string()];
 
         let merged =
-            SqlEditorWidget::merge_suggestions_with_context_aliases(base.clone(), aliases, true);
+            SqlEditorWidget::merge_suggestions_with_context_aliases(base, aliases, true);
 
         assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
         assert_eq!(merged[0], "e");

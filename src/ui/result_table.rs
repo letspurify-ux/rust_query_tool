@@ -1005,7 +1005,7 @@ impl ResultTableWidget {
             Key::Right => col >= cols - 1,
             Key::Up => row <= 0,
             Key::Down => row >= rows - 1,
-            _ => return false,
+            _ => false,
         }
     }
 
@@ -2098,11 +2098,10 @@ impl ResultTableWidget {
         *active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        if !input.was_deleted() {
-            if app::is_ui_thread() {
+        if !input.was_deleted()
+            && app::is_ui_thread() {
                 Input::delete(input);
             }
-        }
         let mut table = table.clone();
         if !table.was_deleted() {
             let _ = table.take_focus();
@@ -2319,7 +2318,7 @@ impl ResultTableWidget {
                 }
             }
 
-            let mut input = active_editor.input.clone();
+            let mut input = active_editor.input;
             input.hide();
             if app::is_ui_thread() {
                 Input::delete(input);
@@ -2412,20 +2411,14 @@ impl ResultTableWidget {
         }
 
         let left_end = anchor_col.min(max_cols.saturating_sub(1));
-        for col in 0..=left_end {
-            if is_editable_target(col) {
-                return Some(col);
-            }
-        }
-
-        None
+        (0..=left_end).find(|&col| is_editable_target(col))
     }
 
     /// Apply pasted values to the data grid.
     /// Returns `(changed_cells, skipped_cells, updated_cells)` where `skipped_cells` counts
     /// editable target cells that fell outside the current table bounds.
     fn apply_paste_values_to_data(
-        full_data: &mut Vec<Vec<String>>,
+        full_data: &mut [Vec<String>],
         rowid_col: usize,
         editable_cols: &HashSet<usize>,
         max_cols: usize,
@@ -5234,10 +5227,10 @@ impl ResultTableWidget {
             return 0;
         };
 
-        let rows = (row_bot - row_top + 1) as usize;
+        let rows = row_bot - row_top + 1;
         let visible_cols = Self::visible_column_indices_in_range(
-            col_left as usize,
-            col_right as usize,
+            col_left,
+            col_right,
             hidden_col,
         );
         if visible_cols.is_empty() {
@@ -5257,7 +5250,7 @@ impl ResultTableWidget {
                 if visible_idx > 0 {
                     result.push('\t');
                 }
-                if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
+                if let Some(val) = full_data.get(row).and_then(|r| r.get(*col)) {
                     result.push_str(val);
                 }
             }
@@ -5287,10 +5280,10 @@ impl ResultTableWidget {
             return 0;
         };
 
-        let rows = (row_bot - row_top + 1) as usize;
+        let rows = row_bot - row_top + 1;
         let visible_cols = Self::visible_column_indices_in_range(
-            col_left as usize,
-            col_right as usize,
+            col_left,
+            col_right,
             hidden_col,
         );
         if visible_cols.is_empty() {
@@ -5326,7 +5319,7 @@ impl ResultTableWidget {
                     if visible_idx > 0 {
                         result.push('\t');
                     }
-                    if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
+                    if let Some(val) = full_data.get(row).and_then(|r| r.get(*col)) {
                         result.push_str(val);
                     }
                 }
@@ -5525,11 +5518,8 @@ impl ResultTableWidget {
         } else {
             String::new()
         };
-        let should_render_message_only = !result.is_select
-            || (!result.success
-                && result.is_select
-                && result.rows.is_empty()
-                && result.columns.is_empty());
+        let should_render_message_only =
+            !result.is_select || (!result.success && result.rows.is_empty() && result.columns.is_empty());
 
         if should_render_message_only {
             self.clear_pending_stream_buffers();
@@ -5541,10 +5531,12 @@ impl ResultTableWidget {
             self.table.set_rows(1);
             self.table.set_cols(1);
             self.apply_table_metrics_for_current_font();
-            let message_width =
-                Self::estimate_display_width(&result.message, font_size, max_cell_display_chars)
-                    .max(200)
-                    .min(1200);
+            let message_width = Self::estimate_display_width(
+                &result.message,
+                font_size,
+                max_cell_display_chars,
+            )
+            .clamp(200, 1200);
             self.table.set_col_width(0, message_width);
             *self
                 .headers
@@ -5994,13 +5986,8 @@ impl ResultTableWidget {
         let hidden_col = self.hidden_auto_rowid_col_value();
         let count = Self::copy_selected_to_clipboard(&self.table, &self.full_data, hidden_col);
         if count > 0 {
-            let rows = (row_bot - row_top + 1) as usize;
-            let cols = Self::visible_column_indices_in_range(
-                col_left as usize,
-                col_right as usize,
-                hidden_col,
-            )
-            .len();
+            let rows = row_bot - row_top + 1;
+            let cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col).len();
             println!("Copied {} cells ({} rows x {} cols)", count, rows, cols);
         }
         count
@@ -6031,25 +6018,21 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn get_selected_data(&self) -> Option<String> {
-        let Some((row_top, col_left, row_bot, col_right)) =
-            Self::normalized_selection_bounds_with_limits(
-                self.table.get_selection(),
-                self.table.rows().max(0) as usize,
-                self.table.cols().max(0) as usize,
-            )
-        else {
-            return None;
-        };
+        let (row_top, col_left, row_bot, col_right) = Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            self.table.rows().max(0) as usize,
+            self.table.cols().max(0) as usize,
+        )?;
 
         let full_data = self
             .full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let rows = (row_bot - row_top + 1) as usize;
+        let rows = row_bot - row_top + 1;
         let hidden_col = self.hidden_auto_rowid_col_value();
         let visible_cols = Self::visible_column_indices_in_range(
-            col_left as usize,
-            col_right as usize,
+            col_left,
+            col_right,
             hidden_col,
         );
         if visible_cols.is_empty() {
@@ -6064,7 +6047,7 @@ impl ResultTableWidget {
                 if visible_idx > 0 {
                     result.push('\t');
                 }
-                if let Some(val) = full_data.get(row as usize).and_then(|r| r.get(*col)) {
+                if let Some(val) = full_data.get(row).and_then(|r| r.get(*col)) {
                     result.push_str(val);
                 }
             }
@@ -6214,11 +6197,11 @@ impl ResultTableWidget {
                     // Also update non-explicit null cells that still carry the
                     // executor's original null marker so that every null cell
                     // displays the newly configured null_text consistently.
-                    for col_idx in 0..row.len() {
+                    for (col_idx, cell) in row.iter_mut().enumerate() {
                         if explicit_cols.contains(&col_idx) {
                             continue;
                         }
-                        if Self::value_represents_null(&row[col_idx], &old_null_text) {
+                        if Self::value_represents_null(cell.as_str(), &old_null_text) {
                             // Verify against the original snapshot: only rewrite
                             // the display value when the original was also null
                             // (avoids clobbering user-edited data that happens
@@ -6228,7 +6211,7 @@ impl ResultTableWidget {
                                     let orig_val =
                                         orig.get(col_idx).map(|v| v.as_str()).unwrap_or("");
                                     if Self::value_represents_null(orig_val, &old_null_text) {
-                                        row[col_idx] = normalized.clone();
+                                        *cell = normalized.clone();
                                     }
                                 }
                             }

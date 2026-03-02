@@ -72,14 +72,13 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
         None => true,
         Some(&b) if b < 0x80 => b.is_ascii_whitespace() || matches!(b, b';' | b',' | b'(' | b')'),
         // Non-ASCII byte: decode and check for Unicode whitespace
-        _ => rest.chars().next().map_or(true, |c| c.is_whitespace()),
+        _ => rest.chars().next().is_none_or(|c| c.is_whitespace()),
     }
 }
 
 /// Returns normalized leading words from a line in uppercase.
 pub(crate) fn leading_words_upper(line: &str) -> Vec<String> {
-    line.trim_start()
-        .split_whitespace()
+    line.split_whitespace()
         .map(|w| {
             w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .to_uppercase()

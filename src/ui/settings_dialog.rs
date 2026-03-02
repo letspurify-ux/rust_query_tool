@@ -98,7 +98,7 @@ fn refill_font_list(
         .iter()
         .position(|name| name.eq_ignore_ascii_case(selected_font))
         .unwrap_or(0);
-    let _ = browser.select((selected_index + 1) as i32);
+    browser.select((selected_index + 1) as i32);
     *selected_font = filtered[selected_index].clone();
 }
 

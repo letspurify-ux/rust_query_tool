@@ -177,7 +177,7 @@ impl LogViewerDialog {
         browser.set_callback(move |b| {
             let selected = b.value();
             if selected > 0 {
-                if let Some(idx) = (selected - 1).try_into().ok() {
+                if let Ok(idx) = (selected - 1).try_into() {
                     let _ = sender_for_preview.send(DialogMessage::UpdatePreview(idx));
                     app::awake();
                 }
@@ -206,7 +206,7 @@ impl LogViewerDialog {
         });
 
         // Close button
-        let sender_for_close = sender.clone();
+        let sender_for_close = sender;
         close_btn.set_callback(move |_| {
             let _ = sender_for_close.send(DialogMessage::Close);
             app::awake();
@@ -214,7 +214,7 @@ impl LogViewerDialog {
 
         dialog.show();
 
-        let mut detail_buffer = detail_buffer.clone();
+        let mut detail_buffer = detail_buffer;
         let mut browser = browser.clone();
         let mut count_label = count_label.clone();
         let level_choice = level_choice.clone();

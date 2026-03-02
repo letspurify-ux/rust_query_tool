@@ -783,8 +783,7 @@ impl SqlEditorWidget {
         let sender_tick = sender.clone();
         let auto_thread = thread::spawn(move || {
             let polls_per_refresh =
-                ((SQL_MONITOR_AUTO_REFRESH_INTERVAL_MS + SQL_MONITOR_AUTO_REFRESH_POLL_MS - 1)
-                    / SQL_MONITOR_AUTO_REFRESH_POLL_MS)
+                SQL_MONITOR_AUTO_REFRESH_INTERVAL_MS.div_ceil(SQL_MONITOR_AUTO_REFRESH_POLL_MS)
                     .max(1);
             let mut poll_count = 0u64;
             while !load_mutex_bool(&stop_auto_signal_for_thread) {
@@ -7268,7 +7267,7 @@ fn prompt_secret_text(prompt: &str) -> Option<String> {
     }
 
     {
-        let response_tx = response_tx.clone();
+        let response_tx = response_tx;
         let mut dialog = dialog.clone();
         let password_input_for_enter = password_input.clone();
         let mut password_input_callback = password_input.clone();
@@ -7287,10 +7286,7 @@ fn prompt_secret_text(prompt: &str) -> Option<String> {
         app::wait();
     }
 
-    let result = match response_rx.try_recv() {
-        Ok(value) => value,
-        Err(_) => None,
-    };
+    let result = response_rx.try_recv().unwrap_or_default();
     Window::delete(dialog);
     result
 }
@@ -7488,13 +7484,11 @@ fn parse_sql_id_child_row(
 ) -> Option<(String, Option<i32>)> {
     let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
     let sql_id = sql_id_text.trim().to_uppercase();
-    if normalize_optional_sql_id(&sql_id).ok().flatten().is_none() {
-        return None;
-    }
+    normalize_optional_sql_id(&sql_id).ok().flatten()?;
     let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
         .or_else(|| column_value_by_name(row_values, columns, "CHILD#"));
     let child = if let Some(text) = child_text {
-        match parse_optional_non_negative_i32(&text, "Child#") {
+        match parse_optional_non_negative_i32(text, "Child#") {
             Ok(value) => value,
             Err(_) => return None,
         }

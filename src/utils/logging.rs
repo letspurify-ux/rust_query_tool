@@ -402,7 +402,7 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
     }
 
     // Persist via background writer
-    if let Err(send_err) = send_log_command(LogCommand::Write(entry.clone())) {
+    if let Err(send_err) = send_log_command(LogCommand::Write(entry)) {
         if let LogCommand::Write(failed_entry) = send_err.0 {
             let mut log = AppLog::load();
             log.add_entry(failed_entry);

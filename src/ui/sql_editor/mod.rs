@@ -1253,7 +1253,7 @@ impl SqlEditorWidget {
             column_sender,
             ui_action_sender,
             query_running: query_running.clone(),
-            current_query_connection: current_query_connection.clone(),
+            current_query_connection,
             cancel_flag,
             intellisense_data,
             intellisense_popup,
@@ -1275,8 +1275,8 @@ impl SqlEditorWidget {
             keyup_debounce_handle,
             last_explain_plan,
             highlight_result_sender,
-            highlight_revision: highlight_revision.clone(),
-            highlight_generation: highlight_generation.clone(),
+            highlight_revision,
+            highlight_generation,
             highlight_editor_id: Self::next_highlight_editor_id(),
         };
 
@@ -1417,7 +1417,7 @@ impl SqlEditorWidget {
                             }
                             QueryProgress::PromptInput { prompt, response } => {
                                 flush_rows(&mut pending_rows, &mut pending_row_index_map);
-                                let value = SqlEditorWidget::prompt_input_dialog(&prompt);
+                                let value = SqlEditorWidget::prompt_input_dialog(prompt);
                                 let _ = response.send(value);
                                 app::awake();
                             }
@@ -2067,18 +2067,17 @@ impl SqlEditorWidget {
                 let mut previous = last_viewport_state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let changed = previous.map_or(true, |state| state != current_state);
+                let changed = previous.is_none_or(|state| state != current_state);
                 if changed {
                     *previous = Some(current_state);
                 }
                 changed
             };
 
-            if should_refresh {
-                if SqlEditorWidget::should_use_windowed_highlighting(text_len.max(0) as usize) {
+            if should_refresh
+                && SqlEditorWidget::should_use_windowed_highlighting(text_len.max(0) as usize) {
                     widget.refresh_highlighting();
                 }
-            }
 
             app::add_timeout3(VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS, move |_| {
                 schedule_poll(
@@ -2120,7 +2119,7 @@ impl SqlEditorWidget {
                 let result = match conn_guard.require_live_connection() {
                     Ok(db_conn) => QueryExecutor::get_explain_plan(db_conn.as_ref(), &sql)
                         .map_err(|err| err.to_string()),
-                    Err(message) => Err(message.to_string()),
+                    Err(message) => Err(message),
                 };
 
                 let _ = sender.send(UiActionResult::ExplainPlan(result));
@@ -2333,7 +2332,7 @@ impl SqlEditorWidget {
 
                 let result = match conn_guard.require_live_connection() {
                     Ok(db_conn) => db_conn.commit().map_err(|err| err.to_string()),
-                    Err(message) => Err(message.to_string()),
+                    Err(message) => Err(message),
                 };
 
                 let _ = sender.send(UiActionResult::Commit(result));
@@ -2375,7 +2374,7 @@ impl SqlEditorWidget {
 
                 let result = match conn_guard.require_live_connection() {
                     Ok(db_conn) => db_conn.rollback().map_err(|err| err.to_string()),
-                    Err(message) => Err(message.to_string()),
+                    Err(message) => Err(message),
                 };
 
                 let _ = sender.send(UiActionResult::Rollback(result));

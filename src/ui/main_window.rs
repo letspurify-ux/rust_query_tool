@@ -943,7 +943,7 @@ impl MainWindow {
         let drag_state = Arc::new(Mutex::new(None::<(i32, i32)>));
         let mut content_flex_for_split = content_flex.clone();
         let obj_browser_for_split = obj_browser_widget.clone();
-        let drag_state_for_split = drag_state.clone();
+        let drag_state_for_split = drag_state;
         split_bar.handle(move |_bar, ev| match ev {
             fltk::enums::Event::Enter | fltk::enums::Event::Move => {
                 set_cursor(Cursor::WE);
@@ -1166,7 +1166,7 @@ impl MainWindow {
         let mut query_top_group_for_tile = query_top_group.clone();
         let mut query_split_bar_for_tile = query_split_bar.clone();
         let split_drag_active = Arc::new(Mutex::new(false));
-        let split_drag_active_for_tile = split_drag_active.clone();
+        let split_drag_active_for_tile = split_drag_active;
         right_tile.handle(move |tile, ev| {
             const SPLIT_GRAB_MARGIN: i32 = 6;
             match ev {
@@ -1305,7 +1305,7 @@ impl MainWindow {
             editor_tabs,
             active_editor_tab_id: first_tab_id,
             next_editor_tab_number: 2,
-            sql_editor: sql_editor.clone(),
+            sql_editor,
             sql_buffer,
             schema_intellisense_data: IntellisenseData::new(),
             schema_highlight_data: HighlightData::new(),
@@ -1331,7 +1331,7 @@ impl MainWindow {
             popups: Arc::new(Mutex::new(Vec::new())),
             window,
             right_tile: right_tile.clone(),
-            query_split_adjusted: query_split_adjusted.clone(),
+            query_split_adjusted,
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
             pending_connection_metadata_refresh: false,
@@ -2032,8 +2032,8 @@ impl MainWindow {
         state.editor_tabs.push(QueryEditorTab {
             tab_id,
             base_label: label,
-            sql_editor: editor.clone(),
-            sql_buffer: buffer.clone(),
+            sql_editor: editor,
+            sql_buffer: buffer,
             current_file: None,
             pristine_text: String::new(),
             current_text_len: 0,
@@ -2314,11 +2314,8 @@ impl MainWindow {
             let Some(state_for_status) = weak_state_for_status.upgrade() else {
                 return;
             };
-            match state_for_status.try_lock() {
-                Ok(mut s) => {
-                    s.set_status_message(message);
-                }
-                Err(_) => {}
+            if let Ok(mut s) = state_for_status.try_lock() {
+                s.set_status_message(message);
             };
         });
 
@@ -2359,7 +2356,7 @@ impl MainWindow {
         });
 
         let weak_state_for_progress = Arc::downgrade(state);
-        let schema_sender_for_progress = schema_sender.clone();
+        let schema_sender_for_progress = schema_sender;
         editor.set_progress_callback(move |progress| {
             let Some(state_for_progress) = weak_state_for_progress.upgrade() else {
                 return;
@@ -2635,10 +2632,7 @@ impl MainWindow {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                 return;
             };
-            match state_for_dirty.try_lock() {
-                Ok(mut s) => s.on_tab_buffer_modified(tab_id, ins, del, buf),
-                Err(_) => {}
-            };
+            if let Ok(mut s) = state_for_dirty.try_lock() { s.on_tab_buffer_modified(tab_id, ins, del, buf) };
         });
     }
 
@@ -2658,7 +2652,7 @@ impl MainWindow {
             return;
         };
         let weak_state_for_file_drop = Arc::downgrade(state);
-        let file_sender_for_drop = file_sender.clone();
+        let file_sender_for_drop = file_sender;
         editor.set_file_drop_callback(move |path| {
             if let Some(state_for_drop) = weak_state_for_file_drop.upgrade() {
                 let mut s = state_for_drop
@@ -3651,22 +3645,19 @@ impl MainWindow {
             let mut should_retry_schema_sync = false;
             let mut connection_for_retry: Option<SharedConnection> = None;
 
-            match state_for_status.try_lock() {
-                Ok(mut s) => {
-                    let conn_info = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    s.status_bar.set_label(&format_status(message, &conn_info));
+            if let Ok(mut s) = state_for_status.try_lock() {
+                let conn_info = s
+                    .connection_info
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                s.status_bar.set_label(&format_status(message, &conn_info));
 
-                    if message == "Object browser metadata refresh completed" && conn_info.is_some()
-                    {
-                        should_retry_schema_sync = true;
-                        connection_for_retry = Some(s.connection.clone());
-                    }
+                if message == "Object browser metadata refresh completed" && conn_info.is_some()
+                {
+                    should_retry_schema_sync = true;
+                    connection_for_retry = Some(s.connection.clone());
                 }
-                Err(_) => {}
             };
 
             if should_retry_schema_sync {
@@ -4163,9 +4154,9 @@ impl MainWindow {
 
         if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
             let weak_state_for_menu = Arc::downgrade(&state);
-            let schema_sender_for_menu = schema_sender.clone();
-            let conn_sender_for_menu = conn_sender.clone();
-            let file_sender_for_menu = file_sender.clone();
+            let schema_sender_for_menu = schema_sender;
+            let conn_sender_for_menu = conn_sender;
+            let file_sender_for_menu = file_sender;
             menu.set_callback(move |m| {
                 let Some(state_for_menu) = weak_state_for_menu.upgrade() else {
                     return;
@@ -4173,7 +4164,7 @@ impl MainWindow {
                 let menu_path = m
                     .item_pathname(None)
                     .ok()
-                    .or_else(|| m.choice().map(|p| p.to_string()));
+                    .or_else(|| m.choice());
                 if let Some(path) = menu_path {
                     let choice = MainWindow::strip_menu_label_shortcut(&path);
                     if MainWindow::execute_menu_action(

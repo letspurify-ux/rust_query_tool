@@ -420,7 +420,7 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
     let at_idx = rest
         .char_indices()
         .filter_map(|(idx, ch)| if ch == '@' { Some(idx) } else { None })
-        .last()?;
+        .next_back()?;
     if slash_idx >= at_idx {
         return None;
     }
@@ -757,7 +757,7 @@ fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
         } else {
             'A'
         };
-        styles.extend(std::iter::repeat(style_char).take(line.len()));
+        styles.extend(std::iter::repeat_n(style_char, line.len()));
         line_number = line_number.saturating_add(1);
     }
     styles
@@ -765,7 +765,7 @@ fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
 
 fn preview_style_table() -> Vec<StyleTableEntry> {
     let profile = configured_editor_profile();
-    let size = configured_ui_font_size() as i32;
+    let size = configured_ui_font_size();
     vec![
         StyleTableEntry {
             color: theme::text_primary(),
@@ -918,7 +918,7 @@ impl QueryHistoryDialog {
         preview_display.set_linenumber_fgcolor(theme::text_muted());
         preview_display.set_linenumber_bgcolor(theme::panel_bg());
         preview_display.set_linenumber_font(configured_editor_profile().normal);
-        preview_display.set_linenumber_size((configured_ui_font_size().saturating_sub(2)) as i32);
+        preview_display.set_linenumber_size(configured_ui_font_size().saturating_sub(2));
         preview_display.set_highlight_data(preview_style_buffer.clone(), preview_style_table());
 
         let mut error_label = fltk::frame::Frame::default().with_label("Error details:");
@@ -1007,7 +1007,7 @@ impl QueryHistoryDialog {
         browser.set_callback(move |b| {
             let selected = b.value();
             if selected > 0 {
-                if let Some(idx) = (selected - 1).try_into().ok() {
+                if let Ok(idx) = (selected - 1).try_into() {
                     let _ = sender_for_preview.send(DialogMessage::UpdatePreview(idx));
                     app::awake();
                 }
@@ -1041,7 +1041,7 @@ impl QueryHistoryDialog {
         });
 
         // Close button
-        let sender_for_close = sender.clone();
+        let sender_for_close = sender;
         close_btn.set_callback(move |_| {
             let _ = sender_for_close.send(DialogMessage::Close);
             app::awake();
@@ -1049,9 +1049,9 @@ impl QueryHistoryDialog {
 
         dialog.show();
 
-        let mut preview_buffer = preview_buffer.clone();
-        let mut preview_style_buffer = preview_style_buffer.clone();
-        let mut error_buffer = error_buffer.clone();
+        let mut preview_buffer = preview_buffer;
+        let mut preview_style_buffer = preview_style_buffer;
+        let mut error_buffer = error_buffer;
         let mut error_display = error_display.clone();
         let mut error_label = error_label.clone();
         let preview_flex_for_error = preview_flex.clone();

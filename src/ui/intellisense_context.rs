@@ -292,9 +292,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 if matches!(cte_state, CteState::InBody) && depth == cte_paren_depth {
                     cte_state = CteState::None;
                 }
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
                 }
@@ -467,7 +465,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     // After comma in WITH clause, expect next CTE name
                     _ => {
                         if matches!(cte_state, CteState::None)
-                            && matches!(phase_stack.get(0), Some(SqlPhase::WithClause))
+                            && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
                             && depth == 0
                         {
                             // We might be between CTE definitions
@@ -622,9 +620,7 @@ fn collect_tables_deep(
                 if let Some((_, start_idx)) = was_subquery.then(|| subquery_tracks.pop()).flatten()
                 {
                     if start_idx > idx {
-                        if depth > 0 {
-                            depth -= 1;
-                        }
+                        depth = depth.saturating_sub(1);
                         idx += 1;
                         continue;
                     }
@@ -658,9 +654,7 @@ fn collect_tables_deep(
                             scope_id: parent_scope_id,
                         });
                         idx = next_idx;
-                        if depth > 0 {
-                            depth -= 1;
-                        }
+                        depth = depth.saturating_sub(1);
                         if scope_stack.len() > 1 {
                             scope_stack.pop();
                         }
@@ -698,9 +692,7 @@ fn collect_tables_deep(
                     });
                 }
 
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
                 }
@@ -1051,7 +1043,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 
     // Skip RECURSIVE if present
     if let Some(SqlToken::Word(w)) = tokens.get(idx) {
-        if w.to_ascii_uppercase() == "RECURSIVE" {
+        if w.eq_ignore_ascii_case("RECURSIVE") {
             idx += 1;
         }
     }
@@ -1103,7 +1095,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 
         // Expect AS
         if let Some(SqlToken::Word(w)) = tokens.get(idx) {
-            if w.to_ascii_uppercase() == "AS" {
+            if w.eq_ignore_ascii_case("AS") {
                 idx += 1;
             }
         }
@@ -1283,27 +1275,24 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
 
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
-    match tokens.get(start) {
-        Some(SqlToken::Word(word)) => {
-            let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-            let upper = word.to_ascii_uppercase();
-            if upper == "AS" {
-                if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
-                    if !is_identifier_word_token(alias) {
-                        return (None, start + 2);
-                    }
-                    return (Some(strip_identifier_quotes(alias)), start + 2);
+    if let Some(SqlToken::Word(word)) = tokens.get(start) {
+        let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
+        let upper = word.to_ascii_uppercase();
+        if upper == "AS" {
+            if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
+                if !is_identifier_word_token(alias) {
+                    return (None, start + 2);
                 }
-                return (None, start + 1);
+                return (Some(strip_identifier_quotes(alias)), start + 2);
             }
-            if !is_identifier_word_token(word) {
-                return (None, start);
-            }
-            if is_quoted || !is_alias_breaker(&upper) {
-                return (Some(strip_identifier_quotes(word)), start + 1);
-            }
+            return (None, start + 1);
         }
-        _ => {}
+        if !is_identifier_word_token(word) {
+            return (None, start);
+        }
+        if is_quoted || !is_alias_breaker(&upper) {
+            return (Some(strip_identifier_quotes(word)), start + 1);
+        }
     }
     (None, start)
 }
@@ -1478,7 +1467,7 @@ pub fn resolve_qualifier_tables(
         if alias_upper.as_deref() == Some(qualifier_upper.as_str()) {
             if alias_match
                 .as_ref()
-                .map_or(true, |(depth, _)| table_ref.depth >= *depth)
+                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
             {
                 alias_match = Some((table_ref.depth, table_ref.name.clone()));
             }
@@ -1488,7 +1477,7 @@ pub fn resolve_qualifier_tables(
         if name_upper == qualifier_upper
             && name_match
                 .as_ref()
-                .map_or(true, |(depth, _)| table_ref.depth >= *depth)
+                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
         {
             name_match = Some((table_ref.depth, table_ref.name.clone()));
             continue;
@@ -1498,7 +1487,7 @@ pub fn resolve_qualifier_tables(
             .is_some_and(|short| short.eq_ignore_ascii_case(&qualifier_upper))
             && short_name_match
                 .as_ref()
-                .map_or(true, |(depth, _)| table_ref.depth >= *depth)
+                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
         {
             short_name_match = Some((table_ref.depth, table_ref.name.clone()));
         }
@@ -1776,7 +1765,7 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
         if subq.depth != 0 || subq.body_range.end > clause_idx {
             continue;
         }
-        if selected_subquery.as_ref().map_or(true, |existing| {
+        if selected_subquery.as_ref().is_none_or(|existing| {
             subq.body_range.end > existing.body_range.end
         }) {
             selected_subquery = Some(subq);

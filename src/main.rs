@@ -2,6 +2,11 @@
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
+#![allow(
+    clippy::arc_with_non_send_sync,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 mod app;
 mod db;
