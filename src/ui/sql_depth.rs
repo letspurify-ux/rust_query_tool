@@ -113,10 +113,9 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
             _ => false,
         };
 
-        if is_break
-            && !current.is_empty() {
-                groups.push(std::mem::take(&mut current));
-            }
+        if is_break && !current.is_empty() {
+            groups.push(std::mem::take(&mut current));
+        }
 
         current.push(token);
         apply_paren_token(&mut depth, token);

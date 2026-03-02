@@ -8,7 +8,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,6 +32,21 @@ use super::*;
 const MAX_MERGED_SUGGESTIONS: usize = 50;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 const COLUMN_LOAD_WORKER_COUNT: usize = 4;
+const INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS: f64 = 0.01;
+const INTELLISENSE_DEFERRED_HIDE_RETRIES: u8 = 3;
+static INTELLISENSE_POPUP_SHOW_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+struct IntellisenseTriggerSnapshot {
+    request_generation: u64,
+    cursor_pos: i32,
+    cursor_pos_usize: usize,
+    prefix: String,
+    word_start: usize,
+    qualifier: Option<String>,
+    statement_text: String,
+    cursor_in_statement: usize,
+}
 
 #[derive(Clone)]
 struct ColumnLoadTask {
@@ -480,6 +495,21 @@ impl SqlEditorWidget {
         keyup_debounce_generation: &Arc<Mutex<u64>>,
         keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
     ) -> u64 {
+        Self::invalidate_keyup_debounce_with_parse_generation(
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            None,
+        )
+    }
+
+    pub(crate) fn invalidate_keyup_debounce_with_parse_generation(
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: Option<&Arc<AtomicU64>>,
+    ) -> u64 {
+        if let Some(parse_generation) = intellisense_parse_generation {
+            parse_generation.fetch_add(1, Ordering::Relaxed);
+        }
         Self::cancel_keyup_debounce_timeout(keyup_debounce_handle);
         let mut generation_guard = keyup_debounce_generation
             .lock()
@@ -487,6 +517,18 @@ impl SqlEditorWidget {
         let generation = (*generation_guard).wrapping_add(1);
         *generation_guard = generation;
         generation
+    }
+
+    fn invalidate_manual_trigger_debounce_state(
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+    ) {
+        Self::invalidate_keyup_debounce_with_parse_generation(
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            Some(intellisense_parse_generation),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -504,9 +546,13 @@ impl SqlEditorWidget {
         connection: &SharedConnection,
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
     ) {
-        let generation =
-            Self::invalidate_keyup_debounce(keyup_debounce_generation, keyup_debounce_handle);
+        let generation = Self::invalidate_keyup_debounce_with_parse_generation(
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            Some(intellisense_parse_generation),
+        );
         let keyup_debounce_generation_for_timeout = keyup_debounce_generation.clone();
         let keyup_debounce_handle_for_timeout = keyup_debounce_handle.clone();
         let editor_for_timeout = editor.clone();
@@ -518,6 +564,7 @@ impl SqlEditorWidget {
         let connection_for_timeout = connection.clone();
         let pending_intellisense_for_timeout = pending_intellisense.clone();
         let intellisense_parse_cache_for_timeout = intellisense_parse_cache.clone();
+        let intellisense_parse_generation_for_timeout = intellisense_parse_generation.clone();
         let handle = app::add_timeout3(
             Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
             move |timeout_handle| {
@@ -565,6 +612,7 @@ impl SqlEditorWidget {
                     &connection_for_timeout,
                     &pending_intellisense_for_timeout,
                     &intellisense_parse_cache_for_timeout,
+                    &intellisense_parse_generation_for_timeout,
                 );
             },
         );
@@ -591,6 +639,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled = Arc::new(Mutex::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
+        let intellisense_parse_generation = self.intellisense_parse_generation.clone();
         let keyup_debounce_generation = self.keyup_debounce_generation.clone();
         let keyup_debounce_handle = self.keyup_debounce_handle.clone();
 
@@ -676,6 +725,7 @@ impl SqlEditorWidget {
         let ctrl_enter_handled_for_handle = ctrl_enter_handled;
         let pending_intellisense_for_handle = pending_intellisense;
         let intellisense_parse_cache_for_handle = intellisense_parse_cache;
+        let intellisense_parse_generation_for_handle = intellisense_parse_generation;
         let keyup_debounce_generation_for_handle = keyup_debounce_generation;
         let keyup_debounce_handle_for_handle = keyup_debounce_handle;
         let dnd_file_drop_pending_for_handle = Arc::new(Mutex::new(false));
@@ -762,17 +812,14 @@ impl SqlEditorWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .hide();
-                            *completion_range_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            Self::invalidate_keyup_debounce(
-                                &keyup_debounce_generation_for_handle,
-                                &keyup_debounce_handle_for_handle,
-                            );
                         }
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &completion_range_for_handle,
+                            &pending_intellisense_for_handle,
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                            &intellisense_parse_generation_for_handle,
+                        );
                         let direction = if key == Key::Up { -1 } else { 1 };
                         widget_for_shortcuts.select_block_in_direction(direction);
                         return true;
@@ -784,42 +831,38 @@ impl SqlEditorWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .hide();
-                            *completion_range_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            *pending_intellisense_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            Self::invalidate_keyup_debounce(
-                                &keyup_debounce_generation_for_handle,
-                                &keyup_debounce_handle_for_handle,
-                            );
                         }
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &completion_range_for_handle,
+                            &pending_intellisense_for_handle,
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                            &intellisense_parse_generation_for_handle,
+                        );
                         let direction = if key == Key::Up { 1 } else { -1 };
                         widget_for_shortcuts.navigate_history(direction);
                         return true;
                     }
 
+                    if shortcut_key == Key::Escape {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                        }
+                        return Self::cancel_intellisense_on_escape_keydown(
+                            popup_visible,
+                            &completion_range_for_handle,
+                            &pending_intellisense_for_handle,
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                            &intellisense_parse_generation_for_handle,
+                        );
+                    }
+
                     if popup_visible {
                         match shortcut_key {
-                            Key::Escape => {
-                                // Close popup, consume event
-                                intellisense_popup_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .hide();
-                                *completion_range_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                *pending_intellisense_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                Self::invalidate_keyup_debounce(
-                                    &keyup_debounce_generation_for_handle,
-                                    &keyup_debounce_handle_for_handle,
-                                );
-                                return true;
-                            }
                             Key::Up => {
                                 // Navigate popup up, consume event
                                 let pos = ed.insert_position();
@@ -918,9 +961,10 @@ impl SqlEditorWidget {
                                 *pending_intellisense_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                Self::invalidate_keyup_debounce(
+                                Self::invalidate_keyup_debounce_with_parse_generation(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
+                                    Some(&intellisense_parse_generation_for_handle),
                                 );
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
@@ -964,6 +1008,11 @@ impl SqlEditorWidget {
                             }
                             k if k == Key::from_char(' ') => {
                                 // Ctrl+Space - Trigger intellisense
+                                Self::invalidate_manual_trigger_debounce_state(
+                                    &keyup_debounce_generation_for_handle,
+                                    &keyup_debounce_handle_for_handle,
+                                    &intellisense_parse_generation_for_handle,
+                                );
                                 Self::trigger_intellisense(
                                     ed,
                                     &buffer_for_handle,
@@ -974,6 +1023,7 @@ impl SqlEditorWidget {
                                     &connection_for_handle,
                                     &pending_intellisense_for_handle,
                                     &intellisense_parse_cache_for_handle,
+                                    &intellisense_parse_generation_for_handle,
                                 );
                                 return true;
                             }
@@ -1135,9 +1185,10 @@ impl SqlEditorWidget {
                             *pending_intellisense_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            Self::invalidate_keyup_debounce(
+                            Self::invalidate_keyup_debounce_with_parse_generation(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
+                                Some(&intellisense_parse_generation_for_handle),
                             );
                         }
                         return false;
@@ -1202,9 +1253,10 @@ impl SqlEditorWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         }
-                        Self::invalidate_keyup_debounce(
+                        Self::invalidate_keyup_debounce_with_parse_generation(
                             &keyup_debounce_generation_for_handle,
                             &keyup_debounce_handle_for_handle,
+                            Some(&intellisense_parse_generation_for_handle),
                         );
                         widget_for_shortcuts.refresh_highlighting();
                         return false;
@@ -1248,9 +1300,10 @@ impl SqlEditorWidget {
                         *pending_intellisense_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                        Self::invalidate_keyup_debounce(
+                        Self::invalidate_keyup_debounce_with_parse_generation(
                             &keyup_debounce_generation_for_handle,
                             &keyup_debounce_handle_for_handle,
+                            Some(&intellisense_parse_generation_for_handle),
                         );
                     } else if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
@@ -1269,6 +1322,7 @@ impl SqlEditorWidget {
                                 &connection_for_handle,
                                 &pending_intellisense_for_handle,
                                 &intellisense_parse_cache_for_handle,
+                                &intellisense_parse_generation_for_handle,
                             );
                         } else {
                             intellisense_popup_for_handle
@@ -1281,9 +1335,10 @@ impl SqlEditorWidget {
                             *pending_intellisense_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            Self::invalidate_keyup_debounce(
+                            Self::invalidate_keyup_debounce_with_parse_generation(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
+                                Some(&intellisense_parse_generation_for_handle),
                             );
                         }
                     } else if let Some(ch) = typed_char {
@@ -1308,6 +1363,7 @@ impl SqlEditorWidget {
                                     &connection_for_handle,
                                     &pending_intellisense_for_handle,
                                     &intellisense_parse_cache_for_handle,
+                                    &intellisense_parse_generation_for_handle,
                                 );
                             } else {
                                 intellisense_popup_for_handle
@@ -1320,9 +1376,10 @@ impl SqlEditorWidget {
                                 *pending_intellisense_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                Self::invalidate_keyup_debounce(
+                                Self::invalidate_keyup_debounce_with_parse_generation(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
+                                    Some(&intellisense_parse_generation_for_handle),
                                 );
                             }
                         } else if sql_text::is_identifier_char(ch) {
@@ -1342,6 +1399,7 @@ impl SqlEditorWidget {
                                     &connection_for_handle,
                                     &pending_intellisense_for_handle,
                                     &intellisense_parse_cache_for_handle,
+                                    &intellisense_parse_generation_for_handle,
                                 );
                             } else {
                                 intellisense_popup_for_handle
@@ -1354,9 +1412,10 @@ impl SqlEditorWidget {
                                 *pending_intellisense_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                                Self::invalidate_keyup_debounce(
+                                Self::invalidate_keyup_debounce_with_parse_generation(
                                     &keyup_debounce_generation_for_handle,
                                     &keyup_debounce_handle_for_handle,
+                                    Some(&intellisense_parse_generation_for_handle),
                                 );
                             }
                         } else {
@@ -1372,9 +1431,10 @@ impl SqlEditorWidget {
                             *pending_intellisense_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                            Self::invalidate_keyup_debounce(
+                            Self::invalidate_keyup_debounce_with_parse_generation(
                                 &keyup_debounce_generation_for_handle,
                                 &keyup_debounce_handle_for_handle,
+                                Some(&intellisense_parse_generation_for_handle),
                             );
                         }
                     }
@@ -1393,10 +1453,46 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Unfocus => {
-                    Self::invalidate_keyup_debounce(
-                        &keyup_debounce_generation_for_handle,
-                        &keyup_debounce_handle_for_handle,
-                    );
+                    let unfocus_x = fltk::app::event_x_root();
+                    let unfocus_y = fltk::app::event_y_root();
+                    if INTELLISENSE_POPUP_SHOW_IN_PROGRESS.load(Ordering::Relaxed) {
+                        Self::schedule_deferred_unfocus_popup_hide(
+                            ed.clone(),
+                            intellisense_popup_for_handle.clone(),
+                            keyup_debounce_generation_for_handle.clone(),
+                            keyup_debounce_handle_for_handle.clone(),
+                            intellisense_parse_generation_for_handle.clone(),
+                            completion_range_for_handle.clone(),
+                            pending_intellisense_for_handle.clone(),
+                            unfocus_x,
+                            unfocus_y,
+                            INTELLISENSE_DEFERRED_HIDE_RETRIES,
+                        );
+                        return false;
+                    }
+                    let should_hide_and_clear = {
+                        let mut popup = intellisense_popup_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let popup_visible = popup.is_visible();
+                        let pointer_inside_popup =
+                            popup_visible && popup.contains_point(unfocus_x, unfocus_y);
+                        if Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
+                            popup.hide();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_hide_and_clear {
+                        Self::clear_intellisense_state_for_external_hide(
+                            &keyup_debounce_generation_for_handle,
+                            &keyup_debounce_handle_for_handle,
+                            &intellisense_parse_generation_for_handle,
+                            &completion_range_for_handle,
+                            &pending_intellisense_for_handle,
+                        );
+                    }
                     false
                 }
                 Event::Shortcut => {
@@ -1572,12 +1668,15 @@ impl SqlEditorWidget {
         connection: &SharedConnection,
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
     ) {
+        let request_generation = intellisense_parse_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         let cursor_pos = Self::raw_cursor_position(buffer, editor.insert_position());
         let cursor_pos_usize = cursor_pos as usize;
-        let (word, start, _) = Self::word_at_cursor(buffer, cursor_pos);
-        let qualifier = Self::qualifier_before_word(buffer, start);
-        let prefix = word;
+        let (prefix, word_start, _) = Self::word_at_cursor(buffer, cursor_pos);
+        let qualifier = Self::qualifier_before_word(buffer, word_start);
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
             && Self::non_whitespace_char_before_cursor(buffer, cursor_pos) == Some(';');
@@ -1596,8 +1695,104 @@ impl SqlEditorWidget {
             return;
         }
 
-        // Extract statement text once and cache parse results for repeated triggers
-        // at the same cursor position (e.g. async column-load refreshes).
+        let (statement_context_text, cursor_in_statement_raw) =
+            Self::statement_context_with_cursor(buffer, cursor_pos);
+        let cursor_in_statement_raw =
+            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
+        let (statement_text, cursor_in_statement) =
+            Self::normalize_intellisense_context_with_cursor(
+                &statement_context_text,
+                cursor_in_statement_raw,
+            );
+        let snapshot = Arc::new(IntellisenseTriggerSnapshot {
+            request_generation,
+            cursor_pos,
+            cursor_pos_usize,
+            prefix,
+            word_start,
+            qualifier,
+            statement_text,
+            cursor_in_statement,
+        });
+
+        let cached_context = {
+            let cache = intellisense_parse_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache
+                .as_ref()
+                .filter(|entry| {
+                    entry.cursor_in_statement == snapshot.cursor_in_statement
+                        && entry.statement_text.as_str() == snapshot.statement_text.as_str()
+                })
+                .map(|entry| entry.context.clone())
+        };
+
+        if let Some(context) = cached_context {
+            Self::apply_intellisense_with_context(
+                editor,
+                intellisense_data,
+                intellisense_popup,
+                completion_range,
+                column_sender,
+                connection,
+                pending_intellisense,
+                snapshot.as_ref(),
+                context.as_ref(),
+            );
+            return;
+        }
+
+        // Cache miss means full parse is pending on a worker.
+        // Hide stale popup/completion state to avoid applying outdated candidates.
+        Self::clear_intellisense_ui_state(
+            intellisense_popup,
+            completion_range,
+            pending_intellisense,
+        );
+
+        Self::queue_async_intellisense_parse(
+            editor,
+            buffer,
+            intellisense_data,
+            intellisense_popup,
+            completion_range,
+            column_sender,
+            connection,
+            pending_intellisense,
+            intellisense_parse_cache,
+            intellisense_parse_generation,
+            snapshot.clone(),
+        );
+    }
+
+    fn analyze_statement_context(
+        statement_text: &str,
+        cursor_in_statement: usize,
+    ) -> intellisense_context::CursorContext {
+        let full_token_spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let split_idx = full_token_spans.partition_point(|span| span.end <= cursor_in_statement);
+        let full_tokens: Vec<SqlToken> = full_token_spans
+            .into_iter()
+            .map(|span| span.token)
+            .collect();
+        intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
+    }
+
+    fn is_intellisense_snapshot_current(
+        editor: &TextEditor,
+        buffer: &TextBuffer,
+        snapshot: &IntellisenseTriggerSnapshot,
+    ) -> bool {
+        if editor.was_deleted() {
+            return false;
+        }
+
+        let cursor_pos = Self::raw_cursor_position(buffer, editor.insert_position());
+        if cursor_pos != snapshot.cursor_pos {
+            return false;
+        }
+
         let (statement_context_text, cursor_in_statement_raw) =
             Self::statement_context_with_cursor(buffer, cursor_pos);
         let cursor_in_statement_raw =
@@ -1608,80 +1803,453 @@ impl SqlEditorWidget {
                 cursor_in_statement_raw,
             );
 
-        let cached_context = {
-            let cache = intellisense_parse_cache
+        cursor_in_statement == snapshot.cursor_in_statement
+            && statement_text.as_str() == snapshot.statement_text.as_str()
+    }
+
+    fn is_intellisense_parse_generation_current(
+        intellisense_parse_generation: &Arc<AtomicU64>,
+        snapshot: &IntellisenseTriggerSnapshot,
+    ) -> bool {
+        intellisense_parse_generation.load(Ordering::Relaxed) == snapshot.request_generation
+    }
+
+    fn clear_intellisense_ui_state(
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+    ) {
+        intellisense_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hide();
+        *completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *pending_intellisense
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn clear_intellisense_state_for_external_hide(
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+    ) {
+        Self::invalidate_and_clear_pending_intellisense_state(
+            completion_range,
+            pending_intellisense,
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            intellisense_parse_generation,
+        );
+    }
+
+    fn should_ignore_external_hide_click(popup_visible: bool, click_inside_popup: bool) -> bool {
+        popup_visible && click_inside_popup
+    }
+
+    fn should_hide_popup_on_unfocus(popup_visible: bool, pointer_inside_popup: bool) -> bool {
+        popup_visible && !pointer_inside_popup
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_deferred_unfocus_popup_hide(
+        editor: TextEditor,
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        keyup_debounce_generation: Arc<Mutex<u64>>,
+        keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: Arc<AtomicU64>,
+        completion_range: Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
+        pointer_x: i32,
+        pointer_y: i32,
+        retries_left: u8,
+    ) {
+        app::add_timeout3(0.0, move |_| {
+            if editor.was_deleted() {
+                return;
+            }
+
+            if INTELLISENSE_POPUP_SHOW_IN_PROGRESS.load(Ordering::Relaxed) {
+                if retries_left > 0 {
+                    Self::schedule_deferred_unfocus_popup_hide(
+                        editor.clone(),
+                        intellisense_popup.clone(),
+                        keyup_debounce_generation.clone(),
+                        keyup_debounce_handle.clone(),
+                        intellisense_parse_generation.clone(),
+                        completion_range.clone(),
+                        pending_intellisense.clone(),
+                        pointer_x,
+                        pointer_y,
+                        retries_left - 1,
+                    );
+                }
+                return;
+            }
+
+            if editor.has_focus() {
+                return;
+            }
+            let mut popup = intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache
-                .as_ref()
-                .filter(|entry| {
-                    entry.cursor_in_statement == cursor_in_statement
-                        && entry.statement_text.as_str() == statement_text.as_str()
-                })
-                .map(|entry| entry.context.clone())
+            let popup_visible = popup.is_visible();
+            let pointer_inside_popup = popup_visible && popup.contains_point(pointer_x, pointer_y);
+            if !Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
+                return;
+            }
+            popup.hide();
+            drop(popup);
+            Self::clear_intellisense_state_for_external_hide(
+                &keyup_debounce_generation,
+                &keyup_debounce_handle,
+                &intellisense_parse_generation,
+                &completion_range,
+                &pending_intellisense,
+            );
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_deferred_outside_click_popup_hide(
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        keyup_debounce_generation: Arc<Mutex<u64>>,
+        keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: Arc<AtomicU64>,
+        completion_range: Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
+        click_x: i32,
+        click_y: i32,
+        retries_left: u8,
+    ) {
+        app::add_timeout3(0.0, move |_| {
+            if INTELLISENSE_POPUP_SHOW_IN_PROGRESS.load(Ordering::Relaxed) {
+                if retries_left > 0 {
+                    Self::schedule_deferred_outside_click_popup_hide(
+                        intellisense_popup.clone(),
+                        keyup_debounce_generation.clone(),
+                        keyup_debounce_handle.clone(),
+                        intellisense_parse_generation.clone(),
+                        completion_range.clone(),
+                        pending_intellisense.clone(),
+                        click_x,
+                        click_y,
+                        retries_left - 1,
+                    );
+                }
+                return;
+            }
+            let mut popup = intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let popup_visible = popup.is_visible();
+            if !popup_visible {
+                return;
+            }
+            let click_inside_popup = popup.contains_point(click_x, click_y);
+            if Self::should_ignore_external_hide_click(popup_visible, click_inside_popup) {
+                return;
+            }
+            popup.hide();
+            drop(popup);
+            Self::clear_intellisense_state_for_external_hide(
+                &keyup_debounce_generation,
+                &keyup_debounce_handle,
+                &intellisense_parse_generation,
+                &completion_range,
+                &pending_intellisense,
+            );
+        });
+    }
+
+    fn invalidate_and_clear_pending_intellisense_state(
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+    ) {
+        *completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *pending_intellisense
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Self::invalidate_keyup_debounce_with_parse_generation(
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            Some(intellisense_parse_generation),
+        );
+    }
+
+    fn cancel_intellisense_on_escape_keydown(
+        popup_visible: bool,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+    ) -> bool {
+        Self::invalidate_and_clear_pending_intellisense_state(
+            completion_range,
+            pending_intellisense,
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            intellisense_parse_generation,
+        );
+        popup_visible
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_async_intellisense_parse(
+        editor: &TextEditor,
+        buffer: &TextBuffer,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+        snapshot: Arc<IntellisenseTriggerSnapshot>,
+    ) {
+        let (parse_sender, parse_receiver) =
+            mpsc::channel::<Result<intellisense_context::CursorContext, String>>();
+        let parse_receiver = Arc::new(Mutex::new(parse_receiver));
+        let snapshot_for_thread = snapshot.clone();
+        let spawn_result = thread::Builder::new()
+            .name("intellisense-parse-worker".to_string())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    Self::analyze_statement_context(
+                        &snapshot_for_thread.statement_text,
+                        snapshot_for_thread.cursor_in_statement,
+                    )
+                }));
+
+                match result {
+                    Ok(parsed) => {
+                        let _ = parse_sender.send(Ok(parsed));
+                    }
+                    Err(payload) => {
+                        let panic_msg = Self::panic_payload_to_string(payload.as_ref());
+                        crate::utils::logging::log_error(
+                            "sql_editor::intellisense::parse_worker",
+                            &format!("parse worker panicked: {panic_msg}"),
+                        );
+                        let _ = parse_sender.send(Err(format!("Internal error: {panic_msg}")));
+                    }
+                }
+                app::awake();
+            });
+
+        if let Err(err) = spawn_result {
+            crate::utils::logging::log_error(
+                "sql_editor::intellisense::parse_worker",
+                &format!("failed to spawn parse worker: {err}"),
+            );
+            if Self::is_intellisense_parse_generation_current(
+                intellisense_parse_generation,
+                snapshot.as_ref(),
+            ) && Self::is_intellisense_snapshot_current(editor, buffer, snapshot.as_ref())
+            {
+                Self::clear_intellisense_ui_state(
+                    intellisense_popup,
+                    completion_range,
+                    pending_intellisense,
+                );
+            }
+            return;
+        }
+
+        let editor_for_poll = editor.clone();
+        let buffer_for_poll = buffer.clone();
+        let intellisense_data_for_poll = intellisense_data.clone();
+        let intellisense_popup_for_poll = intellisense_popup.clone();
+        let completion_range_for_poll = completion_range.clone();
+        let column_sender_for_poll = column_sender.clone();
+        let connection_for_poll = connection.clone();
+        let pending_intellisense_for_poll = pending_intellisense.clone();
+        let intellisense_parse_cache_for_poll = intellisense_parse_cache.clone();
+        let intellisense_parse_generation_for_poll = intellisense_parse_generation.clone();
+        app::add_timeout3(0.0, move |_| {
+            Self::poll_async_intellisense_parse(
+                editor_for_poll.clone(),
+                buffer_for_poll.clone(),
+                intellisense_data_for_poll.clone(),
+                intellisense_popup_for_poll.clone(),
+                completion_range_for_poll.clone(),
+                column_sender_for_poll.clone(),
+                connection_for_poll.clone(),
+                pending_intellisense_for_poll.clone(),
+                intellisense_parse_cache_for_poll.clone(),
+                intellisense_parse_generation_for_poll.clone(),
+                snapshot.clone(),
+                parse_receiver.clone(),
+            );
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll_async_intellisense_parse(
+        editor: TextEditor,
+        buffer: TextBuffer,
+        intellisense_data: Arc<Mutex<IntellisenseData>>,
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        completion_range: Arc<Mutex<Option<(usize, usize)>>>,
+        column_sender: mpsc::Sender<ColumnLoadUpdate>,
+        connection: SharedConnection,
+        pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
+        intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+        intellisense_parse_generation: Arc<AtomicU64>,
+        snapshot: Arc<IntellisenseTriggerSnapshot>,
+        parse_receiver: Arc<
+            Mutex<mpsc::Receiver<Result<intellisense_context::CursorContext, String>>>,
+        >,
+    ) {
+        if editor.was_deleted() {
+            return;
+        }
+        if !Self::is_intellisense_parse_generation_current(
+            &intellisense_parse_generation,
+            snapshot.as_ref(),
+        ) {
+            return;
+        }
+
+        let recv_result = {
+            let receiver = parse_receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            receiver.try_recv()
         };
 
-        let deep_ctx: Arc<intellisense_context::CursorContext> =
-            if let Some(context) = cached_context {
-                context
-            } else {
-                let full_token_spans = super::query_text::tokenize_sql_spanned(&statement_text);
-                let mut split_idx = 0usize;
-                let mut full_tokens: Vec<SqlToken> = Vec::with_capacity(full_token_spans.len());
-                for span in full_token_spans {
-                    if span.end <= cursor_in_statement {
-                        split_idx = split_idx.saturating_add(1);
-                    }
-                    full_tokens.push(span.token);
+        match recv_result {
+            Ok(Ok(parsed)) => {
+                if !Self::is_intellisense_parse_generation_current(
+                    &intellisense_parse_generation,
+                    snapshot.as_ref(),
+                ) || !Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                {
+                    return;
                 }
-                let parsed = Arc::new(intellisense_context::analyze_cursor_context(
-                    &full_tokens,
-                    split_idx,
-                ));
+                let parsed = Arc::new(parsed);
                 *intellisense_parse_cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(IntellisenseParseCacheEntry {
-                        statement_text,
-                        cursor_in_statement,
+                        statement_text: snapshot.statement_text.clone(),
+                        cursor_in_statement: snapshot.cursor_in_statement,
                         context: parsed.clone(),
                     });
-                parsed
-            };
 
-        let context = Self::classify_intellisense_context(
-            deep_ctx.as_ref(),
-            deep_ctx.statement_tokens.as_ref(),
-        );
+                Self::apply_intellisense_with_context(
+                    &editor,
+                    &intellisense_data,
+                    &intellisense_popup,
+                    &completion_range,
+                    &column_sender,
+                    &connection,
+                    &pending_intellisense,
+                    snapshot.as_ref(),
+                    parsed.as_ref(),
+                );
+            }
+            Ok(Err(message)) => {
+                crate::utils::logging::log_error(
+                    "sql_editor::intellisense::parse_worker",
+                    &format!("failed to parse intellisense context: {message}"),
+                );
+                if Self::is_intellisense_parse_generation_current(
+                    &intellisense_parse_generation,
+                    snapshot.as_ref(),
+                ) && Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                {
+                    Self::clear_intellisense_ui_state(
+                        &intellisense_popup,
+                        &completion_range,
+                        &pending_intellisense,
+                    );
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                app::add_timeout3(INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS, move |_| {
+                    Self::poll_async_intellisense_parse(
+                        editor.clone(),
+                        buffer.clone(),
+                        intellisense_data.clone(),
+                        intellisense_popup.clone(),
+                        completion_range.clone(),
+                        column_sender.clone(),
+                        connection.clone(),
+                        pending_intellisense.clone(),
+                        intellisense_parse_cache.clone(),
+                        intellisense_parse_generation.clone(),
+                        snapshot.clone(),
+                        parse_receiver.clone(),
+                    );
+                });
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if Self::is_intellisense_parse_generation_current(
+                    &intellisense_parse_generation,
+                    snapshot.as_ref(),
+                ) && Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                {
+                    Self::clear_intellisense_ui_state(
+                        &intellisense_popup,
+                        &completion_range,
+                        &pending_intellisense,
+                    );
+                }
+            }
+        }
+    }
 
-        // Resolve column tables using deep context
-        let column_tables =
-            Self::resolve_column_tables_for_context(qualifier.as_deref(), deep_ctx.as_ref());
+    #[allow(clippy::too_many_arguments)]
+    fn apply_intellisense_with_context(
+        editor: &TextEditor,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        snapshot: &IntellisenseTriggerSnapshot,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) {
+        let qualifier = snapshot.qualifier.as_deref();
+        let context =
+            Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
 
+        let column_tables = Self::resolve_column_tables_for_context(qualifier, deep_ctx);
         let include_columns = qualifier.is_some()
             || matches!(context, SqlContext::ColumnName | SqlContext::ColumnOrAll);
 
         let allow_empty_prefix =
             qualifier.is_some() || include_columns || matches!(context, SqlContext::TableName);
-        if prefix.is_empty() && !allow_empty_prefix {
-            *pending_intellisense
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            *completion_range
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        if snapshot.prefix.is_empty() && !allow_empty_prefix {
+            // Context no longer allows completion for empty prefix, so hide
+            // stale popup state immediately.
+            Self::clear_intellisense_ui_state(
+                intellisense_popup,
+                completion_range,
+                pending_intellisense,
+            );
             return;
         }
 
         let mut virtual_wildcard_dependencies: HashMap<String, Vec<String>> = HashMap::new();
         if include_columns {
-            // Register CTE/subquery alias columns only when column completion is needed.
             let mut virtual_table_columns: HashMap<String, Vec<String>> = HashMap::new();
-
-            // Register CTE columns.
             for cte in &deep_ctx.ctes {
                 let (columns, wildcard_tables) = Self::collect_cte_virtual_columns_for_completion(
-                    deep_ctx.as_ref(),
+                    deep_ctx,
                     cte,
                     intellisense_data,
                     column_sender,
@@ -1695,7 +2263,6 @@ impl SqlEditorWidget {
                 }
             }
 
-            // Register subquery alias columns.
             for subq in &deep_ctx.subqueries {
                 let body_tokens = intellisense_context::token_range_slice(
                     deep_ctx.statement_tokens.as_ref(),
@@ -1745,7 +2312,6 @@ impl SqlEditorWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .replace_virtual_table_columns(virtual_table_columns);
 
-            // Load columns from DB for real tables (skip virtual tables).
             for table in &column_tables {
                 let is_virtual = deep_ctx
                     .ctes
@@ -1790,10 +2356,10 @@ impl SqlEditorWidget {
                 None
             };
             if qualifier.is_some() {
-                data.get_column_suggestions(&prefix, column_scope)
+                data.get_column_suggestions(&snapshot.prefix, column_scope)
             } else {
                 data.get_suggestions(
-                    &prefix,
+                    &snapshot.prefix,
                     include_columns,
                     column_scope,
                     matches!(context, SqlContext::TableName),
@@ -1802,12 +2368,15 @@ impl SqlEditorWidget {
             }
         };
         if include_columns && qualifier.is_none() {
-            let derived_columns = Self::collect_derived_columns_for_context(deep_ctx.as_ref());
-            suggestions =
-                Self::merge_suggestions_with_derived_columns(suggestions, &prefix, derived_columns);
+            let derived_columns = Self::collect_derived_columns_for_context(deep_ctx);
+            suggestions = Self::merge_suggestions_with_derived_columns(
+                suggestions,
+                &snapshot.prefix,
+                derived_columns,
+            );
         }
         let context_alias_suggestions =
-            Self::collect_context_alias_suggestions(&prefix, deep_ctx.as_ref());
+            Self::collect_context_alias_suggestions(&snapshot.prefix, deep_ctx);
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_alias_suggestions,
@@ -1819,8 +2388,9 @@ impl SqlEditorWidget {
         if should_refresh_when_columns_ready {
             *pending_intellisense
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(PendingIntellisense { cursor_pos });
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingIntellisense {
+                cursor_pos: snapshot.cursor_pos,
+            });
         } else {
             *pending_intellisense
                 .lock()
@@ -1841,21 +2411,28 @@ impl SqlEditorWidget {
         let popup_width = Self::INTELLISENSE_POPUP_WIDTH;
         let popup_height = (suggestions.len().min(10) * 20 + 10) as i32;
         let (popup_x, popup_y) =
-            Self::popup_screen_position(editor, cursor_pos, popup_width, popup_height);
-
+            Self::popup_screen_position(editor, snapshot.cursor_pos, popup_width, popup_height);
+        struct PopupShowInProgressReset;
+        impl Drop for PopupShowInProgressReset {
+            fn drop(&mut self) {
+                INTELLISENSE_POPUP_SHOW_IN_PROGRESS.store(false, Ordering::Relaxed);
+            }
+        }
+        INTELLISENSE_POPUP_SHOW_IN_PROGRESS.store(true, Ordering::Relaxed);
+        let _popup_show_reset = PopupShowInProgressReset;
         intellisense_popup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .show_suggestions(suggestions, popup_x, popup_y);
-        let completion_start = if prefix.is_empty() {
-            cursor_pos_usize
+        let completion_start = if snapshot.prefix.is_empty() {
+            snapshot.cursor_pos_usize
         } else {
-            start
+            snapshot.word_start
         };
         *completion_range
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((completion_start, cursor_pos_usize));
+            Some((completion_start, snapshot.cursor_pos_usize));
         let mut editor = editor.clone();
         let _ = editor.take_focus();
     }
@@ -1984,8 +2561,7 @@ impl SqlEditorWidget {
             return base;
         }
 
-        let mut seen: HashSet<String> =
-            base.iter().map(|item| item.to_ascii_uppercase()).collect();
+        let mut seen: HashSet<String> = base.iter().map(|item| item.to_ascii_uppercase()).collect();
         let mut filtered_aliases = Vec::new();
         for alias in aliases {
             if seen.insert(alias.to_ascii_uppercase()) {
@@ -2139,8 +2715,7 @@ impl SqlEditorWidget {
         }
 
         let prefix_upper = prefix.to_ascii_uppercase();
-        let mut seen: HashSet<String> =
-            base.iter().map(|item| item.to_ascii_uppercase()).collect();
+        let mut seen: HashSet<String> = base.iter().map(|item| item.to_ascii_uppercase()).collect();
 
         for column in derived_columns {
             let upper = column.to_ascii_uppercase();
@@ -3167,6 +3742,17 @@ impl SqlEditorWidget {
         // Fast path: keep existing suggestions and just filter by the current in-range prefix.
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
         let prefix = Self::prefix_in_completion_range(buffer, start, cursor_pos);
+        let qualifier = Self::qualifier_before_word(buffer, start);
+        if Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key) {
+            intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            *completion_range
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return true;
+        }
         {
             let mut popup = intellisense_popup
                 .lock()
@@ -3253,6 +3839,12 @@ impl SqlEditorWidget {
     fn has_min_intellisense_prefix(word: &str) -> bool {
         let mut chars = word.chars();
         chars.next().is_some() && chars.next().is_some()
+    }
+
+    fn should_hide_fast_path_after_delete(prefix: &str, qualifier: Option<&str>, key: Key) -> bool {
+        matches!(key, Key::BackSpace | Key::Delete)
+            && qualifier.is_none()
+            && !Self::has_min_intellisense_prefix(prefix)
     }
 
     fn should_ignore_keyup_after_manual_trigger(
@@ -3488,25 +4080,41 @@ impl SqlEditorWidget {
         Window::delete(dialog);
     }
     pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
+        if INTELLISENSE_POPUP_SHOW_IN_PROGRESS.load(Ordering::Relaxed) {
+            Self::schedule_deferred_outside_click_popup_hide(
+                self.intellisense_popup.clone(),
+                self.keyup_debounce_generation.clone(),
+                self.keyup_debounce_handle.clone(),
+                self.intellisense_parse_generation.clone(),
+                self.completion_range.clone(),
+                self.pending_intellisense.clone(),
+                x,
+                y,
+                INTELLISENSE_DEFERRED_HIDE_RETRIES,
+            );
+            return;
+        }
         let mut popup = self
             .intellisense_popup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !popup.is_visible() {
+        let popup_visible = popup.is_visible();
+        if !popup_visible {
             return;
         }
-        if popup.contains_point(x, y) {
+        let click_inside_popup = popup_visible && popup.contains_point(x, y);
+        if Self::should_ignore_external_hide_click(popup_visible, click_inside_popup) {
             return;
         }
         popup.hide();
-        *self
-            .completion_range
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        *self
-            .pending_intellisense
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        drop(popup);
+        Self::clear_intellisense_state_for_external_hide(
+            &self.keyup_debounce_generation,
+            &self.keyup_debounce_handle,
+            &self.intellisense_parse_generation,
+            &self.completion_range,
+            &self.pending_intellisense,
+        );
     }
 
     #[allow(dead_code)]
@@ -3533,6 +4141,7 @@ impl SqlEditorWidget {
             &self.connection,
             &self.pending_intellisense,
             &self.intellisense_parse_cache,
+            &self.intellisense_parse_generation,
         );
     }
 
@@ -4110,12 +4719,173 @@ FROM d
     }
 
     #[test]
+    fn manual_trigger_invalidates_debounce_and_parse_generation() {
+        let keyup_generation = Arc::new(Mutex::new(17u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(23));
+
+        SqlEditorWidget::invalidate_manual_trigger_debounce_state(
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+        );
+
+        assert_eq!(*lock_or_recover(&keyup_generation), 18);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 24);
+    }
+
+    #[test]
+    fn external_hide_clears_state_and_invalidates_generations() {
+        let keyup_generation = Arc::new(Mutex::new(41u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(9));
+        let completion_range = Arc::new(Mutex::new(Some((3usize, 5usize))));
+        let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 7 })));
+
+        SqlEditorWidget::clear_intellisense_state_for_external_hide(
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+            &completion_range,
+            &pending,
+        );
+
+        assert_eq!(*lock_or_recover(&keyup_generation), 42);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 10);
+        assert!(lock_or_recover(&completion_range).is_none());
+        assert!(lock_or_recover(&pending).is_none());
+    }
+
+    #[test]
+    fn external_hide_ignores_only_inside_click_when_popup_visible() {
+        assert!(SqlEditorWidget::should_ignore_external_hide_click(
+            true, true
+        ));
+        assert!(!SqlEditorWidget::should_ignore_external_hide_click(
+            true, false
+        ));
+        assert!(!SqlEditorWidget::should_ignore_external_hide_click(
+            false, true
+        ));
+        assert!(!SqlEditorWidget::should_ignore_external_hide_click(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn unfocus_hide_rule_hides_only_when_pointer_is_outside_visible_popup() {
+        assert!(SqlEditorWidget::should_hide_popup_on_unfocus(true, false));
+        assert!(!SqlEditorWidget::should_hide_popup_on_unfocus(true, true));
+        assert!(!SqlEditorWidget::should_hide_popup_on_unfocus(false, false));
+        assert!(!SqlEditorWidget::should_hide_popup_on_unfocus(false, true));
+    }
+
+    #[test]
+    fn escape_keydown_cancels_pending_even_when_popup_not_visible() {
+        let completion_range = Arc::new(Mutex::new(Some((10usize, 12usize))));
+        let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 14 })));
+        let keyup_generation = Arc::new(Mutex::new(5u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(20));
+
+        let consumed = SqlEditorWidget::cancel_intellisense_on_escape_keydown(
+            false,
+            &completion_range,
+            &pending,
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+        );
+
+        assert!(!consumed);
+        assert!(lock_or_recover(&completion_range).is_none());
+        assert!(lock_or_recover(&pending).is_none());
+        assert_eq!(*lock_or_recover(&keyup_generation), 6);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 21);
+    }
+
+    #[test]
+    fn navigation_shortcut_clears_pending_even_when_popup_not_visible() {
+        let completion_range = Arc::new(Mutex::new(Some((4usize, 8usize))));
+        let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 11 })));
+        let keyup_generation = Arc::new(Mutex::new(12u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(33));
+
+        SqlEditorWidget::invalidate_and_clear_pending_intellisense_state(
+            &completion_range,
+            &pending,
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+        );
+
+        assert!(lock_or_recover(&completion_range).is_none());
+        assert!(lock_or_recover(&pending).is_none());
+        assert_eq!(*lock_or_recover(&keyup_generation), 13);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 34);
+    }
+
+    #[test]
+    fn escape_keydown_consumes_when_popup_is_visible() {
+        let completion_range = Arc::new(Mutex::new(Some((1usize, 3usize))));
+        let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 3 })));
+        let keyup_generation = Arc::new(Mutex::new(0u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(0));
+
+        let consumed = SqlEditorWidget::cancel_intellisense_on_escape_keydown(
+            true,
+            &completion_range,
+            &pending,
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+        );
+
+        assert!(consumed);
+        assert!(lock_or_recover(&completion_range).is_none());
+        assert!(lock_or_recover(&pending).is_none());
+        assert_eq!(*lock_or_recover(&keyup_generation), 1);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn min_intellisense_prefix_uses_character_count() {
         assert!(!SqlEditorWidget::has_min_intellisense_prefix(""));
         assert!(!SqlEditorWidget::has_min_intellisense_prefix("a"));
         assert!(SqlEditorWidget::has_min_intellisense_prefix("ab"));
         assert!(!SqlEditorWidget::has_min_intellisense_prefix("한"));
         assert!(SqlEditorWidget::has_min_intellisense_prefix("한글"));
+    }
+
+    #[test]
+    fn fast_path_delete_hides_popup_when_prefix_too_short_without_qualifier() {
+        assert!(SqlEditorWidget::should_hide_fast_path_after_delete(
+            "",
+            None,
+            Key::BackSpace
+        ));
+        assert!(SqlEditorWidget::should_hide_fast_path_after_delete(
+            "a",
+            None,
+            Key::Delete
+        ));
+        assert!(!SqlEditorWidget::should_hide_fast_path_after_delete(
+            "ab",
+            None,
+            Key::BackSpace
+        ));
+        assert!(!SqlEditorWidget::should_hide_fast_path_after_delete(
+            "a",
+            Some("t"),
+            Key::BackSpace
+        ));
+        assert!(!SqlEditorWidget::should_hide_fast_path_after_delete(
+            "a",
+            None,
+            Key::from_char('a')
+        ));
     }
 
     #[test]
@@ -4431,8 +5201,7 @@ FROM d
             .collect();
         let aliases = vec!["e".to_string(), "x".to_string()];
 
-        let merged =
-            SqlEditorWidget::merge_suggestions_with_context_aliases(base, aliases, true);
+        let merged = SqlEditorWidget::merge_suggestions_with_context_aliases(base, aliases, true);
 
         assert_eq!(merged.len(), MAX_MERGED_SUGGESTIONS);
         assert_eq!(merged[0], "e");

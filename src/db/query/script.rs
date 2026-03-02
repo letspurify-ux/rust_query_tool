@@ -173,9 +173,7 @@ impl SplitState {
         // Handle TYPE declarations that don't create a block:
         // TYPE ... AS OBJECT/VARRAY/TABLE - these are type definitions, not blocks
         // TYPE ... IS REF CURSOR - this is a REF CURSOR type definition in package spec
-        if self.after_as_is
-            && matches!(upper, "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD")
-        {
+        if self.after_as_is && matches!(upper, "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD") {
             if self.block_depth > 0 {
                 self.block_depth -= 1;
             } else {
@@ -915,9 +913,8 @@ impl QueryExecutor {
             }
 
             if with_cte_depth > 0 {
-                let starts_main_select = leading_word
-                    .is_some_and(&is_with_main_query_keyword)
-                    && with_cte_paren <= 0;
+                let starts_main_select =
+                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
                 if starts_main_select {
                     depth = depth.saturating_sub(1);
                 } else {

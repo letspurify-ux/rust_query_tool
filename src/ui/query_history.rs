@@ -1330,8 +1330,11 @@ fn contains_lower(haystack: &str, needle_lower: &str) -> bool {
         if n.len() > h.len() {
             return false;
         }
-        h.windows(n.len())
-            .any(|w| w.iter().zip(n.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b))
+        h.windows(n.len()).any(|w| {
+            w.iter()
+                .zip(n.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
     } else {
         fold_for_case_insensitive(haystack).contains(needle_lower)
     }

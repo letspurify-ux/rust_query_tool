@@ -216,26 +216,25 @@ fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
         let mut log = AppLog::load();
         let save_debounce = log_writer_save_debounce();
         let mut save_pending = false;
-        let apply_command =
-            |log: &mut AppLog,
-             command: LogCommand,
-             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>|
-             -> bool {
-                match command {
-                    LogCommand::Write(entry) => {
-                        log.add_entry(entry);
-                        true
-                    }
-                    LogCommand::Clear => {
-                        log.entries.clear();
-                        true
-                    }
-                    LogCommand::Flush(reply) => {
-                        flush_replies.push(reply);
-                        false
-                    }
+        let apply_command = |log: &mut AppLog,
+                             command: LogCommand,
+                             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>|
+         -> bool {
+            match command {
+                LogCommand::Write(entry) => {
+                    log.add_entry(entry);
+                    true
                 }
-            };
+                LogCommand::Clear => {
+                    log.entries.clear();
+                    true
+                }
+                LogCommand::Flush(reply) => {
+                    flush_replies.push(reply);
+                    false
+                }
+            }
+        };
         loop {
             let cmd = match receiver.recv() {
                 Ok(cmd) => cmd,

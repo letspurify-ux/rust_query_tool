@@ -2098,10 +2098,9 @@ impl ResultTableWidget {
         *active_inline_edit
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        if !input.was_deleted()
-            && app::is_ui_thread() {
-                Input::delete(input);
-            }
+        if !input.was_deleted() && app::is_ui_thread() {
+            Input::delete(input);
+        }
         let mut table = table.clone();
         if !table.was_deleted() {
             let _ = table.take_focus();
@@ -5228,11 +5227,7 @@ impl ResultTableWidget {
         };
 
         let rows = row_bot - row_top + 1;
-        let visible_cols = Self::visible_column_indices_in_range(
-            col_left,
-            col_right,
-            hidden_col,
-        );
+        let visible_cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col);
         if visible_cols.is_empty() {
             return 0;
         }
@@ -5281,11 +5276,7 @@ impl ResultTableWidget {
         };
 
         let rows = row_bot - row_top + 1;
-        let visible_cols = Self::visible_column_indices_in_range(
-            col_left,
-            col_right,
-            hidden_col,
-        );
+        let visible_cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col);
         if visible_cols.is_empty() {
             return 0;
         }
@@ -5518,8 +5509,8 @@ impl ResultTableWidget {
         } else {
             String::new()
         };
-        let should_render_message_only =
-            !result.is_select || (!result.success && result.rows.is_empty() && result.columns.is_empty());
+        let should_render_message_only = !result.is_select
+            || (!result.success && result.rows.is_empty() && result.columns.is_empty());
 
         if should_render_message_only {
             self.clear_pending_stream_buffers();
@@ -5531,12 +5522,9 @@ impl ResultTableWidget {
             self.table.set_rows(1);
             self.table.set_cols(1);
             self.apply_table_metrics_for_current_font();
-            let message_width = Self::estimate_display_width(
-                &result.message,
-                font_size,
-                max_cell_display_chars,
-            )
-            .clamp(200, 1200);
+            let message_width =
+                Self::estimate_display_width(&result.message, font_size, max_cell_display_chars)
+                    .clamp(200, 1200);
             self.table.set_col_width(0, message_width);
             *self
                 .headers
@@ -6018,11 +6006,12 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn get_selected_data(&self) -> Option<String> {
-        let (row_top, col_left, row_bot, col_right) = Self::normalized_selection_bounds_with_limits(
-            self.table.get_selection(),
-            self.table.rows().max(0) as usize,
-            self.table.cols().max(0) as usize,
-        )?;
+        let (row_top, col_left, row_bot, col_right) =
+            Self::normalized_selection_bounds_with_limits(
+                self.table.get_selection(),
+                self.table.rows().max(0) as usize,
+                self.table.cols().max(0) as usize,
+            )?;
 
         let full_data = self
             .full_data
@@ -6030,11 +6019,7 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let rows = row_bot - row_top + 1;
         let hidden_col = self.hidden_auto_rowid_col_value();
-        let visible_cols = Self::visible_column_indices_in_range(
-            col_left,
-            col_right,
-            hidden_col,
-        );
+        let visible_cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col);
         if visible_cols.is_empty() {
             return None;
         }

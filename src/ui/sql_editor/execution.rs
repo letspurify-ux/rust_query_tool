@@ -1096,8 +1096,8 @@ impl SqlEditorWidget {
                     let mut newline_after_keyword = false;
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = upper == "WHEN" && pending_exit_condition;
-                    let is_trigger_event_keyword =
-                        trigger_header_active && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
+                    let is_trigger_event_keyword = trigger_header_active
+                        && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
                     let is_trigger_or_on_keyword =
                         trigger_header_active && matches!(upper.as_str(), "OR" | "ON");
                     let suppress_order_clause_break =
@@ -3043,10 +3043,11 @@ impl SqlEditorWidget {
             // Regression guard: scripts that contain CONNECT/@START must pass this gate
             // even when disconnected, so CONNECT can establish a session for later SQL.
             if requires_connected_session
-                && (!conn_guard.is_connected() || conn_guard.get_connection().is_none()) {
-                    SqlEditorWidget::show_alert_dialog("Not connected to database");
-                    return;
-                }
+                && (!conn_guard.is_connected() || conn_guard.get_connection().is_none())
+            {
+                SqlEditorWidget::show_alert_dialog("Not connected to database");
+                return;
+            }
         } // Release lock early for the pre-check
 
         let shared_connection = self.connection.clone();
@@ -3557,14 +3558,14 @@ impl SqlEditorWidget {
                                                     Some(default_size),
                                                 )
                                                 .is_ok()
-                                                {
-                                                    applied_size = default_size;
-                                                    message = format!(
+                                            {
+                                                applied_size = default_size;
+                                                message = format!(
                                                         "SERVEROUTPUT enabled with size {} (requested {} not supported)",
                                                         applied_size, desired_size
                                                     );
-                                                    enable_result = Ok(());
-                                                }
+                                                enable_result = Ok(());
+                                            }
 
                                             match enable_result {
                                                 Ok(()) => {

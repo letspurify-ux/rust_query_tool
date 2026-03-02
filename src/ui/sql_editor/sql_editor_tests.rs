@@ -39,6 +39,22 @@ fn update_alert_pump_state_after_display_reschedules_when_queue_not_empty() {
 }
 
 #[test]
+fn should_clear_pending_after_poll_refresh_requires_no_column_loading() {
+    assert!(SqlEditorWidget::should_clear_pending_after_poll_refresh(
+        true, false
+    ));
+    assert!(!SqlEditorWidget::should_clear_pending_after_poll_refresh(
+        true, true
+    ));
+    assert!(!SqlEditorWidget::should_clear_pending_after_poll_refresh(
+        false, false
+    ));
+    assert!(!SqlEditorWidget::should_clear_pending_after_poll_refresh(
+        false, true
+    ));
+}
+
+#[test]
 fn is_window_shown_and_visible_requires_both_flags() {
     assert!(is_window_shown_and_visible(true, true));
     assert!(!is_window_shown_and_visible(true, false));

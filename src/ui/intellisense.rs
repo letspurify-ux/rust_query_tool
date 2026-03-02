@@ -1130,9 +1130,7 @@ impl IntellisenseData {
         if !self.relations_upper.is_empty() {
             return self.relations_upper.contains(&upper);
         }
-        self.tables
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&upper))
+        self.tables.iter().any(|t| t.eq_ignore_ascii_case(&upper))
             || self.views.iter().any(|v| v.eq_ignore_ascii_case(&upper))
     }
 

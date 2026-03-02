@@ -778,6 +778,7 @@ pub struct SqlEditorWidget {
     completion_range: Arc<Mutex<Option<(usize, usize)>>>,
     pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
     intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+    intellisense_parse_generation: Arc<AtomicU64>,
     history_cursor: Arc<Mutex<Option<usize>>>,
     history_original: Arc<Mutex<Option<String>>>,
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
@@ -1230,6 +1231,7 @@ impl SqlEditorWidget {
         let completion_range = Arc::new(Mutex::new(None::<(usize, usize)>));
         let pending_intellisense = Arc::new(Mutex::new(None::<PendingIntellisense>));
         let intellisense_parse_cache = Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
+        let intellisense_parse_generation = Arc::new(AtomicU64::new(0));
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
@@ -1266,6 +1268,7 @@ impl SqlEditorWidget {
             completion_range,
             pending_intellisense,
             intellisense_parse_cache,
+            intellisense_parse_generation,
             history_cursor,
             history_original,
             history_navigation_entries,
@@ -1540,6 +1543,13 @@ impl SqlEditorWidget {
         store_mutex_bool(cancel_flag, false);
     }
 
+    fn should_clear_pending_after_poll_refresh(
+        should_clear_pending: bool,
+        has_columns_loading: bool,
+    ) -> bool {
+        should_clear_pending && !has_columns_loading
+    }
+
     fn setup_column_loader(&self, column_receiver: mpsc::Receiver<ColumnLoadUpdate>) {
         let intellisense_data = self.intellisense_data.clone();
         let editor = self.editor.clone();
@@ -1553,6 +1563,7 @@ impl SqlEditorWidget {
         let connection = self.connection.clone();
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
+        let intellisense_parse_generation = self.intellisense_parse_generation.clone();
 
         // Wrap receiver in Arc<Mutex> to share across timeout callbacks
         let receiver: Arc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
@@ -1576,6 +1587,7 @@ impl SqlEditorWidget {
             connection: SharedConnection,
             pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
             intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
+            intellisense_parse_generation: Arc<AtomicU64>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -1674,6 +1686,7 @@ impl SqlEditorWidget {
                             &connection,
                             &pending_intellisense,
                             &intellisense_parse_cache,
+                            &intellisense_parse_generation,
                         );
                     } else {
                         // Cursor moved since async load was requested.
@@ -1688,9 +1701,20 @@ impl SqlEditorWidget {
             // Clear pending AFTER the refresh above so the retry is not
             // skipped when all outstanding loads finish in the same poll.
             if should_clear_pending {
-                *pending_intellisense
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                let has_columns_loading = {
+                    let data = intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    !data.columns_loading.is_empty()
+                };
+                if SqlEditorWidget::should_clear_pending_after_poll_refresh(
+                    should_clear_pending,
+                    has_columns_loading,
+                ) {
+                    *pending_intellisense
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                }
             }
 
             let stale_cleared = {
@@ -1748,6 +1772,7 @@ impl SqlEditorWidget {
                     connection.clone(),
                     pending_intellisense.clone(),
                     intellisense_parse_cache.clone(),
+                    intellisense_parse_generation.clone(),
                 );
             });
         }
@@ -1767,6 +1792,7 @@ impl SqlEditorWidget {
             connection,
             pending_intellisense,
             intellisense_parse_cache,
+            intellisense_parse_generation,
         );
     }
 
@@ -1948,7 +1974,9 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let widget = self.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
+        let intellisense_parse_generation = self.intellisense_parse_generation.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
+            intellisense_parse_generation.fetch_add(1, Ordering::Relaxed);
             intellisense_parse_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2075,9 +2103,10 @@ impl SqlEditorWidget {
             };
 
             if should_refresh
-                && SqlEditorWidget::should_use_windowed_highlighting(text_len.max(0) as usize) {
-                    widget.refresh_highlighting();
-                }
+                && SqlEditorWidget::should_use_windowed_highlighting(text_len.max(0) as usize)
+            {
+                widget.refresh_highlighting();
+            }
 
             app::add_timeout3(VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS, move |_| {
                 schedule_poll(
@@ -2604,6 +2633,8 @@ impl SqlEditorWidget {
             &self.keyup_debounce_generation,
             &self.keyup_debounce_handle,
         );
+        self.intellisense_parse_generation
+            .fetch_add(1, Ordering::Relaxed);
 
         self.intellisense_popup
             .lock()

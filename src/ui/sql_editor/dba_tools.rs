@@ -782,9 +782,9 @@ impl SqlEditorWidget {
         let auto_refresh_enabled_for_thread = Arc::clone(&auto_refresh_enabled);
         let sender_tick = sender.clone();
         let auto_thread = thread::spawn(move || {
-            let polls_per_refresh =
-                SQL_MONITOR_AUTO_REFRESH_INTERVAL_MS.div_ceil(SQL_MONITOR_AUTO_REFRESH_POLL_MS)
-                    .max(1);
+            let polls_per_refresh = SQL_MONITOR_AUTO_REFRESH_INTERVAL_MS
+                .div_ceil(SQL_MONITOR_AUTO_REFRESH_POLL_MS)
+                .max(1);
             let mut poll_count = 0u64;
             while !load_mutex_bool(&stop_auto_signal_for_thread) {
                 thread::sleep(Duration::from_millis(SQL_MONITOR_AUTO_REFRESH_POLL_MS));

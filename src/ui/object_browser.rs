@@ -203,11 +203,7 @@ impl ObjectBrowserWidget {
             std::sync::mpsc::channel::<RefreshRequest>();
         let (action_sender, action_receiver) = std::sync::mpsc::channel::<ObjectActionResult>();
 
-        Self::spawn_refresh_worker(
-            refresh_request_receiver,
-            refresh_sender,
-            connection.clone(),
-        );
+        Self::spawn_refresh_worker(refresh_request_receiver, refresh_sender, connection.clone());
 
         let mut widget = Self {
             flex,
@@ -813,98 +809,95 @@ impl ObjectBrowserWidget {
                     }
 
                     if mouse_button == fltk::app::MouseButton::Left as i32
-                        && fltk::app::event_clicks() {
-                            let clicked_item = t
-                                .find_clicked(false)
-                                .or_else(|| t.find_clicked(true))
-                                .or_else(|| Self::item_at_mouse(t));
+                        && fltk::app::event_clicks()
+                    {
+                        let clicked_item = t
+                            .find_clicked(false)
+                            .or_else(|| t.find_clicked(true))
+                            .or_else(|| Self::item_at_mouse(t));
 
-                            if let (Some(item), Some(selected_item)) =
-                                (clicked_item, t.first_selected_item())
+                        if let (Some(item), Some(selected_item)) =
+                            (clicked_item, t.first_selected_item())
+                        {
+                            if item != selected_item {
+                                return false;
+                            }
+
+                            // Double-click on a package node: load sub-items
+                            if let Some(ObjectItem::Simple {
+                                object_type,
+                                object_name,
+                            }) = Self::get_item_info(&item)
                             {
-                                if item != selected_item {
-                                    return false;
-                                }
-
-                                // Double-click on a package node: load sub-items
-                                if let Some(ObjectItem::Simple {
-                                    object_type,
-                                    object_name,
-                                }) = Self::get_item_info(&item)
-                                {
-                                    if object_type == "PACKAGES" {
-                                        let package_name = object_name;
-                                        let should_fetch = {
-                                            let cache = object_cache
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                            !cache.package_routines.contains_key(&package_name)
-                                        };
-                                        if should_fetch {
-                                            let connection = connection.clone();
-                                            let sender = action_sender.clone();
-                                            Self::emit_status_callback(
-                                                &status_callback,
-                                                &format!(
-                                                    "Loading package members for {}",
-                                                    package_name
-                                                ),
-                                            );
-                                            thread::spawn(move || {
-                                                // Try to acquire connection lock without blocking
-                                                let Some(mut conn_guard) =
-                                                    try_lock_connection_with_activity(
-                                                        &connection,
-                                                        format!(
-                                                            "Loading package members for {}",
-                                                            package_name
-                                                        ),
-                                                    )
-                                                else {
-                                                    // Query is already running, notify user
-                                                    let _ = sender.send(
-                                                        ObjectActionResult::QueryAlreadyRunning,
-                                                    );
-                                                    app::awake();
-                                                    return;
-                                                };
-
-                                                let result =
-                                                    match conn_guard.require_live_connection() {
-                                                        Ok(db_conn) => {
-                                                            ObjectBrowser::get_package_routines(
-                                                                db_conn.as_ref(),
-                                                                &package_name,
-                                                            )
-                                                            .map_err(|err| err.to_string())
-                                                        }
-                                                        Err(message) => Err(message),
-                                                    };
-
-                                                let _ = sender.send(
-                                                    ObjectActionResult::PackageRoutines {
-                                                        package_name,
-                                                        result,
-                                                    },
-                                                );
+                                if object_type == "PACKAGES" {
+                                    let package_name = object_name;
+                                    let should_fetch = {
+                                        let cache = object_cache
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        !cache.package_routines.contains_key(&package_name)
+                                    };
+                                    if should_fetch {
+                                        let connection = connection.clone();
+                                        let sender = action_sender.clone();
+                                        Self::emit_status_callback(
+                                            &status_callback,
+                                            &format!(
+                                                "Loading package members for {}",
+                                                package_name
+                                            ),
+                                        );
+                                        thread::spawn(move || {
+                                            // Try to acquire connection lock without blocking
+                                            let Some(mut conn_guard) =
+                                                try_lock_connection_with_activity(
+                                                    &connection,
+                                                    format!(
+                                                        "Loading package members for {}",
+                                                        package_name
+                                                    ),
+                                                )
+                                            else {
+                                                // Query is already running, notify user
+                                                let _ = sender
+                                                    .send(ObjectActionResult::QueryAlreadyRunning);
                                                 app::awake();
-                                                // conn_guard drops here, releasing the lock
-                                            });
-                                        }
-                                        return true;
-                                    }
-                                }
+                                                return;
+                                            };
 
-                                // Double-click on other items: insert text into SQL editor
-                                if let Some(insert_text) = Self::get_insert_text(&item) {
-                                    ObjectBrowserWidget::emit_sql_callback(
-                                        &sql_callback,
-                                        SqlAction::Insert(insert_text),
-                                    );
+                                            let result = match conn_guard.require_live_connection()
+                                            {
+                                                Ok(db_conn) => ObjectBrowser::get_package_routines(
+                                                    db_conn.as_ref(),
+                                                    &package_name,
+                                                )
+                                                .map_err(|err| err.to_string()),
+                                                Err(message) => Err(message),
+                                            };
+
+                                            let _ =
+                                                sender.send(ObjectActionResult::PackageRoutines {
+                                                    package_name,
+                                                    result,
+                                                });
+                                            app::awake();
+                                            // conn_guard drops here, releasing the lock
+                                        });
+                                    }
                                     return true;
                                 }
                             }
+
+                            // Double-click on other items: insert text into SQL editor
+                            if let Some(insert_text) = Self::get_insert_text(&item) {
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::Insert(insert_text),
+                                );
+                                return true;
+                            }
                         }
+                    }
 
                     false
                 }

@@ -45,7 +45,9 @@ pub fn center_on_main(window: &mut Window) {
         } else {
             None
         }
-    } else { app::first_window().map(|main| (main.x(), main.y(), main.width(), main.height())) };
+    } else {
+        app::first_window().map(|main| (main.x(), main.y(), main.width(), main.height()))
+    };
 
     let (x, y) = if let Some((mx, my, mw, mh)) = target {
         (

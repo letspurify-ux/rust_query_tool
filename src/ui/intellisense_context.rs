@@ -1765,9 +1765,10 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
         if subq.depth != 0 || subq.body_range.end > clause_idx {
             continue;
         }
-        if selected_subquery.as_ref().is_none_or(|existing| {
-            subq.body_range.end > existing.body_range.end
-        }) {
+        if selected_subquery
+            .as_ref()
+            .is_none_or(|existing| subq.body_range.end > existing.body_range.end)
+        {
             selected_subquery = Some(subq);
         }
     }

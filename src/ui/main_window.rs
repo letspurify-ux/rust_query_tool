@@ -16,6 +16,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -84,6 +85,7 @@ struct QueryEditorTab {
     pristine_text: String,
     current_text_len: usize,
     is_dirty: bool,
+    schema_generation: u64,
 }
 
 pub struct AppState {
@@ -132,6 +134,7 @@ pub struct AppState {
     schema_sender: Option<std::sync::mpsc::Sender<SchemaUpdate>>,
     file_sender: Option<std::sync::mpsc::Sender<FileActionResult>>,
     schema_refresh_in_progress: Arc<Mutex<bool>>,
+    schema_apply_generation: Arc<AtomicU64>,
 }
 
 fn set_result_action_button_visibility(toolbar: &mut Flex, button: &mut Button, visible: bool) {
@@ -182,6 +185,49 @@ impl AppState {
         self.editor_tabs.iter().position(|tab| tab.tab_id == tab_id)
     }
 
+    fn current_schema_generation(&self) -> u64 {
+        self.schema_apply_generation.load(Ordering::Relaxed)
+    }
+
+    fn apply_schema_to_tab_if_needed(&mut self, tab_index: usize) {
+        let target_generation = self.current_schema_generation();
+        let needs_schema_apply = self
+            .editor_tabs
+            .get(tab_index)
+            .map(|tab| tab.schema_generation != target_generation)
+            .unwrap_or(false);
+        if !needs_schema_apply {
+            return;
+        }
+
+        let schema_data = self.schema_intellisense_data.clone();
+        let highlight_data = self.schema_highlight_data.clone();
+        let Some(tab) = self.editor_tabs.get_mut(tab_index) else {
+            return;
+        };
+
+        *tab.sql_editor
+            .get_intellisense_data()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = schema_data;
+        tab.sql_editor
+            .get_highlighter()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_highlight_data(highlight_data);
+        tab.schema_generation = target_generation;
+
+        if !tab.sql_editor.get_editor().was_deleted() {
+            tab.sql_editor.refresh_highlighting();
+        }
+    }
+
+    fn apply_schema_to_active_tab_if_needed(&mut self) {
+        if let Some(index) = self.find_tab_index(self.active_editor_tab_id) {
+            self.apply_schema_to_tab_if_needed(index);
+        }
+    }
+
     fn set_active_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
         let Some(index) = self.find_tab_index(tab_id) else {
             return false;
@@ -194,6 +240,7 @@ impl AppState {
             .current_file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = tab.current_file;
+        self.apply_schema_to_tab_if_needed(index);
         self.refresh_window_title();
         true
     }
@@ -630,9 +677,8 @@ impl MainWindow {
         }
         let reset_data = IntellisenseData::new();
         let reset_highlight = HighlightData::new();
-        let editors_to_refresh =
-            Self::apply_schema_to_all_editors(state, &reset_data, &reset_highlight);
-        Self::schedule_schema_highlight_refresh(editors_to_refresh);
+        Self::update_schema_snapshot(state, reset_data, reset_highlight);
+        state.apply_schema_to_active_tab_if_needed();
 
         // Clear object browser cache and tree so stale metadata from the previous
         // connection is not visible when connecting to a different database.
@@ -1281,6 +1327,7 @@ impl MainWindow {
             pristine_text: String::new(),
             current_text_len: 0,
             is_dirty: false,
+            schema_generation: 0,
         }];
 
         right_flex.resizable(&right_tile);
@@ -1345,6 +1392,7 @@ impl MainWindow {
             schema_sender: None,
             file_sender: None,
             schema_refresh_in_progress: Arc::new(Mutex::new(false)),
+            schema_apply_generation: Arc::new(AtomicU64::new(0)),
         }));
 
         {
@@ -2040,6 +2088,7 @@ impl MainWindow {
             pristine_text: String::new(),
             current_text_len: 0,
             is_dirty: false,
+            schema_generation: state.current_schema_generation(),
         });
         state.query_tabs.select(tab_id);
         let _ = state.set_active_editor_tab(tab_id);
@@ -2161,13 +2210,13 @@ impl MainWindow {
         true
     }
 
-    fn apply_schema_to_all_editors(
+    fn update_schema_snapshot(
         state: &mut AppState,
-        data: &IntellisenseData,
-        highlight_data: &HighlightData,
-    ) -> Vec<SqlEditorWidget> {
+        data: IntellisenseData,
+        highlight_data: HighlightData,
+    ) {
         let mut combined_highlight = highlight_data.clone();
-        let columns_from_intellisense = Self::collect_highlight_columns(data);
+        let columns_from_intellisense = Self::collect_highlight_columns(&data);
         if !columns_from_intellisense.is_empty() {
             let mut seen: HashSet<String> = combined_highlight
                 .columns
@@ -2182,53 +2231,12 @@ impl MainWindow {
             }
         }
 
-        state.schema_intellisense_data = data.clone();
-        state.schema_highlight_data = combined_highlight.clone();
-
-        let mut editors_to_refresh = Vec::with_capacity(state.editor_tabs.len());
-        for tab in &mut state.editor_tabs {
-            *tab.sql_editor
-                .get_intellisense_data()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = data.clone();
-            tab.sql_editor
-                .get_highlighter()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .set_highlight_data(combined_highlight.clone());
-            editors_to_refresh.push(tab.sql_editor.clone());
-        }
-
-        editors_to_refresh
-    }
-
-    fn schedule_schema_highlight_refresh(editors: Vec<SqlEditorWidget>) {
-        if editors.is_empty() {
-            return;
-        }
-        let shared_editors = Arc::new(editors);
-        app::add_timeout3(0.0, move |_| {
-            MainWindow::refresh_editor_highlight_batch(shared_editors.clone(), 0);
-        });
-    }
-
-    fn refresh_editor_highlight_batch(editors: Arc<Vec<SqlEditorWidget>>, index: usize) {
-        let Some(editor) = editors.get(index).cloned() else {
-            return;
-        };
-
-        if !editor.get_editor().was_deleted() {
-            editor.refresh_highlighting();
-        }
-
-        let next_index = index.saturating_add(1);
-        if next_index >= editors.len() {
-            return;
-        }
-
-        app::add_timeout3(0.0, move |_| {
-            MainWindow::refresh_editor_highlight_batch(editors.clone(), next_index);
-        });
+        state.schema_intellisense_data = data;
+        state.schema_highlight_data = combined_highlight;
+        let _ = state
+            .schema_apply_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
     }
 
     fn collect_highlight_columns(data: &IntellisenseData) -> Vec<String> {
@@ -2666,7 +2674,9 @@ impl MainWindow {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                 return;
             };
-            if let Ok(mut s) = state_for_dirty.try_lock() { s.on_tab_buffer_modified(tab_id, ins, del, buf) };
+            if let Ok(mut s) = state_for_dirty.try_lock() {
+                s.on_tab_buffer_modified(tab_id, ins, del, buf)
+            };
         });
     }
 
@@ -3087,11 +3097,10 @@ impl MainWindow {
                 true
             }
             "Tools/Refresh Objects" => {
-                state
+                let mut s = state
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .object_browser
-                    .refresh();
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                MainWindow::start_connection_metadata_refresh(&mut s, schema_sender);
                 true
             }
             "Tools/Session Lock Monitor..." => {
@@ -3665,19 +3674,10 @@ impl MainWindow {
 
         // Setup object browser callback
         let weak_state_for_browser_status = Arc::downgrade(&state);
-        let schema_sender_for_browser_status = schema_sender.clone();
-        let schema_refresh_guard_for_browser_status = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .schema_refresh_in_progress
-            .clone();
         object_browser.set_status_callback(move |message| {
             let Some(state_for_status) = weak_state_for_browser_status.upgrade() else {
                 return;
             };
-
-            let mut should_retry_schema_sync = false;
-            let mut connection_for_retry: Option<SharedConnection> = None;
 
             if let Ok(mut s) = state_for_status.try_lock() {
                 let conn_info = s
@@ -3686,34 +3686,7 @@ impl MainWindow {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 s.status_bar.set_label(&format_status(message, &conn_info));
-
-                if message == "Object browser metadata refresh completed" && conn_info.is_some()
-                {
-                    should_retry_schema_sync = true;
-                    connection_for_retry = Some(s.connection.clone());
-                }
             };
-
-            if should_retry_schema_sync {
-                if let Some(connection) = connection_for_retry {
-                    if !try_set_mutex_flag(&schema_refresh_guard_for_browser_status) {
-                        return;
-                    }
-
-                    let schema_sender = schema_sender_for_browser_status.clone();
-                    let schema_refresh_guard = schema_refresh_guard_for_browser_status.clone();
-                    thread::spawn(move || {
-                        if let Some(update) =
-                            MainWindow::load_schema_update_for_current_connection(&connection)
-                        {
-                            let _ = schema_sender.send(update);
-                            app::awake();
-                        }
-
-                        clear_mutex_flag(&schema_refresh_guard);
-                    });
-                }
-            }
         });
 
         let weak_state_for_browser = Arc::downgrade(&state);
@@ -3917,26 +3890,20 @@ impl MainWindow {
                         }
                     }
 
-                    let mut editors_to_refresh: Option<Vec<SqlEditorWidget>> = None;
                     if let Some(update) = latest_update {
                         match state.try_lock() {
                             Ok(mut s) => {
-                                let mut data = update.data;
-                                data.rebuild_indices();
-                                editors_to_refresh = Some(MainWindow::apply_schema_to_all_editors(
+                                MainWindow::update_schema_snapshot(
                                     &mut s,
-                                    &data,
-                                    &update.highlight_data,
-                                ));
+                                    update.data,
+                                    update.highlight_data,
+                                );
+                                s.apply_schema_to_active_tab_if_needed();
                             }
                             Err(_) => {
                                 deferred_by_borrow_conflict = true;
                             }
                         }
-                    }
-
-                    if let Some(editors) = editors_to_refresh {
-                        MainWindow::schedule_schema_highlight_refresh(editors);
                     }
                 }
             }
@@ -4200,10 +4167,7 @@ impl MainWindow {
                 let Some(state_for_menu) = weak_state_for_menu.upgrade() else {
                     return;
                 };
-                let menu_path = m
-                    .item_pathname(None)
-                    .ok()
-                    .or_else(|| m.choice());
+                let menu_path = m.item_pathname(None).ok().or_else(|| m.choice());
                 if let Some(path) = menu_path {
                     let choice = MainWindow::strip_menu_label_shortcut(&path);
                     if MainWindow::execute_menu_action(
