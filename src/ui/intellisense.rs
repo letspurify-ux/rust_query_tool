@@ -827,7 +827,7 @@ impl IntellisenseData {
     ) -> Vec<String> {
         self.ensure_base_indices();
 
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = prefix.to_ascii_uppercase();
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
         let relation_only = prefer_relations && prefix_upper.is_empty();
@@ -913,7 +913,7 @@ impl IntellisenseData {
                     continue;
                 }
                 let rendered = format!("{func}{FUNCTION_SUFFIX}");
-                if seen.insert(rendered.to_uppercase()) {
+                if seen.insert(rendered.to_ascii_uppercase()) {
                     suggestions.push(rendered);
                 }
                 if suggestions.len() >= MAX_SUGGESTIONS {
@@ -1005,7 +1005,7 @@ impl IntellisenseData {
     ) -> Vec<String> {
         self.ensure_base_indices();
 
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = prefix.to_ascii_uppercase();
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1036,7 +1036,7 @@ impl IntellisenseData {
     }
 
     fn column_entries_for_scope_table(&self, table: &str) -> Option<&[NameEntry]> {
-        let key = table.to_uppercase();
+        let key = table.to_ascii_uppercase();
         if let Some(entries) = self.column_entries_for_exact_key(&key) {
             return Some(entries);
         }
@@ -1057,7 +1057,7 @@ impl IntellisenseData {
 
     #[allow(dead_code)]
     pub fn get_columns_for_table(&self, table_name: &str) -> Vec<String> {
-        let key = table_name.to_uppercase();
+        let key = table_name.to_ascii_uppercase();
         if let Some(columns) = self.virtual_column_entries_by_table.get(&key) {
             return columns.iter().map(|entry| entry.name.clone()).collect();
         }
@@ -1104,7 +1104,7 @@ impl IntellisenseData {
     }
 
     pub fn set_columns_for_table(&mut self, table_name: &str, columns: Vec<String>) {
-        let key = table_name.to_uppercase();
+        let key = table_name.to_ascii_uppercase();
         self.columns_loading.remove(&key);
         self.column_loading_started_at.remove(&key);
         let entries = Self::build_entries(&columns);
@@ -1114,7 +1114,7 @@ impl IntellisenseData {
     }
 
     pub fn mark_columns_loading(&mut self, table_name: &str) -> bool {
-        let key = table_name.to_uppercase();
+        let key = table_name.to_ascii_uppercase();
         if self.columns.contains_key(&key) || self.columns_loading.contains(&key) {
             return false;
         }
@@ -1124,7 +1124,7 @@ impl IntellisenseData {
     }
 
     pub fn clear_columns_loading(&mut self, table_name: &str) {
-        let key = table_name.to_uppercase();
+        let key = table_name.to_ascii_uppercase();
         self.columns_loading.remove(&key);
         self.column_loading_started_at.remove(&key);
     }
@@ -1151,12 +1151,12 @@ impl IntellisenseData {
     }
 
     pub fn is_known_relation(&self, name: &str) -> bool {
-        let upper = name.to_uppercase();
+        let upper = name.to_ascii_uppercase();
         if !self.relations_upper.is_empty() {
             return self.relations_upper.contains(&upper);
         }
-        self.tables.iter().any(|t| t.to_uppercase() == upper)
-            || self.views.iter().any(|v| v.to_uppercase() == upper)
+        self.tables.iter().any(|t| t.eq_ignore_ascii_case(name))
+            || self.views.iter().any(|v| v.eq_ignore_ascii_case(name))
     }
 
     pub fn rebuild_indices(&mut self) {
@@ -1168,7 +1168,7 @@ impl IntellisenseData {
             .tables
             .iter()
             .chain(self.views.iter())
-            .map(|name| name.to_uppercase())
+            .map(|name| name.to_ascii_uppercase())
             .collect();
         self.column_entries_by_table.clear();
         self.columns_loading.clear();
@@ -1197,7 +1197,7 @@ impl IntellisenseData {
     /// These are text-derived columns, not loaded from the database.
     #[allow(dead_code)]
     pub fn set_virtual_table_columns(&mut self, name: &str, columns: Vec<String>) {
-        let key = name.to_uppercase();
+        let key = name.to_ascii_uppercase();
         self.virtual_column_entries_by_table
             .insert(key.clone(), Self::build_entries(&columns));
         self.virtual_table_keys.insert(key);
@@ -1210,7 +1210,7 @@ impl IntellisenseData {
         let mut changed = false;
         let next_keys: HashSet<String> = virtual_columns
             .keys()
-            .map(|name| name.to_uppercase())
+            .map(|name| name.to_ascii_uppercase())
             .collect();
 
         let stale_keys: Vec<String> = self
@@ -1227,7 +1227,7 @@ impl IntellisenseData {
         }
 
         for (name, columns) in virtual_columns {
-            let key = name.to_uppercase();
+            let key = name.to_ascii_uppercase();
             let entries = Self::build_entries(&columns);
             let is_same = self
                 .virtual_column_entries_by_table
