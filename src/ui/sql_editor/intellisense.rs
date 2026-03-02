@@ -1892,7 +1892,7 @@ impl SqlEditorWidget {
 
     fn dedup_column_names_case_insensitive(columns: &mut Vec<String>) {
         let mut seen = HashSet::new();
-        columns.retain(|column| seen.insert(column.to_uppercase()));
+        columns.retain(|column| seen.insert(column.to_ascii_uppercase()));
     }
 
     fn has_column_loading_for_scope(
@@ -1906,10 +1906,21 @@ impl SqlEditorWidget {
         }
 
         fn table_is_loading(data: &IntellisenseData, table: &str) -> bool {
+            // Fast path: check uppercased name directly before allocating candidates.
+            let upper = table.to_uppercase();
+            if data.columns_loading.contains(&upper) {
+                return true;
+            }
+            // Only build full candidate list when the name has a qualified dot.
+            if !SqlEditorWidget::has_unquoted_dot(table) {
+                return false;
+            }
             SqlEditorWidget::table_lookup_key_candidates(table)
                 .iter()
-                .map(|key| key.to_uppercase())
-                .any(|key| data.columns_loading.contains(&key))
+                .any(|key| {
+                    let key_upper = key.to_uppercase();
+                    key_upper != upper && data.columns_loading.contains(&key_upper)
+                })
         }
 
         column_tables.iter().any(|table| {
@@ -1927,7 +1938,7 @@ impl SqlEditorWidget {
         prefix: &str,
         deep_ctx: &intellisense_context::CursorContext,
     ) -> Vec<String> {
-        let prefix_upper = prefix.to_uppercase();
+        let prefix_upper = prefix.to_ascii_uppercase();
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1935,13 +1946,13 @@ impl SqlEditorWidget {
             if candidate.is_empty() {
                 return;
             }
-            if !prefix_upper.is_empty() {
-                let candidate_upper = candidate.to_uppercase();
-                if !candidate_upper.starts_with(&prefix_upper) || candidate_upper == prefix_upper {
-                    return;
-                }
+            let candidate_upper = candidate.to_ascii_uppercase();
+            if !prefix_upper.is_empty()
+                && (!candidate_upper.starts_with(&prefix_upper) || candidate_upper == prefix_upper)
+            {
+                return;
             }
-            if seen.insert(candidate.to_uppercase()) {
+            if seen.insert(candidate_upper) {
                 suggestions.push(candidate.to_string());
             }
         };
@@ -1973,10 +1984,11 @@ impl SqlEditorWidget {
             return base;
         }
 
-        let mut seen: HashSet<String> = base.iter().map(|item| item.to_uppercase()).collect();
+        let mut seen: HashSet<String> =
+            base.iter().map(|item| item.to_ascii_uppercase()).collect();
         let mut filtered_aliases = Vec::new();
         for alias in aliases {
-            if seen.insert(alias.to_uppercase()) {
+            if seen.insert(alias.to_ascii_uppercase()) {
                 filtered_aliases.push(alias);
             }
         }
@@ -2126,11 +2138,12 @@ impl SqlEditorWidget {
             return base;
         }
 
-        let prefix_upper = prefix.to_uppercase();
-        let mut seen: HashSet<String> = base.iter().map(|item| item.to_uppercase()).collect();
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut seen: HashSet<String> =
+            base.iter().map(|item| item.to_ascii_uppercase()).collect();
 
         for column in derived_columns {
-            let upper = column.to_uppercase();
+            let upper = column.to_ascii_uppercase();
             if !prefix_upper.is_empty()
                 && (!upper.starts_with(prefix_upper.as_str()) || upper == prefix_upper)
             {
@@ -3238,7 +3251,8 @@ impl SqlEditorWidget {
     }
 
     fn has_min_intellisense_prefix(word: &str) -> bool {
-        word.chars().count() >= 2
+        let mut chars = word.chars();
+        chars.next().is_some() && chars.next().is_some()
     }
 
     fn should_ignore_keyup_after_manual_trigger(
