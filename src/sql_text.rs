@@ -68,10 +68,12 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
     let Some(rest) = text_upper.strip_prefix(keyword) else {
         return false;
     };
-    let Some(next) = rest.chars().next() else {
-        return true;
-    };
-    next.is_whitespace() || matches!(next, ';' | ',' | '(' | ')')
+    match rest.as_bytes().first() {
+        None => true,
+        Some(&b) if b < 0x80 => b.is_ascii_whitespace() || matches!(b, b';' | b',' | b'(' | b')'),
+        // Non-ASCII byte: decode and check for Unicode whitespace
+        _ => rest.chars().next().map_or(true, |c| c.is_whitespace()),
+    }
 }
 
 /// Returns normalized leading words from a line in uppercase.

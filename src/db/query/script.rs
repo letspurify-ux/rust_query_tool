@@ -56,6 +56,9 @@ pub(crate) struct SplitState {
     /// True when parsing a CREATE TYPE statement (not TYPE BODY).
     /// Restricts TYPE ... AS/IS OBJECT|VARRAY|TABLE handling to real type DDL.
     is_type_create: bool,
+    /// Reusable buffer for uppercase token comparisons.
+    /// Avoids a heap allocation on every `flush_token` call.
+    token_upper_buf: String,
 }
 
 impl SplitState {
@@ -71,9 +74,16 @@ impl SplitState {
         if self.token.is_empty() {
             return;
         }
-        let upper = self.token.to_ascii_uppercase();
+        // Reuse the pre-allocated buffer to avoid a new heap allocation per token.
+        // mem::take leaves token_upper_buf as an empty String so &mut self borrows
+        // inside this function remain valid.
+        let mut upper_buf = std::mem::take(&mut self.token_upper_buf);
+        upper_buf.clear();
+        upper_buf.push_str(&self.token);
+        upper_buf.make_ascii_uppercase();
+        let upper = upper_buf.as_str();
 
-        if matches!(upper.as_str(), "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
+        if matches!(upper, "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
             && self
                 .routine_is_stack
                 .last()
@@ -84,7 +94,7 @@ impl SplitState {
             }
         }
 
-        self.track_create_plsql(&upper);
+        self.track_create_plsql(upper);
 
         // Check if this is "END CASE" / "END IF" / "END LOOP" before processing pending_end
         let is_end_case = self.pending_end && upper == "CASE";
@@ -115,7 +125,7 @@ impl SplitState {
                 if self.block_depth > 0 {
                     self.block_depth -= 1;
                 }
-            } else if matches!(upper.as_str(), "BEFORE" | "AFTER") && self.in_compound_trigger {
+            } else if matches!(upper, "BEFORE" | "AFTER") && self.in_compound_trigger {
                 // END BEFORE ..., END AFTER ... - COMPOUND TRIGGER timing point 종료
                 // depth 감소 (타이밍 포인트 블록 종료)
                 if self.block_depth > 0 {
@@ -164,10 +174,7 @@ impl SplitState {
         // TYPE ... AS OBJECT/VARRAY/TABLE - these are type definitions, not blocks
         // TYPE ... IS REF CURSOR - this is a REF CURSOR type definition in package spec
         if self.after_as_is
-            && matches!(
-                upper.as_str(),
-                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD"
-            )
+            && matches!(upper, "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD")
         {
             if self.block_depth > 0 {
                 self.block_depth -= 1;
@@ -182,7 +189,7 @@ impl SplitState {
         // Track nested PROCEDURE/FUNCTION inside DECLARE blocks (anonymous blocks)
         // These need IS to start their body block
         // Only track when NOT in CREATE PL/SQL (packages already handle nested subprograms via in_create_plsql)
-        if self.block_depth > 0 && matches!(upper.as_str(), "PROCEDURE" | "FUNCTION") {
+        if self.block_depth > 0 && matches!(upper, "PROCEDURE" | "FUNCTION") {
             self.nested_subprogram = true;
         }
 
@@ -198,7 +205,7 @@ impl SplitState {
         // We use nested_subprogram to track when IS should start a block.
         // For the first AS/IS in CREATE, we use block_depth==0 as indicator.
         // For COMPOUND TRIGGER timing points, pending_timing_point_is indicates IS starts a block.
-        let is_block_starting_as_is = if matches!(upper.as_str(), "AS" | "IS") {
+        let is_block_starting_as_is = if matches!(upper, "AS" | "IS") {
             if self.pending_timing_point_is {
                 true // COMPOUND TRIGGER timing point (BEFORE/AFTER ... IS)
             } else if self.nested_subprogram {
@@ -280,11 +287,14 @@ impl SplitState {
             // 최종 END trigger_name이 depth 1→0으로 내려서 문장을 종료한다.
             self.in_compound_trigger = true;
             self.block_depth += 1;
-        } else if matches!(upper.as_str(), "BEFORE" | "AFTER") && self.in_compound_trigger {
+        } else if matches!(upper, "BEFORE" | "AFTER") && self.in_compound_trigger {
             // BEFORE/AFTER in COMPOUND TRIGGER context - prepare for timing point IS
             self.pending_timing_point_is = true;
         }
 
+        // Return the uppercase buffer so its capacity is reused on the next call.
+        drop(upper);
+        self.token_upper_buf = upper_buf;
         self.token.clear();
     }
 
