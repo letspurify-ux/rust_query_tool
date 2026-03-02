@@ -18,6 +18,13 @@ use crate::ui::theme;
 use crate::ui::{configured_editor_profile, configured_ui_font_size};
 use crate::utils::logging::{self, LogEntry, LogLevel};
 
+#[derive(Clone)]
+struct LogListRow {
+    entry_index: usize,
+    level: LogLevel,
+    display: String,
+}
+
 enum DialogMessage {
     UpdatePreview(usize),
     FilterChanged,
@@ -157,6 +164,7 @@ impl LogViewerDialog {
             .push(dialog.clone());
 
         let entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(all_entries));
+        let list_rows: Arc<Mutex<Vec<LogListRow>>> = Arc::new(Mutex::new(Vec::new()));
         let filtered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
@@ -166,6 +174,7 @@ impl LogViewerDialog {
             &entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            &list_rows,
             &mut browser,
             &filtered_indices,
             &mut count_label,
@@ -254,6 +263,7 @@ impl LogViewerDialog {
                             &entries
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &list_rows,
                             &mut browser,
                             &filtered_indices,
                             &mut count_label,
@@ -272,6 +282,10 @@ impl LogViewerDialog {
                             match logging::clear_log() {
                                 Ok(()) => {
                                     entries
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clear();
+                                    list_rows
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clear();
@@ -369,47 +383,67 @@ fn selected_filter(choice: &Choice) -> Option<LogLevel> {
 
 fn populate_browser(
     entries: &[LogEntry],
+    list_rows: &Arc<Mutex<Vec<LogListRow>>>,
     browser: &mut HoldBrowser,
     filtered_indices: &Arc<Mutex<Vec<usize>>>,
     count_label: &mut fltk::frame::Frame,
     filter: Option<LogLevel>,
 ) {
     browser.clear();
-    let mut indices = Vec::with_capacity(entries.len());
-
-    for (i, entry) in entries.iter().enumerate() {
-        if let Some(level) = filter {
-            if entry.level != level {
-                continue;
+    {
+        let mut rows = list_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if rows.len() != entries.len() {
+            rows.clear();
+            rows.reserve(entries.len());
+            for (entry_index, entry) in entries.iter().enumerate() {
+                rows.push(LogListRow {
+                    entry_index,
+                    level: entry.level,
+                    display: log_entry_display(entry),
+                });
             }
         }
+    }
 
-        let color_prefix = match entry.level {
-            LogLevel::Error => "@C1 ",    // red
-            LogLevel::Warning => "@C95 ", // orange
-            LogLevel::Info => "@C255 ",   // white
-            LogLevel::Debug => "@C246 ",  // gray
-        };
-
-        let short_msg = truncate_message(&entry.message, 60);
-        let escaped_source = escape_browser_label(&entry.source);
-        let escaped_msg = escape_browser_label(&short_msg);
-        let display = format!(
-            "{}{} [{}] [{}] {}",
-            color_prefix,
-            entry.timestamp,
-            entry.level.label(),
-            escaped_source,
-            escaped_msg
-        );
-        browser.add(&display);
-        indices.push(i);
+    let mut indices = Vec::with_capacity(entries.len());
+    let rows = list_rows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for row in rows.iter() {
+        if filter.is_some_and(|level| row.level != level) {
+            continue;
+        }
+        browser.add(&row.display);
+        indices.push(row.entry_index);
     }
 
     count_label.set_label(&format!("{} entries", indices.len()));
     *filtered_indices
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = indices;
+}
+
+fn log_entry_display(entry: &LogEntry) -> String {
+    let color_prefix = match entry.level {
+        LogLevel::Error => "@C1 ",    // red
+        LogLevel::Warning => "@C95 ", // orange
+        LogLevel::Info => "@C255 ",   // white
+        LogLevel::Debug => "@C246 ",  // gray
+    };
+
+    let short_msg = truncate_message(&entry.message, 60);
+    let escaped_source = escape_browser_label(&entry.source);
+    let escaped_msg = escape_browser_label(&short_msg);
+    format!(
+        "{}{} [{}] [{}] {}",
+        color_prefix,
+        entry.timestamp,
+        entry.level.label(),
+        escaped_source,
+        escaped_msg
+    )
 }
 
 fn escape_browser_label(text: &str) -> String {

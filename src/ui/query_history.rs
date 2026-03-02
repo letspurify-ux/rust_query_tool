@@ -1,3 +1,9 @@
+use crate::db::{QueryExecutor, ToolCommand};
+use crate::ui::center_on_main;
+use crate::ui::constants::*;
+use crate::ui::theme;
+use crate::ui::{configured_editor_profile, configured_ui_font_size};
+use crate::utils::config::{QueryHistory, QueryHistoryEntry};
 use fltk::{
     app,
     browser::HoldBrowser,
@@ -13,21 +19,19 @@ use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use crate::db::{QueryExecutor, ToolCommand};
-use crate::ui::center_on_main;
-use crate::ui::constants::*;
-use crate::ui::theme;
-use crate::ui::{configured_editor_profile, configured_ui_font_size};
-use crate::utils::config::{QueryHistory, QueryHistoryEntry};
-
+#[derive(Clone)]
+struct HistoryListRow {
+    entry_index: usize,
+    search_blob_lower: String,
+    display: String,
+    success: bool,
+}
 enum HistoryCommand {
     Add(PendingHistoryEntry),
     Clear,
     Snapshot(mpsc::Sender<Vec<QueryHistoryEntry>>),
     Flush(mpsc::Sender<Result<(), String>>),
 }
-
 #[derive(Debug, Clone)]
 struct PendingHistoryEntry {
     sql: String,
@@ -38,15 +42,12 @@ struct PendingHistoryEntry {
     success: bool,
     message: String,
 }
-
 const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const HISTORY_WRITER_SAVE_DEBOUNCE_DEFAULT_MS: u64 = 120;
 const REDACTED_SECRET: &str = "<redacted>";
-
 fn fold_for_case_insensitive(value: &str) -> String {
     value.chars().flat_map(|ch| ch.to_lowercase()).collect()
 }
-
 fn history_writer_response_timeout() -> Duration {
     std::env::var("SPACE_QUERY_HISTORY_TIMEOUT_SECS")
         .ok()
@@ -54,7 +55,6 @@ fn history_writer_response_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
 }
-
 fn history_writer_save_debounce() -> Duration {
     std::env::var("SPACE_QUERY_HISTORY_SAVE_DEBOUNCE_MS")
         .ok()
@@ -62,7 +62,6 @@ fn history_writer_save_debounce() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(HISTORY_WRITER_SAVE_DEBOUNCE_DEFAULT_MS))
 }
-
 fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
     let sanitized_sql = sanitize_history_sql(&entry.sql);
     let sanitized_message = sanitize_history_message(&entry.message);
@@ -72,7 +71,6 @@ fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
         Some(sanitized_message)
     };
     let error_line = error_message.as_deref().and_then(parse_error_line);
-
     QueryHistoryEntry {
         sql: sanitized_sql,
         timestamp: entry.timestamp,
@@ -84,7 +82,6 @@ fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
         error_line,
     }
 }
-
 fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
     let (sender, receiver) = mpsc::channel::<HistoryCommand>();
     thread::spawn(move || {
@@ -120,17 +117,14 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
                 Ok(cmd) => cmd,
                 Err(_) => break,
             };
-
             let mut channel_connected = true;
             let mut mutated_in_batch = false;
             let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
             let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
-
             if apply_command(&mut history, cmd, &mut snapshot_replies, &mut flush_replies) {
                 save_pending = true;
                 mutated_in_batch = true;
             }
-
             let mut persist_result: Result<(), String> = Ok(());
             while let Ok(next) = receiver.try_recv() {
                 if apply_command(
@@ -143,7 +137,6 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
                     mutated_in_batch = true;
                 }
             }
-
             // Small debounce window to coalesce bursts of query history updates into
             // one disk write while keeping Flush responsive.
             if save_pending && mutated_in_batch && flush_replies.is_empty() {
@@ -156,7 +149,6 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
                     if now >= save_deadline {
                         break;
                     }
-
                     let wait_for = save_deadline.saturating_duration_since(now);
                     match receiver.recv_timeout(wait_for) {
                         Ok(next) => {
@@ -189,7 +181,6 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
                     }
                 }
             }
-
             if save_pending {
                 match history.save() {
                     Ok(()) => {
@@ -204,15 +195,12 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
                     }
                 }
             }
-
             for reply in snapshot_replies {
                 let _ = reply.send(history.queries.iter().cloned().collect());
             }
-
             for reply in flush_replies {
                 let _ = reply.send(persist_result.clone());
             }
-
             if !channel_connected {
                 break;
             }
@@ -220,39 +208,33 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
     });
     sender
 }
-
 fn history_writer_handle() -> &'static Mutex<mpsc::Sender<HistoryCommand>> {
     static HISTORY_WRITER: OnceLock<Mutex<mpsc::Sender<HistoryCommand>>> = OnceLock::new();
     HISTORY_WRITER.get_or_init(|| Mutex::new(spawn_history_writer()))
 }
-
 fn history_writer_sender() -> mpsc::Sender<HistoryCommand> {
     history_writer_handle()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
-
 fn send_history_command(command: HistoryCommand) -> Result<(), mpsc::SendError<HistoryCommand>> {
     let initial_sender = history_writer_sender();
     let command = match initial_sender.send(command) {
         Ok(()) => return Ok(()),
         Err(err) => err.0,
     };
-
     let mut guard = history_writer_handle()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = spawn_history_writer();
     guard.send(command)
 }
-
 pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
     if send_history_command(HistoryCommand::Flush(tx)).is_err() {
         return Err("Query history writer is not available".to_string());
     }
-
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -275,11 +257,9 @@ pub fn flush_history_writer_with_timeout(timeout: Duration) -> Result<(), String
         }
     }
 }
-
 pub fn flush_history_writer() -> Result<(), String> {
     flush_history_writer_with_timeout(history_writer_response_timeout())
 }
-
 fn parse_error_line(message: &str) -> Option<usize> {
     let lowercase = fold_for_case_insensitive(message);
     let patterns = [
@@ -290,9 +270,7 @@ fn parse_error_line(message: &str) -> Option<usize> {
         // Keep ORA-06512 lower priority so we prefer primary parser errors.
         "ora-06512: at line",
     ];
-
     let mut best_line: Option<(usize, usize)> = None;
-
     for (priority, needle) in patterns.iter().enumerate() {
         let mut search_start = 0usize;
         while search_start < lowercase.len() {
@@ -302,7 +280,6 @@ fn parse_error_line(message: &str) -> Option<usize> {
             let idx = search_start + relative_idx;
             let mut cursor = idx + needle.len();
             cursor = next_char_boundary(&lowercase, cursor);
-
             let mut digits = String::new();
             while cursor < lowercase.len() {
                 let Some((ch, next)) = next_char_with_clamped_boundary(&lowercase, cursor) else {
@@ -319,7 +296,6 @@ fn parse_error_line(message: &str) -> Option<usize> {
                 }
                 break;
             }
-
             if let Ok(value) = digits.parse::<usize>() {
                 match best_line {
                     None => best_line = Some((priority, value)),
@@ -332,29 +308,23 @@ fn parse_error_line(message: &str) -> Option<usize> {
             search_start = idx.saturating_add(needle.len());
         }
     }
-
     best_line.map(|(_, line)| line).filter(|line| *line > 0)
 }
-
 fn sanitize_history_sql(sql: &str) -> String {
     sanitize_sensitive_text(sql)
 }
-
 fn sanitize_history_message(message: &str) -> String {
     sanitize_sensitive_text(message)
 }
-
 fn sanitize_sensitive_text(text: &str) -> String {
     let redacted_connect = redact_connect_commands(text);
     let redacted_identified = redact_identified_by_clause(&redacted_connect);
     redact_uri_credentials(&redacted_identified)
 }
-
 fn redact_connect_commands(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-
     let mut output = String::with_capacity(text.len());
     for segment in text.split_inclusive('\n') {
         let has_newline = segment.ends_with('\n');
@@ -369,19 +339,15 @@ fn redact_connect_commands(text: &str) -> String {
             output.push('\n');
         }
     }
-
     if !text.ends_with('\n') && output.ends_with('\n') {
         output.pop();
     }
-
     output
 }
-
 fn redact_connect_command_line(line: &str) -> String {
     let trimmed = line.trim_start();
     let indent_len = line.len().saturating_sub(trimmed.len());
     let indent = &line[..indent_len];
-
     if let Some(ToolCommand::Connect {
         username,
         host,
@@ -395,7 +361,6 @@ fn redact_connect_command_line(line: &str) -> String {
             indent, username, REDACTED_SECRET, host, port, service_name
         );
     }
-
     let upper = trimmed.to_ascii_uppercase();
     if (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
         || upper.starts_with("CONN ")
@@ -404,10 +369,8 @@ fn redact_connect_command_line(line: &str) -> String {
             return format!("{}{}", indent, masked);
         }
     }
-
     line.to_string()
 }
-
 fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or_default();
@@ -415,7 +378,6 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
     if command.is_empty() || rest.is_empty() {
         return None;
     }
-
     let slash_idx = rest.find('/')?;
     let at_idx = rest
         .char_indices()
@@ -424,7 +386,6 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
     if slash_idx >= at_idx {
         return None;
     }
-
     Some(format!(
         "{} {}/{}{}",
         command,
@@ -433,12 +394,10 @@ fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
         &rest[at_idx..]
     ))
 }
-
 fn redact_identified_by_clause(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-
     #[derive(Clone, Copy)]
     enum SqlState {
         Code,
@@ -447,18 +406,14 @@ fn redact_identified_by_clause(text: &str) -> String {
         LineComment,
         BlockComment,
     }
-
     const IDENTIFIED_BY: &str = "IDENTIFIED BY";
-
     let mut output = String::with_capacity(text.len());
     let mut state = SqlState::Code;
     let mut idx = 0usize;
-
     while idx < text.len() {
         let Some((ch, next)) = next_char_with_clamped_boundary(text, idx) else {
             break;
         };
-
         match state {
             SqlState::Code => {
                 if ch == '\'' {
@@ -499,12 +454,10 @@ fn redact_identified_by_clause(text: &str) -> String {
                         }
                     }
                 }
-
                 if let Some(found) = find_ascii_case_insensitive(text, IDENTIFIED_BY, idx) {
                     if found == idx {
                         let pattern_end = found + IDENTIFIED_BY.len();
                         output.push_str(&text[idx..pattern_end]);
-
                         let mut value_start = pattern_end;
                         while value_start < text.len() {
                             let Some((ws, next_ws)) =
@@ -519,18 +472,15 @@ fn redact_identified_by_clause(text: &str) -> String {
                                 break;
                             }
                         }
-
                         if value_start >= text.len() {
                             idx = value_start;
                             continue;
                         }
-
                         let Some((first, _)) = next_char_with_clamped_boundary(text, value_start)
                         else {
                             idx = text.len();
                             continue;
                         };
-
                         if first == '\'' || first == '"' {
                             let quote = first;
                             output.push(quote);
@@ -568,7 +518,6 @@ fn redact_identified_by_clause(text: &str) -> String {
                             idx = value_end;
                             continue;
                         }
-
                         let mut value_end = value_start;
                         while value_end < text.len() {
                             let Some((vch, vnext)) =
@@ -587,7 +536,6 @@ fn redact_identified_by_clause(text: &str) -> String {
                         continue;
                     }
                 }
-
                 output.push(ch);
                 idx = next;
             }
@@ -645,10 +593,8 @@ fn redact_identified_by_clause(text: &str) -> String {
             }
         }
     }
-
     output
 }
-
 fn next_char_boundary(text: &str, idx: usize) -> usize {
     let mut boundary = idx.min(text.len());
     while boundary > 0 && !text.is_char_boundary(boundary) {
@@ -656,30 +602,24 @@ fn next_char_boundary(text: &str, idx: usize) -> usize {
     }
     boundary
 }
-
 fn next_char_with_clamped_boundary(text: &str, idx: usize) -> Option<(char, usize)> {
     let start = next_char_boundary(text, idx);
     if start >= text.len() {
         return None;
     }
-
     let ch = text[start..].chars().next()?;
     Some((ch, start + ch.len_utf8()))
 }
-
 fn redact_uri_credentials(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
-
     while let Some(rel) = text[cursor..].find("://") {
         let scheme_sep = cursor + rel;
         let auth_start = scheme_sep + 3;
         output.push_str(&text[cursor..auth_start]);
-
         let authority_end = text[auth_start..]
             .char_indices()
             .find_map(|(offset, ch)| {
@@ -693,7 +633,6 @@ fn redact_uri_credentials(text: &str) -> String {
                 }
             })
             .unwrap_or(text.len());
-
         let authority = &text[auth_start..authority_end];
         if let Some(at_pos) = authority.rfind('@') {
             let userinfo = &authority[..at_pos];
@@ -715,21 +654,17 @@ fn redact_uri_credentials(text: &str) -> String {
         } else {
             output.push_str(authority);
         }
-
         cursor = authority_end;
     }
-
     output.push_str(&text[cursor..]);
     output
 }
-
 fn find_ascii_case_insensitive(text: &str, needle: &str, start: usize) -> Option<usize> {
     let haystack = text.as_bytes();
     let pattern = needle.as_bytes();
     if pattern.is_empty() || start >= haystack.len() || pattern.len() > haystack.len() {
         return None;
     }
-
     for idx in start..=haystack.len().saturating_sub(pattern.len()) {
         if !text.is_char_boundary(idx) {
             continue;
@@ -744,7 +679,6 @@ fn find_ascii_case_insensitive(text: &str, needle: &str, start: usize) -> Option
     }
     None
 }
-
 fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
     if sql.is_empty() {
         return String::new();
@@ -762,7 +696,6 @@ fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
     }
     styles
 }
-
 fn preview_style_table() -> Vec<StyleTableEntry> {
     let profile = configured_editor_profile();
     let size = configured_ui_font_size() as i32;
@@ -779,7 +712,6 @@ fn preview_style_table() -> Vec<StyleTableEntry> {
         },
     ]
 }
-
 /// Retrieve a snapshot of the current history from the background writer thread,
 /// avoiding a redundant disk read + parse.  Falls back to disk if the writer
 /// thread is unreachable.
@@ -807,7 +739,6 @@ fn load_snapshot() -> (Vec<QueryHistoryEntry>, bool) {
         (QueryHistory::load().queries.into(), true)
     }
 }
-
 pub fn clear_history() -> Result<(), String> {
     match send_history_command(HistoryCommand::Clear) {
         Ok(()) => flush_history_writer(),
@@ -825,10 +756,8 @@ pub fn clear_history() -> Result<(), String> {
         }
     }
 }
-
 /// Query history dialog for viewing and re-executing past queries
 pub struct QueryHistoryDialog;
-
 impl QueryHistoryDialog {
     pub fn show_with_registry(popups: Arc<Mutex<Vec<Window>>>) -> Option<String> {
         enum DialogMessage {
@@ -838,33 +767,26 @@ impl QueryHistoryDialog {
             ClearHistory,
             Close,
         }
-
         let (snapshot, snapshot_is_fallback) = load_snapshot();
-
         let current_group = fltk::group::Group::try_current();
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
-
         let mut dialog = Window::default()
             .with_size(800, 500)
             .with_label("Query History");
         center_on_main(&mut dialog);
         dialog.set_color(theme::panel_raised());
         dialog.make_modal(true);
-
         let mut main_flex = Flex::default().with_pos(10, 10).with_size(780, 480);
         main_flex.set_type(fltk::group::FlexType::Column);
         main_flex.set_spacing(DIALOG_SPACING);
-
         // Top section with list and preview
         let mut content_flex = Flex::default();
         content_flex.set_type(fltk::group::FlexType::Row);
         content_flex.set_spacing(DIALOG_SPACING);
-
         // Left - History list
         let mut list_flex = Flex::default();
         list_flex.set_type(fltk::group::FlexType::Column);
         list_flex.set_spacing(DIALOG_SPACING);
-
         let mut list_label =
             fltk::frame::Frame::default().with_label("Query History (Most Recent First):");
         if snapshot_is_fallback {
@@ -872,40 +794,31 @@ impl QueryHistoryDialog {
         }
         list_label.set_label_color(theme::text_primary());
         list_flex.fixed(&list_label, LABEL_ROW_HEIGHT);
-
         let mut filter_row = Flex::default();
         filter_row.set_type(fltk::group::FlexType::Row);
         filter_row.set_spacing(DIALOG_SPACING);
-
         let mut search_input = Input::default();
         search_input.set_color(theme::input_bg());
         search_input.set_text_color(theme::text_primary());
         search_input.set_tooltip("Filter by SQL text, connection, timestamp, or error");
         filter_row.fixed(&search_input, 224);
-
         let mut failed_only_check = CheckButton::default().with_label("Failed only");
         failed_only_check.set_label_color(theme::text_primary());
         filter_row.fixed(&failed_only_check, 114);
-
         filter_row.end();
         list_flex.fixed(&filter_row, INPUT_ROW_HEIGHT);
-
         let mut browser = HoldBrowser::default();
         browser.set_color(theme::input_bg());
         browser.set_selection_color(theme::selection_strong());
-
         list_flex.end();
         content_flex.fixed(&list_flex, 350);
-
         // Right - SQL preview
         let mut preview_flex = Flex::default();
         preview_flex.set_type(fltk::group::FlexType::Column);
         preview_flex.set_spacing(DIALOG_SPACING);
-
         let mut preview_label = fltk::frame::Frame::default().with_label("SQL Preview:");
         preview_label.set_label_color(theme::text_primary());
         preview_flex.fixed(&preview_label, LABEL_ROW_HEIGHT);
-
         let preview_buffer = TextBuffer::default();
         let preview_style_buffer = TextBuffer::default();
         let mut preview_display = TextDisplay::default();
@@ -920,11 +833,9 @@ impl QueryHistoryDialog {
         preview_display.set_linenumber_font(configured_editor_profile().normal);
         preview_display.set_linenumber_size((configured_ui_font_size().saturating_sub(2)) as i32);
         preview_display.set_highlight_data(preview_style_buffer.clone(), preview_style_table());
-
         let mut error_label = fltk::frame::Frame::default().with_label("Error details:");
         error_label.set_label_color(theme::text_primary());
         preview_flex.fixed(&error_label, LABEL_ROW_HEIGHT);
-
         let error_buffer = TextBuffer::default();
         let mut error_display = TextDisplay::default();
         error_display.set_buffer(error_buffer.clone());
@@ -935,49 +846,39 @@ impl QueryHistoryDialog {
         error_display.hide();
         error_label.hide();
         preview_flex.fixed(&error_display, 90);
-
         preview_flex.end();
-
         content_flex.end();
-
         // Bottom buttons
         let mut button_flex = Flex::default();
         button_flex.set_type(fltk::group::FlexType::Row);
         button_flex.set_spacing(DIALOG_SPACING);
-
         let _spacer = fltk::frame::Frame::default();
-
         let mut use_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Use Query");
         use_btn.set_color(theme::button_primary());
         use_btn.set_label_color(theme::text_primary());
         use_btn.set_frame(FrameType::RFlatBox);
-
         let mut clear_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Clear History");
         clear_btn.set_color(theme::button_danger());
         clear_btn.set_label_color(theme::text_primary());
         clear_btn.set_frame(FrameType::RFlatBox);
-
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Close");
         close_btn.set_color(theme::button_subtle());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
-
         button_flex.fixed(&use_btn, BUTTON_WIDTH_LARGE);
         button_flex.fixed(&clear_btn, BUTTON_WIDTH_LARGE);
         button_flex.fixed(&close_btn, BUTTON_WIDTH);
         button_flex.end();
         main_flex.fixed(&button_flex, BUTTON_ROW_HEIGHT);
-
         main_flex.end();
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
-
         popups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -986,7 +887,7 @@ impl QueryHistoryDialog {
         let selected_sql: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let queries: Arc<Mutex<Vec<QueryHistoryEntry>>> = Arc::new(Mutex::new(snapshot));
         let filtered_indices: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-
+        let list_rows: Arc<Mutex<Vec<HistoryListRow>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let query_snapshot = queries
                 .lock()
@@ -995,13 +896,12 @@ impl QueryHistoryDialog {
                 &query_snapshot,
                 &mut browser,
                 &filtered_indices,
+                &list_rows,
                 &search_input.value(),
                 failed_only_check.value(),
             );
         }
-
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
-
         // Browser selection callback - update preview
         let sender_for_preview = sender.clone();
         browser.set_callback(move |b| {
@@ -1013,42 +913,35 @@ impl QueryHistoryDialog {
                 }
             }
         });
-
         let sender_for_filter = sender.clone();
         search_input.set_callback(move |_| {
             let _ = sender_for_filter.send(DialogMessage::FilterChanged);
             app::awake();
         });
-
         let sender_for_failed_only = sender.clone();
         failed_only_check.set_callback(move |_| {
             let _ = sender_for_failed_only.send(DialogMessage::FilterChanged);
             app::awake();
         });
-
         // Use Query button
         let sender_for_use = sender.clone();
         use_btn.set_callback(move |_| {
             let _ = sender_for_use.send(DialogMessage::UseSelected);
             app::awake();
         });
-
         // Clear History button
         let sender_for_clear = sender.clone();
         clear_btn.set_callback(move |_| {
             let _ = sender_for_clear.send(DialogMessage::ClearHistory);
             app::awake();
         });
-
         // Close button
         let sender_for_close = sender.clone();
         close_btn.set_callback(move |_| {
             let _ = sender_for_close.send(DialogMessage::Close);
             app::awake();
         });
-
         dialog.show();
-
         let mut preview_buffer = preview_buffer.clone();
         let mut preview_style_buffer = preview_style_buffer.clone();
         let mut error_buffer = error_buffer.clone();
@@ -1098,6 +991,7 @@ impl QueryHistoryDialog {
                             &query_snapshot,
                             &mut browser,
                             &filtered_indices,
+                            &list_rows,
                             &search_input.value(),
                             failed_only_check.value(),
                         );
@@ -1150,6 +1044,10 @@ impl QueryHistoryDialog {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                                         .clear();
+                                    list_rows
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clear();
                                     let query_snapshot = queries
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1157,6 +1055,7 @@ impl QueryHistoryDialog {
                                         &query_snapshot,
                                         &mut browser,
                                         &filtered_indices,
+                                        &list_rows,
                                         &search_input.value(),
                                         failed_only_check.value(),
                                     );
@@ -1182,23 +1081,19 @@ impl QueryHistoryDialog {
                 }
             }
         }
-
         // Remove dialog from popups to prevent memory leak
         popups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|w| w.as_widget_ptr() != dialog.as_widget_ptr());
-
         // Explicitly destroy top-level dialog widgets to release native resources.
         Window::delete(dialog);
-
         let result = selected_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         result
     }
-
     /// Add a query to history
     pub fn add_to_history(
         sql: &str,
@@ -1211,7 +1106,6 @@ impl QueryHistoryDialog {
         if sql.trim().is_empty() {
             return Ok(());
         }
-
         // Keep UI responsive for large SQL text (for example package body DDL):
         // enqueue raw data and sanitize/persist on the background history writer.
         let entry = PendingHistoryEntry {
@@ -1223,7 +1117,6 @@ impl QueryHistoryDialog {
             success,
             message: message.to_string(),
         };
-
         if let Err(err) = send_history_command(HistoryCommand::Add(entry)) {
             app::awake();
             if let HistoryCommand::Add(entry) = err.0 {
@@ -1240,7 +1133,6 @@ impl QueryHistoryDialog {
         Ok(())
     }
 }
-
 /// Truncate SQL for display in list.
 ///
 /// All indices are byte offsets; `is_char_boundary` is used before every slice
@@ -1249,7 +1141,6 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
-
     // Normalize whitespace using byte-level ASCII checks for whitespace detection.
     // Multi-byte characters are copied as complete byte sequences identified by
     // char boundaries, never sliced mid-character.
@@ -1275,15 +1166,12 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
             last_was_whitespace = false;
         }
     }
-
     while normalized.ends_with(' ') {
         normalized.pop();
     }
-
     if normalized.is_empty() {
         return String::new();
     }
-
     if max_len <= 3 {
         // Truncate at a char boundary so we don't produce invalid UTF-8.
         let mut end = max_len.min(normalized.len());
@@ -1292,7 +1180,6 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
         }
         return normalized[..end].to_string();
     }
-
     let visible_len = max_len - 3;
     // `char_indices` yields (byte_offset, char) pairs; truncate_at is a byte offset.
     let mut visible_chars = 0usize;
@@ -1304,9 +1191,7 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
         }
         visible_chars += 1;
     }
-
     debug_assert!(normalized.is_char_boundary(truncate_at));
-
     if visible_chars < visible_len {
         normalized
     } else {
@@ -1316,10 +1201,10 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
         output
     }
 }
-
 /// Case-insensitive substring search. Uses a fast byte-level comparison when
 /// the haystack is ASCII (common for SQL, timestamps, connection names),
 /// falling back to Unicode case folding only when necessary.
+#[allow(dead_code)]
 fn contains_lower(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
@@ -1330,13 +1215,16 @@ fn contains_lower(haystack: &str, needle_lower: &str) -> bool {
         if n.len() > h.len() {
             return false;
         }
-        h.windows(n.len())
-            .any(|w| w.iter().zip(n.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b))
+        h.windows(n.len()).any(|w| {
+            w.iter()
+                .zip(n.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
     } else {
         fold_for_case_insensitive(haystack).contains(needle_lower)
     }
 }
-
+#[allow(dead_code)]
 fn history_entry_matches_filter(
     entry: &QueryHistoryEntry,
     search_lower: &str,
@@ -1345,29 +1233,42 @@ fn history_entry_matches_filter(
     if failed_only && entry.success {
         return false;
     }
-
     if search_lower.is_empty() {
         return true;
     }
-
     if contains_lower(&entry.sql, search_lower) {
         return true;
     }
-
     if contains_lower(&entry.connection_name, search_lower) {
         return true;
     }
-
     if contains_lower(&entry.timestamp, search_lower) {
         return true;
     }
-
     match entry.error_message.as_deref() {
         Some(message) => contains_lower(message, search_lower),
         None => false,
     }
 }
-
+fn history_entry_search_blob_lower(entry: &QueryHistoryEntry) -> String {
+    let mut blob = String::with_capacity(
+        entry.sql.len()
+            + entry.connection_name.len()
+            + entry.timestamp.len()
+            + entry.error_message.as_ref().map_or(0, |msg| msg.len())
+            + 3,
+    );
+    blob.push_str(&entry.sql);
+    blob.push('\n');
+    blob.push_str(&entry.connection_name);
+    blob.push('\n');
+    blob.push_str(&entry.timestamp);
+    if let Some(message) = entry.error_message.as_deref() {
+        blob.push('\n');
+        blob.push_str(message);
+    }
+    fold_for_case_insensitive(&blob)
+}
 fn history_entry_display(entry: &QueryHistoryEntry) -> String {
     let color_prefix = if entry.success { "@C255 " } else { "@C1 " };
     format!(
@@ -1378,30 +1279,51 @@ fn history_entry_display(entry: &QueryHistoryEntry) -> String {
         entry.row_count
     )
 }
-
 fn populate_history_browser(
     entries: &[QueryHistoryEntry],
     browser: &mut HoldBrowser,
     filtered_indices: &Arc<Mutex<Vec<usize>>>,
+    list_rows: &Arc<Mutex<Vec<HistoryListRow>>>,
     search_text: &str,
     failed_only: bool,
 ) {
     let search_lower = fold_for_case_insensitive(search_text.trim());
     browser.clear();
-
+    {
+        let mut rows = list_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if rows.len() != entries.len() {
+            rows.clear();
+            rows.reserve(entries.len());
+            for (entry_index, entry) in entries.iter().enumerate() {
+                rows.push(HistoryListRow {
+                    entry_index,
+                    search_blob_lower: history_entry_search_blob_lower(entry),
+                    display: history_entry_display(entry),
+                    success: entry.success,
+                });
+            }
+        }
+    }
     let mut indices = filtered_indices
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     indices.clear();
-
-    for (index, entry) in entries.iter().enumerate() {
-        if history_entry_matches_filter(entry, &search_lower, failed_only) {
-            browser.add(&history_entry_display(entry));
-            indices.push(index);
+    let rows = list_rows
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for row in rows.iter() {
+        if failed_only && row.success {
+            continue;
         }
+        if !search_lower.is_empty() && !row.search_blob_lower.contains(&search_lower) {
+            continue;
+        }
+        browser.add(&row.display);
+        indices.push(row.entry_index);
     }
 }
-
 #[cfg(test)]
 mod query_history_tests {
     use super::{
@@ -1409,30 +1331,25 @@ mod query_history_tests {
         sanitize_history_message, sanitize_history_sql, truncate_sql, PendingHistoryEntry,
         QueryHistoryEntry, REDACTED_SECRET,
     };
-
     #[test]
     fn truncate_sql_preserves_multibyte_text_while_normalizing_whitespace() {
         let sql = "  SELECT\t'프로시저 테스트'\nFROM dual  ";
         assert_eq!(truncate_sql(sql, 100), "SELECT '프로시저 테스트' FROM dual");
     }
-
     #[test]
     fn truncate_sql_truncates_on_char_boundary_for_multibyte_text() {
         let sql = "가나다라마바사";
         assert_eq!(truncate_sql(sql, 5), "가나...");
     }
-
     #[test]
     fn truncate_sql_collapses_whitespace_runs() {
         let sql = "SELECT\n\n\t\t*\t\tFROM\t\tdual";
         assert_eq!(truncate_sql(sql, 100), "SELECT * FROM dual");
     }
-
     #[test]
     fn truncate_sql_returns_empty_for_zero_limit() {
         assert_eq!(truncate_sql("SELECT 1", 0), "");
     }
-
     #[test]
     fn sanitize_history_sql_redacts_connect_password() {
         let sql = "CONNECT scott/tiger@localhost:1521/ORCL";
@@ -1440,14 +1357,12 @@ mod query_history_tests {
         assert!(sanitized.contains(&format!("scott/{}@", REDACTED_SECRET)));
         assert!(!sanitized.contains("tiger"));
     }
-
     #[test]
     fn sanitize_history_sql_keeps_connect_by_clause() {
         let sql = "SELECT * FROM emp CONNECT BY PRIOR empno = mgr";
         let sanitized = sanitize_history_sql(sql);
         assert_eq!(sanitized, sql);
     }
-
     #[test]
     fn sanitize_history_sql_redacts_identified_by_secret() {
         let sql = "CREATE USER app IDENTIFIED BY \"MySecret!\"";
@@ -1455,7 +1370,6 @@ mod query_history_tests {
         assert!(sanitized.contains(&format!("IDENTIFIED BY \"{}\"", REDACTED_SECRET)));
         assert!(!sanitized.contains("MySecret!"));
     }
-
     #[test]
     fn sanitize_history_sql_redacts_unterminated_identified_by_quote_without_appending_quote() {
         let sql = "CREATE USER app IDENTIFIED BY 'MySecret!";
@@ -1466,7 +1380,6 @@ mod query_history_tests {
         );
         assert!(!sanitized.contains("MySecret!"));
     }
-
     #[test]
     fn sanitize_history_message_redacts_uri_password() {
         let message = "failed to connect via https://alice:pa55@example.com/path";
@@ -1474,21 +1387,18 @@ mod query_history_tests {
         assert!(sanitized.contains(&format!("alice:{}@", REDACTED_SECRET)));
         assert!(!sanitized.contains("pa55"));
     }
-
     #[test]
     fn parse_error_line_prefers_primary_error_line_reference() {
         let message = "failed near line 1
 ORA-06512: at line 27";
         assert_eq!(parse_error_line(message), Some(1));
     }
-
     #[test]
     fn parse_error_line_ignores_non_error_line_wording() {
         let message = "client command line 8 received
 server location at line 12";
         assert_eq!(parse_error_line(message), Some(12));
     }
-
     #[test]
     fn sanitize_history_message_redacts_user_only_uri_credentials() {
         let sql = "failed to reach https://scott@db-host/service";
@@ -1499,7 +1409,6 @@ server location at line 12";
         )));
         assert!(!sanitized.contains("https://scott@db-host/service"));
     }
-
     #[test]
     fn sanitize_history_sql_ignores_identified_by_in_comments_and_strings() {
         let sql = "/* IDENTIFIED BY should_not_change */
@@ -1511,7 +1420,6 @@ CREATE USER app IDENTIFIED BY real_secret;";
         assert!(sanitized.contains(&format!("IDENTIFIED BY {}", REDACTED_SECRET)));
         assert!(!sanitized.contains("real_secret"));
     }
-
     #[test]
     fn contains_lower_ascii_fast_path() {
         assert!(contains_lower("SELECT * FROM EMPLOYEES", "employees"));
@@ -1520,13 +1428,11 @@ CREATE USER app IDENTIFIED BY real_secret;";
         assert!(contains_lower("", ""));
         assert!(!contains_lower("", "x"));
     }
-
     #[test]
     fn contains_lower_unicode_fallback() {
         assert!(contains_lower("SELECT '프로시저' FROM dual", "프로시저"));
         assert!(!contains_lower("SELECT '프로시저' FROM dual", "테스트"));
     }
-
     #[test]
     fn history_filter_matches_sql_and_connection() {
         let entry = QueryHistoryEntry {
@@ -1543,7 +1449,6 @@ CREATE USER app IDENTIFIED BY real_secret;";
         assert!(history_entry_matches_filter(&entry, "hrdev", false));
         assert!(!history_entry_matches_filter(&entry, "orders", false));
     }
-
     #[test]
     fn history_filter_failed_only_excludes_success_rows() {
         let success_entry = QueryHistoryEntry {
@@ -1569,7 +1474,6 @@ CREATE USER app IDENTIFIED BY real_secret;";
         assert!(!history_entry_matches_filter(&success_entry, "", true));
         assert!(history_entry_matches_filter(&failed_entry, "", true));
     }
-
     #[test]
     fn materialize_history_entry_sanitizes_and_extracts_error_line() {
         let entry = PendingHistoryEntry {
@@ -1581,7 +1485,6 @@ CREATE USER app IDENTIFIED BY real_secret;";
             success: false,
             message: "ORA-00900 invalid SQL statement near line 7".to_string(),
         };
-
         let materialized = materialize_history_entry(entry);
         assert!(materialized
             .sql
