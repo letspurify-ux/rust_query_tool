@@ -115,6 +115,8 @@ impl SqlEditorWidget {
         let mut seen_into = false;
         let mut seen_target = false;
         let mut seen_values = false;
+        let mut seen_select_body_start = false;
+        let mut seen_column_list_start = false;
         let mut depth = 0usize;
         let mut column_list_depth: Option<usize> = None;
 
@@ -127,6 +129,8 @@ impl SqlEditorWidget {
                         seen_into = false;
                         seen_target = false;
                         seen_values = false;
+                        seen_select_body_start = false;
+                        seen_column_list_start = false;
                         column_list_depth = None;
                         depth = 0;
                         continue;
@@ -143,11 +147,20 @@ impl SqlEditorWidget {
 
                     if word.eq_ignore_ascii_case("VALUES") {
                         seen_values = true;
+                        seen_select_body_start = true;
                         continue;
                     }
 
                     if seen_into && !seen_target {
                         seen_target = true;
+                        continue;
+                    }
+
+                    if seen_target
+                        && (word.eq_ignore_ascii_case("SELECT")
+                            || word.eq_ignore_ascii_case("WITH"))
+                    {
+                        seen_select_body_start = true;
                     }
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
@@ -155,9 +168,12 @@ impl SqlEditorWidget {
                         && seen_into
                         && seen_target
                         && !seen_values
+                        && !seen_select_body_start
+                        && !seen_column_list_start
                         && column_list_depth.is_none()
                     {
                         column_list_depth = Some(depth + 1);
+                        seen_column_list_start = true;
                     }
                     depth = depth.saturating_add(1);
                 }
@@ -530,6 +546,26 @@ impl SqlEditorWidget {
         );
     }
 
+    fn finalize_completion_after_selection(
+        completion_range: &Arc<Mutex<Option<(usize, usize)>>>,
+        pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
+        keyup_debounce_generation: &Arc<Mutex<u64>>,
+        keyup_debounce_handle: &Arc<Mutex<Option<app::TimeoutHandle>>>,
+        intellisense_parse_generation: &Arc<AtomicU64>,
+    ) {
+        *completion_range
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *pending_intellisense
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        Self::invalidate_keyup_debounce_with_parse_generation(
+            keyup_debounce_generation,
+            keyup_debounce_handle,
+            Some(intellisense_parse_generation),
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn schedule_keyup_intellisense_debounce(
         keyup_debounce_generation: &Arc<Mutex<u64>>,
@@ -651,6 +687,10 @@ impl SqlEditorWidget {
         let mut buffer_for_insert = buffer.clone();
         let mut editor_for_insert = editor.clone();
         let completion_range_for_insert = completion_range.clone();
+        let pending_intellisense_for_insert = pending_intellisense.clone();
+        let keyup_debounce_generation_for_insert = keyup_debounce_generation.clone();
+        let keyup_debounce_handle_for_insert = keyup_debounce_handle.clone();
+        let intellisense_parse_generation_for_insert = intellisense_parse_generation.clone();
         let intellisense_data_for_insert = intellisense_data.clone();
         let column_sender_for_insert = column_sender.clone();
         let connection_for_insert = connection.clone();
@@ -706,9 +746,13 @@ impl SqlEditorWidget {
                     editor_for_insert
                         .set_insert_position((cursor_pos_usize + selected.len()) as i32);
                 }
-                *completion_range_for_insert
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                Self::finalize_completion_after_selection(
+                    &completion_range_for_insert,
+                    &pending_intellisense_for_insert,
+                    &keyup_debounce_generation_for_insert,
+                    &keyup_debounce_handle_for_insert,
+                    &intellisense_parse_generation_for_insert,
+                );
             });
         }
 
@@ -5717,6 +5761,24 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
+    fn insert_column_list_context_ignores_parentheses_after_select_body_starts() {
+        let sql_with_cursor = "INSERT INTO audit_emp (emp_id) SELECT * FROM (SELECT | FROM oqt_t_emp) src";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+
+        assert!(
+            !SqlEditorWidget::is_insert_column_list_context(&full_tokens, split_idx),
+            "subquery parentheses after INSERT ... SELECT should not be treated as target column-list context"
+        );
+    }
+
+    #[test]
     fn classify_intellisense_context_treats_with_cte_column_list_as_column_context() {
         let sql_with_cursor = "WITH r (|) AS (SELECT node_id FROM oqt_t_tree) SELECT * FROM r";
         let cursor = sql_with_cursor
@@ -6055,5 +6117,27 @@ CROSS APPLY (
             deep_ctx.statement_tokens.as_ref(),
         );
         assert_eq!(context, SqlContext::TableName);
+    }
+
+    #[test]
+    fn finalize_completion_after_selection_clears_pending_and_invalidates_generation() {
+        let completion_range = Arc::new(Mutex::new(Some((5usize, 10usize))));
+        let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 10 })));
+        let keyup_generation = Arc::new(Mutex::new(3u64));
+        let keyup_handle = Arc::new(Mutex::new(None::<app::TimeoutHandle>));
+        let parse_generation = Arc::new(AtomicU64::new(9));
+
+        SqlEditorWidget::finalize_completion_after_selection(
+            &completion_range,
+            &pending,
+            &keyup_generation,
+            &keyup_handle,
+            &parse_generation,
+        );
+
+        assert!(lock_or_recover(&completion_range).is_none());
+        assert!(lock_or_recover(&pending).is_none());
+        assert_eq!(*lock_or_recover(&keyup_generation), 4);
+        assert_eq!(parse_generation.load(Ordering::Relaxed), 10);
     }
 }
