@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -779,6 +779,7 @@ pub struct SqlEditorWidget {
     pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
     intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     intellisense_parse_generation: Arc<AtomicU64>,
+    intellisense_popup_show_in_progress: Arc<AtomicBool>,
     history_cursor: Arc<Mutex<Option<usize>>>,
     history_original: Arc<Mutex<Option<String>>>,
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
@@ -1232,6 +1233,7 @@ impl SqlEditorWidget {
         let pending_intellisense = Arc::new(Mutex::new(None::<PendingIntellisense>));
         let intellisense_parse_cache = Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
         let intellisense_parse_generation = Arc::new(AtomicU64::new(0));
+        let intellisense_popup_show_in_progress = Arc::new(AtomicBool::new(false));
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
@@ -1269,6 +1271,7 @@ impl SqlEditorWidget {
             pending_intellisense,
             intellisense_parse_cache,
             intellisense_parse_generation,
+            intellisense_popup_show_in_progress,
             history_cursor,
             history_original,
             history_navigation_entries,
@@ -1564,6 +1567,7 @@ impl SqlEditorWidget {
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let intellisense_parse_generation = self.intellisense_parse_generation.clone();
+        let intellisense_popup_show_in_progress = self.intellisense_popup_show_in_progress.clone();
 
         // Wrap receiver in Arc<Mutex> to share across timeout callbacks
         let receiver: Arc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
@@ -1588,6 +1592,7 @@ impl SqlEditorWidget {
             pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
             intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
             intellisense_parse_generation: Arc<AtomicU64>,
+            intellisense_popup_show_in_progress: Arc<AtomicBool>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -1687,6 +1692,7 @@ impl SqlEditorWidget {
                             &pending_intellisense,
                             &intellisense_parse_cache,
                             &intellisense_parse_generation,
+                            &intellisense_popup_show_in_progress,
                         );
                     } else {
                         // Cursor moved since async load was requested.
@@ -1773,6 +1779,7 @@ impl SqlEditorWidget {
                     pending_intellisense.clone(),
                     intellisense_parse_cache.clone(),
                     intellisense_parse_generation.clone(),
+                    intellisense_popup_show_in_progress.clone(),
                 );
             });
         }
@@ -1793,6 +1800,7 @@ impl SqlEditorWidget {
             pending_intellisense,
             intellisense_parse_cache,
             intellisense_parse_generation,
+            intellisense_popup_show_in_progress,
         );
     }
 
@@ -2635,6 +2643,8 @@ impl SqlEditorWidget {
         );
         self.intellisense_parse_generation
             .fetch_add(1, Ordering::Relaxed);
+        self.intellisense_popup_show_in_progress
+            .store(false, Ordering::Relaxed);
 
         self.intellisense_popup
             .lock()
