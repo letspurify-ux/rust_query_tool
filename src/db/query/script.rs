@@ -130,8 +130,8 @@ impl SplitState {
                 if self.block_depth > 0 {
                     self.block_depth -= 1;
                 }
-            } else if matches!(upper, "BEFORE" | "AFTER") && self.in_compound_trigger {
-                // END BEFORE ..., END AFTER ... - COMPOUND TRIGGER timing point 종료
+            } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD") && self.in_compound_trigger {
+                // END BEFORE ..., END AFTER ..., END INSTEAD ... - COMPOUND TRIGGER timing point 종료
                 // depth 감소 (타이밍 포인트 블록 종료)
                 if self.block_depth > 0 {
                     self.block_depth -= 1;
@@ -271,7 +271,7 @@ impl SplitState {
             // Set pending_end and determine in next token whether this is:
             // - END CASE (PL/SQL CASE statement)
             // - END IF / END LOOP
-            // - END BEFORE / END AFTER (COMPOUND TRIGGER timing point)
+            // - END BEFORE / END AFTER / END INSTEAD (COMPOUND TRIGGER timing point)
             // - END (CASE expression or PL/SQL block)
             self.pending_end = true;
         } else if upper == "COMPOUND" && self.in_create_plsql {
@@ -281,8 +281,8 @@ impl SplitState {
             // 최종 END trigger_name이 depth 1→0으로 내려서 문장을 종료한다.
             self.in_compound_trigger = true;
             self.block_depth += 1;
-        } else if matches!(upper, "BEFORE" | "AFTER") && self.in_compound_trigger {
-            // BEFORE/AFTER in COMPOUND TRIGGER context - prepare for timing point IS
+        } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD") && self.in_compound_trigger {
+            // BEFORE/AFTER/INSTEAD in COMPOUND TRIGGER context - prepare for timing point IS
             self.pending_timing_point_is = true;
         }
 
@@ -870,14 +870,23 @@ impl QueryExecutor {
             }
 
             // Eagerly resolve pending_end when the current line does NOT continue an
-            // END CASE / END IF / END LOOP / END BEFORE / END AFTER sequence.
+            // END CASE / END IF / END LOOP / END BEFORE / END AFTER / END INSTEAD sequence.
             // Without this, a bare "END" on its own line (e.g. CASE expression end)
             // leaves block_depth and case_depth_stack stale for the next line's depth
             // calculation, causing incorrect indentation for ELSE/WHEN that follow.
             if builder.state.pending_end
                 && !matches!(
                     leading_word,
-                    Some("CASE" | "IF" | "LOOP" | "WHILE" | "BEFORE" | "AFTER" | "REPEAT")
+                    Some(
+                        "CASE"
+                            | "IF"
+                            | "LOOP"
+                            | "WHILE"
+                            | "BEFORE"
+                            | "AFTER"
+                            | "INSTEAD"
+                            | "REPEAT"
+                    )
                 )
             {
                 if builder
@@ -915,7 +924,16 @@ impl QueryExecutor {
             if builder.state.pending_end
                 && matches!(
                     leading_word,
-                    Some("CASE" | "IF" | "LOOP" | "WHILE" | "BEFORE" | "AFTER" | "REPEAT")
+                    Some(
+                        "CASE"
+                            | "IF"
+                            | "LOOP"
+                            | "WHILE"
+                            | "BEFORE"
+                            | "AFTER"
+                            | "INSTEAD"
+                            | "REPEAT"
+                    )
                 )
             {
                 depth = depth.saturating_sub(1);
