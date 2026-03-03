@@ -157,11 +157,11 @@ pub fn analyze_cursor_context(
 ) -> CursorContext {
     let clamped_cursor_token_len = cursor_token_len.min(full_statement.len());
     let statement_tokens: Arc<[SqlToken]> = full_statement.to_vec().into();
-    let phase_analysis = analyze_phase(&statement_tokens[..clamped_cursor_token_len]);
-    let table_analysis = collect_tables_deep(
-        statement_tokens.as_ref(),
-        &phase_analysis.visible_scope_chain,
-        clamped_cursor_token_len,
+    let parse_result = scan_cursor_context(statement_tokens.as_ref(), clamped_cursor_token_len);
+    let table_analysis = filter_scope_entries(
+        &parse_result.parsed_tables,
+        &parse_result.parsed_subqueries,
+        &parse_result.visible_scope_chain,
     );
     let ctes = parse_ctes(statement_tokens.as_ref());
 
@@ -183,20 +183,14 @@ pub fn analyze_cursor_context(
     CursorContext {
         statement_tokens,
         cursor_token_len: clamped_cursor_token_len,
-        phase: phase_analysis.phase,
-        depth: phase_analysis.depth,
+        phase: parse_result.phase,
+        depth: parse_result.depth,
         tables_in_scope,
         ctes,
         subqueries: table_analysis.subqueries,
         qualifier: None,
         qualifier_tables: Vec::new(),
     }
-}
-
-struct PhaseAnalysis {
-    phase: SqlPhase,
-    depth: usize,
-    visible_scope_chain: Vec<usize>,
 }
 
 /// Returns true for functions whose syntax includes a FROM keyword as part of
@@ -214,13 +208,6 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE")
 }
 
-fn is_cte_recovery_keyword(word: &str) -> bool {
-    matches!(
-        word,
-        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH"
-    )
-}
-
 fn should_enter_with_clause(current_phase: SqlPhase, depth: usize, last_word: Option<&str>) -> bool {
     if matches!(current_phase, SqlPhase::Initial) {
         return true;
@@ -234,31 +221,84 @@ fn should_enter_with_clause(current_phase: SqlPhase, depth: usize, last_word: Op
     depth > 0 && last_word.is_none()
 }
 
-/// Walk tokens up to cursor to determine the current SQL phase and depth.
-fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
+#[derive(Debug, Clone)]
+struct ParsedTableEntry {
+    table: ScopedTableRef,
+    scope_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSubqueryEntry {
+    subquery: SubqueryDefinition,
+    scope_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CursorScanResult {
+    phase: SqlPhase,
+    depth: usize,
+    visible_scope_chain: Vec<usize>,
+    parsed_tables: Vec<ParsedTableEntry>,
+    parsed_subqueries: Vec<ParsedSubqueryEntry>,
+}
+
+/// Build visible scope chain from current scope to root.
+fn build_visible_scope_chain(
+    scope_stack: &[usize],
+    visible_parent: &HashMap<usize, Option<usize>>,
+) -> Vec<usize> {
+    let mut visible_scope_chain = Vec::new();
+    let mut scope_id = *scope_stack.last().unwrap_or(&0);
+    visible_scope_chain.push(scope_id);
+    while let Some(Some(parent_id)) = visible_parent.get(&scope_id) {
+        visible_scope_chain.push(*parent_id);
+        scope_id = *parent_id;
+    }
+    visible_scope_chain.reverse();
+    visible_scope_chain
+}
+
+fn snapshot_cursor_state(
+    depth: usize,
+    query_depth: usize,
+    phase_stack: &[SqlPhase],
+    scope_stack: &[usize],
+    visible_parent: &HashMap<usize, Option<usize>>,
+) -> (SqlPhase, usize, Vec<usize>) {
+    (
+        phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial),
+        query_depth,
+        build_visible_scope_chain(scope_stack, visible_parent),
+    )
+}
+
+/// Single-pass cursor parser:
+/// - Tracks SQL phase/query depth at cursor
+/// - Collects relation/subquery entries with scope ids
+/// - Shares one keyword transition table for both phase and table collection
+fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorScanResult {
     let mut depth: usize = 0;
     let mut query_depth: usize = 0;
-    // Track phase at each depth level
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
-    // Track whether each parenthesized scope is a SELECT query scope.
-    // This lets `depth` represent nested query depth rather than generic
-    // parenthesis nesting (e.g. function arguments).
     let mut query_scope_stack: Vec<bool> = vec![false];
-    // Track the function name before '(' at each depth level, used to
-    // distinguish function-internal FROM (EXTRACT, TRIM) from SQL FROM clauses.
     let mut paren_func_stack: Vec<Option<String>> = vec![None];
-    // Each FROM-consuming function should consume only one internal FROM per
-    // parenthesized call depth. This prevents malformed inputs with a missing
-    // ')' from swallowing the real outer FROM clause forever.
     let mut paren_func_from_consumed_stack: Vec<bool> = vec![false];
     let mut last_word: Option<String> = None;
+    let mut expect_table = false;
+    let mut all_tables: Vec<ParsedTableEntry> = Vec::new();
+    let mut all_subqueries: Vec<ParsedSubqueryEntry> = Vec::new();
+    let mut subquery_tracks: Vec<(usize, usize)> = Vec::new(); // (depth, start_idx)
+
     let mut next_scope_id = 1usize;
     let mut scope_stack = vec![0usize];
     let mut visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
     visible_parent.insert(0, None);
+
     let mut pending_lateral_subquery = false;
     let mut cte_state = CteState::None;
     let mut cte_paren_depth: usize = 0;
+
+    let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>)> = None;
     let mut idx = 0;
 
     let mark_query_scope = |depth: usize, query_scope_stack: &mut Vec<bool>, query_depth: &mut usize| {
@@ -274,6 +314,16 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     };
 
     while idx < tokens.len() {
+        if cursor_snapshot.is_none() && idx == cursor_token_len {
+            cursor_snapshot = Some(snapshot_cursor_state(
+                depth,
+                query_depth,
+                &phase_stack,
+                &scope_stack,
+                &visible_parent,
+            ));
+        }
+
         let token = &tokens[idx];
 
         match token {
@@ -281,6 +331,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 let parent_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 depth += 1;
+
                 let inherited_phase = if parent_phase.is_column_context()
                     || matches!(
                         parent_phase,
@@ -313,10 +364,11 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 } else {
                     paren_func_from_consumed_stack[depth] = false;
                 }
+
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
                 scope_stack.push(scope_id);
-                // Derived table/subquery in FROM introduces an isolated scope.
+
                 let is_from_lateral_function = paren_func_stack
                     .get(depth)
                     .and_then(|name| name.as_deref())
@@ -330,7 +382,14 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     Some(parent_scope_id)
                 };
                 visible_parent.insert(scope_id, inherited_visible_parent);
+
                 pending_lateral_subquery = false;
+                expect_table = false;
+
+                if matches!(parent_phase, SqlPhase::FromClause) {
+                    subquery_tracks.push((depth, idx + 1));
+                }
+
                 if matches!(cte_state, CteState::ExpectBody) {
                     cte_state = CteState::InBody;
                     cte_paren_depth = depth;
@@ -347,6 +406,85 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 if matches!(cte_state, CteState::InBody) && depth == cte_paren_depth {
                     cte_state = CteState::None;
                 }
+
+                while subquery_tracks.last().is_some_and(|track| track.0 > depth) {
+                    // Recover from malformed SQL with stale tracks.
+                    subquery_tracks.pop();
+                }
+
+                let was_subquery = subquery_tracks.last().map(|t| t.0) == Some(depth);
+                if let Some((_, start_idx)) = was_subquery.then(|| subquery_tracks.pop()).flatten() {
+                    if start_idx <= idx {
+                        let parent_scope_id = if scope_stack.len() >= 2 {
+                            scope_stack[scope_stack.len() - 2]
+                        } else {
+                            0
+                        };
+                        let body_range = TokenRange {
+                            start: start_idx,
+                            end: idx,
+                        };
+                        if let Some((alias, next_idx)) = parse_subquery_alias(tokens, idx + 1) {
+                            all_subqueries.push(ParsedSubqueryEntry {
+                                subquery: SubqueryDefinition {
+                                    alias: alias.clone(),
+                                    body_range,
+                                    depth: depth.saturating_sub(1),
+                                },
+                                scope_id: parent_scope_id,
+                            });
+                            all_tables.push(ParsedTableEntry {
+                                table: ScopedTableRef {
+                                    name: alias.clone(),
+                                    alias: Some(alias),
+                                    depth: depth.saturating_sub(1),
+                                    is_cte: false,
+                                },
+                                scope_id: parent_scope_id,
+                            });
+                            if query_scope_stack
+                                .last()
+                                .copied()
+                                .unwrap_or(false)
+                                && depth > 0
+                            {
+                                query_depth = query_depth.saturating_sub(1);
+                            }
+                            idx = next_idx;
+                            depth = depth.saturating_sub(1);
+                            if scope_stack.len() > 1 {
+                                scope_stack.pop();
+                            }
+                            if query_scope_stack.len() > 1 {
+                                query_scope_stack.pop();
+                            }
+                            pending_lateral_subquery = false;
+                            expect_table = false;
+                            last_word = None;
+                            continue;
+                        }
+
+                        let generated_name = anonymous_subquery_name(start_idx, depth);
+                        all_subqueries.push(ParsedSubqueryEntry {
+                            subquery: SubqueryDefinition {
+                                alias: generated_name.clone(),
+                                body_range,
+                                depth: depth.saturating_sub(1),
+                            },
+                            scope_id: parent_scope_id,
+                        });
+                        all_tables.push(ParsedTableEntry {
+                            table: ScopedTableRef {
+                                name: generated_name,
+                                alias: None,
+                                depth: depth.saturating_sub(1),
+                                is_cte: false,
+                            },
+                            scope_id: parent_scope_id,
+                        });
+                    }
+                }
+
                 if query_scope_stack
                     .last()
                     .copied()
@@ -363,11 +501,59 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     query_scope_stack.pop();
                 }
                 pending_lateral_subquery = false;
+                expect_table = false;
                 last_word = None;
                 idx += 1;
                 continue;
             }
             SqlToken::Comment(_) | SqlToken::String(_) => {
+                idx += 1;
+                continue;
+            }
+            SqlToken::Symbol(sym) if sym == "," => {
+                pending_lateral_subquery = false;
+                let current_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
+                if matches!(current_phase, SqlPhase::FromClause) {
+                    expect_table = true;
+                }
+                if matches!(cte_state, CteState::None)
+                    && depth == 0
+                    && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
+                {
+                    cte_state = CteState::ExpectName;
+                }
+                idx += 1;
+                continue;
+            }
+            SqlToken::Symbol(sym) if sym == ";" => {
+                let has_following_statement = tokens[idx + 1..]
+                    .iter()
+                    .any(|t| !matches!(t, SqlToken::Comment(_)));
+                if idx >= cursor_token_len || !has_following_statement {
+                    break;
+                }
+
+                all_tables.clear();
+                all_subqueries.clear();
+                subquery_tracks.clear();
+
+                depth = 0;
+                query_depth = 0;
+                phase_stack = vec![SqlPhase::Initial];
+                query_scope_stack = vec![false];
+                paren_func_stack = vec![None];
+                paren_func_from_consumed_stack = vec![false];
+                last_word = None;
+                expect_table = false;
+                cte_state = CteState::None;
+                cte_paren_depth = 0;
+
+                next_scope_id = 1;
+                scope_stack = vec![0usize];
+                visible_parent.clear();
+                visible_parent.insert(0, None);
+                pending_lateral_subquery = false;
+
                 idx += 1;
                 continue;
             }
@@ -384,7 +570,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     CteState::AfterName => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
-                        } else if is_cte_recovery_keyword(&upper) {
+                        } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::None;
                             continue;
                         }
@@ -394,7 +580,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     CteState::ExpectAs => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
-                        } else if is_cte_recovery_keyword(&upper) {
+                        } else if sql_text::is_cte_recovery_keyword(&upper) {
                             cte_state = CteState::None;
                             continue;
                         }
@@ -431,487 +617,17 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 match upper.as_str() {
                     "INSERT" => {
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        expect_table = false;
                     }
                     "WITH" if should_enter_with_clause(current_phase, depth, last_word.as_deref()) => {
                         phase_stack[depth] = SqlPhase::WithClause;
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         cte_state = CteState::ExpectName;
-                    }
-                    "SELECT" => {
-                        phase_stack[depth] = SqlPhase::SelectList;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
-                    }
-                    "FROM" => {
-                        // Only suppress the first FROM when the enclosing '('
-                        // belongs to a function that uses FROM as part of its
-                        // syntax (EXTRACT, TRIM, SUBSTRING, OVERLAY).
-                        // If the call is malformed (e.g. missing ')'), later
-                        // FROM keywords at the same depth are treated as real
-                        // SQL FROM clauses for parser recovery.
-                        let consumes_func_from = depth > 0
-                            && paren_func_stack
-                                .get(depth)
-                                .and_then(|name| name.as_deref())
-                                .is_some_and(is_from_consuming_function);
-                        let func_from_already_consumed = paren_func_from_consumed_stack
-                            .get(depth)
-                            .copied()
-                            .unwrap_or(false);
-                        if consumes_func_from && !func_from_already_consumed {
-                            if let Some(consumed_flag) =
-                                paren_func_from_consumed_stack.get_mut(depth)
-                            {
-                                *consumed_flag = true;
-                            }
-                        } else {
-                            phase_stack[depth] = SqlPhase::FromClause;
-                        }
-                    }
-                    "INTO" => {
-                        if matches!(
-                            current_phase,
-                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
-                        ) {
-                            phase_stack[depth] = SqlPhase::IntoClause;
-                        }
-                    }
-                    "USING" => {
-                        if matches!(
-                            current_phase,
-                            SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
-                        ) {
-                            phase_stack[depth] = SqlPhase::FromClause;
-                        }
-                    }
-                    "JOIN" | "APPLY" => {
-                        // JOIN resets to FROM context for next table
-                        phase_stack[depth] = SqlPhase::FromClause;
-                    }
-                    "ON" => {
-                        if matches!(current_phase, SqlPhase::FromClause) {
-                            phase_stack[depth] = SqlPhase::JoinCondition;
-                        }
-                    }
-                    "WHERE" => {
-                        phase_stack[depth] = SqlPhase::WhereClause;
-                    }
-                    "GROUP" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::GroupByClause;
-                            idx += 1; // skip BY
-                        }
-                    }
-                    "HAVING" => {
-                        phase_stack[depth] = SqlPhase::HavingClause;
-                    }
-                    "ORDER" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::OrderByClause;
-                            idx += 1; // skip BY
-                        }
-                    }
-                    "SET" => {
-                        phase_stack[depth] = SqlPhase::SetClause;
-                    }
-                    "UPDATE" => {
-                        phase_stack[depth] = SqlPhase::UpdateTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
-                    }
-                    "DELETE" => {
-                        phase_stack[depth] = SqlPhase::DeleteTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
-                    }
-                    "MERGE" => {
-                        phase_stack[depth] = SqlPhase::MergeTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
-                    }
-                    "CONNECT" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::ConnectByClause;
-                            idx += 1;
-                        }
-                    }
-                    "START" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("WITH") {
-                            phase_stack[depth] = SqlPhase::StartWithClause;
-                            idx += 1;
-                        }
-                    }
-                    "VALUES" => {
-                        phase_stack[depth] = SqlPhase::ValuesClause;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
-                    }
-                    "MATCH_RECOGNIZE" => {
-                        phase_stack[depth] = SqlPhase::MatchRecognizeClause;
-                    }
-                    "PIVOT" | "UNPIVOT" => {
-                        phase_stack[depth] = SqlPhase::PivotClause;
-                    }
-                    "MODEL" => {
-                        phase_stack[depth] = SqlPhase::ModelClause;
-                    }
-                    // Set operations reset to Initial for next SELECT
-                    "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
-                        phase_stack[depth] = SqlPhase::Initial;
-                    }
-                    // After comma in WITH clause, expect next CTE name
-                    _ => {
-                        if matches!(cte_state, CteState::None)
-                            && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
-                            && depth == 0
-                        {
-                            // We might be between CTE definitions
-                        }
-                    }
-                }
-                last_word = Some(upper);
-            }
-            SqlToken::Symbol(sym) if sym == "," => {
-                pending_lateral_subquery = false;
-                // After comma in WITH clause at depth 0, expect next CTE name
-                if matches!(cte_state, CteState::None)
-                    && depth == 0
-                    && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
-                {
-                    cte_state = CteState::ExpectName;
-                }
-            }
-            SqlToken::Symbol(sym) if sym == ";" => {
-                // Keep scope numbering aligned with collect_tables_deep so
-                // visible_scope_chain matches table scope IDs across PL/SQL.
-                let has_following_statement = tokens[idx + 1..]
-                    .iter()
-                    .any(|t| !matches!(t, SqlToken::Comment(_)));
-                if !has_following_statement {
-                    break;
-                }
-
-                depth = 0;
-                phase_stack = vec![SqlPhase::Initial];
-                query_depth = 0;
-                query_scope_stack = vec![false];
-                paren_func_stack = vec![None];
-                paren_func_from_consumed_stack = vec![false];
-                last_word = None;
-                next_scope_id = 1;
-                scope_stack = vec![0usize];
-                visible_parent.clear();
-                visible_parent.insert(0, None);
-                pending_lateral_subquery = false;
-                cte_state = CteState::None;
-                cte_paren_depth = 0;
-                idx += 1;
-                continue;
-            }
-            _ => {
-                pending_lateral_subquery = false;
-            }
-        }
-        idx += 1;
-    }
-
-    let phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
-    let mut visible_scope_chain = Vec::new();
-    let mut scope_id = *scope_stack.last().unwrap_or(&0);
-    visible_scope_chain.push(scope_id);
-    while let Some(Some(parent_id)) = visible_parent.get(&scope_id) {
-        visible_scope_chain.push(*parent_id);
-        scope_id = *parent_id;
-    }
-    visible_scope_chain.reverse();
-
-    PhaseAnalysis {
-        phase,
-        depth: query_depth,
-        visible_scope_chain,
-    }
-}
-
-struct TableAnalysis {
-    tables: Vec<ScopedTableRef>,
-    subqueries: Vec<SubqueryDefinition>,
-}
-
-fn anonymous_subquery_name(start_idx: usize, depth: usize) -> String {
-    format!("__SUBQUERY_{}_{}", depth, start_idx)
-}
-
-/// Collect all table references from the full statement, tracking depth.
-/// Returns tables visible from the cursor's active scope chain.
-fn collect_tables_deep(
-    tokens: &[SqlToken],
-    cursor_scope_chain: &[usize],
-    cursor_token_len: usize,
-) -> TableAnalysis {
-    struct ParsedTable {
-        table: ScopedTableRef,
-        scope_id: usize,
-    }
-
-    struct ParsedSubquery {
-        subquery: SubqueryDefinition,
-        scope_id: usize,
-    }
-
-    let mut all_tables: Vec<ParsedTable> = Vec::new();
-    let mut all_subqueries: Vec<ParsedSubquery> = Vec::new();
-    let mut depth: usize = 0;
-    let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
-    let mut paren_func_stack: Vec<Option<String>> = vec![None];
-    let mut paren_func_from_consumed_stack: Vec<bool> = vec![false];
-    let mut last_word: Option<String> = None;
-    let mut expect_table = false;
-    let mut cte_state = CteState::None;
-    let mut cte_paren_depth: usize = 0;
-    let mut next_scope_id = 1usize;
-    let mut scope_stack = vec![0usize];
-    // Track subquery aliases: when we close a paren at a certain depth in FROM context,
-    // store (depth, start_token_idx) so we can capture body tokens
-    let mut subquery_tracks: Vec<(usize, usize)> = Vec::new(); // (depth, start_idx)
-    let mut idx = 0;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-
-        match token {
-            SqlToken::Symbol(sym) if sym == "(" => {
-                let parent_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
-                depth += 1;
-                while phase_stack.len() <= depth {
-                    phase_stack.push(SqlPhase::Initial);
-                }
-                phase_stack[depth] = SqlPhase::Initial;
-                let func_name = last_word.take().map(|w| w.to_ascii_uppercase());
-                if paren_func_stack.len() <= depth {
-                    paren_func_stack.push(func_name);
-                } else {
-                    paren_func_stack[depth] = func_name;
-                }
-                if paren_func_from_consumed_stack.len() <= depth {
-                    paren_func_from_consumed_stack.push(false);
-                } else {
-                    paren_func_from_consumed_stack[depth] = false;
-                }
-                expect_table = false;
-                scope_stack.push(next_scope_id);
-                next_scope_id += 1;
-
-                if matches!(parent_phase, SqlPhase::FromClause) {
-                    subquery_tracks.push((depth, idx + 1)); // depth after increment, token after '('
-                }
-                if matches!(cte_state, CteState::ExpectBody) {
-                    cte_state = CteState::InBody;
-                    cte_paren_depth = depth;
-                }
-                idx += 1;
-                continue;
-            }
-            SqlToken::Symbol(sym) if sym == ")" => {
-                if matches!(cte_state, CteState::InBody) && depth == cte_paren_depth {
-                    cte_state = CteState::None;
-                }
-
-                while subquery_tracks.last().is_some_and(|track| track.0 > depth) {
-                    // Recover gracefully from malformed SQL with unbalanced parentheses.
-                    // Stale entries can otherwise trigger panics when slicing token ranges.
-                    subquery_tracks.pop();
-                }
-
-                let was_subquery = subquery_tracks.last().map(|t| t.0) == Some(depth);
-                if let Some((_, start_idx)) = was_subquery.then(|| subquery_tracks.pop()).flatten()
-                {
-                    if start_idx > idx {
-                        depth = depth.saturating_sub(1);
-                        idx += 1;
-                        continue;
-                    }
-                    // Look for alias after the closing paren
-                    if let Some((alias, next_idx)) = parse_subquery_alias(tokens, idx + 1) {
-                        let parent_scope_id = if scope_stack.len() >= 2 {
-                            scope_stack[scope_stack.len() - 2]
-                        } else {
-                            0
-                        };
-                        // Capture body token range for column inference.
-                        let body_range = TokenRange {
-                            start: start_idx,
-                            end: idx,
-                        };
-                        all_subqueries.push(ParsedSubquery {
-                            subquery: SubqueryDefinition {
-                                alias: alias.clone(),
-                                body_range,
-                                depth: depth.saturating_sub(1),
-                            },
-                            scope_id: parent_scope_id,
-                        });
-                        all_tables.push(ParsedTable {
-                            table: ScopedTableRef {
-                                name: alias.clone(),
-                                alias: Some(alias),
-                                depth: depth.saturating_sub(1),
-                                is_cte: false,
-                            },
-                            scope_id: parent_scope_id,
-                        });
-                        idx = next_idx;
-                        depth = depth.saturating_sub(1);
-                        if scope_stack.len() > 1 {
-                            scope_stack.pop();
-                        }
-                        continue;
-                    }
-
-                    // Subquery without alias: still expose projected columns for unqualified
-                    // column completion (e.g. SELECT | FROM (SELECT ...)).
-                    let parent_scope_id = if scope_stack.len() >= 2 {
-                        scope_stack[scope_stack.len() - 2]
-                    } else {
-                        0
-                    };
-                    let generated_name = anonymous_subquery_name(start_idx, depth);
-                    let body_range = TokenRange {
-                        start: start_idx,
-                        end: idx,
-                    };
-                    all_subqueries.push(ParsedSubquery {
-                        subquery: SubqueryDefinition {
-                            alias: generated_name.clone(),
-                            body_range,
-                            depth: depth.saturating_sub(1),
-                        },
-                        scope_id: parent_scope_id,
-                    });
-                    all_tables.push(ParsedTable {
-                        table: ScopedTableRef {
-                            name: generated_name,
-                            alias: None,
-                            depth: depth.saturating_sub(1),
-                            is_cte: false,
-                        },
-                        scope_id: parent_scope_id,
-                    });
-                }
-
-                depth = depth.saturating_sub(1);
-                if scope_stack.len() > 1 {
-                    scope_stack.pop();
-                }
-                last_word = None;
-                idx += 1;
-                continue;
-            }
-            SqlToken::Comment(_) | SqlToken::String(_) => {
-                idx += 1;
-                continue;
-            }
-            SqlToken::Symbol(sym) if sym == "," => {
-                // After comma in FROM clause, expect another table
-                let current_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
-                if matches!(current_phase, SqlPhase::FromClause) {
-                    expect_table = true;
-                }
-                // After comma in WITH clause, expect next CTE
-                if matches!(cte_state, CteState::None)
-                    && depth == 0
-                    && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
-                {
-                    cte_state = CteState::ExpectName;
-                }
-                idx += 1;
-                continue;
-            }
-            SqlToken::Symbol(sym) if sym == ";" => {
-                if idx >= cursor_token_len {
-                    break;
-                }
-                // Statement boundary - reset only when another statement follows.
-                // Keep collected state for trailing terminators in the final statement.
-                let has_following_statement = tokens[idx + 1..]
-                    .iter()
-                    .any(|t| !matches!(t, SqlToken::Comment(_)));
-                if !has_following_statement {
-                    break;
-                }
-
-                all_tables.clear();
-                all_subqueries.clear();
-                depth = 0;
-                phase_stack = vec![SqlPhase::Initial];
-                paren_func_stack = vec![None];
-                paren_func_from_consumed_stack = vec![false];
-                last_word = None;
-                expect_table = false;
-                cte_state = CteState::None;
-                subquery_tracks.clear();
-                next_scope_id = 1;
-                scope_stack = vec![0usize];
-                idx += 1;
-                continue;
-            }
-            SqlToken::Word(word) => {
-                let upper = word.to_ascii_uppercase();
-
-                // CTE state machine for table collection
-                match cte_state {
-                    CteState::ExpectName if upper != "RECURSIVE" => {
-                        cte_state = CteState::AfterName;
-                        idx += 1;
-                        continue;
-                    }
-                    CteState::AfterName => {
-                        if upper == "AS" {
-                            cte_state = CteState::ExpectBody;
-                        } else if is_cte_recovery_keyword(&upper) {
-                            cte_state = CteState::None;
-                            continue;
-                        }
-                        idx += 1;
-                        continue;
-                    }
-                    CteState::ExpectAs => {
-                        if upper == "AS" {
-                            cte_state = CteState::ExpectBody;
-                        } else if is_cte_recovery_keyword(&upper) {
-                            cte_state = CteState::None;
-                            continue;
-                        }
-                        idx += 1;
-                        continue;
-                    }
-                    CteState::InBody => {
-                        // Process normally inside CTE body
-                    }
-                    CteState::None => {}
-                    _ => {
-                        idx += 1;
-                        continue;
-                    }
-                }
-
-                while phase_stack.len() <= depth {
-                    phase_stack.push(SqlPhase::Initial);
-                }
-
-                // Phase transitions
-                match upper.as_str() {
-                    "WITH"
-                        if should_enter_with_clause(
-                            phase_stack[depth],
-                            depth,
-                            last_word.as_deref(),
-                        ) =>
-                    {
-                        phase_stack[depth] = SqlPhase::WithClause;
-                        cte_state = CteState::ExpectName;
-                        expect_table = false;
-                    }
-                    "MERGE" => {
-                        phase_stack[depth] = SqlPhase::MergeTarget;
                         expect_table = false;
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         expect_table = false;
                     }
                     "FROM" => {
@@ -935,96 +651,120 @@ fn collect_tables_deep(
                             expect_table = true;
                         }
                     }
+                    "INTO" => {
+                        if matches!(
+                            current_phase,
+                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
+                        ) {
+                            phase_stack[depth] = SqlPhase::IntoClause;
+                            expect_table = true;
+                        }
+                    }
+                    "USING" => {
+                        if matches!(
+                            current_phase,
+                            SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
+                        ) {
+                            phase_stack[depth] = SqlPhase::FromClause;
+                            expect_table = true;
+                        }
+                    }
                     "JOIN" | "APPLY" => {
                         phase_stack[depth] = SqlPhase::FromClause;
                         expect_table = true;
                     }
-                    "INTO"
-                        if matches!(
-                            phase_stack[depth],
-                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
-                        ) =>
-                    {
-                        phase_stack[depth] = SqlPhase::IntoClause;
-                        expect_table = true;
-                    }
-                    "USING"
-                        if matches!(
-                            phase_stack[depth],
-                            SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
-                        ) =>
-                    {
-                        phase_stack[depth] = SqlPhase::FromClause;
-                        expect_table = true;
-                    }
-                    "UPDATE" => {
-                        phase_stack[depth] = SqlPhase::UpdateTarget;
-                        expect_table = true;
-                    }
-                    "DELETE" => {
-                        phase_stack[depth] = SqlPhase::DeleteTarget;
-                        expect_table = true;
-                    }
-                    "ON" if matches!(phase_stack[depth], SqlPhase::FromClause) => {
-                        phase_stack[depth] = SqlPhase::JoinCondition;
+                    "ON" => {
+                        if matches!(current_phase, SqlPhase::FromClause) {
+                            phase_stack[depth] = SqlPhase::JoinCondition;
+                        }
                         expect_table = false;
                     }
-                    "WHERE" | "HAVING" => {
-                        phase_stack[depth] = if upper == "WHERE" {
-                            SqlPhase::WhereClause
-                        } else {
-                            SqlPhase::HavingClause
-                        };
+                    "WHERE" => {
+                        phase_stack[depth] = SqlPhase::WhereClause;
                         expect_table = false;
                     }
-                    "GROUP" if peek_word_upper(tokens, idx + 1) == Some("BY") => {
-                        phase_stack[depth] = SqlPhase::GroupByClause;
+                    "GROUP" => {
+                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
+                            phase_stack[depth] = SqlPhase::GroupByClause;
+                            idx += 1; // skip BY
+                        }
                         expect_table = false;
-                        idx += 1;
                     }
-                    "ORDER" if peek_word_upper(tokens, idx + 1) == Some("BY") => {
-                        phase_stack[depth] = SqlPhase::OrderByClause;
+                    "HAVING" => {
+                        phase_stack[depth] = SqlPhase::HavingClause;
                         expect_table = false;
-                        idx += 1;
+                    }
+                    "ORDER" => {
+                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
+                            phase_stack[depth] = SqlPhase::OrderByClause;
+                            idx += 1; // skip BY
+                        }
+                        expect_table = false;
                     }
                     "SET" => {
                         phase_stack[depth] = SqlPhase::SetClause;
                         expect_table = false;
                     }
-                    "CONNECT" if peek_word_upper(tokens, idx + 1) == Some("BY") => {
-                        phase_stack[depth] = SqlPhase::ConnectByClause;
-                        expect_table = false;
-                        idx += 1;
+                    "UPDATE" => {
+                        phase_stack[depth] = SqlPhase::UpdateTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        expect_table = true;
                     }
-                    "START" if peek_word_upper(tokens, idx + 1) == Some("WITH") => {
-                        phase_stack[depth] = SqlPhase::StartWithClause;
+                    "DELETE" => {
+                        phase_stack[depth] = SqlPhase::DeleteTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        expect_table = true;
+                    }
+                    "MERGE" => {
+                        phase_stack[depth] = SqlPhase::MergeTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         expect_table = false;
-                        idx += 1;
+                    }
+                    "CONNECT" => {
+                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
+                            phase_stack[depth] = SqlPhase::ConnectByClause;
+                            idx += 1;
+                        }
+                        expect_table = false;
+                    }
+                    "START" => {
+                        if peek_word_upper(tokens, idx + 1) == Some("WITH") {
+                            phase_stack[depth] = SqlPhase::StartWithClause;
+                            idx += 1;
+                        }
+                        expect_table = false;
                     }
                     "VALUES" => {
                         phase_stack[depth] = SqlPhase::ValuesClause;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         expect_table = false;
                     }
                     "MATCH_RECOGNIZE" => {
                         phase_stack[depth] = SqlPhase::MatchRecognizeClause;
                         expect_table = false;
                     }
+                    "PIVOT" | "UNPIVOT" => {
+                        phase_stack[depth] = SqlPhase::PivotClause;
+                        expect_table = false;
+                    }
+                    "MODEL" => {
+                        phase_stack[depth] = SqlPhase::ModelClause;
+                        expect_table = false;
+                    }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
                         phase_stack[depth] = SqlPhase::Initial;
                         expect_table = false;
                     }
-                    // Keywords that signal end of FROM clause table collection
                     kw if is_table_stop_keyword(kw) && expect_table => {
                         expect_table = false;
                     }
                     _ => {
                         if expect_table {
-                            // Try to parse a table name
-                            if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
-                            {
+                            if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx) {
                                 let (alias, after_alias) = parse_alias_deep(tokens, next_idx);
+                                let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
-                                all_tables.push(ParsedTable {
+                                all_tables.push(ParsedTableEntry {
                                     table: ScopedTableRef {
                                         name: table_name,
                                         alias,
@@ -1033,13 +773,22 @@ fn collect_tables_deep(
                                     },
                                     scope_id,
                                 });
-                                // Check if next is comma (continue expecting tables)
                                 if let Some(SqlToken::Symbol(sym)) = tokens.get(after_alias) {
                                     if sym == "," {
                                         expect_table = true;
+                                        last_word = None;
                                         idx = after_alias + 1;
                                         continue;
                                     }
+                                    if sym == "(" && !alias_present {
+                                        // Preserve table-function name for immediate
+                                        // parenthesized argument scope handling.
+                                        last_word = Some(upper.clone());
+                                    } else {
+                                        last_word = None;
+                                    }
+                                } else {
+                                    last_word = None;
                                 }
                                 expect_table = false;
                                 idx = after_alias;
@@ -1052,31 +801,78 @@ fn collect_tables_deep(
                 last_word = Some(upper);
             }
             _ => {
+                pending_lateral_subquery = false;
                 last_word = None;
             }
         }
         idx += 1;
     }
 
-    let visible_scope_ids: HashSet<usize> = cursor_scope_chain.iter().copied().collect();
-
-    // Visible objects are those defined in current scope or any ancestor scope.
-    let visible: Vec<ScopedTableRef> = all_tables
-        .into_iter()
-        .filter(|entry| visible_scope_ids.contains(&entry.scope_id))
-        .map(|entry| entry.table)
-        .collect();
-
-    let visible_subqueries: Vec<SubqueryDefinition> = all_subqueries
-        .into_iter()
-        .filter(|entry| visible_scope_ids.contains(&entry.scope_id))
-        .map(|entry| entry.subquery)
-        .collect();
-
-    TableAnalysis {
-        tables: visible,
-        subqueries: visible_subqueries,
+    if cursor_snapshot.is_none() {
+        cursor_snapshot = Some(snapshot_cursor_state(
+            depth,
+            query_depth,
+            &phase_stack,
+            &scope_stack,
+            &visible_parent,
+        ));
     }
+    let (phase, cursor_query_depth, cursor_visible_scope_chain) =
+        cursor_snapshot.unwrap_or((SqlPhase::Initial, 0usize, vec![0usize]));
+
+    CursorScanResult {
+        phase,
+        depth: cursor_query_depth,
+        visible_scope_chain: cursor_visible_scope_chain,
+        parsed_tables: all_tables,
+        parsed_subqueries: all_subqueries,
+    }
+}
+
+struct TableAnalysis {
+    tables: Vec<ScopedTableRef>,
+    subqueries: Vec<SubqueryDefinition>,
+}
+
+fn anonymous_subquery_name(start_idx: usize, depth: usize) -> String {
+    format!("__SUBQUERY_{}_{}", depth, start_idx)
+}
+
+/// Collect all table references from the full statement, tracking depth.
+/// Returns tables visible from the cursor's active scope chain.
+fn collect_tables_deep(
+    tokens: &[SqlToken],
+    cursor_scope_chain: &[usize],
+    cursor_token_len: usize,
+) -> TableAnalysis {
+    let scan_result = scan_cursor_context(tokens, cursor_token_len);
+    filter_scope_entries(
+        &scan_result.parsed_tables,
+        &scan_result.parsed_subqueries,
+        cursor_scope_chain,
+    )
+}
+
+fn filter_scope_entries(
+    parsed_tables: &[ParsedTableEntry],
+    parsed_subqueries: &[ParsedSubqueryEntry],
+    visible_scope_chain: &[usize],
+) -> TableAnalysis {
+    let visible_scope_ids: HashSet<usize> = visible_scope_chain.iter().copied().collect();
+
+    let tables = parsed_tables
+        .iter()
+        .filter(|entry| visible_scope_ids.contains(&entry.scope_id))
+        .map(|entry| entry.table.clone())
+        .collect();
+
+    let subqueries = parsed_subqueries
+        .iter()
+        .filter(|entry| visible_scope_ids.contains(&entry.scope_id))
+        .map(|entry| entry.subquery.clone())
+        .collect();
+
+    TableAnalysis { tables, subqueries }
 }
 
 pub fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
@@ -1148,10 +944,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             // If we hit a top-level statement keyword before WITH, no CTEs.
             SqlToken::Word(w) if paren_state.depth() == 0 => {
                 let u = w.to_ascii_uppercase();
-                if matches!(
-                    u.as_str(),
-                    "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
-                ) {
+                if sql_text::is_with_main_query_keyword(&u) {
                     return ctes;
                 }
             }

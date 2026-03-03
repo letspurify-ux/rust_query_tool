@@ -542,6 +542,13 @@ impl StatementBuilder {
     }
 
     fn process_text(&mut self, text: &str) {
+        self.process_text_with_observer(text, |_, _, _, _| {});
+    }
+
+    fn process_text_with_observer<F>(&mut self, text: &str, mut on_symbol: F)
+    where
+        F: FnMut(&[char], usize, char, Option<char>),
+    {
         let chars: Vec<char> = text.chars().collect();
         let len = chars.len();
         let mut i = 0usize;
@@ -725,6 +732,7 @@ impl StatementBuilder {
             }
 
             self.state.flush_token();
+            on_symbol(&chars, i, c, next);
 
             // Track parenthesis depth at the execution layer so that
             // formatting/intellisense can build on this base.
@@ -819,24 +827,31 @@ impl StatementBuilder {
 }
 
 impl QueryExecutor {
-    fn is_sqlplus_comment_line(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("--") {
-            return true;
-        }
-
-        matches!(
-            trimmed.split_whitespace().next(),
-            Some(first) if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
-        )
-    }
-
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
         #[derive(Copy, Clone, Eq, PartialEq)]
         enum SubqueryParenKind {
             NonSubquery,
             Pending,
             Subquery,
+        }
+
+        #[derive(Copy, Clone, Default)]
+        struct DepthComponents {
+            block_depth: usize,
+            query_paren_depth: usize,
+            with_cte_depth: usize,
+            case_branch_depth: usize,
+            exception_handler_depth: usize,
+        }
+
+        impl DepthComponents {
+            fn total(self) -> usize {
+                self.block_depth
+                    .saturating_add(self.query_paren_depth)
+                    .saturating_add(self.with_cte_depth)
+                    .saturating_add(self.case_branch_depth)
+                    .saturating_add(self.exception_handler_depth)
+            }
         }
 
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
@@ -895,21 +910,11 @@ impl QueryExecutor {
                 "END" | "ELSE" | "ELSIF" | "ELSEIF" | "EXCEPTION"
             )
         }
-        let is_with_main_query_keyword = |word: &str| -> bool {
-            matches!(
-                word,
-                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES"
-            )
-        };
-        let is_subquery_head_keyword = |word: &str| -> bool {
-            matches!(
-                word,
-                "SELECT" | "WITH" | "VALUES" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
-            )
-        };
+        let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
+        let is_subquery_head_keyword = sql_text::is_subquery_head_keyword;
         let leading_keyword_after_comments = |line: &str| -> Option<String> {
             let trimmed = line.trim_start();
-            if Self::is_sqlplus_comment_line(trimmed) {
+            if sql_text::is_sqlplus_comment_line(trimmed) {
                 return None;
             }
 
@@ -987,7 +992,7 @@ impl QueryExecutor {
 
             let trimmed_start = line.trim_start();
             let is_comment_or_blank = trimmed_start.is_empty()
-                || Self::is_sqlplus_comment_line(trimmed_start)
+                || sql_text::is_sqlplus_comment_line(trimmed_start)
                 || ((trimmed_start.starts_with("/*") || trimmed_start.starts_with("*/"))
                     && leading_keyword.is_none());
 
@@ -1065,7 +1070,7 @@ impl QueryExecutor {
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
                 && matches!(leading_word, Some("END"));
-            let mut depth = if leading_word.is_some_and(should_pre_dedent) {
+            let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
                 builder.block_depth().saturating_sub(1)
             } else {
                 builder.block_depth()
@@ -1085,24 +1090,17 @@ impl QueryExecutor {
                     )
                 )
             {
-                depth = depth.saturating_sub(1);
+                block_depth_component = block_depth_component.saturating_sub(1);
             }
 
             if at_case_header_level && matches!(leading_word, Some("WHEN" | "ELSE")) {
-                depth = builder.block_depth();
+                block_depth_component = builder.block_depth();
             }
 
             if matches!(leading_word, Some("BEGIN"))
                 && (pending_subprogram_begin || builder.state.after_declare)
             {
-                depth = depth.saturating_sub(1);
-            }
-
-            if exception_handler_body
-                && !matches!(leading_word, Some("WHEN"))
-                && !exception_end_line
-            {
-                depth = depth.saturating_add(1);
+                block_depth_component = block_depth_component.saturating_sub(1);
             }
 
             let mut case_branch_indent = 0usize;
@@ -1121,223 +1119,55 @@ impl QueryExecutor {
                     case_branch_indent += 1;
                 }
             }
-            if case_branch_indent > 0 {
-                depth = depth.saturating_add(case_branch_indent);
-            }
 
-            // Pre-dedent additional virtual depths for closing lines.
-            if line.trim_start().starts_with(')') && subquery_paren_depth > 0 {
-                depth = depth.saturating_add(subquery_paren_depth.saturating_sub(1));
-            } else {
-                depth = depth.saturating_add(subquery_paren_depth);
-            }
+            let query_paren_component =
+                if line.trim_start().starts_with(')') && subquery_paren_depth > 0 {
+                    subquery_paren_depth.saturating_sub(1)
+                } else {
+                    subquery_paren_depth
+                };
 
-            if with_cte_depth > 0 {
+            let with_cte_component = if with_cte_depth > 0 {
                 let starts_main_select =
                     leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
-                // For the main query line that follows a WITH clause, do not add with_cte_depth.
-                // This brings depth back to the WITH line's level without touching any
-                // subquery_paren_depth that is already embedded in the current depth value.
-                // (Previously depth.saturating_sub(1) was used, which incorrectly cancelled
-                // subquery_paren_depth when the WITH clause appeared inside parentheses.)
-                if !starts_main_select {
-                    depth = depth.saturating_add(with_cte_depth);
+                if starts_main_select {
+                    0
+                } else {
+                    with_cte_depth
                 }
+            } else {
+                0
+            };
+
+            let exception_handler_component = if exception_handler_body
+                && !matches!(leading_word, Some("WHEN"))
+                && !exception_end_line
+            {
+                1
+            } else {
+                0
+            };
+
+            let depth = DepthComponents {
+                block_depth: block_depth_component,
+                query_paren_depth: query_paren_component,
+                with_cte_depth: with_cte_component,
+                case_branch_depth: case_branch_indent,
+                exception_handler_depth: exception_handler_component,
             }
+            .total();
 
             // No extra subprogram body depth: declarations and statements share the same level.
 
             depths.push(depth);
 
-            // Update additional depth state with a very lightweight token pass.
-            // Instead of maintaining duplicate quote/comment state machines,
-            // derive the carry-over literal state from SplitState (the execution
-            // base). process_text runs at the end of each iteration, so at this
-            // point builder.state reflects the end of the previous line.
-            let raw = line;
+            // Keep WITH-clause indentation context separate from block depth.
             let with_line = matches!(leading_word, Some("WITH"));
 
             if with_line {
                 pending_with = true;
                 with_cte_depth = with_cte_depth.max(1);
                 with_cte_paren = 0;
-            }
-
-            let chars: Vec<char> = raw.chars().collect();
-            let mut i = 0usize;
-            // Base literal/comment state from the execution-layer parser.
-            // SplitState already tracks these across lines via process_text,
-            // so we read the carry-over state instead of duplicating the state machine.
-            let mut in_block_comment = builder.state.in_block_comment;
-            let mut in_q_quote = builder.state.in_q_quote;
-            let mut q_quote_end = builder.state.q_quote_end;
-            let mut in_dollar_quote = builder.state.in_dollar_quote;
-            let mut dollar_quote_tag = builder.state.dollar_quote_tag.clone();
-            let mut in_single_quote = builder.state.in_single_quote;
-            let mut in_double_quote = builder.state.in_double_quote;
-            while i < chars.len() {
-                let c = chars[i];
-                let next = chars.get(i + 1).copied();
-
-                if in_block_comment {
-                    if c == '*' && next == Some('/') {
-                        in_block_comment = false;
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if in_q_quote {
-                    if Some(c) == q_quote_end && next == Some('\'') {
-                        in_q_quote = false;
-                        q_quote_end = None;
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if in_dollar_quote {
-                    if c == '$' && chars_starts_with(&chars, i, &dollar_quote_tag) {
-                        let tag_len = dollar_quote_tag.len();
-                        in_dollar_quote = false;
-                        dollar_quote_tag.clear();
-                        i += tag_len;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if in_single_quote {
-                    if c == '\'' {
-                        if next == Some('\'') {
-                            i += 2;
-                            continue;
-                        }
-                        in_single_quote = false;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if in_double_quote {
-                    if c == '"' {
-                        if next == Some('"') {
-                            i += 2;
-                            continue;
-                        }
-                        in_double_quote = false;
-                    }
-                    i += 1;
-                    continue;
-                }
-
-                if c == '-' && next == Some('-') {
-                    break;
-                }
-
-                if c == '/' && next == Some('*') {
-                    in_block_comment = true;
-                    i += 2;
-                    continue;
-                }
-
-                // Guard: q/nq-quote detection must not fire when the
-                // current character is part of a longer identifier
-                // (e.g. `seq'text'` should NOT start a q-quote at `q`).
-                let prev_is_ident = i > 0 && sql_text::is_identifier_char(chars[i - 1]);
-
-                if !prev_is_ident
-                    && (c == 'n' || c == 'N')
-                    && matches!(next, Some('q') | Some('Q'))
-                    && chars.get(i + 2) == Some(&'\'')
-                    && chars.get(i + 3).is_some()
-                {
-                    let delimiter = chars[i + 3];
-                    in_q_quote = true;
-                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                    i += 4;
-                    continue;
-                }
-
-                if !prev_is_ident
-                    && (c == 'q' || c == 'Q')
-                    && next == Some('\'')
-                    && chars.get(i + 2).is_some()
-                {
-                    let delimiter = chars[i + 2];
-                    in_q_quote = true;
-                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                    i += 3;
-                    continue;
-                }
-
-                if c == '$' {
-                    if let Some(tag) = parse_dollar_quote_tag(&chars, i) {
-                        let tag_len = tag.len();
-                        in_dollar_quote = true;
-                        dollar_quote_tag = tag;
-                        i += tag_len;
-                        continue;
-                    }
-                }
-
-                if c == '\'' {
-                    in_single_quote = true;
-                    i += 1;
-                    continue;
-                }
-
-                if c == '"' {
-                    in_double_quote = true;
-                    i += 1;
-                    continue;
-                }
-
-                if c == '(' {
-                    let j = skip_ws_and_comments(&chars, i + 1);
-                    let mut k = j;
-                    let mut paren_kind = SubqueryParenKind::NonSubquery;
-                    while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
-                        k += 1;
-                    }
-                    if k > j {
-                        let word: String = chars[j..k].iter().collect();
-                        let word = word.to_ascii_uppercase();
-                        if is_subquery_head_keyword(&word) {
-                            subquery_paren_depth += 1;
-                            paren_kind = SubqueryParenKind::Subquery;
-                        }
-                    } else if j >= chars.len()
-                        || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
-                        || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
-                    {
-                        pending_subquery_paren += 1;
-                        paren_kind = SubqueryParenKind::Pending;
-                    }
-                    subquery_paren_stack.push(paren_kind);
-                    if with_cte_depth > 0 {
-                        with_cte_paren += 1;
-                    }
-                } else if c == ')' {
-                    let closed_kind = subquery_paren_stack.pop();
-                    if closed_kind == Some(SubqueryParenKind::Subquery) {
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
-                    } else if closed_kind == Some(SubqueryParenKind::Pending) {
-                        pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                    } else if closed_kind.is_none() {
-                        // Malformed SQL recovery path: keep depth accounting monotonic.
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
-                    }
-                    if with_cte_depth > 0 {
-                        with_cte_paren -= 1;
-                    }
-                }
-                i += 1;
             }
 
             let mut idx = 0usize;
@@ -1393,7 +1223,52 @@ impl QueryExecutor {
 
             let mut line_with_newline = String::from(line);
             line_with_newline.push('\n');
-            builder.process_text(&line_with_newline);
+            builder.process_text_with_observer(
+                &line_with_newline,
+                |chars, symbol_idx, symbol, _next| {
+                    if symbol == '(' {
+                        let j = skip_ws_and_comments(chars, symbol_idx.saturating_add(1));
+                        let mut k = j;
+                        let mut paren_kind = SubqueryParenKind::NonSubquery;
+                        while k < chars.len()
+                            && (chars[k].is_ascii_alphanumeric() || chars[k] == '_')
+                        {
+                            k += 1;
+                        }
+                        if k > j {
+                            let word: String = chars[j..k].iter().collect();
+                            let word = word.to_ascii_uppercase();
+                            if is_subquery_head_keyword(&word) {
+                                subquery_paren_depth = subquery_paren_depth.saturating_add(1);
+                                paren_kind = SubqueryParenKind::Subquery;
+                            }
+                        } else if j >= chars.len()
+                            || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
+                            || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
+                        {
+                            pending_subquery_paren = pending_subquery_paren.saturating_add(1);
+                            paren_kind = SubqueryParenKind::Pending;
+                        }
+                        subquery_paren_stack.push(paren_kind);
+                        if with_cte_depth > 0 {
+                            with_cte_paren += 1;
+                        }
+                    } else if symbol == ')' {
+                        let closed_kind = subquery_paren_stack.pop();
+                        if closed_kind == Some(SubqueryParenKind::Subquery) {
+                            subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
+                        } else if closed_kind == Some(SubqueryParenKind::Pending) {
+                            pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
+                        } else if closed_kind.is_none() {
+                            // Malformed SQL recovery path: keep depth accounting monotonic.
+                            subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
+                        }
+                        if with_cte_depth > 0 {
+                            with_cte_paren -= 1;
+                        }
+                    }
+                },
+            );
         }
 
         depths
@@ -1405,7 +1280,7 @@ impl QueryExecutor {
         loop {
             let trimmed = remaining.trim_start();
 
-            if Self::is_sqlplus_comment_line(trimmed) {
+            if sql_text::is_sqlplus_comment_line(trimmed) {
                 if let Some(line_end) = trimmed.find('\n') {
                     remaining = &trimmed[line_end + 1..];
                     continue;
@@ -1438,13 +1313,13 @@ impl QueryExecutor {
             // Find the last line and check if it's only a comment
             if let Some(last_newline) = trimmed.rfind('\n') {
                 let last_line = trimmed[last_newline + 1..].trim();
-                if Self::is_sqlplus_comment_line(last_line) {
+                if sql_text::is_sqlplus_comment_line(last_line) {
                     result = trimmed[..last_newline].to_string();
                     continue;
                 }
             } else {
                 // Single line - check if entire thing is a line comment
-                if Self::is_sqlplus_comment_line(trimmed) {
+                if sql_text::is_sqlplus_comment_line(trimmed) {
                     return String::new();
                 }
             }
@@ -3716,7 +3591,7 @@ impl QueryExecutor {
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            let is_remark_line = Self::is_sqlplus_comment_line(trimmed);
+            let is_remark_line = sql_text::is_sqlplus_comment_line(trimmed);
 
             if !sqlblanklines_enabled
                 && trimmed.is_empty()

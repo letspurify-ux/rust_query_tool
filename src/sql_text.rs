@@ -95,3 +95,44 @@ pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     }
     trimmed.to_string()
 }
+
+/// Returns true when a line starts with SQL*Plus `REM`/`REMARK` comment commands.
+pub(crate) fn is_sqlplus_remark_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    matches!(
+        trimmed.split_whitespace().next(),
+        Some(first)
+            if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
+    )
+}
+
+/// Returns true when a line is a SQL*Plus-style comment-only line.
+///
+/// Recognizes:
+/// - `-- ...`
+/// - `REM ...`
+/// - `REMARK ...`
+pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("--") || is_sqlplus_remark_comment_line(trimmed)
+}
+
+/// Returns true when a keyword can start the main query after a WITH clause.
+pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
+    word.eq_ignore_ascii_case("SELECT")
+        || word.eq_ignore_ascii_case("INSERT")
+        || word.eq_ignore_ascii_case("UPDATE")
+        || word.eq_ignore_ascii_case("DELETE")
+        || word.eq_ignore_ascii_case("MERGE")
+        || word.eq_ignore_ascii_case("VALUES")
+}
+
+/// Returns true when a keyword can head a subquery body after `(`.
+pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
+    is_with_main_query_keyword(word) || word.eq_ignore_ascii_case("WITH")
+}
+
+/// Returns true when a CTE state machine should recover back to normal parsing.
+pub(crate) fn is_cte_recovery_keyword(word: &str) -> bool {
+    is_subquery_head_keyword(word)
+}

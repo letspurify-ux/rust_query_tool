@@ -586,15 +586,7 @@ impl SqlEditorWidget {
     }
 
     fn is_sqlplus_comment_line(statement: &str) -> bool {
-        let trimmed = statement.trim_start();
-        if trimmed.starts_with("--") {
-            return true;
-        }
-
-        matches!(
-            trimmed.split_whitespace().next(),
-            Some(first) if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
-        )
+        crate::sql_text::is_sqlplus_comment_line(statement)
     }
 
     fn is_create_trigger_statement(statement: &str) -> bool {

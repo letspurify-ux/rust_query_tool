@@ -1019,11 +1019,8 @@ pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
     if trimmed == "/" || trimmed.starts_with("@@") || trimmed.starts_with('@') {
         return true;
     }
-    if let Some(first) = trimmed.split_whitespace().next() {
-        let first = first.to_uppercase();
-        if matches!(first.as_str(), "REM" | "REMARK") {
-            return true;
-        }
+    if sql_text::is_sqlplus_remark_comment_line(trimmed) {
+        return true;
     }
     QueryExecutor::parse_tool_command(trimmed).is_some()
 }

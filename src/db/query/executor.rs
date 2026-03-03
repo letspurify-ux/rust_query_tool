@@ -2074,16 +2074,7 @@ impl QueryExecutor {
     }
 
     fn is_sqlplus_comment_line_for_bounds(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("--") {
-            return true;
-        }
-
-        matches!(
-            trimmed.split_whitespace().next(),
-            Some(first)
-                if first.eq_ignore_ascii_case("REM") || first.eq_ignore_ascii_case("REMARK")
-        )
+        sql_text::is_sqlplus_comment_line(line)
     }
 
     /// Enable DBMS_OUTPUT for the session
