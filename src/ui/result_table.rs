@@ -2950,6 +2950,28 @@ impl ResultTableWidget {
             col += 1;
         }
 
+        // The skip above can overshoot when a narrow column precedes a wide one.
+        // Scan backward from where the forward scan ended to catch skipped columns.
+        if col > scan_start_col + 1 {
+            let mut back = col.saturating_sub(1).min(last_col);
+            loop {
+                if back <= scan_start_col {
+                    break;
+                }
+                if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row_hit, back) {
+                    if mouse_x >= cx && mouse_x < cx + cw {
+                        return Some((row_hit, back));
+                    }
+                    if cw > 0 && cx + cw <= mouse_x {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                back -= 1;
+            }
+        }
+
         None
     }
 
