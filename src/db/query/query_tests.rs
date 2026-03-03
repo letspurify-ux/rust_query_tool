@@ -4666,6 +4666,22 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_end_while_does_not_arm_new_do_block() {
+    let sql = r#"BEGIN
+  WHILE i < 5 DO
+    i := i + 1;
+  END WHILE;
+  DO 1;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "END WHILE must not set pending WHILE-DO state for the next DO"
+    );
+}
+
+#[test]
 fn test_line_block_depths_preserve_pending_end_across_blank_line() {
     let sql = r#"BEGIN
   WHILE i < 5 LOOP
