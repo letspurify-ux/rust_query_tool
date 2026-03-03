@@ -1263,6 +1263,29 @@ fn lateral_values_subquery_in_from_increases_depth() {
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
 }
 
+#[test]
+fn from_subquery_with_update_body_increases_depth() {
+    let ctx = analyze("SELECT * FROM (UPDATE employees SET salary = salary + 1 WHERE | RETURNING id) u");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
+fn from_subquery_with_delete_body_increases_depth() {
+    let ctx = analyze("SELECT * FROM (DELETE FROM employees WHERE | RETURNING id) d");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
+fn from_subquery_with_merge_body_increases_depth() {
+    let ctx = analyze(
+        "SELECT * FROM (MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.v = s.v WHERE |) m",
+    );
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]
