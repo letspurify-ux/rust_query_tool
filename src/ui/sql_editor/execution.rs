@@ -323,14 +323,20 @@ impl SqlEditorWidget {
             return without_semicolon;
         }
 
-        if let Some(without_semicolon) = Self::remove_trailing_line_comment_semicolon(&formatted) {
+        if let Some(without_semicolon) =
+            Self::remove_trailing_line_comment_semicolon(source, &formatted)
+        {
             return without_semicolon;
         }
 
         formatted
     }
 
-    fn remove_trailing_line_comment_semicolon(formatted: &str) -> Option<String> {
+    fn remove_trailing_line_comment_semicolon(source: &str, formatted: &str) -> Option<String> {
+        if source.trim_end().ends_with(';') {
+            return None;
+        }
+
         let trimmed_len = formatted.trim_end().len();
         if trimmed_len == 0 {
             return None;
