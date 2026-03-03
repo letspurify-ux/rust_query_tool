@@ -63,7 +63,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     while let Some((idx, c)) = iter.next() {
         let next = iter.peek().map(|(_, ch)| *ch);
 
-        if scan_state.in_line_comment {
+        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::LineComment) {
             current.push(c);
             if c == '\n' {
                 tokens.push(SqlTokenSpan {
@@ -71,13 +71,13 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end: idx + c.len_utf8(),
                 });
-                scan_state.in_line_comment = false;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                 pending_newline = true;
             }
             continue;
         }
 
-        if scan_state.in_block_comment {
+        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::BlockComment) {
             current.push(c);
             if c == '*' && next == Some('/') {
                 iter.next();
@@ -93,13 +93,13 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end,
                 });
-                scan_state.in_block_comment = false;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                 continue;
             }
             continue;
         }
 
-        if scan_state.in_q_quote {
+        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::QQuote { .. }) {
             current.push(c);
             if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
                 iter.next();
@@ -109,8 +109,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end: idx + 2,
                 });
-                scan_state.in_q_quote = false;
-                scan_state.q_quote_end = None;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                 continue;
             }
             continue;
@@ -140,7 +139,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if scan_state.in_single_quote {
+        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::SingleQuote) {
             current.push(c);
             if c == '\'' {
                 if next == Some('\'') {
@@ -153,13 +152,13 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end: idx + 1,
                 });
-                scan_state.in_single_quote = false;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                 continue;
             }
             continue;
         }
 
-        if scan_state.in_double_quote {
+        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::DoubleQuote) {
             current.push(c);
             if c == '"' {
                 if next == Some('"') {
@@ -172,7 +171,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end: idx + 1,
                 });
-                scan_state.in_double_quote = false;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                 continue;
             }
             continue;
@@ -191,7 +190,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                 || is_sqlplus_line_comment(sql, idx, "REM"))
         {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            scan_state.in_line_comment = true;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
             current_start = idx;
             if pending_newline {
                 current.push('\n');
@@ -203,7 +202,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         if c == '-' && next == Some('-') {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            scan_state.in_line_comment = true;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
             current_start = idx;
             if pending_newline {
                 current.push('\n');
@@ -217,7 +216,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         if c == '/' && next == Some('*') {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            scan_state.in_block_comment = true;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::BlockComment;
             current_start = idx;
             if pending_newline {
                 current.push('\n');
@@ -288,7 +287,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         if c == '\'' {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
-            scan_state.in_single_quote = true;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::SingleQuote;
             current.push('\'');
             continue;
         }
@@ -296,7 +295,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         if c == '"' {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
-            scan_state.in_double_quote = true;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::DoubleQuote;
             current.push('"');
             continue;
         }
@@ -373,32 +372,38 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         });
     }
 
-    if scan_state.in_line_comment || scan_state.in_block_comment {
-        if !current.is_empty() {
-            tokens.push(SqlTokenSpan {
-                token: SqlToken::Comment(std::mem::take(&mut current)),
-                start: current_start,
-                end: sql.len(),
-            });
+    {
+        use crate::sql_parser_engine::LexMode;
+        let is_comment = matches!(scan_state.lex_mode, LexMode::LineComment | LexMode::BlockComment);
+        let is_string = matches!(scan_state.lex_mode, LexMode::SingleQuote | LexMode::QQuote { .. }) || in_dollar_quote;
+        let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
+        if is_comment {
+            if !current.is_empty() {
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::Comment(std::mem::take(&mut current)),
+                    start: current_start,
+                    end: sql.len(),
+                });
+            }
+        } else if is_string {
+            if !current.is_empty() {
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::String(std::mem::take(&mut current)),
+                    start: current_start,
+                    end: sql.len(),
+                });
+            }
+        } else if is_dq {
+            if !current.is_empty() {
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::Word(std::mem::take(&mut current)),
+                    start: current_start,
+                    end: sql.len(),
+                });
+            }
+        } else {
+            flush_word(&mut current, &mut current_start, sql.len(), &mut tokens);
         }
-    } else if scan_state.in_single_quote || scan_state.in_q_quote || in_dollar_quote {
-        if !current.is_empty() {
-            tokens.push(SqlTokenSpan {
-                token: SqlToken::String(std::mem::take(&mut current)),
-                start: current_start,
-                end: sql.len(),
-            });
-        }
-    } else if scan_state.in_double_quote {
-        if !current.is_empty() {
-            tokens.push(SqlTokenSpan {
-                token: SqlToken::Word(std::mem::take(&mut current)),
-                start: current_start,
-                end: sql.len(),
-            });
-        }
-    } else {
-        flush_word(&mut current, &mut current_start, sql.len(), &mut tokens);
     }
 
     tokens
@@ -644,18 +649,18 @@ mod tests {
                 None
             };
 
-            if scan_state.in_line_comment {
+            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::LineComment) {
                 current.push(c);
                 if c == '\n' {
                     tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    scan_state.in_line_comment = false;
+                    scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                     pending_newline = true;
                 }
                 i += 1;
                 continue;
             }
 
-            if scan_state.in_block_comment {
+            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::BlockComment) {
                 current.push(c);
                 if c == '*' && next == Some('/') {
                     current.push('/');
@@ -664,7 +669,7 @@ mod tests {
                         i += 1;
                     }
                     tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                    scan_state.in_block_comment = false;
+                    scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                     i += 2;
                     continue;
                 }
@@ -672,13 +677,12 @@ mod tests {
                 continue;
             }
 
-            if scan_state.in_q_quote {
+            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::QQuote { .. }) {
                 current.push(c);
                 if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
                     current.push('\'');
                     tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    scan_state.in_q_quote = false;
-                    scan_state.q_quote_end = None;
+                    scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                     i += 2;
                     continue;
                 }
@@ -686,7 +690,7 @@ mod tests {
                 continue;
             }
 
-            if scan_state.in_single_quote {
+            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::SingleQuote) {
                 current.push(c);
                 if c == '\'' {
                     if next == Some('\'') {
@@ -695,7 +699,7 @@ mod tests {
                         continue;
                     }
                     tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                    scan_state.in_single_quote = false;
+                    scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                     i += 1;
                     continue;
                 }
@@ -703,7 +707,7 @@ mod tests {
                 continue;
             }
 
-            if scan_state.in_double_quote {
+            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::DoubleQuote) {
                 current.push(c);
                 if c == '"' {
                     if next == Some('"') {
@@ -712,7 +716,7 @@ mod tests {
                         continue;
                     }
                     tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-                    scan_state.in_double_quote = false;
+                    scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
                     i += 1;
                     continue;
                 }
@@ -734,7 +738,7 @@ mod tests {
                     || is_sqlplus_line_comment(&chars, i, "REM"))
             {
                 flush_word(&mut current, &mut tokens);
-                scan_state.in_line_comment = true;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
                 if pending_newline {
                     current.push('\n');
                 }
@@ -746,7 +750,7 @@ mod tests {
 
             if c == '-' && next == Some('-') {
                 flush_word(&mut current, &mut tokens);
-                scan_state.in_line_comment = true;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::LineComment;
                 if pending_newline {
                     current.push('\n');
                 }
@@ -759,7 +763,7 @@ mod tests {
 
             if c == '/' && next == Some('*') {
                 flush_word(&mut current, &mut tokens);
-                scan_state.in_block_comment = true;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::BlockComment;
                 if pending_newline {
                     current.push('\n');
                 }
@@ -810,7 +814,7 @@ mod tests {
 
             if c == '\'' {
                 flush_word(&mut current, &mut tokens);
-                scan_state.in_single_quote = true;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::SingleQuote;
                 current.push('\'');
                 i += 1;
                 continue;
@@ -818,7 +822,7 @@ mod tests {
 
             if c == '"' {
                 flush_word(&mut current, &mut tokens);
-                scan_state.in_double_quote = true;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::DoubleQuote;
                 current.push('"');
                 i += 1;
                 continue;
@@ -871,20 +875,26 @@ mod tests {
             i += 1;
         }
 
-        if scan_state.in_line_comment || scan_state.in_block_comment {
-            if !current.is_empty() {
-                tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
+        {
+            use crate::sql_parser_engine::LexMode;
+            let is_comment = matches!(scan_state.lex_mode, LexMode::LineComment | LexMode::BlockComment);
+            let is_string = matches!(scan_state.lex_mode, LexMode::SingleQuote | LexMode::QQuote { .. });
+            let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
+            if is_comment {
+                if !current.is_empty() {
+                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
+                }
+            } else if is_string {
+                if !current.is_empty() {
+                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
+                }
+            } else if is_dq {
+                if !current.is_empty() {
+                    tokens.push(SqlToken::Word(std::mem::take(&mut current)));
+                }
+            } else {
+                flush_word(&mut current, &mut tokens);
             }
-        } else if scan_state.in_single_quote || scan_state.in_q_quote {
-            if !current.is_empty() {
-                tokens.push(SqlToken::String(std::mem::take(&mut current)));
-            }
-        } else if scan_state.in_double_quote {
-            if !current.is_empty() {
-                tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-            }
-        } else {
-            flush_word(&mut current, &mut tokens);
         }
 
         tokens

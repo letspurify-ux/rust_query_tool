@@ -226,33 +226,25 @@ impl QueryExecutor {
             // Eagerly resolve pending_end when the current line does NOT continue an
             // END CASE / END IF / END LOOP / END BEFORE / END AFTER / END INSTEAD sequence.
             // Without this, a bare "END" on its own line (e.g. CASE expression end)
-            // leaves block_depth and case_depth_stack stale for the next line's depth
-            // calculation, causing incorrect indentation for ELSE/WHEN that follow.
-            if builder.state.pending_end
-                && !is_comment_or_blank
-                && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+            // leaves block_stack stale for the next line's depth calculation,
+            // causing incorrect indentation for ELSE/WHEN that follow.
             {
-                if builder
-                    .state
-                    .case_depth_stack
-                    .last()
-                    .is_some_and(|d| *d + 1 == builder.state.block_depth)
+                use crate::sql_parser_engine::{BlockKind, PendingEnd};
+                if builder.state.pending_end == PendingEnd::End
+                    && !is_comment_or_blank
+                    && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
                 {
-                    builder.state.case_depth_stack.pop();
-                    builder.state.block_depth = builder.state.block_depth.saturating_sub(1);
-                } else if builder.state.block_depth > 0 {
-                    builder.state.block_depth -= 1;
+                    builder.state.resolve_pending_end_on_separator();
                 }
-                builder.state.pending_end = false;
             }
 
-            let open_cases = builder.state.case_depth_stack.len();
+            let open_cases = builder.state.case_count();
             if case_branch_stack.len() < open_cases {
                 case_branch_stack.resize(open_cases, false);
             } else if case_branch_stack.len() > open_cases {
                 case_branch_stack.truncate(open_cases);
             }
-            let innermost_case_depth = builder.state.case_depth_stack.last().copied();
+            let innermost_case_depth = builder.state.innermost_case_depth();
             let at_case_header_level =
                 innermost_case_depth.is_some_and(|depth| depth + 1 == builder.block_depth());
             let exception_end_line = exception_depth_stack
@@ -264,10 +256,13 @@ impl QueryExecutor {
             } else {
                 builder.block_depth()
             };
-            if builder.state.pending_end
-                && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
             {
-                block_depth_component = block_depth_component.saturating_sub(1);
+                use crate::sql_parser_engine::PendingEnd;
+                if builder.state.pending_end == PendingEnd::End
+                    && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+                {
+                    block_depth_component = block_depth_component.saturating_sub(1);
+                }
             }
 
             if at_case_header_level && leading_is_any(&["WHEN", "ELSE"]) {
@@ -280,20 +275,26 @@ impl QueryExecutor {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
 
+            // Compute CASE branch indentation from the block_stack.
             let mut case_branch_indent = 0usize;
-            for (case_depth, branch_active) in builder
-                .state
-                .case_depth_stack
-                .iter()
-                .zip(case_branch_stack.iter())
             {
-                if !*branch_active {
-                    continue;
-                }
-                let is_header_line = builder.block_depth() == *case_depth + 1
-                    && leading_is_any(&["WHEN", "ELSE", "END"]);
-                if !is_header_line {
-                    case_branch_indent += 1;
+                use crate::sql_parser_engine::BlockKind;
+                let mut case_idx = 0usize;
+                for (stack_idx, kind) in builder.state.block_stack.iter().enumerate() {
+                    if *kind != BlockKind::Case {
+                        continue;
+                    }
+                    if let Some(&branch_active) = case_branch_stack.get(case_idx) {
+                        if branch_active {
+                            let case_depth = stack_idx;
+                            let is_header_line = builder.block_depth() == case_depth + 1
+                                && leading_is_any(&["WHEN", "ELSE", "END"]);
+                            if !is_header_line {
+                                case_branch_indent += 1;
+                            }
+                        }
+                    }
+                    case_idx += 1;
                 }
             }
 
