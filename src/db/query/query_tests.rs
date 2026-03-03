@@ -4585,6 +4585,31 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_while_do_loop() {
+    let sql = r#"BEGIN
+  WHILE i < 5 DO
+    i := i + 1;
+  END WHILE;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "WHILE DO depth tracking mismatch");
+}
+
+#[test]
+fn test_line_block_depths_with_split_end_while_do() {
+    let sql = r#"BEGIN
+  WHILE i < 5 DO
+    i := i + 1;
+  END
+  WHILE;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 0];
+    assert_eq!(depths, expected, "split END WHILE after WHILE DO mismatch");
+}
+
+#[test]
 fn test_line_block_depths_with_for_update_clause() {
     let sql = r#"SELECT id, status
 FROM jobs
