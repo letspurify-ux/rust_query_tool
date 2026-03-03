@@ -6120,6 +6120,25 @@ fn test_split_script_items_mysql_if_function_does_not_open_block_depth() {
 }
 
 #[test]
+fn test_split_script_items_mysql_if_function_followed_by_case_then_stays_two_statements() {
+    let sql = "SELECT IF(score > 90, 'A', 'B') + CASE WHEN bonus > 0 THEN 1 ELSE 0 END AS grade FROM exam_scores;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "IF() function must not treat downstream CASE THEN as IF THEN: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("CASE WHEN bonus > 0 THEN 1 ELSE 0 END"),
+        "First statement should preserve CASE expression: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_line_block_depths_if_function_line_stays_top_level_without_then() {
     let sql = "SELECT IF(score > 90, 'A', 'B') AS grade\nFROM exam_scores;";
     let depths = QueryExecutor::line_block_depths(sql);
@@ -6128,6 +6147,30 @@ fn test_line_block_depths_if_function_line_stays_top_level_without_then() {
         depths,
         vec![0, 0],
         "IF() scalar function should not affect block depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_ignores_procedure_keyword_in_comment_for_begin_prededent() {
+    let sql = "BEGIN\n  -- PROCEDURE marker in comment\n  BEGIN\n    NULL;\n  END;\nEND;";
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(
+        depths,
+        vec![0, 1, 1, 2, 1, 0],
+        "Comment text must not trigger subprogram BEGIN pre-dedent"
+    );
+}
+
+#[test]
+fn test_line_block_depths_ignores_function_keyword_in_string_for_begin_prededent() {
+    let sql = "BEGIN\n  v_sql := 'FUNCTION marker in string';\n  BEGIN\n    NULL;\n  END;\nEND;";
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(
+        depths,
+        vec![0, 1, 1, 2, 1, 0],
+        "String literal text must not trigger subprogram BEGIN pre-dedent"
     );
 }
 

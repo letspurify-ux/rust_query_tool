@@ -65,6 +65,16 @@ pub(crate) struct SplitState {
     /// This prevents `IF(expr, ...)` scalar functions from being misclassified
     /// as block openers in non-PL/SQL SQL statements.
     pending_if_then: bool,
+    /// True while waiting for the first meaningful token after IF.
+    /// Used to detect parenthesized IF conditions (`IF (...) THEN`) and
+    /// distinguish them from scalar IF() function calls.
+    pending_if_expect_condition_start: bool,
+    /// Parenthesis depth of an IF condition that started with `(`.
+    /// We must ignore THEN tokens until this condition parenthesis is closed.
+    pending_if_condition_paren_depth: Option<usize>,
+    /// True after an IF condition parenthesis has been closed and we are waiting
+    /// for the control-flow THEN token. Any other non-space token clears IF state.
+    pending_if_after_condition_paren: bool,
 }
 
 impl SplitState {
@@ -109,6 +119,17 @@ impl SplitState {
         let is_end_loop = self.pending_end && upper == "LOOP";
         let is_end_while = self.pending_end && upper == "WHILE";
         let is_end_repeat = self.pending_end && upper == "REPEAT";
+
+        if self.pending_if_after_condition_paren && upper != "THEN" {
+            self.pending_if_then = false;
+            self.pending_if_expect_condition_start = false;
+            self.pending_if_condition_paren_depth = None;
+            self.pending_if_after_condition_paren = false;
+        }
+
+        if self.pending_if_expect_condition_start && upper != "IF" {
+            self.pending_if_expect_condition_start = false;
+        }
 
         if self.pending_end {
             if upper == "CASE" {
@@ -173,11 +194,19 @@ impl SplitState {
 
         if upper == "IF" && !is_end_if {
             self.pending_if_then = true;
+            self.pending_if_expect_condition_start = true;
+            self.pending_if_condition_paren_depth = None;
+            self.pending_if_after_condition_paren = false;
         }
 
-        if upper == "THEN" && self.pending_if_then {
+        if upper == "THEN"
+            && self.pending_if_then
+            && self.pending_if_condition_paren_depth.is_none()
+        {
             self.block_depth += 1;
             self.pending_if_then = false;
+            self.pending_if_expect_condition_start = false;
+            self.pending_if_after_condition_paren = false;
         }
 
         if upper == "LOOP" && !is_end_loop {
@@ -386,6 +415,9 @@ impl SplitState {
         self.is_type_create = false;
         self.pending_while_do = false;
         self.pending_if_then = false;
+        self.pending_if_expect_condition_start = false;
+        self.pending_if_condition_paren_depth = None;
+        self.pending_if_after_condition_paren = false;
     }
 
     fn track_create_plsql(&mut self, upper: &str) {
@@ -755,6 +787,39 @@ impl SqlParserEngine {
 
             self.state.flush_token();
             on_symbol(chars, i, c, next);
+
+            if self.state.pending_if_expect_condition_start {
+                if c.is_whitespace() {
+                    // Keep waiting.
+                } else if c == '(' {
+                    let condition_depth = self.state.paren_depth.saturating_add(1);
+                    self.state.pending_if_condition_paren_depth = Some(condition_depth);
+                    self.state.pending_if_expect_condition_start = false;
+                } else {
+                    self.state.pending_if_expect_condition_start = false;
+                }
+            }
+
+            if self.state.pending_if_after_condition_paren {
+                if c.is_whitespace() {
+                    // Keep waiting for THEN across whitespace.
+                } else {
+                    self.state.pending_if_after_condition_paren = false;
+                    self.state.pending_if_then = false;
+                    self.state.pending_if_expect_condition_start = false;
+                    self.state.pending_if_condition_paren_depth = None;
+                }
+            }
+
+            if c == ')'
+                && self
+                    .state
+                    .pending_if_condition_paren_depth
+                    .is_some_and(|depth| depth == self.state.paren_depth)
+            {
+                self.state.pending_if_condition_paren_depth = None;
+                self.state.pending_if_after_condition_paren = true;
+            }
 
             // Track parenthesis depth at the execution layer so that
             // formatting/intellisense can build on this base.

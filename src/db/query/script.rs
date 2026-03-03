@@ -58,28 +58,6 @@ impl QueryExecutor {
                 || chars_word_eq_ignore_ascii_case(chars, start, end, "WITH")
         }
 
-        fn for_each_line_word<F>(line: &str, mut on_word: F)
-        where
-            F: FnMut(&str),
-        {
-            let bytes = line.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                if sql_text::is_identifier_start_byte(bytes[i]) {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
-                        i += 1;
-                    }
-                    if let Some(word) = line.get(start..i) {
-                        on_word(word);
-                    }
-                    continue;
-                }
-                i += 1;
-            }
-        }
-
         fn leading_keyword_after_comments(line: &str) -> Option<&str> {
             let trimmed = line.trim_start();
             if sql_text::is_sqlplus_comment_line(trimmed) {
@@ -191,7 +169,6 @@ impl QueryExecutor {
         let mut with_cte_depth = 0usize;
         let mut with_cte_paren = 0isize;
         let mut pending_with = false;
-        let mut pending_subprogram_begin = false;
         let mut exception_depth_stack: Vec<usize> = Vec::new();
         let mut exception_handler_body = false;
         let mut case_branch_stack: Vec<bool> = Vec::new();
@@ -298,7 +275,7 @@ impl QueryExecutor {
             }
 
             if leading_is("BEGIN")
-                && (pending_subprogram_begin || builder.state.after_declare)
+                && (builder.state.pending_subprogram_begins > 0 || builder.state.after_declare)
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -369,16 +346,6 @@ impl QueryExecutor {
                 with_cte_depth = with_cte_depth.max(1);
                 with_cte_paren = 0;
             }
-
-            for_each_line_word(line, |word| {
-                if word.eq_ignore_ascii_case("PROCEDURE")
-                    || word.eq_ignore_ascii_case("FUNCTION")
-                {
-                    pending_subprogram_begin = true;
-                } else if pending_subprogram_begin && word.eq_ignore_ascii_case("BEGIN") {
-                    pending_subprogram_begin = false;
-                }
-            });
 
             if pending_with
                 && leading_word.is_some_and(&is_with_main_query_keyword)
