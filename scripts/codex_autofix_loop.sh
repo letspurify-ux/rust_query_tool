@@ -51,7 +51,8 @@ run_codex_fix() {
   local prompt model reasoning_effort
   local -a cmd_args=()
 
-  prompt="결과 테이블 편집 기능에서 편집 체크, 입력, 삭제, 취소, 쿼리실행, 쿼리취소, 쿼리실패 등등 이벤트들 사이에서 예상하지 못했던 버그 시나리오 검토 후 바로 수정해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘. 수정 내용은 fixed.md에 추가해줘."
+  prompt="쿼리 depth 구하는 로직에서 고려하지 못한 구문 케이스가 있을지 상세 검토해줘. Cargo test 실행해서 항상 오류가 없는 상태에서 종료해줘. 수정 내용은 fixed.md에 추가해줘."
+
 
   if [[ -n "$CODEX_MODEL" ]]; then
     if [[ "$CODEX_MODEL" == *" "* ]]; then
@@ -85,6 +86,7 @@ while [[ "$(date +%s)" -lt "$END_TS" ]]; do
     echo "[WARN] Codex invocation failed in iteration $iteration"
   fi
 
+  echo "=== Iteration $iteration finished ==="
   sleep 60
   iteration="$((iteration + 1))"
 done

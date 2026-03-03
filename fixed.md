@@ -1,5 +1,96 @@
 # 예외 처리 보완 내역
 
+## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (FROM-소비 함수 미닫힘 복구)
+
+### [중] `TRIM/EXTRACT/...` 괄호 미닫힘 시 실제 `FROM` 절이 함수 내부 `FROM`으로 계속 오인되던 문제 수정
+- **증상**:
+  - `SELECT TRIM(LEADING '0' FROM name FROM ...`처럼 함수 호출의 닫는 `)`가 빠진 입력에서,
+  - 뒤쪽 실제 `FROM`이 계속 함수 내부 문법으로 처리되어 `phase/table scope` 복구가 늦거나 실패할 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `analyze_phase` / `collect_tables_deep`에서
+  - `is_from_consuming_function` 분기(`EXTRACT/TRIM/SUBSTRING/OVERLAY`)가 해당 괄호 depth에서 `FROM`을 무조건 suppress 했습니다.
+  - 따라서 malformed 입력에서 두 번째 `FROM`(실제 SQL clause)도 계속 무시되었습니다.
+- **수정**:
+  - 괄호 depth별로 `FROM` 소비 여부를 추적하는 `paren_func_from_consumed_stack`을 추가했습니다.
+  - FROM-소비 함수에서는 **첫 번째 `FROM`만** 내부 문법으로 소비하고,
+  - 같은 depth에서 이후 `FROM`은 실제 `SqlPhase::FromClause` 전이로 처리해 복구하도록 변경했습니다.
+  - 동일 로직을 table 수집 경로(`collect_tables_deep`)에도 적용해 phase/테이블 스코프 일관성을 맞췄습니다.
+
+### [테스트] 회귀 테스트 추가
+- `malformed_trim_missing_close_paren_recovers_real_from_clause`
+- `malformed_trim_missing_close_paren_still_collects_from_tables`
+
+### [검증]
+- `cargo test malformed_trim_missing_close_paren -- --nocapture`
+- `cargo test`
+
+## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (서브쿼리 내부 일반 괄호)
+
+### [중] 서브쿼리 내부의 일반 괄호 `()`가 닫힐 때 query depth가 조기 감소하던 문제 수정
+- **증상**: `FROM ( SELECT (1 + 2) ... FROM ... )`처럼 서브쿼리 내부에 일반 수식 괄호가 있을 때, 내부 `FROM` 라인의 `line_block_depths`가 바깥 depth로 잘못 내려갈 수 있었습니다.
+- **원인**:
+  - `src/db/query/script.rs`의 `line_block_depths`에서 서브쿼리 depth(`subquery_paren_depth`)는 `(` 뒤에 `SELECT/WITH/...`일 때만 증가했습니다.
+  - 반면 `)`는 괄호 종류 구분 없이 항상 `subquery_paren_depth`를 감소시켜, 일반 수식 괄호 닫힘이 서브쿼리 depth까지 소비되는 경로가 있었습니다.
+- **수정**:
+  - `SubqueryParenKind` 스택(`NonSubquery`, `Pending`, `Subquery`)을 도입해 괄호별 성격을 추적하도록 변경했습니다.
+  - `(` 처리 시 서브쿼리 시작 괄호만 `Subquery`로 기록하고 depth를 증가시킵니다.
+  - `)` 처리 시 pop된 종류가 `Subquery`일 때만 `subquery_paren_depth`를 감소시키도록 보정했습니다.
+  - `Pending` 괄호는 다음 유효 라인에서 실제 subquery head 여부에 따라 `Subquery`/`NonSubquery`로 승격/확정하도록 처리했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_line_block_depths_preserves_subquery_depth_after_non_subquery_parentheses`
+
+### [검증]
+- `cargo test test_line_block_depths_preserves_subquery_depth_after_non_subquery_parentheses -- --nocapture`
+- `cargo test line_block_depths -- --nocapture`
+- `cargo test`
+
+## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (괄호 내부 WITH 시작점)
+
+### [중] `WHERE ... IN (WITH ... )` 형태에서 CTE body depth 과소 계산 보정
+- **증상**: `WHERE ... IN (` 다음에 바로 `WITH`가 시작되는 서브쿼리에서, CTE body 내부 커서의 `query depth`가 한 단계 낮게 계산될 수 있었습니다.
+  - 예: `SELECT * FROM outer_t o WHERE o.id IN (WITH cte AS (SELECT | FROM inner_t) SELECT id FROM cte)`
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `WITH` 진입 조건이 `current_phase == Initial`로만 제한되어 있었습니다.
+  - 괄호 내부가 `WHERE`/`SELECT` 같은 상위 phase를 상속한 경우(첫 토큰이 `WITH`여도), `WITH`를 쿼리 시작으로 표시하지 못해 depth가 과소 집계되었습니다.
+- **수정**:
+  - `should_enter_with_clause(...)` 헬퍼를 추가해 `WITH` 진입 조건을 보완했습니다.
+  - 허용: `Initial` phase 또는 `depth > 0`에서 괄호 시작 직후(`last_word.is_none()`)의 `WITH`
+  - 예외: `START WITH` 계층 쿼리 구문은 기존처럼 CTE `WITH`로 오인하지 않도록 제외
+  - 적용 위치:
+    - `analyze_phase` (cursor depth 계산)
+    - `collect_tables_deep` (동일 phase/CTE 상태 전이 일관성 유지)
+
+### [테스트] 회귀 테스트 추가
+- `nested_with_in_where_subquery_cte_body_depth_counts_parent_query`
+- `nested_with_in_where_subquery_main_select_depth_is_one`
+
+### [검증]
+- `cargo test nested_with_in_where_subquery -- --nocapture`
+- `cargo test`
+
+## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (블록 코멘트 prefix + same-line 서브쿼리 헤더)
+
+### [중] `(` 다음 줄이 `/* ... */ SELECT ...` 형태일 때 nested subquery depth 승격 누락 수정
+- **증상**: `WHERE EXISTS (` 다음 줄이 블록 코멘트로 시작하면서 같은 줄에 `SELECT`가 이어지는 경우, `line_block_depths`가 해당 줄을 comment-only로 잘못 분류해 서브쿼리 depth를 올리지 못했습니다.
+- **원인**:
+  - `line_block_depths` 내부 `is_comment_or_blank` 판정이 `trim_start().starts_with("/*")`만으로 comment line으로 처리했습니다.
+  - 이 때문에 `pending_subquery_paren` 해소 시점에서 `/* ... */ SELECT ...` 줄이 제외되어 nested head(`SELECT/WITH/...`) 인식이 누락되었습니다.
+- **수정**:
+  - `src/db/query/script.rs`의 `is_comment_or_blank` 판정을 보정해,
+    - 블록 코멘트 시작(`/*`/`*/`)이더라도
+    - `leading_keyword_after_comments` 결과가 존재하면 comment-only로 간주하지 않도록 변경했습니다.
+- **효과**: 코멘트 prefix 뒤에 같은 줄에서 시작하는 서브쿼리 헤더(`SELECT`, `WITH`, `VALUES`, DML head)가 정상적으로 nested depth에 반영됩니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_line_block_depths_detects_subquery_after_leading_block_comment_with_sql_same_line`
+- `test_line_block_depths_detects_subquery_after_leading_hint_comment_with_sql_same_line`
+
+### [검증]
+- `cargo test test_line_block_depths_detects_subquery_after_leading_block_comment_with_sql_same_line -- --nocapture`
+- `cargo test line_block_depths_detects_subquery_after -- --nocapture`
+- `cargo test`
+
 ## 2026-02-26 결과 테이블 편집/저장 이벤트 경합 추가 보완 (save 성공 응답 SQL 누락 케이스)
 
 ### [중] save 성공 응답에서 SQL 텍스트가 비어 있으면 pending 잠금이 남을 수 있던 경로 수정

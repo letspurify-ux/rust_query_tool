@@ -221,6 +221,19 @@ fn is_cte_recovery_keyword(word: &str) -> bool {
     )
 }
 
+fn should_enter_with_clause(current_phase: SqlPhase, depth: usize, last_word: Option<&str>) -> bool {
+    if matches!(current_phase, SqlPhase::Initial) {
+        return true;
+    }
+    // Preserve hierarchical-query `START WITH` semantics.
+    if matches!(last_word, Some(prev) if prev.eq_ignore_ascii_case("START")) {
+        return false;
+    }
+    // Nested subqueries can inherit a non-Initial parent phase (e.g. WHERE),
+    // but a leading WITH right after `(` still starts a query scope.
+    depth > 0 && last_word.is_none()
+}
+
 /// Walk tokens up to cursor to determine the current SQL phase and depth.
 fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut depth: usize = 0;
@@ -234,6 +247,10 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     // Track the function name before '(' at each depth level, used to
     // distinguish function-internal FROM (EXTRACT, TRIM) from SQL FROM clauses.
     let mut paren_func_stack: Vec<Option<String>> = vec![None];
+    // Each FROM-consuming function should consume only one internal FROM per
+    // parenthesized call depth. This prevents malformed inputs with a missing
+    // ')' from swallowing the real outer FROM clause forever.
+    let mut paren_func_from_consumed_stack: Vec<bool> = vec![false];
     let mut last_word: Option<String> = None;
     let mut next_scope_id = 1usize;
     let mut scope_stack = vec![0usize];
@@ -290,6 +307,11 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     paren_func_stack.push(func_name);
                 } else {
                     paren_func_stack[depth] = func_name;
+                }
+                if paren_func_from_consumed_stack.len() <= depth {
+                    paren_func_from_consumed_stack.push(false);
+                } else {
+                    paren_func_from_consumed_stack[depth] = false;
                 }
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
@@ -410,7 +432,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     "INSERT" => {
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
-                    "WITH" if matches!(current_phase, SqlPhase::Initial) => {
+                    "WITH" if should_enter_with_clause(current_phase, depth, last_word.as_deref()) => {
                         phase_stack[depth] = SqlPhase::WithClause;
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         cte_state = CteState::ExpectName;
@@ -420,17 +442,28 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "FROM" => {
-                        // Only suppress FROM transition when the enclosing '('
+                        // Only suppress the first FROM when the enclosing '('
                         // belongs to a function that uses FROM as part of its
-                        // syntax (EXTRACT, TRIM, XMLCAST). All other cases —
-                        // including incomplete SQL with unclosed parens — treat
-                        // FROM as a real SQL clause.
-                        let is_func_from = depth > 0
+                        // syntax (EXTRACT, TRIM, SUBSTRING, OVERLAY).
+                        // If the call is malformed (e.g. missing ')'), later
+                        // FROM keywords at the same depth are treated as real
+                        // SQL FROM clauses for parser recovery.
+                        let consumes_func_from = depth > 0
                             && paren_func_stack
                                 .get(depth)
                                 .and_then(|name| name.as_deref())
                                 .is_some_and(is_from_consuming_function);
-                        if !is_func_from {
+                        let func_from_already_consumed = paren_func_from_consumed_stack
+                            .get(depth)
+                            .copied()
+                            .unwrap_or(false);
+                        if consumes_func_from && !func_from_already_consumed {
+                            if let Some(consumed_flag) =
+                                paren_func_from_consumed_stack.get_mut(depth)
+                            {
+                                *consumed_flag = true;
+                            }
+                        } else {
                             phase_stack[depth] = SqlPhase::FromClause;
                         }
                     }
@@ -558,6 +591,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 query_depth = 0;
                 query_scope_stack = vec![false];
                 paren_func_stack = vec![None];
+                paren_func_from_consumed_stack = vec![false];
                 last_word = None;
                 next_scope_id = 1;
                 scope_stack = vec![0usize];
@@ -624,6 +658,7 @@ fn collect_tables_deep(
     let mut depth: usize = 0;
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
     let mut paren_func_stack: Vec<Option<String>> = vec![None];
+    let mut paren_func_from_consumed_stack: Vec<bool> = vec![false];
     let mut last_word: Option<String> = None;
     let mut expect_table = false;
     let mut cte_state = CteState::None;
@@ -651,6 +686,11 @@ fn collect_tables_deep(
                     paren_func_stack.push(func_name);
                 } else {
                     paren_func_stack[depth] = func_name;
+                }
+                if paren_func_from_consumed_stack.len() <= depth {
+                    paren_func_from_consumed_stack.push(false);
+                } else {
+                    paren_func_from_consumed_stack[depth] = false;
                 }
                 expect_table = false;
                 scope_stack.push(next_scope_id);
@@ -799,6 +839,7 @@ fn collect_tables_deep(
                 depth = 0;
                 phase_stack = vec![SqlPhase::Initial];
                 paren_func_stack = vec![None];
+                paren_func_from_consumed_stack = vec![false];
                 last_word = None;
                 expect_table = false;
                 cte_state = CteState::None;
@@ -854,7 +895,13 @@ fn collect_tables_deep(
 
                 // Phase transitions
                 match upper.as_str() {
-                    "WITH" if matches!(phase_stack[depth], SqlPhase::Initial) => {
+                    "WITH"
+                        if should_enter_with_clause(
+                            phase_stack[depth],
+                            depth,
+                            last_word.as_deref(),
+                        ) =>
+                    {
                         phase_stack[depth] = SqlPhase::WithClause;
                         cte_state = CteState::ExpectName;
                         expect_table = false;
@@ -868,12 +915,22 @@ fn collect_tables_deep(
                         expect_table = false;
                     }
                     "FROM" => {
-                        let is_func_from = depth > 0
+                        let consumes_func_from = depth > 0
                             && paren_func_stack
                                 .get(depth)
                                 .and_then(|name| name.as_deref())
                                 .is_some_and(is_from_consuming_function);
-                        if !is_func_from {
+                        let func_from_already_consumed = paren_func_from_consumed_stack
+                            .get(depth)
+                            .copied()
+                            .unwrap_or(false);
+                        if consumes_func_from && !func_from_already_consumed {
+                            if let Some(consumed_flag) =
+                                paren_func_from_consumed_stack.get_mut(depth)
+                            {
+                                *consumed_flag = true;
+                            }
+                        } else {
                             phase_stack[depth] = SqlPhase::FromClause;
                             expect_table = true;
                         }

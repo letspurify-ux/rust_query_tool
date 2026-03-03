@@ -1137,6 +1137,24 @@ fn depth_zero_after_nested_with_subquery_closes() {
 }
 
 #[test]
+fn nested_with_in_where_subquery_cte_body_depth_counts_parent_query() {
+    let ctx = analyze(
+        "SELECT * FROM outer_t o WHERE o.id IN (WITH cte AS (SELECT | FROM inner_t) SELECT id FROM cte)",
+    );
+    assert_eq!(ctx.depth, 2);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn nested_with_in_where_subquery_main_select_depth_is_one() {
+    let ctx = analyze(
+        "SELECT * FROM outer_t o WHERE o.id IN (WITH cte AS (SELECT 1 AS id FROM inner_t) SELECT | FROM cte)",
+    );
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
 fn malformed_with_missing_as_in_query_recovers_depth_and_phase() {
     let ctx = analyze("WITH cte (SELECT 1) SELECT | FROM cte");
     assert_eq!(ctx.depth, 0);
@@ -1848,6 +1866,28 @@ fn real_from_after_extract_still_works() {
     let ctx = analyze("SELECT EXTRACT(YEAR FROM hire_date) FROM |");
     assert_eq!(ctx.phase, SqlPhase::FromClause);
     assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn malformed_trim_missing_close_paren_recovers_real_from_clause() {
+    // Recovery case: if TRIM's closing ')' is missing, the parser should still
+    // treat the next FROM as a real SQL clause instead of swallowing it as an
+    // endless function-internal FROM.
+    let ctx = analyze("SELECT TRIM(LEADING '0' FROM name FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn malformed_trim_missing_close_paren_still_collects_from_tables() {
+    let ctx = analyze("SELECT TRIM(LEADING '0' FROM name FROM employees WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]

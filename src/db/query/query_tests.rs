@@ -3886,6 +3886,56 @@ fn test_nq_quote_with_semicolon_inside() {
 }
 
 #[test]
+fn test_split_script_items_dollar_quote_keeps_begin_end_inside_string() {
+    let sql = r#"SELECT $$BEGIN END$$ AS text FROM dual;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "dollar-quote content should not affect block depth or statement split: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("$$BEGIN END$$"),
+        "first statement should preserve dollar-quoted text, got: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].contains("SELECT 2 FROM dual"),
+        "second statement should remain independent, got: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_tagged_dollar_quote_ignores_semicolon_and_parenthesis() {
+    let sql = r#"SELECT $tag$foo(bar); END IF;$tag$ AS text FROM dual;
+SELECT 3 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "tagged dollar-quote should ignore internal semicolon/paren keywords: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("$tag$foo(bar); END IF;$tag$"),
+        "first statement should keep tagged dollar-quote intact, got: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].contains("SELECT 3 FROM dual"),
+        "second statement should be split at top-level semicolon, got: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_nq_quote_different_delimiters() {
     // Test nq'...' with different delimiters: (), {}, <>
     let sql1 = r#"SELECT nq'(parentheses)' FROM dual"#;
@@ -4957,6 +5007,20 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_ignores_subquery_pattern_inside_dollar_quote() {
+    let sql = r#"BEGIN
+  v_sql := $tag$(SELECT BEGIN END)$tag$;
+  NULL;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "Dollar-quoted '(SELECT BEGIN END)' should not affect line depth tracking"
+    );
+}
+
+#[test]
 fn test_line_block_depths_ignores_subquery_pattern_inside_block_comment() {
     let sql = r#"BEGIN
   /* (SELECT */
@@ -4994,6 +5058,60 @@ FROM dual
     assert!(
         depths[select_one_idx] > depths[where_idx],
         "Inline block comment before SELECT should still preserve subquery depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_leading_block_comment_with_sql_same_line() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  /* comment */ SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("/* comment */ SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "Block comment prefix before SELECT should still preserve subquery depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_leading_hint_comment_with_sql_same_line() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  /*+ qb_name(inner_q) */ SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("/*+ qb_name(inner_q) */ SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "Hint comment prefix before SELECT should still preserve subquery depth"
     );
 }
 
@@ -6010,5 +6128,36 @@ fn test_line_block_depths_if_function_line_stays_top_level_without_then() {
         depths,
         vec![0, 0],
         "IF() scalar function should not affect block depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_preserves_subquery_depth_after_non_subquery_parentheses() {
+    let sql = "SELECT *\nFROM (\n  SELECT (1 + 2) AS n\n  FROM dual\n) q;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_open_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM ( line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("SELECT (1 + 2)"))
+        .expect("expected nested SELECT line");
+    let nested_from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM DUAL"))
+        .expect("expected nested FROM line");
+
+    assert!(
+        depths[nested_select_idx] > depths[from_open_idx],
+        "Nested SELECT should be deeper than outer FROM (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[nested_from_idx], depths[nested_select_idx],
+        "Non-subquery parentheses inside nested SELECT must not prematurely dedent subquery depth (depths: {:?})",
+        depths
     );
 }
