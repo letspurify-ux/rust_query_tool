@@ -345,6 +345,45 @@ mod tests {
     }
 
     #[test]
+    fn split_top_level_symbol_groups_q_quote_comma_not_split() {
+        // Oracle q-quote must be tokenized as a string; commas inside must not split.
+        let tokens = tokenize_sql("q'[a,b]', c");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "q-quote comma must not split, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_dollar_quote_comma_not_split() {
+        // PostgreSQL dollar-quoted strings are emitted as SqlToken::String.
+        let tokens = tokenize_sql("$$a,b$$, c");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "dollar-quote comma must not split, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_quoted_identifier_parens_do_not_change_depth() {
+        // Parentheses inside quoted identifiers are SqlToken::Word and must not change depth.
+        let tokens = tokenize_sql("\"A(B)\", c");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "quoted identifier parens must not block top-level split, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
     fn split_top_level_symbol_groups_ignores_nested_comma_in_brackets() {
         let tokens = tokenize_sql("a, [b, c], d");
         let groups = split_top_level_symbol_groups(&tokens, ",");
