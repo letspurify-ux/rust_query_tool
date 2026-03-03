@@ -76,17 +76,6 @@ pub(crate) fn starts_with_keyword_token(text_upper: &str, keyword: &str) -> bool
     }
 }
 
-/// Returns normalized leading words from a line in uppercase.
-pub(crate) fn leading_words_upper(line: &str) -> Vec<String> {
-    line.split_whitespace()
-        .map(|w| {
-            w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .to_uppercase()
-        })
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
 /// Strips surrounding double quotes from SQL identifiers and unescapes doubled quotes.
 pub(crate) fn strip_identifier_quotes(value: &str) -> String {
     let trimmed = value.trim();

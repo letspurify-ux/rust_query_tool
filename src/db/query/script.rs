@@ -32,6 +32,95 @@ impl QueryExecutor {
             }
         }
 
+        fn chars_word_eq_ignore_ascii_case(
+            chars: &[char],
+            start: usize,
+            end: usize,
+            keyword: &str,
+        ) -> bool {
+            let expected_len = keyword.chars().count();
+            if end.saturating_sub(start) != expected_len {
+                return false;
+            }
+            chars[start..end]
+                .iter()
+                .zip(keyword.chars())
+                .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+        }
+
+        fn chars_word_is_subquery_head_keyword(chars: &[char], start: usize, end: usize) -> bool {
+            chars_word_eq_ignore_ascii_case(chars, start, end, "SELECT")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "INSERT")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "UPDATE")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "DELETE")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "MERGE")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "VALUES")
+                || chars_word_eq_ignore_ascii_case(chars, start, end, "WITH")
+        }
+
+        fn for_each_line_word<F>(line: &str, mut on_word: F)
+        where
+            F: FnMut(&str),
+        {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if sql_text::is_identifier_start_byte(bytes[i]) {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    if let Some(word) = line.get(start..i) {
+                        on_word(word);
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        fn leading_keyword_after_comments(line: &str) -> Option<&str> {
+            let trimmed = line.trim_start();
+            if sql_text::is_sqlplus_comment_line(trimmed) {
+                return None;
+            }
+
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b.is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+                if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    return None;
+                }
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                if sql_text::is_identifier_byte(b) {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    return line.get(start..i);
+                }
+                i += 1;
+            }
+            None
+        }
+
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
             loop {
                 while idx < chars.len() && chars[idx].is_whitespace() {
@@ -66,8 +155,9 @@ impl QueryExecutor {
                     while idx < chars.len() && sql_text::is_identifier_char(chars[idx]) {
                         idx += 1;
                     }
-                    let word: String = chars[start..idx].iter().collect();
-                    if word.eq_ignore_ascii_case("REM") || word.eq_ignore_ascii_case("REMARK") {
+                    if chars_word_eq_ignore_ascii_case(chars, start, idx, "REM")
+                        || chars_word_eq_ignore_ascii_case(chars, start, idx, "REMARK")
+                    {
                         while idx < chars.len() && chars[idx] != '\n' {
                             idx += 1;
                         }
@@ -83,60 +173,13 @@ impl QueryExecutor {
         }
 
         fn should_pre_dedent(leading_word: &str) -> bool {
-            matches!(
-                leading_word,
-                "END" | "ELSE" | "ELSIF" | "ELSEIF" | "EXCEPTION"
-            )
+            leading_word.eq_ignore_ascii_case("END")
+                || leading_word.eq_ignore_ascii_case("ELSE")
+                || leading_word.eq_ignore_ascii_case("ELSIF")
+                || leading_word.eq_ignore_ascii_case("ELSEIF")
+                || leading_word.eq_ignore_ascii_case("EXCEPTION")
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
-        let is_subquery_head_keyword = sql_text::is_subquery_head_keyword;
-        let leading_keyword_after_comments = |line: &str| -> Option<String> {
-            let trimmed = line.trim_start();
-            if sql_text::is_sqlplus_comment_line(trimmed) {
-                return None;
-            }
-
-            let bytes = line.as_bytes();
-            let mut i = 0usize;
-
-            while i < bytes.len() {
-                let b = bytes[i];
-
-                if b.is_ascii_whitespace() {
-                    i += 1;
-                    continue;
-                }
-
-                if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    return None;
-                }
-
-                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                    i += 2;
-                    while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-
-                if sql_text::is_identifier_byte(b) {
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
-                        i += 1;
-                    }
-                    return Some(line[start..i].to_ascii_uppercase());
-                }
-
-                i += 1;
-            }
-
-            None
-        };
 
         let mut builder = SqlParserEngine::new();
         let mut depths = Vec::new();
@@ -154,31 +197,34 @@ impl QueryExecutor {
         let mut case_branch_stack: Vec<bool> = Vec::new();
 
         for line in sql.lines() {
-            let words = if builder.is_idle() {
-                sql_text::leading_words_upper(line)
-            } else {
-                Vec::new()
-            };
-            let leading_keyword = if builder.is_idle() {
+            let leading_word = if builder.is_idle() {
                 leading_keyword_after_comments(line)
             } else {
                 None
             };
-            let leading_word = leading_keyword
-                .as_deref()
-                .or_else(|| words.first().map(String::as_str));
+            let leading_is =
+                |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
+            let leading_is_any = |keywords: &[&str]| {
+                leading_word.is_some_and(|word| {
+                    keywords
+                        .iter()
+                        .any(|keyword| word.eq_ignore_ascii_case(keyword))
+                })
+            };
 
             let trimmed_start = line.trim_start();
             let is_comment_or_blank = trimmed_start.is_empty()
                 || sql_text::is_sqlplus_comment_line(trimmed_start)
                 || ((trimmed_start.starts_with("/*") || trimmed_start.starts_with("*/"))
-                    && leading_keyword.is_none());
+                    && leading_word.is_none());
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
                 // VALUES can head a nested query block in dialects that support table value
                 // constructors in FROM/subquery positions.
-                let promote_to_subquery = leading_word.is_some_and(&is_subquery_head_keyword);
+                let promote_to_subquery = leading_is_any(&[
+                    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "WITH",
+                ]);
                 if promote_to_subquery {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);
@@ -207,19 +253,7 @@ impl QueryExecutor {
             // calculation, causing incorrect indentation for ELSE/WHEN that follow.
             if builder.state.pending_end
                 && !is_comment_or_blank
-                && !matches!(
-                    leading_word,
-                    Some(
-                        "CASE"
-                            | "IF"
-                            | "LOOP"
-                            | "WHILE"
-                            | "BEFORE"
-                            | "AFTER"
-                            | "INSTEAD"
-                            | "REPEAT"
-                    )
-                )
+                && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
             {
                 if builder
                     .state
@@ -247,35 +281,23 @@ impl QueryExecutor {
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
-                && matches!(leading_word, Some("END"));
+                && leading_is("END");
             let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
                 builder.block_depth().saturating_sub(1)
             } else {
                 builder.block_depth()
             };
             if builder.state.pending_end
-                && matches!(
-                    leading_word,
-                    Some(
-                        "CASE"
-                            | "IF"
-                            | "LOOP"
-                            | "WHILE"
-                            | "BEFORE"
-                            | "AFTER"
-                            | "INSTEAD"
-                            | "REPEAT"
-                    )
-                )
+                && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
 
-            if at_case_header_level && matches!(leading_word, Some("WHEN" | "ELSE")) {
+            if at_case_header_level && leading_is_any(&["WHEN", "ELSE"]) {
                 block_depth_component = builder.block_depth();
             }
 
-            if matches!(leading_word, Some("BEGIN"))
+            if leading_is("BEGIN")
                 && (pending_subprogram_begin || builder.state.after_declare)
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
@@ -292,7 +314,7 @@ impl QueryExecutor {
                     continue;
                 }
                 let is_header_line = builder.block_depth() == *case_depth + 1
-                    && matches!(leading_word, Some("WHEN" | "ELSE" | "END"));
+                    && leading_is_any(&["WHEN", "ELSE", "END"]);
                 if !is_header_line {
                     case_branch_indent += 1;
                 }
@@ -306,8 +328,8 @@ impl QueryExecutor {
                 };
 
             let with_cte_component = if with_cte_depth > 0 {
-                let starts_main_select =
-                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
+                let starts_main_select = leading_word.is_some_and(&is_with_main_query_keyword)
+                    && with_cte_paren <= 0;
                 if starts_main_select {
                     0
                 } else {
@@ -318,7 +340,7 @@ impl QueryExecutor {
             };
 
             let exception_handler_component = if exception_handler_body
-                && !matches!(leading_word, Some("WHEN"))
+                && !leading_is("WHEN")
                 && !exception_end_line
             {
                 1
@@ -340,7 +362,7 @@ impl QueryExecutor {
             depths.push(depth);
 
             // Keep WITH-clause indentation context separate from block depth.
-            let with_line = matches!(leading_word, Some("WITH"));
+            let with_line = leading_is("WITH");
 
             if with_line {
                 pending_with = true;
@@ -348,25 +370,15 @@ impl QueryExecutor {
                 with_cte_paren = 0;
             }
 
-            let mut idx = 0usize;
-            while idx < words.len() {
-                let word = words[idx].as_str();
-                let next = words.get(idx + 1).map(String::as_str);
-
-                if matches!(word, "PROCEDURE" | "FUNCTION") {
-                    pending_subprogram_begin = true;
-                } else if pending_subprogram_begin && word == "BEGIN" {
-                    pending_subprogram_begin = false;
-                } else if word == "END"
-                    && next != Some("IF")
-                    && next != Some("LOOP")
-                    && next != Some("CASE")
+            for_each_line_word(line, |word| {
+                if word.eq_ignore_ascii_case("PROCEDURE")
+                    || word.eq_ignore_ascii_case("FUNCTION")
                 {
-                    // No subprogram body depth tracking.
+                    pending_subprogram_begin = true;
+                } else if pending_subprogram_begin && word.eq_ignore_ascii_case("BEGIN") {
+                    pending_subprogram_begin = false;
                 }
-
-                idx += 1;
-            }
+            });
 
             if pending_with
                 && leading_word.is_some_and(&is_with_main_query_keyword)
@@ -376,24 +388,24 @@ impl QueryExecutor {
                 pending_with = false;
             }
 
-            if matches!(leading_word, Some("EXCEPTION")) {
+            if leading_is("EXCEPTION") {
                 exception_depth_stack.push(builder.block_depth());
                 exception_handler_body = false;
-            } else if !exception_depth_stack.is_empty() && matches!(leading_word, Some("WHEN")) {
+            } else if !exception_depth_stack.is_empty() && leading_is("WHEN") {
                 exception_handler_body = true;
             } else if exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
-                && matches!(leading_word, Some("END"))
+                && leading_is("END")
             {
                 exception_depth_stack.pop();
                 exception_handler_body = false;
             }
-            if at_case_header_level && matches!(leading_word, Some("WHEN" | "ELSE")) {
+            if at_case_header_level && leading_is_any(&["WHEN", "ELSE"]) {
                 if let Some(last) = case_branch_stack.last_mut() {
                     *last = true;
                 }
-            } else if at_case_header_level && matches!(leading_word, Some("END")) {
+            } else if at_case_header_level && leading_is("END") {
                 if let Some(last) = case_branch_stack.last_mut() {
                     *last = false;
                 }
@@ -410,9 +422,7 @@ impl QueryExecutor {
                             k += 1;
                         }
                         if k > j {
-                            let word: String = chars[j..k].iter().collect();
-                            let word = word.to_ascii_uppercase();
-                            if is_subquery_head_keyword(&word) {
+                            if chars_word_is_subquery_head_keyword(chars, j, k) {
                                 subquery_paren_depth = subquery_paren_depth.saturating_add(1);
                                 paren_kind = SubqueryParenKind::Subquery;
                             }
@@ -2698,8 +2708,9 @@ impl QueryExecutor {
                 continue;
             }
 
-            let is_alter_session_set_clause = builder.starts_with_alter_session()
-                && (trimmed_upper == "SET" || trimmed_upper.starts_with("SET "));
+            let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
+            let is_alter_session_set_clause =
+                is_set_clause && builder.starts_with_alter_session();
             if builder.is_idle()
                 && !builder.current_is_empty()
                 && builder.block_depth() == 0
@@ -2843,8 +2854,9 @@ impl QueryExecutor {
                 continue;
             }
 
-            let is_alter_session_set_clause = builder.starts_with_alter_session()
-                && (trimmed_upper == "SET" || trimmed_upper.starts_with("SET "));
+            let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
+            let is_alter_session_set_clause =
+                is_set_clause && builder.starts_with_alter_session();
             if builder.is_idle()
                 && !builder.current_is_empty()
                 && builder.block_depth() == 0

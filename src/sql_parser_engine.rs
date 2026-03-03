@@ -496,6 +496,7 @@ pub(crate) struct SqlParserEngine {
     pub(crate) state: SplitState,
     current: String,
     statements: Vec<String>,
+    scratch_chars: Vec<char>,
 }
 
 impl SqlParserEngine {
@@ -504,6 +505,7 @@ impl SqlParserEngine {
             state: SplitState::default(),
             current: String::new(),
             statements: Vec::new(),
+            scratch_chars: Vec::new(),
         }
     }
 
@@ -562,21 +564,14 @@ impl SqlParserEngine {
         }
     }
 
-    pub(crate) fn process_text(&mut self, text: &str) {
-        self.process_text_with_observer(text, |_, _, _, _| {});
-    }
-
     pub(crate) fn process_line(&mut self, line: &str) {
-        let mut line_with_newline = String::from(line);
-        line_with_newline.push('\n');
-        self.process_text(&line_with_newline);
+        self.process_line_with_observer(line, |_, _, _, _| {});
     }
 
-    pub(crate) fn process_text_with_observer<F>(&mut self, text: &str, mut on_symbol: F)
+    fn process_chars_with_observer<F>(&mut self, chars: &[char], on_symbol: &mut F)
     where
         F: FnMut(&[char], usize, char, Option<char>),
     {
-        let chars: Vec<char> = text.chars().collect();
         let len = chars.len();
         let mut i = 0usize;
 
@@ -628,7 +623,7 @@ impl SqlParserEngine {
             }
 
             if self.state.in_dollar_quote {
-                if c == '$' && chars_starts_with(&chars, i, &self.state.dollar_quote_tag) {
+                if c == '$' && chars_starts_with(chars, i, &self.state.dollar_quote_tag) {
                     let tag_len = self.state.dollar_quote_tag.len();
                     for quote_ch in self.state.dollar_quote_tag.chars() {
                         self.current.push(quote_ch);
@@ -722,7 +717,7 @@ impl SqlParserEngine {
             }
 
             if self.state.token.is_empty() && c == '$' {
-                if let Some(tag) = parse_dollar_quote_tag(&chars, i) {
+                if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
                     self.state.flush_token();
                     self.state.in_dollar_quote = true;
@@ -759,7 +754,7 @@ impl SqlParserEngine {
             }
 
             self.state.flush_token();
-            on_symbol(&chars, i, c, next);
+            on_symbol(chars, i, c, next);
 
             // Track parenthesis depth at the execution layer so that
             // formatting/intellisense can build on this base.
@@ -817,9 +812,13 @@ impl SqlParserEngine {
     where
         F: FnMut(&[char], usize, char, Option<char>),
     {
-        let mut line_with_newline = String::from(line);
-        line_with_newline.push('\n');
-        self.process_text_with_observer(&line_with_newline, on_symbol);
+        let mut on_symbol = on_symbol;
+        let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
+        scratch_chars.clear();
+        scratch_chars.extend(line.chars());
+        scratch_chars.push('\n');
+        self.process_chars_with_observer(&scratch_chars, &mut on_symbol);
+        self.scratch_chars = scratch_chars;
     }
 
     pub(crate) fn force_terminate(&mut self) {

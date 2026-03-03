@@ -2160,11 +2160,12 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        Self::apply_parser_depth_indentation(out.trim_end())
+        let is_plsql_like = Self::is_plsql_like_tokens(statement, tokens);
+        Self::apply_parser_depth_indentation(out.trim_end(), is_plsql_like)
     }
 
-    fn apply_parser_depth_indentation(formatted: &str) -> String {
-        if formatted.is_empty() || !Self::is_plsql_like_statement(formatted) {
+    fn apply_parser_depth_indentation(formatted: &str, is_plsql_like: bool) -> String {
+        if formatted.is_empty() || !is_plsql_like {
             return formatted.to_string();
         }
 
@@ -2489,60 +2490,68 @@ impl SqlEditorWidget {
         continuation_lines
     }
 
-    fn is_plsql_like_statement(statement: &str) -> bool {
-        let words: Vec<String> = Self::tokenize_sql(statement)
-            .into_iter()
+    fn is_plsql_like_tokens(statement: &str, tokens: &[SqlToken]) -> bool {
+        let words: Vec<&str> = tokens
+            .iter()
             .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.to_uppercase()),
+                SqlToken::Word(word) => Some(word.as_str()),
                 _ => None,
             })
             .collect();
 
-        if let Some(first) = words.first().map(String::as_str) {
-            if matches!(first, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE") {
+        if let Some(first) = words.first().copied() {
+            if first.eq_ignore_ascii_case("SELECT")
+                || first.eq_ignore_ascii_case("INSERT")
+                || first.eq_ignore_ascii_case("UPDATE")
+                || first.eq_ignore_ascii_case("DELETE")
+                || first.eq_ignore_ascii_case("MERGE")
+            {
                 return false;
             }
-            if first == "WITH" {
+            if first.eq_ignore_ascii_case("WITH") {
                 let mut next_index = 1usize;
                 if words
                     .get(next_index)
-                    .is_some_and(|word| word == "RECURSIVE")
+                    .is_some_and(|word| word.eq_ignore_ascii_case("RECURSIVE"))
                 {
                     next_index += 1;
                 }
-                if matches!(
-                    words.get(next_index).map(String::as_str),
-                    Some("FUNCTION" | "PROCEDURE")
-                ) {
+                if words.get(next_index).is_some_and(|word| {
+                    word.eq_ignore_ascii_case("FUNCTION")
+                        || word.eq_ignore_ascii_case("PROCEDURE")
+                }) {
                     return true;
                 }
                 return false;
             }
         }
 
-        let mut idx = 0usize;
-        while idx < words.len() {
-            match words[idx].as_str() {
-                "BEGIN" | "DECLARE" => return true,
-                "CREATE" => {
-                    let object_type = Self::parse_ddl_object_type(statement);
-                    return matches!(
-                        object_type,
-                        "Procedure"
-                            | "Function"
-                            | "Package"
-                            | "Package Body"
-                            | "Type"
-                            | "Type Body"
-                            | "Trigger"
-                    );
-                }
-                _ => {}
+        for word in words {
+            if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("DECLARE") {
+                return true;
             }
-            idx += 1;
+            if word.eq_ignore_ascii_case("CREATE") {
+                let object_type = Self::parse_ddl_object_type(statement);
+                return matches!(
+                    object_type,
+                    "Procedure"
+                        | "Function"
+                        | "Package"
+                        | "Package Body"
+                        | "Type"
+                        | "Type Body"
+                        | "Trigger"
+                );
+            }
         }
 
         false
+    }
+
+    #[cfg(test)]
+    fn is_plsql_like_statement(statement: &str) -> bool {
+        let tokens = Self::tokenize_sql(statement);
+        Self::is_plsql_like_tokens(statement, &tokens)
     }
 
     fn parse_ddl_object_type(statement: &str) -> &'static str {
