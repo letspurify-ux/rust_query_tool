@@ -205,7 +205,8 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         pending_newline = false;
 
-        if (c == 'n' || c == 'N')
+        if current.is_empty()
+            && (c == 'n' || c == 'N')
             && (next == Some('q') || next == Some('Q'))
             && bytes.get(idx + 2) == Some(&b'\'')
             && bytes.get(idx + 3).is_some()
@@ -234,7 +235,11 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if (c == 'q' || c == 'Q') && next == Some('\'') && bytes.get(idx + 2).is_some() {
+        if current.is_empty()
+            && (c == 'q' || c == 'Q')
+            && next == Some('\'')
+            && bytes.get(idx + 2).is_some()
+        {
             // SAFETY: idx+2 is a valid byte position and q-quote delimiters
             // are always single-byte characters in Oracle syntax.
             let del_byte = bytes[idx + 2];
