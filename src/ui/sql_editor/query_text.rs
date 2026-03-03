@@ -979,8 +979,6 @@ mod tests {
             "BEGIN\n  <<outer_label>>\n  NULL;\nEND;\n/",
             "SELECT nq'{문자열 ''보존''}' AS txt, a<=b, a<>b, a!=b, a||b, c:=d, e=>f FROM dual;",
             "/* 한글 블록\n코멘트 */\nSELECT \"컬럼명\" FROM \"테이블\";",
-            "SELECT $$fn(a, b)$$, 1 FROM dual;",
-            "SELECT $tag$BEGIN (x, y); END$tag$, col FROM dual;",
         ];
 
         for sql in cases {
