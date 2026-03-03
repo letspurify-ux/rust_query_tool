@@ -384,6 +384,15 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 match upper.as_str() {
                     "WITH" if matches!(current_phase, SqlPhase::Initial) => {
                         phase_stack[depth] = SqlPhase::WithClause;
+                        if depth > 0
+                            && query_scope_stack
+                                .get(depth)
+                                .copied()
+                                .is_some_and(|is_query_scope| !is_query_scope)
+                        {
+                            query_scope_stack[depth] = true;
+                            query_depth = query_depth.saturating_add(1);
+                        }
                         cte_state = CteState::ExpectName;
                     }
                     "SELECT" => {

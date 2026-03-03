@@ -1107,6 +1107,22 @@ fn nested_with_inside_subquery_is_not_collected_as_top_level_cte() {
 }
 
 #[test]
+fn depth_one_in_nested_with_subquery_select_list() {
+    let ctx = analyze("SELECT * FROM (WITH inner_cte AS (SELECT 1 AS n FROM dual) SELECT | FROM inner_cte) sub");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn depth_zero_after_nested_with_subquery_closes() {
+    let ctx = analyze(
+        "SELECT * FROM (WITH inner_cte AS (SELECT 1 AS n FROM dual) SELECT n FROM inner_cte) sub WHERE |",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
 fn sibling_subquery_tables_are_not_visible_inside_current_subquery() {
     let ctx = analyze(
         "SELECT * \
