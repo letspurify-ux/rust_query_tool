@@ -1749,6 +1749,31 @@ fn malformed_subquery_parentheses_do_not_panic() {
     assert!(names.contains(&"BROKEN_ALIAS".to_string()));
 }
 
+#[test]
+fn collect_table_alias_with_inline_comment() {
+    let ctx = analyze("SELECT e.| FROM employees /*alias*/ e");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|t| t.alias.as_deref() == Some("e") && t.name.eq_ignore_ascii_case("employees")),
+        "expected table alias after inline comment: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+#[test]
+fn collect_table_alias_with_as_and_comment() {
+    let ctx = analyze("SELECT e.| FROM employees AS /*alias*/ e");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|t| t.alias.as_deref() == Some("e") && t.name.eq_ignore_ascii_case("employees")),
+        "expected table alias after AS and comment: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+
 // ─── EXTRACT / TRIM function-internal FROM ───────────────────────────────
 
 #[test]
