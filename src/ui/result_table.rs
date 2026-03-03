@@ -2950,6 +2950,28 @@ impl ResultTableWidget {
             col += 1;
         }
 
+        // The skip above can overshoot when a narrow column precedes a wide one.
+        // Scan backward from where the forward scan ended to catch skipped columns.
+        if col > scan_start_col + 1 {
+            let mut back = col.saturating_sub(1).min(last_col);
+            loop {
+                if back <= scan_start_col {
+                    break;
+                }
+                if let Some((cx, _, cw, _)) = table.find_cell(TableContext::Cell, row_hit, back) {
+                    if mouse_x >= cx && mouse_x < cx + cw {
+                        return Some((row_hit, back));
+                    }
+                    if cw > 0 && cx + cw <= mouse_x {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                back -= 1;
+            }
+        }
+
         None
     }
 
@@ -3131,6 +3153,36 @@ impl ResultTableWidget {
                 break;
             }
             col += 1;
+        }
+
+        // The skip optimisation above uses the current column's width to estimate
+        // how many columns to jump.  When a narrow column precedes a wide one the
+        // skip can overshoot the target.  Scan backward from the position where the
+        // forward scan ended to catch any column that was skipped over.
+        if col > start_col + 1 {
+            let mut back = col.saturating_sub(1).min(last_col);
+            loop {
+                if back <= start_col {
+                    break;
+                }
+                if let Some((cx, _, cw, _)) =
+                    table.find_cell(TableContext::ColHeader, anchor_row, back)
+                {
+                    if cw > 0 && mouse_x >= cx && mouse_x < cx.saturating_add(cw) {
+                        return Some(back);
+                    }
+                    // Mouse is to the right of this column's right edge; columns
+                    // further left are even further away – stop searching.
+                    if cw > 0 && cx.saturating_add(cw) <= mouse_x {
+                        break;
+                    }
+                    // cw == 0 (hidden column) or column is to the right of mouse:
+                    // continue scanning toward lower indices.
+                } else {
+                    break;
+                }
+                back -= 1;
+            }
         }
 
         col = Self::fallback_scan_start(start_col, MAX_HITTEST_COL_BACKTRACK);
