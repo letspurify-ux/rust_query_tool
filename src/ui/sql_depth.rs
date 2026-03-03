@@ -292,6 +292,112 @@ mod tests {
         assert!(groups.is_empty());
     }
 
+    // ── paren_depth_after: additional edge cases ──────────────────────────────
+
+    #[test]
+    fn paren_depth_after_all_unbalanced_close_parens_is_zero() {
+        // Excess `)` tokens must saturate at 0 and not underflow.
+        let tokens = [sym(")"), sym(")"), sym(")")];
+        assert_eq!(paren_depth_after(&tokens), 0);
+    }
+
+    // ── split_top_level_symbol_groups: additional edge cases ──────────────────
+
+    #[test]
+    fn split_top_level_symbol_groups_skips_leading_delimiter() {
+        // A delimiter at the very start produces no empty leading group.
+        let tokens = tokenize_sql(",a");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(groups.len(), 1, "leading delimiter must not create an empty prefix group");
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_skips_trailing_delimiter() {
+        // A delimiter at the very end produces no empty trailing group.
+        let tokens = tokenize_sql("a,");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(groups.len(), 1, "trailing delimiter must not create an empty suffix group");
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_skips_consecutive_delimiters() {
+        // Two consecutive top-level delimiters produce no empty middle group.
+        let tokens = tokenize_sql("a,,b");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "consecutive delimiters must not create empty intermediate segments, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_unbalanced_close_paren_at_root_stays_in_group() {
+        // An unmatched `)` at depth 0 does not affect depth (saturates at 0).
+        // It is treated as a plain symbol and ends up in the current group.
+        let tokens = [word("a"), sym(","), word("b"), sym(")"), sym(","), word("c")];
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        // Expected: [a], [b, )], [c]
+        assert_eq!(
+            groups.len(),
+            3,
+            "unmatched ')' at root should not collapse into adjacent groups, got {:?}",
+            group_words(groups)
+        );
+        assert_eq!(
+            groups[1].len(),
+            2,
+            "the unmatched ')' must be included in its own group, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    // ── split_top_level_keyword_groups: additional edge cases ─────────────────
+
+    #[test]
+    fn split_top_level_keyword_groups_leading_break_keyword_no_empty_prefix() {
+        // When the very first token is a break keyword, no empty group is emitted
+        // before it — the keyword simply starts the first group.
+        let tokens = tokenize_sql("FROM t");
+        let groups = split_top_level_keyword_groups(&tokens, &["FROM"]);
+        assert_eq!(groups.len(), 1, "no empty group before a leading break keyword");
+        assert!(
+            matches!(&groups[0][0], SqlToken::Word(w) if w.eq_ignore_ascii_case("FROM")),
+            "the break keyword must be the first token of the first group"
+        );
+    }
+
+    #[test]
+    fn split_top_level_keyword_groups_trailing_break_keyword_forms_singleton_group() {
+        // When the last token is a break keyword it must become its own group.
+        let tokens = tokenize_sql("SELECT a FROM");
+        let groups = split_top_level_keyword_groups(&tokens, &["FROM"]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[1].len(),
+            1,
+            "trailing break keyword must form a singleton group, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
+    fn split_top_level_keyword_groups_keyword_is_first_token_of_each_group() {
+        // Each break keyword must be preserved as the first token of its group.
+        let tokens = tokenize_sql("SELECT a FROM t WHERE x = 1");
+        let groups = split_top_level_keyword_groups(&tokens, &["FROM", "WHERE"]);
+        assert_eq!(groups.len(), 3);
+        assert!(
+            matches!(&groups[1][0], SqlToken::Word(w) if w.eq_ignore_ascii_case("FROM")),
+            "FROM must be the first token of group[1]"
+        );
+        assert!(
+            matches!(&groups[2][0], SqlToken::Word(w) if w.eq_ignore_ascii_case("WHERE")),
+            "WHERE must be the first token of group[2]"
+        );
+    }
+
     // ── depth_at / is_top_level_depth / is_depth ──────────────────────────────
 
     #[test]
