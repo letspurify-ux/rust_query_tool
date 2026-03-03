@@ -896,7 +896,9 @@ impl QueryExecutor {
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
-                if leading_word.is_some_and(|w| w == "SELECT" || w == "WITH") {
+                // VALUES can head a nested query block in dialects that support table value
+                // constructors in FROM/subquery positions.
+                if leading_word.is_some_and(|w| w == "SELECT" || w == "WITH" || w == "VALUES") {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);
                 }
@@ -1169,7 +1171,7 @@ impl QueryExecutor {
                     if k > j {
                         let word: String = chars[j..k].iter().collect();
                         let word = word.to_ascii_uppercase();
-                        if word == "SELECT" || word == "WITH" {
+                        if word == "SELECT" || word == "WITH" || word == "VALUES" {
                             subquery_paren_depth += 1;
                         }
                     } else if j >= chars.len()

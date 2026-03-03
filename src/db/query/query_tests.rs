@@ -5871,3 +5871,46 @@ fn test_line_block_depths_with_values_main_query_dedents_to_with_level() {
         depths
     );
 }
+
+#[test]
+fn test_line_block_depths_detects_values_subquery_head_after_open_paren() {
+    let sql = "SELECT *\nFROM (\n  VALUES (1), (2)\n) AS t(n)\nWHERE n > 1;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM line");
+    let values_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("VALUES"))
+        .expect("expected VALUES line");
+
+    assert!(
+        depths[values_idx] > depths[from_idx],
+        "VALUES subquery head should be indented inside FROM parentheses (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_values_subquery_after_comment_between_paren_and_values() {
+    let sql = "SELECT *\nFROM (\n  -- comment before nested values\n  VALUES (1), (2)\n) AS t(n)\nWHERE n > 1;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM line");
+    let values_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("VALUES"))
+        .expect("expected VALUES line");
+
+    assert!(
+        depths[values_idx] > depths[from_idx],
+        "Comment between '(' and VALUES should preserve nested depth detection"
+    );
+}
