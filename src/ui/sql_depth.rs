@@ -1,15 +1,73 @@
 use crate::ui::sql_editor::SqlToken;
 
+#[derive(Default)]
+struct ParenDepthState {
+    stack: Vec<char>,
+}
+
+impl ParenDepthState {
+    #[inline]
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn apply_token(&mut self, token: &SqlToken) {
+        let symbol = match token {
+            SqlToken::Symbol(sym) => sym.as_str(),
+            _ => return,
+        };
+
+        match symbol {
+            "(" | "[" | "{" => {
+                if let Some(ch) = symbol.chars().next() {
+                    self.stack.push(ch);
+                }
+            }
+            ")" | "]" | "}" => {
+                if let Some(close_ch) = symbol.chars().next() {
+                    self.consume_close(close_ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn consume_close(&mut self, close_ch: char) {
+        let Some(expected_open) = matching_open_for_close(close_ch) else {
+            return;
+        };
+
+        if self.stack.last().copied() == Some(expected_open) {
+            self.stack.pop();
+            return;
+        }
+
+        if let Some(match_idx) = self.stack.iter().rposition(|&open| open == expected_open) {
+            self.stack.truncate(match_idx);
+        }
+    }
+}
+
+#[inline]
+fn matching_open_for_close(close_ch: char) -> Option<char> {
+    match close_ch {
+        ')' => Some('('),
+        ']' => Some('['),
+        '}' => Some('{'),
+        _ => None,
+    }
+}
+
 /// Returns the parenthesis depth *before* each token is processed.
 ///
 /// Depth changes for grouping symbols (`()`, `[]`, `{}`) and never goes below zero.
 pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
     let mut depths = Vec::with_capacity(tokens.len());
-    let mut depth = 0usize;
+    let mut state = ParenDepthState::default();
 
     for token in tokens {
-        depths.push(depth);
-        apply_paren_token(&mut depth, token);
+        depths.push(state.depth());
+        state.apply_token(token);
     }
 
     depths
@@ -29,11 +87,11 @@ pub(crate) fn apply_paren_token(depth: &mut usize, token: &SqlToken) {
 
 /// Returns the final parenthesis depth after all tokens are processed.
 pub(crate) fn paren_depth_after(tokens: &[SqlToken]) -> usize {
-    let mut depth = 0usize;
+    let mut state = ParenDepthState::default();
     for token in tokens {
-        apply_paren_token(&mut depth, token);
+        state.apply_token(token);
     }
-    depth
+    state.depth()
 }
 
 /// Returns token depth at `idx`, treating out-of-range indices as depth 0.
@@ -64,10 +122,10 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
 ) -> Vec<Vec<&'a SqlToken>> {
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
-    let mut depth = 0usize;
+    let mut state = ParenDepthState::default();
 
     for token in tokens {
-        let at_root = depth == 0;
+        let at_root = state.depth() == 0;
         if let SqlToken::Symbol(sym) = token {
             if sym == delimiter && at_root {
                 if !current.is_empty() {
@@ -78,7 +136,7 @@ pub(crate) fn split_top_level_symbol_groups<'a>(
         }
 
         current.push(token);
-        apply_paren_token(&mut depth, token);
+        state.apply_token(token);
     }
 
     if !current.is_empty() {
@@ -98,12 +156,12 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
 ) -> Vec<Vec<&'a SqlToken>> {
     let mut groups: Vec<Vec<&'a SqlToken>> = Vec::new();
     let mut current: Vec<&'a SqlToken> = Vec::new();
-    let mut depth = 0usize;
+    let mut state = ParenDepthState::default();
 
     for token in tokens {
         let is_break = match token {
             SqlToken::Word(word) => {
-                depth == 0
+                state.depth() == 0
                     && break_keywords
                         .iter()
                         .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -116,7 +174,7 @@ pub(crate) fn split_top_level_keyword_groups<'a>(
         }
 
         current.push(token);
-        apply_paren_token(&mut depth, token);
+        state.apply_token(token);
     }
 
     if !current.is_empty() {
@@ -163,14 +221,7 @@ mod tests {
 
     #[test]
     fn paren_depths_tracks_brackets_and_braces() {
-        let tokens = [
-            sym("["),
-            sym("{"),
-            word("x"),
-            sym("}"),
-            sym("]"),
-            word("y"),
-        ];
+        let tokens = [sym("["), sym("{"), word("x"), sym("}"), sym("]"), word("y")];
         assert_eq!(paren_depths(&tokens), vec![0, 1, 2, 2, 1, 0]);
     }
 
@@ -210,7 +261,10 @@ mod tests {
     fn paren_depth_after_detects_unbalanced_open_via_tokenizer() {
         // Ensure the tokenizer + paren_depth_after pipeline works end-to-end
         let tokens = tokenize_sql("SELECT (a + b FROM dual");
-        assert!(paren_depth_after(&tokens) > 0, "unbalanced open paren should yield depth > 0");
+        assert!(
+            paren_depth_after(&tokens) > 0,
+            "unbalanced open paren should yield depth > 0"
+        );
     }
 
     #[test]
@@ -249,7 +303,12 @@ mod tests {
         // The `,` inside `(b, c)` must not split at top level
         let tokens = tokenize_sql("a, (b, c), d");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 3, "expected 3 groups, got {:?}", group_words(groups));
+        assert_eq!(
+            groups.len(),
+            3,
+            "expected 3 groups, got {:?}",
+            group_words(groups)
+        );
     }
 
     #[test]
@@ -270,21 +329,36 @@ mod tests {
         // A `,` inside a string literal must not cause a split
         let tokens = tokenize_sql("'a,b', c");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 2, "string literal comma must not split, got {:?}", group_words(groups));
+        assert_eq!(
+            groups.len(),
+            2,
+            "string literal comma must not split, got {:?}",
+            group_words(groups)
+        );
     }
 
     #[test]
     fn split_top_level_symbol_groups_ignores_nested_comma_in_brackets() {
         let tokens = tokenize_sql("a, [b, c], d");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 3, "expected bracket depth to block split, got {:?}", group_words(groups));
+        assert_eq!(
+            groups.len(),
+            3,
+            "expected bracket depth to block split, got {:?}",
+            group_words(groups)
+        );
     }
 
     #[test]
     fn split_top_level_symbol_groups_ignores_nested_comma_in_braces() {
         let tokens = tokenize_sql("a, {b, c}, d");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 3, "expected brace depth to block split, got {:?}", group_words(groups));
+        assert_eq!(
+            groups.len(),
+            3,
+            "expected brace depth to block split, got {:?}",
+            group_words(groups)
+        );
     }
 
     // ── split_top_level_keyword_groups ────────────────────────────────────────
@@ -301,7 +375,12 @@ mod tests {
         // FROM inside subquery parens must not split the outer token stream
         let tokens = tokenize_sql("SELECT a, (SELECT b FROM inner_t) FROM outer_t");
         let groups = split_top_level_keyword_groups(&tokens, &["FROM"]);
-        assert_eq!(groups.len(), 2, "inner FROM must not split outer groups, got {:?}", group_words(groups));
+        assert_eq!(
+            groups.len(),
+            2,
+            "inner FROM must not split outer groups, got {:?}",
+            group_words(groups)
+        );
     }
 
     #[test]
@@ -326,6 +405,26 @@ mod tests {
         assert_eq!(paren_depth_after(&tokens), 0);
     }
 
+    #[test]
+    fn paren_depth_after_mismatched_closer_unwinds_to_matching_open() {
+        let tokens = [sym("("), sym("["), word("x"), sym(")")];
+        assert_eq!(paren_depth_after(&tokens), 0);
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_mismatched_closer_restores_root_split() {
+        // In "([x), y" the ')' should unwind both '[' and '(' so the comma
+        // is treated as top-level delimiter.
+        let tokens = tokenize_sql("([x), y");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "mismatched closer should restore root split, got {:?}",
+            group_words(groups)
+        );
+    }
+
     // ── split_top_level_symbol_groups: additional edge cases ──────────────────
 
     #[test]
@@ -333,7 +432,11 @@ mod tests {
         // A delimiter at the very start produces no empty leading group.
         let tokens = tokenize_sql(",a");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 1, "leading delimiter must not create an empty prefix group");
+        assert_eq!(
+            groups.len(),
+            1,
+            "leading delimiter must not create an empty prefix group"
+        );
     }
 
     #[test]
@@ -341,7 +444,11 @@ mod tests {
         // A delimiter at the very end produces no empty trailing group.
         let tokens = tokenize_sql("a,");
         let groups = split_top_level_symbol_groups(&tokens, ",");
-        assert_eq!(groups.len(), 1, "trailing delimiter must not create an empty suffix group");
+        assert_eq!(
+            groups.len(),
+            1,
+            "trailing delimiter must not create an empty suffix group"
+        );
     }
 
     #[test]
@@ -361,7 +468,14 @@ mod tests {
     fn split_top_level_symbol_groups_unbalanced_close_paren_at_root_stays_in_group() {
         // An unmatched `)` at depth 0 does not affect depth (saturates at 0).
         // It is treated as a plain symbol and ends up in the current group.
-        let tokens = [word("a"), sym(","), word("b"), sym(")"), sym(","), word("c")];
+        let tokens = [
+            word("a"),
+            sym(","),
+            word("b"),
+            sym(")"),
+            sym(","),
+            word("c"),
+        ];
         let groups = split_top_level_symbol_groups(&tokens, ",");
         // Expected: [a], [b, )], [c]
         assert_eq!(
@@ -386,7 +500,11 @@ mod tests {
         // before it — the keyword simply starts the first group.
         let tokens = tokenize_sql("FROM t");
         let groups = split_top_level_keyword_groups(&tokens, &["FROM"]);
-        assert_eq!(groups.len(), 1, "no empty group before a leading break keyword");
+        assert_eq!(
+            groups.len(),
+            1,
+            "no empty group before a leading break keyword"
+        );
         assert!(
             matches!(&groups[0][0], SqlToken::Word(w) if w.eq_ignore_ascii_case("FROM")),
             "the break keyword must be the first token of the first group"
@@ -444,7 +562,10 @@ mod tests {
         // index 2 (a) is at depth 1
         let tokens = tokenize_sql("SELECT (a) FROM t");
         let depths = paren_depths(&tokens);
-        let paren_open_idx = depths.iter().position(|&d| d == 1).expect("depth 1 not found");
+        let paren_open_idx = depths
+            .iter()
+            .position(|&d| d == 1)
+            .expect("depth 1 not found");
         assert!(!is_top_level_depth(&depths, paren_open_idx));
     }
 }
