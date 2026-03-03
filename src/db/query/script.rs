@@ -120,6 +120,11 @@ impl SplitState {
                 if self.block_depth > 0 {
                     self.block_depth -= 1;
                 }
+            } else if upper == "WHILE" {
+                // END WHILE
+                if self.block_depth > 0 {
+                    self.block_depth -= 1;
+                }
             } else if upper == "REPEAT" {
                 // END REPEAT
                 if self.block_depth > 0 {
@@ -840,7 +845,7 @@ impl QueryExecutor {
             if builder.state.pending_end
                 && !matches!(
                     leading_word,
-                    Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")
+                    Some("CASE" | "IF" | "LOOP" | "WHILE" | "BEFORE" | "AFTER" | "REPEAT")
                 )
             {
                 if builder
@@ -878,7 +883,7 @@ impl QueryExecutor {
             if builder.state.pending_end
                 && matches!(
                     leading_word,
-                    Some("CASE" | "IF" | "LOOP" | "BEFORE" | "AFTER" | "REPEAT")
+                    Some("CASE" | "IF" | "LOOP" | "WHILE" | "BEFORE" | "AFTER" | "REPEAT")
                 )
             {
                 depth = depth.saturating_sub(1);
