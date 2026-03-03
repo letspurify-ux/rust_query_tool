@@ -2563,6 +2563,63 @@ END test_compound_trg;"#;
 }
 
 #[test]
+fn test_compound_trigger_instead_of_each_row() {
+    // COMPOUND TRIGGER can use INSTEAD OF EACH ROW timing point for views.
+    // END INSTEAD OF EACH ROW should close only timing-point depth.
+    let sql = r#"CREATE OR REPLACE TRIGGER test_compound_view_trg
+INSTEAD OF INSERT ON test_view
+COMPOUND TRIGGER
+  INSTEAD OF EACH ROW IS
+  BEGIN
+    INSERT INTO base_table(id) VALUES (:NEW.id);
+  END INSTEAD OF EACH ROW;
+END test_compound_view_trg;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
+}
+
+#[test]
+fn test_compound_trigger_instead_of_followed_by_show_errors() {
+    // Ensure END INSTEAD OF ... does not leave depth stale and swallow next command.
+    let sql = r#"CREATE OR REPLACE TRIGGER test_compound_view_trg
+INSTEAD OF INSERT ON test_view
+COMPOUND TRIGGER
+  INSTEAD OF EACH ROW IS
+  BEGIN
+    NULL;
+  END INSTEAD OF EACH ROW;
+END test_compound_view_trg;
+
+SHOW ERRORS"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            if let ScriptItem::Statement(s) = item {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let tool_cmds: Vec<_> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+    assert_eq!(stmts.len(), 1, "Should have 1 statement");
+    assert_eq!(
+        tool_cmds.len(),
+        1,
+        "Should have 1 tool command (SHOW ERRORS)"
+    );
+    assert!(
+        !stmts[0].contains("SHOW ERRORS"),
+        "COMPOUND TRIGGER should NOT contain SHOW ERRORS"
+    );
+}
+
+#[test]
 fn test_create_view_with_subqueries_and_like_patterns() {
     // CREATE VIEW with:
     // - Subqueries in CASE WHEN (SELECT ... IN (subquery))
