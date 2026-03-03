@@ -2,18 +2,14 @@ use crate::ui::sql_editor::SqlToken;
 
 /// Returns the parenthesis depth *before* each token is processed.
 ///
-/// Depth changes only for `(` and `)` symbols and never goes below zero.
+/// Depth changes for grouping symbols (`()`, `[]`, `{}`) and never goes below zero.
 pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
     let mut depths = Vec::with_capacity(tokens.len());
     let mut depth = 0usize;
 
     for token in tokens {
         depths.push(depth);
-        match token {
-            SqlToken::Symbol(sym) if sym == "(" => depth += 1,
-            SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+        apply_paren_token(&mut depth, token);
     }
 
     depths
@@ -23,8 +19,10 @@ pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
 #[inline]
 pub(crate) fn apply_paren_token(depth: &mut usize, token: &SqlToken) {
     match token {
-        SqlToken::Symbol(sym) if sym == "(" => *depth += 1,
-        SqlToken::Symbol(sym) if sym == ")" => *depth = depth.saturating_sub(1),
+        SqlToken::Symbol(sym) if matches!(sym.as_str(), "(" | "[" | "{") => *depth += 1,
+        SqlToken::Symbol(sym) if matches!(sym.as_str(), ")" | "]" | "}") => {
+            *depth = depth.saturating_sub(1)
+        }
         _ => {}
     }
 }
@@ -164,6 +162,19 @@ mod tests {
     }
 
     #[test]
+    fn paren_depths_tracks_brackets_and_braces() {
+        let tokens = [
+            sym("["),
+            sym("{"),
+            word("x"),
+            sym("}"),
+            sym("]"),
+            word("y"),
+        ];
+        assert_eq!(paren_depths(&tokens), vec![0, 1, 2, 2, 1, 0]);
+    }
+
+    #[test]
     fn paren_depths_saturates_at_zero_for_unbalanced_close() {
         // ) at depth 0 must not underflow
         let tokens = [sym(")"), word("x")];
@@ -260,6 +271,20 @@ mod tests {
         let tokens = tokenize_sql("'a,b', c");
         let groups = split_top_level_symbol_groups(&tokens, ",");
         assert_eq!(groups.len(), 2, "string literal comma must not split, got {:?}", group_words(groups));
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_ignores_nested_comma_in_brackets() {
+        let tokens = tokenize_sql("a, [b, c], d");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(groups.len(), 3, "expected bracket depth to block split, got {:?}", group_words(groups));
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_ignores_nested_comma_in_braces() {
+        let tokens = tokenize_sql("a, {b, c}, d");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(groups.len(), 3, "expected brace depth to block split, got {:?}", group_words(groups));
     }
 
     // ── split_top_level_keyword_groups ────────────────────────────────────────
