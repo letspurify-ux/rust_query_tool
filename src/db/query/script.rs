@@ -287,21 +287,35 @@ impl SplitState {
         self.token.clear();
     }
 
+    fn resolve_pending_end(&mut self) {
+        if self
+            .case_depth_stack
+            .last()
+            .is_some_and(|depth| *depth + 1 == self.block_depth)
+        {
+            // CASE expression 종료 (stack.last() == block_depth)
+            self.case_depth_stack.pop();
+            self.block_depth = self.block_depth.saturating_sub(1);
+        } else if self.block_depth > 0 {
+            // PL/SQL block 종료
+            self.block_depth -= 1;
+        }
+    }
+
+    pub(crate) fn resolve_pending_end_on_separator(&mut self) {
+        if self.pending_end {
+            // END followed by a non-keyword separator - determine what it closes.
+            // '-' and '/' are treated as separators only when they are not comment starters,
+            // so continuation forms like END /*c*/ IF and END --c ... IF still work.
+            self.resolve_pending_end();
+            self.pending_end = false;
+        }
+    }
+
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
         if self.pending_end {
             // END followed by terminator (;) - determine what it closes
-            if self
-                .case_depth_stack
-                .last()
-                .is_some_and(|depth| *depth + 1 == self.block_depth)
-            {
-                // CASE expression 종료 (stack.last() == block_depth)
-                self.case_depth_stack.pop();
-                self.block_depth = self.block_depth.saturating_sub(1);
-            } else if self.block_depth > 0 {
-                // PL/SQL block 종료
-                self.block_depth -= 1;
-            }
+            self.resolve_pending_end();
             // Reset create state when we reach depth 0 (end of CREATE statement)
             if self.block_depth == 0 {
                 self.reset_create_state();
@@ -321,18 +335,7 @@ impl SplitState {
     pub(crate) fn resolve_pending_end_on_eof(&mut self) {
         if self.pending_end {
             // END at EOF - determine what it closes
-            if self
-                .case_depth_stack
-                .last()
-                .is_some_and(|depth| *depth + 1 == self.block_depth)
-            {
-                // CASE expression 종료 (stack.last() == block_depth)
-                self.case_depth_stack.pop();
-                self.block_depth = self.block_depth.saturating_sub(1);
-            } else if self.block_depth > 0 {
-                // PL/SQL block 종료
-                self.block_depth -= 1;
-            }
+            self.resolve_pending_end();
             // Reset create state when we reach depth 0 (end of CREATE statement)
             if self.block_depth == 0 {
                 self.reset_create_state();
@@ -632,6 +635,17 @@ impl StatementBuilder {
                 self.state.paren_depth += 1;
             } else if c == ')' {
                 self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+            }
+
+            if self.state.pending_end {
+                let separator = matches!(
+                    c,
+                    ',' | ')' | ']' | '}' | '+' | '*' | '%' | '=' | '<' | '>' | '|'
+                ) || (c == '-' && next != Some('-'))
+                    || (c == '/' && next != Some('*'));
+                if separator {
+                    self.state.resolve_pending_end_on_separator();
+                }
             }
 
             if c == ';' {

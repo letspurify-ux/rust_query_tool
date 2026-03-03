@@ -4350,6 +4350,85 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_if_with_begin_and_multiple_case_columns() {
+    let sql = r#"if 1=1 then
+    begin
+        select
+            case
+                when 1=1 then '1'
+                else ''
+            end,
+            case
+                when 1=1 then '1'
+                else ''
+            end
+        from dual;
+end
+end if;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 2, 3, 3, 2, 2, 3, 3, 2, 2, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "IF/BEGIN + multi-CASE depth tracking mismatch"
+    );
+}
+
+#[test]
+fn test_select_with_case_expressions_separated_by_plus() {
+    let sql = "SELECT CASE WHEN a=1 THEN 1 ELSE 0 END + CASE WHEN b=2 THEN 1 ELSE 0 END FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
+}
+
+#[test]
+fn test_select_with_case_expressions_separated_by_minus_and_division() {
+    let sql = "SELECT CASE WHEN a=1 THEN 1 ELSE 0 END - CASE WHEN b=2 THEN 1 ELSE 0 END / CASE WHEN c=3 THEN 1 ELSE 0 END FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
+}
+
+#[test]
+fn test_line_block_depths_if_with_case_expressions_separated_by_plus() {
+    let sql = r#"if 1=1 then
+    begin
+        select
+            case
+                when 1=1 then 1
+                else 0
+            end + case
+                when 1=1 then 1
+                else 0
+            end
+        from dual;
+end
+end if;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 2, 3, 3, 2, 3, 3, 2, 2, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "IF/BEGIN + arithmetic CASE depth tracking mismatch"
+    );
+}
+
+#[test]
+fn test_split_script_items_end_comment_if_continuation() {
+    let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    NULL;
+  END /* keep continuation */ IF;
+END;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 1, "END comment IF should remain one statement");
+}
+
+#[test]
 fn test_split_script_items_repeat_block() {
     let sql = r#"DECLARE
   v_count NUMBER := 0;
