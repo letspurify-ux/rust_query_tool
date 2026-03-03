@@ -1228,6 +1228,20 @@ fn nested_function_parentheses_do_not_increase_query_depth() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 }
 
+#[test]
+fn values_subquery_in_from_increases_query_depth() {
+    let ctx = analyze("SELECT * FROM (VALUES (|)) v(c)");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
+#[test]
+fn values_subquery_depth_returns_to_zero_after_close() {
+    let ctx = analyze("SELECT * FROM (VALUES (1)) v(c) WHERE |");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]

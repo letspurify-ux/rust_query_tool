@@ -237,6 +237,18 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut cte_paren_depth: usize = 0;
     let mut idx = 0;
 
+    let mark_query_scope = |depth: usize, query_scope_stack: &mut Vec<bool>, query_depth: &mut usize| {
+        if depth > 0
+            && query_scope_stack
+                .get(depth)
+                .copied()
+                .is_some_and(|is_query_scope| !is_query_scope)
+        {
+            query_scope_stack[depth] = true;
+            *query_depth = query_depth.saturating_add(1);
+        }
+    };
+
     while idx < tokens.len() {
         let token = &tokens[idx];
 
@@ -384,28 +396,12 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 match upper.as_str() {
                     "WITH" if matches!(current_phase, SqlPhase::Initial) => {
                         phase_stack[depth] = SqlPhase::WithClause;
-                        if depth > 0
-                            && query_scope_stack
-                                .get(depth)
-                                .copied()
-                                .is_some_and(|is_query_scope| !is_query_scope)
-                        {
-                            query_scope_stack[depth] = true;
-                            query_depth = query_depth.saturating_add(1);
-                        }
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                         cte_state = CteState::ExpectName;
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
-                        if depth > 0
-                            && query_scope_stack
-                                .get(depth)
-                                .copied()
-                                .is_some_and(|is_query_scope| !is_query_scope)
-                        {
-                            query_scope_stack[depth] = true;
-                            query_depth = query_depth.saturating_add(1);
-                        }
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "FROM" => {
                         // Only suppress FROM transition when the enclosing '('
@@ -491,6 +487,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "VALUES" => {
                         phase_stack[depth] = SqlPhase::ValuesClause;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "MATCH_RECOGNIZE" => {
                         phase_stack[depth] = SqlPhase::MatchRecognizeClause;
