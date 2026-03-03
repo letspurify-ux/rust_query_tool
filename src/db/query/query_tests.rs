@@ -5914,3 +5914,69 @@ fn test_line_block_depths_detects_values_subquery_after_comment_between_paren_an
         "Comment between '(' and VALUES should preserve nested depth detection"
     );
 }
+
+#[test]
+fn test_line_block_depths_detects_insert_subquery_head_after_open_paren() {
+    let sql = "SELECT *\nFROM (\n  INSERT INTO dst(id) SELECT id FROM src RETURNING id\n) q;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM line");
+    let insert_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("INSERT"))
+        .expect("expected INSERT line");
+
+    assert!(
+        depths[insert_idx] > depths[from_idx],
+        "INSERT subquery head should be indented inside FROM parentheses (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_dml_subquery_after_comment_between_paren_and_update() {
+    let sql = "SELECT *\nFROM (\n  /* comment before nested update */\n  UPDATE dst SET id = src.id FROM src WHERE dst.id = src.id RETURNING dst.id\n) q;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM line");
+    let update_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("UPDATE"))
+        .expect("expected UPDATE line");
+
+    assert!(
+        depths[update_idx] > depths[from_idx],
+        "Comment between '(' and UPDATE should preserve nested depth detection (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_merge_subquery_after_line_comment_between_paren_and_merge() {
+    let sql = "SELECT *\nFROM (\n  -- comment before nested merge\n  MERGE INTO dst d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id\n) q;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let from_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("FROM ("))
+        .expect("expected FROM line");
+    let merge_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("MERGE"))
+        .expect("expected MERGE line");
+
+    assert!(
+        depths[merge_idx] > depths[from_idx],
+        "Line comment between '(' and MERGE should preserve nested depth detection (depths: {:?})",
+        depths
+    );
+}
