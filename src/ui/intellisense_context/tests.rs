@@ -1137,6 +1137,27 @@ fn depth_zero_after_nested_with_subquery_closes() {
 }
 
 #[test]
+fn malformed_with_missing_as_in_query_recovers_depth_and_phase() {
+    let ctx = analyze("WITH cte (SELECT 1) SELECT | FROM cte");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn malformed_with_missing_as_in_query_recovers_from_clause() {
+    let ctx = analyze("WITH cte (SELECT 1) SELECT * FROM |");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+}
+
+#[test]
+fn malformed_with_missing_as_in_subquery_keeps_nested_depth() {
+    let ctx = analyze("SELECT * FROM (WITH cte (SELECT 1) SELECT | FROM cte) x");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
 fn sibling_subquery_tables_are_not_visible_inside_current_subquery() {
     let ctx = analyze(
         "SELECT * \
