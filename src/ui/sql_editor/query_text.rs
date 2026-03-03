@@ -23,6 +23,8 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     let mut current_start = 0usize;
     let mut scan_state = SplitState::default();
     let mut pending_newline = true;
+    let mut in_dollar_quote = false;
+    let mut dollar_quote_tag = String::new();
 
     let flush_word = |current: &mut String,
                       current_start: &mut usize,
@@ -109,6 +111,30 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                 });
                 scan_state.in_q_quote = false;
                 scan_state.q_quote_end = None;
+                continue;
+            }
+            continue;
+        }
+
+        if in_dollar_quote {
+            current.push(c);
+            if c == '$' && sql[idx..].starts_with(&dollar_quote_tag) {
+                let mut end = idx + 1;
+                for _ in 0..dollar_quote_tag.len().saturating_sub(1) {
+                    if let Some((next_idx, next_ch)) = iter.next() {
+                        current.push(next_ch);
+                        end = next_idx + next_ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::String(std::mem::take(&mut current)),
+                    start: current_start,
+                    end,
+                });
+                in_dollar_quote = false;
+                dollar_quote_tag.clear();
                 continue;
             }
             continue;
@@ -275,6 +301,18 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
+        if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
+            flush_word(&mut current, &mut current_start, idx, &mut tokens);
+            current_start = idx;
+            current.push_str(&tag);
+            in_dollar_quote = true;
+            dollar_quote_tag = tag.clone();
+            for _ in 0..tag.len().saturating_sub(1) {
+                let _ = iter.next();
+            }
+            continue;
+        }
+
         if sql_text::is_identifier_char(c) {
             if current.is_empty() {
                 current_start = idx;
@@ -343,7 +381,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                 end: sql.len(),
             });
         }
-    } else if scan_state.in_single_quote || scan_state.in_q_quote {
+    } else if scan_state.in_single_quote || scan_state.in_q_quote || in_dollar_quote {
         if !current.is_empty() {
             tokens.push(SqlTokenSpan {
                 token: SqlToken::String(std::mem::take(&mut current)),
@@ -364,6 +402,31 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     }
 
     tokens
+}
+
+fn parse_dollar_quote_tag(sql: &str, start: usize) -> Option<String> {
+    let bytes = sql.as_bytes();
+    if bytes.get(start).copied() != Some(b'$') {
+        return None;
+    }
+
+    let mut i = start + 1;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'$' {
+            return sql.get(start..=i).map(ToString::to_string);
+        }
+        if !is_dollar_quote_tag_char(b) {
+            return None;
+        }
+        i += 1;
+    }
+
+    None
+}
+
+#[inline]
+fn is_dollar_quote_tag_char(ch: u8) -> bool {
+    ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
 /// 현재 커서 위치가 포함된 문장을 문자열로 반환합니다.
@@ -916,6 +979,8 @@ mod tests {
             "BEGIN\n  <<outer_label>>\n  NULL;\nEND;\n/",
             "SELECT nq'{문자열 ''보존''}' AS txt, a<=b, a<>b, a!=b, a||b, c:=d, e=>f FROM dual;",
             "/* 한글 블록\n코멘트 */\nSELECT \"컬럼명\" FROM \"테이블\";",
+            "SELECT $$fn(a, b)$$, 1 FROM dual;",
+            "SELECT $tag$BEGIN (x, y); END$tag$, col FROM dual;",
         ];
 
         for sql in cases {
@@ -925,6 +990,22 @@ mod tests {
                 "sql: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn tokenize_sql_treats_postgres_dollar_quote_as_string() {
+        let tokens = tokenize_sql("SELECT $$a,(b)$$, c FROM dual");
+        assert!(tokens.iter().any(
+            |t| matches!(t, SqlToken::String(s) if s == "$$a,(b)$$")
+        ));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_tagged_dollar_quote_as_string() {
+        let tokens = tokenize_sql("SELECT $proc$BEGIN (x); END$proc$, c FROM dual");
+        assert!(tokens.iter().any(
+            |t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")
+        ));
     }
 }
 
