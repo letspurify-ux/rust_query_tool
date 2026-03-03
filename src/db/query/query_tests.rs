@@ -3781,6 +3781,24 @@ fn test_accept_prompt_with_utf8_prefix_before_prompt_keyword() {
 }
 
 #[test]
+fn test_prompt_command_preserves_trailing_semicolon_text() {
+    let sql = "PROMPT hello;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let parsed = items.iter().find_map(|item| match item {
+        ScriptItem::ToolCommand(ToolCommand::Prompt { text }) => Some(text.as_str()),
+        _ => None,
+    });
+
+    assert_eq!(
+        parsed,
+        Some("hello;"),
+        "PROMPT payload should preserve trailing semicolon text: {:?}",
+        items
+    );
+}
+
+#[test]
 fn test_trigger_with_declare_and_multiline_header() {
     // TRIGGER 헤더에서 이벤트 타입(INSERT)이 별도 행에 있고,
     // DECLARE 블록과 q-quote 내의 가짜 키워드가 포함된 경우

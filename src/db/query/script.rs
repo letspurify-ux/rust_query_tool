@@ -3704,11 +3704,19 @@ impl QueryExecutor {
     }
 
     pub fn parse_tool_command(line: &str) -> Option<ToolCommand> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let trimmed_line = line.trim();
+        if trimmed_line.is_empty() {
             return None;
         }
-        let trimmed = trimmed.trim_end_matches(';').trim();
+        // PROMPT는 명령 본문 전체를 출력하므로, 문장 끝 세미콜론도 payload로 보존한다.
+        // 다른 도구 명령은 SQL terminator 스타일 입력(예: SET ECHO ON;)을 허용하기 위해
+        // 트레일링 세미콜론을 제거한다.
+        let upper_line = trimmed_line.to_ascii_uppercase();
+        let trimmed = if Self::is_word_command(&upper_line, "PROMPT") {
+            trimmed_line
+        } else {
+            trimmed_line.trim_end_matches(';').trim()
+        };
         if trimmed.is_empty() {
             return None;
         }
