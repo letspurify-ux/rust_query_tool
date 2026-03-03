@@ -1242,6 +1242,27 @@ fn values_subquery_depth_returns_to_zero_after_close() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
+#[test]
+fn merge_using_subquery_increases_depth_inside_select_body() {
+    let ctx = analyze("MERGE INTO target t USING (SELECT | FROM source) s ON (t.id = s.id)");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn merge_using_subquery_depth_returns_to_zero_after_close() {
+    let ctx = analyze("MERGE INTO target t USING (SELECT id FROM source) s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = |");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+}
+
+#[test]
+fn lateral_values_subquery_in_from_increases_depth() {
+    let ctx = analyze("SELECT * FROM base b CROSS APPLY (VALUES (|)) v(c)");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]
