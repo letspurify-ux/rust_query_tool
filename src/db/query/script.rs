@@ -59,6 +59,9 @@ pub(crate) struct SplitState {
     /// Reusable buffer for uppercase token comparisons.
     /// Avoids a heap allocation on every `flush_token` call.
     token_upper_buf: String,
+    /// True after WHILE, waiting for a MySQL-style DO token.
+    /// Used for `WHILE condition DO ... END WHILE;` where LOOP does not appear.
+    pending_while_do: bool,
 }
 
 impl SplitState {
@@ -169,10 +172,18 @@ impl SplitState {
 
         if upper == "LOOP" && !is_end_loop {
             self.block_depth += 1;
+            self.pending_while_do = false;
         }
 
         if upper == "REPEAT" && !is_end_repeat {
             self.block_depth += 1;
+        }
+
+        if upper == "WHILE" && !self.pending_end {
+            self.pending_while_do = true;
+        } else if self.pending_while_do && upper == "DO" {
+            self.block_depth += 1;
+            self.pending_while_do = false;
         }
 
         // Handle TYPE declarations that don't create a block:
@@ -363,6 +374,7 @@ impl SplitState {
         self.pending_timing_point_is = false;
         self.after_type = false;
         self.is_type_create = false;
+        self.pending_while_do = false;
     }
 
     fn track_create_plsql(&mut self, upper: &str) {
