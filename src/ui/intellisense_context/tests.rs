@@ -805,6 +805,20 @@ fn insert_select_keeps_target_and_source_tables_in_scope() {
     assert_eq!(resolved, vec!["employees"]);
 }
 
+#[test]
+fn insert_subquery_in_values_increases_query_depth() {
+    let ctx = analyze("INSERT INTO employees (id) VALUES ((SELECT | FROM dual))");
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn insert_subquery_depth_returns_to_zero_after_closing_values_subquery() {
+    let ctx = analyze("INSERT INTO employees (id) VALUES ((SELECT 1 FROM dual)) RETURNING | INTO :id");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
 // ─── Complex real-world query tests ─────────────────────────────────────
 
 #[test]

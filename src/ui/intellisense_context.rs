@@ -394,6 +394,9 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 pending_lateral_subquery = false;
 
                 match upper.as_str() {
+                    "INSERT" => {
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                    }
                     "WITH" if matches!(current_phase, SqlPhase::Initial) => {
                         phase_stack[depth] = SqlPhase::WithClause;
                         mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
