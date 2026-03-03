@@ -370,6 +370,28 @@ fn subquery_alias_with_as() {
 }
 
 #[test]
+fn subquery_alias_with_column_list_is_recognized() {
+    let ctx = analyze("SELECT * FROM (SELECT 1 AS n FROM dual) sub(n) WHERE |");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"SUB".to_string()),
+        "subquery alias with column list should be in scope: {:?}",
+        names
+    );
+}
+
+#[test]
+fn subquery_alias_with_as_and_column_list_is_recognized() {
+    let ctx = analyze("SELECT * FROM (SELECT 1 AS n FROM dual) AS sub(n) WHERE |");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"SUB".to_string()),
+        "AS subquery alias with column list should be in scope: {:?}",
+        names
+    );
+}
+
+#[test]
 fn subquery_alias_mixed_with_table() {
     let ctx = analyze("SELECT | FROM users u, (SELECT id FROM orders) o");
     let names = table_names(&ctx);

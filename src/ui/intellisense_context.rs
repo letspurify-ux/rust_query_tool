@@ -1303,6 +1303,27 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
 
 /// Parse an alias after a subquery closing ')'.
 fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
+    fn skip_comments(tokens: &[SqlToken], mut idx: usize) -> usize {
+        while idx < tokens.len() {
+            if let SqlToken::Comment(_) = &tokens[idx] {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        idx
+    }
+
+    fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
+        let idx = skip_comments(tokens, start);
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(sym)) if sym == "(" => extract_parenthesized_range(tokens, idx)
+                .map(|(_, next_idx)| next_idx)
+                .unwrap_or(idx),
+            _ => idx,
+        }
+    }
+
     let mut idx = start;
     // Skip comments and stray closing parens to recover from malformed SQL like:
     // `FROM (SELECT ...) ) alias`
@@ -1328,18 +1349,13 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
             if upper == "AS" {
                 idx += 1;
                 // Skip comments after AS
-                while idx < tokens.len() {
-                    if let SqlToken::Comment(_) = &tokens[idx] {
-                        idx += 1;
-                        continue;
-                    }
-                    break;
-                }
+                idx = skip_comments(tokens, idx);
                 if let Some(SqlToken::Word(alias)) = tokens.get(idx) {
                     if !is_identifier_word_token(alias) {
                         return None;
                     }
-                    return Some((strip_identifier_quotes(alias), idx + 1));
+                    let next_idx = consume_optional_alias_column_list(tokens, idx + 1);
+                    return Some((strip_identifier_quotes(alias), next_idx));
                 }
                 return None;
             }
@@ -1347,7 +1363,8 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
                 return None;
             }
             if is_quoted || (!is_alias_breaker(&upper) && !is_join_keyword(&upper)) {
-                return Some((strip_identifier_quotes(word), idx + 1));
+                let next_idx = consume_optional_alias_column_list(tokens, idx + 1);
+                return Some((strip_identifier_quotes(word), next_idx));
             }
             None
         }
