@@ -1670,6 +1670,23 @@ fn trim_from_does_not_trigger_from_clause() {
     assert!(ctx.phase.is_column_context());
 }
 
+
+#[test]
+fn substring_from_does_not_trigger_from_clause() {
+    // SUBSTRING(col FROM start FOR count) uses FROM as function syntax.
+    let ctx = analyze("SELECT SUBSTRING(name FROM | FOR 2) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn overlay_from_does_not_trigger_from_clause() {
+    // OVERLAY(col PLACING txt FROM start FOR count) also consumes FROM internally.
+    let ctx = analyze("SELECT OVERLAY(name PLACING 'X' FROM | FOR 1) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
 #[test]
 fn real_from_after_extract_still_works() {
     // The outer FROM clause should still be detected correctly.
