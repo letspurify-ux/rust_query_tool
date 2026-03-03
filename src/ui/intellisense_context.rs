@@ -200,9 +200,9 @@ struct PhaseAnalysis {
 
 /// Returns true for functions whose syntax includes a FROM keyword as part of
 /// the function call rather than a SQL clause (e.g. `EXTRACT(YEAR FROM ...)`,
-/// `TRIM(LEADING '0' FROM ...)`).
+/// `TRIM(LEADING '0' FROM ...)`, `SUBSTRING(col FROM ...)`).
 fn is_from_consuming_function(name: &str) -> bool {
-    matches!(name, "EXTRACT" | "TRIM" | "XMLCAST")
+    matches!(name, "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY")
 }
 
 /// FROM-clause table functions that may reference left-side row source aliases.
