@@ -62,6 +62,10 @@ pub(crate) struct SplitState {
     /// True after WHILE, waiting for a MySQL-style DO token.
     /// Used for `WHILE condition DO ... END WHILE;` where LOOP does not appear.
     pending_while_do: bool,
+    /// True after IF, waiting for a control-flow THEN token.
+    /// This prevents `IF(expr, ...)` scalar functions from being misclassified
+    /// as block openers in non-PL/SQL SQL statements.
+    pending_if_then: bool,
 }
 
 impl SplitState {
@@ -168,7 +172,12 @@ impl SplitState {
         }
 
         if upper == "IF" && !is_end_if {
+            self.pending_if_then = true;
+        }
+
+        if upper == "THEN" && self.pending_if_then {
             self.block_depth += 1;
+            self.pending_if_then = false;
         }
 
         if upper == "LOOP" && !is_end_loop {
@@ -376,6 +385,7 @@ impl SplitState {
         self.after_type = false;
         self.is_type_create = false;
         self.pending_while_do = false;
+        self.pending_if_then = false;
     }
 
     fn track_create_plsql(&mut self, upper: &str) {
@@ -809,10 +819,16 @@ impl QueryExecutor {
             )
         }
         let is_with_main_query_keyword = |word: &str| -> bool {
-            matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES")
+            matches!(
+                word,
+                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES"
+            )
         };
         let is_subquery_head_keyword = |word: &str| -> bool {
-            matches!(word, "SELECT" | "WITH" | "VALUES" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+            matches!(
+                word,
+                "SELECT" | "WITH" | "VALUES" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+            )
         };
         let leading_keyword_after_comments = |line: &str| -> Option<String> {
             let trimmed = line.trim_start();
@@ -1024,8 +1040,8 @@ impl QueryExecutor {
             }
 
             if with_cte_depth > 0 {
-                let starts_main_select = leading_word.is_some_and(&is_with_main_query_keyword)
-                    && with_cte_paren <= 0;
+                let starts_main_select =
+                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
                 // For the main query line that follows a WITH clause, do not add with_cte_depth.
                 // This brings depth back to the WITH line's level without touching any
                 // subquery_paren_depth that is already embedded in the current depth value.

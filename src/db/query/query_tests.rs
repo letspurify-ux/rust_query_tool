@@ -4692,7 +4692,10 @@ fn test_line_block_depths_preserve_pending_end_across_blank_line() {
 END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     let expected = vec![0, 1, 2, 1, 2, 1, 0];
-    assert_eq!(depths, expected, "blank line between END and WHILE should keep END pending");
+    assert_eq!(
+        depths, expected,
+        "blank line between END and WHILE should keep END pending"
+    );
 }
 
 #[test]
@@ -4706,9 +4709,11 @@ fn test_line_block_depths_preserve_pending_end_across_comment_line() {
 END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     let expected = vec![0, 1, 2, 1, 2, 1, 0];
-    assert_eq!(depths, expected, "comment line between END and WHILE should keep END pending");
+    assert_eq!(
+        depths, expected,
+        "comment line between END and WHILE should keep END pending"
+    );
 }
-
 
 #[test]
 fn test_line_block_depths_with_for_update_clause() {
@@ -5978,5 +5983,32 @@ fn test_line_block_depths_detects_merge_subquery_after_line_comment_between_pare
         depths[merge_idx] > depths[from_idx],
         "Line comment between '(' and MERGE should preserve nested depth detection (depths: {:?})",
         depths
+    );
+}
+
+#[test]
+fn test_split_script_items_mysql_if_function_does_not_open_block_depth() {
+    let sql = "SELECT IF(score > 90, 'A', 'B') AS grade FROM exam_scores;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "IF() function must not keep parser in block depth: {stmts:?}"
+    );
+    assert!(stmts[0].starts_with("SELECT IF("));
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_line_block_depths_if_function_line_stays_top_level_without_then() {
+    let sql = "SELECT IF(score > 90, 'A', 'B') AS grade\nFROM exam_scores;";
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(
+        depths,
+        vec![0, 0],
+        "IF() scalar function should not affect block depth"
     );
 }
