@@ -4757,6 +4757,33 @@ END;"#;
     );
 }
 
+#[test]
+fn test_line_block_depths_detects_subquery_after_inline_block_comment() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (/* inline note */ SELECT
+  1
+FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let select_one_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with('1'))
+        .expect("expected SELECT body line");
+
+    assert!(
+        depths[select_one_idx] > depths[where_idx],
+        "Inline block comment before SELECT should still preserve subquery depth"
+    );
+}
+
 // ── parse_ddl_object_type tests ──
 
 #[test]

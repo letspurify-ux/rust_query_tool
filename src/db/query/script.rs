@@ -1060,6 +1060,20 @@ impl QueryExecutor {
                     while j < chars.len() && chars[j].is_whitespace() {
                         j += 1;
                     }
+                    if j + 1 < chars.len() && chars[j] == '/' && chars[j + 1] == '*' {
+                        let mut comment_idx = j + 2;
+                        while comment_idx + 1 < chars.len() {
+                            if chars[comment_idx] == '*' && chars[comment_idx + 1] == '/' {
+                                comment_idx += 2;
+                                break;
+                            }
+                            comment_idx += 1;
+                        }
+                        j = comment_idx;
+                        while j < chars.len() && chars[j].is_whitespace() {
+                            j += 1;
+                        }
+                    }
                     let mut k = j;
                     while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
                         k += 1;
