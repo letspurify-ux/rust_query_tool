@@ -41,7 +41,14 @@ impl ParenDepthState {
 
         if let Some(match_idx) = self.stack.iter().rposition(|&open| open == expected_open) {
             self.stack.truncate(match_idx);
+            return;
         }
+
+        // Recovery path for malformed SQL: when a closer appears but there is no
+        // matching opener in the stack, consume one nesting level instead of
+        // freezing depth forever. This keeps top-level splitter behavior usable
+        // after mixed typo sequences such as "([x}, y".
+        self.stack.pop();
     }
 }
 
@@ -419,6 +426,14 @@ mod tests {
     }
 
     #[test]
+    fn paren_depth_after_unknown_mismatched_closer_still_recovers_depth() {
+        // There is no '{' opener in the stack, but recovery should still reduce
+        // depth so later top-level parsing can proceed.
+        let tokens = [sym("("), sym("["), word("x"), sym("}"), word("y")];
+        assert_eq!(paren_depth_after(&tokens), 1);
+    }
+
+    #[test]
     fn split_top_level_symbol_groups_mismatched_closer_restores_root_split() {
         // In "([x), y" the ')' should unwind both '[' and '(' so the comma
         // is treated as top-level delimiter.
@@ -428,6 +443,20 @@ mod tests {
             groups.len(),
             2,
             "mismatched closer should restore root split, got {:?}",
+            group_words(groups)
+        );
+    }
+
+    #[test]
+    fn split_top_level_symbol_groups_unknown_mismatched_closer_does_not_stick_depth() {
+        // In "([x}, y" there is no '{' opener. The parser should still recover
+        // one level so the trailing ')' returns to root and comma splits.
+        let tokens = tokenize_sql("([x}), y");
+        let groups = split_top_level_symbol_groups(&tokens, ",");
+        assert_eq!(
+            groups.len(),
+            2,
+            "unknown mismatched closer must not keep parser forever nested, got {:?}",
             group_words(groups)
         );
     }
