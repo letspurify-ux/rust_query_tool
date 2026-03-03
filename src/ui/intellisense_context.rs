@@ -466,12 +466,15 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "UPDATE" => {
                         phase_stack[depth] = SqlPhase::UpdateTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "DELETE" => {
                         phase_stack[depth] = SqlPhase::DeleteTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "MERGE" => {
                         phase_stack[depth] = SqlPhase::MergeTarget;
+                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
                     }
                     "CONNECT" => {
                         if peek_word_upper(tokens, idx + 1) == Some("BY") {
