@@ -333,7 +333,7 @@ impl SqlEditorWidget {
     }
 
     fn remove_trailing_line_comment_semicolon(source: &str, formatted: &str) -> Option<String> {
-        if source.trim_end().ends_with(';') {
+        if Self::statement_ends_with_semicolon(source) {
             return None;
         }
 
@@ -8824,6 +8824,32 @@ FROM DUAL"
             SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Semicolon should remain when selection already ended with semicolon before comment, got:
 {}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_ignores_semicolon_inside_trailing_comment() {
+        let source = "SELECT 1 FROM dual -- existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            preserved
+                .trim_end()
+                .ends_with("-- existing; comment semicolon"),
+            "Trailing comment text should remain unchanged, got:\n{}",
+            preserved
+        );
+        assert_eq!(
+            preserved.matches(';').count(),
+            1,
+            "No extra semicolon should be appended when source had only comment semicolon, got:\n{}",
+            preserved
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Statement terminator should stay absent, got:\n{}",
             preserved
         );
     }
