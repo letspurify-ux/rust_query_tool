@@ -319,38 +319,40 @@ impl SqlEditorWidget {
             return formatted;
         }
 
-        if Self::statement_ends_with_semicolon(&formatted) {
-            if let Some(without_semicolon) = Self::remove_trailing_statement_semicolon(&formatted) {
-                return without_semicolon;
-            }
+        if let Some(without_semicolon) = Self::remove_trailing_statement_semicolon(&formatted) {
+            return without_semicolon;
         }
 
-        if !source.trim_end().ends_with(';') {
-            if let Some(without_semicolon) = Self::remove_last_non_whitespace_semicolon(&formatted)
-            {
-                return without_semicolon;
-            }
+        if let Some(without_semicolon) = Self::remove_trailing_line_comment_semicolon(&formatted) {
+            return without_semicolon;
         }
 
         formatted
     }
 
-    fn remove_last_non_whitespace_semicolon(formatted: &str) -> Option<String> {
+    fn remove_trailing_line_comment_semicolon(formatted: &str) -> Option<String> {
         let trimmed_len = formatted.trim_end().len();
         if trimmed_len == 0 {
             return None;
         }
+        let trimmed = &formatted[..trimmed_len];
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
-        let semicolon_idx = formatted[..trimmed_len].rfind(';')?;
-        if !formatted[semicolon_idx + 1..trimmed_len].trim().is_empty() {
+        let last_span = spans.last()?;
+        let SqlToken::Comment(comment_text) = &last_span.token else {
+            return None;
+        };
+        if !comment_text.starts_with("--") {
             return None;
         }
 
+        let semicolon_idx = trimmed[last_span.start..last_span.end].rfind(';')? + last_span.start;
         let mut out = String::with_capacity(formatted.len().saturating_sub(1));
         out.push_str(&formatted[..semicolon_idx]);
         out.push_str(&formatted[semicolon_idx + 1..]);
         Some(out)
     }
+
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
         let trimmed_len = formatted.trim_end().len();
         let trimmed = &formatted[..trimmed_len];
@@ -8767,6 +8769,25 @@ FROM DUAL"
         let without_semicolon = SqlEditorWidget::remove_trailing_statement_semicolon(&formatted)
             .expect("trailing semicolon should be removable");
         assert_eq!(without_semicolon, "SELECT '한글' FROM dual");
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_does_not_remove_semicolon_inside_string_literal() {
+        let source = "SELECT 'a;b' AS txt FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("'a;b'"),
+            "Semicolon inside string literal must remain unchanged, got:\n{}",
+            preserved
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Formatter should not append semicolon when original selection had none, got:\n{}",
+            preserved
+        );
     }
 
     #[test]
