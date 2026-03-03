@@ -375,7 +375,10 @@ impl SqlEditorWidget {
         }
 
         let (semicolon_start, semicolon_end) = semicolon_span;
-        if !trimmed[semicolon_end..].trim().is_empty() {
+        let has_non_comment_after_semicolon = spans
+            .iter()
+            .any(|span| span.start >= semicolon_end && !matches!(span.token, SqlToken::Comment(_)));
+        if has_non_comment_after_semicolon {
             return None;
         }
 
