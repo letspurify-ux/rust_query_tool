@@ -5598,3 +5598,59 @@ WHERE EXISTS (
         "Mixed block/line comments between '(' and SELECT should preserve subquery depth"
     );
 }
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_rem_comment_between_paren_and_select() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  REM comment before nested select
+  SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "REM comment between '(' and SELECT should preserve subquery depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_remark_comment_between_paren_and_select() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  REMARK comment before nested select
+  SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "REMARK comment between '(' and SELECT should preserve subquery depth"
+    );
+}
