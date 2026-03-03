@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::sql_parser_engine::SplitState;
 use crate::sql_text;
 use crate::ui::sql_depth::{
     apply_paren_token, is_top_level_depth, paren_depths, split_top_level_symbol_groups,
@@ -277,7 +278,8 @@ fn snapshot_cursor_state(
 /// - Collects relation/subquery entries with scope ids
 /// - Shares one keyword transition table for both phase and table collection
 fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorScanResult {
-    let mut depth: usize = 0;
+    let mut parser_state = SplitState::default();
+    let mut depth: usize = parser_state.paren_depth;
     let mut query_depth: usize = 0;
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
     let mut query_scope_stack: Vec<bool> = vec![false];
@@ -330,7 +332,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             SqlToken::Symbol(sym) if sym == "(" => {
                 let parent_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
-                depth += 1;
+                parser_state.paren_depth = parser_state.paren_depth.saturating_add(1);
+                depth = parser_state.paren_depth;
 
                 let inherited_phase = if parent_phase.is_column_context()
                     || matches!(
@@ -493,7 +496,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 {
                     query_depth = query_depth.saturating_sub(1);
                 }
-                depth = depth.saturating_sub(1);
+                parser_state.paren_depth = parser_state.paren_depth.saturating_sub(1);
+                depth = parser_state.paren_depth;
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
                 }
@@ -537,7 +541,6 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 all_subqueries.clear();
                 subquery_tracks.clear();
 
-                depth = 0;
                 query_depth = 0;
                 phase_stack = vec![SqlPhase::Initial];
                 query_scope_stack = vec![false];
@@ -547,6 +550,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 expect_table = false;
                 cte_state = CteState::None;
                 cte_paren_depth = 0;
+                parser_state.paren_depth = 0;
+                depth = 0;
 
                 next_scope_id = 1;
                 scope_stack = vec![0usize];

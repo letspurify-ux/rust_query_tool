@@ -10,6 +10,7 @@
 
 mod app;
 mod db;
+mod sql_parser_engine;
 mod sql_text;
 mod ui;
 mod utils;
