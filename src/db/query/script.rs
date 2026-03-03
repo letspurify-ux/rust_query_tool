@@ -811,6 +811,9 @@ impl QueryExecutor {
         let is_with_main_query_keyword = |word: &str| -> bool {
             matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES")
         };
+        let is_subquery_head_keyword = |word: &str| -> bool {
+            matches!(word, "SELECT" | "WITH" | "VALUES" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        };
         let leading_keyword_after_comments = |line: &str| -> Option<String> {
             let trimmed = line.trim_start();
             if Self::is_sqlplus_comment_line(trimmed) {
@@ -898,7 +901,7 @@ impl QueryExecutor {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
                 // VALUES can head a nested query block in dialects that support table value
                 // constructors in FROM/subquery positions.
-                if leading_word.is_some_and(|w| w == "SELECT" || w == "WITH" || w == "VALUES") {
+                if leading_word.is_some_and(&is_subquery_head_keyword) {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);
                 }
@@ -1171,7 +1174,7 @@ impl QueryExecutor {
                     if k > j {
                         let word: String = chars[j..k].iter().collect();
                         let word = word.to_ascii_uppercase();
-                        if word == "SELECT" || word == "WITH" || word == "VALUES" {
+                        if is_subquery_head_keyword(&word) {
                             subquery_paren_depth += 1;
                         }
                     } else if j >= chars.len()
