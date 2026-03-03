@@ -1198,6 +1198,20 @@ fn analytic_over_clause_doesnt_confuse_depth() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 }
 
+#[test]
+fn plain_expression_parentheses_do_not_increase_query_depth() {
+    let ctx = analyze("SELECT (salary + bonus) * | FROM employees");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn nested_function_parentheses_do_not_increase_query_depth() {
+    let ctx = analyze("SELECT COALESCE(ROUND(salary, 2), 0) + | FROM employees");
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]

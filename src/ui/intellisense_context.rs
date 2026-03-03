@@ -217,8 +217,13 @@ fn is_from_lateral_table_function(name: &str) -> bool {
 /// Walk tokens up to cursor to determine the current SQL phase and depth.
 fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut depth: usize = 0;
+    let mut query_depth: usize = 0;
     // Track phase at each depth level
     let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
+    // Track whether each parenthesized scope is a SELECT query scope.
+    // This lets `depth` represent nested query depth rather than generic
+    // parenthesis nesting (e.g. function arguments).
+    let mut query_scope_stack: Vec<bool> = vec![false];
     // Track the function name before '(' at each depth level, used to
     // distinguish function-internal FROM (EXTRACT, TRIM) from SQL FROM clauses.
     let mut paren_func_stack: Vec<Option<String>> = vec![None];
@@ -253,6 +258,11 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     phase_stack.push(inherited_phase);
                 } else {
                     phase_stack[depth] = inherited_phase;
+                }
+                if query_scope_stack.len() <= depth {
+                    query_scope_stack.push(false);
+                } else {
+                    query_scope_stack[depth] = false;
                 }
                 // Record the function name that preceded this '(' so we can
                 // distinguish function-internal FROM from SQL FROM clauses.
@@ -296,9 +306,20 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                 if matches!(cte_state, CteState::InBody) && depth == cte_paren_depth {
                     cte_state = CteState::None;
                 }
+                if query_scope_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(false)
+                    && depth > 0
+                {
+                    query_depth = query_depth.saturating_sub(1);
+                }
                 depth = depth.saturating_sub(1);
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
+                }
+                if query_scope_stack.len() > 1 {
+                    query_scope_stack.pop();
                 }
                 pending_lateral_subquery = false;
                 last_word = None;
@@ -367,6 +388,15 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     }
                     "SELECT" => {
                         phase_stack[depth] = SqlPhase::SelectList;
+                        if depth > 0
+                            && query_scope_stack
+                                .get(depth)
+                                .copied()
+                                .is_some_and(|is_query_scope| !is_query_scope)
+                        {
+                            query_scope_stack[depth] = true;
+                            query_depth = query_depth.saturating_add(1);
+                        }
                     }
                     "FROM" => {
                         // Only suppress FROM transition when the enclosing '('
@@ -500,6 +530,8 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
 
                 depth = 0;
                 phase_stack = vec![SqlPhase::Initial];
+                query_depth = 0;
+                query_scope_stack = vec![false];
                 paren_func_stack = vec![None];
                 last_word = None;
                 next_scope_id = 1;
@@ -531,7 +563,7 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
 
     PhaseAnalysis {
         phase,
-        depth,
+        depth: query_depth,
         visible_scope_chain,
     }
 }
