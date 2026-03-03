@@ -1317,26 +1317,39 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
 
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
-    if let Some(SqlToken::Word(word)) = tokens.get(start) {
+    fn skip_comments(tokens: &[SqlToken], mut idx: usize) -> usize {
+        while idx < tokens.len() {
+            if let SqlToken::Comment(_) = &tokens[idx] {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        idx
+    }
+
+    let idx = skip_comments(tokens, start);
+    if let Some(SqlToken::Word(word)) = tokens.get(idx) {
         let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
         let upper = word.to_ascii_uppercase();
         if upper == "AS" {
-            if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
+            let alias_idx = skip_comments(tokens, idx + 1);
+            if let Some(SqlToken::Word(alias)) = tokens.get(alias_idx) {
                 if !is_identifier_word_token(alias) {
-                    return (None, start + 2);
+                    return (None, alias_idx + 1);
                 }
-                return (Some(strip_identifier_quotes(alias)), start + 2);
+                return (Some(strip_identifier_quotes(alias)), alias_idx + 1);
             }
-            return (None, start + 1);
+            return (None, alias_idx);
         }
         if !is_identifier_word_token(word) {
-            return (None, start);
+            return (None, idx);
         }
         if is_quoted || !is_alias_breaker(&upper) {
-            return (Some(strip_identifier_quotes(word)), start + 1);
+            return (Some(strip_identifier_quotes(word)), idx + 1);
         }
     }
-    (None, start)
+    (None, idx)
 }
 
 /// Parse an alias after a subquery closing ')'.
