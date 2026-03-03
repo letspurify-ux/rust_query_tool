@@ -739,6 +739,38 @@ impl QueryExecutor {
     }
 
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
+        fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
+            loop {
+                while idx < chars.len() && chars[idx].is_whitespace() {
+                    idx += 1;
+                }
+
+                if idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '*' {
+                    idx += 2;
+                    while idx + 1 < chars.len() {
+                        if chars[idx] == '*' && chars[idx + 1] == '/' {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                if idx + 1 < chars.len() && chars[idx] == '-' && chars[idx + 1] == '-' {
+                    idx += 2;
+                    while idx < chars.len() && chars[idx] != '\n' {
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                break;
+            }
+
+            idx
+        }
+
         fn should_pre_dedent(leading_word: &str) -> bool {
             matches!(leading_word, "END" | "ELSE" | "ELSIF" | "EXCEPTION")
         }
@@ -1036,8 +1068,7 @@ impl QueryExecutor {
                 // Guard: q/nq-quote detection must not fire when the
                 // current character is part of a longer identifier
                 // (e.g. `seq'text'` should NOT start a q-quote at `q`).
-                let prev_is_ident =
-                    i > 0 && sql_text::is_identifier_char(chars[i - 1]);
+                let prev_is_ident = i > 0 && sql_text::is_identifier_char(chars[i - 1]);
 
                 if !prev_is_ident
                     && (c == 'n' || c == 'N')
@@ -1077,24 +1108,7 @@ impl QueryExecutor {
                 }
 
                 if c == '(' {
-                    let mut j = i + 1;
-                    while j < chars.len() && chars[j].is_whitespace() {
-                        j += 1;
-                    }
-                    if j + 1 < chars.len() && chars[j] == '/' && chars[j + 1] == '*' {
-                        let mut comment_idx = j + 2;
-                        while comment_idx + 1 < chars.len() {
-                            if chars[comment_idx] == '*' && chars[comment_idx + 1] == '/' {
-                                comment_idx += 2;
-                                break;
-                            }
-                            comment_idx += 1;
-                        }
-                        j = comment_idx;
-                        while j < chars.len() && chars[j].is_whitespace() {
-                            j += 1;
-                        }
-                    }
+                    let j = skip_ws_and_comments(&chars, i + 1);
                     let mut k = j;
                     while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
                         k += 1;

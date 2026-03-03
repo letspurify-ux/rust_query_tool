@@ -5310,11 +5310,21 @@ fn test_line_block_depths_subquery_headed_by_with_clause_indents_correctly() {
     let lines: Vec<&str> = sql.lines().collect();
     let depths = QueryExecutor::line_block_depths(sql);
 
-    let from_idx = lines.iter().position(|l| l.trim_start().starts_with("FROM (")).unwrap();
-    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let from_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("FROM ("))
+        .unwrap();
+    let with_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("WITH "))
+        .unwrap();
     let inner_select_idx = lines
         .iter()
-        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .position(|l| {
+            l.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
         .unwrap();
 
     assert!(
@@ -5336,11 +5346,21 @@ fn test_line_block_depths_subquery_with_clause_multiline_cte_body() {
     let lines: Vec<&str> = sql.lines().collect();
     let depths = QueryExecutor::line_block_depths(sql);
 
-    let from_idx = lines.iter().position(|l| l.trim_start().starts_with("FROM (")).unwrap();
-    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let from_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("FROM ("))
+        .unwrap();
+    let with_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("WITH "))
+        .unwrap();
     let inner_select_idx = lines
         .iter()
-        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .position(|l| {
+            l.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
         .unwrap();
 
     assert!(
@@ -5363,10 +5383,17 @@ fn test_line_block_depths_standalone_with_main_select_not_affected_by_fix() {
     let lines: Vec<&str> = sql.lines().collect();
     let depths = QueryExecutor::line_block_depths(sql);
 
-    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let with_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("WITH "))
+        .unwrap();
     let main_select_idx = lines
         .iter()
-        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .position(|l| {
+            l.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
         .unwrap();
 
     assert!(
@@ -5378,5 +5405,62 @@ fn test_line_block_depths_standalone_with_main_select_not_affected_by_fix() {
         depths[main_select_idx] <= depths[with_idx],
         "main SELECT must dedent back to WITH level (depths: {:?})",
         depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_line_comment_between_paren_and_select() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  -- comment before nested select
+  SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "Line comment between '(' and SELECT should not break subquery depth detection"
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_subquery_after_mixed_comments_between_paren_and_select() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  /* first comment */
+  -- second comment
+  SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "Mixed block/line comments between '(' and SELECT should preserve subquery depth"
     );
 }
