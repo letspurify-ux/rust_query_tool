@@ -1,17 +1,17 @@
 use crate::ui::sql_editor::SqlToken;
 
 #[derive(Default)]
-struct ParenDepthState {
+pub(crate) struct ParenDepthState {
     stack: Vec<char>,
 }
 
 impl ParenDepthState {
     #[inline]
-    fn depth(&self) -> usize {
+    pub(crate) fn depth(&self) -> usize {
         self.stack.len()
     }
 
-    fn apply_token(&mut self, token: &SqlToken) {
+    pub(crate) fn apply_token(&mut self, token: &SqlToken) {
         let symbol = match token {
             SqlToken::Symbol(sym) => sym.as_str(),
             _ => return,
@@ -75,14 +75,8 @@ pub(crate) fn paren_depths(tokens: &[SqlToken]) -> Vec<usize> {
 
 /// Applies parenthesis depth transition for a single token.
 #[inline]
-pub(crate) fn apply_paren_token(depth: &mut usize, token: &SqlToken) {
-    match token {
-        SqlToken::Symbol(sym) if matches!(sym.as_str(), "(" | "[" | "{") => *depth += 1,
-        SqlToken::Symbol(sym) if matches!(sym.as_str(), ")" | "]" | "}") => {
-            *depth = depth.saturating_sub(1)
-        }
-        _ => {}
-    }
+pub(crate) fn apply_paren_token(state: &mut ParenDepthState, token: &SqlToken) {
+    state.apply_token(token);
 }
 
 /// Returns the final parenthesis depth after all tokens are processed.

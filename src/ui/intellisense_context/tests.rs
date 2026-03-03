@@ -444,6 +444,17 @@ fn cte_with_nested_subquery() {
     assert!(names.iter().any(|n| n.eq_ignore_ascii_case("temp")));
 }
 
+#[test]
+fn cte_with_mismatched_close_before_with_is_still_detected() {
+    let ctx = analyze(") WITH temp AS (SELECT id FROM users) SELECT | FROM temp");
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.contains(&"TEMP".to_string()),
+        "top-level WITH should be detected after unmatched close paren: {:?}",
+        cte_n
+    );
+}
+
 // ─── Complex nested query tests ─────────────────────────────────────────
 
 #[test]
@@ -1669,7 +1680,6 @@ fn trim_from_does_not_trigger_from_clause() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     assert!(ctx.phase.is_column_context());
 }
-
 
 #[test]
 fn substring_from_does_not_trigger_from_clause() {
