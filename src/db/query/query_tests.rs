@@ -5276,3 +5276,82 @@ fn test_line_block_depths_real_q_quote_still_works() {
         "standalone q-quote should not break depth"
     );
 }
+
+#[test]
+fn test_line_block_depths_subquery_headed_by_with_clause_indents_correctly() {
+    // When `(` is followed by `WITH cte AS (...) SELECT ...` on the next line,
+    // the WITH line and the main SELECT inside the paren must both be at depth 1.
+    let sql = "SELECT *\nFROM (\n  WITH cte AS (SELECT 1 FROM dual)\n  SELECT * FROM cte\n);";
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let from_idx = lines.iter().position(|l| l.trim_start().starts_with("FROM (")).unwrap();
+    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let inner_select_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .unwrap();
+
+    assert!(
+        depths[with_idx] > depths[from_idx],
+        "WITH inside paren should be deeper than outer FROM line (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[inner_select_idx], depths[with_idx],
+        "main SELECT after CTE should stay at same depth as WITH (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_subquery_with_clause_multiline_cte_body() {
+    // Same as above but with CTE body on its own lines to exercise pending_subquery_paren.
+    let sql = "SELECT *\nFROM (\n  WITH cte AS (\n    SELECT 1 AS n FROM dual\n  )\n  SELECT * FROM cte\n);";
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let from_idx = lines.iter().position(|l| l.trim_start().starts_with("FROM (")).unwrap();
+    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let inner_select_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .unwrap();
+
+    assert!(
+        depths[with_idx] > depths[from_idx],
+        "WITH inside paren must be deeper than outer FROM (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[inner_select_idx], depths[with_idx],
+        "main SELECT after multi-line CTE body must match WITH depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_standalone_with_main_select_not_affected_by_fix() {
+    // Regression guard: a top-level (non-nested) WITH…SELECT must still give
+    // depth 0 for the main SELECT, exactly as before the fix.
+    let sql = "WITH cte AS (\n  SELECT 1 AS n FROM dual\n)\nSELECT * FROM cte;";
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let with_idx = lines.iter().position(|l| l.trim_start().to_uppercase().starts_with("WITH ")).unwrap();
+    let main_select_idx = lines
+        .iter()
+        .position(|l| l.trim_start().to_uppercase().starts_with("SELECT * FROM CTE"))
+        .unwrap();
+
+    assert!(
+        depths[with_idx + 1] > depths[with_idx],
+        "CTE body must be deeper than WITH line (depths: {:?})",
+        depths
+    );
+    assert!(
+        depths[main_select_idx] <= depths[with_idx],
+        "main SELECT must dedent back to WITH level (depths: {:?})",
+        depths
+    );
+}

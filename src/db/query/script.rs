@@ -824,7 +824,8 @@ impl QueryExecutor {
                 || trimmed_start.starts_with("*/");
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
-                if leading_word.is_some_and(|w| w == "SELECT") {
+                // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
+                if leading_word.is_some_and(|w| w == "SELECT" || w == "WITH") {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);
                 }
@@ -930,9 +931,12 @@ impl QueryExecutor {
             if with_cte_depth > 0 {
                 let starts_main_select =
                     leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
-                if starts_main_select {
-                    depth = depth.saturating_sub(1);
-                } else {
+                // For the main query line that follows a WITH clause, do not add with_cte_depth.
+                // This brings depth back to the WITH line's level without touching any
+                // subquery_paren_depth that is already embedded in the current depth value.
+                // (Previously depth.saturating_sub(1) was used, which incorrectly cancelled
+                // subquery_paren_depth when the WITH clause appeared inside parentheses.)
+                if !starts_main_select {
                     depth = depth.saturating_add(with_cte_depth);
                 }
             }
