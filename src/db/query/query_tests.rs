@@ -5458,6 +5458,58 @@ fn test_line_block_depths_subquery_with_clause_multiline_cte_body() {
 }
 
 #[test]
+fn test_line_block_depths_subquery_with_clause_on_same_line_as_open_paren() {
+    let sql = "SELECT *\nFROM (WITH cte AS (SELECT 1 AS n FROM dual)\n      SELECT * FROM cte\n);";
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let from_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("FROM (WITH "))
+        .unwrap();
+    let inner_select_idx = lines
+        .iter()
+        .position(|l| {
+            l.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
+        .unwrap();
+
+    assert!(
+        depths[inner_select_idx] > depths[from_idx],
+        "main SELECT after same-line (WITH should still stay in nested subquery depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_subquery_with_clause_after_block_comment_same_line() {
+    let sql = "SELECT *\nFROM (/* c */ WITH cte AS (SELECT 1 AS n FROM dual)\n      SELECT * FROM cte\n);";
+    let lines: Vec<&str> = sql.lines().collect();
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let from_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("FROM (/* c */ WITH "))
+        .unwrap();
+    let inner_select_idx = lines
+        .iter()
+        .position(|l| {
+            l.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
+        .unwrap();
+
+    assert!(
+        depths[inner_select_idx] > depths[from_idx],
+        "block comment between ( and WITH should preserve nested subquery depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
 fn test_line_block_depths_standalone_with_main_select_not_affected_by_fix() {
     // Regression guard: a top-level (non-nested) WITH…SELECT must still give
     // depth 0 for the main SELECT, exactly as before the fix.

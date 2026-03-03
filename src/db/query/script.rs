@@ -1146,7 +1146,7 @@ impl QueryExecutor {
                     if k > j {
                         let word: String = chars[j..k].iter().collect();
                         let word = word.to_ascii_uppercase();
-                        if word == "SELECT" {
+                        if word == "SELECT" || word == "WITH" {
                             subquery_paren_depth += 1;
                         }
                     } else if j >= chars.len()
