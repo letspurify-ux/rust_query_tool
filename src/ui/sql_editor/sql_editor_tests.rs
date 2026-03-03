@@ -1856,3 +1856,58 @@ fn finalize_execution_state_clears_running_and_cancel_flags() {
     assert!(!load_mutex_bool(&query_running));
     assert!(!load_mutex_bool(&cancel_flag));
 }
+
+// ── q-quote after identifier: tokenizer regression ──
+
+#[test]
+fn tokenize_sql_identifier_ending_q_not_treated_as_q_quote() {
+    // `seq` is one identifier; the following `'text'` is a regular string.
+    let tokens = SqlEditorWidget::tokenize_sql("SELECT seq'text' FROM dual");
+    let has_word_seq = tokens.iter().any(|t| matches!(t, SqlToken::Word(w) if w == "seq"));
+    assert!(
+        has_word_seq,
+        "Identifier 'seq' should be a single Word token, got: {:?}",
+        tokens
+    );
+    let has_q_quote_string = tokens.iter().any(|t| matches!(t, SqlToken::String(s) if s.starts_with("q'")));
+    assert!(
+        !has_q_quote_string,
+        "Should NOT produce a q-quote String token when q is part of an identifier, got: {:?}",
+        tokens
+    );
+}
+
+#[test]
+fn tokenize_sql_identifier_ending_nq_not_treated_as_nq_quote() {
+    // `unq` is one identifier; the following `'val'` is a regular string.
+    let tokens = SqlEditorWidget::tokenize_sql("SELECT unq'val' FROM dual");
+    let has_word_unq = tokens.iter().any(|t| matches!(t, SqlToken::Word(w) if w == "unq"));
+    assert!(
+        has_word_unq,
+        "Identifier 'unq' should be a single Word token, got: {:?}",
+        tokens
+    );
+}
+
+#[test]
+fn tokenize_sql_standalone_q_quote_still_works() {
+    // Standalone q'[...]' must still be recognized.
+    let tokens = SqlEditorWidget::tokenize_sql("SELECT q'[hello]' FROM dual");
+    let has_q_string = tokens.iter().any(|t| matches!(t, SqlToken::String(s) if s.starts_with("q'")));
+    assert!(
+        has_q_string,
+        "Standalone q-quote should produce a String token, got: {:?}",
+        tokens
+    );
+}
+
+#[test]
+fn tokenize_sql_standalone_nq_quote_still_works() {
+    let tokens = SqlEditorWidget::tokenize_sql("SELECT nq'[test]' FROM dual");
+    let has_nq_string = tokens.iter().any(|t| matches!(t, SqlToken::String(s) if s.starts_with("nq'")));
+    assert!(
+        has_nq_string,
+        "Standalone nq-quote should produce a String token, got: {:?}",
+        tokens
+    );
+}

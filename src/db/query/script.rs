@@ -574,7 +574,8 @@ impl StatementBuilder {
             }
 
             // Handle nq'[...]' (National Character q-quoted strings)
-            if (c == 'n' || c == 'N')
+            if self.state.token.is_empty()
+                && (c == 'n' || c == 'N')
                 && (next == Some('q') || next == Some('Q'))
                 && i + 2 < len
                 && chars[i + 2] == '\''
@@ -592,7 +593,7 @@ impl StatementBuilder {
             }
 
             // Handle q'[...]' (q-quoted strings)
-            if (c == 'q' || c == 'Q') && next == Some('\'') {
+            if self.state.token.is_empty() && (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
                     self.state.flush_token();
                     self.state.start_q_quote(delimiter);
@@ -1023,7 +1024,14 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if (c == 'n' || c == 'N')
+                // Guard: q/nq-quote detection must not fire when the
+                // current character is part of a longer identifier
+                // (e.g. `seq'text'` should NOT start a q-quote at `q`).
+                let prev_is_ident =
+                    i > 0 && sql_text::is_identifier_char(chars[i - 1]);
+
+                if !prev_is_ident
+                    && (c == 'n' || c == 'N')
                     && matches!(next, Some('q') | Some('Q'))
                     && chars.get(i + 2) == Some(&'\'')
                     && chars.get(i + 3).is_some()
@@ -1035,7 +1043,11 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if (c == 'q' || c == 'Q') && next == Some('\'') && chars.get(i + 2).is_some() {
+                if !prev_is_ident
+                    && (c == 'q' || c == 'Q')
+                    && next == Some('\'')
+                    && chars.get(i + 2).is_some()
+                {
                     let delimiter = chars[i + 2];
                     in_q_quote = true;
                     q_quote_end = Some(sql_text::q_quote_closing(delimiter));

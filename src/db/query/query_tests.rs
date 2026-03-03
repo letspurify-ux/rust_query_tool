@@ -5192,3 +5192,55 @@ fn test_summarize_batch_results_marks_failure_when_select_batch_has_errors() {
     assert!(result.message.contains("Errors:"));
     assert!(result.message.contains("Executed 1 of 2 statements"));
 }
+
+// ── q-quote after identifier: depth / split regression ──
+
+#[test]
+fn test_split_script_items_identifier_ending_q_followed_by_string() {
+    // `seq` ends in 'q' → the q-quote detector must NOT treat `q'text'` as a q-quote.
+    let sql = "SELECT seq'text' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "identifier ending in q followed by string should not confuse the splitter, got: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_identifier_ending_nq_followed_by_string() {
+    // `unq` ends in 'nq' → nq-quote detector must NOT fire.
+    let sql = "SELECT unq'val' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "identifier ending in nq followed by string should split correctly, got: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_identifier_ending_q_with_subquery() {
+    // Subquery paren after `seq'text'` must still be tracked.
+    let sql = "SELECT seq'x', (SELECT 1 FROM dual)\nFROM t;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(
+        depths,
+        vec![0, 0],
+        "subquery depth should not be affected by identifier ending in q before string"
+    );
+}
+
+#[test]
+fn test_line_block_depths_real_q_quote_still_works() {
+    // Standalone q-quote must continue to work.
+    let sql = "SELECT q'[hello]', (SELECT 1 FROM dual)\nFROM t;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(
+        depths,
+        vec![0, 0],
+        "standalone q-quote should not break depth"
+    );
+}
