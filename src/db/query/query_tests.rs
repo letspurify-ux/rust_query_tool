@@ -4648,6 +4648,35 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_preserve_pending_end_across_blank_line() {
+    let sql = r#"BEGIN
+  WHILE i < 5 LOOP
+    i := i + 1;
+  END
+
+  WHILE;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "blank line between END and WHILE should keep END pending");
+}
+
+#[test]
+fn test_line_block_depths_preserve_pending_end_across_comment_line() {
+    let sql = r#"BEGIN
+  WHILE i < 5 LOOP
+    i := i + 1;
+  END
+  -- keep END pending for next keyword
+  WHILE;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "comment line between END and WHILE should keep END pending");
+}
+
+
+#[test]
 fn test_line_block_depths_with_for_update_clause() {
     let sql = r#"SELECT id, status
 FROM jobs

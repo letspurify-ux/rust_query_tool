@@ -908,6 +908,7 @@ impl QueryExecutor {
             // leaves block_depth and case_depth_stack stale for the next line's depth
             // calculation, causing incorrect indentation for ELSE/WHEN that follow.
             if builder.state.pending_end
+                && !is_comment_or_blank
                 && !matches!(
                     leading_word,
                     Some(
