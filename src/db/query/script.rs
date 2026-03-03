@@ -777,6 +777,24 @@ impl QueryExecutor {
                     continue;
                 }
 
+                // SQL*Plus comment command (REM/REMARK) can appear after
+                // an opening parenthesis on the same line, and the nested
+                // SELECT/WITH may start on the next line.
+                if idx < chars.len() && sql_text::is_identifier_char(chars[idx]) {
+                    let start = idx;
+                    while idx < chars.len() && sql_text::is_identifier_char(chars[idx]) {
+                        idx += 1;
+                    }
+                    let word: String = chars[start..idx].iter().collect();
+                    if word.eq_ignore_ascii_case("REM") || word.eq_ignore_ascii_case("REMARK") {
+                        while idx < chars.len() && chars[idx] != '\n' {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    idx = start;
+                }
+
                 break;
             }
 
