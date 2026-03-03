@@ -1519,19 +1519,7 @@ impl QueryExecutor {
 
             fn force_terminate(&mut self, sql: &str) -> Option<(usize, usize)> {
                 self.flush_token();
-                self.state.resolve_pending_end_on_eof();
-                self.state.reset_create_state();
-                self.state.in_single_quote = false;
-                self.state.in_double_quote = false;
-                self.state.in_line_comment = false;
-                self.state.in_block_comment = false;
-                self.state.in_q_quote = false;
-                self.state.q_quote_end = None;
-                self.state.pending_end = false;
-                self.state.token.clear();
-                self.state.block_depth = 0;
-                self.state.paren_depth = 0;
-                self.state.case_depth_stack.clear();
+                self.state.force_reset_all();
                 self.push_current_span(sql)
             }
 
@@ -1571,6 +1559,8 @@ impl QueryExecutor {
             where
                 F: FnMut((usize, usize)) -> bool,
             {
+                use crate::sql_parser_engine::LexMode;
+
                 if start >= end {
                     return true;
                 }
@@ -1580,76 +1570,82 @@ impl QueryExecutor {
                     let index = start + relative_idx;
                     let next = iter.peek().map(|(_, ch)| *ch);
 
-                    if self.state.in_line_comment {
-                        self.record_char(index, c);
-                        if c == '\n' {
-                            self.state.in_line_comment = false;
-                        }
-                        continue;
-                    }
-
-                    if self.state.in_block_comment {
-                        self.record_char(index, c);
-                        if c == '*' && next == Some('/') {
-                            if let Some((next_idx, next_char)) =
-                                Self::consume_next_char(&mut iter, start)
-                            {
-                                self.record_char(next_idx, next_char);
+                    match &self.state.lex_mode {
+                        LexMode::LineComment => {
+                            self.record_char(index, c);
+                            if c == '\n' {
+                                self.state.lex_mode = LexMode::Idle;
                             }
-                            self.state.in_block_comment = false;
+                            continue;
                         }
-                        continue;
-                    }
-
-                    if self.state.in_q_quote {
-                        self.record_char(index, c);
-                        if Some(c) == self.state.q_quote_end() && next == Some('\'') {
-                            if let Some((next_idx, next_char)) =
-                                Self::consume_next_char(&mut iter, start)
-                            {
-                                self.record_char(next_idx, next_char);
-                            }
-                            self.state.in_q_quote = false;
-                            self.state.q_quote_end = None;
-                        }
-                        continue;
-                    }
-
-                    if self.state.in_single_quote {
-                        self.record_char(index, c);
-                        if c == '\'' {
-                            if next == Some('\'') {
+                        LexMode::BlockComment => {
+                            self.record_char(index, c);
+                            if c == '*' && next == Some('/') {
                                 if let Some((next_idx, next_char)) =
                                     Self::consume_next_char(&mut iter, start)
                                 {
                                     self.record_char(next_idx, next_char);
                                 }
-                            } else {
-                                self.state.in_single_quote = false;
+                                self.state.lex_mode = LexMode::Idle;
                             }
+                            continue;
                         }
-                        continue;
-                    }
-
-                    if self.state.in_double_quote {
-                        self.record_char(index, c);
-                        if c == '"' {
-                            if next == Some('"') {
+                        LexMode::QQuote { end_char } => {
+                            let end_char = *end_char;
+                            self.record_char(index, c);
+                            if c == end_char && next == Some('\'') {
                                 if let Some((next_idx, next_char)) =
                                     Self::consume_next_char(&mut iter, start)
                                 {
                                     self.record_char(next_idx, next_char);
                                 }
-                            } else {
-                                self.state.in_double_quote = false;
+                                self.state.lex_mode = LexMode::Idle;
                             }
+                            continue;
                         }
-                        continue;
+                        LexMode::SingleQuote => {
+                            self.record_char(index, c);
+                            if c == '\'' {
+                                if next == Some('\'') {
+                                    if let Some((next_idx, next_char)) =
+                                        Self::consume_next_char(&mut iter, start)
+                                    {
+                                        self.record_char(next_idx, next_char);
+                                    }
+                                } else {
+                                    self.state.lex_mode = LexMode::Idle;
+                                }
+                            }
+                            continue;
+                        }
+                        LexMode::DoubleQuote => {
+                            self.record_char(index, c);
+                            if c == '"' {
+                                if next == Some('"') {
+                                    if let Some((next_idx, next_char)) =
+                                        Self::consume_next_char(&mut iter, start)
+                                    {
+                                        self.record_char(next_idx, next_char);
+                                    }
+                                } else {
+                                    self.state.lex_mode = LexMode::Idle;
+                                }
+                            }
+                            continue;
+                        }
+                        LexMode::DollarQuote { .. } => {
+                            // Dollar-quoted strings not used in span collector
+                            self.record_char(index, c);
+                            continue;
+                        }
+                        LexMode::Idle => {
+                            // Fall through to normal code processing below.
+                        }
                     }
 
                     if c == '-' && next == Some('-') {
                         self.flush_token();
-                        self.state.in_line_comment = true;
+                        self.state.lex_mode = LexMode::LineComment;
                         self.record_char(index, c);
                         if let Some((next_idx, next_char)) =
                             Self::consume_next_char(&mut iter, start)
@@ -1661,7 +1657,7 @@ impl QueryExecutor {
 
                     if c == '/' && next == Some('*') {
                         self.flush_token();
-                        self.state.in_block_comment = true;
+                        self.state.lex_mode = LexMode::BlockComment;
                         self.record_char(index, c);
                         if let Some((next_idx, next_char)) =
                             Self::consume_next_char(&mut iter, start)
@@ -1727,14 +1723,14 @@ impl QueryExecutor {
 
                     if c == '\'' {
                         self.flush_token();
-                        self.state.in_single_quote = true;
+                        self.state.lex_mode = LexMode::SingleQuote;
                         self.record_char(index, c);
                         continue;
                     }
 
                     if c == '"' {
                         self.flush_token();
-                        self.state.in_double_quote = true;
+                        self.state.lex_mode = LexMode::DoubleQuote;
                         self.record_char(index, c);
                         continue;
                     }
@@ -1755,7 +1751,7 @@ impl QueryExecutor {
 
                     if c == ';' {
                         self.state.resolve_pending_end_on_terminator();
-                        if self.state.block_depth == 0 {
+                        if self.state.block_depth() == 0 {
                             if let Some(span) = self.push_current_span(sql) {
                                 if !on_span(span) {
                                     return false;
@@ -1764,8 +1760,7 @@ impl QueryExecutor {
                             self.state.reset_create_state();
                         } else if self.state.should_split_on_semicolon() {
                             self.state.reset_create_state();
-                            self.state.block_depth = 0;
-                            self.state.case_depth_stack.clear();
+                            self.state.block_stack.clear();
                             if let Some(span) = self.push_current_span(sql) {
                                 if !on_span(span) {
                                     return false;
@@ -1804,7 +1799,7 @@ impl QueryExecutor {
             if !sqlblanklines_enabled
                 && trimmed.is_empty()
                 && collector.state.is_idle()
-                && collector.state.block_depth == 0
+                && collector.state.block_depth() == 0
                 && !collector.current_is_empty()
             {
                 if let Some(span) = collector.force_terminate(sql) {
@@ -1818,7 +1813,7 @@ impl QueryExecutor {
 
             if collector.state.is_idle()
                 && collector.state.in_create_plsql
-                && collector.state.block_depth == 0
+                && collector.state.block_depth() == 0
                 && !collector.current_is_empty()
                 && !collector.state.is_trigger
                 && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
@@ -1830,7 +1825,7 @@ impl QueryExecutor {
                 }
             }
 
-            if collector.state.is_idle() && trimmed == "/" && collector.state.block_depth == 0 {
+            if collector.state.is_idle() && trimmed == "/" && collector.state.block_depth() == 0 {
                 if !collector.current_is_empty() {
                     if let Some(span) = collector.force_terminate(sql) {
                         if !on_span(span) {
@@ -1845,7 +1840,7 @@ impl QueryExecutor {
             if collector.state.is_idle()
                 && trimmed == ";"
                 && collector.state.in_create_plsql
-                && collector.state.block_depth == 0
+                && collector.state.block_depth() == 0
                 && !collector.current_is_empty()
             {
                 if let Some(span) = collector.force_terminate(sql) {
@@ -1863,7 +1858,7 @@ impl QueryExecutor {
 
             if collector.state.is_idle()
                 && !collector.current_is_empty()
-                && collector.state.block_depth == 0
+                && collector.state.block_depth() == 0
                 && !is_alter_session_set_clause
                 && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
@@ -1883,7 +1878,7 @@ impl QueryExecutor {
 
             if collector.state.is_idle()
                 && collector.current_is_empty()
-                && collector.state.block_depth == 0
+                && collector.state.block_depth() == 0
                 && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
