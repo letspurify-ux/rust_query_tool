@@ -214,6 +214,13 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE")
 }
 
+fn is_cte_recovery_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH"
+    )
+}
+
 /// Walk tokens up to cursor to determine the current SQL phase and depth.
 fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
     let mut depth: usize = 0;
@@ -355,6 +362,9 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     CteState::AfterName => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
+                        } else if is_cte_recovery_keyword(&upper) {
+                            cte_state = CteState::None;
+                            continue;
                         }
                         idx += 1;
                         continue;
@@ -362,6 +372,9 @@ fn analyze_phase(tokens: &[SqlToken]) -> PhaseAnalysis {
                     CteState::ExpectAs => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
+                        } else if is_cte_recovery_keyword(&upper) {
+                            cte_state = CteState::None;
+                            continue;
                         }
                         idx += 1;
                         continue;
@@ -808,6 +821,9 @@ fn collect_tables_deep(
                     CteState::AfterName => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
+                        } else if is_cte_recovery_keyword(&upper) {
+                            cte_state = CteState::None;
+                            continue;
                         }
                         idx += 1;
                         continue;
@@ -815,6 +831,9 @@ fn collect_tables_deep(
                     CteState::ExpectAs => {
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
+                        } else if is_cte_recovery_keyword(&upper) {
+                            cte_state = CteState::None;
+                            continue;
                         }
                         idx += 1;
                         continue;
