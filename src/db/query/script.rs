@@ -809,7 +809,7 @@ impl QueryExecutor {
             )
         }
         let is_with_main_query_keyword = |word: &str| -> bool {
-            matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+            matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES")
         };
         let leading_keyword_after_comments = |line: &str| -> Option<String> {
             let trimmed = line.trim_start();
@@ -1019,8 +1019,8 @@ impl QueryExecutor {
             }
 
             if with_cte_depth > 0 {
-                let starts_main_select =
-                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
+                let starts_main_select = leading_word.is_some_and(&is_with_main_query_keyword)
+                    && with_cte_paren <= 0;
                 // For the main query line that follows a WITH clause, do not add with_cte_depth.
                 // This brings depth back to the WITH line's level without touching any
                 // subquery_paren_depth that is already embedded in the current depth value.

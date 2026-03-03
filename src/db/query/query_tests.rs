@@ -5755,3 +5755,119 @@ WHERE EXISTS (
         "REMARK comment between '(' and SELECT should preserve subquery depth"
     );
 }
+
+#[test]
+fn test_line_block_depths_with_inside_subquery_in_if_block_keeps_main_select_nested() {
+    let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    SELECT *
+    INTO v_dummy
+    FROM (
+      WITH cte AS (
+        SELECT 1 AS n FROM dual
+      )
+      SELECT * FROM cte
+    );
+  END IF;
+END;
+"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("WITH "))
+        .expect("expected WITH line");
+    let inner_select_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM CTE")
+        })
+        .expect("expected SELECT * FROM cte line");
+
+    assert_eq!(
+        depths[inner_select_idx], depths[with_idx],
+        "main SELECT after WITH inside subquery should keep nested depth inside IF block (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_multiple_with_subqueries_in_same_plsql_block() {
+    let sql = r#"BEGIN
+  SELECT *
+  INTO v_one
+  FROM (
+    WITH c1 AS (SELECT 1 AS n FROM dual)
+    SELECT * FROM c1
+  );
+
+  SELECT *
+  INTO v_two
+  FROM (
+    WITH c2 AS (SELECT 2 AS n FROM dual)
+    SELECT * FROM c2
+  );
+END;
+"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let with_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH ")
+                .then_some(idx)
+        })
+        .collect();
+    let select_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM C")
+                .then_some(idx)
+        })
+        .collect();
+
+    assert_eq!(with_lines.len(), 2, "expected two WITH lines");
+    assert_eq!(select_lines.len(), 2, "expected two SELECT * FROM c* lines");
+
+    for (with_idx, select_idx) in with_lines.iter().zip(select_lines.iter()) {
+        assert_eq!(
+            depths[*select_idx], depths[*with_idx],
+            "each main SELECT after WITH inside subquery should remain nested (depths: {:?})",
+            depths
+        );
+    }
+}
+
+#[test]
+fn test_line_block_depths_with_values_main_query_dedents_to_with_level() {
+    let sql = "WITH cte AS (\n  SELECT 1 AS n\n)\nVALUES ((SELECT n FROM cte));";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("WITH "))
+        .expect("expected WITH line");
+    let values_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("VALUES"))
+        .expect("expected VALUES line");
+
+    assert_eq!(
+        depths[values_idx], depths[with_idx],
+        "VALUES main query after WITH should dedent back to WITH depth (depths: {:?})",
+        depths
+    );
+}
