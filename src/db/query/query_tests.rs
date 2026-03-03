@@ -1165,6 +1165,24 @@ END test_pkg;"#;
 }
 
 #[test]
+fn test_if_condition_with_inline_comment_before_then() {
+    let sql = r#"BEGIN
+  IF (1 = 1) /* inline comment */ THEN
+    NULL;
+  END IF;
+END;
+/"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        1,
+        "inline comment between IF condition and THEN should keep block depth balanced"
+    );
+}
+
+#[test]
 fn test_package_with_nested_declare() {
     let sql = r#"CREATE PACKAGE BODY test_pkg AS
   PROCEDURE proc1 IS
