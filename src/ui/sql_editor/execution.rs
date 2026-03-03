@@ -355,46 +355,29 @@ impl SqlEditorWidget {
         let trimmed_len = formatted.trim_end().len();
         let trimmed = &formatted[..trimmed_len];
 
-        let mut semicolon_idx = None;
-        let bytes = trimmed.as_bytes();
-        let mut idx = 0usize;
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        let semicolon_span = spans.iter().rev().find_map(|span| match &span.token {
+            SqlToken::Comment(_) => None,
+            SqlToken::Symbol(sym) if sym == ";" => Some((span.start, span.end)),
+            _ => Some((0, 0)),
+        })?;
 
-        while idx < bytes.len() {
-            if bytes[idx] == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
-                idx += 2;
-                while idx < bytes.len() && bytes[idx] != b'\n' {
-                    idx += 1;
-                }
-                continue;
-            }
-
-            if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
-                idx += 2;
-                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
-                    idx += 1;
-                }
-                if idx + 1 < bytes.len() {
-                    idx += 2;
-                } else {
-                    idx = bytes.len();
-                }
-                continue;
-            }
-
-            if bytes[idx] == b';' {
-                semicolon_idx = Some(idx);
-            }
-            idx += 1;
-        }
-
-        let semicolon_idx = semicolon_idx?;
-        if !trimmed[semicolon_idx + 1..].trim().is_empty() {
+        if semicolon_span == (0, 0) {
             return None;
         }
 
-        let mut out = String::with_capacity(formatted.len().saturating_sub(1));
-        out.push_str(&formatted[..semicolon_idx]);
-        out.push_str(&formatted[semicolon_idx + 1..]);
+        let (semicolon_start, semicolon_end) = semicolon_span;
+        if !trimmed[semicolon_end..].trim().is_empty() {
+            return None;
+        }
+
+        let mut out = String::with_capacity(
+            formatted
+                .len()
+                .saturating_sub(semicolon_end.saturating_sub(semicolon_start)),
+        );
+        out.push_str(&formatted[..semicolon_start]);
+        out.push_str(&formatted[semicolon_end..]);
         Some(out)
     }
 
@@ -8754,6 +8737,26 @@ FROM DUAL"
             preserved.trim_end().ends_with("-- trailing note"),
             "Trailing comment should be preserved, got:
 {}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_when_string_has_comment_markers(
+    ) {
+        let source = "SELECT '-- keep literal' AS txt FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("'-- keep literal'"),
+            "String literal containing comment markers should be preserved, got:\n{}",
             preserved
         );
     }
