@@ -103,6 +103,7 @@ impl SplitState {
         let is_end_case = self.pending_end && upper == "CASE";
         let is_end_if = self.pending_end && upper == "IF";
         let is_end_loop = self.pending_end && upper == "LOOP";
+        let is_end_while = self.pending_end && upper == "WHILE";
         let is_end_repeat = self.pending_end && upper == "REPEAT";
 
         if self.pending_end {
@@ -179,7 +180,7 @@ impl SplitState {
             self.block_depth += 1;
         }
 
-        if upper == "WHILE" && !self.pending_end {
+        if upper == "WHILE" && !self.pending_end && !is_end_while {
             self.pending_while_do = true;
         } else if self.pending_while_do && upper == "DO" {
             self.block_depth += 1;
