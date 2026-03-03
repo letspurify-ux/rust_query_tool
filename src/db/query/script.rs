@@ -802,7 +802,10 @@ impl QueryExecutor {
         }
 
         fn should_pre_dedent(leading_word: &str) -> bool {
-            matches!(leading_word, "END" | "ELSE" | "ELSIF" | "EXCEPTION")
+            matches!(
+                leading_word,
+                "END" | "ELSE" | "ELSIF" | "ELSEIF" | "EXCEPTION"
+            )
         }
         let is_with_main_query_keyword = |word: &str| -> bool {
             matches!(word, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE")
