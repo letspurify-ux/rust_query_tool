@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::sql_text;
 use crate::ui::sql_depth::{
     apply_paren_token, is_top_level_depth, paren_depths, split_top_level_symbol_groups,
+    ParenDepthState,
 };
 use crate::ui::sql_editor::SqlToken;
 
@@ -202,7 +203,10 @@ struct PhaseAnalysis {
 /// the function call rather than a SQL clause (e.g. `EXTRACT(YEAR FROM ...)`,
 /// `TRIM(LEADING '0' FROM ...)`, `SUBSTRING(col FROM ...)`).
 fn is_from_consuming_function(name: &str) -> bool {
-    matches!(name, "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY")
+    matches!(
+        name,
+        "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY"
+    )
 }
 
 /// FROM-clause table functions that may reference left-side row source aliases.
@@ -1011,18 +1015,18 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
     let mut idx = 0;
 
     // Find top-level WITH keyword
-    let mut depth = 0usize;
+    let mut paren_state = ParenDepthState::default();
     let mut found_with = false;
     while idx < tokens.len() {
         let token = &tokens[idx];
         match token {
-            SqlToken::Word(w) if depth == 0 && w.eq_ignore_ascii_case("WITH") => {
+            SqlToken::Word(w) if paren_state.depth() == 0 && w.eq_ignore_ascii_case("WITH") => {
                 idx += 1;
                 found_with = true;
                 break;
             }
             // If we hit a top-level statement keyword before WITH, no CTEs.
-            SqlToken::Word(w) if depth == 0 => {
+            SqlToken::Word(w) if paren_state.depth() == 0 => {
                 let u = w.to_ascii_uppercase();
                 if matches!(
                     u.as_str(),
@@ -1033,7 +1037,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             }
             _ => {}
         }
-        apply_paren_token(&mut depth, token);
+        apply_paren_token(&mut paren_state, token);
         idx += 1;
     }
 
