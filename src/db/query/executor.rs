@@ -1671,7 +1671,8 @@ impl QueryExecutor {
                         continue;
                     }
 
-                    if (c == 'n' || c == 'N')
+                    if self.state.token.is_empty()
+                        && (c == 'n' || c == 'N')
                         && (next == Some('q') || next == Some('Q'))
                         && Self::peek_n_char(&iter, 1) == Some('\'')
                         && Self::peek_n_char(&iter, 2).is_some()
@@ -1700,7 +1701,8 @@ impl QueryExecutor {
                         continue;
                     }
 
-                    if (c == 'q' || c == 'Q')
+                    if self.state.token.is_empty()
+                        && (c == 'q' || c == 'Q')
                         && next == Some('\'')
                         && Self::peek_n_char(&iter, 1).is_some()
                     {

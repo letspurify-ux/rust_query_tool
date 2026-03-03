@@ -5234,6 +5234,38 @@ fn test_line_block_depths_identifier_ending_q_with_subquery() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_identifier_ending_q_string_keeps_second_statement() {
+    let sql = "SELECT seq'v' FROM dual;
+SELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected second statement bounds after identifier-ending q literal");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "expected second statement, got: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_identifier_ending_nq_string_keeps_second_statement() {
+    let sql = "SELECT unq'v' FROM dual;
+SELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected second statement bounds after identifier-ending nq literal");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "expected second statement, got: {statement}"
+    );
+}
+
+#[test]
 fn test_line_block_depths_real_q_quote_still_works() {
     // Standalone q-quote must continue to work.
     let sql = "SELECT q'[hello]', (SELECT 1 FROM dual)\nFROM t;";
