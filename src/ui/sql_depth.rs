@@ -12,23 +12,20 @@ impl ParenDepthState {
     }
 
     pub(crate) fn apply_token(&mut self, token: &SqlToken) {
-        let symbol = match token {
-            SqlToken::Symbol(sym) => sym.as_str(),
-            _ => return,
+        let SqlToken::Symbol(symbol) = token else {
+            return;
         };
 
-        match symbol {
-            "(" | "[" | "{" => {
-                if let Some(ch) = symbol.chars().next() {
-                    self.stack.push(ch);
+        for sym_ch in symbol.chars() {
+            match sym_ch {
+                '(' | '[' | '{' => {
+                    self.stack.push(sym_ch);
                 }
-            }
-            ")" | "]" | "}" => {
-                if let Some(close_ch) = symbol.chars().next() {
-                    self.consume_close(close_ch);
+                ')' | ']' | '}' => {
+                    self.consume_close(sym_ch);
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -220,6 +217,15 @@ mod tests {
     }
 
     #[test]
+    fn paren_depths_handles_multiple_group_symbols_in_one_token() {
+        // Some token streams may include grouped symbols in a single token (e.g. "((").
+        // Depth must reflect every symbol, not just the first char.
+        let tokens = [sym("(("), word("x"), sym("))")];
+        assert_eq!(paren_depths(&tokens), vec![0, 2, 2]);
+        assert_eq!(paren_depth_after(&tokens), 0);
+    }
+
+    #[test]
     fn paren_depths_saturates_at_zero_for_unbalanced_close() {
         // ) at depth 0 must not underflow
         let tokens = [sym(")"), word("x")];
@@ -402,6 +408,13 @@ mod tests {
     #[test]
     fn paren_depth_after_mismatched_closer_unwinds_to_matching_open() {
         let tokens = [sym("("), sym("["), word("x"), sym(")")];
+        assert_eq!(paren_depth_after(&tokens), 0);
+    }
+
+    #[test]
+    fn paren_depth_after_mixed_group_symbols_inside_one_token() {
+        // "([" opens two levels and "])" should close both levels in order.
+        let tokens = [sym("(["), word("x"), sym("])")];
         assert_eq!(paren_depth_after(&tokens), 0);
     }
 
