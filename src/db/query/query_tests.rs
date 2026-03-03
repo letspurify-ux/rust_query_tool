@@ -4433,6 +4433,44 @@ end if;"#;
 }
 
 #[test]
+fn test_line_block_depths_mysql_elseif_is_pre_dedented() {
+    let sql = r#"IF score >= 90 THEN
+  SET grade = 'A';
+ELSEIF score >= 80 THEN
+  SET grade = 'B';
+ELSE
+  SET grade = 'C';
+END IF;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 0, 1, 0, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "ELSEIF depth tracking should match ELSE/ELSIF pre-dedent semantics"
+    );
+}
+
+#[test]
+fn test_split_script_items_mysql_elseif_block_remains_single_statement() {
+    let sql = r#"IF score >= 90 THEN
+  SET grade = 'A';
+ELSEIF score >= 80 THEN
+  SET grade = 'B';
+ELSE
+  SET grade = 'C';
+END IF;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        1,
+        "IF/ELSEIF/ELSE/END IF block should be a single statement"
+    );
+}
+
+#[test]
 fn test_select_with_case_expressions_separated_by_plus() {
     let sql = "SELECT CASE WHEN a=1 THEN 1 ELSE 0 END + CASE WHEN b=2 THEN 1 ELSE 0 END FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
