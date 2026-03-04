@@ -189,13 +189,6 @@ impl SelectListLayoutState {
         *self = Self::Inactive;
     }
 
-    fn indent(self) -> Option<usize> {
-        match self {
-            Self::Pending { indent, .. } | Self::Multiline { indent } => Some(indent),
-            Self::Inactive => None,
-        }
-    }
-
     fn is_multiline(self) -> bool {
         matches!(self, Self::Multiline { .. })
     }
@@ -1936,25 +1929,24 @@ impl SqlEditorWidget {
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
-                        let select_list_indent =
-                            select_list_layout_state.indent().unwrap_or(base + 1);
+                        let current_select_indent = base + 1;
                         if has_leading_newline {
                             line_indent =
                                 if in_select_list && select_list_layout_state.is_multiline() {
-                                    select_list_indent
+                                    current_select_indent
                                 } else {
                                     base
                                 };
                         } else if top_level_select_list {
                             line_indent = if select_list_layout_state.is_multiline() {
-                                select_list_indent
+                                current_select_indent
                             } else {
                                 base
                             };
                         } else if in_select_list
                             || column_list_stack.last().copied().unwrap_or(false)
                         {
-                            line_indent = base + 1;
+                            line_indent = current_select_indent;
                         } else if line_indent == 0 {
                             line_indent = base;
                         }
