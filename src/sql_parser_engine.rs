@@ -1107,22 +1107,16 @@ impl SqlParserEngine {
 
     pub(crate) fn force_terminate(&mut self) {
         self.state.force_reset_all();
-        let trimmed = self.current.trim();
-        if !trimmed.is_empty() {
-            self.statements.push(trimmed.to_string());
-        }
-        self.current.clear();
+        self.push_current_statement();
+        self.reset_statement_local_state();
     }
 
     pub(crate) fn finalize(&mut self) {
         self.state.flush_token();
         self.state.resolve_pending_end_on_eof();
         self.state.reset_create_state();
-        let trimmed = self.current.trim();
-        if !trimmed.is_empty() {
-            self.statements.push(trimmed.to_string());
-        }
-        self.current.clear();
+        self.push_current_statement();
+        self.reset_statement_local_state();
     }
 
     pub(crate) fn take_statements(&mut self) -> Vec<String> {
@@ -1238,5 +1232,20 @@ mod tests {
         assert_eq!(state.block_depth(), 0);
         assert!(state.in_create_plsql);
         assert!(state.in_with_plsql_declaration);
+    }
+
+    #[test]
+    fn finalize_clears_transient_parser_state_for_reuse() {
+        let mut engine = SqlParserEngine::new();
+        engine.process_line("FOR i IN 1..10");
+        engine.process_line("IF flag");
+        engine.state.paren_depth = 3;
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements, vec!["FOR i IN 1..10\nIF flag".to_string()]);
+        assert_eq!(engine.state.pending_do, PendingDo::None);
+        assert_eq!(engine.state.if_state, IfState::None);
+        assert_eq!(engine.state.paren_depth, 0);
     }
 }
