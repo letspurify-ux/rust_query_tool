@@ -6414,6 +6414,37 @@ fn test_split_script_items_oracle_with_function_keeps_single_statement_until_mai
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_as_keeps_single_statement_until_main_select() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER AS
+  BEGIN
+    RETURN 1;
+  END;
+SELECT f() FROM dual;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION ... AS declaration must stay attached to main SELECT statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH
+  FUNCTION f RETURN NUMBER AS"),
+        "first statement should preserve WITH FUNCTION AS declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f() FROM dual"),
+        "first statement should include main SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_oracle_with_procedure_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  PROCEDURE p IS\n  BEGIN\n    NULL;\n  END;\nSELECT 1 FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);
@@ -6534,6 +6565,54 @@ fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_ma
     assert!(
         stmts[0].contains("DELETE FROM target"),
         "first statement should include main DELETE: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_create_type_body_with_member_function_keeps_single_statement() {
+    let sql = "CREATE OR REPLACE TYPE BODY t_demo AS\n  MEMBER FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nEND;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE TYPE BODY with member function should remain a single statement until final END: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE BODY t_demo AS"),
+        "first statement should preserve TYPE BODY header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("MEMBER FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve member function body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_cte_using_function_call_splits_normally() {
+    let sql = "WITH cte AS (SELECT 1 AS n FROM dual)\nSELECT ABS(n) AS v FROM cte;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "regular CTE with scalar FUNCTION call should split on first statement terminator: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH cte AS (SELECT 1 AS n FROM dual)"),
+        "first statement should preserve CTE query: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT ABS(n) AS v FROM cte"),
+        "first statement should include scalar function call in SELECT list: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
