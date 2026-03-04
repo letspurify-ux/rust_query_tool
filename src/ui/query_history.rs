@@ -656,12 +656,8 @@ impl QueryHistoryDialog {
         success: bool,
         message: &str,
     ) -> Result<(), String> {
-        if sql.trim().is_empty() {
-            return Ok(());
-        }
-
         // Keep UI responsive for large SQL text (for example package body DDL):
-        // enqueue raw data and sanitize/persist on the background history writer.
+        // enqueue raw data and persist on the background history writer.
         let entry = PendingHistoryEntry {
             sql: sql.to_string(),
             timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -682,78 +678,35 @@ impl QueryHistoryDialog {
 
 /// Truncate SQL for display in list.
 ///
-/// All indices are byte offsets; `is_char_boundary` is used before every slice
-/// so multi-byte characters are never split.
+/// All indices are byte offsets; `is_char_boundary` is used before slicing so
+/// multi-byte characters are never split.
 fn truncate_sql(sql: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
 
-    // Normalize whitespace using byte-level ASCII checks for whitespace detection.
-    // Multi-byte characters are copied as complete byte sequences identified by
-    // char boundaries, never sliced mid-character.
-    let mut normalized = String::with_capacity(sql.len());
-    let mut last_was_whitespace = true;
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            if !last_was_whitespace {
-                normalized.push(' ');
-                last_was_whitespace = true;
-            }
-            i += 1;
-        } else {
-            // Advance to the end of this char using char boundary checks.
-            let char_start = i;
-            i += 1;
-            while i < bytes.len() && !sql.is_char_boundary(i) {
-                i += 1;
-            }
-            normalized.push_str(&sql[char_start..i]);
-            last_was_whitespace = false;
-        }
-    }
-
-    while normalized.ends_with(' ') {
-        normalized.pop();
-    }
-
-    if normalized.is_empty() {
-        return String::new();
-    }
-
     if max_len <= 3 {
         // Truncate at a char boundary so we don't produce invalid UTF-8.
-        let mut end = max_len.min(normalized.len());
-        while end > 0 && !normalized.is_char_boundary(end) {
+        let mut end = max_len.min(sql.len());
+        while end > 0 && !sql.is_char_boundary(end) {
             end -= 1;
         }
-        return normalized[..end].to_string();
+        return sql[..end].to_string();
     }
 
     let visible_len = max_len - 3;
-    // `char_indices` yields (byte_offset, char) pairs; truncate_at is a byte offset.
     let mut visible_chars = 0usize;
-    let mut truncate_at = normalized.len();
-    for (byte_idx, _ch) in normalized.char_indices() {
+    for (byte_idx, _ch) in sql.char_indices() {
         if visible_chars == visible_len {
-            truncate_at = byte_idx;
-            break;
+            let mut output = String::with_capacity(byte_idx + 3);
+            output.push_str(&sql[..byte_idx]);
+            output.push_str("...");
+            return output;
         }
         visible_chars += 1;
     }
 
-    debug_assert!(normalized.is_char_boundary(truncate_at));
-
-    if visible_chars < visible_len {
-        normalized
-    } else {
-        let mut output = String::with_capacity(truncate_at + 3);
-        output.push_str(&normalized[..truncate_at]);
-        output.push_str("...");
-        output
-    }
+    sql.to_string()
 }
 
 /// Case-insensitive substring search. Uses a fast byte-level comparison when
@@ -852,9 +805,9 @@ mod query_history_tests {
     };
 
     #[test]
-    fn truncate_sql_preserves_multibyte_text_while_normalizing_whitespace() {
+    fn truncate_sql_preserves_original_whitespace() {
         let sql = "  SELECT\t'프로시저 테스트'\nFROM dual  ";
-        assert_eq!(truncate_sql(sql, 100), "SELECT '프로시저 테스트' FROM dual");
+        assert_eq!(truncate_sql(sql, 100), "  SELECT\t'프로시저 테스트'\nFROM dual  ");
     }
 
     #[test]
@@ -864,9 +817,9 @@ mod query_history_tests {
     }
 
     #[test]
-    fn truncate_sql_collapses_whitespace_runs() {
+    fn truncate_sql_does_not_collapse_whitespace_runs() {
         let sql = "SELECT\n\n\t\t*\t\tFROM\t\tdual";
-        assert_eq!(truncate_sql(sql, 100), "SELECT * FROM dual");
+        assert_eq!(truncate_sql(sql, 100), "SELECT\n\n\t\t*\t\tFROM\t\tdual");
     }
 
     #[test]
