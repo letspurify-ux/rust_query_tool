@@ -22,7 +22,7 @@ use crate::utils::config::{QueryHistory, QueryHistoryEntry};
 
 enum HistoryCommand {
     Add(PendingHistoryEntry),
-    Clear,
+    Clear(mpsc::Sender<Result<(), String>>),
     Snapshot(mpsc::Sender<Vec<QueryHistoryEntry>>),
 }
 
@@ -38,9 +38,18 @@ struct PendingHistoryEntry {
 }
 
 const REDACTED_SECRET: &str = "<redacted>";
+const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 3;
 
 fn fold_for_case_insensitive(value: &str) -> String {
     value.chars().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
+fn history_writer_response_timeout() -> std::time::Duration {
+    std::env::var("SPACE_QUERY_HISTORY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
 }
 
 fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
@@ -77,14 +86,16 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
             };
 
             let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
+            let mut clear_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
 
             let mut apply_command = |command: HistoryCommand| {
                 match command {
                     HistoryCommand::Add(entry) => {
                         history.add_entry(materialize_history_entry(entry));
                     }
-                    HistoryCommand::Clear => {
+                    HistoryCommand::Clear(reply) => {
                         history.queries.clear();
+                        clear_replies.push(reply);
                     }
                     HistoryCommand::Snapshot(reply) => {
                         snapshot_replies.push(reply);
@@ -100,6 +111,9 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
             let snapshot: Vec<QueryHistoryEntry> = history.queries.iter().cloned().collect();
             for reply in snapshot_replies {
                 let _ = reply.send(snapshot.clone());
+            }
+            for reply in clear_replies {
+                let _ = reply.send(Ok(()));
             }
         }
     });
@@ -638,20 +652,24 @@ fn load_snapshot() -> Vec<QueryHistoryEntry> {
         return QueryHistory::new().queries.into();
     }
 
-    rx.recv().unwrap_or_else(|_| QueryHistory::new().queries.into())
+    rx.recv_timeout(history_writer_response_timeout())
+        .unwrap_or_else(|_| QueryHistory::new().queries.into())
 }
 
 pub fn history_snapshot() -> Result<Vec<QueryHistoryEntry>, String> {
     let (tx, rx) = mpsc::channel();
     send_history_command(HistoryCommand::Snapshot(tx))
         .map_err(|_| "Failed to fetch query history snapshot".to_string())?;
-    rx.recv()
+    rx.recv_timeout(history_writer_response_timeout())
         .map_err(|_| "Failed to fetch query history snapshot".to_string())
 }
 
 pub fn clear_history() -> Result<(), String> {
-    send_history_command(HistoryCommand::Clear)
-        .map_err(|_| "Failed to clear query history".to_string())
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    send_history_command(HistoryCommand::Clear(tx))
+        .map_err(|_| "Failed to clear query history".to_string())?;
+    rx.recv_timeout(history_writer_response_timeout())
+        .map_err(|_| "Timed out while clearing query history".to_string())?
 }
 
 /// Query history dialog for viewing and re-executing past queries
