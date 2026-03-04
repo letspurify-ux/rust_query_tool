@@ -92,6 +92,7 @@ struct EndSuffixContext {
     while_suffix: bool,
     repeat_suffix: bool,
     for_suffix: bool,
+    timing_point_suffix: bool,
 }
 
 impl EndSuffixContext {
@@ -119,6 +120,10 @@ impl EndSuffixContext {
             },
             Some(PendingEndSuffix::For) => Self {
                 for_suffix: true,
+                ..Self::default()
+            },
+            Some(PendingEndSuffix::TimingPoint) => Self {
+                timing_point_suffix: true,
                 ..Self::default()
             },
             _ => Self::default(),
@@ -554,7 +559,10 @@ impl SplitState {
         } else if upper == "COMPOUND" && self.in_create_plsql {
             self.in_compound_trigger = true;
             self.block_stack.push(BlockKind::Compound);
-        } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD") && self.in_compound_trigger {
+        } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
+            && self.in_compound_trigger
+            && !end_suffix.timing_point_suffix
+        {
             self.pending_timing_point_is = true;
         }
     }
