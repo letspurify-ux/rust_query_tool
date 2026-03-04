@@ -6247,6 +6247,25 @@ fn test_split_script_items_mysql_if_function_followed_by_case_then_stays_two_sta
 }
 
 #[test]
+fn test_split_script_items_mysql_backtick_identifier_with_semicolon_stays_single_statement() {
+    let sql = "SELECT `semi;colon` AS c FROM demo;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "semicolon inside MySQL backtick identifier must not split statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("`semi;colon`"),
+        "first statement should preserve backtick identifier: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_mysql_if_function_followed_by_case_then_stays_two_statements() {
     let sql = "SELECT IF(score > 90, 'A', 'B') + CASE WHEN bonus > 0 THEN 1 ELSE 0 END AS grade FROM exam_scores;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);

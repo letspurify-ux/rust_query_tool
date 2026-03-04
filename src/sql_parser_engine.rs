@@ -12,6 +12,7 @@ pub(crate) enum LexMode {
     Idle,
     SingleQuote,
     DoubleQuote,
+    BacktickQuote,
     LineComment,
     BlockComment,
     QQuote { end_char: char },
@@ -801,6 +802,19 @@ impl SqlParserEngine {
                     i += 1;
                     continue;
                 }
+                LexMode::BacktickQuote => {
+                    self.current.push(c);
+                    if c == '`' {
+                        if next == Some('`') {
+                            self.current.push('`');
+                            i += 2;
+                            continue;
+                        }
+                        self.state.lex_mode = LexMode::Idle;
+                    }
+                    i += 1;
+                    continue;
+                }
                 LexMode::Idle => {
                     // Fall through to normal code processing below.
                 }
@@ -885,6 +899,14 @@ impl SqlParserEngine {
             if c == '"' {
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::DoubleQuote;
+                self.current.push(c);
+                i += 1;
+                continue;
+            }
+
+            if c == '`' {
+                self.state.flush_token();
+                self.state.lex_mode = LexMode::BacktickQuote;
                 self.current.push(c);
                 i += 1;
                 continue;
