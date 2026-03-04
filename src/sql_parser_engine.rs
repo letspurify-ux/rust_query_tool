@@ -270,6 +270,68 @@ enum AsIsFollowState {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum IfSymbolEvent {
+    Whitespace,
+    OpenParen,
+    Other,
+}
+
+impl IfSymbolEvent {
+    fn from_char(ch: char) -> Self {
+        if ch.is_whitespace() {
+            return Self::Whitespace;
+        }
+
+        if ch == '(' {
+            return Self::OpenParen;
+        }
+
+        Self::Other
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SymbolRole {
+    Semicolon,
+    PendingEndSeparator,
+    OpenParen,
+    CloseParen,
+    Other,
+}
+
+impl SymbolRole {
+    fn from_char(ch: char, next: Option<char>) -> Self {
+        if ch == ';' {
+            return Self::Semicolon;
+        }
+
+        if ch == '(' {
+            return Self::OpenParen;
+        }
+
+        if ch == ')' {
+            return Self::CloseParen;
+        }
+
+        let is_pending_end_separator = matches!(
+            ch,
+            ',' | ')' | ']' | '}' | '+' | '*' | '%' | '=' | '<' | '>' | '|'
+        ) || (ch == '-' && next != Some('-'))
+            || (ch == '/' && next != Some('*'));
+
+        if is_pending_end_separator {
+            return Self::PendingEndSeparator;
+        }
+
+        Self::Other
+    }
+
+    fn resolves_pending_end(self) -> bool {
+        matches!(self, Self::PendingEndSeparator | Self::CloseParen)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum EndResolutionPolicy {
     KeepCreateState,
     ResetCreateStateWhenTopLevel,
@@ -844,6 +906,13 @@ impl SplitState {
         self.resolve_pending_end_with_policy(EndResolutionPolicy::ResetCreateStateWhenTopLevel);
     }
 
+    fn advance_with_clause_after_semicolon(&mut self) {
+        if self.in_with_plsql_declaration() && self.block_depth() == 0 && self.paren_depth == 0 {
+            self.with_clause_state =
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery);
+        }
+    }
+
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
         self.routine_is_stack
             .last()
@@ -1401,19 +1470,24 @@ impl SqlParserEngine {
 
             self.state.flush_token();
             on_symbol(chars, i, c, next);
+            let symbol_role = SymbolRole::from_char(c, next);
 
             // IF state machine on symbol characters
             match &self.state.if_state {
                 IfState::ExpectConditionStart => {
-                    if c.is_whitespace() {
-                        // Keep waiting.
-                    } else if c == '(' {
-                        let condition_depth = self.state.paren_depth.saturating_add(1);
-                        self.state.if_state = IfState::InConditionParen {
-                            depth: condition_depth,
-                        };
-                    } else {
-                        self.state.if_state = IfState::AwaitingThen;
+                    match IfSymbolEvent::from_char(c) {
+                        IfSymbolEvent::Whitespace => {
+                            // Keep waiting.
+                        }
+                        IfSymbolEvent::OpenParen => {
+                            let condition_depth = self.state.paren_depth.saturating_add(1);
+                            self.state.if_state = IfState::InConditionParen {
+                                depth: condition_depth,
+                            };
+                        }
+                        IfSymbolEvent::Other => {
+                            self.state.if_state = IfState::AwaitingThen;
+                        }
                     }
                 }
                 IfState::AfterConditionParen => {
@@ -1425,7 +1499,7 @@ impl SqlParserEngine {
             }
 
             // Check if closing paren matches IF condition paren
-            if c == ')' {
+            if symbol_role == SymbolRole::CloseParen {
                 if let IfState::InConditionParen { depth } = self.state.if_state {
                     if depth == self.state.paren_depth {
                         self.state.if_state = IfState::AfterConditionParen;
@@ -1434,37 +1508,27 @@ impl SqlParserEngine {
             }
 
             // Track parenthesis depth
-            if c == '(' {
-                self.state.paren_depth += 1;
-            } else if c == ')' {
-                self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+            match symbol_role {
+                SymbolRole::OpenParen => {
+                    self.state.paren_depth += 1;
+                }
+                SymbolRole::CloseParen => {
+                    self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+                }
+                _ => {}
             }
 
             // Pending END on separator
-            if self.state.pending_end == PendingEnd::End {
-                let separator = matches!(
-                    c,
-                    ',' | ')' | ']' | '}' | '+' | '*' | '%' | '=' | '<' | '>' | '|'
-                ) || (c == '-' && next != Some('-'))
-                    || (c == '/' && next != Some('*'));
-                if separator {
-                    self.state.resolve_pending_end_on_separator();
-                }
+            if self.state.pending_end == PendingEnd::End && symbol_role.resolves_pending_end() {
+                self.state.resolve_pending_end_on_separator();
             }
 
-            if c == ';' {
+            if symbol_role == SymbolRole::Semicolon {
                 // FOR/WHILE ... DO candidates cannot span statement terminators.
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
-                if self.state.in_with_plsql_declaration()
-                    && self.state.block_depth() == 0
-                    && self.state.paren_depth == 0
-                {
-                    self.state.with_clause_state = WithClauseState::InPlsqlDeclaration(
-                        WithDeclarationState::AwaitingMainQuery,
-                    );
-                }
+                self.state.advance_with_clause_after_semicolon();
                 let semicolon_action = SemicolonAction::from_state(&self.state);
                 self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
@@ -1526,9 +1590,10 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SplitState,
-        SqlParserEngine, TimingPointState, TriggerKind, WithClauseState, WithDeclarationState,
+        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, IfSymbolEvent, PendingDo,
+        PendingEnd, PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SplitState,
+        SqlParserEngine, SymbolRole, TimingPointState, TriggerKind, WithClauseState,
+        WithDeclarationState,
     };
 
     #[test]
@@ -1563,6 +1628,27 @@ mod tests {
             SemicolonAction::from_state(&state),
             SemicolonAction::SplitForcedRoutine
         );
+    }
+
+    #[test]
+    fn if_symbol_event_classifies_characters() {
+        assert_eq!(IfSymbolEvent::from_char(' '), IfSymbolEvent::Whitespace);
+        assert_eq!(IfSymbolEvent::from_char('('), IfSymbolEvent::OpenParen);
+        assert_eq!(IfSymbolEvent::from_char('A'), IfSymbolEvent::Other);
+    }
+
+    #[test]
+    fn symbol_role_classifies_semicolon_and_pending_end_separators() {
+        assert_eq!(SymbolRole::from_char(';', None), SymbolRole::Semicolon);
+        assert_eq!(SymbolRole::from_char('/', Some('*')), SymbolRole::Other);
+        assert_eq!(
+            SymbolRole::from_char('/', Some('1')),
+            SymbolRole::PendingEndSeparator
+        );
+        assert_eq!(SymbolRole::from_char(')', None), SymbolRole::CloseParen);
+        assert!(SymbolRole::from_char(')', None).resolves_pending_end());
+        assert!(SymbolRole::from_char('/', Some('1')).resolves_pending_end());
+        assert!(!SymbolRole::from_char('(', None).resolves_pending_end());
     }
 
     #[test]
