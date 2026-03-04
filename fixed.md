@@ -1224,3 +1224,28 @@
 ### [검증]
 - `cargo test recovers_to_lock_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강 (`ASSOCIATE` / `DISASSOCIATE`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `ASSOCIATE`/`DISASSOCIATE`를 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; ASSOCIATE STATISTICS ...; SELECT ...;`
+  - `WITH FUNCTION ... END; DISASSOCIATE STATISTICS ...; SELECT ...;`
+  - 위 형태에서 `ASSOCIATE`/`DISASSOCIATE`가 새 top-level statement로 분리되지 않고, `WITH FUNCTION` 블록에 붙어 하나의 statement로 병합됐습니다.
+- **원인**:
+  - `src/sql_text.rs`의 `is_statement_head_keyword`에 `ASSOCIATE`, `DISASSOCIATE`가 누락되어
+  - `WITH FUNCTION/PROCEDURE` 복구 상태(`AwaitingMainQuery`)에서 새 statement 시작을 감지하지 못했습니다.
+- **수정**:
+  - `is_statement_head_keyword`에 `ASSOCIATE`, `DISASSOCIATE`를 추가해 복구 분리 조건을 보강했습니다.
+  - 발견된 버그와 유사한 `split_script_items`/`split_format_items` 경로를 함께 회귀 테스트로 일괄 보강했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_associate_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_disassociate_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_associate_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_disassociate_statement_head`
+
+### [검증]
+- `cargo test -q recovers_to_disassociate_statement_head -- --nocapture` 통과
+- `cargo test -q recovers_to_associate_statement_head -- --nocapture` 통과
+- `cargo test` 전체 통과
