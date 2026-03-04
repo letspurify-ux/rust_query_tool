@@ -6607,6 +6607,44 @@ fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_ma
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_and_cte_keeps_single_statement() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+  cte AS (
+    SELECT f() AS n FROM dual
+  )
+SELECT n FROM cte;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION declaration + CTE must stay attached to main SELECT statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("cte AS ("),
+        "first statement should keep the CTE clause after function declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT n FROM cte"),
+        "first statement should include the main SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_create_type_opaque_keeps_single_statement() {
     let sql = "CREATE OR REPLACE TYPE t_opaque AS OPAQUE (
   STORAGE RAW(16)
