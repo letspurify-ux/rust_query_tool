@@ -119,6 +119,13 @@ fn phase_group_by() {
 }
 
 #[test]
+fn phase_group_by_with_comment_between_keywords() {
+    let ctx = analyze("SELECT a FROM t GROUP /*c*/ BY |");
+    assert_eq!(ctx.phase, SqlPhase::GroupByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_having() {
     let ctx = analyze("SELECT a FROM t GROUP BY a HAVING |");
     assert_eq!(ctx.phase, SqlPhase::HavingClause);
@@ -128,6 +135,13 @@ fn phase_having() {
 #[test]
 fn phase_order_by() {
     let ctx = analyze("SELECT a FROM t ORDER BY |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_order_by_with_comment_between_keywords() {
+    let ctx = analyze("SELECT a FROM t ORDER /*c*/ BY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
     assert!(ctx.phase.is_column_context());
 }
@@ -160,8 +174,22 @@ fn phase_connect_by() {
 }
 
 #[test]
+fn phase_connect_by_with_comment_between_keywords() {
+    let ctx = analyze("SELECT a FROM t START WITH a = 1 CONNECT /*c*/ BY |");
+    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_start_with() {
     let ctx = analyze("SELECT a FROM t START WITH |");
+    assert_eq!(ctx.phase, SqlPhase::StartWithClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_start_with_with_comment_between_keywords() {
+    let ctx = analyze("SELECT a FROM t START /*c*/ WITH |");
     assert_eq!(ctx.phase, SqlPhase::StartWithClause);
     assert!(ctx.phase.is_column_context());
 }
@@ -814,7 +842,8 @@ fn insert_subquery_in_values_increases_query_depth() {
 
 #[test]
 fn insert_subquery_depth_returns_to_zero_after_closing_values_subquery() {
-    let ctx = analyze("INSERT INTO employees (id) VALUES ((SELECT 1 FROM dual)) RETURNING | INTO :id");
+    let ctx =
+        analyze("INSERT INTO employees (id) VALUES ((SELECT 1 FROM dual)) RETURNING | INTO :id");
     assert_eq!(ctx.depth, 0);
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
 }
@@ -1122,7 +1151,9 @@ fn nested_with_inside_subquery_is_not_collected_as_top_level_cte() {
 
 #[test]
 fn depth_one_in_nested_with_subquery_select_list() {
-    let ctx = analyze("SELECT * FROM (WITH inner_cte AS (SELECT 1 AS n FROM dual) SELECT | FROM inner_cte) sub");
+    let ctx = analyze(
+        "SELECT * FROM (WITH inner_cte AS (SELECT 1 AS n FROM dual) SELECT | FROM inner_cte) sub",
+    );
     assert_eq!(ctx.depth, 1);
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 }
@@ -1318,7 +1349,8 @@ fn lateral_values_subquery_in_from_increases_depth() {
 
 #[test]
 fn from_subquery_with_update_body_increases_depth() {
-    let ctx = analyze("SELECT * FROM (UPDATE employees SET salary = salary + 1 WHERE | RETURNING id) u");
+    let ctx =
+        analyze("SELECT * FROM (UPDATE employees SET salary = salary + 1 WHERE | RETURNING id) u");
     assert_eq!(ctx.depth, 1);
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
