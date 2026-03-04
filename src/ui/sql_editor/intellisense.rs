@@ -35,6 +35,25 @@ const COLUMN_LOAD_WORKER_COUNT: usize = 4;
 const INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS: f64 = 0.01;
 const INTELLISENSE_DEFERRED_HIDE_RETRIES: u8 = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationKeyupState {
+    Idle,
+    RestoreCursor { anchor: i32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterKeyupSuppression {
+    None,
+    PopupConfirm,
+    CtrlEnterExecute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DndDropState {
+    Idle,
+    AwaitingPaste,
+}
+
 #[derive(Clone)]
 struct IntellisenseTriggerSnapshot {
     request_generation: u64,
@@ -654,11 +673,9 @@ impl SqlEditorWidget {
         let intellisense_popup = self.intellisense_popup.clone();
         let connection = self.connection.clone();
         let column_sender = self.column_sender.clone();
-        let suppress_enter = Arc::new(Mutex::new(false));
-        let suppress_nav = Arc::new(Mutex::new(false));
-        let nav_anchor = Arc::new(Mutex::new(None::<i32>));
+        let enter_keyup_suppression = Arc::new(Mutex::new(EnterKeyupSuppression::None));
+        let navigation_keyup_state = Arc::new(Mutex::new(NavigationKeyupState::Idle));
         let completion_range = self.completion_range.clone();
-        let ctrl_enter_handled = Arc::new(Mutex::new(false));
         let pending_intellisense = self.pending_intellisense.clone();
         let intellisense_parse_cache = self.intellisense_parse_cache.clone();
         let intellisense_parse_generation = self.intellisense_parse_generation.clone();
@@ -745,22 +762,20 @@ impl SqlEditorWidget {
         let intellisense_popup_for_handle = intellisense_popup;
         let column_sender_for_handle = column_sender;
         let connection_for_handle = connection;
-        let suppress_enter_for_handle = suppress_enter;
-        let suppress_nav_for_handle = suppress_nav;
-        let nav_anchor_for_handle = nav_anchor;
+        let enter_keyup_suppression_for_handle = enter_keyup_suppression;
+        let navigation_keyup_state_for_handle = navigation_keyup_state;
         let completion_range_for_handle = completion_range;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
         let replace_callback_for_handle = self.replace_callback.clone();
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
-        let ctrl_enter_handled_for_handle = ctrl_enter_handled;
         let pending_intellisense_for_handle = pending_intellisense;
         let intellisense_parse_cache_for_handle = intellisense_parse_cache;
         let intellisense_parse_generation_for_handle = intellisense_parse_generation;
         let intellisense_popup_show_in_progress_for_handle = intellisense_popup_show_in_progress;
         let keyup_debounce_generation_for_handle = keyup_debounce_generation;
         let keyup_debounce_handle_for_handle = keyup_debounce_handle;
-        let dnd_file_drop_pending_for_handle = Arc::new(Mutex::new(false));
+        let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
 
         editor.handle(move |ed, ev| {
             let schedule_viewport_refresh = |widget: &SqlEditorWidget| {
@@ -779,21 +794,23 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::DndEnter | Event::DndDrag => {
-                    *dnd_file_drop_pending_for_handle
+                    *dnd_drop_state_for_handle
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        DndDropState::AwaitingPaste;
                     true
                 }
                 Event::DndLeave => {
-                    *dnd_file_drop_pending_for_handle
+                    *dnd_drop_state_for_handle
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = DndDropState::Idle;
                     true
                 }
                 Event::DndRelease => {
-                    *dnd_file_drop_pending_for_handle
+                    *dnd_drop_state_for_handle
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        DndDropState::AwaitingPaste;
                     true
                 }
                 Event::Push => {
@@ -898,35 +915,33 @@ impl SqlEditorWidget {
                             Key::Up => {
                                 // Navigate popup up, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle
+                                *navigation_keyup_state_for_handle
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
                                 intellisense_popup_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .select_prev();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
                                 return true;
                             }
                             Key::Down => {
                                 // Navigate popup down, consume event
                                 let pos = ed.insert_position();
-                                *nav_anchor_for_handle
+                                *navigation_keyup_state_for_handle
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pos);
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
                                 intellisense_popup_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .select_next();
                                 ed.set_insert_position(pos);
                                 ed.show_insert_position();
-                                *suppress_nav_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+
                                 return true;
                             }
                             Key::Enter | Key::KPEnter | Key::Tab => {
@@ -982,9 +997,10 @@ impl SqlEditorWidget {
                                     widget_for_shortcuts.refresh_highlighting();
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
-                                    *suppress_enter_for_handle
+                                    *enter_keyup_suppression_for_handle
                                         .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        EnterKeyupSuppression::PopupConfirm;
                                 }
                                 intellisense_popup_for_handle
                                     .lock()
@@ -1061,15 +1077,18 @@ impl SqlEditorWidget {
                                 return true;
                             }
                             Key::Enter | Key::KPEnter => {
-                                if *ctrl_enter_handled_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                {
+                                if matches!(
+                                    *enter_keyup_suppression_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                    EnterKeyupSuppression::CtrlEnterExecute
+                                ) {
                                     return true;
                                 }
-                                *ctrl_enter_handled_for_handle
+                                *enter_keyup_suppression_for_handle
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    EnterKeyupSuppression::CtrlEnterExecute;
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
@@ -1227,45 +1246,44 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    if matches!(key, Key::Up | Key::Down)
-                        && *suppress_nav_for_handle
+                    if matches!(key, Key::Up | Key::Down) {
+                        let mut nav_state = navigation_keyup_state_for_handle
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    {
-                        if let Some(pos) = *nav_anchor_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        {
-                            ed.set_insert_position(pos);
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let NavigationKeyupState::RestoreCursor { anchor } = *nav_state {
+                            ed.set_insert_position(anchor);
                             ed.show_insert_position();
+                            *nav_state = NavigationKeyupState::Idle;
+                            return true;
                         }
-                        *nav_anchor_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                        *suppress_nav_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-                        return true;
                     }
 
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *suppress_enter_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::PopupConfirm
+                        )
                     {
-                        *suppress_enter_for_handle
+                        *enter_keyup_suppression_for_handle
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::None;
                         return true;
                     }
                     if matches!(key, Key::Enter | Key::KPEnter)
-                        && *ctrl_enter_handled_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::CtrlEnterExecute
+                        )
                     {
-                        *ctrl_enter_handled_for_handle
+                        *enter_keyup_suppression_for_handle
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::None;
                         return true;
                     }
 
@@ -1558,15 +1576,18 @@ impl SqlEditorWidget {
                     }
 
                     if ctrl_or_cmd && matches!(key, Key::Enter | Key::KPEnter) {
-                        if *ctrl_enter_handled_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        {
+                        if matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::CtrlEnterExecute
+                        ) {
                             return true;
                         }
-                        *ctrl_enter_handled_for_handle
+                        *enter_keyup_suppression_for_handle
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::CtrlEnterExecute;
                         widget_for_shortcuts.execute_statement_at_cursor();
                         return true;
                     }
@@ -1575,12 +1596,12 @@ impl SqlEditorWidget {
                 }
                 Event::Paste => {
                     let from_drop = {
-                        let mut pending = dnd_file_drop_pending_for_handle
+                        let mut drop_state = dnd_drop_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let was_pending = *pending;
-                        *pending = false;
-                        was_pending
+                        let was_drop = matches!(*drop_state, DndDropState::AwaitingPaste);
+                        *drop_state = DndDropState::Idle;
+                        was_drop
                     };
                     if !from_drop {
                         return false;
