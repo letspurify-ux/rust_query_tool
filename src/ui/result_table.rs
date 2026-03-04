@@ -244,6 +244,7 @@ struct DragState {
     last_mouse_x: i32,
     last_mouse_y: i32,
     header_sort_candidate_col: Option<i32>,
+    header_sort_requires_double_click: bool,
     header_sort_start_x: i32,
     header_sort_start_y: i32,
 }
@@ -1509,6 +1510,7 @@ impl ResultTableWidget {
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 state.header_sort_candidate_col = Some(col);
+                                state.header_sort_requires_double_click = app::event_clicks();
                                 state.header_sort_start_x = app::event_x();
                                 state.header_sort_start_y = app::event_y();
                                 state.is_dragging = false;
@@ -1522,6 +1524,7 @@ impl ResultTableWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.header_sort_candidate_col = None;
+                            state.header_sort_requires_double_click = false;
                         }
                         let target_cell = if app::event_clicks() {
                             // On double-click, prefer the already-selected single cell.
@@ -1588,6 +1591,7 @@ impl ResultTableWidget {
                         is_dragging,
                         mouse_unchanged,
                         header_sort_candidate,
+                        header_sort_requires_double_click,
                         header_start_x,
                         header_start_y,
                     ) = {
@@ -1600,11 +1604,19 @@ impl ResultTableWidget {
                             state.is_dragging,
                             state.last_mouse_x == mx && state.last_mouse_y == my,
                             state.header_sort_candidate_col,
+                            state.header_sort_requires_double_click,
                             state.header_sort_start_x,
                             state.header_sort_start_y,
                         )
                     };
                     if header_sort_candidate.is_some() {
+                        if !header_sort_requires_double_click {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.header_sort_candidate_col = None;
+                            return true;
+                        }
                         let moved_beyond = Self::pointer_moved_beyond_tolerance(
                             header_start_x,
                             header_start_y,
@@ -1617,6 +1629,7 @@ impl ResultTableWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.header_sort_candidate_col = None;
+                            state.header_sort_requires_double_click = false;
                         } else {
                             return true;
                         }
@@ -1654,21 +1667,24 @@ impl ResultTableWidget {
                     false
                 }
                 Event::Released => {
-                    let (header_sort_candidate, was_dragging) = {
+                    let (header_sort_candidate, header_sort_requires_double_click, was_dragging) = {
                         let mut state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let header_candidate = state.header_sort_candidate_col.take();
+                        let header_is_double_click = state.header_sort_requires_double_click;
+                        state.header_sort_requires_double_click = false;
                         let dragging = state.is_dragging;
                         if dragging {
                             state.is_dragging = false;
                             state.last_row = -1;
                             state.last_col = -1;
                         }
-                        (header_candidate, dragging)
+                        (header_candidate, header_is_double_click, dragging)
                     };
                     if let Some(col) = header_sort_candidate {
                         if col >= 0
+                            && header_sort_requires_double_click
                             && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
                             // Streaming append mutates full_data incrementally, so block
                             // column sort until the result set is finalized.
