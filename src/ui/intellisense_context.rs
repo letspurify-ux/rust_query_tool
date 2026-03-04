@@ -709,9 +709,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         expect_table = false;
                     }
                     "GROUP" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            depth_frames[depth].phase = SqlPhase::GroupByClause;
-                            idx += 1; // skip BY
+                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
+                            if next_keyword == "BY" {
+                                depth_frames[depth].phase = SqlPhase::GroupByClause;
+                                idx = next_idx; // skip BY (and any interleaved comments)
+                            }
                         }
                         expect_table = false;
                     }
@@ -720,9 +722,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         expect_table = false;
                     }
                     "ORDER" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
-                            idx += 1; // skip BY
+                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
+                            if next_keyword == "BY" {
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                                idx = next_idx; // skip BY (and any interleaved comments)
+                            }
                         }
                         expect_table = false;
                     }
@@ -746,16 +750,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         expect_table = false;
                     }
                     "CONNECT" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            depth_frames[depth].phase = SqlPhase::ConnectByClause;
-                            idx += 1;
+                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
+                            if next_keyword == "BY" {
+                                depth_frames[depth].phase = SqlPhase::ConnectByClause;
+                                idx = next_idx;
+                            }
                         }
                         expect_table = false;
                     }
                     "START" => {
-                        if peek_word_upper(tokens, idx + 1) == Some("WITH") {
-                            depth_frames[depth].phase = SqlPhase::StartWithClause;
-                            idx += 1;
+                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
+                            if next_keyword == "WITH" {
+                                depth_frames[depth].phase = SqlPhase::StartWithClause;
+                                idx = next_idx;
+                            }
                         }
                         expect_table = false;
                     }
@@ -1075,23 +1083,16 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
 }
 
 /// Peek at the next word token (skipping comments) and return its uppercase form.
-fn peek_word_upper(tokens: &[SqlToken], idx: usize) -> Option<&'static str> {
-    let mut i = idx;
-    while i < tokens.len() {
-        match &tokens[i] {
+fn next_word_upper(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
+    let mut current_idx = idx;
+    while current_idx < tokens.len() {
+        match &tokens[current_idx] {
             SqlToken::Comment(_) => {
-                i += 1;
+                current_idx += 1;
                 continue;
             }
-            SqlToken::Word(w) => {
-                let upper = w.to_ascii_uppercase();
-                // Return a static str by matching known keywords
-                return match upper.as_str() {
-                    "BY" => Some("BY"),
-                    "WITH" => Some("WITH"),
-                    "AS" => Some("AS"),
-                    _ => None,
-                };
+            SqlToken::Word(word) => {
+                return Some((word.to_ascii_uppercase(), current_idx));
             }
             _ => return None,
         }
