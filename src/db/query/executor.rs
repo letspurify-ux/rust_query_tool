@@ -1633,6 +1633,21 @@ impl QueryExecutor {
                             }
                             continue;
                         }
+                        LexMode::BacktickQuote => {
+                            self.record_char(index, c);
+                            if c == '`' {
+                                if next == Some('`') {
+                                    if let Some((next_idx, next_char)) =
+                                        Self::consume_next_char(&mut iter, start)
+                                    {
+                                        self.record_char(next_idx, next_char);
+                                    }
+                                } else {
+                                    self.state.lex_mode = LexMode::Idle;
+                                }
+                            }
+                            continue;
+                        }
                         LexMode::DollarQuote { .. } => {
                             // Dollar-quoted strings not used in span collector
                             self.record_char(index, c);
@@ -1731,6 +1746,13 @@ impl QueryExecutor {
                     if c == '"' {
                         self.flush_token();
                         self.state.lex_mode = LexMode::DoubleQuote;
+                        self.record_char(index, c);
+                        continue;
+                    }
+
+                    if c == '`' {
+                        self.flush_token();
+                        self.state.lex_mode = LexMode::BacktickQuote;
                         self.record_char(index, c);
                         continue;
                     }
