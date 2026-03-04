@@ -229,10 +229,10 @@ impl QueryExecutor {
             // leaves block_stack stale for the next line's depth calculation,
             // causing incorrect indentation for ELSE/WHEN that follow.
             {
-                use crate::sql_parser_engine::{BlockKind, PendingEnd};
+                use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+                    && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -259,7 +259,7 @@ impl QueryExecutor {
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
-                    && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+                    && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 }

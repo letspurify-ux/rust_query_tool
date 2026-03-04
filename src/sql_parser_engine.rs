@@ -46,6 +46,8 @@ pub(crate) enum BlockKind {
     Loop,
     /// WHILE ... DO ... END WHILE  (MySQL-style)
     While,
+    /// FOR ... DO ... END FOR (MySQL-style)
+    For,
     /// REPEAT ... END REPEAT
     Repeat,
     /// COMPOUND (TRIGGER body outer block)
@@ -111,6 +113,7 @@ pub(crate) struct SplitState {
 
     // -- WHILE ... DO state --
     pub(crate) pending_while_do: bool,
+    pub(crate) pending_for_do: bool,
 
     // -- Token accumulator --
     pub(crate) token: String,
@@ -207,6 +210,7 @@ impl SplitState {
         let is_end_loop = was_pending_end && upper == "LOOP";
         let is_end_while = was_pending_end && upper == "WHILE";
         let is_end_repeat = was_pending_end && upper == "REPEAT";
+        let is_end_for = was_pending_end && upper == "FOR";
 
         self.handle_if_state_on_token(upper);
         self.handle_pending_end_on_token(upper);
@@ -217,6 +221,7 @@ impl SplitState {
             is_end_loop,
             is_end_while,
             is_end_repeat,
+            is_end_for,
         );
 
         // Return the uppercase buffer so its capacity is reused.
@@ -289,6 +294,9 @@ impl SplitState {
             "REPEAT" => {
                 self.pop_block_of_kind(BlockKind::Repeat);
             }
+            "FOR" => {
+                self.pop_block_of_kind(BlockKind::For);
+            }
             "BEFORE" | "AFTER" | "INSTEAD" if self.in_compound_trigger => {
                 self.pop_block_of_kind(BlockKind::TimingPoint);
             }
@@ -309,6 +317,7 @@ impl SplitState {
         is_end_loop: bool,
         is_end_while: bool,
         is_end_repeat: bool,
+        is_end_for: bool,
     ) {
         // CASE (opening, not END CASE)
         if upper == "CASE" && !is_end_case {
@@ -335,6 +344,7 @@ impl SplitState {
         if upper == "LOOP" && !is_end_loop {
             self.block_stack.push(BlockKind::Loop);
             self.pending_while_do = false;
+            self.pending_for_do = false;
         }
 
         // REPEAT (opening, not END REPEAT)
@@ -348,6 +358,13 @@ impl SplitState {
         } else if self.pending_while_do && upper == "DO" {
             self.block_stack.push(BlockKind::While);
             self.pending_while_do = false;
+        }
+
+        if upper == "FOR" && self.pending_end == PendingEnd::None && !is_end_for {
+            self.pending_for_do = true;
+        } else if self.pending_for_do && upper == "DO" {
+            self.block_stack.push(BlockKind::For);
+            self.pending_for_do = false;
         }
 
         // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD – not a real block
@@ -488,6 +505,7 @@ impl SplitState {
         self.after_type = false;
         self.is_type_create = false;
         self.pending_while_do = false;
+        self.pending_for_do = false;
         self.if_state = IfState::None;
     }
 
