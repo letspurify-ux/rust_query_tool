@@ -1124,3 +1124,19 @@
 ### [검증]
 - `cargo test -q recovers_to_` 통과
 - `cargo test -q` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강 (`LOCK TABLE`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `LOCK TABLE`을 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**: `WITH FUNCTION ... END; LOCK TABLE ...;` 형태에서 `LOCK TABLE`이 새 top-level 문장으로 분리되지 않고 `WITH FUNCTION` 선언 블록에 붙어 하나의 문장으로 합쳐졌습니다.
+- **원인**: `WITH FUNCTION/PROCEDURE` 선언 모드 복구에 사용하는 문장 시작 키워드 집합(`is_statement_head_keyword`)에 `LOCK`이 누락되어 있었습니다.
+- **수정**: `src/sql_text.rs`의 `is_statement_head_keyword`에 `LOCK`을 추가해, `WITH FUNCTION/PROCEDURE` 대기 상태에서 `LOCK TABLE`을 만나면 즉시 새 문장으로 복구 분리되도록 수정했습니다.
+- **효과**: Oracle 잠금 구문(`LOCK TABLE ...`)이 후속 문장과 정상 분리되어 실행 단위 오염을 방지합니다.
+
+### [테스트] 회귀 케이스 추가
+- `test_split_script_items_oracle_with_function_recovers_to_lock_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_lock_statement_head`
+
+### [검증]
+- `cargo test recovers_to_lock_statement_head -- --nocapture` 통과
+- `cargo test` 전체 통과
