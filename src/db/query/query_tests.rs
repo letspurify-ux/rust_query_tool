@@ -6760,3 +6760,32 @@ fn test_split_script_items_oracle_parenthesized_with_function_cte_splits_normall
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_simple_trigger_with_compound_identifier_splits_normally() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_compound_name
+BEFORE INSERT ON t
+FOR EACH ROW
+DECLARE
+  v_compound NUMBER := 1;
+BEGIN
+  IF v_compound = 1 THEN
+    NULL;
+  END IF;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger that mentions COMPOUND-like identifier must split after END; got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TRIGGER trg_compound_name"),
+        "first statement should preserve trigger body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
