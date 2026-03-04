@@ -136,6 +136,44 @@ fn test_connect_by_prior_keywords_are_highlighted() {
 }
 
 #[test]
+fn test_connect_with_comment_then_by_is_not_sqlplus_connect() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT level FROM dual CONNECT /*comment*/ BY level <= 2";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CONNECT", "BY"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
+}
+
+#[test]
+fn test_parse_connect_continuation_detects_by_with_comment() {
+    let bytes = b"CONNECT /*+ hint */ BY PRIOR id = parent_id";
+    let connect_end = "CONNECT".len();
+    assert_eq!(
+        parse_connect_continuation(bytes, connect_end),
+        ConnectContinuation::ByClause
+    );
+}
+
+#[test]
+fn test_parse_connect_continuation_detects_sqlplus_connect_line() {
+    let bytes = b"CONNECT system/password@db";
+    let connect_end = "CONNECT".len();
+    assert_eq!(
+        parse_connect_continuation(bytes, connect_end),
+        ConnectContinuation::Other
+    );
+}
+
+#[test]
 fn test_prompt_keyword_with_large_start_is_safe() {
     assert!(!is_prompt_keyword(b"PROMPT", usize::MAX));
 }
