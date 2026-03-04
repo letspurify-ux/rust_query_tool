@@ -158,12 +158,8 @@ impl Default for IfState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingDo {
     None,
-    While {
-        armed_at_block_depth: usize,
-    },
-    For {
-        armed_at_block_depth: usize,
-    },
+    While { armed_at_block_depth: usize },
+    For { armed_at_block_depth: usize },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -272,6 +268,27 @@ enum AsIsBlockStart {
     None,
     Regular,
     TimingPoint,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SemicolonAction {
+    AppendToCurrent,
+    SplitTopLevel,
+    SplitForcedRoutine,
+}
+
+impl SemicolonAction {
+    fn from_state(state: &SplitState) -> Self {
+        if state.block_depth() == 0 && !state.in_with_plsql_declaration() {
+            return Self::SplitTopLevel;
+        }
+
+        if state.should_split_on_semicolon() {
+            return Self::SplitForcedRoutine;
+        }
+
+        Self::AppendToCurrent
+    }
 }
 
 impl AsIsBlockStart {
@@ -1005,6 +1022,25 @@ impl SqlParserEngine {
         self.current.clear();
     }
 
+    fn apply_semicolon_action(&mut self, action: SemicolonAction, semicolon: char) {
+        match action {
+            SemicolonAction::AppendToCurrent => {
+                self.current.push(semicolon);
+            }
+            SemicolonAction::SplitTopLevel => {
+                self.push_current_statement();
+                self.reset_statement_local_state();
+                self.state.reset_create_state();
+            }
+            SemicolonAction::SplitForcedRoutine => {
+                self.push_current_statement();
+                self.reset_statement_local_state();
+                self.state.reset_create_state();
+                self.state.block_stack.clear();
+            }
+        }
+    }
+
     pub(crate) fn starts_with_alter_session(&self) -> bool {
         let mut remaining = self.current.as_str();
 
@@ -1338,18 +1374,8 @@ impl SqlParserEngine {
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
-                if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration() {
-                    self.push_current_statement();
-                    self.reset_statement_local_state();
-                    self.state.reset_create_state();
-                } else if self.state.should_split_on_semicolon() {
-                    self.push_current_statement();
-                    self.reset_statement_local_state();
-                    self.state.reset_create_state();
-                    self.state.block_stack.clear();
-                } else {
-                    self.current.push(c);
-                }
+                let semicolon_action = SemicolonAction::from_state(&self.state);
+                self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
                 continue;
             }
@@ -1410,9 +1436,42 @@ impl SqlParserEngine {
 mod tests {
     use super::{
         BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SemicolonPolicy, SplitState, SqlParserEngine,
-        TimingPointState, TriggerKind, WithClauseState,
+        PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SplitState,
+        SqlParserEngine, TimingPointState, TriggerKind, WithClauseState,
     };
+
+    #[test]
+    fn semicolon_action_classifies_top_level_split() {
+        let state = SplitState::default();
+        assert_eq!(
+            SemicolonAction::from_state(&state),
+            SemicolonAction::SplitTopLevel
+        );
+    }
+
+    #[test]
+    fn semicolon_action_keeps_with_clause_declaration_statement_open() {
+        let mut state = SplitState::default();
+        state.with_clause_state = WithClauseState::InPlsqlDeclaration;
+        assert_eq!(
+            SemicolonAction::from_state(&state),
+            SemicolonAction::AppendToCurrent
+        );
+    }
+
+    #[test]
+    fn semicolon_action_detects_forced_routine_split() {
+        let mut state = SplitState::default();
+        state.block_stack.push(BlockKind::AsIs);
+        state.routine_is_stack.push(RoutineFrame {
+            block_depth: 1,
+            semicolon_policy: SemicolonPolicy::ForceSplit,
+        });
+        assert_eq!(
+            SemicolonAction::from_state(&state),
+            SemicolonAction::SplitForcedRoutine
+        );
+    }
 
     #[test]
     fn create_state_transitions_to_plsql_on_create_or_replace_function() {
