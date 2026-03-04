@@ -168,7 +168,9 @@ enum SemicolonPolicy {
 enum ExternalClauseState {
     None,
     SawExternalKeyword,
-    AwaitingLanguageTarget,
+    AwaitingLanguageTargetFromExternal,
+    AwaitingLanguageTargetImplicit,
+    SawImplicitLanguageTarget,
     Confirmed,
 }
 
@@ -201,10 +203,20 @@ impl RoutineFrame {
     }
 
     fn observe_external_clause_token(&mut self, token_upper: &str) {
-        if self.external_clause_state == ExternalClauseState::AwaitingLanguageTarget {
+        if matches!(
+            self.external_clause_state,
+            ExternalClauseState::AwaitingLanguageTargetFromExternal
+                | ExternalClauseState::AwaitingLanguageTargetImplicit
+        ) {
+            let from_external = self.external_clause_state
+                == ExternalClauseState::AwaitingLanguageTargetFromExternal;
             self.external_clause_state = ExternalClauseState::None;
             if is_external_language_target(token_upper) {
-                self.mark_external_clause();
+                if from_external {
+                    self.mark_external_clause();
+                } else {
+                    self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+                }
                 return;
             }
         }
@@ -214,18 +226,29 @@ impl RoutineFrame {
                 self.external_clause_state = ExternalClauseState::SawExternalKeyword;
             }
             "LANGUAGE" => {
-                self.external_clause_state = ExternalClauseState::AwaitingLanguageTarget;
+                self.external_clause_state =
+                    if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
+                        ExternalClauseState::AwaitingLanguageTargetFromExternal
+                    } else {
+                        ExternalClauseState::AwaitingLanguageTargetImplicit
+                    };
             }
-            "NAME" | "LIBRARY" => {
+            "NAME" | "LIBRARY" | "PARAMETERS" => {
                 if matches!(
                     self.external_clause_state,
-                    ExternalClauseState::SawExternalKeyword | ExternalClauseState::Confirmed
+                    ExternalClauseState::SawExternalKeyword
+                        | ExternalClauseState::SawImplicitLanguageTarget
+                        | ExternalClauseState::Confirmed
                 ) {
                     self.mark_external_clause();
                 }
             }
             _ => {
                 if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
+                    self.external_clause_state = ExternalClauseState::None;
+                } else if self.external_clause_state
+                    == ExternalClauseState::SawImplicitLanguageTarget
+                {
                     self.external_clause_state = ExternalClauseState::None;
                 }
             }
@@ -2237,11 +2260,17 @@ mod tests {
 
         state.handle_block_openers("COMPOUND", EndTokenRole::None);
         assert!(!state.block_stack.contains(&BlockKind::Compound));
-        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Trigger(TriggerKind::Simple));
+        assert_eq!(
+            state.create_plsql_kind,
+            CreatePlsqlKind::Trigger(TriggerKind::Simple)
+        );
 
         state.handle_block_openers("IS", EndTokenRole::None);
         assert!(!state.block_stack.contains(&BlockKind::Compound));
-        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Trigger(TriggerKind::Simple));
+        assert_eq!(
+            state.create_plsql_kind,
+            CreatePlsqlKind::Trigger(TriggerKind::Simple)
+        );
     }
 
     #[test]
@@ -2306,6 +2335,35 @@ mod tests {
         assert!(statements[0].contains("library NUMBER := 3;"));
         assert!(statements[0].contains("END"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_parameters_without_external_keyword_still_marks_external_routine_split()
+    {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_params RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C PARAMETERS (CONTEXT) ;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C PARAMETERS (CONTEXT)"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_without_external_name_or_parameters_does_not_force_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(statements[0].contains("SELECT 1 FROM dual"));
     }
 
     #[test]
