@@ -1234,7 +1234,7 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
         if !is_identifier_word_token(word) {
             return (None, start);
         }
-        if is_quoted || !is_alias_breaker(&upper) {
+        if is_quoted || !is_relation_alias_breaker(&upper) {
             return (Some(strip_identifier_quotes(word)), start + 1);
         }
     }
@@ -1302,7 +1302,7 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
             if !is_identifier_word_token(word) {
                 return None;
             }
-            if is_quoted || (!is_alias_breaker(&upper) && !is_join_keyword(&upper)) {
+            if is_quoted || !is_relation_alias_breaker(&upper) {
                 let next_idx = consume_optional_alias_column_list(tokens, idx + 1);
                 return Some((strip_identifier_quotes(word), next_idx));
             }
@@ -1359,7 +1359,12 @@ fn is_table_stop_keyword(word: &str) -> bool {
     )
 }
 
-fn is_alias_breaker(word: &str) -> bool {
+/// Keywords that must not be interpreted as relation aliases.
+///
+/// This is intentionally broader than `is_table_stop_keyword` and also includes
+/// join modifiers such as `LATERAL` so table/subquery alias parsing follows the
+/// same boundary rules.
+fn is_relation_alias_breaker(word: &str) -> bool {
     matches!(
         word,
         "ON" | "JOIN"
@@ -1370,6 +1375,7 @@ fn is_alias_breaker(word: &str) -> bool {
             | "CROSS"
             | "OUTER"
             | "NATURAL"
+            | "LATERAL"
             | "APPLY"
             | "WHERE"
             | "GROUP"

@@ -1080,6 +1080,33 @@ fn lateral_subquery_can_see_outer_table_scope() {
     assert!(names.contains(&"T2".to_string()), "tables: {:?}", names);
 }
 
+
+#[test]
+fn lateral_keyword_is_not_parsed_as_left_table_alias() {
+    let ctx = analyze("SELECT * FROM t1 LATERAL (SELECT * FROM t2) l WHERE l.|");
+    let aliases: Vec<&str> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_deref())
+        .collect();
+
+    assert!(
+        aliases.iter().all(|alias| !alias.eq_ignore_ascii_case("LATERAL")),
+        "LATERAL must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("l")),
+        "lateral subquery alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn cross_apply_subquery_can_see_outer_table_scope() {
     let ctx = analyze("SELECT * FROM oqt_t_emp jt CROSS APPLY (SELECT jt.| FROM dual) it");
