@@ -163,6 +163,38 @@ pub(crate) enum PendingDo {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CreateParseState {
+    None,
+    SeenCreate,
+    SeenCreateOr,
+}
+
+impl Default for CreateParseState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl CreateParseState {
+    fn arm_on_keyword(self, upper: &str) -> Self {
+        match (self, upper) {
+            (Self::None, "CREATE") => Self::SeenCreate,
+            (Self::SeenCreate, "OR") => Self::SeenCreateOr,
+            (Self::SeenCreate | Self::SeenCreateOr, "NO" | "FORCE" | "REPLACE") => self,
+            (
+                Self::SeenCreate | Self::SeenCreateOr,
+                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING",
+            ) => self,
+            _ => Self::None,
+        }
+    }
+
+    fn can_accept_object_keyword(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct RoutineFrame {
     block_depth: usize,
     split_on_semicolon: bool,
@@ -250,8 +282,7 @@ pub(crate) struct SplitState {
 
     // -- CREATE PL/SQL tracking --
     pub(crate) in_create_plsql: bool,
-    pub(crate) create_pending: bool,
-    create_or_seen: bool,
+    create_state: CreateParseState,
     pub(crate) after_declare: bool,
     after_as_is: bool,
     nested_subprogram: bool,
@@ -631,8 +662,7 @@ impl SplitState {
 
     pub(crate) fn reset_create_state(&mut self) {
         self.in_create_plsql = false;
-        self.create_pending = false;
-        self.create_or_seen = false;
+        self.create_state = CreateParseState::None;
         self.after_as_is = false;
         self.nested_subprogram = false;
         self.pending_subprogram_begins = 0;
@@ -675,39 +705,19 @@ impl SplitState {
             return;
         }
 
-        if self.create_pending {
-            match upper {
-                "OR" => {
-                    self.create_or_seen = true;
-                    return;
-                }
-                "NO" | "FORCE" | "REPLACE" => {
-                    return;
-                }
-                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" => {
-                    return;
-                }
-                "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER" => {
-                    self.in_create_plsql = true;
-                    self.is_package = upper == "PACKAGE";
-                    self.is_trigger = upper == "TRIGGER";
-                    self.is_type_create = upper == "TYPE";
-                    self.after_type = upper == "TYPE";
-                    self.create_pending = false;
-                    self.create_or_seen = false;
-                    return;
-                }
-                _ => {
-                    self.create_pending = false;
-                    self.create_or_seen = false;
-                }
-            }
+        if self.create_state.can_accept_object_keyword()
+            && matches!(upper, "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER")
+        {
+            self.in_create_plsql = true;
+            self.is_package = upper == "PACKAGE";
+            self.is_trigger = upper == "TRIGGER";
+            self.is_type_create = upper == "TYPE";
+            self.after_type = upper == "TYPE";
+            self.create_state = CreateParseState::None;
+            return;
         }
 
-        if upper == "CREATE" {
-            self.create_pending = true;
-            self.create_or_seen = false;
-        }
+        self.create_state = std::mem::take(&mut self.create_state).arm_on_keyword(upper);
     }
 
     fn track_top_level_with_plsql(&mut self, upper: &str) {
@@ -1383,6 +1393,31 @@ mod tests {
         state.handle_block_openers("DO", EndTokenRole::None);
         assert_eq!(state.block_stack.last(), Some(&BlockKind::For));
         assert_eq!(state.pending_do, PendingDo::None);
+    }
+
+    #[test]
+    fn create_state_tracks_create_or_replace_sequence() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        state.track_create_plsql("OR");
+        state.track_create_plsql("REPLACE");
+        state.track_create_plsql("FUNCTION");
+
+        assert!(state.in_create_plsql);
+        assert!(!state.is_package);
+        assert!(!state.is_trigger);
+    }
+
+    #[test]
+    fn create_state_resets_when_non_object_keyword_interrupts_sequence() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        state.track_create_plsql("TEMP");
+        state.track_create_plsql("FUNCTION");
+
+        assert!(!state.in_create_plsql);
     }
 
     #[test]
