@@ -3014,7 +3014,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        if load_mutex_bool(&self.query_running) {
+        if !try_mark_query_running(&self.query_running) {
             let _ = self
                 .ui_action_sender
                 .send(UiActionResult::QueryAlreadyRunning);
@@ -3061,8 +3061,6 @@ impl SqlEditorWidget {
 
         // Reset cancel flag before starting new execution
         store_mutex_bool(&cancel_flag, false);
-
-        store_mutex_bool(&query_running, true);
 
         set_cursor(Cursor::Wait);
         app::flush();
