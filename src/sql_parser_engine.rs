@@ -381,8 +381,13 @@ impl SplitState {
             self.pending_for_do = false;
         }
 
-        // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD – not a real block
-        if self.after_as_is && matches!(upper, "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD") {
+        // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE – not a real block
+        if self.after_as_is
+            && matches!(
+                upper,
+                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE"
+            )
+        {
             self.block_stack.pop(); // undo the AS/IS push
             self.after_as_is = false;
         }
