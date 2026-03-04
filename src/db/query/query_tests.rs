@@ -1075,6 +1075,74 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_type_body_nested_external_member_function_followed_by_select_splits() {
+    let sql = r#"CREATE OR REPLACE TYPE BODY oqt_obj AS
+  MEMBER FUNCTION ext_fn RETURN NUMBER
+  AS EXTERNAL
+  NAME 'ExtFn'
+  LANGUAGE C;
+END oqt_obj;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "TYPE BODY with EXTERNAL member function should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE BODY oqt_obj AS"),
+        "first statement should keep full TYPE BODY: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("MEMBER FUNCTION ext_fn RETURN NUMBER"),
+        "TYPE BODY should include external member function: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 1 FROM dual"),
+        "trailing SELECT should remain separate statement"
+    );
+}
+
+#[test]
+fn test_type_body_nested_external_member_procedure_followed_by_select_splits() {
+    let sql = r#"CREATE OR REPLACE TYPE BODY oqt_obj AS
+  MEMBER PROCEDURE ext_proc (p_id NUMBER)
+  AS EXTERNAL
+  NAME 'ExtProc'
+  LANGUAGE C;
+END oqt_obj;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "TYPE BODY with EXTERNAL member procedure should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE BODY oqt_obj AS"),
+        "first statement should keep full TYPE BODY: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("MEMBER PROCEDURE ext_proc"),
+        "TYPE BODY should include external member procedure: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 1 FROM dual"),
+        "trailing SELECT should remain separate statement"
+    );
+}
+
+#[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS
 BEGIN
@@ -1408,6 +1476,28 @@ SELECT 1 FROM dual;"#;
     assert!(
         stmts[0].contains("create_flag NUMBER"),
         "TYPE OBJECT statement should preserve CREATE_* attribute line: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_type_enum_splits_before_next_statement() {
+    let sql = r#"CREATE OR REPLACE TYPE color_t AS ENUM ('RED', 'GREEN');
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE TYPE ... AS ENUM should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("AS ENUM ('RED', 'GREEN')"),
+        "first statement should preserve ENUM declaration: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
@@ -6998,6 +7088,36 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_savepoint_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+SAVEPOINT before_batch;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH FUNCTION declaration mode when SAVEPOINT starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SAVEPOINT before_batch"),
+        "second statement should start at SAVEPOINT after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_and_cte_keeps_single_statement() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
@@ -7313,6 +7433,32 @@ SELECT 2 FROM dual;"#;
     assert!(
         stmts[0].starts_with("CREATE OR REPLACE TRIGGER trg_compound_name"),
         "first statement should preserve trigger body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_simple_trigger_when_clause_compound_identifier_splits_normally() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_compound_when
+BEFORE INSERT ON t
+FOR EACH ROW
+WHEN (NEW.COMPOUND IS NULL)
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger WHEN clause identifier COMPOUND must not be parsed as COMPOUND TRIGGER: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TRIGGER trg_compound_when"),
+        "first statement should preserve simple trigger body: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));

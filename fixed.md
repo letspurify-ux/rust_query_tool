@@ -1,5 +1,54 @@
 # 예외 처리 보완 내역
 
+## 2026-03-05 Oracle 공통 파서 엔진 누락 문법 보완 (`SIMPLE TRIGGER WHEN (NEW.COMPOUND ...)`)
+
+### [중] SIMPLE TRIGGER `WHEN` 절 식별자 `COMPOUND`를 `COMPOUND TRIGGER`로 오인식하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE TRIGGER ... WHEN (NEW.COMPOUND IS NULL) ... END; SELECT ...;` 형태에서
+  - `COMPOUND` 식별자가 compound trigger 시작으로 오인식되어 `END;` 이후 statement split이 일어나지 않고 뒤 `SELECT`가 병합될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `handle_block_openers`가
+  - trigger 헤더(`block_depth == 0`)에서 `COMPOUND` 토큰 단독으로 compound trigger 진입을 확정했습니다.
+  - 즉, 실제 문법인 `COMPOUND TRIGGER` 키워드 쌍 검증 없이 `BlockKind::Compound`를 push했습니다.
+- **수정**:
+  - `SplitState`에 `saw_compound_keyword` 상태를 추가해 `COMPOUND` 단독 감지를 임시 상태로만 저장했습니다.
+  - 다음 토큰이 `TRIGGER`일 때만 compound trigger로 확정(`mark_compound_trigger` + `BlockKind::Compound` push)하도록 변경했습니다.
+  - `TRIGGER`가 아닌 토큰이 오면 후보 상태를 즉시 해제하고, `reset_create_state`에서도 상태를 정리하도록 반영했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_simple_trigger_when_clause_compound_identifier_splits_normally`
+- `compound_trigger_requires_compound_trigger_keyword_pair`
+- `compound_trigger_header_still_splits_after_end`
+
+### [검증]
+- `cargo test test_split_script_items_simple_trigger_when_clause_compound_identifier_splits_normally -- --nocapture`
+- `cargo test compound_trigger_requires_compound_trigger_keyword_pair -- --nocapture`
+- `cargo test compound_trigger_header_still_splits_after_end -- --nocapture`
+- `cargo test` 전체 통과
+
+## 2026-03-05 인텔리센스 누락 구문 보완 (`JOIN ... USING (...)`)
+
+### [중] `JOIN ... USING (...)`에서 인텔리센스가 컬럼 컨텍스트를 잃던 문제 수정
+- **증상**:
+  - `SELECT * FROM employees e JOIN departments d USING (|)` 위치에서
+  - 문맥이 `JoinCondition`이 아닌 `Initial`로 계산되어 컬럼 추천이 비정상 동작할 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `USING` 분기가 `MERGE ... USING`과 `JOIN ... USING`을 동일하게 처리했습니다.
+  - `JOIN ... USING`에서도 `FromClause + expect_table`로 전이되어, 괄호 내부를 조인 조건이 아닌 일반 구간으로 해석했습니다.
+- **수정**:
+  - `USING` 처리 로직을 분리했습니다.
+  - `MergeTarget/IntoClause`에서의 `USING`은 기존대로 `FromClause`(테이블 컨텍스트) 유지.
+  - `FromClause`에서의 `USING`은 `JoinCondition`(컬럼 컨텍스트)으로 전이하도록 변경.
+
+### [테스트] 회귀 테스트 추가
+- `phase_join_using_clause` (`src/ui/intellisense_context/tests.rs`)
+- `detect_sql_context_join_using_clause_is_column_name` (`src/ui/intellisense.rs`)
+
+### [검증]
+- `cargo test phase_join_using_clause -- --nocapture` (수정 전 실패 확인)
+- `cargo test join_using_clause -- --nocapture`
+- `cargo test`
+
 ## 2026-03-04 Oracle 공통 파서 엔진 누락 문법 보완 (`MATCH_RECOGNIZE inline DEFINE` / `CREATE TYPE OBJECT` 속성명)
 
 ### [중] `MATCH_RECOGNIZE (...)` 내부 `DEFINE b AS ...`가 SQL*Plus `DEFINE` 명령으로 오인식되던 문제 수정
@@ -62,6 +111,26 @@
 - `cargo test test_package_body_nested_external_procedure_followed_by_select_splits -- --nocapture`
 - `cargo test nested_external_routine -- --nocapture`
 - `cargo test close_external_routine_semicolon_only_closes_nested_routine_block -- --nocapture`
+- `cargo test`
+
+## 2026-03-05 Oracle 공통 파서 엔진 보강 (`TYPE BODY MEMBER PROCEDURE EXTERNAL`)
+
+### [중] `TYPE BODY` 내부 `MEMBER PROCEDURE ... EXTERNAL` 구문 미검증 항목 보강
+- **증상**:
+  - 기존 회귀 테스트는 `TYPE BODY`의 `MEMBER FUNCTION` 및 일부 `EXTERNAL` 케이스를 검증했지만,
+  - `MEMBER PROCEDURE ... EXTERNAL` 조합은 별도 테스트가 없어 분할 동작 미검증 상태였습니다.
+- **원인/판단**:
+  - 파서 상태 머신은 `EXTERNAL` 처리 자체를 공유 경로로 처리하므로,
+  - 현재 엔진에서는 별도 코드 수정 없이 동일 동작으로 처리될 것으로 판단했습니다.
+- **수정**:
+  - `src/db/query/query_tests.rs`에 회귀 테스트를 추가해 구문을 명시적으로 커버했습니다.
+    - `test_type_body_nested_external_member_procedure_followed_by_select_splits`
+
+### [테스트] 회귀 테스트 추가
+- `test_type_body_nested_external_member_procedure_followed_by_select_splits`
+
+### [검증]
+- `cargo test test_type_body_nested_external_member_procedure_followed_by_select_splits -- --nocapture`
 - `cargo test`
 
 ## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (FROM-소비 함수 미닫힘 복구)
@@ -931,6 +1000,22 @@
 ### [검증]
 - `cargo test` 전체 통과
 
+## 2026-03-04 Oracle 공통 파서 엔진 ENUM 타입 선언 분리 보완
+
+### [중] `CREATE TYPE ... AS ENUM` 구문이 후속 문장과 합쳐지던 분리 오류 수정
+- **증상**: `CREATE OR REPLACE TYPE color_t AS ENUM (...); SELECT ...;` 형태에서 `AS ENUM` 선언을 블록으로 오인식해, trailing `SELECT`가 같은 문장으로 합쳐졌습니다.
+- **원인**: `TYPE AS/IS` 후속 declarative kind 판별 목록에 `ENUM` 키워드가 없어 `AS/IS`로 열린 내부 상태를 해제하지 못했습니다.
+- **수정**: `src/sql_parser_engine.rs`의 type declarative kind 매칭 목록에 `ENUM`을 추가해 `AS/IS` 임시 블록을 즉시 해제하도록 보완했습니다.
+- **효과**: Oracle 23c `CREATE TYPE ... AS ENUM (...)` 선언이 세미콜론에서 정상 종료되고, 다음 top-level 문장이 정확히 분리됩니다.
+
+### [테스트] 회귀 케이스 추가
+- `sql_parser_engine::tests::type_enum_declaration_splits_at_semicolon`
+- `db::query::query_tests::test_create_type_enum_splits_before_next_statement`
+
+### [검증]
+- `cargo test type_enum -- --nocapture` 통과
+- `cargo test` 전체 통과
+
 ## 2026-02-26 결과 테이블 편집 이벤트 경계 보강
 
 ### [중] 스트리밍(쿼리 실행/취소/실패 전환 구간) 중 편집 액션이 상태를 변경할 수 있던 경로 차단
@@ -1024,3 +1109,18 @@
 
 ### [검증]
 - `cargo test` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `SAVEPOINT`를 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**: `WITH FUNCTION ... END; SAVEPOINT ...;` 형태에서 `SAVEPOINT`가 새 top-level 문장으로 분리되지 않고, `WITH FUNCTION` 선언 문장에 계속 붙어 하나의 문장으로 합쳐졌습니다.
+- **원인**: `WITH FUNCTION/PROCEDURE` 선언 모드 복구에 사용하는 문장 시작 키워드 집합(`is_statement_head_keyword`)에 `SAVEPOINT`가 누락되어 있었습니다.
+- **수정**: `src/sql_text.rs`의 `is_statement_head_keyword`에 `SAVEPOINT`를 추가해, `WITH FUNCTION/PROCEDURE` 대기 상태에서 `SAVEPOINT`를 만나면 즉시 새 문장으로 복구 분리되도록 수정했습니다.
+- **효과**: 비정상 `WITH FUNCTION/PROCEDURE` 이후 이어지는 트랜잭션 제어 문장이 정확히 분리되어 후속 파싱/실행 오염을 방지합니다.
+
+### [테스트] 회귀 케이스 추가
+- `test_split_script_items_oracle_with_function_recovers_to_savepoint_statement_head`
+
+### [검증]
+- `cargo test -q recovers_to_` 통과
+- `cargo test -q` 전체 통과

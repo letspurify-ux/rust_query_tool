@@ -112,6 +112,17 @@ fn phase_join_on_clause() {
 }
 
 #[test]
+fn phase_join_using_clause() {
+    let ctx = analyze("SELECT * FROM employees e JOIN departments d USING (|)");
+    assert_eq!(ctx.phase, SqlPhase::JoinCondition);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DEPARTMENTS".to_string()), "tables: {:?}", names);
+}
+
+#[test]
 fn phase_group_by() {
     let ctx = analyze("SELECT a FROM t GROUP BY |");
     assert_eq!(ctx.phase, SqlPhase::GroupByClause);

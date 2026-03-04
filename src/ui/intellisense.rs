@@ -1909,6 +1909,20 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn detect_sql_context_join_using_clause_is_column_name() {
+        let sql_with_cursor = "SELECT * FROM employees e JOIN departments d USING (|)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
     fn detect_sql_context_pivot_sum_argument_is_column_name() {
         let sql_with_cursor = "WITH s AS (SELECT DEPTNO, job, sal FROM oqt_t_emp) SELECT * FROM s PIVOT (SUM(|) AS sum_sal FOR DEPTNO IN (10 AS D10))";
         let cursor = sql_with_cursor

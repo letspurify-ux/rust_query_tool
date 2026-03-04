@@ -452,6 +452,7 @@ pub(crate) struct SplitState {
     pub(crate) pending_subprogram_begins: usize,
     routine_is_stack: Vec<RoutineFrame>,
     timing_point_state: TimingPointState,
+    saw_compound_keyword: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
@@ -701,6 +702,10 @@ impl SplitState {
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
     fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
+        if self.saw_compound_keyword && upper != "TRIGGER" {
+            self.saw_compound_keyword = false;
+        }
+
         // CASE (opening, not END CASE)
         if upper == "CASE" && !end_token_role.is_suffix(PendingEndSuffix::Case) {
             self.block_stack.push(BlockKind::Case);
@@ -764,11 +769,11 @@ impl SplitState {
             self.pending_do = PendingDo::None;
         }
 
-        // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE – not a real block
+        // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE/ENUM – not a real block
         if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind
             && matches!(
                 upper,
-                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE" | "VARYING"
+                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE" | "VARYING" | "ENUM"
             )
         {
             self.block_stack.pop(); // undo the AS/IS push
@@ -830,8 +835,15 @@ impl SplitState {
         } else if upper == "END" {
             self.pending_end = PendingEnd::End;
         } else if upper == "COMPOUND" && self.is_trigger() && self.block_depth() == 0 {
+            self.saw_compound_keyword = true;
+        } else if upper == "TRIGGER"
+            && self.saw_compound_keyword
+            && self.is_trigger()
+            && self.block_depth() == 0
+        {
             self.mark_compound_trigger();
             self.block_stack.push(BlockKind::Compound);
+            self.saw_compound_keyword = false;
         } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
             && self.in_compound_trigger()
             && !end_token_role.is_suffix(PendingEndSuffix::TimingPoint)
@@ -929,6 +941,7 @@ impl SplitState {
         self.pending_subprogram_begins = 0;
         self.routine_is_stack.clear();
         self.timing_point_state = TimingPointState::None;
+        self.saw_compound_keyword = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
@@ -2159,6 +2172,46 @@ mod tests {
     }
 
     #[test]
+    fn compound_trigger_requires_compound_trigger_keyword_pair() {
+        let mut state = SplitState {
+            create_plsql_kind: CreatePlsqlKind::Trigger(TriggerKind::Simple),
+            ..SplitState::default()
+        };
+
+        state.handle_block_openers("COMPOUND", EndTokenRole::None);
+        assert!(!state.block_stack.contains(&BlockKind::Compound));
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Trigger(TriggerKind::Simple));
+
+        state.handle_block_openers("IS", EndTokenRole::None);
+        assert!(!state.block_stack.contains(&BlockKind::Compound));
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Trigger(TriggerKind::Simple));
+    }
+
+    #[test]
+    fn compound_trigger_header_still_splits_after_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TRIGGER trg_compound"),
+            "first statement should preserve COMPOUND TRIGGER body: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
     fn package_with_nested_external_procedure_does_not_split_mid_statement() {
         let mut engine = SqlParserEngine::new();
 
@@ -2189,6 +2242,22 @@ mod tests {
             vec![
                 "CREATE OR REPLACE TYPE phone_list_t IS VARYING ARRAY(10) OF VARCHAR2(25)"
                     .to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_enum_declaration_splits_at_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE color_t AS ENUM ('RED', 'GREEN');");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE TYPE color_t AS ENUM ('RED', 'GREEN')".to_string(),
                 "SELECT 1 FROM dual".to_string(),
             ]
         );

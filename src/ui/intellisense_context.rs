@@ -767,12 +767,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "USING" => {
-                        if matches!(
-                            current_phase,
-                            SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
-                        ) {
+                        if matches!(current_phase, SqlPhase::MergeTarget | SqlPhase::IntoClause) {
                             depth_frames[depth].phase = SqlPhase::FromClause;
                             relation_state.expect_table();
+                        } else if matches!(current_phase, SqlPhase::FromClause) {
+                            // JOIN ... USING (...) is a join-condition context, not a relation target.
+                            depth_frames[depth].phase = SqlPhase::JoinCondition;
+                            relation_state.clear();
                         }
                     }
                     "JOIN" | "APPLY" => {
