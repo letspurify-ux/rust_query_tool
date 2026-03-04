@@ -4750,6 +4750,48 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_for_do_loop() {
+    let sql = r#"BEGIN
+  FOR i IN 1..3 DO
+    NULL;
+  END FOR;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "FOR DO depth tracking mismatch");
+}
+
+#[test]
+fn test_line_block_depths_with_split_end_for_do() {
+    let sql = r#"BEGIN
+  FOR i IN 1..3 DO
+    NULL;
+  END
+  FOR;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 0];
+    assert_eq!(depths, expected, "split END FOR after FOR DO mismatch");
+}
+
+#[test]
+fn test_line_block_depths_end_for_does_not_arm_new_do_block() {
+    let sql = r#"BEGIN
+  FOR i IN 1..3 DO
+    NULL;
+  END FOR;
+  DO 1;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "END FOR must not set pending FOR-DO state for the next DO"
+    );
+}
+
+
+#[test]
 fn test_line_block_depths_preserve_pending_end_across_blank_line() {
     let sql = r#"BEGIN
   WHILE i < 5 LOOP
