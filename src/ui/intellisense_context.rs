@@ -1219,17 +1219,19 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
 
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
+    let start = skip_comment_tokens(tokens, start);
     if let Some(SqlToken::Word(word)) = tokens.get(start) {
         let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
         let upper = word.to_ascii_uppercase();
         if upper == "AS" {
-            if let Some(SqlToken::Word(alias)) = tokens.get(start + 1) {
+            let alias_idx = skip_comment_tokens(tokens, start + 1);
+            if let Some(SqlToken::Word(alias)) = tokens.get(alias_idx) {
                 if !is_identifier_word_token(alias) {
-                    return (None, start + 2);
+                    return (None, alias_idx + 1);
                 }
-                return (Some(strip_identifier_quotes(alias)), start + 2);
+                return (Some(strip_identifier_quotes(alias)), alias_idx + 1);
             }
-            return (None, start + 1);
+            return (None, alias_idx);
         }
         if !is_identifier_word_token(word) {
             return (None, start);
@@ -1241,21 +1243,21 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
     (None, start)
 }
 
+fn skip_comment_tokens(tokens: &[SqlToken], mut idx: usize) -> usize {
+    while idx < tokens.len() {
+        if let SqlToken::Comment(_) = &tokens[idx] {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    idx
+}
+
 /// Parse an alias after a subquery closing ')'.
 fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
-    fn skip_comments(tokens: &[SqlToken], mut idx: usize) -> usize {
-        while idx < tokens.len() {
-            if let SqlToken::Comment(_) = &tokens[idx] {
-                idx += 1;
-                continue;
-            }
-            break;
-        }
-        idx
-    }
-
     fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
-        let idx = skip_comments(tokens, start);
+        let idx = skip_comment_tokens(tokens, start);
         match tokens.get(idx) {
             Some(SqlToken::Symbol(sym)) if sym == "(" => extract_parenthesized_range(tokens, idx)
                 .map(|(_, next_idx)| next_idx)
@@ -1289,7 +1291,7 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
             if upper == "AS" {
                 idx += 1;
                 // Skip comments after AS
-                idx = skip_comments(tokens, idx);
+                idx = skip_comment_tokens(tokens, idx);
                 if let Some(SqlToken::Word(alias)) = tokens.get(idx) {
                     if !is_identifier_word_token(alias) {
                         return None;

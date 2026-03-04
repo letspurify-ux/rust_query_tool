@@ -373,6 +373,38 @@ fn collect_table_as_alias() {
         .any(|t| t.alias.as_deref() == Some("emp")));
 }
 
+#[test]
+fn collect_table_alias_with_inline_comment_after_table_name() {
+    let ctx = analyze("SELECT e.| FROM employees /* alias marker */ e");
+
+    let employee_scope = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("employees"));
+    assert!(employee_scope.is_some(), "tables: {:?}", ctx.tables_in_scope);
+
+    assert_eq!(
+        employee_scope.and_then(|table| table.alias.as_deref()),
+        Some("e")
+    );
+}
+
+#[test]
+fn collect_subquery_alias_with_comment_after_as_keyword() {
+    let ctx = analyze("SELECT sq.| FROM (SELECT 1 AS id FROM dual) AS /* alias marker */ sq");
+
+    let subquery_scope = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("sq"));
+    assert!(subquery_scope.is_some(), "tables: {:?}", ctx.tables_in_scope);
+
+    assert_eq!(
+        subquery_scope.and_then(|table| table.alias.as_deref()),
+        Some("sq")
+    );
+}
+
 // ─── Subquery alias tests ────────────────────────────────────────────────
 
 #[test]
