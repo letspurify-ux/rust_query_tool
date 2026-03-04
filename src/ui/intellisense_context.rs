@@ -1736,9 +1736,11 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
 fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumns> {
     let pivot_idx = find_top_level_word_index(tokens, "PIVOT")?;
     let mut idx = next_non_comment_index(tokens, pivot_idx.saturating_add(1));
+    let mut is_xml_pivot = false;
 
     if let Some(SqlToken::Word(word)) = tokens.get(idx) {
         if word.eq_ignore_ascii_case("XML") {
+            is_xml_pivot = true;
             idx = next_non_comment_index(tokens, idx.saturating_add(1));
         }
     }
@@ -1754,8 +1756,11 @@ fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumn
 
     let aggregate_columns = parse_pivot_aggregate_columns(&clause_tokens[..for_idx]);
     let for_columns = parse_identifier_segment(&clause_tokens[for_idx + 1..in_idx]);
-    let generated_columns =
-        parse_pivot_generated_columns_from_in_segment(&clause_tokens[in_idx + 1..]);
+    let generated_columns = if is_xml_pivot {
+        Vec::new()
+    } else {
+        parse_pivot_generated_columns_from_in_segment(&clause_tokens[in_idx + 1..])
+    };
 
     let mut result = PivotClauseColumns {
         clause_index: pivot_idx,
