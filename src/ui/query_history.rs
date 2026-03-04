@@ -13,7 +13,6 @@ use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::db::{QueryExecutor, ToolCommand};
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::theme;
@@ -37,7 +36,6 @@ struct PendingHistoryEntry {
     message: String,
 }
 
-const REDACTED_SECRET: &str = "<redacted>";
 const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 3;
 
 fn fold_for_case_insensitive(value: &str) -> String {
@@ -49,21 +47,21 @@ fn history_writer_response_timeout() -> std::time::Duration {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
+        .unwrap_or_else(|| {
+            std::time::Duration::from_secs(HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS)
+        })
 }
 
 fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
-    let sanitized_sql = sanitize_history_sql(&entry.sql);
-    let sanitized_message = sanitize_history_message(&entry.message);
     let error_message = if entry.success {
         None
     } else {
-        Some(sanitized_message)
+        Some(entry.message)
     };
     let error_line = error_message.as_deref().and_then(parse_error_line);
 
     QueryHistoryEntry {
-        sql: sanitized_sql,
+        sql: entry.sql,
         timestamp: entry.timestamp,
         execution_time_ms: entry.execution_time_ms,
         row_count: entry.row_count,
@@ -88,18 +86,16 @@ fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
             let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
             let mut clear_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
 
-            let mut apply_command = |command: HistoryCommand| {
-                match command {
-                    HistoryCommand::Add(entry) => {
-                        history.add_entry(materialize_history_entry(entry));
-                    }
-                    HistoryCommand::Clear(reply) => {
-                        history.queries.clear();
-                        clear_replies.push(reply);
-                    }
-                    HistoryCommand::Snapshot(reply) => {
-                        snapshot_replies.push(reply);
-                    }
+            let mut apply_command = |command: HistoryCommand| match command {
+                HistoryCommand::Add(entry) => {
+                    history.add_entry(materialize_history_entry(entry));
+                }
+                HistoryCommand::Clear(reply) => {
+                    history.queries.clear();
+                    clear_replies.push(reply);
+                }
+                HistoryCommand::Snapshot(reply) => {
+                    snapshot_replies.push(reply);
                 }
             };
 
@@ -202,319 +198,6 @@ fn parse_error_line(message: &str) -> Option<usize> {
     best_line.map(|(_, line)| line).filter(|line| *line > 0)
 }
 
-fn sanitize_history_sql(sql: &str) -> String {
-    sanitize_sensitive_text(sql)
-}
-
-fn sanitize_history_message(message: &str) -> String {
-    sanitize_sensitive_text(message)
-}
-
-fn sanitize_sensitive_text(text: &str) -> String {
-    let redacted_connect = redact_connect_commands(text);
-    let redacted_identified = redact_identified_by_clause(&redacted_connect);
-    redact_uri_credentials(&redacted_identified)
-}
-
-fn redact_connect_commands(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-
-    let mut output = String::with_capacity(text.len());
-    for segment in text.split_inclusive('\n') {
-        let has_newline = segment.ends_with('\n');
-        let line = if has_newline {
-            &segment[..segment.len().saturating_sub(1)]
-        } else {
-            segment
-        };
-        let redacted = redact_connect_command_line(line);
-        output.push_str(&redacted);
-        if has_newline {
-            output.push('\n');
-        }
-    }
-
-    if !text.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
-    }
-
-    output
-}
-
-fn redact_connect_command_line(line: &str) -> String {
-    let trimmed = line.trim_start();
-    let indent_len = line.len().saturating_sub(trimmed.len());
-    let indent = &line[..indent_len];
-
-    if let Some(ToolCommand::Connect {
-        username,
-        host,
-        port,
-        service_name,
-        ..
-    }) = QueryExecutor::parse_tool_command(trimmed)
-    {
-        return format!(
-            "{}CONNECT {}/{}@{}:{}/{}",
-            indent, username, REDACTED_SECRET, host, port, service_name
-        );
-    }
-
-    let upper = trimmed.to_ascii_uppercase();
-    if (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY"))
-        || upper.starts_with("CONN ")
-    {
-        if let Some(masked) = redact_connect_credentials_fallback(trimmed) {
-            return format!("{}{}", indent, masked);
-        }
-    }
-
-    line.to_string()
-}
-
-fn redact_connect_credentials_fallback(trimmed: &str) -> Option<String> {
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let command = parts.next().unwrap_or_default();
-    let rest = parts.next().unwrap_or_default().trim_start();
-    if command.is_empty() || rest.is_empty() {
-        return None;
-    }
-
-    let slash_idx = rest.find('/')?;
-    let at_idx = rest
-        .char_indices()
-        .filter_map(|(idx, ch)| if ch == '@' { Some(idx) } else { None })
-        .next_back()?;
-    if slash_idx >= at_idx {
-        return None;
-    }
-
-    Some(format!(
-        "{} {}/{}{}",
-        command,
-        &rest[..slash_idx],
-        REDACTED_SECRET,
-        &rest[at_idx..]
-    ))
-}
-
-fn redact_identified_by_clause(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-
-    #[derive(Clone, Copy)]
-    enum SqlState {
-        Code,
-        SingleQuoted,
-        DoubleQuoted,
-        LineComment,
-        BlockComment,
-    }
-
-    const IDENTIFIED_BY: &str = "IDENTIFIED BY";
-
-    let mut output = String::with_capacity(text.len());
-    let mut state = SqlState::Code;
-    let mut idx = 0usize;
-
-    while idx < text.len() {
-        let Some((ch, next)) = next_char_with_clamped_boundary(text, idx) else {
-            break;
-        };
-
-        match state {
-            SqlState::Code => {
-                if ch == '\'' {
-                    output.push(ch);
-                    state = SqlState::SingleQuoted;
-                    idx = next;
-                    continue;
-                }
-                if ch == '"' {
-                    output.push(ch);
-                    state = SqlState::DoubleQuoted;
-                    idx = next;
-                    continue;
-                }
-                if ch == '-' {
-                    if let Some((next_ch, next_boundary)) =
-                        next_char_with_clamped_boundary(text, next)
-                    {
-                        if next_ch == '-' {
-                            output.push(ch);
-                            output.push(next_ch);
-                            state = SqlState::LineComment;
-                            idx = next_boundary;
-                            continue;
-                        }
-                    }
-                }
-                if ch == '/' {
-                    if let Some((next_ch, next_boundary)) =
-                        next_char_with_clamped_boundary(text, next)
-                    {
-                        if next_ch == '*' {
-                            output.push(ch);
-                            output.push(next_ch);
-                            state = SqlState::BlockComment;
-                            idx = next_boundary;
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(found) = find_ascii_case_insensitive(text, IDENTIFIED_BY, idx) {
-                    if found == idx {
-                        let pattern_end = found + IDENTIFIED_BY.len();
-                        output.push_str(&text[idx..pattern_end]);
-
-                        let mut value_start = pattern_end;
-                        while value_start < text.len() {
-                            let Some((ws, next_ws)) =
-                                next_char_with_clamped_boundary(text, value_start)
-                            else {
-                                break;
-                            };
-                            if ws.is_whitespace() {
-                                output.push(ws);
-                                value_start = next_ws;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        if value_start >= text.len() {
-                            idx = value_start;
-                            continue;
-                        }
-
-                        let Some((first, _)) = next_char_with_clamped_boundary(text, value_start)
-                        else {
-                            idx = text.len();
-                            continue;
-                        };
-
-                        if first == '\'' || first == '"' {
-                            let quote = first;
-                            output.push(quote);
-                            let mut value_end = value_start + quote.len_utf8();
-                            let mut closed_quote = false;
-                            while value_end < text.len() {
-                                let Some((vch, vnext)) =
-                                    next_char_with_clamped_boundary(text, value_end)
-                                else {
-                                    value_end = text.len();
-                                    break;
-                                };
-                                value_end = vnext;
-                                if vch == quote {
-                                    if value_end < text.len() {
-                                        let Some((escaped, escaped_next)) =
-                                            next_char_with_clamped_boundary(text, value_end)
-                                        else {
-                                            value_end = text.len();
-                                            break;
-                                        };
-                                        if escaped == quote {
-                                            value_end = escaped_next;
-                                            continue;
-                                        }
-                                    }
-                                    closed_quote = true;
-                                    break;
-                                }
-                            }
-                            output.push_str(REDACTED_SECRET);
-                            if closed_quote {
-                                output.push(quote);
-                            }
-                            idx = value_end;
-                            continue;
-                        }
-
-                        let mut value_end = value_start;
-                        while value_end < text.len() {
-                            let Some((vch, vnext)) =
-                                next_char_with_clamped_boundary(text, value_end)
-                            else {
-                                value_end = text.len();
-                                break;
-                            };
-                            if vch.is_whitespace() || matches!(vch, ';' | ')' | ',' | '\n' | '\r') {
-                                break;
-                            }
-                            value_end = vnext;
-                        }
-                        output.push_str(REDACTED_SECRET);
-                        idx = value_end;
-                        continue;
-                    }
-                }
-
-                output.push(ch);
-                idx = next;
-            }
-            SqlState::SingleQuoted => {
-                output.push(ch);
-                idx = next;
-                if ch == '\'' {
-                    if let Some((escaped, escaped_next)) =
-                        next_char_with_clamped_boundary(text, idx)
-                    {
-                        if escaped == '\'' {
-                            output.push(escaped);
-                            idx = escaped_next;
-                            continue;
-                        }
-                    }
-                    state = SqlState::Code;
-                }
-            }
-            SqlState::DoubleQuoted => {
-                output.push(ch);
-                idx = next;
-                if ch == '"' {
-                    if let Some((escaped, escaped_next)) =
-                        next_char_with_clamped_boundary(text, idx)
-                    {
-                        if escaped == '"' {
-                            output.push(escaped);
-                            idx = escaped_next;
-                            continue;
-                        }
-                    }
-                    state = SqlState::Code;
-                }
-            }
-            SqlState::LineComment => {
-                output.push(ch);
-                idx = next;
-                if ch == '\n' {
-                    state = SqlState::Code;
-                }
-            }
-            SqlState::BlockComment => {
-                output.push(ch);
-                idx = next;
-                if ch == '*' {
-                    if let Some((slash, slash_next)) = next_char_with_clamped_boundary(text, idx) {
-                        if slash == '/' {
-                            output.push(slash);
-                            idx = slash_next;
-                            state = SqlState::Code;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    output
-}
-
 fn next_char_boundary(text: &str, idx: usize) -> usize {
     let mut boundary = idx.min(text.len());
     while boundary > 0 && !text.is_char_boundary(boundary) {
@@ -531,84 +214,6 @@ fn next_char_with_clamped_boundary(text: &str, idx: usize) -> Option<(char, usiz
 
     let ch = text[start..].chars().next()?;
     Some((ch, start + ch.len_utf8()))
-}
-
-fn redact_uri_credentials(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-
-    while let Some(rel) = text[cursor..].find("://") {
-        let scheme_sep = cursor + rel;
-        let auth_start = scheme_sep + 3;
-        output.push_str(&text[cursor..auth_start]);
-
-        let authority_end = text[auth_start..]
-            .char_indices()
-            .find_map(|(offset, ch)| {
-                if matches!(
-                    ch,
-                    '/' | '?' | '#' | ' ' | '\t' | '\n' | '\r' | '\'' | '"' | ';' | ')' | '('
-                ) {
-                    Some(auth_start + offset)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(text.len());
-
-        let authority = &text[auth_start..authority_end];
-        if let Some(at_pos) = authority.rfind('@') {
-            let userinfo = &authority[..at_pos];
-            let host = &authority[at_pos..];
-            if let Some(colon_pos) = userinfo.find(':') {
-                output.push_str(&userinfo[..colon_pos + 1]);
-                output.push_str(REDACTED_SECRET);
-                output.push_str(host);
-            } else if !userinfo.is_empty() {
-                // Username-only authority (user@host) can still expose credentials.
-                // Mask to avoid leaking account identifiers in history previews.
-                output.push_str(userinfo);
-                output.push(':');
-                output.push_str(REDACTED_SECRET);
-                output.push_str(host);
-            } else {
-                output.push_str(authority);
-            }
-        } else {
-            output.push_str(authority);
-        }
-
-        cursor = authority_end;
-    }
-
-    output.push_str(&text[cursor..]);
-    output
-}
-
-fn find_ascii_case_insensitive(text: &str, needle: &str, start: usize) -> Option<usize> {
-    let haystack = text.as_bytes();
-    let pattern = needle.as_bytes();
-    if pattern.is_empty() || start >= haystack.len() || pattern.len() > haystack.len() {
-        return None;
-    }
-
-    for idx in start..=haystack.len().saturating_sub(pattern.len()) {
-        if !text.is_char_boundary(idx) {
-            continue;
-        }
-        if haystack[idx..idx + pattern.len()]
-            .iter()
-            .zip(pattern.iter())
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        {
-            return Some(idx);
-        }
-    }
-    None
 }
 
 fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
@@ -1243,8 +848,7 @@ fn populate_history_browser(
 mod query_history_tests {
     use super::{
         contains_lower, history_entry_matches_filter, materialize_history_entry, parse_error_line,
-        sanitize_history_message, sanitize_history_sql, truncate_sql, PendingHistoryEntry,
-        QueryHistoryEntry, REDACTED_SECRET,
+        truncate_sql, PendingHistoryEntry, QueryHistoryEntry,
     };
 
     #[test]
@@ -1271,48 +875,6 @@ mod query_history_tests {
     }
 
     #[test]
-    fn sanitize_history_sql_redacts_connect_password() {
-        let sql = "CONNECT scott/tiger@localhost:1521/ORCL";
-        let sanitized = sanitize_history_sql(sql);
-        assert!(sanitized.contains(&format!("scott/{}@", REDACTED_SECRET)));
-        assert!(!sanitized.contains("tiger"));
-    }
-
-    #[test]
-    fn sanitize_history_sql_keeps_connect_by_clause() {
-        let sql = "SELECT * FROM emp CONNECT BY PRIOR empno = mgr";
-        let sanitized = sanitize_history_sql(sql);
-        assert_eq!(sanitized, sql);
-    }
-
-    #[test]
-    fn sanitize_history_sql_redacts_identified_by_secret() {
-        let sql = "CREATE USER app IDENTIFIED BY \"MySecret!\"";
-        let sanitized = sanitize_history_sql(sql);
-        assert!(sanitized.contains(&format!("IDENTIFIED BY \"{}\"", REDACTED_SECRET)));
-        assert!(!sanitized.contains("MySecret!"));
-    }
-
-    #[test]
-    fn sanitize_history_sql_redacts_unterminated_identified_by_quote_without_appending_quote() {
-        let sql = "CREATE USER app IDENTIFIED BY 'MySecret!";
-        let sanitized = sanitize_history_sql(sql);
-        assert_eq!(
-            sanitized,
-            format!("CREATE USER app IDENTIFIED BY '{}", REDACTED_SECRET)
-        );
-        assert!(!sanitized.contains("MySecret!"));
-    }
-
-    #[test]
-    fn sanitize_history_message_redacts_uri_password() {
-        let message = "failed to connect via https://alice:pa55@example.com/path";
-        let sanitized = sanitize_history_message(message);
-        assert!(sanitized.contains(&format!("alice:{}@", REDACTED_SECRET)));
-        assert!(!sanitized.contains("pa55"));
-    }
-
-    #[test]
     fn parse_error_line_prefers_primary_error_line_reference() {
         let message = "failed near line 1
 ORA-06512: at line 27";
@@ -1324,29 +886,6 @@ ORA-06512: at line 27";
         let message = "client command line 8 received
 server location at line 12";
         assert_eq!(parse_error_line(message), Some(12));
-    }
-
-    #[test]
-    fn sanitize_history_message_redacts_user_only_uri_credentials() {
-        let sql = "failed to reach https://scott@db-host/service";
-        let sanitized = sanitize_history_message(sql);
-        assert!(sanitized.contains(&format!(
-            "https://scott:{}@db-host/service",
-            REDACTED_SECRET
-        )));
-        assert!(!sanitized.contains("https://scott@db-host/service"));
-    }
-
-    #[test]
-    fn sanitize_history_sql_ignores_identified_by_in_comments_and_strings() {
-        let sql = "/* IDENTIFIED BY should_not_change */
-SELECT 'IDENTIFIED BY keep_me' FROM dual;
-CREATE USER app IDENTIFIED BY real_secret;";
-        let sanitized = sanitize_history_sql(sql);
-        assert!(sanitized.contains("IDENTIFIED BY should_not_change"));
-        assert!(sanitized.contains("IDENTIFIED BY keep_me"));
-        assert!(sanitized.contains(&format!("IDENTIFIED BY {}", REDACTED_SECRET)));
-        assert!(!sanitized.contains("real_secret"));
     }
 
     #[test]
@@ -1408,7 +947,7 @@ CREATE USER app IDENTIFIED BY real_secret;";
     }
 
     #[test]
-    fn materialize_history_entry_sanitizes_and_extracts_error_line() {
+    fn materialize_history_entry_preserves_sql_and_extracts_error_line() {
         let entry = PendingHistoryEntry {
             sql: "CONNECT scott/tiger@localhost:1521/ORCL".to_string(),
             timestamp: "2026-02-27 10:00:00".to_string(),
@@ -1420,9 +959,7 @@ CREATE USER app IDENTIFIED BY real_secret;";
         };
 
         let materialized = materialize_history_entry(entry);
-        assert!(materialized
-            .sql
-            .contains(&format!("scott/{}@", REDACTED_SECRET)));
+        assert_eq!(materialized.sql, "CONNECT scott/tiger@localhost:1521/ORCL");
         assert_eq!(materialized.error_line, Some(7));
         assert!(materialized.error_message.is_some());
     }
