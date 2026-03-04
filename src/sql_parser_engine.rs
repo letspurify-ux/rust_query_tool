@@ -670,10 +670,10 @@ impl SplitState {
 
     /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY semicolon behavior.
     fn handle_routine_is_external(&mut self, upper: &str) {
-        if !self
+        if self
             .routine_is_stack
             .last()
-            .is_some_and(|frame| frame.block_depth == self.block_depth())
+            .is_none_or(|frame| frame.block_depth != self.block_depth())
         {
             return;
         }
