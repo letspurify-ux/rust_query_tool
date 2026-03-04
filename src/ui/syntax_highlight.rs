@@ -175,6 +175,12 @@ enum ConnectContinuationScanState {
     ScanToken,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumberScanState {
+    Integer,
+    Fraction,
+}
+
 impl BlockCommentKind {
     fn from_after_open(bytes: &[u8], idx_after_open: usize) -> Self {
         if bytes.get(idx_after_open) == Some(&b'+') {
@@ -670,13 +676,17 @@ impl SqlHighlighter {
                 || (byte == b'.' && bytes.get(idx + 1).is_some_and(|b| b.is_ascii_digit()))
             {
                 let start = idx;
-                let mut has_dot = byte == b'.';
+                let mut number_state = if byte == b'.' {
+                    NumberScanState::Fraction
+                } else {
+                    NumberScanState::Integer
+                };
                 idx += 1;
                 while let Some(&next_byte) = bytes.get(idx) {
                     if next_byte.is_ascii_digit() {
                         idx += 1;
-                    } else if next_byte == b'.' && !has_dot {
-                        has_dot = true;
+                    } else if next_byte == b'.' && number_state == NumberScanState::Integer {
+                        number_state = NumberScanState::Fraction;
                         idx += 1;
                     } else {
                         break;
