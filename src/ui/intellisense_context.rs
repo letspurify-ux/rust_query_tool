@@ -139,12 +139,37 @@ pub struct CursorContext {
 /// CTE parsing state machine
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CteState {
-    None,
+    Inactive,
     ExpectName,
     AfterName,
     ExpectAs,
     ExpectBody,
-    InBody,
+    InBody { body_depth: usize },
+}
+
+impl CteState {
+    fn enter_body(self, body_depth: usize) -> Self {
+        if matches!(self, Self::ExpectBody) {
+            Self::InBody { body_depth }
+        } else {
+            self
+        }
+    }
+
+    fn enter_explicit_column_list(self) -> Self {
+        if matches!(self, Self::AfterName) {
+            Self::ExpectAs
+        } else {
+            self
+        }
+    }
+
+    fn close_parenthesis(self, current_depth: usize) -> Self {
+        match self {
+            Self::InBody { body_depth } if body_depth == current_depth => Self::Inactive,
+            other => other,
+        }
+    }
 }
 
 /// FROM/INTO/JOIN relation parsing state machine.
@@ -388,8 +413,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     visible_parent.insert(0, None);
 
     let mut relation_modifier_state = RelationModifierState::None;
-    let mut cte_state = CteState::None;
-    let mut cte_paren_depth: usize = 0;
+    let mut cte_state = CteState::Inactive;
 
     let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>)> = None;
     let mut idx = 0;
@@ -478,22 +502,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     subquery_tracks.push((depth, idx + 1));
                 }
 
-                if matches!(cte_state, CteState::ExpectBody) {
-                    cte_state = CteState::InBody;
-                    cte_paren_depth = depth;
-                }
-                if matches!(cte_state, CteState::AfterName) {
-                    // CTE explicit columns: WITH cte(col1, col2) AS (...)
-                    // Skip until matching ')'
-                    cte_state = CteState::ExpectAs;
-                }
+                cte_state = cte_state.enter_body(depth).enter_explicit_column_list();
                 idx += 1;
                 continue;
             }
             SqlToken::Symbol(sym) if sym == ")" => {
-                if matches!(cte_state, CteState::InBody) && depth == cte_paren_depth {
-                    cte_state = CteState::None;
-                }
+                cte_state = cte_state.close_parenthesis(depth);
 
                 while subquery_tracks.last().is_some_and(|track| track.0 > depth) {
                     // Recover from malformed SQL with stale tracks.
@@ -610,7 +624,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if matches!(current_phase, SqlPhase::FromClause) {
                     relation_state.expect_table();
                 }
-                if matches!(cte_state, CteState::None)
+                if matches!(cte_state, CteState::Inactive)
                     && depth == 0
                     && depth_frames
                         .first()
@@ -637,8 +651,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 depth_frames = vec![ParserDepthFrame::default()];
                 last_word = None;
                 relation_state.clear();
-                cte_state = CteState::None;
-                cte_paren_depth = 0;
+                cte_state = CteState::Inactive;
                 parser_state.paren_depth = 0;
                 depth = 0;
 
@@ -665,7 +678,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
-                            cte_state = CteState::None;
+                            cte_state = CteState::Inactive;
                             continue;
                         }
                         idx += 1;
@@ -675,17 +688,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if upper == "AS" {
                             cte_state = CteState::ExpectBody;
                         } else if sql_text::is_cte_recovery_keyword(&upper) {
-                            cte_state = CteState::None;
+                            cte_state = CteState::Inactive;
                             continue;
                         }
                         idx += 1;
                         continue;
                     }
-                    CteState::InBody => {
+                    CteState::InBody { .. } => {
                         // Inside CTE body, process normally for phase tracking at this depth
                         // but don't break out of CTE state
                     }
-                    CteState::None => {}
+                    CteState::Inactive => {}
                     _ => {
                         idx += 1;
                         continue;
