@@ -22,14 +22,14 @@ use crate::db::{ConnectionInfo, QueryExecutor, QueryResult, SharedConnection, Ta
 use crate::ui::constants::*;
 use crate::ui::font_settings::{configured_editor_profile, configured_ui_font_size, FontProfile};
 use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
-use crate::ui::query_history::{flush_history_writer_with_timeout, QueryHistoryDialog};
+use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
     create_style_table_with, HighlightData, SqlHighlighter, WindowHighlightRequest,
     WindowHighlightResult, STYLE_COMMENT, STYLE_STRING, WINDOWED_HIGHLIGHT_THRESHOLD,
 };
 use crate::ui::theme;
-use crate::utils::{AppConfig, QueryHistory, QueryHistoryEntry};
+use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
 
 mod dba_tools;
@@ -73,7 +73,6 @@ const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
 const DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT: usize = 16_384;
 const VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS: f64 = 0.08;
 const EDITOR_TOP_PADDING: i32 = 4;
-const HISTORY_NAVIGATION_FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
 
 fn is_window_shown_and_visible(shown: bool, visible: bool) -> bool {
@@ -3207,15 +3206,15 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if cursor.is_none() {
-            // Keep navigation aligned with persisted history while avoiding long UI stalls
-            // on each key press: flush once when navigation starts, then reuse a snapshot.
-            let _ = flush_history_writer_with_timeout(HISTORY_NAVIGATION_FLUSH_TIMEOUT);
-            let loaded = QueryHistory::load();
-            if loaded.queries.is_empty() {
+            if let Ok(snapshot) = history_snapshot() {
+                if snapshot.is_empty() {
+                    return;
+                }
+                *history_entries = Some(snapshot.into());
+                *original = Some(self.buffer.text());
+            } else {
                 return;
             }
-            *history_entries = Some(loaded.queries.into());
-            *original = Some(self.buffer.text());
         }
 
         let Some(entries) = history_entries.as_ref() else {

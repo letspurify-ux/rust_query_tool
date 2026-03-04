@@ -4230,9 +4230,6 @@ impl MainWindow {
                 result_tabs.clear();
             }
             crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
-            if let Err(err) = crate::ui::query_history::flush_history_writer() {
-                eprintln!("Query history flush on exit failed: {err}");
-            }
             if let Err(err) = crate::utils::logging::flush_log_writer() {
                 eprintln!("Application log flush on exit failed: {err}");
             }
