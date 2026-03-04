@@ -116,6 +116,23 @@ pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
         || word.eq_ignore_ascii_case("VALUES")
 }
 
+/// Returns true when a token can reasonably start a new top-level statement.
+///
+/// Used as a recovery signal when the parser stayed inside an Oracle
+/// `WITH FUNCTION/PROCEDURE` declaration mode but encountered another
+/// statement head instead of a main query keyword.
+pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
+    word.eq_ignore_ascii_case("CREATE")
+        || word.eq_ignore_ascii_case("ALTER")
+        || word.eq_ignore_ascii_case("DROP")
+        || word.eq_ignore_ascii_case("TRUNCATE")
+        || word.eq_ignore_ascii_case("RENAME")
+        || word.eq_ignore_ascii_case("COMMIT")
+        || word.eq_ignore_ascii_case("ROLLBACK")
+        || word.eq_ignore_ascii_case("GRANT")
+        || word.eq_ignore_ascii_case("REVOKE")
+}
+
 /// Returns true when a keyword can head a subquery body after `(`.
 pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
     is_with_main_query_keyword(word) || word.eq_ignore_ascii_case("WITH")

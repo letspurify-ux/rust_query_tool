@@ -416,6 +416,7 @@ pub(crate) struct SplitState {
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
     with_clause_state: WithClauseState,
+    with_clause_waiting_main_query: bool,
     top_level_token_seen: bool,
 
     // -- Reusable buffer --
@@ -832,6 +833,7 @@ impl SplitState {
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
+        self.with_clause_waiting_main_query = false;
         self.top_level_token_seen = false;
     }
 
@@ -902,6 +904,7 @@ impl SplitState {
 
         if upper == "WITH" && at_statement_start {
             self.with_clause_state = WithClauseState::PendingClause;
+            self.with_clause_waiting_main_query = false;
             return;
         }
 
@@ -911,6 +914,7 @@ impl SplitState {
 
         if matches!(upper, "FUNCTION" | "PROCEDURE") {
             self.with_clause_state = WithClauseState::InPlsqlDeclaration;
+            self.with_clause_waiting_main_query = true;
             return;
         }
 
@@ -925,6 +929,15 @@ impl SplitState {
 
         if sql_text::is_with_main_query_keyword(upper) {
             self.with_clause_state = WithClauseState::None;
+            self.with_clause_waiting_main_query = false;
+            return;
+        }
+
+        if self.with_clause_state == WithClauseState::InPlsqlDeclaration
+            && self.block_depth() == 0
+            && !matches!(upper, "FUNCTION" | "PROCEDURE")
+        {
+            self.with_clause_waiting_main_query = true;
         }
     }
 }
@@ -966,6 +979,25 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
         idx += 1;
     }
     true
+}
+
+fn preview_identifier_upper(chars: &[char], start: usize) -> Option<String> {
+    let first = chars.get(start).copied()?;
+    if !sql_text::is_identifier_char(first) {
+        return None;
+    }
+
+    let mut idx = start;
+    let mut token = String::new();
+    while let Some(ch) = chars.get(idx).copied() {
+        if !sql_text::is_identifier_char(ch) {
+            break;
+        }
+        token.push(ch);
+        idx += 1;
+    }
+    token.make_ascii_uppercase();
+    Some(token)
 }
 
 #[inline]
@@ -1317,6 +1349,21 @@ impl SqlParserEngine {
             }
 
             if sql_text::is_identifier_char(c) {
+                if self.state.with_clause_state == WithClauseState::InPlsqlDeclaration
+                    && self.state.with_clause_waiting_main_query
+                    && self.state.block_depth() == 0
+                    && self.state.paren_depth == 0
+                {
+                    if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
+                        if sql_text::is_statement_head_keyword(&candidate_upper)
+                            && !sql_text::is_with_main_query_keyword(&candidate_upper)
+                        {
+                            self.push_current_statement();
+                            self.reset_statement_local_state();
+                            self.state.reset_create_state();
+                        }
+                    }
+                }
                 self.state.token.push(c);
                 self.current.push(c);
                 i += 1;
@@ -1381,6 +1428,12 @@ impl SqlParserEngine {
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
+                if self.state.in_with_plsql_declaration()
+                    && self.state.block_depth() == 0
+                    && self.state.paren_depth == 0
+                {
+                    self.state.with_clause_waiting_main_query = true;
+                }
                 let semicolon_action = SemicolonAction::from_state(&self.state);
                 self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
