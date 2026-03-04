@@ -4836,6 +4836,24 @@ FOR UPDATE SKIP LOCKED;"#;
 }
 
 #[test]
+fn test_line_block_depths_for_update_inside_block_does_not_arm_do_block() {
+    let sql = r#"BEGIN
+  SELECT id
+  INTO v_id
+  FROM jobs
+  WHERE status = 'PENDING'
+  FOR UPDATE;
+  DO 1;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 1, 1, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "FOR UPDATE inside a block must not leave pending FOR-DO state for a later DO"
+    );
+}
+
+#[test]
 fn test_line_block_depths_with_with_clause_prefixed_by_hint_comment() {
     let sql = r#"/*+ leading_optimizer_hint */ WITH cte AS (
   SELECT 1 AS id FROM dual
