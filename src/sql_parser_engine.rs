@@ -107,6 +107,21 @@ pub(crate) enum PendingDo {
     For,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RoutineFrame {
+    block_depth: usize,
+    split_on_semicolon: bool,
+}
+
+impl RoutineFrame {
+    fn new(block_depth: usize) -> Self {
+        Self {
+            block_depth,
+            split_on_semicolon: false,
+        }
+    }
+}
+
 impl Default for PendingDo {
     fn default() -> Self {
         Self::None
@@ -145,7 +160,7 @@ pub(crate) struct SplitState {
     after_as_is: bool,
     nested_subprogram: bool,
     pub(crate) pending_subprogram_begins: usize,
-    routine_is_stack: Vec<(usize, bool)>,
+    routine_is_stack: Vec<RoutineFrame>,
     pub(crate) is_package: bool,
     pub(crate) is_trigger: bool,
     in_compound_trigger: bool,
@@ -273,10 +288,10 @@ impl SplitState {
             && self
                 .routine_is_stack
                 .last()
-                .is_some_and(|(depth, _)| *depth == self.block_depth())
+                .is_some_and(|frame| frame.block_depth == self.block_depth())
         {
-            if let Some((_, split_on_semicolon)) = self.routine_is_stack.last_mut() {
-                *split_on_semicolon = true;
+            if let Some(frame) = self.routine_is_stack.last_mut() {
+                frame.split_on_semicolon = true;
             }
         }
     }
@@ -431,7 +446,6 @@ impl SplitState {
 
         if is_block_starting_as_is {
             self.block_stack.push(BlockKind::AsIs);
-            let split_on_semicolon = false;
             if self.is_type_create && !self.nested_subprogram && !self.pending_timing_point_is {
                 self.after_as_is = true;
             }
@@ -444,7 +458,7 @@ impl SplitState {
             };
             if needs_begin_tracking {
                 self.routine_is_stack
-                    .push((self.block_depth(), split_on_semicolon));
+                    .push(RoutineFrame::new(self.block_depth()));
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
@@ -459,7 +473,7 @@ impl SplitState {
                 if self
                     .routine_is_stack
                     .last()
-                    .is_some_and(|(depth, _)| *depth == self.block_depth())
+                    .is_some_and(|frame| frame.block_depth == self.block_depth())
                 {
                     let _ = self.routine_is_stack.pop();
                 }
@@ -513,11 +527,9 @@ impl SplitState {
     }
 
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
-        self.routine_is_stack
-            .last()
-            .is_some_and(|(depth, split_on_semicolon)| {
-                *depth == self.block_depth() && *split_on_semicolon
-            })
+        self.routine_is_stack.last().is_some_and(|frame| {
+            frame.block_depth == self.block_depth() && frame.split_on_semicolon
+        })
     }
 
     pub(crate) fn reset_create_state(&mut self) {
@@ -1141,8 +1153,9 @@ impl SqlParserEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockKind, IfState, PendingDo, PendingEnd, SplitState, SqlParserEngine};
-
+    use super::{
+        BlockKind, IfState, PendingDo, PendingEnd, RoutineFrame, SplitState, SqlParserEngine,
+    };
 
     #[test]
     fn semicolon_split_resets_transient_state_at_top_level() {
@@ -1168,7 +1181,10 @@ mod tests {
         let mut engine = SqlParserEngine::new();
         engine.current.push_str("LANGUAGE C");
         engine.state.block_stack.push(BlockKind::AsIs);
-        engine.state.routine_is_stack.push((1, true));
+        engine.state.routine_is_stack.push(RoutineFrame {
+            block_depth: 1,
+            split_on_semicolon: true,
+        });
         engine.state.pending_end = PendingEnd::End;
         engine.state.pending_do = PendingDo::While;
         engine.state.if_state = IfState::AfterConditionParen;
