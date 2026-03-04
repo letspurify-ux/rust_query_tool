@@ -381,7 +381,11 @@ fn collect_table_alias_with_inline_comment_after_table_name() {
         .tables_in_scope
         .iter()
         .find(|table| table.name.eq_ignore_ascii_case("employees"));
-    assert!(employee_scope.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        employee_scope.is_some(),
+        "tables: {:?}",
+        ctx.tables_in_scope
+    );
 
     assert_eq!(
         employee_scope.and_then(|table| table.alias.as_deref()),
@@ -397,7 +401,11 @@ fn collect_subquery_alias_with_comment_after_as_keyword() {
         .tables_in_scope
         .iter()
         .find(|table| table.name.eq_ignore_ascii_case("sq"));
-    assert!(subquery_scope.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        subquery_scope.is_some(),
+        "tables: {:?}",
+        ctx.tables_in_scope
+    );
 
     assert_eq!(
         subquery_scope.and_then(|table| table.alias.as_deref()),
@@ -1112,7 +1120,6 @@ fn lateral_subquery_can_see_outer_table_scope() {
     assert!(names.contains(&"T2".to_string()), "tables: {:?}", names);
 }
 
-
 #[test]
 fn lateral_keyword_is_not_parsed_as_left_table_alias() {
     let ctx = analyze("SELECT * FROM t1 LATERAL (SELECT * FROM t2) l WHERE l.|");
@@ -1123,7 +1130,9 @@ fn lateral_keyword_is_not_parsed_as_left_table_alias() {
         .collect();
 
     assert!(
-        aliases.iter().all(|alias| !alias.eq_ignore_ascii_case("LATERAL")),
+        aliases
+            .iter()
+            .all(|alias| !alias.eq_ignore_ascii_case("LATERAL")),
         "LATERAL must remain a join modifier, not a relation alias: {:?}",
         aliases
     );
@@ -2038,4 +2047,38 @@ fn delete_with_from_collects_target_table() {
         "tables: {:?}",
         names
     );
+}
+
+// ─── State machine regression tests ─────────────────────────────────────
+
+#[test]
+fn pivot_xml_skips_generated_columns() {
+    let tokens =
+        tokenize("SELECT * FROM sales PIVOT XML (SUM(amount) FOR quarter IN ('Q1' AS Q1))");
+    let parsed = parse_top_level_pivot_clause(&tokens).expect("PIVOT XML clause should be parsed");
+    assert!(parsed.generated_columns.is_empty());
+    assert_eq!(parsed.for_columns, vec!["quarter".to_string()]);
+    assert_eq!(parsed.aggregate_columns, vec!["amount".to_string()]);
+}
+
+#[test]
+fn parse_simple_identifier_path_rejects_trailing_dot() {
+    let tokens = vec![
+        SqlToken::Word("schema".to_string()),
+        SqlToken::Symbol(".".to_string()),
+    ];
+    let refs: Vec<&SqlToken> = tokens.iter().collect();
+    assert_eq!(parse_simple_identifier_path_output_column(&refs), None);
+}
+
+#[test]
+fn normalize_dotted_identifier_rejects_double_dot() {
+    let tokens = vec![
+        SqlToken::Word("schema".to_string()),
+        SqlToken::Symbol(".".to_string()),
+        SqlToken::Symbol(".".to_string()),
+        SqlToken::Word("table".to_string()),
+    ];
+    let refs: Vec<&SqlToken> = tokens.iter().collect();
+    assert_eq!(normalize_dotted_identifier_tokens(&refs), None);
 }
