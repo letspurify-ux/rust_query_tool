@@ -325,6 +325,10 @@ impl SymbolRole {
 
         Self::Other
     }
+
+    fn resolves_pending_end(self) -> bool {
+        matches!(self, Self::PendingEndSeparator | Self::CloseParen)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1515,9 +1519,7 @@ impl SqlParserEngine {
             }
 
             // Pending END on separator
-            if self.state.pending_end == PendingEnd::End
-                && symbol_role == SymbolRole::PendingEndSeparator
-            {
+            if self.state.pending_end == PendingEnd::End && symbol_role.resolves_pending_end() {
                 self.state.resolve_pending_end_on_separator();
             }
 
@@ -1644,6 +1646,9 @@ mod tests {
             SymbolRole::PendingEndSeparator
         );
         assert_eq!(SymbolRole::from_char(')', None), SymbolRole::CloseParen);
+        assert!(SymbolRole::from_char(')', None).resolves_pending_end());
+        assert!(SymbolRole::from_char('/', Some('1')).resolves_pending_end());
+        assert!(!SymbolRole::from_char('(', None).resolves_pending_end());
     }
 
     #[test]
