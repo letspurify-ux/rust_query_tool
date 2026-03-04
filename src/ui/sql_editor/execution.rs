@@ -3062,6 +3062,33 @@ impl SqlEditorWidget {
         !has_connection_bootstrap_command && !can_run_while_disconnected
     }
 
+    fn emit_execution_startup_error(
+        sender: &mpsc::Sender<QueryProgress>,
+        script_mode: bool,
+        sql_text: &str,
+        conn_name: &str,
+        message: &str,
+        session: Option<&Arc<Mutex<SessionState>>>,
+    ) {
+        if script_mode {
+            let result = QueryResult::new_error(sql_text, message);
+            SqlEditorWidget::emit_script_result(sender, conn_name, 0, result, false);
+            return;
+        }
+
+        if let Some(active_session) = session {
+            SqlEditorWidget::append_spool_output(active_session, &[message.to_string()]);
+        }
+
+        let _ = sender.send(QueryProgress::StatementFinished {
+            index: 0,
+            result: QueryResult::new_error(sql_text, message),
+            connection_name: conn_name.to_string(),
+            timed_out: false,
+        });
+        app::awake();
+    }
+
     fn execute_sql(&self, sql: &str, script_mode: bool) {
         if sql.trim().is_empty() {
             return;
@@ -3171,20 +3198,14 @@ impl SqlEditorWidget {
                                     sender.send(QueryProgress::ConnectionChanged { info: None });
                                 app::awake();
                             }
-                            if script_mode {
-                                let result = QueryResult::new_error(&sql_text, &message);
-                                SqlEditorWidget::emit_script_result(
-                                    &sender, &conn_name, 0, result, false,
-                                );
-                            } else {
-                                let _ = sender.send(QueryProgress::StatementFinished {
-                                    index: 0,
-                                    result: QueryResult::new_error(&sql_text, &message),
-                                    connection_name: conn_name.clone(),
-                                    timed_out: false,
-                                });
-                                app::awake();
-                            }
+                            SqlEditorWidget::emit_execution_startup_error(
+                                &sender,
+                                script_mode,
+                                &sql_text,
+                                &conn_name,
+                                &message,
+                                None,
+                            );
                             return;
                         }
                     }
@@ -3200,18 +3221,14 @@ impl SqlEditorWidget {
                     let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
                     let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                     app::awake();
-                    if script_mode {
-                        let result = QueryResult::new_error(&sql_text, &message);
-                        SqlEditorWidget::emit_script_result(&sender, &conn_name, 0, result, false);
-                    } else {
-                        let _ = sender.send(QueryProgress::StatementFinished {
-                            index: 0,
-                            result: QueryResult::new_error(&sql_text, &message),
-                            connection_name: conn_name.clone(),
-                            timed_out: false,
-                        });
-                        app::awake();
-                    }
+                    SqlEditorWidget::emit_execution_startup_error(
+                        &sender,
+                        script_mode,
+                        &sql_text,
+                        &conn_name,
+                        &message,
+                        None,
+                    );
                     return;
                 }
                 let auto_commit = conn_guard.auto_commit();
@@ -3254,21 +3271,15 @@ impl SqlEditorWidget {
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
-                        if script_mode {
-                            let result = QueryResult::new_error(&sql_text, &err.to_string());
-                            SqlEditorWidget::emit_script_result(
-                                &sender, &conn_name, 0, result, false,
-                            );
-                        } else {
-                            SqlEditorWidget::append_spool_output(&session, &[err.to_string()]);
-                            let _ = sender.send(QueryProgress::StatementFinished {
-                                index: 0,
-                                result: QueryResult::new_error(&sql_text, &err.to_string()),
-                                connection_name: conn_name.clone(),
-                                timed_out: false,
-                            });
-                            app::awake();
-                        }
+                        let timeout_error = err.to_string();
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &timeout_error,
+                            Some(&session),
+                        );
                         return;
                     }
                     if !requires_transaction_first_statement {
@@ -9160,6 +9171,83 @@ mod script_include_guard_tests {
             err.contains("Maximum nested script depth"),
             "unexpected error message: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_startup_error_tests {
+    use super::SqlEditorWidget;
+    use crate::ui::sql_editor::QueryProgress;
+    use std::sync::mpsc;
+
+    #[test]
+    fn emit_execution_startup_error_reports_statement_finished_for_single_sql() {
+        let (tx, rx) = mpsc::channel();
+
+        SqlEditorWidget::emit_execution_startup_error(
+            &tx,
+            false,
+            "select 1 from dual",
+            "DEV",
+            "startup failed",
+            None,
+        );
+
+        let progress = rx
+            .recv()
+            .unwrap_or_else(|err| panic!("expected statement error progress event: {err}"));
+
+        match progress {
+            QueryProgress::StatementFinished {
+                index,
+                result,
+                connection_name,
+                timed_out,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(connection_name, "DEV");
+                assert!(!timed_out);
+                assert_eq!(result.sql, "select 1 from dual");
+                assert_eq!(result.message, "Error: startup failed");
+                assert!(!result.success);
+            }
+            _ => panic!("expected StatementFinished progress event"),
+        }
+    }
+
+    #[test]
+    fn emit_execution_startup_error_reports_script_result_in_script_mode() {
+        let (tx, rx) = mpsc::channel();
+
+        SqlEditorWidget::emit_execution_startup_error(
+            &tx,
+            true,
+            "begin null; end;",
+            "DEV",
+            "script startup failed",
+            None,
+        );
+
+        let progress = rx
+            .recv()
+            .unwrap_or_else(|err| panic!("expected script error progress event: {err}"));
+
+        match progress {
+            QueryProgress::StatementFinished {
+                index,
+                result,
+                connection_name,
+                timed_out,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(connection_name, "DEV");
+                assert!(!timed_out);
+                assert_eq!(result.sql, "begin null; end;");
+                assert_eq!(result.message, "Error: script startup failed");
+                assert!(!result.success);
+            }
+            _ => panic!("expected StatementFinished progress event"),
+        }
     }
 }
 
