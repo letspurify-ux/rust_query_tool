@@ -224,6 +224,11 @@ enum AsIsState {
     AwaitingNestedSubprogram,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AsIsFollowState {
+    None,
+    AwaitingTypeDeclarativeKind,
+}
 
 impl Default for BeginState {
     fn default() -> Self {
@@ -232,6 +237,12 @@ impl Default for BeginState {
 }
 
 impl Default for AsIsState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl Default for AsIsFollowState {
     fn default() -> Self {
         Self::None
     }
@@ -307,7 +318,7 @@ pub(crate) struct SplitState {
     create_plsql_kind: CreatePlsqlKind,
     pub(crate) create_state: CreateState,
     begin_state: BeginState,
-    after_as_is: bool,
+    as_is_follow_state: AsIsFollowState,
     as_is_state: AsIsState,
     pub(crate) pending_subprogram_begins: usize,
     routine_is_stack: Vec<RoutineFrame>,
@@ -597,14 +608,14 @@ impl SplitState {
         }
 
         // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE – not a real block
-        if self.after_as_is
+        if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind
             && matches!(
                 upper,
                 "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE"
             )
         {
             self.block_stack.pop(); // undo the AS/IS push
-            self.after_as_is = false;
+            self.as_is_follow_state = AsIsFollowState::None;
         }
 
         // Nested PROCEDURE/FUNCTION
@@ -631,7 +642,7 @@ impl SplitState {
                 && self.as_is_state != AsIsState::AwaitingNestedSubprogram
                 && self.timing_point_state != TimingPointState::AwaitingAsOrIs
             {
-                self.after_as_is = true;
+                self.as_is_follow_state = AsIsFollowState::AwaitingTypeDeclarativeKind;
             }
             self.as_is_state = AsIsState::None;
             self.timing_point_state = TimingPointState::None;
@@ -722,7 +733,7 @@ impl SplitState {
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
-        self.after_as_is = false;
+        self.as_is_follow_state = AsIsFollowState::None;
         self.begin_state = BeginState::None;
         self.as_is_state = AsIsState::None;
         self.pending_subprogram_begins = 0;
@@ -1615,6 +1626,20 @@ mod tests {
         assert_eq!(engine.state.if_state, IfState::None);
         assert_eq!(engine.state.paren_depth, 0);
     }
+    #[test]
+    fn type_as_is_follow_state_is_cleared_by_declarative_kind_token() {
+        let mut state = SplitState {
+            create_plsql_kind: CreatePlsqlKind::TypeBody,
+            ..SplitState::default()
+        };
+
+        state.handle_block_openers("AS", EndTokenRole::None);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
+
+        state.handle_block_openers("OBJECT", EndTokenRole::None);
+        assert!(state.block_stack.is_empty());
+    }
+
     #[test]
     fn compound_trigger_timing_point_uses_dedicated_block_kind() {
         let mut state = SplitState {
