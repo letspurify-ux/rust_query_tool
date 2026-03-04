@@ -6,6 +6,32 @@ use crate::db::{FormatItem, QueryExecutor, ScriptItem, SplitState, ToolCommand};
 use crate::sql_text;
 use crate::ui::sql_editor::{SqlToken, SqlTokenSpan};
 
+#[derive(Debug, Clone, Default)]
+enum DollarQuoteState {
+    #[default]
+    Inactive,
+    Active {
+        tag: String,
+    },
+}
+
+impl DollarQuoteState {
+    fn activate(&mut self, tag: String) {
+        *self = Self::Active { tag };
+    }
+
+    fn deactivate(&mut self) {
+        *self = Self::Inactive;
+    }
+
+    fn active_tag(&self) -> Option<&str> {
+        match self {
+            Self::Active { tag } => Some(tag.as_str()),
+            Self::Inactive => None,
+        }
+    }
+}
+
 /// SQL 문자열을 토큰 단위로 분해합니다.
 ///
 /// 기존 에디터 토크나이저 동작(문자열, 주석, 라벨, 심벌 처리)을 유지합니다.
@@ -23,8 +49,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     let mut current_start = 0usize;
     let mut scan_state = SplitState::default();
     let mut pending_newline = true;
-    let mut in_dollar_quote = false;
-    let mut dollar_quote_tag = String::new();
+    let mut dollar_quote_state = DollarQuoteState::default();
 
     let flush_word = |current: &mut String,
                       current_start: &mut usize,
@@ -63,7 +88,10 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     while let Some((idx, c)) = iter.next() {
         let next = iter.peek().map(|(_, ch)| *ch);
 
-        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::LineComment) {
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::LineComment
+        ) {
             current.push(c);
             if c == '\n' {
                 tokens.push(SqlTokenSpan {
@@ -77,7 +105,10 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::BlockComment) {
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::BlockComment
+        ) {
             current.push(c);
             if c == '*' && next == Some('/') {
                 iter.next();
@@ -99,7 +130,10 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::QQuote { .. }) {
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::QQuote { .. }
+        ) {
             current.push(c);
             if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
                 iter.next();
@@ -115,11 +149,11 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if in_dollar_quote {
+        if let Some(tag) = dollar_quote_state.active_tag() {
             current.push(c);
-            if c == '$' && sql[idx..].starts_with(&dollar_quote_tag) {
+            if c == '$' && sql[idx..].starts_with(tag) {
                 let mut end = idx + 1;
-                for _ in 0..dollar_quote_tag.len().saturating_sub(1) {
+                for _ in 0..tag.len().saturating_sub(1) {
                     if let Some((next_idx, next_ch)) = iter.next() {
                         current.push(next_ch);
                         end = next_idx + next_ch.len_utf8();
@@ -132,14 +166,16 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
                     start: current_start,
                     end,
                 });
-                in_dollar_quote = false;
-                dollar_quote_tag.clear();
+                dollar_quote_state.deactivate();
                 continue;
             }
             continue;
         }
 
-        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::SingleQuote) {
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::SingleQuote
+        ) {
             current.push(c);
             if c == '\'' {
                 if next == Some('\'') {
@@ -158,7 +194,10 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
-        if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::DoubleQuote) {
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::DoubleQuote
+        ) {
             current.push(c);
             if c == '"' {
                 if next == Some('"') {
@@ -304,8 +343,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
             current.push_str(&tag);
-            in_dollar_quote = true;
-            dollar_quote_tag = tag.clone();
+            dollar_quote_state.activate(tag.clone());
             for _ in 0..tag.len().saturating_sub(1) {
                 let _ = iter.next();
             }
@@ -374,8 +412,14 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
     {
         use crate::sql_parser_engine::LexMode;
-        let is_comment = matches!(scan_state.lex_mode, LexMode::LineComment | LexMode::BlockComment);
-        let is_string = matches!(scan_state.lex_mode, LexMode::SingleQuote | LexMode::QQuote { .. }) || in_dollar_quote;
+        let is_comment = matches!(
+            scan_state.lex_mode,
+            LexMode::LineComment | LexMode::BlockComment
+        );
+        let is_string = matches!(
+            scan_state.lex_mode,
+            LexMode::SingleQuote | LexMode::QQuote { .. }
+        ) || matches!(dollar_quote_state, DollarQuoteState::Active { .. });
         let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
         if is_comment {
             if !current.is_empty() {
@@ -649,7 +693,10 @@ mod tests {
                 None
             };
 
-            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::LineComment) {
+            if matches!(
+                scan_state.lex_mode,
+                crate::sql_parser_engine::LexMode::LineComment
+            ) {
                 current.push(c);
                 if c == '\n' {
                     tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
@@ -660,7 +707,10 @@ mod tests {
                 continue;
             }
 
-            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::BlockComment) {
+            if matches!(
+                scan_state.lex_mode,
+                crate::sql_parser_engine::LexMode::BlockComment
+            ) {
                 current.push(c);
                 if c == '*' && next == Some('/') {
                     current.push('/');
@@ -677,7 +727,10 @@ mod tests {
                 continue;
             }
 
-            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::QQuote { .. }) {
+            if matches!(
+                scan_state.lex_mode,
+                crate::sql_parser_engine::LexMode::QQuote { .. }
+            ) {
                 current.push(c);
                 if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
                     current.push('\'');
@@ -690,7 +743,10 @@ mod tests {
                 continue;
             }
 
-            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::SingleQuote) {
+            if matches!(
+                scan_state.lex_mode,
+                crate::sql_parser_engine::LexMode::SingleQuote
+            ) {
                 current.push(c);
                 if c == '\'' {
                     if next == Some('\'') {
@@ -707,7 +763,10 @@ mod tests {
                 continue;
             }
 
-            if matches!(scan_state.lex_mode, crate::sql_parser_engine::LexMode::DoubleQuote) {
+            if matches!(
+                scan_state.lex_mode,
+                crate::sql_parser_engine::LexMode::DoubleQuote
+            ) {
                 current.push(c);
                 if c == '"' {
                     if next == Some('"') {
@@ -877,8 +936,14 @@ mod tests {
 
         {
             use crate::sql_parser_engine::LexMode;
-            let is_comment = matches!(scan_state.lex_mode, LexMode::LineComment | LexMode::BlockComment);
-            let is_string = matches!(scan_state.lex_mode, LexMode::SingleQuote | LexMode::QQuote { .. });
+            let is_comment = matches!(
+                scan_state.lex_mode,
+                LexMode::LineComment | LexMode::BlockComment
+            );
+            let is_string = matches!(
+                scan_state.lex_mode,
+                LexMode::SingleQuote | LexMode::QQuote { .. }
+            );
             let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
             if is_comment {
                 if !current.is_empty() {
@@ -1003,17 +1068,17 @@ mod tests {
     #[test]
     fn tokenize_sql_treats_postgres_dollar_quote_as_string() {
         let tokens = tokenize_sql("SELECT $$a,(b)$$, c FROM dual");
-        assert!(tokens.iter().any(
-            |t| matches!(t, SqlToken::String(s) if s == "$$a,(b)$$")
-        ));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, SqlToken::String(s) if s == "$$a,(b)$$")));
     }
 
     #[test]
     fn tokenize_sql_treats_tagged_dollar_quote_as_string() {
         let tokens = tokenize_sql("SELECT $proc$BEGIN (x); END$proc$, c FROM dual");
-        assert!(tokens.iter().any(
-            |t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")
-        ));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")));
     }
 }
 
