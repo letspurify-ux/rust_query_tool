@@ -106,6 +106,28 @@ fn store_mutex_bool(flag: &Arc<Mutex<bool>>, value: bool) {
     }
 }
 
+fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
+    match query_running.lock() {
+        Ok(mut guard) => {
+            if *guard {
+                false
+            } else {
+                *guard = true;
+                true
+            }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            if *guard {
+                false
+            } else {
+                *guard = true;
+                true
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct PendingAlertState {
     queue: VecDeque<String>,
@@ -3576,8 +3598,8 @@ fn is_string_or_comment_style(style: char) -> bool {
 #[cfg(test)]
 mod execution_state_tests {
     use super::{
-        classify_edit_group, load_mutex_bool, BufferEdit, EditGranularity, EditOperation,
-        QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState,
+        classify_edit_group, load_mutex_bool, try_mark_query_running, BufferEdit, EditGranularity,
+        EditOperation, QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState,
     };
     use fltk::app;
     use std::ptr::NonNull;
@@ -3682,6 +3704,31 @@ mod execution_state_tests {
 
         assert!(!load_mutex_bool(&query_running));
         assert!(!load_mutex_bool(&cancel_flag));
+    }
+
+    #[test]
+    fn try_mark_query_running_sets_running_flag_once() {
+        let query_running = Arc::new(Mutex::new(false));
+
+        assert!(try_mark_query_running(&query_running));
+        assert!(!try_mark_query_running(&query_running));
+        assert!(load_mutex_bool(&query_running));
+    }
+
+    #[test]
+    fn try_mark_query_running_recovers_when_mutex_is_poisoned() {
+        let query_running = Arc::new(Mutex::new(false));
+        let poison_target = query_running.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("poison query_running mutex");
+        })
+        .join();
+
+        assert!(try_mark_query_running(&query_running));
+        assert!(load_mutex_bool(&query_running));
     }
 
     #[test]
