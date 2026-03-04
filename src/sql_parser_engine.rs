@@ -768,7 +768,7 @@ impl SplitState {
             }
         } else if upper == "END" {
             self.pending_end = PendingEnd::End;
-        } else if upper == "COMPOUND" && self.in_create_plsql() {
+        } else if upper == "COMPOUND" && self.is_trigger() && self.block_depth() == 0 {
             self.mark_compound_trigger();
             self.block_stack.push(BlockKind::Compound);
         } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
