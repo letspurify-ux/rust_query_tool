@@ -110,77 +110,60 @@ impl SqlEditorWidget {
     const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
 
     fn is_insert_column_list_context(tokens: &[SqlToken], cursor_token_len: usize) -> bool {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum InsertParseState {
+            Idle,
+            AfterInsert,
+            AfterInto,
+            AfterTarget,
+            InColumnList { start_depth: usize },
+            AfterColumnList,
+            InValuesOrSelectBody,
+        }
+
         let cursor_token_len = cursor_token_len.min(tokens.len());
-        let mut seen_insert = false;
-        let mut seen_into = false;
-        let mut seen_target = false;
-        let mut seen_values = false;
-        let mut seen_select_body_start = false;
-        let mut seen_column_list_start = false;
+        let mut state = InsertParseState::Idle;
         let mut depth = 0usize;
-        let mut column_list_depth: Option<usize> = None;
 
         for token in &tokens[..cursor_token_len] {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
                     if word.eq_ignore_ascii_case("INSERT") {
-                        seen_insert = true;
-                        seen_into = false;
-                        seen_target = false;
-                        seen_values = false;
-                        seen_select_body_start = false;
-                        seen_column_list_start = false;
-                        column_list_depth = None;
+                        state = InsertParseState::AfterInsert;
                         depth = 0;
                         continue;
                     }
 
-                    if !seen_insert {
-                        continue;
-                    }
-
-                    if word.eq_ignore_ascii_case("INTO") && !seen_into {
-                        seen_into = true;
-                        continue;
-                    }
-
-                    if word.eq_ignore_ascii_case("VALUES") {
-                        seen_values = true;
-                        seen_select_body_start = true;
-                        continue;
-                    }
-
-                    if seen_into && !seen_target {
-                        seen_target = true;
-                        continue;
-                    }
-
-                    if seen_target
-                        && (word.eq_ignore_ascii_case("SELECT")
-                            || word.eq_ignore_ascii_case("WITH"))
-                    {
-                        seen_select_body_start = true;
-                    }
+                    state = match state {
+                        InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
+                            InsertParseState::AfterInto
+                        }
+                        InsertParseState::AfterInto => InsertParseState::AfterTarget,
+                        InsertParseState::AfterTarget | InsertParseState::AfterColumnList
+                            if word.eq_ignore_ascii_case("VALUES")
+                                || word.eq_ignore_ascii_case("SELECT")
+                                || word.eq_ignore_ascii_case("WITH") =>
+                        {
+                            InsertParseState::InValuesOrSelectBody
+                        }
+                        current => current,
+                    };
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
-                    if seen_insert
-                        && seen_into
-                        && seen_target
-                        && !seen_values
-                        && !seen_select_body_start
-                        && !seen_column_list_start
-                        && column_list_depth.is_none()
-                    {
-                        column_list_depth = Some(depth + 1);
-                        seen_column_list_start = true;
+                    if matches!(state, InsertParseState::AfterTarget) {
+                        state = InsertParseState::InColumnList {
+                            start_depth: depth + 1,
+                        };
                     }
                     depth = depth.saturating_add(1);
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
                     if depth > 0 {
-                        if column_list_depth == Some(depth) {
-                            column_list_depth = None;
+                        if let InsertParseState::InColumnList { start_depth } = state {
+                            if start_depth == depth {
+                                state = InsertParseState::AfterColumnList;
+                            }
                         }
                         depth -= 1;
                     }
@@ -189,7 +172,7 @@ impl SqlEditorWidget {
             }
         }
 
-        !seen_values && column_list_depth.is_some()
+        matches!(state, InsertParseState::InColumnList { .. })
     }
 
     fn is_cursor_inside_cte_explicit_column_list(
