@@ -123,6 +123,7 @@ pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
 /// statement head instead of a main query keyword.
 pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
     word.eq_ignore_ascii_case("DECLARE")
+        || word.eq_ignore_ascii_case("BEGIN")
         || word.eq_ignore_ascii_case("WITH")
         || word.eq_ignore_ascii_case("CALL")
         || word.eq_ignore_ascii_case("EXPLAIN")
