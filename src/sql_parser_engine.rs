@@ -947,6 +947,10 @@ impl SqlParserEngine {
             }
 
             if c == ';' {
+                // FOR/WHILE ... DO candidates cannot span statement terminators.
+                // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
+                self.state.pending_for_do = false;
+                self.state.pending_while_do = false;
                 self.state.resolve_pending_end_on_terminator();
                 if self.state.block_depth() == 0 {
                     let trimmed = self.current.trim();
