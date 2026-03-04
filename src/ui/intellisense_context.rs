@@ -209,7 +209,11 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE")
 }
 
-fn should_enter_with_clause(current_phase: SqlPhase, depth: usize, last_word: Option<&str>) -> bool {
+fn should_enter_with_clause(
+    current_phase: SqlPhase,
+    depth: usize,
+    last_word: Option<&str>,
+) -> bool {
     if matches!(current_phase, SqlPhase::Initial) {
         return true;
     }
@@ -262,15 +266,37 @@ fn build_visible_scope_chain(
 fn snapshot_cursor_state(
     depth: usize,
     query_depth: usize,
-    phase_stack: &[SqlPhase],
+    depth_frames: &[ParserDepthFrame],
     scope_stack: &[usize],
     visible_parent: &HashMap<usize, Option<usize>>,
 ) -> (SqlPhase, usize, Vec<usize>) {
     (
-        phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial),
+        depth_frames
+            .get(depth)
+            .map(|frame| frame.phase)
+            .unwrap_or(SqlPhase::Initial),
         query_depth,
         build_visible_scope_chain(scope_stack, visible_parent),
     )
+}
+
+#[derive(Debug, Clone)]
+struct ParserDepthFrame {
+    phase: SqlPhase,
+    is_query_scope: bool,
+    paren_func: Option<String>,
+    func_from_consumed: bool,
+}
+
+impl Default for ParserDepthFrame {
+    fn default() -> Self {
+        Self {
+            phase: SqlPhase::Initial,
+            is_query_scope: false,
+            paren_func: None,
+            func_from_consumed: false,
+        }
+    }
 }
 
 /// Single-pass cursor parser:
@@ -281,10 +307,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut parser_state = SplitState::default();
     let mut depth: usize = parser_state.paren_depth;
     let mut query_depth: usize = 0;
-    let mut phase_stack: Vec<SqlPhase> = vec![SqlPhase::Initial];
-    let mut query_scope_stack: Vec<bool> = vec![false];
-    let mut paren_func_stack: Vec<Option<String>> = vec![None];
-    let mut paren_func_from_consumed_stack: Vec<bool> = vec![false];
+    let mut depth_frames: Vec<ParserDepthFrame> = vec![ParserDepthFrame::default()];
     let mut last_word: Option<String> = None;
     let mut expect_table = false;
     let mut all_tables: Vec<ParsedTableEntry> = Vec::new();
@@ -303,24 +326,26 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut cursor_snapshot: Option<(SqlPhase, usize, Vec<usize>)> = None;
     let mut idx = 0;
 
-    let mark_query_scope = |depth: usize, query_scope_stack: &mut Vec<bool>, query_depth: &mut usize| {
-        if depth > 0
-            && query_scope_stack
-                .get(depth)
-                .copied()
-                .is_some_and(|is_query_scope| !is_query_scope)
-        {
-            query_scope_stack[depth] = true;
-            *query_depth = query_depth.saturating_add(1);
-        }
-    };
+    let mark_query_scope =
+        |depth: usize, depth_frames: &mut Vec<ParserDepthFrame>, query_depth: &mut usize| {
+            if depth > 0
+                && depth_frames
+                    .get(depth)
+                    .is_some_and(|frame| !frame.is_query_scope)
+            {
+                if let Some(frame) = depth_frames.get_mut(depth) {
+                    frame.is_query_scope = true;
+                }
+                *query_depth = query_depth.saturating_add(1);
+            }
+        };
 
     while idx < tokens.len() {
         if cursor_snapshot.is_none() && idx == cursor_token_len {
             cursor_snapshot = Some(snapshot_cursor_state(
                 depth,
                 query_depth,
-                &phase_stack,
+                &depth_frames,
                 &scope_stack,
                 &visible_parent,
             ));
@@ -330,7 +355,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
         match token {
             SqlToken::Symbol(sym) if sym == "(" => {
-                let parent_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
+                let parent_phase = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.phase)
+                    .unwrap_or(SqlPhase::Initial);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
                 parser_state.paren_depth = parser_state.paren_depth.saturating_add(1);
                 depth = parser_state.paren_depth;
@@ -344,37 +372,25 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 } else {
                     SqlPhase::Initial
                 };
-                if phase_stack.len() <= depth {
-                    phase_stack.push(inherited_phase);
-                } else {
-                    phase_stack[depth] = inherited_phase;
+                if depth_frames.len() <= depth {
+                    depth_frames.push(ParserDepthFrame::default());
                 }
-                if query_scope_stack.len() <= depth {
-                    query_scope_stack.push(false);
-                } else {
-                    query_scope_stack[depth] = false;
-                }
-                // Record the function name that preceded this '(' so we can
-                // distinguish function-internal FROM from SQL FROM clauses.
-                let func_name = last_word.take().map(|w| w.to_ascii_uppercase());
-                if paren_func_stack.len() <= depth {
-                    paren_func_stack.push(func_name);
-                } else {
-                    paren_func_stack[depth] = func_name;
-                }
-                if paren_func_from_consumed_stack.len() <= depth {
-                    paren_func_from_consumed_stack.push(false);
-                } else {
-                    paren_func_from_consumed_stack[depth] = false;
+                if let Some(frame) = depth_frames.get_mut(depth) {
+                    frame.phase = inherited_phase;
+                    frame.is_query_scope = false;
+                    // Record the function name that preceded this '(' so we can
+                    // distinguish function-internal FROM from SQL FROM clauses.
+                    frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
+                    frame.func_from_consumed = false;
                 }
 
                 let scope_id = next_scope_id;
                 next_scope_id += 1;
                 scope_stack.push(scope_id);
 
-                let is_from_lateral_function = paren_func_stack
+                let is_from_lateral_function = depth_frames
                     .get(depth)
-                    .and_then(|name| name.as_deref())
+                    .and_then(|frame| frame.paren_func.as_deref())
                     .is_some_and(is_from_lateral_table_function);
                 let inherited_visible_parent = if matches!(parent_phase, SqlPhase::FromClause)
                     && !pending_lateral_subquery
@@ -416,7 +432,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 }
 
                 let was_subquery = subquery_tracks.last().map(|t| t.0) == Some(depth);
-                if let Some((_, start_idx)) = was_subquery.then(|| subquery_tracks.pop()).flatten() {
+                if let Some((_, start_idx)) = was_subquery.then(|| subquery_tracks.pop()).flatten()
+                {
                     if start_idx <= idx {
                         let parent_scope_id = if scope_stack.len() >= 2 {
                             scope_stack[scope_stack.len() - 2]
@@ -445,9 +462,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 },
                                 scope_id: parent_scope_id,
                             });
-                            if query_scope_stack
-                                .last()
-                                .copied()
+                            if depth_frames
+                                .get(depth)
+                                .map(|frame| frame.is_query_scope)
                                 .unwrap_or(false)
                                 && depth > 0
                             {
@@ -455,11 +472,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             }
                             idx = next_idx;
                             depth = depth.saturating_sub(1);
+                            parser_state.paren_depth = depth;
                             if scope_stack.len() > 1 {
                                 scope_stack.pop();
                             }
-                            if query_scope_stack.len() > 1 {
-                                query_scope_stack.pop();
+                            if depth_frames.len() > 1 {
+                                depth_frames.pop();
                             }
                             pending_lateral_subquery = false;
                             expect_table = false;
@@ -488,9 +506,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                 }
 
-                if query_scope_stack
-                    .last()
-                    .copied()
+                if depth_frames
+                    .get(depth)
+                    .map(|frame| frame.is_query_scope)
                     .unwrap_or(false)
                     && depth > 0
                 {
@@ -501,8 +519,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if scope_stack.len() > 1 {
                     scope_stack.pop();
                 }
-                if query_scope_stack.len() > 1 {
-                    query_scope_stack.pop();
+                if depth_frames.len() > 1 {
+                    depth_frames.pop();
                 }
                 pending_lateral_subquery = false;
                 expect_table = false;
@@ -516,13 +534,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
             }
             SqlToken::Symbol(sym) if sym == "," => {
                 pending_lateral_subquery = false;
-                let current_phase = phase_stack.get(depth).copied().unwrap_or(SqlPhase::Initial);
+                let current_phase = depth_frames
+                    .get(depth)
+                    .map(|frame| frame.phase)
+                    .unwrap_or(SqlPhase::Initial);
                 if matches!(current_phase, SqlPhase::FromClause) {
                     expect_table = true;
                 }
                 if matches!(cte_state, CteState::None)
                     && depth == 0
-                    && matches!(phase_stack.first(), Some(SqlPhase::WithClause))
+                    && depth_frames
+                        .first()
+                        .is_some_and(|frame| matches!(frame.phase, SqlPhase::WithClause))
                 {
                     cte_state = CteState::ExpectName;
                 }
@@ -542,10 +565,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 subquery_tracks.clear();
 
                 query_depth = 0;
-                phase_stack = vec![SqlPhase::Initial];
-                query_scope_stack = vec![false];
-                paren_func_stack = vec![None];
-                paren_func_from_consumed_stack = vec![false];
+                depth_frames = vec![ParserDepthFrame::default()];
                 last_word = None;
                 expect_table = false;
                 cte_state = CteState::None;
@@ -604,11 +624,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 }
 
                 // Ensure phase_stack has entry for current depth
-                while phase_stack.len() <= depth {
-                    phase_stack.push(SqlPhase::Initial);
+                while depth_frames.len() <= depth {
+                    depth_frames.push(ParserDepthFrame::default());
                 }
 
-                let current_phase = phase_stack[depth];
+                let current_phase = depth_frames[depth].phase;
 
                 if (upper == "LATERAL" || upper == "APPLY")
                     && matches!(current_phase, SqlPhase::FromClause)
@@ -621,38 +641,38 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 match upper.as_str() {
                     "INSERT" => {
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = false;
                     }
-                    "WITH" if should_enter_with_clause(current_phase, depth, last_word.as_deref()) => {
-                        phase_stack[depth] = SqlPhase::WithClause;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                    "WITH"
+                        if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
+                    {
+                        depth_frames[depth].phase = SqlPhase::WithClause;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         cte_state = CteState::ExpectName;
                         expect_table = false;
                     }
                     "SELECT" => {
-                        phase_stack[depth] = SqlPhase::SelectList;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        depth_frames[depth].phase = SqlPhase::SelectList;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = false;
                     }
                     "FROM" => {
                         let consumes_func_from = depth > 0
-                            && paren_func_stack
+                            && depth_frames
                                 .get(depth)
-                                .and_then(|name| name.as_deref())
+                                .and_then(|frame| frame.paren_func.as_deref())
                                 .is_some_and(is_from_consuming_function);
-                        let func_from_already_consumed = paren_func_from_consumed_stack
+                        let func_from_already_consumed = depth_frames
                             .get(depth)
-                            .copied()
+                            .map(|frame| frame.func_from_consumed)
                             .unwrap_or(false);
                         if consumes_func_from && !func_from_already_consumed {
-                            if let Some(consumed_flag) =
-                                paren_func_from_consumed_stack.get_mut(depth)
-                            {
-                                *consumed_flag = true;
+                            if let Some(frame) = depth_frames.get_mut(depth) {
+                                frame.func_from_consumed = true;
                             }
                         } else {
-                            phase_stack[depth] = SqlPhase::FromClause;
+                            depth_frames[depth].phase = SqlPhase::FromClause;
                             expect_table = true;
                         }
                     }
@@ -661,7 +681,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
                         ) {
-                            phase_stack[depth] = SqlPhase::IntoClause;
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
                             expect_table = true;
                         }
                     }
@@ -670,94 +690,94 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
                         ) {
-                            phase_stack[depth] = SqlPhase::FromClause;
+                            depth_frames[depth].phase = SqlPhase::FromClause;
                             expect_table = true;
                         }
                     }
                     "JOIN" | "APPLY" => {
-                        phase_stack[depth] = SqlPhase::FromClause;
+                        depth_frames[depth].phase = SqlPhase::FromClause;
                         expect_table = true;
                     }
                     "ON" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
-                            phase_stack[depth] = SqlPhase::JoinCondition;
+                            depth_frames[depth].phase = SqlPhase::JoinCondition;
                         }
                         expect_table = false;
                     }
                     "WHERE" => {
-                        phase_stack[depth] = SqlPhase::WhereClause;
+                        depth_frames[depth].phase = SqlPhase::WhereClause;
                         expect_table = false;
                     }
                     "GROUP" => {
                         if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::GroupByClause;
+                            depth_frames[depth].phase = SqlPhase::GroupByClause;
                             idx += 1; // skip BY
                         }
                         expect_table = false;
                     }
                     "HAVING" => {
-                        phase_stack[depth] = SqlPhase::HavingClause;
+                        depth_frames[depth].phase = SqlPhase::HavingClause;
                         expect_table = false;
                     }
                     "ORDER" => {
                         if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::OrderByClause;
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
                             idx += 1; // skip BY
                         }
                         expect_table = false;
                     }
                     "SET" => {
-                        phase_stack[depth] = SqlPhase::SetClause;
+                        depth_frames[depth].phase = SqlPhase::SetClause;
                         expect_table = false;
                     }
                     "UPDATE" => {
-                        phase_stack[depth] = SqlPhase::UpdateTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        depth_frames[depth].phase = SqlPhase::UpdateTarget;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = true;
                     }
                     "DELETE" => {
-                        phase_stack[depth] = SqlPhase::DeleteTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        depth_frames[depth].phase = SqlPhase::DeleteTarget;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = true;
                     }
                     "MERGE" => {
-                        phase_stack[depth] = SqlPhase::MergeTarget;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        depth_frames[depth].phase = SqlPhase::MergeTarget;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = false;
                     }
                     "CONNECT" => {
                         if peek_word_upper(tokens, idx + 1) == Some("BY") {
-                            phase_stack[depth] = SqlPhase::ConnectByClause;
+                            depth_frames[depth].phase = SqlPhase::ConnectByClause;
                             idx += 1;
                         }
                         expect_table = false;
                     }
                     "START" => {
                         if peek_word_upper(tokens, idx + 1) == Some("WITH") {
-                            phase_stack[depth] = SqlPhase::StartWithClause;
+                            depth_frames[depth].phase = SqlPhase::StartWithClause;
                             idx += 1;
                         }
                         expect_table = false;
                     }
                     "VALUES" => {
-                        phase_stack[depth] = SqlPhase::ValuesClause;
-                        mark_query_scope(depth, &mut query_scope_stack, &mut query_depth);
+                        depth_frames[depth].phase = SqlPhase::ValuesClause;
+                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         expect_table = false;
                     }
                     "MATCH_RECOGNIZE" => {
-                        phase_stack[depth] = SqlPhase::MatchRecognizeClause;
+                        depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
                         expect_table = false;
                     }
                     "PIVOT" | "UNPIVOT" => {
-                        phase_stack[depth] = SqlPhase::PivotClause;
+                        depth_frames[depth].phase = SqlPhase::PivotClause;
                         expect_table = false;
                     }
                     "MODEL" => {
-                        phase_stack[depth] = SqlPhase::ModelClause;
+                        depth_frames[depth].phase = SqlPhase::ModelClause;
                         expect_table = false;
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
-                        phase_stack[depth] = SqlPhase::Initial;
+                        depth_frames[depth].phase = SqlPhase::Initial;
                         expect_table = false;
                     }
                     kw if is_table_stop_keyword(kw) && expect_table => {
@@ -765,7 +785,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     _ => {
                         if expect_table {
-                            if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx) {
+                            if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
+                            {
                                 let (alias, after_alias) = parse_alias_deep(tokens, next_idx);
                                 let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
@@ -817,7 +838,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         cursor_snapshot = Some(snapshot_cursor_state(
             depth,
             query_depth,
-            &phase_stack,
+            &depth_frames,
             &scope_stack,
             &visible_parent,
         ));
