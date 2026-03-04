@@ -595,7 +595,7 @@ impl SplitState {
             && self
                 .routine_is_stack
                 .last()
-                .is_some_and(|frame| frame.block_depth == self.block_depth())
+                .is_some_and(|frame| frame.block_depth == self.block_depth() && frame.block_depth == 1)
         {
             if let Some(frame) = self.routine_is_stack.last_mut() {
                 frame.semicolon_policy = SemicolonPolicy::ForceSplit;
@@ -1920,5 +1920,22 @@ mod tests {
 
         assert!(state.block_stack.is_empty());
         assert_eq!(state.pending_end, PendingEnd::None);
+    }
+
+    #[test]
+    fn package_with_nested_external_procedure_does_not_split_mid_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg AS");
+        engine.process_line("  PROCEDURE ext_proc IS");
+        engine.process_line("  EXTERNAL NAME \"ext_proc\" LANGUAGE C;");
+        engine.process_line("END pkg;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg;".to_string()
+            ]
+        );
     }
 }
