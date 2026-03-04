@@ -270,7 +270,7 @@ impl QueryExecutor {
             }
 
             if leading_is("BEGIN")
-                && (builder.state.pending_subprogram_begins > 0 || builder.state.after_declare)
+                && (builder.state.pending_subprogram_begins > 0 || builder.state.declare_state == crate::sql_parser_engine::DeclareState::AwaitingBegin)
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }

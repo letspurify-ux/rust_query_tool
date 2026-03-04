@@ -213,6 +213,31 @@ enum TimingPointState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeclareState {
+    None,
+    AwaitingBegin,
+}
+
+impl Default for DeclareState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AsIsContext {
+    None,
+    TypeAwaitingShape,
+    NestedSubprogram,
+}
+
+impl Default for AsIsContext {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CreateState {
     None,
     AwaitingObjectType,
@@ -281,9 +306,8 @@ pub(crate) struct SplitState {
     // -- CREATE PL/SQL tracking --
     create_plsql_kind: CreatePlsqlKind,
     pub(crate) create_state: CreateState,
-    pub(crate) after_declare: bool,
-    after_as_is: bool,
-    nested_subprogram: bool,
+    pub(crate) declare_state: DeclareState,
+    as_is_context: AsIsContext,
     pub(crate) pending_subprogram_begins: usize,
     routine_is_stack: Vec<RoutineFrame>,
     timing_point_state: TimingPointState,
@@ -568,19 +592,19 @@ impl SplitState {
         }
 
         // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE – not a real block
-        if self.after_as_is
+        if self.as_is_context == AsIsContext::TypeAwaitingShape
             && matches!(
                 upper,
                 "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE"
             )
         {
             self.block_stack.pop(); // undo the AS/IS push
-            self.after_as_is = false;
+            self.as_is_context = AsIsContext::None;
         }
 
         // Nested PROCEDURE/FUNCTION
         if self.block_depth() > 0 && matches!(upper, "PROCEDURE" | "FUNCTION") {
-            self.nested_subprogram = true;
+            self.as_is_context = AsIsContext::NestedSubprogram;
         }
 
         // AS/IS block start
@@ -589,7 +613,7 @@ impl SplitState {
 
         let is_block_starting_as_is = matches!(upper, "AS" | "IS")
             && (self.timing_point_state == TimingPointState::AwaitingAsOrIs
-                || self.nested_subprogram
+                || self.as_is_context == AsIsContext::NestedSubprogram
                 || (self.in_create_plsql() && self.block_depth() == 0));
 
         if is_block_starting_as_is {
@@ -599,12 +623,13 @@ impl SplitState {
                 self.block_stack.push(BlockKind::AsIs);
             }
             if self.is_type_create()
-                && !self.nested_subprogram
+                && self.as_is_context != AsIsContext::NestedSubprogram
                 && self.timing_point_state != TimingPointState::AwaitingAsOrIs
             {
-                self.after_as_is = true;
+                self.as_is_context = AsIsContext::TypeAwaitingShape;
+            } else {
+                self.as_is_context = AsIsContext::None;
             }
-            self.nested_subprogram = false;
             self.timing_point_state = TimingPointState::None;
             let needs_begin_tracking = if self.needs_nested_begin_tracking() {
                 self.block_depth() > 1
@@ -618,11 +643,11 @@ impl SplitState {
             }
         } else if upper == "DECLARE" {
             self.block_stack.push(BlockKind::Declare);
-            self.after_declare = true;
+            self.declare_state = DeclareState::AwaitingBegin;
         } else if upper == "BEGIN" {
-            if self.after_declare {
+            if self.declare_state == DeclareState::AwaitingBegin {
                 // DECLARE ... BEGIN – same block, don't push
-                self.after_declare = false;
+                self.declare_state = DeclareState::None;
             } else if self.pending_subprogram_begins > 0 {
                 // AS/IS ... BEGIN – same block
                 if self
@@ -693,8 +718,8 @@ impl SplitState {
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
-        self.after_as_is = false;
-        self.nested_subprogram = false;
+        self.declare_state = DeclareState::None;
+        self.as_is_context = AsIsContext::None;
         self.pending_subprogram_begins = 0;
         self.routine_is_stack.clear();
         self.timing_point_state = TimingPointState::None;
@@ -1301,8 +1326,8 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, TimingPointState,
+        BlockKind, CreatePlsqlKind, CreateState, DeclareState, EndTokenRole, IfState, PendingDo,
+        PendingEnd, PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, TimingPointState,
         WithClauseState,
     };
 
@@ -1441,6 +1466,31 @@ mod tests {
         assert_eq!(engine.state.pending_do, PendingDo::None);
         assert_eq!(engine.state.if_state, IfState::None);
         assert_eq!(engine.state.paren_depth, 0);
+    }
+
+    #[test]
+    fn declare_state_tracks_declare_begin_transition() {
+        let mut state = SplitState::default();
+
+        state.handle_block_openers("DECLARE", EndTokenRole::None);
+        assert_eq!(state.declare_state, DeclareState::AwaitingBegin);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::Declare));
+
+        state.handle_block_openers("BEGIN", EndTokenRole::None);
+        assert_eq!(state.declare_state, DeclareState::None);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::Declare));
+    }
+
+    #[test]
+    fn reset_create_state_clears_declare_state_machine() {
+        let mut state = SplitState {
+            declare_state: DeclareState::AwaitingBegin,
+            ..SplitState::default()
+        };
+
+        state.reset_create_state();
+
+        assert_eq!(state.declare_state, DeclareState::None);
     }
 
     #[test]
