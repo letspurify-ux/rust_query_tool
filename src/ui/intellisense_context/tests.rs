@@ -1527,6 +1527,16 @@ fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
 }
 
 #[test]
+fn extract_oracle_pivot_xml_projection_keeps_source_columns_without_generated_aliases() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
+         PIVOT XML (SUM(SAL) FOR DEPTNO IN (ANY))",
+    );
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["job"]);
+}
+
+#[test]
 fn extract_oracle_unpivot_generated_columns_from_clause() {
     let tokens = tokenize(
         "SELECT * FROM p \
