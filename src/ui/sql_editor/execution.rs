@@ -72,6 +72,12 @@ struct ResolvedScriptInclude {
     items: Vec<ScriptItem>,
 }
 
+#[derive(Clone, Copy)]
+struct ExecutionStartupPolicy {
+    has_connect_command: bool,
+    requires_connected_session: bool,
+}
+
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
@@ -3062,6 +3068,52 @@ impl SqlEditorWidget {
         !has_connection_bootstrap_command && !can_run_while_disconnected
     }
 
+    fn execution_startup_policy(sql: &str) -> ExecutionStartupPolicy {
+        let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
+        let can_run_while_disconnected = super::query_text::can_execute_while_disconnected(sql);
+        let requires_connected_session = Self::requires_connected_session_for_precheck(
+            has_connect_command,
+            can_run_while_disconnected,
+        );
+
+        ExecutionStartupPolicy {
+            has_connect_command,
+            requires_connected_session,
+        }
+    }
+
+    fn acquire_execution_connection(
+        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        sender: &mpsc::Sender<QueryProgress>,
+        has_connect_command: bool,
+    ) -> Result<Option<Arc<Connection>>, String> {
+        if has_connect_command {
+            if conn_guard.is_connected() {
+                match conn_guard.require_live_connection() {
+                    Ok(conn) => Ok(Some(conn)),
+                    Err(_) => {
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                        Ok(None)
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            match conn_guard.require_live_connection() {
+                Ok(conn) => Ok(Some(conn)),
+                Err(message) => {
+                    if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
+                        let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                        app::awake();
+                    }
+                    Err(message)
+                }
+            }
+        }
+    }
+
     fn emit_execution_startup_error(
         sender: &mpsc::Sender<QueryProgress>,
         script_mode: bool,
@@ -3106,13 +3158,8 @@ impl SqlEditorWidget {
                 }
             };
 
-        // Check if script includes connection bootstrap commands.
-        let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
-        let can_run_while_disconnected = super::query_text::can_execute_while_disconnected(sql);
-        let requires_connected_session = Self::requires_connected_session_for_precheck(
-            has_connect_command,
-            can_run_while_disconnected,
-        );
+        // Build an execution policy once and reuse it for both UI pre-check and worker startup.
+        let startup_policy = Self::execution_startup_policy(sql);
 
         // Pre-check connection status without holding lock for long
         {
@@ -3126,7 +3173,7 @@ impl SqlEditorWidget {
             // The execution worker performs full liveness validation.
             // Regression guard: scripts that contain CONNECT/@START must pass this gate
             // even when disconnected, so CONNECT can establish a session for later SQL.
-            if requires_connected_session
+            if startup_policy.requires_connected_session
                 && (!conn_guard.is_connected() || conn_guard.get_connection().is_none())
             {
                 SqlEditorWidget::show_alert_dialog("Not connected to database");
@@ -3171,43 +3218,22 @@ impl SqlEditorWidget {
                     String::new()
                 };
 
-                let mut conn_opt = if has_connect_command {
-                    // Script/bootstrapping commands may run while disconnected,
-                    // but if there is an existing session we still need to verify
-                    // it is alive before reusing it for non-CONNECT statements in
-                    // the same execution batch.
-                    if conn_guard.is_connected() {
-                        match conn_guard.require_live_connection() {
-                            Ok(conn) => Some(conn),
-                            Err(_) => {
-                                let _ =
-                                    sender.send(QueryProgress::ConnectionChanged { info: None });
-                                app::awake();
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    match conn_guard.require_live_connection() {
-                        Ok(conn) => Some(conn),
-                        Err(message) => {
-                            if !conn_guard.is_connected() || conn_guard.get_connection().is_none() {
-                                let _ =
-                                    sender.send(QueryProgress::ConnectionChanged { info: None });
-                                app::awake();
-                            }
-                            SqlEditorWidget::emit_execution_startup_error(
-                                &sender,
-                                script_mode,
-                                &sql_text,
-                                &conn_name,
-                                &message,
-                                None,
-                            );
-                            return;
-                        }
+                let mut conn_opt = match Self::acquire_execution_connection(
+                    &mut conn_guard,
+                    &sender,
+                    startup_policy.has_connect_command,
+                ) {
+                    Ok(conn) => conn,
+                    Err(message) => {
+                        SqlEditorWidget::emit_execution_startup_error(
+                            &sender,
+                            script_mode,
+                            &sql_text,
+                            &conn_name,
+                            &message,
+                            None,
+                        );
+                        return;
                     }
                 };
 
@@ -3217,7 +3243,7 @@ impl SqlEditorWidget {
                     conn_name.clear();
                 }
 
-                if requires_connected_session && conn_opt.is_none() {
+                if startup_policy.requires_connected_session && conn_opt.is_none() {
                     let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
                     let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
                     app::awake();
@@ -9274,6 +9300,22 @@ mod disconnected_precheck_gate_tests {
         assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
             false, true
         ));
+    }
+
+    #[test]
+    fn execution_startup_policy_marks_bootstrap_queries_as_disconnected_safe() {
+        let policy = SqlEditorWidget::execution_startup_policy("connect user/pass@db");
+
+        assert!(policy.has_connect_command);
+        assert!(!policy.requires_connected_session);
+    }
+
+    #[test]
+    fn execution_startup_policy_requires_connection_for_regular_sql() {
+        let policy = SqlEditorWidget::execution_startup_policy("select * from dual");
+
+        assert!(!policy.has_connect_command);
+        assert!(policy.requires_connected_session);
     }
 }
 
