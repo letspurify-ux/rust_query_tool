@@ -118,8 +118,16 @@ fn phase_join_using_clause() {
     assert!(ctx.phase.is_column_context());
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
-    assert!(names.contains(&"DEPARTMENTS".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"DEPARTMENTS".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -1257,6 +1265,58 @@ fn table_wrapper_collection_expression_keeps_alias() {
             .iter()
             .any(|table| table.alias.as_deref() == Some("c")),
         "TABLE(collection_expression) should still allow alias-driven completion: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_extension_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM sales PARTITION (p202401) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("PARTITION")),
+        "PARTITION clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following PARTITION clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flashback_as_of_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees AS OF SCN (12345) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("AS")),
+        "AS OF clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following AS OF clause should be collected: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|table| (&table.name, &table.alias))
