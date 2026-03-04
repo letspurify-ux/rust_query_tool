@@ -241,6 +241,39 @@ enum AsIsFollowState {
     AwaitingTypeDeclarativeKind,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EndResolutionPolicy {
+    KeepCreateState,
+    ResetCreateStateWhenTopLevel,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AsIsBlockStart {
+    None,
+    Regular,
+    TimingPoint,
+}
+
+impl AsIsBlockStart {
+    fn from_token(upper: &str, state: &SplitState) -> Self {
+        if !matches!(upper, "AS" | "IS") {
+            return Self::None;
+        }
+
+        if state.timing_point_state == TimingPointState::AwaitingAsOrIs {
+            return Self::TimingPoint;
+        }
+
+        if state.as_is_state == AsIsState::AwaitingNestedSubprogram
+            || (state.in_create_plsql() && state.block_depth() == 0)
+        {
+            return Self::Regular;
+        }
+
+        Self::None
+    }
+}
+
 impl Default for BeginState {
     fn default() -> Self {
         Self::None
@@ -352,13 +385,13 @@ pub(crate) struct SplitState {
 }
 
 impl SplitState {
-    fn resolve_pending_end_with_policy(&mut self, reset_create_state_when_top_level: bool) {
+    fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
         }
 
         self.resolve_plain_end();
-        if reset_create_state_when_top_level
+        if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
             && !self.in_with_plsql_declaration()
         {
@@ -638,23 +671,17 @@ impl SplitState {
         }
 
         // AS/IS block start
-        let is_timing_point_block_start = matches!(upper, "AS" | "IS")
-            && self.timing_point_state == TimingPointState::AwaitingAsOrIs;
+        let as_is_block_start = AsIsBlockStart::from_token(upper, self);
 
-        let is_block_starting_as_is = matches!(upper, "AS" | "IS")
-            && (self.timing_point_state == TimingPointState::AwaitingAsOrIs
-                || self.as_is_state == AsIsState::AwaitingNestedSubprogram
-                || (self.in_create_plsql() && self.block_depth() == 0));
-
-        if is_block_starting_as_is {
-            if is_timing_point_block_start {
+        if as_is_block_start != AsIsBlockStart::None {
+            if as_is_block_start == AsIsBlockStart::TimingPoint {
                 self.block_stack.push(BlockKind::TimingPoint);
             } else {
                 self.block_stack.push(BlockKind::AsIs);
             }
             if self.is_type_create()
                 && self.as_is_state != AsIsState::AwaitingNestedSubprogram
-                && self.timing_point_state != TimingPointState::AwaitingAsOrIs
+                && as_is_block_start != AsIsBlockStart::TimingPoint
             {
                 self.as_is_follow_state = AsIsFollowState::AwaitingTypeDeclarativeKind;
             }
@@ -727,15 +754,15 @@ impl SplitState {
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
-        self.resolve_pending_end_with_policy(false);
+        self.resolve_pending_end_with_policy(EndResolutionPolicy::KeepCreateState);
     }
 
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
-        self.resolve_pending_end_with_policy(true);
+        self.resolve_pending_end_with_policy(EndResolutionPolicy::ResetCreateStateWhenTopLevel);
     }
 
     pub(crate) fn resolve_pending_end_on_eof(&mut self) {
-        self.resolve_pending_end_with_policy(true);
+        self.resolve_pending_end_with_policy(EndResolutionPolicy::ResetCreateStateWhenTopLevel);
     }
 
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
