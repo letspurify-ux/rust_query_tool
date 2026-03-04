@@ -165,15 +165,26 @@ pub(crate) enum PendingDo {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct RoutineFrame {
     block_depth: usize,
-    split_on_semicolon: bool,
+    semicolon_policy: SemicolonPolicy,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SemicolonPolicy {
+    Default,
+    ForceSplit,
 }
 
 impl RoutineFrame {
     fn new(block_depth: usize) -> Self {
         Self {
             block_depth,
-            split_on_semicolon: false,
+            semicolon_policy: SemicolonPolicy::Default,
         }
+    }
+
+    fn should_split_on_semicolon(self, current_block_depth: usize) -> bool {
+        self.block_depth == current_block_depth
+            && self.semicolon_policy == SemicolonPolicy::ForceSplit
     }
 }
 
@@ -269,7 +280,13 @@ enum CreatePlsqlKind {
     TypeSpecAwaitingBody,
     TypeSpec,
     TypeBody,
-    Trigger { compound: bool },
+    Trigger(TriggerKind),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TriggerKind {
+    Simple,
+    Compound,
 }
 
 impl Default for CreatePlsqlKind {
@@ -369,19 +386,16 @@ impl SplitState {
     }
 
     pub(crate) fn is_trigger(&self) -> bool {
-        matches!(self.create_plsql_kind, CreatePlsqlKind::Trigger { .. })
+        matches!(self.create_plsql_kind, CreatePlsqlKind::Trigger(_))
     }
 
     fn in_compound_trigger(&self) -> bool {
-        matches!(
-            self.create_plsql_kind,
-            CreatePlsqlKind::Trigger { compound: true }
-        )
+        self.create_plsql_kind == CreatePlsqlKind::Trigger(TriggerKind::Compound)
     }
 
     fn mark_compound_trigger(&mut self) {
         if self.is_trigger() {
-            self.create_plsql_kind = CreatePlsqlKind::Trigger { compound: true };
+            self.create_plsql_kind = CreatePlsqlKind::Trigger(TriggerKind::Compound);
         }
     }
 
@@ -478,7 +492,7 @@ impl SplitState {
                 .is_some_and(|frame| frame.block_depth == self.block_depth())
         {
             if let Some(frame) = self.routine_is_stack.last_mut() {
-                frame.split_on_semicolon = true;
+                frame.semicolon_policy = SemicolonPolicy::ForceSplit;
             }
         }
     }
@@ -725,9 +739,9 @@ impl SplitState {
     }
 
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
-        self.routine_is_stack.last().is_some_and(|frame| {
-            frame.block_depth == self.block_depth() && frame.split_on_semicolon
-        })
+        self.routine_is_stack
+            .last()
+            .is_some_and(|frame| frame.should_split_on_semicolon(self.block_depth()))
     }
 
     pub(crate) fn reset_create_state(&mut self) {
@@ -787,7 +801,7 @@ impl SplitState {
                         "FUNCTION" => CreatePlsqlKind::Function,
                         "PACKAGE" => CreatePlsqlKind::Package,
                         "TYPE" => CreatePlsqlKind::TypeSpecAwaitingBody,
-                        "TRIGGER" => CreatePlsqlKind::Trigger { compound: false },
+                        "TRIGGER" => CreatePlsqlKind::Trigger(TriggerKind::Simple),
                         _ => CreatePlsqlKind::None,
                     };
                     self.create_state = CreateState::None;
@@ -1343,8 +1357,8 @@ impl SqlParserEngine {
 mod tests {
     use super::{
         BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, TimingPointState,
-        WithClauseState,
+        PendingEndSuffix, RoutineFrame, SemicolonPolicy, SplitState, SqlParserEngine,
+        TimingPointState, TriggerKind, WithClauseState,
     };
 
     #[test]
@@ -1545,7 +1559,7 @@ mod tests {
         engine.state.block_stack.push(BlockKind::AsIs);
         engine.state.routine_is_stack.push(RoutineFrame {
             block_depth: 1,
-            split_on_semicolon: true,
+            semicolon_policy: SemicolonPolicy::ForceSplit,
         });
         engine.state.pending_end = PendingEnd::End;
         engine.state.pending_do = PendingDo::While;
@@ -1643,7 +1657,7 @@ mod tests {
     #[test]
     fn compound_trigger_timing_point_uses_dedicated_block_kind() {
         let mut state = SplitState {
-            create_plsql_kind: CreatePlsqlKind::Trigger { compound: true },
+            create_plsql_kind: CreatePlsqlKind::Trigger(TriggerKind::Compound),
             timing_point_state: TimingPointState::AwaitingAsOrIs,
             ..SplitState::default()
         };
