@@ -279,11 +279,11 @@ enum SemicolonAction {
 
 impl SemicolonAction {
     fn from_state(state: &SplitState) -> Self {
-        if state.block_depth() == 0 && !state.in_with_plsql_declaration() {
+        if state.block_depth() == 0 && state.paren_depth == 0 && !state.in_with_plsql_declaration() {
             return Self::SplitTopLevel;
         }
 
-        if state.should_split_on_semicolon() {
+        if state.paren_depth == 0 && state.should_split_on_semicolon() {
             return Self::SplitForcedRoutine;
         }
 
@@ -889,7 +889,7 @@ impl SplitState {
     }
 
     fn track_top_level_with_plsql(&mut self, upper: &str) {
-        if self.block_depth() != 0 {
+        if self.block_depth() != 0 || self.paren_depth != 0 {
             return;
         }
 
@@ -1626,7 +1626,7 @@ mod tests {
             armed_at_block_depth: 0,
         };
         engine.state.if_state = IfState::AwaitingThen;
-        engine.state.paren_depth = 2;
+        engine.state.paren_depth = 0;
 
         engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
 
@@ -1705,7 +1705,7 @@ mod tests {
             armed_at_block_depth: 1,
         };
         engine.state.if_state = IfState::AfterConditionParen;
-        engine.state.paren_depth = 1;
+        engine.state.paren_depth = 0;
 
         engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
 

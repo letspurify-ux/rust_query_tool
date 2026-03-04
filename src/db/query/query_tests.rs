@@ -6713,3 +6713,50 @@ fn test_split_script_items_oracle_with_cte_using_function_call_splits_normally()
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_oracle_nested_with_function_subquery_splits_normally() {
+    let sql = "SELECT *\nFROM (\n  WITH\n    FUNCTION inner_f RETURN NUMBER IS\n    BEGIN\n      RETURN 1;\n    END;\n  SELECT inner_f() AS v FROM dual\n) t;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION inside subquery must not suppress top-level split: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("SELECT *\nFROM (\n  WITH\n    FUNCTION inner_f RETURN NUMBER IS"),
+        "first statement should preserve nested WITH FUNCTION subquery: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should start with trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_parenthesized_with_function_cte_splits_normally() {
+    let sql = "WITH outer_cte AS (\n  WITH\n    FUNCTION inner_f RETURN NUMBER IS\n    BEGIN\n      RETURN 1;\n    END;\n  SELECT inner_f() AS v FROM dual\n)\nSELECT * FROM outer_cte;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "parenthesized nested WITH FUNCTION CTE must still split at top-level semicolon: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH outer_cte AS (\n  WITH\n    FUNCTION inner_f RETURN NUMBER IS"),
+        "first statement should preserve nested WITH FUNCTION CTE: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT * FROM outer_cte"),
+        "first statement should include main outer SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
