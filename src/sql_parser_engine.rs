@@ -92,6 +92,7 @@ struct EndSuffixContext {
     while_suffix: bool,
     repeat_suffix: bool,
     for_suffix: bool,
+    timing_point_suffix: bool,
 }
 
 impl EndSuffixContext {
@@ -119,6 +120,10 @@ impl EndSuffixContext {
             },
             Some(PendingEndSuffix::For) => Self {
                 for_suffix: true,
+                ..Self::default()
+            },
+            Some(PendingEndSuffix::TimingPoint) => Self {
+                timing_point_suffix: true,
                 ..Self::default()
             },
             _ => Self::default(),
@@ -428,6 +433,7 @@ impl SplitState {
             }
             Some(PendingEndSuffix::TimingPoint) => {
                 self.pop_block_of_kind(BlockKind::TimingPoint);
+                self.pending_timing_point_is = false;
             }
             None => {
                 // Plain END – CASE expression or PL/SQL block
@@ -554,7 +560,10 @@ impl SplitState {
         } else if upper == "COMPOUND" && self.in_create_plsql {
             self.in_compound_trigger = true;
             self.block_stack.push(BlockKind::Compound);
-        } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD") && self.in_compound_trigger {
+        } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
+            && self.in_compound_trigger
+            && !end_suffix.timing_point_suffix
+        {
             self.pending_timing_point_is = true;
         }
     }
@@ -1273,8 +1282,29 @@ mod tests {
         assert!(for_ctx.for_suffix);
         assert!(!for_ctx.repeat_suffix);
 
+        let timing_ctx =
+            EndSuffixContext::from_pending_end_suffix(Some(PendingEndSuffix::TimingPoint));
+        assert!(timing_ctx.timing_point_suffix);
+        assert!(!timing_ctx.case_suffix);
+
         let none_ctx = EndSuffixContext::from_pending_end_suffix(None);
         assert_eq!(none_ctx, EndSuffixContext::default());
+    }
+
+    #[test]
+    fn end_timing_point_suffix_clears_pending_timing_point_state() {
+        let mut state = SplitState {
+            pending_end: PendingEnd::End,
+            pending_timing_point_is: true,
+            block_stack: vec![BlockKind::TimingPoint],
+            ..SplitState::default()
+        };
+
+        state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
+
+        assert_eq!(state.pending_end, PendingEnd::None);
+        assert!(!state.pending_timing_point_is);
+        assert!(state.block_stack.is_empty());
     }
 
     #[test]
