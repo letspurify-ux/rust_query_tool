@@ -6442,3 +6442,51 @@ fn test_split_format_items_oracle_with_procedure_keeps_single_statement_until_ma
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_merge() {
+    let sql = "WITH\n  FUNCTION normalize_id(p_id NUMBER) RETURN NUMBER IS\n  BEGIN\n    RETURN p_id;\n  END;\nMERGE INTO target t\nUSING (SELECT normalize_id(1) AS id FROM dual) s\nON (t.id = s.id)\nWHEN MATCHED THEN\n  UPDATE SET t.id = s.id;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION declaration must stay attached to main MERGE statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION normalize_id"),
+        "first statement should preserve WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("MERGE INTO target t"),
+        "first statement should include main MERGE: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_main_insert() {
+    let sql = "WITH\n  PROCEDURE p_log(p_id NUMBER) IS\n  BEGIN\n    NULL;\n  END;\nINSERT INTO target(id)\nSELECT 1 FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH PROCEDURE declaration must stay attached to main INSERT statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  PROCEDURE p_log"),
+        "first statement should preserve WITH PROCEDURE declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("INSERT INTO target(id)"),
+        "first statement should include main INSERT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
