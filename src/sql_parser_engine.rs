@@ -677,6 +677,11 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
     true
 }
 
+#[inline]
+fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
+    !delimiter.is_whitespace()
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -908,6 +913,14 @@ impl SqlParserEngine {
                 && chars[i + 2] == '\''
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
+                    if !is_valid_q_quote_delimiter(delimiter) {
+                        // Oracle q-quote delimiters cannot be whitespace.
+                        // Fall back to regular token/quote parsing.
+                        self.current.push(c);
+                        self.state.token.push(c);
+                        i += 1;
+                        continue;
+                    }
                     self.state.flush_token();
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);
@@ -922,6 +935,12 @@ impl SqlParserEngine {
             // q'[...]'
             if self.state.token.is_empty() && (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(delimiter) = next2 {
+                    if !is_valid_q_quote_delimiter(delimiter) {
+                        self.current.push(c);
+                        self.state.token.push(c);
+                        i += 1;
+                        continue;
+                    }
                     self.state.flush_token();
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);

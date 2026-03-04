@@ -5745,6 +5745,42 @@ fn test_line_block_depths_real_q_quote_still_works() {
 }
 
 #[test]
+fn test_split_script_items_q_quote_whitespace_delimiter_falls_back_to_normal_quote() {
+    let sql = "SELECT q' hello' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "q' <space>...' must not be treated as q-quote delimiter and should split normally: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("SELECT q' hello' FROM dual"),
+        "first statement should preserve regular quote fallback: {}",
+        stmts[0]
+    );
+}
+
+#[test]
+fn test_split_script_items_nq_quote_whitespace_delimiter_falls_back_to_normal_quote() {
+    let sql = "SELECT nq' hello' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "nq' <space>...' must not be treated as q-quote delimiter and should split normally: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("SELECT nq' hello' FROM dual"),
+        "first statement should preserve regular quote fallback: {}",
+        stmts[0]
+    );
+}
+
+#[test]
 fn test_line_block_depths_subquery_headed_by_with_clause_indents_correctly() {
     // When `(` is followed by `WITH cte AS (...) SELECT ...` on the next line,
     // the WITH line and the main SELECT inside the paren must both be at depth 1.
