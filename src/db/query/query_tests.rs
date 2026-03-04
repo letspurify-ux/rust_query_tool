@@ -4854,6 +4854,36 @@ END;"#;
 }
 
 #[test]
+fn test_split_script_items_trigger_for_each_row_does_not_arm_for_do() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_jobs
+BEFORE INSERT ON jobs
+FOR EACH ROW
+BEGIN
+  DO 1;
+END;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "FOR EACH ROW in trigger header must not arm FOR ... DO state: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("CREATE OR REPLACE TRIGGER"),
+        "first statement should be the trigger body"
+    );
+    assert!(
+        statements[1].contains("SELECT 1 FROM dual"),
+        "second statement should remain independently split"
+    );
+}
+
+#[test]
 fn test_line_block_depths_with_with_clause_prefixed_by_hint_comment() {
     let sql = r#"/*+ leading_optimizer_hint */ WITH cte AS (
   SELECT 1 AS id FROM dual

@@ -361,7 +361,11 @@ impl SplitState {
         }
 
         if upper == "FOR" && self.pending_end == PendingEnd::None && !is_end_for {
-            self.pending_for_do = true;
+            let is_trigger_header_for =
+                self.in_create_plsql && self.is_trigger && self.block_depth() == 0;
+            if !is_trigger_header_for {
+                self.pending_for_do = true;
+            }
         } else if self.pending_for_do && upper == "DO" {
             self.block_stack.push(BlockKind::For);
             self.pending_for_do = false;
