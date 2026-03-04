@@ -147,6 +147,27 @@ enum CteState {
     InBody,
 }
 
+/// FROM/INTO/JOIN relation parsing state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationParseState {
+    Idle,
+    ExpectTable,
+}
+
+impl RelationParseState {
+    fn expect_table(&mut self) {
+        *self = Self::ExpectTable;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Idle;
+    }
+
+    fn is_expect_table(self) -> bool {
+        matches!(self, Self::ExpectTable)
+    }
+}
+
 /// Analyze the SQL text from statement start to cursor position.
 /// Returns a `CursorContext` describing the phase, depth, and available tables.
 ///
@@ -309,7 +330,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut query_depth: usize = 0;
     let mut depth_frames: Vec<ParserDepthFrame> = vec![ParserDepthFrame::default()];
     let mut last_word: Option<String> = None;
-    let mut expect_table = false;
+    let mut relation_state = RelationParseState::Idle;
     let mut all_tables: Vec<ParsedTableEntry> = Vec::new();
     let mut all_subqueries: Vec<ParsedSubqueryEntry> = Vec::new();
     let mut subquery_tracks: Vec<(usize, usize)> = Vec::new(); // (depth, start_idx)
@@ -403,7 +424,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 visible_parent.insert(scope_id, inherited_visible_parent);
 
                 pending_lateral_subquery = false;
-                expect_table = false;
+                relation_state.clear();
 
                 if matches!(parent_phase, SqlPhase::FromClause) {
                     subquery_tracks.push((depth, idx + 1));
@@ -480,7 +501,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 depth_frames.pop();
                             }
                             pending_lateral_subquery = false;
-                            expect_table = false;
+                            relation_state.clear();
                             last_word = None;
                             continue;
                         }
@@ -523,7 +544,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     depth_frames.pop();
                 }
                 pending_lateral_subquery = false;
-                expect_table = false;
+                relation_state.clear();
                 last_word = None;
                 idx += 1;
                 continue;
@@ -539,7 +560,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
                 if matches!(current_phase, SqlPhase::FromClause) {
-                    expect_table = true;
+                    relation_state.expect_table();
                 }
                 if matches!(cte_state, CteState::None)
                     && depth == 0
@@ -567,7 +588,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 query_depth = 0;
                 depth_frames = vec![ParserDepthFrame::default()];
                 last_word = None;
-                expect_table = false;
+                relation_state.clear();
                 cte_state = CteState::None;
                 cte_paren_depth = 0;
                 parser_state.paren_depth = 0;
@@ -642,7 +663,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 match upper.as_str() {
                     "INSERT" => {
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "WITH"
                         if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
@@ -650,12 +671,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::WithClause;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         cte_state = CteState::ExpectName;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "SELECT" => {
                         depth_frames[depth].phase = SqlPhase::SelectList;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "FROM" => {
                         let consumes_func_from = depth > 0
@@ -673,7 +694,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             }
                         } else {
                             depth_frames[depth].phase = SqlPhase::FromClause;
-                            expect_table = true;
+                            relation_state.expect_table();
                         }
                     }
                     "INTO" => {
@@ -682,7 +703,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
                         ) {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
-                            expect_table = true;
+                            relation_state.expect_table();
                         }
                     }
                     "USING" => {
@@ -691,22 +712,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             SqlPhase::MergeTarget | SqlPhase::IntoClause | SqlPhase::FromClause
                         ) {
                             depth_frames[depth].phase = SqlPhase::FromClause;
-                            expect_table = true;
+                            relation_state.expect_table();
                         }
                     }
                     "JOIN" | "APPLY" => {
                         depth_frames[depth].phase = SqlPhase::FromClause;
-                        expect_table = true;
+                        relation_state.expect_table();
                     }
                     "ON" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
                             depth_frames[depth].phase = SqlPhase::JoinCondition;
                         }
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "WHERE" => {
                         depth_frames[depth].phase = SqlPhase::WhereClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "GROUP" => {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
@@ -715,11 +736,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 idx = next_idx; // skip BY (and any interleaved comments)
                             }
                         }
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "HAVING" => {
                         depth_frames[depth].phase = SqlPhase::HavingClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "ORDER" => {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
@@ -728,26 +749,26 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 idx = next_idx; // skip BY (and any interleaved comments)
                             }
                         }
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "SET" => {
                         depth_frames[depth].phase = SqlPhase::SetClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "UPDATE" => {
                         depth_frames[depth].phase = SqlPhase::UpdateTarget;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = true;
+                        relation_state.expect_table();
                     }
                     "DELETE" => {
                         depth_frames[depth].phase = SqlPhase::DeleteTarget;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = true;
+                        relation_state.expect_table();
                     }
                     "MERGE" => {
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "CONNECT" => {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
@@ -756,7 +777,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 idx = next_idx;
                             }
                         }
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "START" => {
                         if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
@@ -765,34 +786,34 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 idx = next_idx;
                             }
                         }
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "VALUES" => {
                         depth_frames[depth].phase = SqlPhase::ValuesClause;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "MATCH_RECOGNIZE" => {
                         depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "PIVOT" | "UNPIVOT" => {
                         depth_frames[depth].phase = SqlPhase::PivotClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "MODEL" => {
                         depth_frames[depth].phase = SqlPhase::ModelClause;
-                        expect_table = false;
+                        relation_state.clear();
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
                         depth_frames[depth].phase = SqlPhase::Initial;
-                        expect_table = false;
+                        relation_state.clear();
                     }
-                    kw if is_table_stop_keyword(kw) && expect_table => {
-                        expect_table = false;
+                    kw if is_table_stop_keyword(kw) && relation_state.is_expect_table() => {
+                        relation_state.clear();
                     }
                     _ => {
-                        if expect_table {
+                        if relation_state.is_expect_table() {
                             if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
                             {
                                 let (alias, after_alias) = parse_alias_deep(tokens, next_idx);
@@ -809,7 +830,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 if let Some(SqlToken::Symbol(sym)) = tokens.get(after_alias) {
                                     if sym == "," {
-                                        expect_table = true;
+                                        relation_state.expect_table();
                                         last_word = None;
                                         idx = after_alias + 1;
                                         continue;
@@ -824,11 +845,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     last_word = None;
                                 }
-                                expect_table = false;
+                                relation_state.clear();
                                 idx = after_alias;
                                 continue;
                             }
-                            expect_table = false;
+                            relation_state.clear();
                         }
                     }
                 }
