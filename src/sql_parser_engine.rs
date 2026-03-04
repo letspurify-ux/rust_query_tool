@@ -230,7 +230,13 @@ impl PendingDo {
 enum WithClauseState {
     None,
     PendingClause,
-    InPlsqlDeclaration { waiting_main_query: bool },
+    InPlsqlDeclaration(WithDeclarationState),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WithDeclarationState {
+    CollectingDeclaration,
+    AwaitingMainQuery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,16 +466,14 @@ impl SplitState {
     pub(crate) fn in_with_plsql_declaration(&self) -> bool {
         matches!(
             self.with_clause_state,
-            WithClauseState::InPlsqlDeclaration { .. }
+            WithClauseState::InPlsqlDeclaration(_)
         )
     }
 
     fn with_clause_waiting_main_query(&self) -> bool {
         matches!(
             self.with_clause_state,
-            WithClauseState::InPlsqlDeclaration {
-                waiting_main_query: true
-            }
+            WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery)
         )
     }
 
@@ -936,9 +940,8 @@ impl SplitState {
         }
 
         if matches!(upper, "FUNCTION" | "PROCEDURE") {
-            self.with_clause_state = WithClauseState::InPlsqlDeclaration {
-                waiting_main_query: true,
-            };
+            self.with_clause_state =
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
             return;
         }
 
@@ -958,13 +961,12 @@ impl SplitState {
 
         if matches!(
             self.with_clause_state,
-            WithClauseState::InPlsqlDeclaration { .. }
+            WithClauseState::InPlsqlDeclaration(_)
         ) && self.block_depth() == 0
             && !matches!(upper, "FUNCTION" | "PROCEDURE")
         {
-            self.with_clause_state = WithClauseState::InPlsqlDeclaration {
-                waiting_main_query: true,
-            };
+            self.with_clause_state =
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
         }
     }
 }
@@ -1459,9 +1461,9 @@ impl SqlParserEngine {
                     && self.state.block_depth() == 0
                     && self.state.paren_depth == 0
                 {
-                    self.state.with_clause_state = WithClauseState::InPlsqlDeclaration {
-                        waiting_main_query: true,
-                    };
+                    self.state.with_clause_state = WithClauseState::InPlsqlDeclaration(
+                        WithDeclarationState::AwaitingMainQuery,
+                    );
                 }
                 let semicolon_action = SemicolonAction::from_state(&self.state);
                 self.apply_semicolon_action(semicolon_action, c);
@@ -1526,7 +1528,7 @@ mod tests {
     use super::{
         BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
         PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SplitState,
-        SqlParserEngine, TimingPointState, TriggerKind, WithClauseState,
+        SqlParserEngine, TimingPointState, TriggerKind, WithClauseState, WithDeclarationState,
     };
 
     #[test]
@@ -1541,9 +1543,8 @@ mod tests {
     #[test]
     fn semicolon_action_keeps_with_clause_declaration_statement_open() {
         let mut state = SplitState::default();
-        state.with_clause_state = WithClauseState::InPlsqlDeclaration {
-            waiting_main_query: true,
-        };
+        state.with_clause_state =
+            WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery);
         assert_eq!(
             SemicolonAction::from_state(&state),
             SemicolonAction::AppendToCurrent
@@ -1845,9 +1846,9 @@ mod tests {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
             create_plsql_kind: CreatePlsqlKind::Procedure,
-            with_clause_state: WithClauseState::InPlsqlDeclaration {
-                waiting_main_query: true,
-            },
+            with_clause_state: WithClauseState::InPlsqlDeclaration(
+                WithDeclarationState::AwaitingMainQuery,
+            ),
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
         };
