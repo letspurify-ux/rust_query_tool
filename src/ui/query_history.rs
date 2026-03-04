@@ -765,10 +765,16 @@ fn history_entry_matches_filter(
 
 fn history_entry_display(entry: &QueryHistoryEntry) -> String {
     let color_prefix = if entry.success { "@C255 " } else { "@C1 " };
+    let sql_first_line = entry
+        .sql
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r');
     format!(
         "{color_prefix}{} | {} | {}ms | {} rows",
         entry.timestamp,
-        truncate_sql(&entry.sql, 50),
+        truncate_sql(sql_first_line, 50),
         entry.execution_time_ms,
         entry.row_count
     )
