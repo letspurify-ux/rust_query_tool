@@ -799,7 +799,7 @@ impl SplitState {
         if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind
             && matches!(
                 upper,
-                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE"
+                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE" | "VARYING"
             )
         {
             self.block_stack.pop(); // undo the AS/IS push
@@ -2021,6 +2021,25 @@ mod tests {
             engine.finalize_and_take_statements(),
             vec![
                 "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg;".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn type_varying_array_declaration_splits_at_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line(
+            "CREATE OR REPLACE TYPE phone_list_t IS VARYING ARRAY(10) OF VARCHAR2(25);",
+        );
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE TYPE phone_list_t IS VARYING ARRAY(10) OF VARCHAR2(25)"
+                    .to_string(),
+                "SELECT 1 FROM dual".to_string(),
             ]
         );
     }
