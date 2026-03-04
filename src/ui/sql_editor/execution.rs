@@ -154,6 +154,28 @@ impl Drop for QueryRunningReservation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenCursorFormatState {
+    None,
+    AwaitingFor,
+    InSelect { anchor_indent: usize },
+}
+
+impl OpenCursorFormatState {
+    fn base_indent(self, indent_level: usize) -> usize {
+        match self {
+            Self::InSelect { anchor_indent } => {
+                anchor_indent + indent_level.saturating_sub(anchor_indent.saturating_sub(1))
+            }
+            _ => indent_level,
+        }
+    }
+
+    fn in_select(self) -> bool {
+        matches!(self, Self::InSelect { .. })
+    }
+}
+
 impl SqlEditorWidget {
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
@@ -1010,9 +1032,7 @@ impl SqlEditorWidget {
         let mut column_list_stack: Vec<bool> = Vec::new();
         let mut current_clause: Option<String> = None;
         let mut pending_package_member_separator = false;
-        let mut open_cursor_pending = false;
-        let mut in_open_cursor_sql = false;
-        let mut open_cursor_sql_indent = 0usize;
+        let mut open_cursor_state = OpenCursorFormatState::None;
         let mut case_branch_started: Vec<bool> = Vec::new();
         let mut between_pending = false;
         let mut select_list_anchor: Option<usize> = None;
@@ -1040,15 +1060,9 @@ impl SqlEditorWidget {
             *needs_space = false;
         };
 
-        let base_indent =
-            |indent_level: usize, in_open_cursor_sql: bool, open_cursor_sql_indent: usize| {
-                if in_open_cursor_sql {
-                    open_cursor_sql_indent
-                        + indent_level.saturating_sub(open_cursor_sql_indent.saturating_sub(1))
-                } else {
-                    indent_level
-                }
-            };
+        let base_indent = |indent_level: usize, open_cursor_state: OpenCursorFormatState| {
+            open_cursor_state.base_indent(indent_level)
+        };
 
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
@@ -1250,7 +1264,7 @@ impl SqlEditorWidget {
                             };
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             end_extra + paren_extra,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1295,7 +1309,7 @@ impl SqlEditorWidget {
                     {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             1,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1314,7 +1328,7 @@ impl SqlEditorWidget {
                     {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             if is_within_group { 1 } else { 0 },
                             &mut at_line_start,
                             &mut needs_space,
@@ -1326,9 +1340,8 @@ impl SqlEditorWidget {
                                 select_list_anchor = None;
                                 select_list_multiline_forced = false;
                             }
-                            if upper == "SELECT" && in_open_cursor_sql {
+                            if upper == "SELECT" && open_cursor_state.in_select() {
                                 // Keep OPEN ... FOR SELECT inside the cursor SQL context.
-                                open_cursor_pending = false;
                             }
                             if upper == "WITH" {
                                 with_cte_active = true;
@@ -1359,7 +1372,7 @@ impl SqlEditorWidget {
                         }
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             1 + paren_extra,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1397,11 +1410,7 @@ impl SqlEditorWidget {
                         if !at_line_start {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1426,11 +1435,7 @@ impl SqlEditorWidget {
                         if in_if_block {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level.saturating_sub(1),
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1440,11 +1445,7 @@ impl SqlEditorWidget {
                             // ELSE in CASE or other context
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 1 + paren_extra,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1471,11 +1472,7 @@ impl SqlEditorWidget {
                         if !join_modifier_active {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1487,11 +1484,7 @@ impl SqlEditorWidget {
                         if next_word_is("JOIN") || next_word_is("OUTER") {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1503,11 +1496,7 @@ impl SqlEditorWidget {
                         if next_word_is("JOIN") && !join_modifier_active {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1516,36 +1505,30 @@ impl SqlEditorWidget {
                             join_modifier_active = true;
                         }
                     } else if upper == "OPEN" {
-                        open_cursor_pending = true;
+                        open_cursor_state = OpenCursorFormatState::AwaitingFor;
                     } else if upper == "FOR" || upper == "WHILE" {
                         if upper == "FOR" && trigger_header_active {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 1,
                                 &mut at_line_start,
                                 &mut needs_space,
                                 &mut line_indent,
                             );
                             after_for_while = false;
-                        } else if upper == "FOR" && open_cursor_pending {
-                            open_cursor_pending = false;
-                            in_open_cursor_sql = true;
-                            open_cursor_sql_indent = indent_level.saturating_add(1);
+                        } else if upper == "FOR"
+                            && open_cursor_state == OpenCursorFormatState::AwaitingFor
+                        {
+                            open_cursor_state = OpenCursorFormatState::InSelect {
+                                anchor_indent: indent_level.saturating_add(1),
+                            };
                             newline_after_keyword = true;
                         } else {
                             // FOR/WHILE starts a line, LOOP will follow on same line
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1558,11 +1541,7 @@ impl SqlEditorWidget {
                         if !after_for_while {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1576,7 +1555,7 @@ impl SqlEditorWidget {
                         // REPEAT starts a block body on the next line.
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1588,11 +1567,7 @@ impl SqlEditorWidget {
                             let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 1 + paren_extra,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1601,11 +1576,7 @@ impl SqlEditorWidget {
                         } else if in_plsql_block {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1616,7 +1587,7 @@ impl SqlEditorWidget {
                     } else if block_start_keywords.contains(&upper.as_str()) {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1632,11 +1603,7 @@ impl SqlEditorWidget {
                             // Don't increase indent, just newline at current level
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level.saturating_sub(1),
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1646,11 +1613,7 @@ impl SqlEditorWidget {
                             // Standalone BEGIN block
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1671,18 +1634,12 @@ impl SqlEditorWidget {
                     needs_space = true;
                     if upper == "SELECT" {
                         select_list_anchor = Some(out.len());
-                        select_list_indent =
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent)
-                                + 1;
+                        select_list_indent = base_indent(indent_level, open_cursor_state) + 1;
                         select_list_multiline_forced = false;
                         if force_select_list_newline_next {
                             newline_with(
                                 &mut out,
-                                base_indent(
-                                    indent_level,
-                                    in_open_cursor_sql,
-                                    open_cursor_sql_indent,
-                                ),
+                                base_indent(indent_level, open_cursor_state),
                                 1,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -1765,7 +1722,7 @@ impl SqlEditorWidget {
                         }
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1776,7 +1733,7 @@ impl SqlEditorWidget {
                     if newline_after_keyword {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1839,7 +1796,7 @@ impl SqlEditorWidget {
                     if has_leading_newline {
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             0,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1851,8 +1808,7 @@ impl SqlEditorWidget {
 
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
-                        let base =
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent);
+                        let base = base_indent(indent_level, open_cursor_state);
                         if has_leading_newline {
                             line_indent = if in_select_list && select_list_multiline_forced {
                                 base + 1
@@ -1889,11 +1845,7 @@ impl SqlEditorWidget {
                         at_line_start = true;
                         needs_space = false;
                         if in_select_list || column_list_stack.last().copied().unwrap_or(false) {
-                            line_indent = base_indent(
-                                indent_level,
-                                in_open_cursor_sql,
-                                open_cursor_sql_indent,
-                            ) + 1;
+                            line_indent = base_indent(indent_level, open_cursor_state) + 1;
                         }
                     } else if is_block_comment && next_is_word_like {
                         let list_extra = if in_select_list
@@ -1905,7 +1857,7 @@ impl SqlEditorWidget {
                         };
                         newline_with(
                             &mut out,
-                            base_indent(indent_level, in_open_cursor_sql, open_cursor_sql_indent),
+                            base_indent(indent_level, open_cursor_state),
                             list_extra,
                             &mut at_line_start,
                             &mut needs_space,
@@ -1920,7 +1872,7 @@ impl SqlEditorWidget {
                         "," => {
                             if statement_has_with_clause
                                 && matches!(current_clause.as_deref(), Some("SELECT"))
-                                && !in_open_cursor_sql
+                                && !open_cursor_state.in_select()
                                 && suppress_comma_break_depth == 0
                             {
                                 force_select_list_newline(
@@ -1938,11 +1890,7 @@ impl SqlEditorWidget {
                             if column_list_stack.last().copied().unwrap_or(false) {
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -1951,11 +1899,7 @@ impl SqlEditorWidget {
                             } else if is_with_cte_separator {
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -1964,11 +1908,7 @@ impl SqlEditorWidget {
                             } else if suppress_comma_break_depth == 0 {
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -1993,9 +1933,7 @@ impl SqlEditorWidget {
                             current_clause = None;
                             select_list_anchor = None;
                             select_list_multiline_forced = false;
-                            open_cursor_pending = false;
-                            in_open_cursor_sql = false;
-                            open_cursor_sql_indent = 0;
+                            open_cursor_state = OpenCursorFormatState::None;
                             between_pending = false;
                             pending_exit_condition = false;
                             if pending_package_member_separator
@@ -2042,11 +1980,7 @@ impl SqlEditorWidget {
                             {
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -2098,11 +2032,7 @@ impl SqlEditorWidget {
                                 indent_level += indent_increase;
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     0,
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -2132,11 +2062,7 @@ impl SqlEditorWidget {
                                 }
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     indent_increase.saturating_sub(1),
                                     &mut at_line_start,
                                     &mut needs_space,
@@ -2150,11 +2076,7 @@ impl SqlEditorWidget {
                             if close_case_paren_on_newline {
                                 newline_with(
                                     &mut out,
-                                    base_indent(
-                                        indent_level,
-                                        in_open_cursor_sql,
-                                        open_cursor_sql_indent,
-                                    ),
+                                    base_indent(indent_level, open_cursor_state),
                                     1,
                                     &mut at_line_start,
                                     &mut needs_space,
