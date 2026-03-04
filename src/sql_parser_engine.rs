@@ -62,8 +62,8 @@ pub(crate) enum BlockKind {
 }
 
 // ---------------------------------------------------------------------------
-// 3) PendingState – replaces pending_end, pending_if_*, pending_while_do,
-//    pending_timing_point_is.  Only one pending state is active at a time.
+// 3) Pending state machines – replaces pending_end, pending_if_*,
+//    pending_while_do/pending_for_do, pending_timing_point_is.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +100,19 @@ impl Default for IfState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingDo {
+    None,
+    While,
+    For,
+}
+
+impl Default for PendingDo {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SplitState – the main parser state, now using the types above.
 // ---------------------------------------------------------------------------
@@ -118,9 +131,8 @@ pub(crate) struct SplitState {
     // -- IF state machine --
     pub(crate) if_state: IfState,
 
-    // -- WHILE ... DO state --
-    pub(crate) pending_while_do: bool,
-    pub(crate) pending_for_do: bool,
+    // -- WHILE/FOR ... DO pending state --
+    pub(crate) pending_do: PendingDo,
 
     // -- Token accumulator --
     pub(crate) token: String,
@@ -353,8 +365,7 @@ impl SplitState {
         // LOOP (opening, not END LOOP)
         if upper == "LOOP" && !is_end_loop {
             self.block_stack.push(BlockKind::Loop);
-            self.pending_while_do = false;
-            self.pending_for_do = false;
+            self.pending_do = PendingDo::None;
         }
 
         // REPEAT (opening, not END REPEAT)
@@ -364,21 +375,21 @@ impl SplitState {
 
         // WHILE ... DO
         if upper == "WHILE" && self.pending_end == PendingEnd::None && !is_end_while {
-            self.pending_while_do = true;
-        } else if self.pending_while_do && upper == "DO" {
+            self.pending_do = PendingDo::While;
+        } else if self.pending_do == PendingDo::While && upper == "DO" {
             self.block_stack.push(BlockKind::While);
-            self.pending_while_do = false;
+            self.pending_do = PendingDo::None;
         }
 
         if upper == "FOR" && self.pending_end == PendingEnd::None && !is_end_for {
             let is_trigger_header_for =
                 self.in_create_plsql && self.is_trigger && self.block_depth() == 0;
             if !is_trigger_header_for {
-                self.pending_for_do = true;
+                self.pending_do = PendingDo::For;
             }
-        } else if self.pending_for_do && upper == "DO" {
+        } else if self.pending_do == PendingDo::For && upper == "DO" {
             self.block_stack.push(BlockKind::For);
-            self.pending_for_do = false;
+            self.pending_do = PendingDo::None;
         }
 
         // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE – not a real block
@@ -523,8 +534,7 @@ impl SplitState {
         self.pending_timing_point_is = false;
         self.after_type = false;
         self.is_type_create = false;
-        self.pending_while_do = false;
-        self.pending_for_do = false;
+        self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.pending_with_clause = false;
         self.in_with_plsql_declaration = false;
@@ -1025,8 +1035,7 @@ impl SqlParserEngine {
             if c == ';' {
                 // FOR/WHILE ... DO candidates cannot span statement terminators.
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
-                self.state.pending_for_do = false;
-                self.state.pending_while_do = false;
+                self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
                 if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration {
                     let trimmed = self.current.trim();
