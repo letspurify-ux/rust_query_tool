@@ -6607,6 +6607,68 @@ fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_ma
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_create_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+CREATE TABLE t_parser_recover (id NUMBER);
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH FUNCTION declaration mode when CREATE starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH
+  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("CREATE TABLE t_parser_recover"),
+        "second statement should start at CREATE TABLE after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_procedure_recovers_to_alter_statement_head() {
+    let sql = "WITH
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END;
+ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH PROCEDURE declaration mode when ALTER starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH
+  PROCEDURE p IS"),
+        "first statement should preserve WITH PROCEDURE declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("ALTER SESSION SET NLS_DATE_FORMAT"),
+        "second statement should start at ALTER SESSION after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_and_cte_keeps_single_statement() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
