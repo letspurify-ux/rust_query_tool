@@ -66,6 +66,12 @@ struct ScriptExecutionFrame {
     source_path: Option<PathBuf>,
 }
 
+struct ResolvedScriptInclude {
+    source_path: PathBuf,
+    script_dir: PathBuf,
+    items: Vec<ScriptItem>,
+}
+
 struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
@@ -3032,6 +3038,52 @@ impl SqlEditorWidget {
         Ok(())
     }
 
+    fn resolve_script_include_path(
+        path: &str,
+        relative_to_caller: bool,
+        caller_base_dir: &Path,
+        working_dir: &Path,
+    ) -> (PathBuf, PathBuf) {
+        let base_dir = if relative_to_caller {
+            caller_base_dir
+        } else {
+            working_dir
+        };
+        let target_path = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            base_dir.join(path)
+        };
+        let normalized_target_path = Self::normalize_script_include_path(&target_path);
+
+        (target_path, normalized_target_path)
+    }
+
+    fn load_script_include(
+        target_path: &Path,
+        normalized_target_path: &Path,
+        base_dir: &Path,
+    ) -> Result<ResolvedScriptInclude, String> {
+        let contents = fs::read_to_string(target_path).map_err(|err| {
+            format!(
+                "Failed to read script {}: {}",
+                target_path.display(),
+                err
+            )
+        })?;
+
+        let script_dir = normalized_target_path
+            .parent()
+            .unwrap_or(base_dir)
+            .to_path_buf();
+
+        Ok(ResolvedScriptInclude {
+            source_path: normalized_target_path.to_path_buf(),
+            script_dir,
+            items: super::query_text::split_script_items(&contents),
+        })
+    }
+
     fn requires_connected_session_for_precheck(
         has_connection_bootstrap_command: bool,
         can_run_while_disconnected: bool,
@@ -3277,18 +3329,28 @@ impl SqlEditorWidget {
                     source_path: None,
                 }];
 
-                while let Some(frame) = frames.last_mut() {
+                while !frames.is_empty() {
                     if stop_execution || load_mutex_bool(&cancel_flag) {
                         break;
                     }
 
-                    if frame.index >= frame.items.len() {
+                    let Some((item, current_frame_base_dir)) = ({
+                        let frame = match frames.last_mut() {
+                            Some(frame) => frame,
+                            None => break,
+                        };
+
+                        if frame.index >= frame.items.len() {
+                            None
+                        } else {
+                            let item = frame.items[frame.index].clone();
+                            frame.index += 1;
+                            Some((item, frame.base_dir.clone()))
+                        }
+                    }) else {
                         frames.pop();
                         continue;
-                    }
-
-                    let item = frame.items[frame.index].clone();
-                    frame.index += 1;
+                    };
 
                     let echo_enabled = match session.lock() {
                         Ok(guard) => guard.echo_enabled,
@@ -4897,7 +4959,7 @@ impl SqlEditorWidget {
                                         let target_path = if Path::new(&path).is_absolute() {
                                             PathBuf::from(&path)
                                         } else {
-                                            frame.base_dir.join(&path)
+                                            current_frame_base_dir.join(&path)
                                         };
                                         match session.lock() {
                                             Ok(mut guard) => {
@@ -5240,19 +5302,17 @@ impl SqlEditorWidget {
                                     path,
                                     relative_to_caller,
                                 } => {
-                                    let base_dir = if relative_to_caller {
-                                        frame.base_dir.clone()
+                                    let include_base_dir = if relative_to_caller {
+                                        current_frame_base_dir.as_path()
                                     } else {
-                                        working_dir.clone()
+                                        working_dir.as_path()
                                     };
-                                    let target_path = if Path::new(&path).is_absolute() {
-                                        PathBuf::from(&path)
-                                    } else {
-                                        base_dir.join(&path)
-                                    };
-                                    let normalized_target_path =
-                                        SqlEditorWidget::normalize_script_include_path(
-                                            &target_path,
+                                    let (target_path, normalized_target_path) =
+                                        SqlEditorWidget::resolve_script_include_path(
+                                            &path,
+                                            relative_to_caller,
+                                            current_frame_base_dir.as_path(),
+                                            working_dir.as_path(),
                                         );
                                     if let Err(message) =
                                         SqlEditorWidget::validate_script_include_target(
@@ -5271,19 +5331,17 @@ impl SqlEditorWidget {
                                         }
                                         continue;
                                     }
-                                    match fs::read_to_string(&target_path) {
-                                        Ok(contents) => {
-                                            let script_items =
-                                                super::query_text::split_script_items(&contents);
-                                            let script_dir = normalized_target_path
-                                                .parent()
-                                                .unwrap_or(&base_dir)
-                                                .to_path_buf();
+                                    match SqlEditorWidget::load_script_include(
+                                        target_path.as_path(),
+                                        normalized_target_path.as_path(),
+                                        include_base_dir,
+                                    ) {
+                                        Ok(resolved_include) => {
                                             frames.push(ScriptExecutionFrame {
-                                                items: script_items,
+                                                items: resolved_include.items,
                                                 index: 0,
-                                                base_dir: script_dir,
-                                                source_path: Some(normalized_target_path.clone()),
+                                                base_dir: resolved_include.script_dir,
+                                                source_path: Some(resolved_include.source_path),
                                             });
                                             SqlEditorWidget::emit_script_message(
                                                 &sender,
@@ -5295,16 +5353,12 @@ impl SqlEditorWidget {
                                                 ),
                                             );
                                         }
-                                        Err(err) => {
+                                        Err(message) => {
                                             SqlEditorWidget::emit_script_message(
                                                 &sender,
                                                 &session,
                                                 if relative_to_caller { "@@" } else { "@" },
-                                                &format!(
-                                                    "Error: Failed to read script {}: {}",
-                                                    target_path.display(),
-                                                    err
-                                                ),
+                                                &format!("Error: {}", message),
                                             );
                                             command_error = true;
                                         }
