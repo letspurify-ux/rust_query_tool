@@ -8,7 +8,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -565,7 +565,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         intellisense_parse_generation: &Arc<AtomicU64>,
-        intellisense_popup_show_in_progress: &Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: &Arc<AtomicU8>,
     ) {
         let generation = Self::invalidate_keyup_debounce_with_parse_generation(
             keyup_debounce_generation,
@@ -1491,7 +1491,12 @@ impl SqlEditorWidget {
                 Event::Unfocus => {
                     let unfocus_x = fltk::app::event_x_root();
                     let unfocus_y = fltk::app::event_y_root();
-                    if intellisense_popup_show_in_progress_for_handle.load(Ordering::Relaxed) {
+                    if matches!(
+                        load_popup_transition_state(
+                            &intellisense_popup_show_in_progress_for_handle
+                        ),
+                        IntellisensePopupTransitionState::Showing
+                    ) {
                         Self::schedule_deferred_unfocus_popup_hide(
                             ed.clone(),
                             intellisense_popup_for_handle.clone(),
@@ -1706,7 +1711,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         intellisense_parse_generation: &Arc<AtomicU64>,
-        intellisense_popup_show_in_progress: &Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: &Arc<AtomicU8>,
     ) {
         let request_generation = intellisense_parse_generation
             .fetch_add(1, Ordering::Relaxed)
@@ -1899,7 +1904,7 @@ impl SqlEditorWidget {
     fn schedule_deferred_unfocus_popup_hide(
         editor: TextEditor,
         intellisense_popup: Arc<Mutex<IntellisensePopup>>,
-        intellisense_popup_show_in_progress: Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: Arc<AtomicU8>,
         keyup_debounce_generation: Arc<Mutex<u64>>,
         keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
         intellisense_parse_generation: Arc<AtomicU64>,
@@ -1914,7 +1919,10 @@ impl SqlEditorWidget {
                 return;
             }
 
-            if intellisense_popup_show_in_progress.load(Ordering::Relaxed) {
+            if matches!(
+                load_popup_transition_state(&intellisense_popup_show_in_progress),
+                IntellisensePopupTransitionState::Showing
+            ) {
                 if retries_left > 0 {
                     Self::schedule_deferred_unfocus_popup_hide(
                         editor.clone(),
@@ -1959,7 +1967,7 @@ impl SqlEditorWidget {
     #[allow(clippy::too_many_arguments)]
     fn schedule_deferred_outside_click_popup_hide(
         intellisense_popup: Arc<Mutex<IntellisensePopup>>,
-        intellisense_popup_show_in_progress: Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: Arc<AtomicU8>,
         keyup_debounce_generation: Arc<Mutex<u64>>,
         keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
         intellisense_parse_generation: Arc<AtomicU64>,
@@ -1970,7 +1978,10 @@ impl SqlEditorWidget {
         retries_left: u8,
     ) {
         app::add_timeout3(0.0, move |_| {
-            if intellisense_popup_show_in_progress.load(Ordering::Relaxed) {
+            if matches!(
+                load_popup_transition_state(&intellisense_popup_show_in_progress),
+                IntellisensePopupTransitionState::Showing
+            ) {
                 if retries_left > 0 {
                     Self::schedule_deferred_outside_click_popup_hide(
                         intellisense_popup.clone(),
@@ -2060,7 +2071,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: &Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         intellisense_parse_generation: &Arc<AtomicU64>,
-        intellisense_popup_show_in_progress: &Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: &Arc<AtomicU8>,
         snapshot: Arc<IntellisenseTriggerSnapshot>,
     ) {
         let (parse_sender, parse_receiver) =
@@ -2155,7 +2166,7 @@ impl SqlEditorWidget {
         pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
         intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
         intellisense_parse_generation: Arc<AtomicU64>,
-        intellisense_popup_show_in_progress: Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: Arc<AtomicU8>,
         snapshot: Arc<IntellisenseTriggerSnapshot>,
         parse_receiver: Arc<
             Mutex<mpsc::Receiver<Result<intellisense_context::CursorContext, String>>>,
@@ -2273,7 +2284,7 @@ impl SqlEditorWidget {
         pending_intellisense: &Arc<Mutex<Option<PendingIntellisense>>>,
         snapshot: &IntellisenseTriggerSnapshot,
         deep_ctx: &intellisense_context::CursorContext,
-        intellisense_popup_show_in_progress: &Arc<AtomicBool>,
+        intellisense_popup_show_in_progress: &Arc<AtomicU8>,
     ) {
         let qualifier = snapshot.qualifier.as_deref();
         let context =
@@ -2465,14 +2476,17 @@ impl SqlEditorWidget {
         let (popup_x, popup_y) =
             Self::popup_screen_position(editor, snapshot.cursor_pos, popup_width, popup_height);
         struct PopupShowInProgressReset {
-            flag: Arc<AtomicBool>,
+            flag: Arc<AtomicU8>,
         }
         impl Drop for PopupShowInProgressReset {
             fn drop(&mut self) {
-                self.flag.store(false, Ordering::Relaxed);
+                store_popup_transition_state(&self.flag, IntellisensePopupTransitionState::Idle);
             }
         }
-        intellisense_popup_show_in_progress.store(true, Ordering::Relaxed);
+        store_popup_transition_state(
+            intellisense_popup_show_in_progress,
+            IntellisensePopupTransitionState::Showing,
+        );
         let _popup_show_reset = PopupShowInProgressReset {
             flag: intellisense_popup_show_in_progress.clone(),
         };
@@ -4136,10 +4150,10 @@ impl SqlEditorWidget {
         Window::delete(dialog);
     }
     pub fn hide_intellisense_if_outside(&self, x: i32, y: i32) {
-        if self
-            .intellisense_popup_show_in_progress
-            .load(Ordering::Relaxed)
-        {
+        if matches!(
+            load_popup_transition_state(&self.intellisense_popup_show_in_progress),
+            IntellisensePopupTransitionState::Showing
+        ) {
             Self::schedule_deferred_outside_click_popup_hide(
                 self.intellisense_popup.clone(),
                 self.intellisense_popup_show_in_progress.clone(),
@@ -5745,7 +5759,8 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
 
     #[test]
     fn insert_column_list_context_ignores_parentheses_after_select_body_starts() {
-        let sql_with_cursor = "INSERT INTO audit_emp (emp_id) SELECT * FROM (SELECT | FROM oqt_t_emp) src";
+        let sql_with_cursor =
+            "INSERT INTO audit_emp (emp_id) SELECT * FROM (SELECT | FROM oqt_t_emp) src";
         let cursor = sql_with_cursor
             .find('|')
             .expect("cursor marker should exist");

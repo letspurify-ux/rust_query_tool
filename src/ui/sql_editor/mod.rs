@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -104,6 +104,35 @@ fn store_mutex_bool(flag: &Arc<Mutex<bool>>, value: bool) {
             *guard = value;
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum IntellisensePopupTransitionState {
+    Idle = 0,
+    Showing = 1,
+}
+
+impl IntellisensePopupTransitionState {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Showing,
+            _ => Self::Idle,
+        }
+    }
+}
+
+pub(super) fn load_popup_transition_state(
+    state: &Arc<AtomicU8>,
+) -> IntellisensePopupTransitionState {
+    IntellisensePopupTransitionState::from_u8(state.load(Ordering::Relaxed))
+}
+
+pub(super) fn store_popup_transition_state(
+    state: &Arc<AtomicU8>,
+    value: IntellisensePopupTransitionState,
+) {
+    state.store(value as u8, Ordering::Relaxed);
 }
 
 fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
@@ -800,7 +829,7 @@ pub struct SqlEditorWidget {
     pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
     intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     intellisense_parse_generation: Arc<AtomicU64>,
-    intellisense_popup_show_in_progress: Arc<AtomicBool>,
+    intellisense_popup_show_in_progress: Arc<AtomicU8>,
     history_cursor: Arc<Mutex<Option<usize>>>,
     history_original: Arc<Mutex<Option<String>>>,
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
@@ -1254,7 +1283,8 @@ impl SqlEditorWidget {
         let pending_intellisense = Arc::new(Mutex::new(None::<PendingIntellisense>));
         let intellisense_parse_cache = Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>));
         let intellisense_parse_generation = Arc::new(AtomicU64::new(0));
-        let intellisense_popup_show_in_progress = Arc::new(AtomicBool::new(false));
+        let intellisense_popup_show_in_progress =
+            Arc::new(AtomicU8::new(IntellisensePopupTransitionState::Idle as u8));
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
@@ -1613,7 +1643,7 @@ impl SqlEditorWidget {
             pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
             intellisense_parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
             intellisense_parse_generation: Arc<AtomicU64>,
-            intellisense_popup_show_in_progress: Arc<AtomicBool>,
+            intellisense_popup_show_in_progress: Arc<AtomicU8>,
         ) {
             if editor.was_deleted() {
                 return;
@@ -2664,8 +2694,10 @@ impl SqlEditorWidget {
         );
         self.intellisense_parse_generation
             .fetch_add(1, Ordering::Relaxed);
-        self.intellisense_popup_show_in_progress
-            .store(false, Ordering::Relaxed);
+        store_popup_transition_state(
+            &self.intellisense_popup_show_in_progress,
+            IntellisensePopupTransitionState::Idle,
+        );
 
         self.intellisense_popup
             .lock()
