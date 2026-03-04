@@ -416,6 +416,7 @@ pub(crate) struct SplitState {
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
     with_clause_state: WithClauseState,
+    top_level_token_seen: bool,
 
     // -- Reusable buffer --
     token_upper_buf: String,
@@ -530,6 +531,8 @@ impl SplitState {
         if self.token.is_empty() {
             return;
         }
+        let at_top_level = self.block_depth() == 0 && self.paren_depth == 0;
+        let at_statement_start = at_top_level && !self.top_level_token_seen;
         let mut upper_buf = std::mem::take(&mut self.token_upper_buf);
         upper_buf.clear();
         upper_buf.push_str(&self.token);
@@ -538,7 +541,7 @@ impl SplitState {
 
         self.handle_routine_is_external(upper);
         self.track_create_plsql(upper);
-        self.track_top_level_with_plsql(upper);
+        self.track_top_level_with_plsql(upper, at_statement_start);
 
         let end_token_role =
             EndTokenRole::from_token(upper, self.pending_end, self.in_compound_trigger());
@@ -551,6 +554,9 @@ impl SplitState {
         let _ = upper;
         self.token_upper_buf = upper_buf;
         self.token.clear();
+        if at_top_level {
+            self.top_level_token_seen = true;
+        }
     }
 
     /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY as split-on-semicolon.
@@ -826,6 +832,7 @@ impl SplitState {
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
+        self.top_level_token_seen = false;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -888,12 +895,12 @@ impl SplitState {
         }
     }
 
-    fn track_top_level_with_plsql(&mut self, upper: &str) {
+    fn track_top_level_with_plsql(&mut self, upper: &str, at_statement_start: bool) {
         if self.block_depth() != 0 || self.paren_depth != 0 {
             return;
         }
 
-        if upper == "WITH" {
+        if upper == "WITH" && at_statement_start {
             self.with_clause_state = WithClauseState::PendingClause;
             return;
         }
@@ -1765,6 +1772,16 @@ mod tests {
         assert_eq!(state.block_depth(), 0);
         assert!(state.in_create_plsql());
         assert!(state.in_with_plsql_declaration());
+    }
+
+    #[test]
+    fn statement_with_midstream_with_keyword_does_not_enter_with_plsql_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT col WITH FROM t;");
+
+        assert_eq!(engine.take_statements(), vec!["SELECT col WITH FROM t".to_string()]);
+        assert!(!engine.state.in_with_plsql_declaration());
     }
 
     #[test]
