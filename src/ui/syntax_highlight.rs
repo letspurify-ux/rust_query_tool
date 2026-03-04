@@ -150,6 +150,12 @@ pub enum LexerState {
     InDoubleQuote,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanResult {
+    Closed { next_idx: usize },
+    Unterminated { next_idx: usize, state: LexerState },
+}
+
 /// Holds additional identifiers for highlighting (tables, views, etc.)
 #[derive(Clone, Default)]
 pub struct HighlightData {
@@ -412,100 +418,56 @@ impl SqlHighlighter {
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
         match initial_state {
-            LexerState::InBlockComment => {
-                loop {
-                    match (bytes.get(idx), bytes.get(idx + 1)) {
-                        (Some(&b'*'), Some(&b'/')) => {
-                            idx += 2;
-                            break;
-                        }
-                        (Some(_), _) => idx += 1,
-                        (None, _) => {
-                            styles[..].fill(STYLE_COMMENT as u8);
-                            return (style_bytes_to_string(styles), LexerState::InBlockComment);
-                        }
-                    }
+            LexerState::InBlockComment => match scan_until_block_comment_end(bytes, idx, false) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_COMMENT as u8);
                 }
-                styles[..idx].fill(STYLE_COMMENT as u8);
-            }
-            LexerState::InHintComment => {
-                loop {
-                    match (bytes.get(idx), bytes.get(idx + 1)) {
-                        (Some(&b'*'), Some(&b'/')) => {
-                            idx += 2;
-                            break;
-                        }
-                        (Some(_), _) => idx += 1,
-                        (None, _) => {
-                            styles[..].fill(STYLE_HINT as u8);
-                            return (style_bytes_to_string(styles), LexerState::InHintComment);
-                        }
-                    }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_COMMENT as u8);
+                    return (style_bytes_to_string(styles), state);
                 }
-                styles[..idx].fill(STYLE_HINT as u8);
-            }
-            LexerState::InSingleQuote => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b'\'') => {
-                            if bytes.get(idx + 1) == Some(&b'\'') {
-                                idx += 2;
-                            } else {
-                                idx += 1;
-                                break;
-                            }
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_STRING as u8);
-                            return (style_bytes_to_string(styles), LexerState::InSingleQuote);
-                        }
-                    }
+            },
+            LexerState::InHintComment => match scan_until_block_comment_end(bytes, idx, true) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_HINT as u8);
                 }
-                styles[..idx].fill(STYLE_STRING as u8);
-            }
-            LexerState::InQQuote { closing } => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b) if b == closing => {
-                            if bytes.get(idx + 1) == Some(&b'\'') {
-                                idx += 2;
-                                break;
-                            }
-                            idx += 1;
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_STRING as u8);
-                            return (
-                                style_bytes_to_string(styles),
-                                LexerState::InQQuote { closing },
-                            );
-                        }
-                    }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_HINT as u8);
+                    return (style_bytes_to_string(styles), state);
                 }
-                styles[..idx].fill(STYLE_STRING as u8);
-            }
-            LexerState::InDoubleQuote => {
-                loop {
-                    match bytes.get(idx) {
-                        Some(&b'"') => {
-                            if bytes.get(idx + 1) == Some(&b'"') {
-                                idx += 2;
-                            } else {
-                                idx += 1;
-                                break;
-                            }
-                        }
-                        Some(_) => idx += 1,
-                        None => {
-                            styles[..].fill(STYLE_IDENTIFIER as u8);
-                            return (style_bytes_to_string(styles), LexerState::InDoubleQuote);
-                        }
-                    }
+            },
+            LexerState::InSingleQuote => match scan_until_single_quote_end(bytes, idx) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_STRING as u8);
                 }
-                styles[..idx].fill(STYLE_IDENTIFIER as u8);
-            }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_STRING as u8);
+                    return (style_bytes_to_string(styles), state);
+                }
+            },
+            LexerState::InQQuote { closing } => match scan_until_q_quote_end(bytes, idx, closing) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_STRING as u8);
+                }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_STRING as u8);
+                    return (style_bytes_to_string(styles), state);
+                }
+            },
+            LexerState::InDoubleQuote => match scan_until_double_quote_end(bytes, idx) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_IDENTIFIER as u8);
+                }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_IDENTIFIER as u8);
+                    return (style_bytes_to_string(styles), state);
+                }
+            },
             LexerState::Normal => {}
         }
 
@@ -566,26 +528,16 @@ impl SqlHighlighter {
                 let start = idx;
                 let is_hint = bytes.get(idx + 2) == Some(&b'+');
                 idx += 2;
-                let mut closed = false;
-                loop {
-                    match (bytes.get(idx), bytes.get(idx + 1)) {
-                        (Some(&b'*'), Some(&b'/')) => {
-                            idx += 2;
-                            closed = true;
-                            break;
-                        }
-                        (Some(_), _) => idx += 1,
-                        (None, _) => break,
+                let scan_result = scan_until_block_comment_end(bytes, idx, is_hint);
+                idx = match scan_result {
+                    ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
+                        next_idx
                     }
-                }
+                };
                 let style_char = if is_hint { STYLE_HINT } else { STYLE_COMMENT };
                 styles[start..idx].fill(style_char as u8);
-                if !closed {
-                    exit_state = if is_hint {
-                        LexerState::InHintComment
-                    } else {
-                        LexerState::InBlockComment
-                    };
+                if let ScanResult::Unterminated { state, .. } = scan_result {
+                    exit_state = state;
                 }
                 continue;
             }
@@ -599,18 +551,14 @@ impl SqlHighlighter {
                     let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
                     idx += 4;
-                    let mut closed = false;
-                    while idx < bytes.len() {
-                        if bytes.get(idx) == Some(&closing) && bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            closed = true;
-                            break;
-                        }
-                        idx += 1;
-                    }
+                    let scan_result = scan_until_q_quote_end(bytes, idx, closing);
+                    idx = match scan_result {
+                        ScanResult::Closed { next_idx }
+                        | ScanResult::Unterminated { next_idx, .. } => next_idx,
+                    };
                     styles[start..idx].fill(STYLE_STRING as u8);
-                    if !closed {
-                        exit_state = LexerState::InQQuote { closing };
+                    if let ScanResult::Unterminated { state, .. } = scan_result {
+                        exit_state = state;
                     }
                     continue;
                 }
@@ -622,18 +570,14 @@ impl SqlHighlighter {
                     let closing = sql_text::q_quote_closing_byte(delimiter);
                     let start = idx;
                     idx += 3;
-                    let mut closed = false;
-                    while idx < bytes.len() {
-                        if bytes.get(idx) == Some(&closing) && bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            closed = true;
-                            break;
-                        }
-                        idx += 1;
-                    }
+                    let scan_result = scan_until_q_quote_end(bytes, idx, closing);
+                    idx = match scan_result {
+                        ScanResult::Closed { next_idx }
+                        | ScanResult::Unterminated { next_idx, .. } => next_idx,
+                    };
                     styles[start..idx].fill(STYLE_STRING as u8);
-                    if !closed {
-                        exit_state = LexerState::InQQuote { closing };
+                    if let ScanResult::Unterminated { state, .. } = scan_result {
+                        exit_state = state;
                     }
                     continue;
                 }
@@ -643,22 +587,15 @@ impl SqlHighlighter {
             if byte == b'\'' {
                 let start = idx;
                 idx += 1;
-                let mut closed = false;
-                while let Some(&b) = bytes.get(idx) {
-                    if b == b'\'' {
-                        if bytes.get(idx + 1) == Some(&b'\'') {
-                            idx += 2;
-                            continue;
-                        }
-                        idx += 1;
-                        closed = true;
-                        break;
+                let scan_result = scan_until_single_quote_end(bytes, idx);
+                idx = match scan_result {
+                    ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
+                        next_idx
                     }
-                    idx += 1;
-                }
+                };
                 styles[start..idx].fill(STYLE_STRING as u8);
-                if !closed {
-                    exit_state = LexerState::InSingleQuote;
+                if let ScanResult::Unterminated { state, .. } = scan_result {
+                    exit_state = state;
                 }
                 continue;
             }
@@ -667,22 +604,15 @@ impl SqlHighlighter {
             if byte == b'"' {
                 let start = idx;
                 idx += 1;
-                let mut closed = false;
-                while let Some(&b) = bytes.get(idx) {
-                    if b == b'"' {
-                        if bytes.get(idx + 1) == Some(&b'"') {
-                            idx += 2;
-                            continue;
-                        }
-                        idx += 1;
-                        closed = true;
-                        break;
+                let scan_result = scan_until_double_quote_end(bytes, idx);
+                idx = match scan_result {
+                    ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
+                        next_idx
                     }
-                    idx += 1;
-                }
+                };
                 styles[start..idx].fill(STYLE_IDENTIFIER as u8);
-                if !closed {
-                    exit_state = LexerState::InDoubleQuote;
+                if let ScanResult::Unterminated { state, .. } = scan_result {
+                    exit_state = state;
                 }
                 continue;
             }
@@ -734,23 +664,15 @@ impl SqlHighlighter {
                     }
                     if bytes.get(look_ahead) == Some(&b'\'') {
                         look_ahead += 1;
-                        let mut closed = false;
-                        while let Some(&b) = bytes.get(look_ahead) {
-                            if b == b'\'' {
-                                if bytes.get(look_ahead + 1) == Some(&b'\'') {
-                                    look_ahead += 2;
-                                    continue;
-                                }
-                                look_ahead += 1;
-                                closed = true;
-                                break;
-                            }
-                            look_ahead += 1;
-                        }
+                        let scan_result = scan_until_single_quote_end(bytes, look_ahead);
+                        look_ahead = match scan_result {
+                            ScanResult::Closed { next_idx }
+                            | ScanResult::Unterminated { next_idx, .. } => next_idx,
+                        };
                         styles[start..look_ahead].fill(STYLE_DATETIME_LITERAL as u8);
                         idx = look_ahead;
-                        if !closed {
-                            exit_state = LexerState::InSingleQuote;
+                        if let ScanResult::Unterminated { state, .. } = scan_result {
+                            exit_state = state;
                         }
                         continue;
                     }
@@ -977,6 +899,93 @@ fn range_focus_distance(start: usize, end: usize, focus_points: &[usize]) -> usi
         .unwrap_or(0)
 }
 
+fn scan_until_block_comment_end(bytes: &[u8], mut idx: usize, hint: bool) -> ScanResult {
+    loop {
+        match (bytes.get(idx), bytes.get(idx + 1)) {
+            (Some(&b'*'), Some(&b'/')) => {
+                idx += 2;
+                return ScanResult::Closed { next_idx: idx };
+            }
+            (Some(_), _) => idx += 1,
+            (None, _) => {
+                let state = if hint {
+                    LexerState::InHintComment
+                } else {
+                    LexerState::InBlockComment
+                };
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state,
+                };
+            }
+        }
+    }
+}
+
+fn scan_until_single_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+    loop {
+        match bytes.get(idx) {
+            Some(&b'\'') => {
+                if bytes.get(idx + 1) == Some(&b'\'') {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                    return ScanResult::Closed { next_idx: idx };
+                }
+            }
+            Some(_) => idx += 1,
+            None => {
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state: LexerState::InSingleQuote,
+                };
+            }
+        }
+    }
+}
+
+fn scan_until_q_quote_end(bytes: &[u8], mut idx: usize, closing: u8) -> ScanResult {
+    loop {
+        match bytes.get(idx) {
+            Some(&b) if b == closing => {
+                if bytes.get(idx + 1) == Some(&b'\'') {
+                    idx += 2;
+                    return ScanResult::Closed { next_idx: idx };
+                }
+                idx += 1;
+            }
+            Some(_) => idx += 1,
+            None => {
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state: LexerState::InQQuote { closing },
+                };
+            }
+        }
+    }
+}
+
+fn scan_until_double_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+    loop {
+        match bytes.get(idx) {
+            Some(&b'"') => {
+                if bytes.get(idx + 1) == Some(&b'"') {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                    return ScanResult::Closed { next_idx: idx };
+                }
+            }
+            Some(_) => idx += 1,
+            None => {
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state: LexerState::InDoubleQuote,
+                };
+            }
+        }
+    }
+}
 fn is_operator_byte(byte: u8) -> bool {
     matches!(
         byte,
