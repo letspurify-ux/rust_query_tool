@@ -84,17 +84,6 @@ enum PendingEndSuffix {
     TimingPoint,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct EndSuffixContext {
-    case_suffix: bool,
-    if_suffix: bool,
-    loop_suffix: bool,
-    while_suffix: bool,
-    repeat_suffix: bool,
-    for_suffix: bool,
-    timing_point_suffix: bool,
-}
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum EndTokenRole {
     None,
@@ -119,44 +108,8 @@ impl EndTokenRole {
         }
     }
 
-    fn as_context(self) -> EndSuffixContext {
-        EndSuffixContext::from_pending_end_suffix(self.suffix())
-    }
-}
-
-impl EndSuffixContext {
-    fn from_pending_end_suffix(suffix: Option<PendingEndSuffix>) -> Self {
-        match suffix {
-            Some(PendingEndSuffix::Case) => Self {
-                case_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::If) => Self {
-                if_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::Loop) => Self {
-                loop_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::While) => Self {
-                while_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::Repeat) => Self {
-                repeat_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::For) => Self {
-                for_suffix: true,
-                ..Self::default()
-            },
-            Some(PendingEndSuffix::TimingPoint) => Self {
-                timing_point_suffix: true,
-                ..Self::default()
-            },
-            _ => Self::default(),
-        }
+    fn is_suffix(self, suffix: PendingEndSuffix) -> bool {
+        self.suffix() == Some(suffix)
     }
 }
 
@@ -253,6 +206,18 @@ enum WithClauseState {
     InPlsqlDeclaration,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TimingPointState {
+    None,
+    AwaitingAsOrIs,
+}
+
+impl Default for TimingPointState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 impl Default for WithClauseState {
     fn default() -> Self {
         Self::None
@@ -295,7 +260,7 @@ pub(crate) struct SplitState {
     pub(crate) is_package: bool,
     pub(crate) is_trigger: bool,
     in_compound_trigger: bool,
-    pending_timing_point_is: bool,
+    timing_point_state: TimingPointState,
     after_type: bool,
     is_type_create: bool,
 
@@ -395,7 +360,7 @@ impl SplitState {
 
         self.handle_if_state_on_token(upper);
         self.handle_pending_end_on_token(end_token_role.suffix());
-        self.handle_block_openers(upper, end_token_role.as_context());
+        self.handle_block_openers(upper, end_token_role);
 
         // Return the uppercase buffer so its capacity is reused.
         let _ = upper;
@@ -472,7 +437,7 @@ impl SplitState {
             }
             Some(PendingEndSuffix::TimingPoint) => {
                 self.pop_block_of_kind(BlockKind::TimingPoint);
-                self.pending_timing_point_is = false;
+                self.timing_point_state = TimingPointState::None;
             }
             None => {
                 // Plain END – CASE expression or PL/SQL block
@@ -483,14 +448,14 @@ impl SplitState {
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
-    fn handle_block_openers(&mut self, upper: &str, end_suffix: EndSuffixContext) {
+    fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
         // CASE (opening, not END CASE)
-        if upper == "CASE" && !end_suffix.case_suffix {
+        if upper == "CASE" && !end_token_role.is_suffix(PendingEndSuffix::Case) {
             self.block_stack.push(BlockKind::Case);
         }
 
         // IF (opening, not END IF)
-        if upper == "IF" && !end_suffix.if_suffix {
+        if upper == "IF" && !end_token_role.is_suffix(PendingEndSuffix::If) {
             self.if_state = IfState::ExpectConditionStart;
         }
 
@@ -506,25 +471,31 @@ impl SplitState {
         }
 
         // LOOP (opening, not END LOOP)
-        if upper == "LOOP" && !end_suffix.loop_suffix {
+        if upper == "LOOP" && !end_token_role.is_suffix(PendingEndSuffix::Loop) {
             self.block_stack.push(BlockKind::Loop);
             self.pending_do = PendingDo::None;
         }
 
         // REPEAT (opening, not END REPEAT)
-        if upper == "REPEAT" && !end_suffix.repeat_suffix {
+        if upper == "REPEAT" && !end_token_role.is_suffix(PendingEndSuffix::Repeat) {
             self.block_stack.push(BlockKind::Repeat);
         }
 
         // WHILE ... DO
-        if upper == "WHILE" && self.pending_end == PendingEnd::None && !end_suffix.while_suffix {
+        if upper == "WHILE"
+            && self.pending_end == PendingEnd::None
+            && !end_token_role.is_suffix(PendingEndSuffix::While)
+        {
             self.pending_do = std::mem::take(&mut self.pending_do).arm_for_while();
         } else if self.pending_do == PendingDo::While && upper == "DO" {
             self.block_stack.push(BlockKind::While);
             self.pending_do = PendingDo::None;
         }
 
-        if upper == "FOR" && self.pending_end == PendingEnd::None && !end_suffix.for_suffix {
+        if upper == "FOR"
+            && self.pending_end == PendingEnd::None
+            && !end_token_role.is_suffix(PendingEndSuffix::For)
+        {
             let is_trigger_header_for =
                 self.in_create_plsql && self.is_trigger && self.block_depth() == 0;
             if !is_trigger_header_for {
@@ -552,11 +523,11 @@ impl SplitState {
         }
 
         // AS/IS block start
-        let is_timing_point_block_start =
-            matches!(upper, "AS" | "IS") && self.pending_timing_point_is;
+        let is_timing_point_block_start = matches!(upper, "AS" | "IS")
+            && self.timing_point_state == TimingPointState::AwaitingAsOrIs;
 
         let is_block_starting_as_is = matches!(upper, "AS" | "IS")
-            && (self.pending_timing_point_is
+            && (self.timing_point_state == TimingPointState::AwaitingAsOrIs
                 || self.nested_subprogram
                 || (self.in_create_plsql && self.block_depth() == 0));
 
@@ -566,11 +537,14 @@ impl SplitState {
             } else {
                 self.block_stack.push(BlockKind::AsIs);
             }
-            if self.is_type_create && !self.nested_subprogram && !self.pending_timing_point_is {
+            if self.is_type_create
+                && !self.nested_subprogram
+                && self.timing_point_state != TimingPointState::AwaitingAsOrIs
+            {
                 self.after_as_is = true;
             }
             self.nested_subprogram = false;
-            self.pending_timing_point_is = false;
+            self.timing_point_state = TimingPointState::None;
             let needs_begin_tracking = if self.is_package {
                 self.block_depth() > 1
             } else {
@@ -608,9 +582,9 @@ impl SplitState {
             self.block_stack.push(BlockKind::Compound);
         } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
             && self.in_compound_trigger
-            && !end_suffix.timing_point_suffix
+            && !end_token_role.is_suffix(PendingEndSuffix::TimingPoint)
         {
-            self.pending_timing_point_is = true;
+            self.timing_point_state = TimingPointState::AwaitingAsOrIs;
         }
     }
 
@@ -666,7 +640,7 @@ impl SplitState {
         self.is_package = false;
         self.is_trigger = false;
         self.in_compound_trigger = false;
-        self.pending_timing_point_is = false;
+        self.timing_point_state = TimingPointState::None;
         self.after_type = false;
         self.is_type_create = false;
         self.pending_do = PendingDo::None;
@@ -1274,8 +1248,8 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, EndSuffixContext, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, WithClauseState,
+        BlockKind, EndTokenRole, IfState, PendingDo, PendingEnd, PendingEndSuffix, RoutineFrame,
+        SplitState, SqlParserEngine, TimingPointState, WithClauseState,
     };
 
     #[test]
@@ -1300,6 +1274,15 @@ mod tests {
             EndTokenRole::from_token("AFTER", PendingEnd::End, true).suffix(),
             Some(PendingEndSuffix::TimingPoint)
         );
+    }
+
+    #[test]
+    fn end_token_role_reports_matching_suffix() {
+        let suffix_role = EndTokenRole::Suffix(PendingEndSuffix::Loop);
+
+        assert!(suffix_role.is_suffix(PendingEndSuffix::Loop));
+        assert!(!suffix_role.is_suffix(PendingEndSuffix::If));
+        assert!(!EndTokenRole::None.is_suffix(PendingEndSuffix::Case));
     }
 
     #[test]
@@ -1340,29 +1323,10 @@ mod tests {
     }
 
     #[test]
-    fn end_suffix_context_maps_pending_end_suffix_flags() {
-        let case_ctx = EndSuffixContext::from_pending_end_suffix(Some(PendingEndSuffix::Case));
-        assert!(case_ctx.case_suffix);
-        assert!(!case_ctx.if_suffix);
-
-        let for_ctx = EndSuffixContext::from_pending_end_suffix(Some(PendingEndSuffix::For));
-        assert!(for_ctx.for_suffix);
-        assert!(!for_ctx.repeat_suffix);
-
-        let timing_ctx =
-            EndSuffixContext::from_pending_end_suffix(Some(PendingEndSuffix::TimingPoint));
-        assert!(timing_ctx.timing_point_suffix);
-        assert!(!timing_ctx.case_suffix);
-
-        let none_ctx = EndSuffixContext::from_pending_end_suffix(None);
-        assert_eq!(none_ctx, EndSuffixContext::default());
-    }
-
-    #[test]
     fn end_timing_point_suffix_clears_pending_timing_point_state() {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
-            pending_timing_point_is: true,
+            timing_point_state: TimingPointState::AwaitingAsOrIs,
             block_stack: vec![BlockKind::TimingPoint],
             ..SplitState::default()
         };
@@ -1370,7 +1334,7 @@ mod tests {
         state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
 
         assert_eq!(state.pending_end, PendingEnd::None);
-        assert!(!state.pending_timing_point_is);
+        assert_eq!(state.timing_point_state, TimingPointState::None);
         assert!(state.block_stack.is_empty());
     }
 
@@ -1400,10 +1364,10 @@ mod tests {
             ..SplitState::default()
         };
 
-        state.handle_block_openers("FOR", EndSuffixContext::default());
+        state.handle_block_openers("FOR", EndTokenRole::None);
         assert_eq!(state.pending_do, PendingDo::While);
 
-        state.handle_block_openers("DO", EndSuffixContext::default());
+        state.handle_block_openers("DO", EndTokenRole::None);
         assert_eq!(state.block_depth(), 1);
         assert_eq!(state.block_stack.last(), Some(&BlockKind::While));
         assert_eq!(state.pending_do, PendingDo::None);
@@ -1413,10 +1377,10 @@ mod tests {
     fn pending_do_arms_when_no_active_candidate_exists() {
         let mut state = SplitState::default();
 
-        state.handle_block_openers("FOR", EndSuffixContext::default());
+        state.handle_block_openers("FOR", EndTokenRole::None);
         assert_eq!(state.pending_do, PendingDo::For);
 
-        state.handle_block_openers("DO", EndSuffixContext::default());
+        state.handle_block_openers("DO", EndTokenRole::None);
         assert_eq!(state.block_stack.last(), Some(&BlockKind::For));
         assert_eq!(state.pending_do, PendingDo::None);
     }
@@ -1514,14 +1478,14 @@ mod tests {
         let mut state = SplitState {
             in_create_plsql: true,
             in_compound_trigger: true,
-            pending_timing_point_is: true,
+            timing_point_state: TimingPointState::AwaitingAsOrIs,
             ..SplitState::default()
         };
 
-        state.handle_block_openers("IS", EndSuffixContext::default());
+        state.handle_block_openers("IS", EndTokenRole::None);
 
         assert_eq!(state.block_stack.last(), Some(&BlockKind::TimingPoint));
-        assert!(!state.pending_timing_point_is);
+        assert_eq!(state.timing_point_state, TimingPointState::None);
 
         state.pending_end = PendingEnd::End;
         state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
