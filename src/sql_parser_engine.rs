@@ -536,13 +536,20 @@ impl SplitState {
         }
 
         // AS/IS block start
+        let is_timing_point_block_start =
+            matches!(upper, "AS" | "IS") && self.pending_timing_point_is;
+
         let is_block_starting_as_is = matches!(upper, "AS" | "IS")
             && (self.pending_timing_point_is
                 || self.nested_subprogram
                 || (self.in_create_plsql && self.block_depth() == 0));
 
         if is_block_starting_as_is {
-            self.block_stack.push(BlockKind::AsIs);
+            if is_timing_point_block_start {
+                self.block_stack.push(BlockKind::TimingPoint);
+            } else {
+                self.block_stack.push(BlockKind::AsIs);
+            }
             if self.is_type_create && !self.nested_subprogram && !self.pending_timing_point_is {
                 self.after_as_is = true;
             }
@@ -1258,7 +1265,6 @@ mod tests {
         PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine,
     };
 
-
     #[test]
     fn end_token_role_requires_pending_end_state() {
         assert_eq!(
@@ -1489,5 +1495,25 @@ mod tests {
         assert_eq!(engine.state.pending_do, PendingDo::None);
         assert_eq!(engine.state.if_state, IfState::None);
         assert_eq!(engine.state.paren_depth, 0);
+    }
+    #[test]
+    fn compound_trigger_timing_point_uses_dedicated_block_kind() {
+        let mut state = SplitState {
+            in_create_plsql: true,
+            in_compound_trigger: true,
+            pending_timing_point_is: true,
+            ..SplitState::default()
+        };
+
+        state.handle_block_openers("IS", EndSuffixContext::default());
+
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::TimingPoint));
+        assert!(!state.pending_timing_point_is);
+
+        state.pending_end = PendingEnd::End;
+        state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
+
+        assert!(state.block_stack.is_empty());
+        assert_eq!(state.pending_end, PendingEnd::None);
     }
 }
