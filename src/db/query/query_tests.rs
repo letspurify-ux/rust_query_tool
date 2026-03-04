@@ -6414,6 +6414,37 @@ fn test_split_script_items_oracle_with_function_keeps_single_statement_until_mai
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_as_keeps_single_statement_until_main_select() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER AS
+  BEGIN
+    RETURN 1;
+  END;
+SELECT f() FROM dual;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION ... AS declaration must stay attached to main SELECT statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH
+  FUNCTION f RETURN NUMBER AS"),
+        "first statement should preserve WITH FUNCTION AS declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f() FROM dual"),
+        "first statement should include main SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_oracle_with_procedure_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  PROCEDURE p IS\n  BEGIN\n    NULL;\n  END;\nSELECT 1 FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);

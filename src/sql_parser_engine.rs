@@ -607,8 +607,10 @@ impl SplitState {
         }
 
         // Standard CTE shape (`WITH name AS (...)`) means this is not a
-        // top-level PL/SQL declaration prefix.
-        if upper == "AS" {
+        // top-level PL/SQL declaration prefix. But Oracle allows
+        // `WITH FUNCTION/PROCEDURE ... AS`, so keep declaration mode once
+        // a PL/SQL declaration keyword has already been seen.
+        if upper == "AS" && !self.in_with_plsql_declaration {
             self.pending_with_clause = false;
             self.in_with_plsql_declaration = false;
             return;
