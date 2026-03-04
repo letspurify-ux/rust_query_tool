@@ -1,5 +1,58 @@
 # 예외 처리 보완 내역
 
+## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강 (`AUDIT` / `NOAUDIT`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `AUDIT`/`NOAUDIT`를 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; AUDIT SESSION; SELECT ...;`
+  - `WITH FUNCTION ... END; NOAUDIT SESSION; SELECT ...;`
+  - 위 형태에서 `AUDIT`/`NOAUDIT`가 새 top-level statement로 분리되지 않고, `WITH FUNCTION` 블록에 붙어 하나의 statement로 병합됐습니다.
+- **원인**:
+  - `src/sql_text.rs`의 `is_statement_head_keyword`에 `AUDIT`, `NOAUDIT`가 누락되어
+  - `WITH FUNCTION/PROCEDURE` 복구 상태(`AwaitingMainQuery`)에서 새 statement 시작을 감지하지 못했습니다.
+- **수정**:
+  - `is_statement_head_keyword`에 `AUDIT`, `NOAUDIT`를 추가해 복구 분리 조건을 보강했습니다.
+  - 회귀 테스트 4건(`split_script_items` 2건, `split_format_items` 2건)을 추가했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_audit_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_noaudit_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_audit_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_noaudit_statement_head`
+
+### [검증]
+- `cargo test test_split_script_items_oracle_with_function_recovers_to_audit_statement_head -- --nocapture` (수정 전 실패 확인)
+- `cargo test recovers_to_audit_statement_head -- --nocapture`
+- `cargo test recovers_to_noaudit_statement_head -- --nocapture`
+- `cargo test oracle_with_function_recovers_to_ -- --nocapture`
+- `cargo test` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강 (`PURGE` / `FLASHBACK`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `PURGE`/`FLASHBACK`를 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; PURGE TABLE ...; SELECT ...;`
+  - `WITH FUNCTION ... END; FLASHBACK TABLE ...; SELECT ...;`
+  - 위 형태에서 `PURGE`/`FLASHBACK`가 새 top-level statement로 분리되지 않고, `WITH FUNCTION` 블록에 붙어 하나의 statement로 병합됐습니다.
+- **원인**:
+  - `src/sql_text.rs`의 `is_statement_head_keyword`에 `PURGE`, `FLASHBACK`가 누락되어
+  - `WITH FUNCTION/PROCEDURE` 복구 상태(`AwaitingMainQuery`)에서 새 statement 시작을 감지하지 못했습니다.
+- **수정**:
+  - `is_statement_head_keyword`에 `PURGE`, `FLASHBACK`를 추가해 복구 분리 조건을 보강했습니다.
+  - 회귀 테스트 4건(`split_script_items` 2건, `split_format_items` 2건)을 추가했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_purge_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_flashback_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_purge_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_flashback_statement_head`
+
+### [검증]
+- `cargo test -q recovers_to_purge_statement_head -- --nocapture`
+- `cargo test -q recovers_to_flashback_statement_head -- --nocapture`
+- `cargo test -q recovers_to_ -- --nocapture`
+- `cargo test` 전체 통과
+
 ## 2026-03-05 Oracle 공통 파서 엔진 누락 문법 보완 (`SIMPLE TRIGGER WHEN (NEW.COMPOUND ...)`)
 
 ### [중] SIMPLE TRIGGER `WHEN` 절 식별자 `COMPOUND`를 `COMPOUND TRIGGER`로 오인식하던 문제 수정
