@@ -606,6 +606,14 @@ impl SplitState {
             return;
         }
 
+        // Standard CTE shape (`WITH name AS (...)`) means this is not a
+        // top-level PL/SQL declaration prefix.
+        if upper == "AS" {
+            self.pending_with_clause = false;
+            self.in_with_plsql_declaration = false;
+            return;
+        }
+
         if sql_text::is_with_main_query_keyword(upper) {
             self.pending_with_clause = false;
             self.in_with_plsql_declaration = false;
