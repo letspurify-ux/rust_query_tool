@@ -723,6 +723,21 @@ impl SqlParserEngine {
         self.state.is_trigger
     }
 
+    fn reset_statement_local_state(&mut self) {
+        self.state.pending_end = PendingEnd::None;
+        self.state.pending_do = PendingDo::None;
+        self.state.if_state = IfState::None;
+        self.state.paren_depth = 0;
+    }
+
+    fn push_current_statement(&mut self) {
+        let trimmed = self.current.trim();
+        if !trimmed.is_empty() {
+            self.statements.push(trimmed.to_string());
+        }
+        self.current.clear();
+    }
+
     pub(crate) fn starts_with_alter_session(&self) -> bool {
         let mut remaining = self.current.as_str();
 
@@ -1057,20 +1072,14 @@ impl SqlParserEngine {
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
                 if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration {
-                    let trimmed = self.current.trim();
-                    if !trimmed.is_empty() {
-                        self.statements.push(trimmed.to_string());
-                    }
-                    self.current.clear();
+                    self.push_current_statement();
+                    self.reset_statement_local_state();
                     self.state.reset_create_state();
                 } else if self.state.should_split_on_semicolon() {
+                    self.push_current_statement();
+                    self.reset_statement_local_state();
                     self.state.reset_create_state();
                     self.state.block_stack.clear();
-                    let trimmed = self.current.trim();
-                    if !trimmed.is_empty() {
-                        self.statements.push(trimmed.to_string());
-                    }
-                    self.current.clear();
                 } else {
                     self.current.push(c);
                 }
@@ -1138,8 +1147,49 @@ impl SqlParserEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockKind, PendingEnd, SplitState};
+    use super::{BlockKind, IfState, PendingDo, PendingEnd, SplitState, SqlParserEngine};
 
+
+    #[test]
+    fn semicolon_split_resets_transient_state_at_top_level() {
+        let mut engine = SqlParserEngine::new();
+        engine.current.push_str("SELECT 1");
+        engine.state.pending_end = PendingEnd::End;
+        engine.state.pending_do = PendingDo::For;
+        engine.state.if_state = IfState::AwaitingThen;
+        engine.state.paren_depth = 2;
+
+        engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
+
+        assert_eq!(engine.take_statements(), vec!["SELECT 1".to_string()]);
+        assert!(engine.current.is_empty());
+        assert_eq!(engine.state.pending_end, PendingEnd::None);
+        assert_eq!(engine.state.pending_do, PendingDo::None);
+        assert_eq!(engine.state.if_state, IfState::None);
+        assert_eq!(engine.state.paren_depth, 0);
+    }
+
+    #[test]
+    fn semicolon_split_for_external_routine_resets_transient_state() {
+        let mut engine = SqlParserEngine::new();
+        engine.current.push_str("LANGUAGE C");
+        engine.state.block_stack.push(BlockKind::AsIs);
+        engine.state.routine_is_stack.push((1, true));
+        engine.state.pending_end = PendingEnd::End;
+        engine.state.pending_do = PendingDo::While;
+        engine.state.if_state = IfState::AfterConditionParen;
+        engine.state.paren_depth = 1;
+
+        engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
+
+        assert_eq!(engine.take_statements(), vec!["LANGUAGE C".to_string()]);
+        assert!(engine.current.is_empty());
+        assert_eq!(engine.state.block_depth(), 0);
+        assert_eq!(engine.state.pending_end, PendingEnd::None);
+        assert_eq!(engine.state.pending_do, PendingDo::None);
+        assert_eq!(engine.state.if_state, IfState::None);
+        assert_eq!(engine.state.paren_depth, 0);
+    }
     #[test]
     fn separator_resolution_keeps_create_state() {
         let mut state = SplitState {
