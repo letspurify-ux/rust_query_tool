@@ -1277,3 +1277,33 @@
 - `cargo test -q recovers_to_disassociate_statement_head -- --nocapture` 통과
 - `cargo test -q recovers_to_associate_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-04 Oracle 공통 파서 엔진 `WITH FUNCTION/PROCEDURE` 복구 로직 일괄 보강 (`is_statement_head_keyword` 재사용)
+
+### [중] `split_script_items` / `split_format_items`가 복구 대상 키워드를 하드코딩해 누락 구문이 계속 재발하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; COMMENT ON ...; SELECT ...;`
+  - `WITH FUNCTION ... END; RENAME ...; SELECT ...;`
+  - 위 형태에서 `COMMENT`, `RENAME`가 새 문장 시작으로 인식되지 않아 앞 `WITH FUNCTION` 블록과 합쳐질 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`는 `is_statement_head_keyword` 기반으로 복구 키워드를 폭넓게 인식하지만,
+  - `src/db/query/script.rs`의 조기 복구 분기(`split_script_items`, `split_format_items`)는 별도 하드코딩 목록을 사용해 동기화가 깨져 있었습니다.
+- **수정**:
+  - 두 분기 모두 `trimmed_upper.split_whitespace().next()`로 선두 토큰을 추출한 뒤,
+  - `sql_text::is_statement_head_keyword`를 공통으로 재사용하도록 변경했습니다.
+  - 이로써 기존에 누락되던 `COMMENT`, `RENAME`뿐 아니라 동일 클래스의 누락 가능 구문이 일괄적으로 예방됩니다.
+
+### [유사 케이스 점검] 하드코딩 목록과 공통 분류기 불일치 구조 제거
+- `CREATE/ALTER/DROP/.../WITH`만 나열하던 중복 조건을 제거해,
+- 파서 엔진의 복구 기준과 스크립트 분할기의 복구 기준이 동일한 소스(`is_statement_head_keyword`)를 따르도록 정렬했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_comment_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_rename_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_comment_statement_head`
+- `test_split_format_items_oracle_with_function_recovers_to_rename_statement_head`
+
+### [검증]
+- `cargo test -q recovers_to_comment_statement_head` 통과
+- `cargo test -q recovers_to_rename_statement_head` 통과
+- `cargo test -q` 전체 통과

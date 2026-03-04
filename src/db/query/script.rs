@@ -2630,27 +2630,17 @@ impl QueryExecutor {
             // TRIGGER 헤더에서는 INSERT/UPDATE/DELETE/SELECT 등이 이벤트 타입으로
             // block_depth == 0 상태에서 나올 수 있으므로, TRIGGER의 block_depth == 0 구간에서는
             // 이 강제 종료를 건너뜀
+            let leading_word = trimmed_upper.split_whitespace().next();
+            let starts_new_statement_head =
+                leading_word.is_some_and(sql_text::is_statement_head_keyword);
+
             if builder.is_idle()
                 && builder.in_create_plsql()
                 && builder.block_depth() == 0
                 && builder.paren_depth() == 0
                 && !builder.current_is_empty()
                 && !builder.is_trigger()
-                && (trimmed_upper.starts_with("CREATE")
-                    || trimmed_upper.starts_with("ALTER")
-                    || trimmed_upper.starts_with("DROP")
-                    || trimmed_upper.starts_with("TRUNCATE")
-                    || trimmed_upper.starts_with("GRANT")
-                    || trimmed_upper.starts_with("REVOKE")
-                    || trimmed_upper.starts_with("COMMIT")
-                    || trimmed_upper.starts_with("ROLLBACK")
-                    || trimmed_upper.starts_with("SAVEPOINT")
-                    || trimmed_upper.starts_with("SELECT")
-                    || trimmed_upper.starts_with("INSERT")
-                    || trimmed_upper.starts_with("UPDATE")
-                    || trimmed_upper.starts_with("DELETE")
-                    || trimmed_upper.starts_with("MERGE")
-                    || trimmed_upper.starts_with("WITH"))
+                && starts_new_statement_head
             {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
@@ -2782,27 +2772,17 @@ impl QueryExecutor {
                 }
             }
 
+            let leading_word = trimmed_upper.split_whitespace().next();
+            let starts_new_statement_head =
+                leading_word.is_some_and(sql_text::is_statement_head_keyword);
+
             if builder.is_idle()
                 && builder.in_create_plsql()
                 && builder.block_depth() == 0
                 && builder.paren_depth() == 0
                 && !builder.current_is_empty()
                 && !builder.is_trigger()
-                && (trimmed_upper.starts_with("CREATE")
-                    || trimmed_upper.starts_with("ALTER")
-                    || trimmed_upper.starts_with("DROP")
-                    || trimmed_upper.starts_with("TRUNCATE")
-                    || trimmed_upper.starts_with("GRANT")
-                    || trimmed_upper.starts_with("REVOKE")
-                    || trimmed_upper.starts_with("COMMIT")
-                    || trimmed_upper.starts_with("ROLLBACK")
-                    || trimmed_upper.starts_with("SAVEPOINT")
-                    || trimmed_upper.starts_with("SELECT")
-                    || trimmed_upper.starts_with("INSERT")
-                    || trimmed_upper.starts_with("UPDATE")
-                    || trimmed_upper.starts_with("DELETE")
-                    || trimmed_upper.starts_with("MERGE")
-                    || trimmed_upper.starts_with("WITH"))
+                && starts_new_statement_head
             {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
