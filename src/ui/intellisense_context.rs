@@ -306,7 +306,54 @@ struct ParserDepthFrame {
     phase: SqlPhase,
     is_query_scope: bool,
     paren_func: Option<String>,
-    func_from_consumed: bool,
+    function_from_state: FunctionFromState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionFromState {
+    NotApplicable,
+    Available,
+    Consumed,
+}
+
+impl FunctionFromState {
+    fn from_function_name(function_name: Option<&str>) -> Self {
+        if function_name.is_some_and(is_from_consuming_function) {
+            Self::Available
+        } else {
+            Self::NotApplicable
+        }
+    }
+
+    fn consume(&mut self) {
+        if matches!(self, Self::Available) {
+            *self = Self::Consumed;
+        }
+    }
+
+    fn should_treat_from_as_function_argument(self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationModifierState {
+    None,
+    LateralLikePending,
+}
+
+impl RelationModifierState {
+    fn mark_lateral_like(&mut self) {
+        *self = Self::LateralLikePending;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+
+    fn blocks_outer_scope_cutoff(self) -> bool {
+        matches!(self, Self::LateralLikePending)
+    }
 }
 
 impl Default for ParserDepthFrame {
@@ -315,7 +362,7 @@ impl Default for ParserDepthFrame {
             phase: SqlPhase::Initial,
             is_query_scope: false,
             paren_func: None,
-            func_from_consumed: false,
+            function_from_state: FunctionFromState::NotApplicable,
         }
     }
 }
@@ -340,7 +387,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     let mut visible_parent: HashMap<usize, Option<usize>> = HashMap::new();
     visible_parent.insert(0, None);
 
-    let mut pending_lateral_subquery = false;
+    let mut relation_modifier_state = RelationModifierState::None;
     let mut cte_state = CteState::None;
     let mut cte_paren_depth: usize = 0;
 
@@ -402,7 +449,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     // Record the function name that preceded this '(' so we can
                     // distinguish function-internal FROM from SQL FROM clauses.
                     frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
-                    frame.func_from_consumed = false;
+                    frame.function_from_state =
+                        FunctionFromState::from_function_name(frame.paren_func.as_deref());
                 }
 
                 let scope_id = next_scope_id;
@@ -414,7 +462,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .and_then(|frame| frame.paren_func.as_deref())
                     .is_some_and(is_from_lateral_table_function);
                 let inherited_visible_parent = if matches!(parent_phase, SqlPhase::FromClause)
-                    && !pending_lateral_subquery
+                    && !relation_modifier_state.blocks_outer_scope_cutoff()
                     && !is_from_lateral_function
                 {
                     None
@@ -423,7 +471,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 };
                 visible_parent.insert(scope_id, inherited_visible_parent);
 
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
                 relation_state.clear();
 
                 if matches!(parent_phase, SqlPhase::FromClause) {
@@ -500,7 +548,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             if depth_frames.len() > 1 {
                                 depth_frames.pop();
                             }
-                            pending_lateral_subquery = false;
+                            relation_modifier_state.clear();
                             relation_state.clear();
                             last_word = None;
                             continue;
@@ -543,7 +591,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if depth_frames.len() > 1 {
                     depth_frames.pop();
                 }
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
                 relation_state.clear();
                 last_word = None;
                 idx += 1;
@@ -554,7 +602,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 continue;
             }
             SqlToken::Symbol(sym) if sym == "," => {
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
                 let current_phase = depth_frames
                     .get(depth)
                     .map(|frame| frame.phase)
@@ -598,7 +646,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 scope_stack = vec![0usize];
                 visible_parent.clear();
                 visible_parent.insert(0, None);
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
 
                 idx += 1;
                 continue;
@@ -654,11 +702,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 if (upper == "LATERAL" || upper == "APPLY")
                     && matches!(current_phase, SqlPhase::FromClause)
                 {
-                    pending_lateral_subquery = true;
+                    relation_modifier_state.mark_lateral_like();
                     idx += 1;
                     continue;
                 }
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
 
                 match upper.as_str() {
                     "INSERT" => {
@@ -679,18 +727,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "FROM" => {
-                        let consumes_func_from = depth > 0
-                            && depth_frames
-                                .get(depth)
-                                .and_then(|frame| frame.paren_func.as_deref())
-                                .is_some_and(is_from_consuming_function);
-                        let func_from_already_consumed = depth_frames
+                        let should_treat_as_function_from = depth_frames
                             .get(depth)
-                            .map(|frame| frame.func_from_consumed)
+                            .map(|frame| {
+                                frame
+                                    .function_from_state
+                                    .should_treat_from_as_function_argument()
+                            })
                             .unwrap_or(false);
-                        if consumes_func_from && !func_from_already_consumed {
+                        if should_treat_as_function_from {
                             if let Some(frame) = depth_frames.get_mut(depth) {
-                                frame.func_from_consumed = true;
+                                frame.function_from_state.consume();
                             }
                         } else {
                             depth_frames[depth].phase = SqlPhase::FromClause;
@@ -856,7 +903,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 last_word = Some(upper);
             }
             _ => {
-                pending_lateral_subquery = false;
+                relation_modifier_state.clear();
                 last_word = None;
             }
         }
