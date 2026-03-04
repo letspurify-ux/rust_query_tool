@@ -2158,6 +2158,23 @@ fn overlay_from_does_not_trigger_from_clause() {
     assert!(ctx.phase.is_column_context());
 }
 
+
+#[test]
+fn position_from_does_not_trigger_from_clause() {
+    // POSITION(sub IN source) uses IN, but POSITION(sub FROM source) is allowed in some dialects
+    // and should not be interpreted as a SQL FROM clause.
+    let ctx = analyze("SELECT POSITION('a' FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn real_from_after_position_still_works() {
+    let ctx = analyze("SELECT POSITION('a' FROM name) FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
 #[test]
 fn real_from_after_extract_still_works() {
     // The outer FROM clause should still be detected correctly.
