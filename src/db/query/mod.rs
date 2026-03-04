@@ -2,8 +2,8 @@ mod executor;
 mod script;
 mod types;
 
-pub use executor::*;
 pub(crate) use crate::sql_parser_engine::SplitState;
+pub use executor::*;
 pub use types::*;
 
 #[cfg(test)]

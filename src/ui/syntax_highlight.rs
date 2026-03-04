@@ -1138,7 +1138,7 @@ fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContin
 
                 if bytes.get(idx) == Some(&b'/') && bytes.get(idx + 1) == Some(&b'*') {
                     idx += 2;
-                    while let Some(_) = bytes.get(idx) {
+                    while bytes.get(idx).is_some() {
                         if bytes.get(idx) == Some(&b'*') && bytes.get(idx + 1) == Some(&b'/') {
                             idx += 2;
                             break;

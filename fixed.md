@@ -1,5 +1,69 @@
 # 예외 처리 보완 내역
 
+## 2026-03-04 Oracle 공통 파서 엔진 누락 문법 보완 (`MATCH_RECOGNIZE inline DEFINE` / `CREATE TYPE OBJECT` 속성명)
+
+### [중] `MATCH_RECOGNIZE (...)` 내부 `DEFINE b AS ...`가 SQL*Plus `DEFINE` 명령으로 오인식되던 문제 수정
+- **증상**:
+  - `MATCH_RECOGNIZE` 절에서 `DEFINE b AS ...`를 한 줄에 작성하면 statement가 중간에서 끊기고,
+  - `DEFINE`가 `ToolCommand::Define`으로 분류되어 SQL 본문이 손상될 수 있었습니다.
+- **원인**:
+  - `src/db/query/script.rs`의 `split_script_items`/`split_format_items`가
+  - 진행 중 statement에서도 `block_depth == 0`만 확인하고 도구 명령 판별(`parse_tool_command`)을 수행했습니다.
+  - `MATCH_RECOGNIZE (...)` 내부는 `block_depth == 0`이지만 `paren_depth > 0`인 컨텍스트라 오인식이 가능했습니다.
+- **수정**:
+  - 도구 명령 판별 및 CREATE-PL/SQL 강제 종료 분기에 `paren_depth == 0` 조건을 추가했습니다.
+  - `src/sql_parser_engine.rs`에 `SqlParserEngine::paren_depth()` 접근자를 추가해 호출부에서 안전하게 depth를 참조하도록 정리했습니다.
+- **효과**:
+  - 괄호 내부 SQL 절(`MATCH_RECOGNIZE`, 객체 정의 속성 목록 등)에서는 명령어 오인식/강제 분리가 발생하지 않습니다.
+
+### [중] `CREATE TYPE ... AS OBJECT (...)` 속성명이 `CREATE_*`로 시작할 때 강제 분리되던 문제 수정
+- **증상**:
+  - 객체 타입 속성 라인이 `create_flag NUMBER`처럼 `CREATE` 접두를 가지면,
+  - 다음 statement 시작으로 오인되어 `CREATE TYPE` 문장이 중간에서 분리될 수 있었습니다.
+- **원인**:
+  - CREATE-PL/SQL 복구 분기에서 `trimmed_upper.starts_with("CREATE")`를 괄호 depth 검증 없이 적용했습니다.
+- **수정**:
+  - 동일 분기에 `paren_depth == 0` 가드를 추가해 괄호 내부 라인에서는 복구 분기가 동작하지 않도록 보정했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_match_recognize_inline_define_not_parsed_as_tool_command`
+- `test_split_format_items_match_recognize_inline_define_not_parsed_as_tool_command`
+- `test_create_type_object_attribute_prefixed_create_does_not_force_split`
+
+### [검증]
+- `cargo test test_match_recognize_inline_define_not_parsed_as_tool_command`
+- `cargo test inline_define_not_parsed_as_tool_command`
+- `cargo test test_create_type_object_attribute_prefixed_create_does_not_force_split`
+- `cargo test` 전체 통과
+
+## 2026-03-04 Oracle 공통 파서 엔진 누락 구문 보완 (중첩 EXTERNAL 루틴)
+
+### [중] `PACKAGE/TYPE BODY` 내부 `PROCEDURE ... IS EXTERNAL ...;` 뒤 후속 문장이 분리되지 않던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE PACKAGE BODY ... PROCEDURE ... IS EXTERNAL ...; END pkg; SELECT ...;` 형태에서
+  - 내부 `EXTERNAL` 루틴 선언이 세미콜론으로 종료되어도 내부 루틴 블록이 닫히지 않아, 뒤 `SELECT`가 같은 statement로 병합될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `handle_routine_is_external`가 `block_depth == 1`(top-level)에서만 semicolon policy를 설정했습니다.
+  - 그 결과 중첩 루틴(`block_depth > 1`)은 `BEGIN` 없는 `EXTERNAL` 선언 종료 시점을 인식하지 못해 `AsIs` 블록이 남았습니다.
+- **수정**:
+  - semicolon 정책을 확장해 중첩 루틴은 `CloseRoutineBlock`으로 처리하도록 추가했습니다.
+  - 세미콜론 처리 시 top-level `EXTERNAL`은 기존처럼 statement split을 유지하고,
+  - 중첩 `EXTERNAL`은 statement split 없이 내부 루틴 블록만 닫도록 `close_external_routine_on_semicolon` 경로를 추가했습니다.
+  - 관련 상태(`routine_is_stack`, `pending_subprogram_begins`, `block_stack`)가 함께 정리되도록 보강했습니다.
+
+### [테스트] 회귀 테스트 추가/보강
+- `test_package_body_nested_external_procedure_followed_by_select_splits`
+- `semicolon_action_closes_nested_external_routine_without_split`
+- `close_external_routine_semicolon_only_closes_nested_routine_block`
+- 기존 단위 테스트 기대값 보정:
+  - `package_with_nested_external_procedure_does_not_split_mid_statement`
+
+### [검증]
+- `cargo test test_package_body_nested_external_procedure_followed_by_select_splits -- --nocapture`
+- `cargo test nested_external_routine -- --nocapture`
+- `cargo test close_external_routine_semicolon_only_closes_nested_routine_block -- --nocapture`
+- `cargo test`
+
 ## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (FROM-소비 함수 미닫힘 복구)
 
 ### [중] `TRIM/EXTRACT/...` 괄호 미닫힘 시 실제 `FROM` 절이 함수 내부 `FROM`으로 계속 오인되던 문제 수정
@@ -23,6 +87,39 @@
 ### [검증]
 - `cargo test malformed_trim_missing_close_paren -- --nocapture`
 - `cargo test`
+
+## 2026-03-04 Oracle 공통 파서 엔진 누락 문법 보완 (`CREATE JAVA SOURCE`)
+
+### [중] `CREATE ... JAVA SOURCE` 본문 내부 세미콜론(`;`)으로 statement가 잘못 분리되던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE AND COMPILE JAVA SOURCE ... AS` 본문(Java 코드) 내부 `;`를 top-level SQL terminator로 오인해 문장이 중간 분리되거나,
+  - 반대로 `AS`를 PL/SQL `AS/IS` 블록 시작으로 잘못 해석해 `block_depth`가 남아 `/` 구분자 처리까지 꼬일 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `track_create_plsql`가 `JAVA SOURCE`를 CREATE 상태로 추적하지 못했고,
+  - `SemicolonAction`/`AsIsBlockStart`가 `JAVA SOURCE` 컨텍스트를 별도로 고려하지 않았습니다.
+- **수정**:
+  - `CreateState::AwaitingJavaTarget`, `CreatePlsqlKind::JavaSource` 상태를 추가해 `CREATE ... JAVA SOURCE`를 명시적으로 인식.
+  - `SemicolonAction::from_state`에서 `JAVA SOURCE` 컨텍스트일 때 세미콜론을 분리 트리거로 사용하지 않도록 보강.
+  - `AsIsBlockStart::from_token`에서 `JAVA SOURCE ... AS`는 PL/SQL 블록 opener로 취급하지 않도록 제외.
+  - `CREATE` modifier 파싱에 `AND/COMPILE/RESOLVE`를 반영해 `CREATE OR REPLACE AND COMPILE JAVA SOURCE` 패턴을 정상 인식.
+  - `statement_bounds_at_cursor` 내부 span collector(`src/db/query/executor.rs`)에도 동일 규칙을 반영해, `JAVA SOURCE` 본문 세미콜론에서 커서 문장 경계가 잘리지 않도록 정합성을 맞췄습니다.
+- **효과**:
+  - Java 본문 내부 `;`가 statement를 깨뜨리지 않고, SQL*Plus slash(`"/"`) 또는 다음 statement 경계에서 안정적으로 분리됩니다.
+
+### [테스트] 회귀 테스트 추가
+- `create_state_transitions_to_java_source_on_create_and_compile_java_source`
+- `semicolon_action_keeps_java_source_statement_open_at_top_level`
+- `test_split_script_items_oracle_create_java_source_keeps_body_until_slash`
+- `test_split_format_items_oracle_create_java_source_keeps_body_until_slash`
+- `test_statement_bounds_at_cursor_create_java_source_ignores_body_semicolon_until_slash`
+
+### [검증]
+- `cargo test create_state_transitions_to_java_source_on_create_and_compile_java_source -- --nocapture`
+- `cargo test semicolon_action_keeps_java_source_statement_open_at_top_level -- --nocapture`
+- `cargo test test_split_script_items_oracle_create_java_source_keeps_body_until_slash -- --nocapture`
+- `cargo test test_split_format_items_oracle_create_java_source_keeps_body_until_slash -- --nocapture`
+- `cargo test test_statement_bounds_at_cursor_create_java_source_ignores_body_semicolon_until_slash -- --nocapture`
+- `cargo test` 전체 통과
 
 ## 2026-03-03 쿼리 depth 로직 누락 구문 케이스 보완 (서브쿼리 내부 일반 괄호)
 
@@ -865,6 +962,65 @@
 ### [테스트] 회귀 테스트 추가
 - `display_result_keeps_staged_edits_when_non_save_non_select_query_succeeds`
   - 편집 모드에서 `COMMIT` 성공 결과 수신 시 edit session과 staged row/source SQL이 유지되는지 검증.
+
+### [검증]
+- `cargo test` 전체 통과
+
+## 2026-03-04 Oracle 공통 파서 엔진 문법 회귀 수정
+
+### [중] PACKAGE 스펙 전방 선언 뒤 `SUBTYPE ... IS ...` 오인식으로 인한 문장 분리 실패 수정
+- **증상**: `CREATE PACKAGE ... PROCEDURE p; SUBTYPE t IS ...; END ...;` 형태에서, `PROCEDURE` 전방 선언 이후 남아 있던 nested subprogram 대기 상태 때문에 `SUBTYPE ... IS`의 `IS`를 서브프로그램 본문 시작으로 잘못 인식했습니다.
+- **영향**: `block_depth`가 과도하게 유지되어 패키지 종료 후 다음 `SELECT`까지 하나의 문장으로 합쳐지는 분리 오류가 발생했습니다.
+- **수정**: 세미콜론(`;`) 처리 시 `PROCEDURE/FUNCTION` 전방 선언 대기 상태(`AwaitingNestedSubprogram`)를 즉시 해제하도록 `clear_forward_subprogram_declaration_state_on_semicolon` 경로를 추가했습니다.
+- **효과**: PACKAGE 스펙 내 `SUBTYPE/TYPE ... IS ...` 선언이 정상 해석되고, 후속 top-level 문장이 올바르게 분리됩니다.
+
+### [테스트] Oracle PACKAGE 전방 선언 + SUBTYPE 회귀 케이스 추가
+- `test_package_spec_forward_declaration_followed_by_subtype_splits_before_next_statement`
+- `test_split_format_items_package_spec_forward_declaration_followed_by_subtype_splits_before_next_statement`
+
+### [검증]
+- `cargo test package_spec_forward_declaration_followed_by_subtype -- --nocapture` 통과
+
+## 2026-03-04 Oracle 공통 파서 엔진 `WITH FUNCTION` 문장 중간 위치 회귀 수정
+
+### [중] `CREATE VIEW ... AS WITH FUNCTION ...` 구문에서 내부 `END;` 뒤 오분리되던 버그 수정
+- **증상**: Oracle의 `WITH FUNCTION/PROCEDURE` 선언이 문장 첫 토큰이 아닌 위치(예: `CREATE VIEW ... AS WITH ...`)에 올 때, 내부 함수 `END;`를 문장 종결로 잘못 판단해 다음 `SELECT`를 별도 문장으로 분리했습니다.
+- **원인**: `track_top_level_with_plsql`가 top-level `WITH`를 문장 시작(`at_statement_start`)에서만 감지해 `WITH FUNCTION` 선언 모드로 전환하지 못했습니다.
+- **수정**: top-level에서 `WITH`가 등장하면(기존 `WITH` 상태를 덮어쓰지 않는 조건으로) `PendingClause`로 진입하도록 감지 조건을 확장했습니다.
+- **효과**: `CREATE VIEW ... AS WITH FUNCTION ... SELECT ...;` 형태에서 선언부와 메인 쿼리가 하나의 DDL 문장으로 유지되고, 이후 문장만 정상 분리됩니다.
+
+### [테스트] 회귀 케이스 추가
+- `sql_parser_engine::tests::create_view_as_with_function_keeps_statement_open_until_main_select_terminator`
+- `test_split_script_items_oracle_create_view_as_with_function_keeps_single_statement`
+- `test_split_format_items_oracle_create_view_as_with_function_keeps_single_statement`
+
+### [검증]
+- `cargo test create_view_as_with_function -- --nocapture` 통과
+- `cargo test` 전체 통과
+
+## 2026-03-04 인텔리센스 문맥 인식 보강 (QUALIFY / WINDOW / RETURNING)
+
+### [중] `QUALIFY` 절에서 테이블 컨텍스트로 오인식되던 문제 수정
+- **증상**: `SELECT ... FROM ... QUALIFY ...` 구문에서 커서가 `QUALIFY` 식 내부에 있어도 phase가 `FromClause`로 유지되어 테이블 추천이 우선되는 문제가 있었습니다.
+- **수정**: `scan_cursor_context`의 키워드 전이에 `QUALIFY` 분기를 추가해 `WhereClause`로 전환되도록 변경했습니다.
+- **효과**: `QUALIFY` 식 내부에서 컬럼 컨텍스트로 안정적으로 분류됩니다.
+
+### [중] `WINDOW` 절에서 컬럼 식 컨텍스트가 반영되지 않던 문제 수정
+- **증상**: `WINDOW w AS (PARTITION BY ... ORDER BY ...)` 절에서 phase 전이가 없어 이전 상태가 유지될 수 있었습니다.
+- **수정**: `WINDOW` 키워드 진입 시 `OrderByClause`로 전환하도록 처리했습니다.
+- **효과**: `WINDOW` 절 내부의 컬럼/식 입력 시 컬럼 추천 컨텍스트가 유지됩니다.
+
+### [중] DML `RETURNING` 절이 값 절(`VALUES`)로 남아 컬럼 추천이 제한되던 문제 수정
+- **증상**: `INSERT ... VALUES ... RETURNING ...`에서 커서가 `RETURNING` 목록에 있어도 phase가 `ValuesClause`로 남았습니다.
+- **수정**: `RETURNING` 키워드 진입 시 `SetClause`로 전환하도록 처리하고, 관련 테스트 기대값을 업데이트했습니다.
+- **효과**: `RETURNING` 목록에서 컬럼 컨텍스트 기반 추천이 동작합니다.
+
+### [테스트] 회귀/보강 테스트 추가
+- `ui::intellisense_context::tests::phase_window_clause_is_column_context`
+- `ui::intellisense_context::tests::phase_qualify_clause_is_column_context`
+- `ui::intellisense::intellisense_tests::detect_sql_context_qualify_clause_is_column_name`
+- `ui::intellisense::intellisense_tests::detect_sql_context_returning_clause_is_column_name`
+- `ui::intellisense_context::tests::insert_subquery_depth_returns_to_zero_after_closing_values_subquery` 기대 phase를 `SetClause`로 보강
 
 ### [검증]
 - `cargo test` 전체 통과

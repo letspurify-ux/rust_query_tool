@@ -6,9 +6,10 @@ use crate::sql_text;
 //    structurally impossible.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum LexMode {
     /// Normal code – not inside any string literal or comment.
+    #[default]
     Idle,
     SingleQuote,
     DoubleQuote,
@@ -21,12 +22,6 @@ pub(crate) enum LexMode {
     DollarQuote {
         tag: String,
     },
-}
-
-impl Default for LexMode {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -66,8 +61,9 @@ pub(crate) enum BlockKind {
 //    pending_while_do/pending_for_do, pending_timing_point_is.
 // ---------------------------------------------------------------------------
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum PendingEnd {
+    #[default]
     None,
     /// Saw END, waiting for next token to determine what it closes.
     End,
@@ -128,38 +124,30 @@ impl PendingEndSuffix {
     }
 }
 
-impl Default for PendingEnd {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum IfState {
+    #[default]
     None,
     /// Saw IF, waiting for the first meaningful character after IF.
     ExpectConditionStart,
     /// Saw IF followed by `(`, tracking condition paren depth.
-    InConditionParen {
-        depth: usize,
-    },
+    InConditionParen { depth: usize },
     /// Condition paren closed, waiting for THEN.
     AfterConditionParen,
     /// Saw IF (no paren), waiting for THEN.
     AwaitingThen,
 }
 
-impl Default for IfState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum PendingDo {
+    #[default]
     None,
-    While { armed_at_block_depth: usize },
-    For { armed_at_block_depth: usize },
+    While {
+        armed_at_block_depth: usize,
+    },
+    For {
+        armed_at_block_depth: usize,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -172,6 +160,7 @@ struct RoutineFrame {
 enum SemicolonPolicy {
     Default,
     ForceSplit,
+    CloseRoutineBlock,
 }
 
 impl RoutineFrame {
@@ -186,11 +175,10 @@ impl RoutineFrame {
         self.block_depth == current_block_depth
             && self.semicolon_policy == SemicolonPolicy::ForceSplit
     }
-}
 
-impl Default for PendingDo {
-    fn default() -> Self {
-        Self::None
+    fn should_close_routine_block_on_semicolon(self, current_block_depth: usize) -> bool {
+        self.block_depth == current_block_depth
+            && self.semicolon_policy == SemicolonPolicy::CloseRoutineBlock
     }
 }
 
@@ -226,8 +214,9 @@ impl PendingDo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum WithClauseState {
+    #[default]
     None,
     PendingClause,
     InPlsqlDeclaration(WithDeclarationState),
@@ -239,32 +228,37 @@ enum WithDeclarationState {
     AwaitingMainQuery,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum TopLevelTokenState {
+    #[default]
     NoneSeen,
     Seen,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum TimingPointState {
+    #[default]
     None,
     AwaitingAsOrIs,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum BeginState {
+    #[default]
     None,
     AfterDeclare,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum AsIsState {
+    #[default]
     None,
     AwaitingNestedSubprogram,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum AsIsFollowState {
+    #[default]
     None,
     AwaitingTypeDeclarativeKind,
 }
@@ -349,10 +343,15 @@ enum SemicolonAction {
     AppendToCurrent,
     SplitTopLevel,
     SplitForcedRoutine,
+    CloseRoutineBlock,
 }
 
 impl SemicolonAction {
     fn from_state(state: &SplitState) -> Self {
+        if state.in_java_source_create() {
+            return Self::AppendToCurrent;
+        }
+
         if state.block_depth() == 0 && state.paren_depth == 0 && !state.in_with_plsql_declaration()
         {
             return Self::SplitTopLevel;
@@ -360,6 +359,10 @@ impl SemicolonAction {
 
         if state.paren_depth == 0 && state.should_split_on_semicolon() {
             return Self::SplitForcedRoutine;
+        }
+
+        if state.paren_depth == 0 && state.should_close_routine_block_on_semicolon() {
+            return Self::CloseRoutineBlock;
         }
 
         Self::AppendToCurrent
@@ -377,7 +380,9 @@ impl AsIsBlockStart {
         }
 
         if state.as_is_state == AsIsState::AwaitingNestedSubprogram
-            || (state.in_create_plsql() && state.block_depth() == 0)
+            || (state.in_create_plsql()
+                && !state.in_java_source_create()
+                && state.block_depth() == 0)
         {
             return Self::Regular;
         }
@@ -386,38 +391,17 @@ impl AsIsBlockStart {
     }
 }
 
-impl Default for BeginState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for AsIsState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for AsIsFollowState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum CreateState {
+    #[default]
     None,
     AwaitingObjectType,
+    AwaitingJavaTarget,
 }
 
-impl Default for CreateState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 enum CreatePlsqlKind {
+    #[default]
     None,
     Procedure,
     Function,
@@ -426,36 +410,13 @@ enum CreatePlsqlKind {
     TypeSpec,
     TypeBody,
     Trigger(TriggerKind),
+    JavaSource,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TriggerKind {
     Simple,
     Compound,
-}
-
-impl Default for CreatePlsqlKind {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for TimingPointState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for WithClauseState {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl Default for TopLevelTokenState {
-    fn default() -> Self {
-        Self::NoneSeen
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +510,10 @@ impl SplitState {
 
     pub(crate) fn is_trigger(&self) -> bool {
         matches!(self.create_plsql_kind, CreatePlsqlKind::Trigger(_))
+    }
+
+    pub(crate) fn in_java_source_create(&self) -> bool {
+        self.create_plsql_kind == CreatePlsqlKind::JavaSource
     }
 
     fn in_compound_trigger(&self) -> bool {
@@ -651,16 +616,20 @@ impl SplitState {
         }
     }
 
-    /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY as split-on-semicolon.
+    /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY semicolon behavior.
     fn handle_routine_is_external(&mut self, upper: &str) {
         if matches!(upper, "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
             && self
                 .routine_is_stack
                 .last()
-                .is_some_and(|frame| frame.block_depth == self.block_depth() && frame.block_depth == 1)
+                .is_some_and(|frame| frame.block_depth == self.block_depth())
         {
             if let Some(frame) = self.routine_is_stack.last_mut() {
-                frame.semicolon_policy = SemicolonPolicy::ForceSplit;
+                frame.semicolon_policy = if frame.block_depth == 1 {
+                    SemicolonPolicy::ForceSplit
+                } else {
+                    SemicolonPolicy::CloseRoutineBlock
+                };
             }
         }
     }
@@ -887,11 +856,7 @@ impl SplitState {
     /// Plain END (not END CASE/IF/LOOP/WHILE/REPEAT/timing).
     /// If top is Case, treat as CASE expression end. Otherwise pop a PL/SQL block.
     fn resolve_plain_end(&mut self) {
-        if self.top_is_case() {
-            self.block_stack.pop();
-        } else if !self.block_stack.is_empty() {
-            self.block_stack.pop();
-        }
+        let _ = self.block_stack.pop();
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
@@ -917,6 +882,42 @@ impl SplitState {
         self.routine_is_stack
             .last()
             .is_some_and(|frame| frame.should_split_on_semicolon(self.block_depth()))
+    }
+
+    fn should_close_routine_block_on_semicolon(&self) -> bool {
+        self.routine_is_stack
+            .last()
+            .is_some_and(|frame| frame.should_close_routine_block_on_semicolon(self.block_depth()))
+    }
+
+    fn close_external_routine_on_semicolon(&mut self) {
+        if !self.should_close_routine_block_on_semicolon() {
+            return;
+        }
+
+        let _ = self.routine_is_stack.pop();
+        self.pending_subprogram_begins = self.pending_subprogram_begins.saturating_sub(1);
+
+        if self.block_stack.last() == Some(&BlockKind::AsIs) {
+            let _ = self.block_stack.pop();
+            return;
+        }
+
+        if let Some(pos) = self
+            .block_stack
+            .iter()
+            .rposition(|kind| *kind == BlockKind::AsIs)
+        {
+            self.block_stack.remove(pos);
+        }
+    }
+
+    fn clear_forward_subprogram_declaration_state_on_semicolon(&mut self) {
+        // `PROCEDURE/FUNCTION name;` forward declarations inside package/type specs
+        // should not leave nested-subprogram state armed for later `TYPE/SUBTYPE ... IS`.
+        if self.as_is_state == AsIsState::AwaitingNestedSubprogram {
+            self.as_is_state = AsIsState::None;
+        }
     }
 
     pub(crate) fn reset_create_state(&mut self) {
@@ -960,15 +961,36 @@ impl SplitState {
             return;
         }
 
+        if self.create_state == CreateState::AwaitingJavaTarget {
+            match upper {
+                "SOURCE" => {
+                    self.create_plsql_kind = CreatePlsqlKind::JavaSource;
+                    self.create_state = CreateState::None;
+                    return;
+                }
+                "CLASS" | "RESOURCE" => {
+                    self.create_state = CreateState::None;
+                    return;
+                }
+                _ => {
+                    self.create_state = CreateState::None;
+                }
+            }
+        }
+
         if self.create_state == CreateState::AwaitingObjectType {
             match upper {
                 "OR" => {
                     return;
                 }
-                "NO" | "FORCE" | "REPLACE" => {
+                "NO" | "FORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE" => {
                     return;
                 }
                 "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" => {
+                    return;
+                }
+                "JAVA" => {
+                    self.create_state = CreateState::AwaitingJavaTarget;
                     return;
                 }
                 "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER" => {
@@ -999,7 +1021,12 @@ impl SplitState {
             return;
         }
 
-        if upper == "WITH" && at_statement_start {
+        // Oracle allows `WITH FUNCTION/PROCEDURE` inside top-level query contexts
+        // that are not the very first token (e.g. CREATE VIEW ... AS WITH ...).
+        // Start tracking on any top-level WITH while preserving active WITH states.
+        let can_start_with_clause =
+            at_statement_start || self.with_clause_state == WithClauseState::None;
+        if upper == "WITH" && can_start_with_clause {
             self.with_clause_state = WithClauseState::PendingClause;
             return;
         }
@@ -1140,6 +1167,10 @@ impl SqlParserEngine {
         self.state.block_depth()
     }
 
+    pub(crate) fn paren_depth(&self) -> usize {
+        self.state.paren_depth
+    }
+
     pub(crate) fn is_trigger(&self) -> bool {
         self.state.is_trigger()
     }
@@ -1174,6 +1205,10 @@ impl SqlParserEngine {
                 self.reset_statement_local_state();
                 self.state.reset_create_state();
                 self.state.block_stack.clear();
+            }
+            SemicolonAction::CloseRoutineBlock => {
+                self.current.push(semicolon);
+                self.state.close_external_routine_on_semicolon();
             }
         }
     }
@@ -1528,6 +1563,8 @@ impl SqlParserEngine {
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
+                self.state
+                    .clear_forward_subprogram_declaration_state_on_semicolon();
                 self.state.advance_with_clause_after_semicolon();
                 let semicolon_action = SemicolonAction::from_state(&self.state);
                 self.apply_semicolon_action(semicolon_action, c);
@@ -1607,9 +1644,12 @@ mod tests {
 
     #[test]
     fn semicolon_action_keeps_with_clause_declaration_statement_open() {
-        let mut state = SplitState::default();
-        state.with_clause_state =
-            WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery);
+        let state = SplitState {
+            with_clause_state: WithClauseState::InPlsqlDeclaration(
+                WithDeclarationState::AwaitingMainQuery,
+            ),
+            ..SplitState::default()
+        };
         assert_eq!(
             SemicolonAction::from_state(&state),
             SemicolonAction::AppendToCurrent
@@ -1627,6 +1667,34 @@ mod tests {
         assert_eq!(
             SemicolonAction::from_state(&state),
             SemicolonAction::SplitForcedRoutine
+        );
+    }
+
+    #[test]
+    fn semicolon_action_closes_nested_external_routine_without_split() {
+        let mut state = SplitState::default();
+        state.block_stack.push(BlockKind::AsIs);
+        state.block_stack.push(BlockKind::AsIs);
+        state.routine_is_stack.push(RoutineFrame {
+            block_depth: 2,
+            semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
+        });
+        assert_eq!(
+            SemicolonAction::from_state(&state),
+            SemicolonAction::CloseRoutineBlock
+        );
+    }
+
+    #[test]
+    fn semicolon_action_keeps_java_source_statement_open_at_top_level() {
+        let state = SplitState {
+            create_plsql_kind: CreatePlsqlKind::JavaSource,
+            ..SplitState::default()
+        };
+
+        assert_eq!(
+            SemicolonAction::from_state(&state),
+            SemicolonAction::AppendToCurrent
         );
     }
 
@@ -1680,6 +1748,35 @@ mod tests {
         state.track_create_plsql("TABLE");
 
         assert!(!state.in_create_plsql());
+        assert_eq!(state.create_state, CreateState::None);
+    }
+
+    #[test]
+    fn create_state_transitions_to_java_source_on_create_and_compile_java_source() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("OR");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("REPLACE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("AND");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("COMPILE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("JAVA");
+        assert_eq!(state.create_state, CreateState::AwaitingJavaTarget);
+
+        state.track_create_plsql("SOURCE");
+
+        assert!(state.in_create_plsql());
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::JavaSource);
         assert_eq!(state.create_state, CreateState::None);
     }
 
@@ -1895,6 +1992,25 @@ mod tests {
         assert_eq!(engine.state.if_state, IfState::None);
         assert_eq!(engine.state.paren_depth, 0);
     }
+
+    #[test]
+    fn close_external_routine_semicolon_only_closes_nested_routine_block() {
+        let mut state = SplitState {
+            block_stack: vec![BlockKind::AsIs, BlockKind::AsIs],
+            pending_subprogram_begins: 1,
+            routine_is_stack: vec![RoutineFrame {
+                block_depth: 2,
+                semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
+            }],
+            ..SplitState::default()
+        };
+
+        state.close_external_routine_on_semicolon();
+
+        assert_eq!(state.block_stack, vec![BlockKind::AsIs]);
+        assert_eq!(state.pending_subprogram_begins, 0);
+        assert!(state.routine_is_stack.is_empty());
+    }
     #[test]
     fn separator_resolution_keeps_create_state() {
         let mut state = SplitState {
@@ -1961,6 +2077,40 @@ mod tests {
     }
 
     #[test]
+    fn create_view_as_with_function_keeps_statement_open_until_main_select_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE VIEW v_with_fn AS");
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("SELECT f() AS v FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE VIEW v_with_fn AS"),
+            "first statement should preserve CREATE VIEW header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("FUNCTION f RETURN NUMBER IS"),
+            "first statement should preserve WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("SELECT f() AS v FROM dual"),
+            "first statement should include main SELECT body: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
     fn finalize_clears_transient_parser_state_for_reuse() {
         let mut engine = SqlParserEngine::new();
         engine.process_line("FOR i IN 1..10");
@@ -2020,7 +2170,7 @@ mod tests {
         assert_eq!(
             engine.finalize_and_take_statements(),
             vec![
-                "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg;".to_string()
+                "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg".to_string()
             ]
         );
     }

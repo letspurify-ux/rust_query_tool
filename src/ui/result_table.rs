@@ -1644,10 +1644,8 @@ impl ResultTableWidget {
                             let mut state = drag_state_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let r1 = state.start_row.min(row);
-                            let r2 = state.start_row.max(row);
-                            let c1 = state.start_col.min(col);
-                            let c2 = state.start_col.max(col);
+                            let start_row = state.start_row;
+                            let start_col = state.start_col;
 
                             state.last_mouse_x = app::event_x();
                             state.last_mouse_y = app::event_y();
@@ -1659,7 +1657,8 @@ impl ResultTableWidget {
                             state.last_row = row;
                             state.last_col = col;
                             drop(state);
-                            table_for_handle.set_selection(r1, c1, r2, c2);
+
+                            table_for_handle.set_selection(start_row, start_col, row, col);
                             table_for_handle.redraw();
                         }
                         return true;

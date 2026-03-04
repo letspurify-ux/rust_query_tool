@@ -1774,6 +1774,10 @@ impl QueryExecutor {
                     if c == ';' {
                         self.state.resolve_pending_end_on_terminator();
                         if self.state.block_depth() == 0 {
+                            if self.state.in_java_source_create() {
+                                self.record_char(index, c);
+                                continue;
+                            }
                             if let Some(span) = self.push_current_span(sql) {
                                 if !on_span(span) {
                                     return false;

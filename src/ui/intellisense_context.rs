@@ -811,7 +811,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                         relation_state.clear();
                     }
+                    "WINDOW" => {
+                        // Treat SQL-standard WINDOW clause expressions as column context.
+                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        relation_state.clear();
+                    }
+                    "QUALIFY" => {
+                        // QUALIFY filters rows using analytic expressions, similar to WHERE.
+                        depth_frames[depth].phase = SqlPhase::WhereClause;
+                        relation_state.clear();
+                    }
                     "SET" => {
+                        depth_frames[depth].phase = SqlPhase::SetClause;
+                        relation_state.clear();
+                    }
+                    "RETURNING" => {
+                        // DML RETURNING lists target columns/expressions.
                         depth_frames[depth].phase = SqlPhase::SetClause;
                         relation_state.clear();
                     }

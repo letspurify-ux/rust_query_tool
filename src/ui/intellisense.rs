@@ -1432,8 +1432,9 @@ impl IntellisensePopup {
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();
-                    *state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        PopupState::Hidden;
+                    *state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
                 }
             }
         });
@@ -1877,6 +1878,34 @@ mod intellisense_tests {
             detect_sql_context(sql, mid_char),
             detect_sql_context(sql, utf8_start)
         );
+    }
+
+    #[test]
+    fn detect_sql_context_qualify_clause_is_column_name() {
+        let sql_with_cursor = "SELECT a FROM t QUALIFY |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_returning_clause_is_column_name() {
+        let sql_with_cursor = "INSERT INTO t (a) VALUES (1) RETURNING | INTO :a";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
     }
 
     #[test]

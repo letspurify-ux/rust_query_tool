@@ -4379,6 +4379,12 @@ The crash has been recorded in the application log.",
     }
 }
 
+impl Default for MainWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4467,11 +4473,5 @@ mod tests {
     fn resolve_progress_tab_index_keeps_batch_offset_when_tabs_grow() {
         assert_eq!(resolve_progress_tab_index(6, 3, None, 0), 3);
         assert_eq!(resolve_progress_tab_index(6, 3, None, 2), 5);
-    }
-}
-
-impl Default for MainWindow {
-    fn default() -> Self {
-        Self::new()
     }
 }

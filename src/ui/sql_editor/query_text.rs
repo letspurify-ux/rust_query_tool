@@ -613,6 +613,168 @@ fn clamp_cursor_to_char_boundary(sql: &str, cursor_pos: usize) -> usize {
     clamped
 }
 
+/// SQL*Plus 커맨드 라인인지 판별합니다.
+///
+/// 포맷팅/실행/인텔리센스에서 공통으로 사용하는 선행/단독 라인 규칙을 공유하도록
+/// 기존 파서 규칙을 재사용합니다.
+pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
+    let trimmed = trimmed_line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == "/" || trimmed.starts_with("@@") || trimmed.starts_with('@') {
+        return true;
+    }
+    if sql_text::is_sqlplus_remark_comment_line(trimmed) {
+        return true;
+    }
+    QueryExecutor::parse_tool_command(trimmed).is_some()
+}
+
+/// `QueryExecutor`의 스크립트 분할 규칙을 UI 공통 경로로 위임해
+/// 실행/포맷/인텔리센스에서 동일한 기준의 첫 문장을 사용합니다.
+pub(crate) fn normalize_single_statement(statement: &str) -> String {
+    let items = split_script_items(statement);
+    if items.len() > 1 {
+        if let Some(ScriptItem::Statement(stmt)) = items
+            .into_iter()
+            .find(|item| matches!(item, ScriptItem::Statement(_)))
+        {
+            return stmt;
+        }
+    }
+    statement.to_string()
+}
+
+pub(crate) fn split_format_items(sql: &str) -> Vec<FormatItem> {
+    QueryExecutor::split_format_items(sql)
+}
+
+pub(crate) fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
+    let normalized = expr.trim();
+    if normalized.is_empty() {
+        return Err("SQL expression after '=' cannot be empty.".to_string());
+    }
+
+    let items = split_script_items(normalized);
+    if items.len() != 1 {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    if !matches!(items.first(), Some(ScriptItem::Statement(_))) {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    if tokenize_sql_spanned(normalized)
+        .iter()
+        .any(|span| matches!(span.token, SqlToken::Comment(_)))
+    {
+        return Err(
+            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
+                .to_string(),
+        );
+    }
+
+    Ok(normalized.to_string())
+}
+
+pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, String> {
+    let sql = source_sql.trim();
+    if sql.is_empty() {
+        return Err("Cannot edit rows: source SQL is not available for this result.".to_string());
+    }
+
+    let tokens = tokenize_sql(sql);
+    let tables_in_scope = crate::ui::intellisense_context::collect_tables_in_statement(&tokens);
+    let mut candidates = Vec::new();
+    let mut seen_candidates = std::collections::HashSet::new();
+    for table_ref in &tables_in_scope {
+        if table_ref.is_cte {
+            continue;
+        }
+        let key = table_ref.name.to_ascii_uppercase();
+        if seen_candidates.insert(key) {
+            candidates.push(table_ref.name.clone());
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("Cannot edit rows: no base table was resolved from this query.".to_string());
+    }
+
+    let mut depth = 0usize;
+    let mut in_select = false;
+    let mut idx = 0usize;
+    let mut rowid_qualifier: Option<String> = None;
+    while idx < tokens.len() {
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(sym)) if sym == "(" => {
+                depth = depth.saturating_add(1);
+            }
+            Some(SqlToken::Symbol(sym)) if sym == ")" => {
+                depth = depth.saturating_sub(1);
+            }
+            Some(SqlToken::Word(word)) => {
+                if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
+                    in_select = true;
+                } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
+                    break;
+                }
+            }
+            _ => {}
+        }
+
+        if in_select && depth == 0 {
+            if let (
+                Some(SqlToken::Word(lhs)),
+                Some(SqlToken::Symbol(dot)),
+                Some(SqlToken::Word(rhs)),
+            ) = (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2))
+            {
+                if dot == "."
+                    && crate::sql_text::strip_identifier_quotes(rhs).eq_ignore_ascii_case("ROWID")
+                {
+                    rowid_qualifier = Some(crate::sql_text::strip_identifier_quotes(lhs));
+                    break;
+                }
+            }
+        }
+
+        idx += 1;
+    }
+
+    if let Some(qualifier) = rowid_qualifier {
+        let resolved =
+            crate::ui::intellisense_context::resolve_qualifier_tables(&qualifier, &tables_in_scope);
+        let mut resolved_deduped = Vec::new();
+        let mut seen_resolved = std::collections::HashSet::new();
+        for table in resolved {
+            let key = table.to_ascii_uppercase();
+            if seen_resolved.insert(key) {
+                resolved_deduped.push(table);
+            }
+        }
+        if resolved_deduped.len() == 1 {
+            return Ok(resolved_deduped.remove(0));
+        }
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates[0].clone());
+    }
+
+    Err(format!(
+        "Cannot resolve a single edit target table (candidates: {}). Query one table or qualify ROWID with an alias.",
+        candidates.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1068,166 +1230,4 @@ mod tests {
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")));
     }
-}
-
-/// SQL*Plus 커맨드 라인인지 판별합니다.
-///
-/// 포맷팅/실행/인텔리센스에서 공통으로 사용하는 선행/단독 라인 규칙을 공유하도록
-/// 기존 파서 규칙을 재사용합니다.
-pub(crate) fn is_sqlplus_command_line(trimmed_line: &str) -> bool {
-    let trimmed = trimmed_line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed == "/" || trimmed.starts_with("@@") || trimmed.starts_with('@') {
-        return true;
-    }
-    if sql_text::is_sqlplus_remark_comment_line(trimmed) {
-        return true;
-    }
-    QueryExecutor::parse_tool_command(trimmed).is_some()
-}
-
-/// `QueryExecutor`의 스크립트 분할 규칙을 UI 공통 경로로 위임해
-/// 실행/포맷/인텔리센스에서 동일한 기준의 첫 문장을 사용합니다.
-pub(crate) fn normalize_single_statement(statement: &str) -> String {
-    let items = split_script_items(statement);
-    if items.len() > 1 {
-        if let Some(ScriptItem::Statement(stmt)) = items
-            .into_iter()
-            .find(|item| matches!(item, ScriptItem::Statement(_)))
-        {
-            return stmt;
-        }
-    }
-    statement.to_string()
-}
-
-pub(crate) fn split_format_items(sql: &str) -> Vec<FormatItem> {
-    QueryExecutor::split_format_items(sql)
-}
-
-pub(crate) fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
-    let normalized = expr.trim();
-    if normalized.is_empty() {
-        return Err("SQL expression after '=' cannot be empty.".to_string());
-    }
-
-    let items = split_script_items(normalized);
-    if items.len() != 1 {
-        return Err(
-            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
-                .to_string(),
-        );
-    }
-
-    if !matches!(items.first(), Some(ScriptItem::Statement(_))) {
-        return Err(
-            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
-                .to_string(),
-        );
-    }
-
-    if tokenize_sql_spanned(normalized)
-        .iter()
-        .any(|span| matches!(span.token, SqlToken::Comment(_)))
-    {
-        return Err(
-            "SQL expression cannot contain statement/comment delimiters (;, --, /*, */)."
-                .to_string(),
-        );
-    }
-
-    Ok(normalized.to_string())
-}
-
-pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, String> {
-    let sql = source_sql.trim();
-    if sql.is_empty() {
-        return Err("Cannot edit rows: source SQL is not available for this result.".to_string());
-    }
-
-    let tokens = tokenize_sql(sql);
-    let tables_in_scope = crate::ui::intellisense_context::collect_tables_in_statement(&tokens);
-    let mut candidates = Vec::new();
-    let mut seen_candidates = std::collections::HashSet::new();
-    for table_ref in &tables_in_scope {
-        if table_ref.is_cte {
-            continue;
-        }
-        let key = table_ref.name.to_ascii_uppercase();
-        if seen_candidates.insert(key) {
-            candidates.push(table_ref.name.clone());
-        }
-    }
-
-    if candidates.is_empty() {
-        return Err("Cannot edit rows: no base table was resolved from this query.".to_string());
-    }
-
-    let mut depth = 0usize;
-    let mut in_select = false;
-    let mut idx = 0usize;
-    let mut rowid_qualifier: Option<String> = None;
-    while idx < tokens.len() {
-        match tokens.get(idx) {
-            Some(SqlToken::Symbol(sym)) if sym == "(" => {
-                depth = depth.saturating_add(1);
-            }
-            Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                depth = depth.saturating_sub(1);
-            }
-            Some(SqlToken::Word(word)) => {
-                if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
-                    in_select = true;
-                } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
-                    break;
-                }
-            }
-            _ => {}
-        }
-
-        if in_select && depth == 0 {
-            if let (
-                Some(SqlToken::Word(lhs)),
-                Some(SqlToken::Symbol(dot)),
-                Some(SqlToken::Word(rhs)),
-            ) = (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2))
-            {
-                if dot == "."
-                    && crate::sql_text::strip_identifier_quotes(rhs).eq_ignore_ascii_case("ROWID")
-                {
-                    rowid_qualifier = Some(crate::sql_text::strip_identifier_quotes(lhs));
-                    break;
-                }
-            }
-        }
-
-        idx += 1;
-    }
-
-    if let Some(qualifier) = rowid_qualifier {
-        let resolved =
-            crate::ui::intellisense_context::resolve_qualifier_tables(&qualifier, &tables_in_scope);
-        let mut resolved_deduped = Vec::new();
-        let mut seen_resolved = std::collections::HashSet::new();
-        for table in resolved {
-            let key = table.to_ascii_uppercase();
-            if seen_resolved.insert(key) {
-                resolved_deduped.push(table);
-            }
-        }
-        if resolved_deduped.len() == 1 {
-            return Ok(resolved_deduped.remove(0));
-        }
-    }
-
-    if candidates.len() == 1 {
-        return Ok(candidates[0].clone());
-    }
-
-    Err(format!(
-        "Cannot resolve a single edit target table (candidates: {}). Query one table or qualify ROWID with an alias.",
-        candidates.join(", ")
-    ))
 }

@@ -36,7 +36,6 @@ fn generate_styles_windowed_for_test(
     styles.into_iter().collect()
 }
 
-
 #[test]
 fn test_number_highlighting_supports_single_decimal_point() {
     let highlighter = SqlHighlighter::new();

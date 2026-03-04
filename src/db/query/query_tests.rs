@@ -125,6 +125,36 @@ fn test_statement_bounds_at_cursor_keeps_multiline_alter_session_set_clause() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_create_java_source_ignores_body_semicolon_until_slash() {
+    let sql = r#"CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED "DemoClass" AS
+public class DemoClass {
+  public static String hello() {
+    return "hello";
+  }
+}
+/
+SELECT 2 FROM dual;"#;
+    let cursor = sql.find("return \"hello\"").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected JAVA SOURCE statement bounds");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE OR REPLACE AND COMPILE JAVA SOURCE"),
+        "JAVA SOURCE header should be included: {statement}"
+    );
+    assert!(
+        statement.contains("return \"hello\";"),
+        "JAVA body semicolon should remain inside one statement: {statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 2 FROM dual"),
+        "slash-delimited trailing statement must not be merged: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");
@@ -1021,6 +1051,30 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_package_body_nested_external_procedure_followed_by_select_splits() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_ext AS
+  PROCEDURE ext_proc IS
+    EXTERNAL NAME "ext_proc" LANGUAGE C;
+END pkg_ext;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "Package body with nested EXTERNAL procedure should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE PACKAGE BODY pkg_ext AS"),
+        "first statement should keep full package body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS
 BEGIN
@@ -1042,6 +1096,64 @@ END test_pkg;"#;
     assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
     assert!(stmts[0].contains("CREATE PACKAGE"));
     assert!(stmts[0].contains("END test_pkg"));
+}
+
+#[test]
+fn test_package_spec_forward_declaration_followed_by_subtype_splits_before_next_statement() {
+    let sql = r#"CREATE OR REPLACE PACKAGE test_pkg AS
+  PROCEDURE proc1;
+  SUBTYPE vc30 IS VARCHAR2(30);
+END test_pkg;
+
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "package spec with forward declaration + SUBTYPE should split before trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE PACKAGE test_pkg AS"),
+        "first statement should preserve package spec: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SUBTYPE vc30 IS VARCHAR2(30);"),
+        "first statement should preserve SUBTYPE declaration: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_package_spec_forward_declaration_followed_by_subtype_splits_before_next_statement(
+) {
+    let sql = r#"CREATE OR REPLACE PACKAGE test_pkg AS
+  PROCEDURE proc1;
+  SUBTYPE vc30 IS VARCHAR2(30);
+END test_pkg;
+
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should split package spec and trailing SELECT separately: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PACKAGE test_pkg AS"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
 
 #[test]
@@ -1275,6 +1387,30 @@ fn test_create_type() {
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
     assert_eq!(stmts.len(), 1, "Should have 1 statement, got: {:?}", stmts);
+}
+
+#[test]
+fn test_create_type_object_attribute_prefixed_create_does_not_force_split() {
+    let sql = r#"CREATE OR REPLACE TYPE test_type AS OBJECT (
+  create_flag NUMBER,
+  id NUMBER
+);
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE TYPE OBJECT attribute named CREATE_* should not trigger forced split: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("create_flag NUMBER"),
+        "TYPE OBJECT statement should preserve CREATE_* attribute line: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
 
 #[test]
@@ -3182,6 +3318,90 @@ MATCH_RECOGNIZE (
     assert!(
         tool_commands.is_empty(),
         "Should have no tool commands, got: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_match_recognize_inline_define_not_parsed_as_tool_command() {
+    let sql = r#"SELECT *
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY hiredate, empno
+  PATTERN (a b+)
+  DEFINE b AS b.sal > PREV(b.sal)
+);"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        1,
+        "Should be 1 statement, got: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("DEFINE b AS b.sal > PREV(b.sal)"),
+        "Statement should preserve MATCH_RECOGNIZE inline DEFINE clause, got: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "Inline DEFINE in MATCH_RECOGNIZE should not be parsed as tool command, got: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_split_format_items_match_recognize_inline_define_not_parsed_as_tool_command() {
+    let sql = r#"SELECT *
+FROM oqt_t_emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY hiredate, empno
+  PATTERN (a b+)
+  DEFINE b AS b.sal > PREV(b.sal)
+);"#;
+
+    let items = QueryExecutor::split_format_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&FormatItem> = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        1,
+        "split_format_items should keep MATCH_RECOGNIZE inline DEFINE in one statement: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("DEFINE b AS b.sal > PREV(b.sal)"),
+        "Formatted statement should preserve MATCH_RECOGNIZE inline DEFINE clause: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "split_format_items should not emit tool commands for MATCH_RECOGNIZE inline DEFINE, got: {:?}",
         tool_commands
     );
 }
@@ -6467,8 +6687,10 @@ SELECT 2 FROM dual;";
         "WITH FUNCTION ... AS declaration must stay attached to main SELECT statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  FUNCTION f RETURN NUMBER AS"),
+        stmts[0].starts_with(
+            "WITH
+  FUNCTION f RETURN NUMBER AS"
+        ),
         "first statement should preserve WITH FUNCTION AS declaration: {}",
         stmts[0]
     );
@@ -6624,8 +6846,10 @@ SELECT 2 FROM dual;";
         "parser should recover WITH FUNCTION declaration mode when CREATE starts a new statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  FUNCTION f RETURN NUMBER IS"),
+        stmts[0].starts_with(
+            "WITH
+  FUNCTION f RETURN NUMBER IS"
+        ),
         "first statement should preserve WITH FUNCTION declaration block: {}",
         stmts[0]
     );
@@ -6655,8 +6879,10 @@ SELECT 2 FROM dual;";
         "parser should recover WITH PROCEDURE declaration mode when ALTER starts a new statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  PROCEDURE p IS"),
+        stmts[0].starts_with(
+            "WITH
+  PROCEDURE p IS"
+        ),
         "first statement should preserve WITH PROCEDURE declaration block: {}",
         stmts[0]
     );
@@ -6722,15 +6948,19 @@ SELECT 2 FROM dual;";
         "parser should recover WITH FUNCTION declaration mode when BEGIN starts a new statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  FUNCTION f RETURN NUMBER IS"),
+        stmts[0].starts_with(
+            "WITH
+  FUNCTION f RETURN NUMBER IS"
+        ),
         "first statement should preserve WITH FUNCTION declaration block: {}",
         stmts[0]
     );
     assert!(
-        stmts[1].contains("BEGIN
+        stmts[1].contains(
+            "BEGIN
   NULL;
-END"),
+END"
+        ),
         "second statement should start at BEGIN block after recovery: {}",
         stmts[1]
     );
@@ -6852,8 +7082,81 @@ fn test_split_script_items_oracle_create_type_body_with_member_function_keeps_si
 }
 
 #[test]
+fn test_split_script_items_oracle_create_java_source_keeps_body_until_slash() {
+    let sql = r#"CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED "DemoClass" AS
+public class DemoClass {
+  public static String hello() {
+    return "hello";
+  }
+}
+/
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE JAVA SOURCE should keep Java body semicolons inside one statement until slash delimiter: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED \"DemoClass\" AS"),
+        "first statement should preserve JAVA SOURCE header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("return \"hello\";"),
+        "first statement should preserve Java body semicolon: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_create_java_source_keeps_body_until_slash() {
+    let sql = r#"CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED "DemoClass" AS
+public class DemoClass {
+  public static String hello() {
+    return "hello";
+  }
+}
+/
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        items.iter().any(|item| matches!(item, FormatItem::Slash)),
+        "CREATE JAVA SOURCE should keep SQL*Plus slash delimiter in format items"
+    );
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep JAVA SOURCE body as one statement and split trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED \"DemoClass\" AS"),
+        "first formatted statement should preserve JAVA SOURCE header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("return \"hello\";"),
+        "first formatted statement should preserve Java body semicolon: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_cte_using_function_call_splits_normally() {
-    let sql = "WITH cte AS (SELECT 1 AS n FROM dual)\nSELECT ABS(n) AS v FROM cte;\nSELECT 2 FROM dual;";
+    let sql =
+        "WITH cte AS (SELECT 1 AS n FROM dual)\nSELECT ABS(n) AS v FROM cte;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
 
@@ -6917,6 +7220,70 @@ fn test_split_script_items_oracle_parenthesized_with_function_cte_splits_normall
     assert!(
         stmts[0].contains("SELECT * FROM outer_cte"),
         "first statement should include main outer SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_create_view_as_with_function_keeps_single_statement() {
+    let sql = "CREATE OR REPLACE VIEW v_with_fn AS\nWITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() AS v FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE VIEW ... AS WITH FUNCTION must remain one statement until main SELECT terminator: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE VIEW v_with_fn AS"),
+        "first statement should preserve CREATE VIEW header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("FUNCTION f RETURN NUMBER IS"),
+        "first statement should keep WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f() AS v FROM dual"),
+        "first statement should include main SELECT body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_create_view_as_with_function_keeps_single_statement() {
+    let sql = "CREATE OR REPLACE VIEW v_with_fn AS\nWITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() AS v FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items must keep CREATE VIEW ... AS WITH FUNCTION together: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE VIEW v_with_fn AS"),
+        "first formatted statement should preserve CREATE VIEW header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("FUNCTION f RETURN NUMBER IS"),
+        "first formatted statement should keep WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f() AS v FROM dual"),
+        "first formatted statement should include main SELECT body: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));

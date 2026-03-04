@@ -147,6 +147,20 @@ fn phase_order_by_with_comment_between_keywords() {
 }
 
 #[test]
+fn phase_window_clause_is_column_context() {
+    let ctx = analyze("SELECT a FROM t WINDOW w AS (PARTITION BY |)");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_qualify_clause_is_column_context() {
+    let ctx = analyze("SELECT a FROM t QUALIFY |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_update_set() {
     let ctx = analyze("UPDATE t SET |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
@@ -885,7 +899,8 @@ fn insert_subquery_depth_returns_to_zero_after_closing_values_subquery() {
     let ctx =
         analyze("INSERT INTO employees (id) VALUES ((SELECT 1 FROM dual)) RETURNING | INTO :id");
     assert_eq!(ctx.depth, 0);
-    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
 }
 
 // ─── Complex real-world query tests ─────────────────────────────────────
@@ -2063,7 +2078,7 @@ fn pivot_xml_skips_generated_columns() {
 
 #[test]
 fn parse_simple_identifier_path_rejects_trailing_dot() {
-    let tokens = vec![
+    let tokens = [
         SqlToken::Word("schema".to_string()),
         SqlToken::Symbol(".".to_string()),
     ];
@@ -2073,7 +2088,7 @@ fn parse_simple_identifier_path_rejects_trailing_dot() {
 
 #[test]
 fn normalize_dotted_identifier_rejects_double_dot() {
-    let tokens = vec![
+    let tokens = [
         SqlToken::Word("schema".to_string()),
         SqlToken::Symbol(".".to_string()),
         SqlToken::Symbol(".".to_string()),

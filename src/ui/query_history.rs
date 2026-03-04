@@ -695,15 +695,13 @@ fn truncate_sql(sql: &str, max_len: usize) -> String {
     }
 
     let visible_len = max_len - 3;
-    let mut visible_chars = 0usize;
-    for (byte_idx, _ch) in sql.char_indices() {
+    for (visible_chars, (byte_idx, _ch)) in sql.char_indices().enumerate() {
         if visible_chars == visible_len {
             let mut output = String::with_capacity(byte_idx + 3);
             output.push_str(&sql[..byte_idx]);
             output.push_str("...");
             return output;
         }
-        visible_chars += 1;
     }
 
     sql.to_string()
@@ -813,7 +811,10 @@ mod query_history_tests {
     #[test]
     fn truncate_sql_preserves_original_whitespace() {
         let sql = "  SELECT\t'프로시저 테스트'\nFROM dual  ";
-        assert_eq!(truncate_sql(sql, 100), "  SELECT\t'프로시저 테스트'\nFROM dual  ");
+        assert_eq!(
+            truncate_sql(sql, 100),
+            "  SELECT\t'프로시저 테스트'\nFROM dual  "
+        );
     }
 
     #[test]

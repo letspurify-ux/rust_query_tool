@@ -3308,7 +3308,7 @@ impl SqlEditorWidget {
                 if snapshot.is_empty() {
                     return;
                 }
-                *history_entries = Some(snapshot.into());
+                *history_entries = Some(snapshot);
                 *original = Some(self.buffer.text());
             } else {
                 return;

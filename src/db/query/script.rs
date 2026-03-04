@@ -232,7 +232,10 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+                    && !leading_is_any(&[
+                        "CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD",
+                        "REPEAT",
+                    ])
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -259,7 +262,10 @@ impl QueryExecutor {
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
-                    && leading_is_any(&["CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD", "REPEAT"])
+                    && leading_is_any(&[
+                        "CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD",
+                        "REPEAT",
+                    ])
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 }
@@ -270,7 +276,8 @@ impl QueryExecutor {
             }
 
             if leading_is("BEGIN")
-                && (builder.state.pending_subprogram_begins > 0 || builder.state.has_pending_declare_begin())
+                && (builder.state.pending_subprogram_begins > 0
+                    || builder.state.has_pending_declare_begin())
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -306,8 +313,8 @@ impl QueryExecutor {
                 };
 
             let with_cte_component = if with_cte_depth > 0 {
-                let starts_main_select = leading_word.is_some_and(&is_with_main_query_keyword)
-                    && with_cte_paren <= 0;
+                let starts_main_select =
+                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
                 if starts_main_select {
                     0
                 } else {
@@ -317,14 +324,12 @@ impl QueryExecutor {
                 0
             };
 
-            let exception_handler_component = if exception_handler_body
-                && !leading_is("WHEN")
-                && !exception_end_line
-            {
-                1
-            } else {
-                0
-            };
+            let exception_handler_component =
+                if exception_handler_body && !leading_is("WHEN") && !exception_end_line {
+                    1
+                } else {
+                    0
+                };
 
             let depth = DepthComponents {
                 block_depth: block_depth_component,
@@ -380,46 +385,44 @@ impl QueryExecutor {
             }
 
             builder.process_line_with_observer(line, |chars, symbol_idx, symbol, _next| {
-                    if symbol == '(' {
-                        let j = skip_ws_and_comments(chars, symbol_idx.saturating_add(1));
-                        let mut k = j;
-                        let mut paren_kind = SubqueryParenKind::NonSubquery;
-                        while k < chars.len()
-                            && (chars[k].is_ascii_alphanumeric() || chars[k] == '_')
-                        {
-                            k += 1;
-                        }
-                        if k > j {
-                            if chars_word_is_subquery_head_keyword(chars, j, k) {
-                                subquery_paren_depth = subquery_paren_depth.saturating_add(1);
-                                paren_kind = SubqueryParenKind::Subquery;
-                            }
-                        } else if j >= chars.len()
-                            || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
-                            || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
-                        {
-                            pending_subquery_paren = pending_subquery_paren.saturating_add(1);
-                            paren_kind = SubqueryParenKind::Pending;
-                        }
-                        subquery_paren_stack.push(paren_kind);
-                        if with_cte_depth > 0 {
-                            with_cte_paren += 1;
-                        }
-                    } else if symbol == ')' {
-                        let closed_kind = subquery_paren_stack.pop();
-                        if closed_kind == Some(SubqueryParenKind::Subquery) {
-                            subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
-                        } else if closed_kind == Some(SubqueryParenKind::Pending) {
-                            pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                        } else if closed_kind.is_none() {
-                            // Malformed SQL recovery path: keep depth accounting monotonic.
-                            subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
-                        }
-                        if with_cte_depth > 0 {
-                            with_cte_paren -= 1;
-                        }
+                if symbol == '(' {
+                    let j = skip_ws_and_comments(chars, symbol_idx.saturating_add(1));
+                    let mut k = j;
+                    let mut paren_kind = SubqueryParenKind::NonSubquery;
+                    while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                        k += 1;
                     }
-                });
+                    if k > j {
+                        if chars_word_is_subquery_head_keyword(chars, j, k) {
+                            subquery_paren_depth = subquery_paren_depth.saturating_add(1);
+                            paren_kind = SubqueryParenKind::Subquery;
+                        }
+                    } else if j >= chars.len()
+                        || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
+                        || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
+                    {
+                        pending_subquery_paren = pending_subquery_paren.saturating_add(1);
+                        paren_kind = SubqueryParenKind::Pending;
+                    }
+                    subquery_paren_stack.push(paren_kind);
+                    if with_cte_depth > 0 {
+                        with_cte_paren += 1;
+                    }
+                } else if symbol == ')' {
+                    let closed_kind = subquery_paren_stack.pop();
+                    if closed_kind == Some(SubqueryParenKind::Subquery) {
+                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
+                    } else if closed_kind == Some(SubqueryParenKind::Pending) {
+                        pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
+                    } else if closed_kind.is_none() {
+                        // Malformed SQL recovery path: keep depth accounting monotonic.
+                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
+                    }
+                    if with_cte_depth > 0 {
+                        with_cte_paren -= 1;
+                    }
+                }
+            });
         }
 
         depths
@@ -2630,6 +2633,7 @@ impl QueryExecutor {
             if builder.is_idle()
                 && builder.in_create_plsql()
                 && builder.block_depth() == 0
+                && builder.paren_depth() == 0
                 && !builder.current_is_empty()
                 && !builder.is_trigger()
                 && (trimmed_upper.starts_with("CREATE")
@@ -2677,11 +2681,11 @@ impl QueryExecutor {
             }
 
             let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
-            let is_alter_session_set_clause =
-                is_set_clause && builder.starts_with_alter_session();
+            let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
             if builder.is_idle()
                 && !builder.current_is_empty()
                 && builder.block_depth() == 0
+                && builder.paren_depth() == 0
                 && !is_alter_session_set_clause
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
@@ -2696,7 +2700,11 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle() && builder.current_is_empty() && builder.block_depth() == 0 {
+            if builder.is_idle()
+                && builder.current_is_empty()
+                && builder.block_depth() == 0
+                && builder.paren_depth() == 0
+            {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
@@ -2777,6 +2785,7 @@ impl QueryExecutor {
             if builder.is_idle()
                 && builder.in_create_plsql()
                 && builder.block_depth() == 0
+                && builder.paren_depth() == 0
                 && !builder.current_is_empty()
                 && !builder.is_trigger()
                 && (trimmed_upper.starts_with("CREATE")
@@ -2823,11 +2832,11 @@ impl QueryExecutor {
             }
 
             let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
-            let is_alter_session_set_clause =
-                is_set_clause && builder.starts_with_alter_session();
+            let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
             if builder.is_idle()
                 && !builder.current_is_empty()
                 && builder.block_depth() == 0
+                && builder.paren_depth() == 0
                 && !is_alter_session_set_clause
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
@@ -2842,7 +2851,11 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle() && builder.current_is_empty() && builder.block_depth() == 0 {
+            if builder.is_idle()
+                && builder.current_is_empty()
+                && builder.block_depth() == 0
+                && builder.paren_depth() == 0
+            {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
