@@ -1498,6 +1498,11 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "MODEL"
             | "MATCH_RECOGNIZE"
             | "USING"
+            | "SAMPLE"
+            | "TABLESAMPLE"
+            | "PARTITION"
+            | "SUBPARTITION"
+            | "VERSIONS"
     )
 }
 
@@ -1546,6 +1551,11 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "SELECT"
             | "FROM"
             | "INTO"
+            | "SAMPLE"
+            | "TABLESAMPLE"
+            | "PARTITION"
+            | "SUBPARTITION"
+            | "VERSIONS"
     )
 }
 
