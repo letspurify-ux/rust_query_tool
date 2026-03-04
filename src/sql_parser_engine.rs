@@ -246,6 +246,19 @@ impl PendingDo {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WithClauseState {
+    None,
+    PendingClause,
+    InPlsqlDeclaration,
+}
+
+impl Default for WithClauseState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SplitState – the main parser state, now using the types above.
 // ---------------------------------------------------------------------------
@@ -290,8 +303,7 @@ pub(crate) struct SplitState {
     pub(crate) paren_depth: usize,
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
-    pending_with_clause: bool,
-    in_with_plsql_declaration: bool,
+    with_clause_state: WithClauseState,
 
     // -- Reusable buffer --
     token_upper_buf: String,
@@ -306,7 +318,7 @@ impl SplitState {
         self.resolve_plain_end();
         if reset_create_state_when_top_level
             && self.block_depth() == 0
-            && !self.in_with_plsql_declaration
+            && !self.in_with_plsql_declaration()
         {
             self.reset_create_state();
         }
@@ -317,6 +329,10 @@ impl SplitState {
 
     pub(crate) fn is_idle(&self) -> bool {
         self.lex_mode == LexMode::Idle
+    }
+
+    pub(crate) fn in_with_plsql_declaration(&self) -> bool {
+        self.with_clause_state == WithClauseState::InPlsqlDeclaration
     }
 
     /// Derived block depth – equivalent to the old `block_depth` field.
@@ -655,8 +671,7 @@ impl SplitState {
         self.is_type_create = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
-        self.pending_with_clause = false;
-        self.in_with_plsql_declaration = false;
+        self.with_clause_state = WithClauseState::None;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -727,16 +742,16 @@ impl SplitState {
         }
 
         if upper == "WITH" {
-            self.pending_with_clause = true;
+            self.with_clause_state = WithClauseState::PendingClause;
             return;
         }
 
-        if !self.pending_with_clause {
+        if self.with_clause_state == WithClauseState::None {
             return;
         }
 
         if matches!(upper, "FUNCTION" | "PROCEDURE") {
-            self.in_with_plsql_declaration = true;
+            self.with_clause_state = WithClauseState::InPlsqlDeclaration;
             return;
         }
 
@@ -744,15 +759,13 @@ impl SplitState {
         // top-level PL/SQL declaration prefix. But Oracle allows
         // `WITH FUNCTION/PROCEDURE ... AS`, so keep declaration mode once
         // a PL/SQL declaration keyword has already been seen.
-        if upper == "AS" && !self.in_with_plsql_declaration {
-            self.pending_with_clause = false;
-            self.in_with_plsql_declaration = false;
+        if upper == "AS" && self.with_clause_state == WithClauseState::PendingClause {
+            self.with_clause_state = WithClauseState::None;
             return;
         }
 
         if sql_text::is_with_main_query_keyword(upper) {
-            self.pending_with_clause = false;
-            self.in_with_plsql_declaration = false;
+            self.with_clause_state = WithClauseState::None;
         }
     }
 }
@@ -1190,7 +1203,7 @@ impl SqlParserEngine {
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
                 self.state.resolve_pending_end_on_terminator();
-                if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration {
+                if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration() {
                     self.push_current_statement();
                     self.reset_statement_local_state();
                     self.state.reset_create_state();
@@ -1262,7 +1275,7 @@ impl SqlParserEngine {
 mod tests {
     use super::{
         BlockKind, EndSuffixContext, EndTokenRole, IfState, PendingDo, PendingEnd,
-        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine,
+        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, WithClauseState,
     };
 
     #[test]
@@ -1469,7 +1482,7 @@ mod tests {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
             in_create_plsql: true,
-            in_with_plsql_declaration: true,
+            with_clause_state: WithClauseState::InPlsqlDeclaration,
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
         };
@@ -1479,7 +1492,7 @@ mod tests {
         assert_eq!(state.pending_end, PendingEnd::None);
         assert_eq!(state.block_depth(), 0);
         assert!(state.in_create_plsql);
-        assert!(state.in_with_plsql_declaration);
+        assert!(state.in_with_plsql_declaration());
     }
 
     #[test]
