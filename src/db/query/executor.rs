@@ -1834,10 +1834,10 @@ impl QueryExecutor {
             }
 
             if collector.state.is_idle()
-                && collector.state.in_create_plsql
+                && collector.state.in_create_plsql()
                 && collector.state.block_depth() == 0
                 && !collector.current_is_empty()
-                && !collector.state.is_trigger
+                && !collector.state.is_trigger()
                 && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
             {
                 if let Some(span) = collector.force_terminate(sql) {
@@ -1861,7 +1861,7 @@ impl QueryExecutor {
 
             if collector.state.is_idle()
                 && trimmed == ";"
-                && collector.state.in_create_plsql
+                && collector.state.in_create_plsql()
                 && collector.state.block_depth() == 0
                 && !collector.current_is_empty()
             {

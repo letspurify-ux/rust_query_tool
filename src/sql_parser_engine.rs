@@ -224,6 +224,24 @@ impl Default for CreateState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CreatePlsqlKind {
+    None,
+    Procedure,
+    Function,
+    Package,
+    TypeSpecAwaitingBody,
+    TypeSpec,
+    TypeBody,
+    Trigger { compound: bool },
+}
+
+impl Default for CreatePlsqlKind {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 impl Default for TimingPointState {
     fn default() -> Self {
         Self::None
@@ -261,19 +279,14 @@ pub(crate) struct SplitState {
     pub(crate) token: String,
 
     // -- CREATE PL/SQL tracking --
-    pub(crate) in_create_plsql: bool,
+    create_plsql_kind: CreatePlsqlKind,
     pub(crate) create_state: CreateState,
     pub(crate) after_declare: bool,
     after_as_is: bool,
     nested_subprogram: bool,
     pub(crate) pending_subprogram_begins: usize,
     routine_is_stack: Vec<RoutineFrame>,
-    pub(crate) is_package: bool,
-    pub(crate) is_trigger: bool,
-    in_compound_trigger: bool,
     timing_point_state: TimingPointState,
-    after_type: bool,
-    is_type_create: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
@@ -309,6 +322,43 @@ impl SplitState {
 
     pub(crate) fn in_with_plsql_declaration(&self) -> bool {
         self.with_clause_state == WithClauseState::InPlsqlDeclaration
+    }
+
+    pub(crate) fn in_create_plsql(&self) -> bool {
+        self.create_plsql_kind != CreatePlsqlKind::None
+    }
+
+    pub(crate) fn is_trigger(&self) -> bool {
+        matches!(self.create_plsql_kind, CreatePlsqlKind::Trigger { .. })
+    }
+
+    fn in_compound_trigger(&self) -> bool {
+        matches!(
+            self.create_plsql_kind,
+            CreatePlsqlKind::Trigger { compound: true }
+        )
+    }
+
+    fn mark_compound_trigger(&mut self) {
+        if self.is_trigger() {
+            self.create_plsql_kind = CreatePlsqlKind::Trigger { compound: true };
+        }
+    }
+
+    fn is_type_create(&self) -> bool {
+        matches!(
+            self.create_plsql_kind,
+            CreatePlsqlKind::TypeSpecAwaitingBody
+                | CreatePlsqlKind::TypeSpec
+                | CreatePlsqlKind::TypeBody
+        )
+    }
+
+    fn needs_nested_begin_tracking(&self) -> bool {
+        matches!(
+            self.create_plsql_kind,
+            CreatePlsqlKind::Package | CreatePlsqlKind::TypeBody
+        )
     }
 
     /// Derived block depth – equivalent to the old `block_depth` field.
@@ -367,7 +417,7 @@ impl SplitState {
         self.track_top_level_with_plsql(upper);
 
         let end_token_role =
-            EndTokenRole::from_token(upper, self.pending_end, self.in_compound_trigger);
+            EndTokenRole::from_token(upper, self.pending_end, self.in_compound_trigger());
 
         self.handle_if_state_on_token(upper);
         self.handle_pending_end_on_token(end_token_role.suffix());
@@ -508,7 +558,7 @@ impl SplitState {
             && !end_token_role.is_suffix(PendingEndSuffix::For)
         {
             let is_trigger_header_for =
-                self.in_create_plsql && self.is_trigger && self.block_depth() == 0;
+                self.in_create_plsql() && self.is_trigger() && self.block_depth() == 0;
             if !is_trigger_header_for {
                 self.pending_do = std::mem::take(&mut self.pending_do).arm_for_for();
             }
@@ -540,7 +590,7 @@ impl SplitState {
         let is_block_starting_as_is = matches!(upper, "AS" | "IS")
             && (self.timing_point_state == TimingPointState::AwaitingAsOrIs
                 || self.nested_subprogram
-                || (self.in_create_plsql && self.block_depth() == 0));
+                || (self.in_create_plsql() && self.block_depth() == 0));
 
         if is_block_starting_as_is {
             if is_timing_point_block_start {
@@ -548,7 +598,7 @@ impl SplitState {
             } else {
                 self.block_stack.push(BlockKind::AsIs);
             }
-            if self.is_type_create
+            if self.is_type_create()
                 && !self.nested_subprogram
                 && self.timing_point_state != TimingPointState::AwaitingAsOrIs
             {
@@ -556,7 +606,7 @@ impl SplitState {
             }
             self.nested_subprogram = false;
             self.timing_point_state = TimingPointState::None;
-            let needs_begin_tracking = if self.is_package {
+            let needs_begin_tracking = if self.needs_nested_begin_tracking() {
                 self.block_depth() > 1
             } else {
                 true
@@ -588,11 +638,11 @@ impl SplitState {
             }
         } else if upper == "END" {
             self.pending_end = PendingEnd::End;
-        } else if upper == "COMPOUND" && self.in_create_plsql {
-            self.in_compound_trigger = true;
+        } else if upper == "COMPOUND" && self.in_create_plsql() {
+            self.mark_compound_trigger();
             self.block_stack.push(BlockKind::Compound);
         } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
-            && self.in_compound_trigger
+            && self.in_compound_trigger()
             && !end_token_role.is_suffix(PendingEndSuffix::TimingPoint)
         {
             self.timing_point_state = TimingPointState::AwaitingAsOrIs;
@@ -641,18 +691,13 @@ impl SplitState {
     }
 
     pub(crate) fn reset_create_state(&mut self) {
-        self.in_create_plsql = false;
+        self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
         self.after_as_is = false;
         self.nested_subprogram = false;
         self.pending_subprogram_begins = 0;
         self.routine_is_stack.clear();
-        self.is_package = false;
-        self.is_trigger = false;
-        self.in_compound_trigger = false;
         self.timing_point_state = TimingPointState::None;
-        self.after_type = false;
-        self.is_type_create = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
@@ -671,17 +716,16 @@ impl SplitState {
     }
 
     fn track_create_plsql(&mut self, upper: &str) {
-        if self.in_create_plsql && self.after_type && upper == "BODY" {
-            self.is_package = true;
-            self.after_type = false;
+        if self.create_plsql_kind == CreatePlsqlKind::TypeSpecAwaitingBody && upper == "BODY" {
+            self.create_plsql_kind = CreatePlsqlKind::TypeBody;
             return;
         }
 
-        if self.after_type && upper != "BODY" {
-            self.after_type = false;
+        if self.create_plsql_kind == CreatePlsqlKind::TypeSpecAwaitingBody && upper != "BODY" {
+            self.create_plsql_kind = CreatePlsqlKind::TypeSpec;
         }
 
-        if self.in_create_plsql {
+        if self.in_create_plsql() {
             return;
         }
 
@@ -697,11 +741,14 @@ impl SplitState {
                     return;
                 }
                 "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER" => {
-                    self.in_create_plsql = true;
-                    self.is_package = upper == "PACKAGE";
-                    self.is_trigger = upper == "TRIGGER";
-                    self.is_type_create = upper == "TYPE";
-                    self.after_type = upper == "TYPE";
+                    self.create_plsql_kind = match upper {
+                        "PROCEDURE" => CreatePlsqlKind::Procedure,
+                        "FUNCTION" => CreatePlsqlKind::Function,
+                        "PACKAGE" => CreatePlsqlKind::Package,
+                        "TYPE" => CreatePlsqlKind::TypeSpecAwaitingBody,
+                        "TRIGGER" => CreatePlsqlKind::Trigger { compound: false },
+                        _ => CreatePlsqlKind::None,
+                    };
                     self.create_state = CreateState::None;
                     return;
                 }
@@ -824,7 +871,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn in_create_plsql(&self) -> bool {
-        self.state.in_create_plsql
+        self.state.in_create_plsql()
     }
 
     pub(crate) fn block_depth(&self) -> usize {
@@ -832,7 +879,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn is_trigger(&self) -> bool {
-        self.state.is_trigger
+        self.state.is_trigger()
     }
 
     fn reset_statement_local_state(&mut self) {
@@ -1254,8 +1301,9 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd, PendingEndSuffix,
-        RoutineFrame, SplitState, SqlParserEngine, TimingPointState, WithClauseState,
+        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd,
+        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine, TimingPointState,
+        WithClauseState,
     };
 
     #[test]
@@ -1273,7 +1321,7 @@ mod tests {
 
         state.track_create_plsql("FUNCTION");
 
-        assert!(state.in_create_plsql);
+        assert!(state.in_create_plsql());
         assert_eq!(state.create_state, CreateState::None);
     }
 
@@ -1286,7 +1334,7 @@ mod tests {
 
         state.track_create_plsql("TABLE");
 
-        assert!(!state.in_create_plsql);
+        assert!(!state.in_create_plsql());
         assert_eq!(state.create_state, CreateState::None);
     }
 
@@ -1451,7 +1499,7 @@ mod tests {
     fn separator_resolution_keeps_create_state() {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
-            in_create_plsql: true,
+            create_plsql_kind: CreatePlsqlKind::Procedure,
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
         };
@@ -1460,14 +1508,14 @@ mod tests {
 
         assert_eq!(state.pending_end, PendingEnd::None);
         assert_eq!(state.block_depth(), 0);
-        assert!(state.in_create_plsql);
+        assert!(state.in_create_plsql());
     }
 
     #[test]
     fn terminator_resolution_resets_create_state_at_top_level() {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
-            in_create_plsql: true,
+            create_plsql_kind: CreatePlsqlKind::Procedure,
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
         };
@@ -1476,14 +1524,14 @@ mod tests {
 
         assert_eq!(state.pending_end, PendingEnd::None);
         assert_eq!(state.block_depth(), 0);
-        assert!(!state.in_create_plsql);
+        assert!(!state.in_create_plsql());
     }
 
     #[test]
     fn eof_resolution_preserves_with_plsql_declaration_mode() {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
-            in_create_plsql: true,
+            create_plsql_kind: CreatePlsqlKind::Procedure,
             with_clause_state: WithClauseState::InPlsqlDeclaration,
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
@@ -1493,7 +1541,7 @@ mod tests {
 
         assert_eq!(state.pending_end, PendingEnd::None);
         assert_eq!(state.block_depth(), 0);
-        assert!(state.in_create_plsql);
+        assert!(state.in_create_plsql());
         assert!(state.in_with_plsql_declaration());
     }
 
@@ -1514,8 +1562,7 @@ mod tests {
     #[test]
     fn compound_trigger_timing_point_uses_dedicated_block_kind() {
         let mut state = SplitState {
-            in_create_plsql: true,
-            in_compound_trigger: true,
+            create_plsql_kind: CreatePlsqlKind::Trigger { compound: true },
             timing_point_state: TimingPointState::AwaitingAsOrIs,
             ..SplitState::default()
         };
