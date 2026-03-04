@@ -196,6 +196,22 @@ impl Default for PendingDo {
     }
 }
 
+impl PendingDo {
+    fn arm_for_while(self) -> Self {
+        match self {
+            Self::None => Self::While,
+            active => active,
+        }
+    }
+
+    fn arm_for_for(self) -> Self {
+        match self {
+            Self::None => Self::For,
+            active => active,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SplitState – the main parser state, now using the types above.
 // ---------------------------------------------------------------------------
@@ -457,7 +473,7 @@ impl SplitState {
 
         // WHILE ... DO
         if upper == "WHILE" && self.pending_end == PendingEnd::None && !end_suffix.while_suffix {
-            self.pending_do = PendingDo::While;
+            self.pending_do = std::mem::take(&mut self.pending_do).arm_for_while();
         } else if self.pending_do == PendingDo::While && upper == "DO" {
             self.block_stack.push(BlockKind::While);
             self.pending_do = PendingDo::None;
@@ -467,7 +483,7 @@ impl SplitState {
             let is_trigger_header_for =
                 self.in_create_plsql && self.is_trigger && self.block_depth() == 0;
             if !is_trigger_header_for {
-                self.pending_do = PendingDo::For;
+                self.pending_do = std::mem::take(&mut self.pending_do).arm_for_for();
             }
         } else if self.pending_do == PendingDo::For && upper == "DO" {
             self.block_stack.push(BlockKind::For);
@@ -1278,6 +1294,34 @@ mod tests {
         assert_eq!(engine.state.pending_do, PendingDo::None);
         assert_eq!(engine.state.if_state, IfState::None);
         assert_eq!(engine.state.paren_depth, 0);
+    }
+
+    #[test]
+    fn pending_do_does_not_get_overwritten_by_new_candidates() {
+        let mut state = SplitState {
+            pending_do: PendingDo::While,
+            ..SplitState::default()
+        };
+
+        state.handle_block_openers("FOR", EndSuffixContext::default());
+        assert_eq!(state.pending_do, PendingDo::While);
+
+        state.handle_block_openers("DO", EndSuffixContext::default());
+        assert_eq!(state.block_depth(), 1);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::While));
+        assert_eq!(state.pending_do, PendingDo::None);
+    }
+
+    #[test]
+    fn pending_do_arms_when_no_active_candidate_exists() {
+        let mut state = SplitState::default();
+
+        state.handle_block_openers("FOR", EndSuffixContext::default());
+        assert_eq!(state.pending_do, PendingDo::For);
+
+        state.handle_block_openers("DO", EndSuffixContext::default());
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::For));
+        assert_eq!(state.pending_do, PendingDo::None);
     }
 
     #[test]
