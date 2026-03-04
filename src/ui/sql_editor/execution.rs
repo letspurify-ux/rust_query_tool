@@ -218,6 +218,38 @@ impl ExitConditionState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WithCteFormatState {
+    None,
+    InDefinitions { paren_depth: usize },
+}
+
+impl WithCteFormatState {
+    fn on_clause_keyword(&mut self, keyword: &str) {
+        match keyword {
+            "WITH" => *self = Self::InDefinitions { paren_depth: 0 },
+            "SELECT" if self.can_close_on_select() => *self = Self::None,
+            _ => {}
+        }
+    }
+
+    fn on_open_paren(&mut self) {
+        if let Self::InDefinitions { paren_depth } = self {
+            *paren_depth = paren_depth.saturating_add(1);
+        }
+    }
+
+    fn on_close_paren(&mut self) {
+        if let Self::InDefinitions { paren_depth } = self {
+            *paren_depth = paren_depth.saturating_sub(1);
+        }
+    }
+
+    fn can_close_on_select(self) -> bool {
+        matches!(self, Self::InDefinitions { paren_depth: 0 })
+    }
+}
+
 impl OpenCursorFormatState {
     fn base_indent(self, indent_level: usize) -> usize {
         match self {
@@ -1098,8 +1130,7 @@ impl SqlEditorWidget {
         let mut select_list_multiline_forced = false;
         let mut select_list_break_state = select_list_break_state_on_start;
         let mut exit_condition_state = ExitConditionState::None;
-        let mut with_cte_active = false;
-        let mut with_cte_paren_depth = 0usize;
+        let mut with_cte_state = WithCteFormatState::None;
         let mut statement_has_with_clause = false;
         let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
         let mut trigger_header_active = false;
@@ -1402,15 +1433,11 @@ impl SqlEditorWidget {
                                 // Keep OPEN ... FOR SELECT inside the cursor SQL context.
                             }
                             if upper == "WITH" {
-                                with_cte_active = true;
-                                with_cte_paren_depth = 0;
+                                with_cte_state.on_clause_keyword("WITH");
                                 statement_has_with_clause = true;
-                            } else if upper == "SELECT"
-                                && with_cte_active
-                                && with_cte_paren_depth == 0
-                            {
+                            } else if upper == "SELECT" {
                                 // Main query SELECT after CTE definitions.
-                                with_cte_active = false;
+                                with_cte_state.on_clause_keyword("SELECT");
                             }
                         }
                     } else if condition_keywords.contains(&upper.as_str())
@@ -1939,8 +1966,7 @@ impl SqlEditorWidget {
                             trim_trailing_space(&mut out);
                             out.push(',');
                             between_pending = false;
-                            let is_with_cte_separator =
-                                with_cte_active && with_cte_paren_depth == 0;
+                            let is_with_cte_separator = with_cte_state.can_close_on_select();
                             if column_list_stack.last().copied().unwrap_or(false) {
                                 newline_with(
                                     &mut out,
@@ -2026,9 +2052,7 @@ impl SqlEditorWidget {
                             }
                         }
                         "(" => {
-                            if with_cte_active {
-                                with_cte_paren_depth = with_cte_paren_depth.saturating_add(1);
-                            }
+                            with_cte_state.on_open_paren();
                             if matches!(current_clause.as_deref(), Some("SELECT"))
                                 && matches!(prev_word_upper.as_deref(), Some("SELECT"))
                             {
@@ -2063,8 +2087,11 @@ impl SqlEditorWidget {
                             });
                             column_list_stack.push(is_column_list);
                             let indent_increase = if is_subquery || is_column_list {
-                                let in_cte_as_subquery = with_cte_active
-                                    && matches!(prev_word_upper.as_deref(), Some("AS"));
+                                let in_cte_as_subquery =
+                                    matches!(
+                                        with_cte_state,
+                                        WithCteFormatState::InDefinitions { .. }
+                                    ) && matches!(prev_word_upper.as_deref(), Some("AS"));
                                 let deep_subquery_indent =
                                     matches!(current_clause.as_deref(), Some("SELECT" | "FROM"))
                                         && !in_cte_as_subquery
@@ -2098,9 +2125,7 @@ impl SqlEditorWidget {
                             needs_space = false;
                         }
                         ")" => {
-                            if with_cte_active && with_cte_paren_depth > 0 {
-                                with_cte_paren_depth -= 1;
-                            }
+                            with_cte_state.on_close_paren();
                             trim_trailing_space(&mut out);
                             let was_subquery = paren_stack.pop().unwrap_or(false);
                             let restore_clause = paren_clause_restore_stack.pop().unwrap_or(None);
