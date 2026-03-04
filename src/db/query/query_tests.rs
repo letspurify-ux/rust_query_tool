@@ -1241,6 +1241,32 @@ END;"#;
 }
 
 #[test]
+fn test_create_editioning_trigger() {
+    let sql = r#"CREATE OR REPLACE EDITIONING TRIGGER test_trg
+BEFORE INSERT ON test_table
+FOR EACH ROW
+BEGIN
+  :NEW.created_at := SYSDATE;
+END;
+
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "EDITIONING TRIGGER body must stay as one statement before trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("CREATE OR REPLACE EDITIONING TRIGGER"),
+        "first statement should keep EDITIONING TRIGGER header: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_type() {
     let sql = r#"CREATE TYPE test_type AS OBJECT (
   id NUMBER,
@@ -4790,7 +4816,6 @@ END;"#;
     );
 }
 
-
 #[test]
 fn test_line_block_depths_preserve_pending_end_across_blank_line() {
     let sql = r#"BEGIN
@@ -5214,7 +5239,10 @@ WHERE EXISTS (
         .expect("expected WHERE EXISTS line");
     let nested_select_idx = lines
         .iter()
-        .position(|line| line.trim_start().starts_with("/*+ qb_name(inner_q) */ SELECT 1"))
+        .position(|line| {
+            line.trim_start()
+                .starts_with("/*+ qb_name(inner_q) */ SELECT 1")
+        })
         .expect("expected nested SELECT line");
 
     assert!(
@@ -6338,7 +6366,11 @@ fn test_line_block_depths_preserves_subquery_depth_after_non_subquery_parenthese
         .expect("expected FROM ( line");
     let nested_select_idx = lines
         .iter()
-        .position(|line| line.trim_start().to_uppercase().starts_with("SELECT (1 + 2)"))
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT (1 + 2)")
+        })
         .expect("expected nested SELECT line");
     let nested_from_idx = lines
         .iter()

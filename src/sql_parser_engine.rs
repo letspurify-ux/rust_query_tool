@@ -15,8 +15,12 @@ pub(crate) enum LexMode {
     BacktickQuote,
     LineComment,
     BlockComment,
-    QQuote { end_char: char },
-    DollarQuote { tag: String },
+    QQuote {
+        end_char: char,
+    },
+    DollarQuote {
+        tag: String,
+    },
 }
 
 impl Default for LexMode {
@@ -81,7 +85,9 @@ pub(crate) enum IfState {
     /// Saw IF, waiting for the first meaningful character after IF.
     ExpectConditionStart,
     /// Saw IF followed by `(`, tracking condition paren depth.
-    InConditionParen { depth: usize },
+    InConditionParen {
+        depth: usize,
+    },
     /// Condition paren closed, waiting for THEN.
     AfterConditionParen,
     /// Saw IF (no paren), waiting for THEN.
@@ -169,9 +175,7 @@ impl SplitState {
     /// Returns the depth at which the innermost CASE was opened, if any.
     /// This is the index in block_stack of the last Case entry.
     pub(crate) fn innermost_case_depth(&self) -> Option<usize> {
-        self.block_stack
-            .iter()
-            .rposition(|k| *k == BlockKind::Case)
+        self.block_stack.iter().rposition(|k| *k == BlockKind::Case)
     }
 
     /// Whether the top of the block stack is a CASE (used for END resolution).
@@ -557,7 +561,7 @@ impl SplitState {
                 "NO" | "FORCE" | "REPLACE" => {
                     return;
                 }
-                "EDITIONABLE" | "NONEDITIONABLE" => {
+                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" => {
                     return;
                 }
                 "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER" => {
@@ -790,16 +794,15 @@ impl SqlParserEngine {
                         false
                     };
                     if tag_matches {
-                        let tag_len =
-                            if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
-                                let tl = tag.len();
-                                for quote_ch in tag.chars() {
-                                    self.current.push(quote_ch);
-                                }
-                                tl
-                            } else {
-                                0
-                            };
+                        let tag_len = if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
+                            let tl = tag.len();
+                            for quote_ch in tag.chars() {
+                                self.current.push(quote_ch);
+                            }
+                            tl
+                        } else {
+                            0
+                        };
                         self.state.lex_mode = LexMode::Idle;
                         i += tag_len;
                         continue;
