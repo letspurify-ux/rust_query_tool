@@ -162,6 +162,19 @@ enum BlockCommentKind {
     Hint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectContinuation {
+    EndOfLine,
+    ByClause,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectContinuationScanState {
+    SkipTrivia,
+    ScanToken,
+}
+
 impl BlockCommentKind {
     fn from_after_open(bytes: &[u8], idx_after_open: usize) -> Self {
         if bytes.get(idx_after_open) == Some(&b'+') {
@@ -528,7 +541,9 @@ impl SqlHighlighter {
                 }
                 if is_connect_keyword(bytes, scan) {
                     let keyword_end = scan + 7;
-                    if !is_connect_by_continuation(bytes, keyword_end) {
+                    if parse_connect_continuation(bytes, keyword_end)
+                        != ConnectContinuation::ByClause
+                    {
                         styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
                         let mut end = scan;
                         while let Some(&b) = bytes.get(end) {
@@ -1085,30 +1100,75 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
     )
 }
 
-fn is_connect_by_continuation(bytes: &[u8], connect_end: usize) -> bool {
+fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContinuation {
     let mut idx = connect_end.min(bytes.len());
-    while matches!(bytes.get(idx), Some(b' ' | b'\t')) {
-        idx += 1;
+    let mut state = ConnectContinuationScanState::SkipTrivia;
+    let mut token_start = idx;
+
+    while idx <= bytes.len() {
+        match state {
+            ConnectContinuationScanState::SkipTrivia => {
+                while matches!(bytes.get(idx), Some(b' ' | b'\t' | b'\r')) {
+                    idx += 1;
+                }
+
+                if matches!(bytes.get(idx), None | Some(b'\n')) {
+                    return ConnectContinuation::EndOfLine;
+                }
+
+                if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-') {
+                    while let Some(&b) = bytes.get(idx) {
+                        idx += 1;
+                        if b == b'\n' {
+                            return ConnectContinuation::EndOfLine;
+                        }
+                    }
+                    return ConnectContinuation::EndOfLine;
+                }
+
+                if bytes.get(idx) == Some(&b'/') && bytes.get(idx + 1) == Some(&b'*') {
+                    idx += 2;
+                    while let Some(_) = bytes.get(idx) {
+                        if bytes.get(idx) == Some(&b'*') && bytes.get(idx + 1) == Some(&b'/') {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                token_start = idx;
+                state = ConnectContinuationScanState::ScanToken;
+            }
+            ConnectContinuationScanState::ScanToken => {
+                while bytes
+                    .get(idx)
+                    .is_some_and(|&byte| sql_text::is_identifier_byte(byte))
+                {
+                    idx += 1;
+                }
+                if idx == token_start {
+                    return ConnectContinuation::Other;
+                }
+
+                let Some(token) = bytes.get(token_start..idx) else {
+                    return ConnectContinuation::Other;
+                };
+
+                if token.eq_ignore_ascii_case(b"BY") {
+                    if matches!(bytes.get(idx), None | Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                        return ConnectContinuation::ByClause;
+                    }
+                    return ConnectContinuation::Other;
+                }
+
+                return ConnectContinuation::Other;
+            }
+        }
     }
 
-    let Some(by_end) = idx.checked_add(2) else {
-        return false;
-    };
-    if bytes.len() < by_end {
-        return false;
-    }
-    if !bytes[idx..by_end]
-        .iter()
-        .zip(b"BY")
-        .all(|(b, c)| b.to_ascii_uppercase() == *c)
-    {
-        return false;
-    }
-
-    matches!(
-        bytes.get(by_end),
-        None | Some(b' ') | Some(b'\t') | Some(b'\n')
-    )
+    ConnectContinuation::EndOfLine
 }
 
 fn skip_trivia_and_comments(bytes: &[u8], mut idx: usize) -> usize {
