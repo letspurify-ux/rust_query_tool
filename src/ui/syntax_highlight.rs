@@ -156,6 +156,36 @@ enum ScanResult {
     Unterminated { next_idx: usize, state: LexerState },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockCommentKind {
+    Regular,
+    Hint,
+}
+
+impl BlockCommentKind {
+    fn from_after_open(bytes: &[u8], idx_after_open: usize) -> Self {
+        if bytes.get(idx_after_open) == Some(&b'+') {
+            Self::Hint
+        } else {
+            Self::Regular
+        }
+    }
+
+    fn style_byte(self) -> u8 {
+        match self {
+            Self::Regular => STYLE_COMMENT as u8,
+            Self::Hint => STYLE_HINT as u8,
+        }
+    }
+
+    fn unterminated_state(self) -> LexerState {
+        match self {
+            Self::Regular => LexerState::InBlockComment,
+            Self::Hint => LexerState::InHintComment,
+        }
+    }
+}
+
 /// Holds additional identifiers for highlighting (tables, views, etc.)
 #[derive(Clone, Default)]
 pub struct HighlightData {
@@ -418,26 +448,30 @@ impl SqlHighlighter {
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
         match initial_state {
-            LexerState::InBlockComment => match scan_until_block_comment_end(bytes, idx, false) {
-                ScanResult::Closed { next_idx } => {
-                    idx = next_idx;
-                    styles[..idx].fill(STYLE_COMMENT as u8);
+            LexerState::InBlockComment => {
+                match scan_until_block_comment_end(bytes, idx, BlockCommentKind::Regular) {
+                    ScanResult::Closed { next_idx } => {
+                        idx = next_idx;
+                        styles[..idx].fill(STYLE_COMMENT as u8);
+                    }
+                    ScanResult::Unterminated { state, .. } => {
+                        styles[..].fill(STYLE_COMMENT as u8);
+                        return (style_bytes_to_string(styles), state);
+                    }
                 }
-                ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_COMMENT as u8);
-                    return (style_bytes_to_string(styles), state);
+            }
+            LexerState::InHintComment => {
+                match scan_until_block_comment_end(bytes, idx, BlockCommentKind::Hint) {
+                    ScanResult::Closed { next_idx } => {
+                        idx = next_idx;
+                        styles[..idx].fill(STYLE_HINT as u8);
+                    }
+                    ScanResult::Unterminated { state, .. } => {
+                        styles[..].fill(STYLE_HINT as u8);
+                        return (style_bytes_to_string(styles), state);
+                    }
                 }
-            },
-            LexerState::InHintComment => match scan_until_block_comment_end(bytes, idx, true) {
-                ScanResult::Closed { next_idx } => {
-                    idx = next_idx;
-                    styles[..idx].fill(STYLE_HINT as u8);
-                }
-                ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_HINT as u8);
-                    return (style_bytes_to_string(styles), state);
-                }
-            },
+            }
             LexerState::InSingleQuote => match scan_until_single_quote_end(bytes, idx) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
@@ -526,16 +560,15 @@ impl SqlHighlighter {
             // Multi-line comment (/* */) or hint (/*+ */)
             if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
                 let start = idx;
-                let is_hint = bytes.get(idx + 2) == Some(&b'+');
+                let comment_kind = BlockCommentKind::from_after_open(bytes, idx + 2);
                 idx += 2;
-                let scan_result = scan_until_block_comment_end(bytes, idx, is_hint);
+                let scan_result = scan_until_block_comment_end(bytes, idx, comment_kind);
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
                     }
                 };
-                let style_char = if is_hint { STYLE_HINT } else { STYLE_COMMENT };
-                styles[start..idx].fill(style_char as u8);
+                styles[start..idx].fill(comment_kind.style_byte());
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
@@ -899,7 +932,11 @@ fn range_focus_distance(start: usize, end: usize, focus_points: &[usize]) -> usi
         .unwrap_or(0)
 }
 
-fn scan_until_block_comment_end(bytes: &[u8], mut idx: usize, hint: bool) -> ScanResult {
+fn scan_until_block_comment_end(
+    bytes: &[u8],
+    mut idx: usize,
+    comment_kind: BlockCommentKind,
+) -> ScanResult {
     loop {
         match (bytes.get(idx), bytes.get(idx + 1)) {
             (Some(&b'*'), Some(&b'/')) => {
@@ -908,14 +945,9 @@ fn scan_until_block_comment_end(bytes: &[u8], mut idx: usize, hint: bool) -> Sca
             }
             (Some(_), _) => idx += 1,
             (None, _) => {
-                let state = if hint {
-                    LexerState::InHintComment
-                } else {
-                    LexerState::InBlockComment
-                };
                 return ScanResult::Unterminated {
                     next_idx: idx,
-                    state,
+                    state: comment_kind.unterminated_state(),
                 };
             }
         }
