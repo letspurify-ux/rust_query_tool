@@ -6669,6 +6669,70 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_declare_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+DECLARE
+  v NUMBER := 1;
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH FUNCTION declaration mode when DECLARE starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("DECLARE\n  v NUMBER := 1;"),
+        "second statement should start at DECLARE block after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_procedure_recovers_to_drop_statement_head() {
+    let sql = "WITH
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END;
+DROP TABLE t_parser_recover;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH PROCEDURE declaration mode when DROP starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  PROCEDURE p IS"),
+        "first statement should preserve WITH PROCEDURE declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("DROP TABLE t_parser_recover"),
+        "second statement should start at DROP statement after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_and_cte_keeps_single_statement() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
