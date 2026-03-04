@@ -1,5 +1,33 @@
 # 예외 처리 보완 내역
 
+## 2026-03-04 인텔리센스 누락 구문 보완 (`ONLY(...)` / `TABLE(...)` relation wrapper)
+
+### [중] FROM 절 relation wrapper를 테이블명으로 해석하지 못해 별칭 기반 컬럼 추천이 누락되던 문제 수정
+- **증상**:
+  - `SELECT o.| FROM ONLY (hr.orders) o`
+  - `SELECT c.| FROM TABLE(hr.order_rows) c`
+  - 위 형태에서 wrapper 내부 relation 경로를 수집하지 못해 인텔리센스 스코프에서 테이블/별칭 해석이 불완전했습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 relation 수집 경로(`parse_table_name_deep`)가 일반 식별자 경로만 처리하고,
+  - Oracle wrapper 문법인 `ONLY (...)` / `TABLE (...)`를 relation 토큰으로 정규화하지 않았습니다.
+- **수정**:
+  - `parse_relation_wrapper_table_name` 헬퍼를 추가해 `ONLY (...)` / `TABLE (...)`를 우선 파싱하도록 확장했습니다.
+  - `ONLY (...)`는 내부 식별자 경로를 필수로 해석하고, `TABLE (...)`는 식별자 인자면 경로를, 표현식 인자면 fallback relation key(`TABLE`)를 사용하도록 정리했습니다.
+
+### [유사 케이스] wrapper 인자 형태별 일괄 검증
+- `TABLE(collection_expression)`처럼 식별자 경로가 아닌 인자도 별칭 기반 추천이 유지되는지 회귀 테스트로 함께 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `only_wrapper_relation_is_collected_and_visible`
+- `table_wrapper_relation_with_identifier_argument_is_collected`
+- `table_wrapper_collection_expression_keeps_alias`
+
+### [검증]
+- `cargo test -q only_wrapper_relation_is_collected_and_visible -- --nocapture` 통과
+- `cargo test -q table_wrapper_ -- --nocapture` 통과
+- `cargo test` 전체 통과
+
+
 ## 2026-03-05 Oracle 공통 파서 엔진 오탐 수정 (`NAME/LANGUAGE/LIBRARY` 식별자)
 
 ### [중] 일반 식별자 `NAME/LANGUAGE/LIBRARY`를 `EXTERNAL` call spec으로 오인식해 문장을 조기 분리하던 문제 수정

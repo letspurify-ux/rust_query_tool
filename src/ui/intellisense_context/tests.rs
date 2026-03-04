@@ -1207,6 +1207,63 @@ fn outer_apply_keeps_from_phase_before_right_relation() {
     assert!(ctx.phase.is_table_context());
 }
 
+#[test]
+fn only_wrapper_relation_is_collected_and_visible() {
+    let ctx = analyze("SELECT o.| FROM ONLY (hr.orders) o");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.ORDERS".to_string()),
+        "ONLY wrapper should preserve underlying relation name: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("o")),
+        "ONLY wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn table_wrapper_relation_with_identifier_argument_is_collected() {
+    let ctx = analyze("SELECT c.| FROM TABLE(hr.order_rows) c");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.ORDER_ROWS".to_string()),
+        "TABLE wrapper should preserve identifier-like relation path: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "TABLE wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn table_wrapper_collection_expression_keeps_alias() {
+    let ctx = analyze("SELECT c.| FROM TABLE(get_rows()) c");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "TABLE(collection_expression) should still allow alias-driven completion: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]

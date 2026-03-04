@@ -1284,6 +1284,11 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
     match tokens.get(start) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => None,
         Some(SqlToken::Word(word)) => {
+            if let Some((wrapped_name, next_idx)) =
+                parse_relation_wrapper_table_name(tokens, start, word)
+            {
+                return Some((wrapped_name, next_idx));
+            }
             let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
             let upper = word.to_ascii_uppercase();
             // Skip if this is a keyword rather than a table name
@@ -1311,6 +1316,44 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
             Some((table, idx))
         }
         _ => None,
+    }
+}
+
+fn parse_relation_wrapper_table_name(
+    tokens: &[SqlToken],
+    start: usize,
+    relation_word: &str,
+) -> Option<(String, usize)> {
+    let relation_upper = relation_word.to_ascii_uppercase();
+    if !matches!(relation_upper.as_str(), "ONLY" | "TABLE") {
+        return None;
+    }
+
+    let open_idx = skip_comment_tokens(tokens, start + 1);
+    let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
+        return None;
+    };
+    if sym != "(" {
+        return None;
+    }
+
+    let Some((inner_range, next_idx)) = extract_parenthesized_range(tokens, open_idx) else {
+        return None;
+    };
+    let inner_tokens = token_range_slice(tokens, inner_range);
+
+    if relation_upper == "ONLY" {
+        let (relation_name, _) = parse_table_name_deep(inner_tokens, 0)?;
+        return Some((relation_name, next_idx));
+    }
+
+    // TABLE(...) may contain collection function calls or scalar subqueries.
+    // For identifier-like forms (`TABLE(schema.collection_col)`) keep the
+    // underlying name so alias resolution can target stable relation keys.
+    if let Some((relation_name, _)) = parse_table_name_deep(inner_tokens, 0) {
+        Some((relation_name, next_idx))
+    } else {
+        Some((relation_upper, next_idx))
     }
 }
 
