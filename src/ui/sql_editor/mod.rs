@@ -79,6 +79,40 @@ fn is_window_shown_and_visible(shown: bool, visible: bool) -> bool {
     shown && visible
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnPollPendingAction {
+    None,
+    Refresh,
+    Clear,
+    RefreshThenClear,
+}
+
+impl ColumnPollPendingAction {
+    fn request_refresh(&mut self) {
+        *self = match *self {
+            Self::None => Self::Refresh,
+            Self::Clear => Self::RefreshThenClear,
+            current => current,
+        };
+    }
+
+    fn request_clear(&mut self) {
+        *self = match *self {
+            Self::None => Self::Clear,
+            Self::Refresh => Self::RefreshThenClear,
+            current => current,
+        };
+    }
+
+    fn should_refresh(self) -> bool {
+        matches!(self, Self::Refresh | Self::RefreshThenClear)
+    }
+
+    fn should_clear(self, has_columns_loading: bool) -> bool {
+        matches!(self, Self::Clear | Self::RefreshThenClear) && !has_columns_loading
+    }
+}
+
 fn update_alert_pump_state_after_display(queue_is_empty: bool, pump_scheduled: &mut bool) -> bool {
     if queue_is_empty {
         *pump_scheduled = false;
@@ -1597,13 +1631,6 @@ impl SqlEditorWidget {
         store_mutex_bool(cancel_flag, false);
     }
 
-    fn should_clear_pending_after_poll_refresh(
-        should_clear_pending: bool,
-        has_columns_loading: bool,
-    ) -> bool {
-        should_clear_pending && !has_columns_loading
-    }
-
     fn setup_column_loader(&self, column_receiver: mpsc::Receiver<ColumnLoadUpdate>) {
         let intellisense_data = self.intellisense_data.clone();
         let editor = self.editor.clone();
@@ -1651,8 +1678,7 @@ impl SqlEditorWidget {
 
             let mut disconnected = false;
             let mut processed = 0usize;
-            let mut should_refresh_pending = false;
-            let mut should_clear_pending = false;
+            let mut pending_action = ColumnPollPendingAction::None;
             let mut highlight_columns: Option<Vec<String>> = None;
             // Process any pending messages
             {
@@ -1663,26 +1689,44 @@ impl SqlEditorWidget {
                     match r.try_recv() {
                         Ok(update) => {
                             processed += 1;
-                            let (refresh_pending, clear_pending, new_highlight_columns) = {
+                            let (new_pending_action, new_highlight_columns) = {
                                 let mut data = intellisense_data
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 if update.cache_columns {
                                     data.set_columns_for_table(&update.table, update.columns);
                                     (
-                                        true,
-                                        false,
+                                        ColumnPollPendingAction::Refresh,
                                         Some(collect_highlight_columns_from_intellisense(&data)),
                                     )
                                 } else {
                                     data.clear_columns_loading(&update.table);
                                     // If every pending table load has completed without cached
                                     // columns, clear pending intellisense to avoid retry loops.
-                                    (false, data.columns_loading.is_empty(), None)
+                                    (
+                                        if data.columns_loading.is_empty() {
+                                            ColumnPollPendingAction::Clear
+                                        } else {
+                                            ColumnPollPendingAction::None
+                                        },
+                                        None,
+                                    )
                                 }
                             };
-                            should_refresh_pending |= refresh_pending;
-                            should_clear_pending |= clear_pending;
+                            if matches!(
+                                new_pending_action,
+                                ColumnPollPendingAction::Refresh
+                                    | ColumnPollPendingAction::RefreshThenClear
+                            ) {
+                                pending_action.request_refresh();
+                            }
+                            if matches!(
+                                new_pending_action,
+                                ColumnPollPendingAction::Clear
+                                    | ColumnPollPendingAction::RefreshThenClear
+                            ) {
+                                pending_action.request_clear();
+                            }
                             if new_highlight_columns.is_some() {
                                 highlight_columns = new_highlight_columns;
                             }
@@ -1724,7 +1768,7 @@ impl SqlEditorWidget {
             // Refresh intellisense BEFORE clearing pending so that a poll
             // iteration with mixed results (some tables cached, some failed)
             // still fires a retry with whatever data is now available.
-            if should_refresh_pending {
+            if pending_action.should_refresh() {
                 let pending = pending_intellisense
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1757,17 +1801,17 @@ impl SqlEditorWidget {
 
             // Clear pending AFTER the refresh above so the retry is not
             // skipped when all outstanding loads finish in the same poll.
-            if should_clear_pending {
+            if matches!(
+                pending_action,
+                ColumnPollPendingAction::Clear | ColumnPollPendingAction::RefreshThenClear
+            ) {
                 let has_columns_loading = {
                     let data = intellisense_data
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     !data.columns_loading.is_empty()
                 };
-                if SqlEditorWidget::should_clear_pending_after_poll_refresh(
-                    should_clear_pending,
-                    has_columns_loading,
-                ) {
+                if pending_action.should_clear(has_columns_loading) {
                     *pending_intellisense
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
