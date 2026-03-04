@@ -70,6 +70,7 @@ struct QueryExecutionCleanupGuard {
     sender: mpsc::Sender<QueryProgress>,
     current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
     cancel_flag: Arc<Mutex<bool>>,
+    query_running: Arc<Mutex<bool>>,
     timeout_connection: Option<Arc<Connection>>,
     previous_timeout: Option<Duration>,
 }
@@ -79,11 +80,13 @@ impl QueryExecutionCleanupGuard {
         sender: mpsc::Sender<QueryProgress>,
         current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
         cancel_flag: Arc<Mutex<bool>>,
+        query_running: Arc<Mutex<bool>>,
     ) -> Self {
         Self {
             sender,
             current_query_connection,
             cancel_flag,
+            query_running,
             timeout_connection: None,
             previous_timeout: None,
         }
@@ -107,6 +110,9 @@ impl Drop for QueryExecutionCleanupGuard {
         }
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
         store_mutex_bool(&self.cancel_flag, false);
+        // Keep execution state fail-safe even if the UI progress poller has
+        // stopped (e.g. tab closed while worker thread is still unwinding).
+        store_mutex_bool(&self.query_running, false);
         let _ = self.sender.send(QueryProgress::BatchFinished);
         app::awake();
     }
@@ -2517,8 +2523,7 @@ impl SqlEditorWidget {
                     next_index += 1;
                 }
                 if words.get(next_index).is_some_and(|word| {
-                    word.eq_ignore_ascii_case("FUNCTION")
-                        || word.eq_ignore_ascii_case("PROCEDURE")
+                    word.eq_ignore_ascii_case("FUNCTION") || word.eq_ignore_ascii_case("PROCEDURE")
                 }) {
                     return true;
                 }
@@ -3068,6 +3073,7 @@ impl SqlEditorWidget {
                     sender.clone(),
                     current_query_connection.clone(),
                     cancel_flag.clone(),
+                    query_running.clone(),
                 );
 
                 // Acquire connection lock inside thread and hold it during execution
@@ -8914,6 +8920,7 @@ mod query_execution_cleanup_tests {
     fn cleanup_guard_resets_cancel_and_emits_batch_finished_on_drop() {
         let (sender, receiver) = mpsc::channel();
         let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8922,10 +8929,15 @@ mod query_execution_cleanup_tests {
                 sender,
                 current_query_connection.clone(),
                 cancel_flag.clone(),
+                query_running.clone(),
             );
         }
 
         assert!(!cancel_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned());
+        assert!(!query_running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
@@ -8943,21 +8955,31 @@ mod query_execution_cleanup_tests {
     fn cleanup_guard_runs_during_panic_unwind() {
         let (sender, receiver) = mpsc::channel();
         let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
         let unwind_result = panic::catch_unwind(AssertUnwindSafe({
             let cancel_flag = cancel_flag.clone();
             let current_query_connection = current_query_connection;
+            let query_running = query_running.clone();
             move || {
-                let _guard =
-                    QueryExecutionCleanupGuard::new(sender, current_query_connection, cancel_flag);
+                let _guard = QueryExecutionCleanupGuard::new(
+                    sender,
+                    current_query_connection,
+                    cancel_flag,
+                    query_running,
+                );
                 panic!("simulate execution panic");
             }
         }));
 
         assert!(unwind_result.is_err());
         assert!(!cancel_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned());
+        assert!(!query_running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
@@ -8973,6 +8995,7 @@ mod query_execution_cleanup_tests {
         drop(receiver);
 
         let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -8981,11 +9004,16 @@ mod query_execution_cleanup_tests {
                 sender,
                 current_query_connection,
                 cancel_flag.clone(),
+                query_running.clone(),
             );
         }));
 
         assert!(drop_result.is_ok(), "Drop must ignore send failures");
         assert!(!cancel_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned());
+        assert!(!query_running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
@@ -8995,6 +9023,7 @@ mod query_execution_cleanup_tests {
     fn cleanup_guard_recovers_from_poisoned_connection_mutex() {
         let (sender, receiver) = mpsc::channel();
         let cancel_flag = Arc::new(Mutex::new(true));
+        let query_running = Arc::new(Mutex::new(true));
         let current_query_connection: Arc<Mutex<Option<Arc<Connection>>>> =
             Arc::new(Mutex::new(None));
 
@@ -9011,10 +9040,15 @@ mod query_execution_cleanup_tests {
                 sender,
                 current_query_connection,
                 cancel_flag.clone(),
+                query_running.clone(),
             );
         }
 
         assert!(!cancel_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned());
+        assert!(!query_running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .to_owned());
