@@ -230,6 +230,26 @@ enum WithCteFormatState {
     InDefinitions { paren_depth: usize },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerHeaderState {
+    None,
+    InHeader,
+}
+
+impl TriggerHeaderState {
+    fn is_active(self) -> bool {
+        matches!(self, Self::InHeader)
+    }
+
+    fn start(&mut self) {
+        *self = Self::InHeader;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
 impl WithCteFormatState {
     fn on_clause_keyword(&mut self, keyword: &str) {
         match keyword {
@@ -1139,7 +1159,7 @@ impl SqlEditorWidget {
         let mut with_cte_state = WithCteFormatState::None;
         let mut statement_has_with_clause = false;
         let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
-        let mut trigger_header_active = false;
+        let mut trigger_header_state = TriggerHeaderState::None;
 
         let newline_with = |out: &mut String,
                             indent_level: usize,
@@ -1233,10 +1253,10 @@ impl SqlEditorWidget {
                     let mut newline_after_keyword = false;
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
-                    let is_trigger_event_keyword = trigger_header_active
+                    let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
-                    let is_trigger_or_on_keyword =
-                        trigger_header_active && matches!(upper.as_str(), "OR" | "ON");
+                    let is_trigger_or_on_keyword = trigger_header_state.is_active()
+                        && matches!(upper.as_str(), "OR" | "ON");
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
                     if upper == "END" {
@@ -1399,7 +1419,7 @@ impl SqlEditorWidget {
                             idx = lookahead;
                         }
                         continue;
-                    } else if trigger_header_active
+                    } else if trigger_header_state.is_active()
                         && matches!(upper.as_str(), "BEFORE" | "AFTER" | "INSTEAD")
                     {
                         newline_with(
@@ -1492,7 +1512,7 @@ impl SqlEditorWidget {
                     {
                         create_object = Some(upper.clone());
                         if upper == "TRIGGER" {
-                            trigger_header_active = true;
+                            trigger_header_state.start();
                         }
                         create_pending = false;
                     } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
@@ -1598,7 +1618,7 @@ impl SqlEditorWidget {
                     } else if upper == "OPEN" {
                         open_cursor_state = OpenCursorFormatState::AwaitingFor;
                     } else if upper == "FOR" || upper == "WHILE" {
-                        if upper == "FOR" && trigger_header_active {
+                        if upper == "FOR" && trigger_header_state.is_active() {
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
@@ -1809,7 +1829,7 @@ impl SqlEditorWidget {
 
                     if upper == "DECLARE" || upper == "BEGIN" {
                         if upper == "BEGIN" {
-                            trigger_header_active = false;
+                            trigger_header_state.clear();
                         }
                         newline_with(
                             &mut out,
@@ -2021,6 +2041,7 @@ impl SqlEditorWidget {
                             select_list_multiline_forced = false;
                             open_cursor_state = OpenCursorFormatState::None;
                             between_pending = false;
+                            trigger_header_state.clear();
                             exit_condition_state.clear();
                             if pending_package_member_separator
                                 && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
