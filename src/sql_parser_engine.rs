@@ -73,6 +73,32 @@ pub(crate) enum PendingEnd {
     End,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PendingEndSuffix {
+    Case,
+    If,
+    Loop,
+    While,
+    Repeat,
+    For,
+    TimingPoint,
+}
+
+impl PendingEndSuffix {
+    fn parse(token_upper: &str, in_compound_trigger: bool) -> Option<Self> {
+        match token_upper {
+            "CASE" => Some(Self::Case),
+            "IF" => Some(Self::If),
+            "LOOP" => Some(Self::Loop),
+            "WHILE" => Some(Self::While),
+            "REPEAT" => Some(Self::Repeat),
+            "FOR" => Some(Self::For),
+            "BEFORE" | "AFTER" | "INSTEAD" if in_compound_trigger => Some(Self::TimingPoint),
+            _ => None,
+        }
+    }
+}
+
 impl Default for PendingEnd {
     fn default() -> Self {
         Self::None
@@ -256,24 +282,22 @@ impl SplitState {
         self.track_create_plsql(upper);
         self.track_top_level_with_plsql(upper);
 
-        let was_pending_end = self.pending_end == PendingEnd::End;
-        let is_end_case = was_pending_end && upper == "CASE";
-        let is_end_if = was_pending_end && upper == "IF";
-        let is_end_loop = was_pending_end && upper == "LOOP";
-        let is_end_while = was_pending_end && upper == "WHILE";
-        let is_end_repeat = was_pending_end && upper == "REPEAT";
-        let is_end_for = was_pending_end && upper == "FOR";
+        let pending_end_suffix = if self.pending_end == PendingEnd::End {
+            PendingEndSuffix::parse(upper, self.in_compound_trigger)
+        } else {
+            None
+        };
 
         self.handle_if_state_on_token(upper);
-        self.handle_pending_end_on_token(upper);
+        self.handle_pending_end_on_token(pending_end_suffix);
         self.handle_block_openers(
             upper,
-            is_end_case,
-            is_end_if,
-            is_end_loop,
-            is_end_while,
-            is_end_repeat,
-            is_end_for,
+            pending_end_suffix == Some(PendingEndSuffix::Case),
+            pending_end_suffix == Some(PendingEndSuffix::If),
+            pending_end_suffix == Some(PendingEndSuffix::Loop),
+            pending_end_suffix == Some(PendingEndSuffix::While),
+            pending_end_suffix == Some(PendingEndSuffix::Repeat),
+            pending_end_suffix == Some(PendingEndSuffix::For),
         );
 
         // Return the uppercase buffer so its capacity is reused.
@@ -315,12 +339,12 @@ impl SplitState {
     }
 
     /// Sub-handler: resolve pending END based on the following keyword.
-    fn handle_pending_end_on_token(&mut self, upper: &str) {
+    fn handle_pending_end_on_token(&mut self, suffix: Option<PendingEndSuffix>) {
         if self.pending_end != PendingEnd::End {
             return;
         }
-        match upper {
-            "CASE" => {
+        match suffix {
+            Some(PendingEndSuffix::Case) => {
                 // END CASE – pop CASE from stack
                 if self.top_is_case() {
                     self.block_stack.pop();
@@ -334,25 +358,25 @@ impl SplitState {
                     }
                 }
             }
-            "IF" => {
+            Some(PendingEndSuffix::If) => {
                 self.pop_block_of_kind(BlockKind::If);
             }
-            "LOOP" => {
+            Some(PendingEndSuffix::Loop) => {
                 self.pop_block_of_kind(BlockKind::Loop);
             }
-            "WHILE" => {
+            Some(PendingEndSuffix::While) => {
                 self.pop_block_of_kind(BlockKind::While);
             }
-            "REPEAT" => {
+            Some(PendingEndSuffix::Repeat) => {
                 self.pop_block_of_kind(BlockKind::Repeat);
             }
-            "FOR" => {
+            Some(PendingEndSuffix::For) => {
                 self.pop_block_of_kind(BlockKind::For);
             }
-            "BEFORE" | "AFTER" | "INSTEAD" if self.in_compound_trigger => {
+            Some(PendingEndSuffix::TimingPoint) => {
                 self.pop_block_of_kind(BlockKind::TimingPoint);
             }
-            _ => {
+            None => {
                 // Plain END – CASE expression or PL/SQL block
                 self.resolve_plain_end();
             }
@@ -1154,8 +1178,46 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, IfState, PendingDo, PendingEnd, RoutineFrame, SplitState, SqlParserEngine,
+        BlockKind, IfState, PendingDo, PendingEnd, PendingEndSuffix, RoutineFrame, SplitState,
+        SqlParserEngine,
     };
+
+    #[test]
+    fn pending_end_suffix_parse_covers_supported_keywords() {
+        assert_eq!(
+            PendingEndSuffix::parse("CASE", false),
+            Some(PendingEndSuffix::Case)
+        );
+        assert_eq!(
+            PendingEndSuffix::parse("IF", false),
+            Some(PendingEndSuffix::If)
+        );
+        assert_eq!(
+            PendingEndSuffix::parse("LOOP", false),
+            Some(PendingEndSuffix::Loop)
+        );
+        assert_eq!(
+            PendingEndSuffix::parse("WHILE", false),
+            Some(PendingEndSuffix::While)
+        );
+        assert_eq!(
+            PendingEndSuffix::parse("REPEAT", false),
+            Some(PendingEndSuffix::Repeat)
+        );
+        assert_eq!(
+            PendingEndSuffix::parse("FOR", false),
+            Some(PendingEndSuffix::For)
+        );
+    }
+
+    #[test]
+    fn pending_end_suffix_parse_scopes_timing_point_keywords() {
+        assert_eq!(PendingEndSuffix::parse("BEFORE", false), None);
+        assert_eq!(
+            PendingEndSuffix::parse("AFTER", true),
+            Some(PendingEndSuffix::TimingPoint)
+        );
+    }
 
     #[test]
     fn semicolon_split_resets_transient_state_at_top_level() {
