@@ -1277,3 +1277,29 @@
 - `cargo test -q recovers_to_disassociate_statement_head -- --nocapture` 통과
 - `cargo test -q recovers_to_associate_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-04 인텔리센스 FROM 확장 구문 별칭 파싱 보완 (`PARTITION` / `SUBPARTITION` / `SAMPLE` / `AS OF`)
+
+### [중] 테이블 postfix 절을 별칭으로 오인식해 스코프 해석이 깨지던 문제 수정
+- **증상**:
+  - `SELECT * FROM sales PARTITION (p202401) s WHERE s.|`
+  - `SELECT * FROM employees AS OF SCN (12345) e WHERE e.|`
+  - 위 형태에서 `PARTITION` 또는 `AS`가 별칭으로 잘못 파싱되거나, 실제 별칭(`s`, `e`) 수집이 누락될 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `parse_alias_deep`가 테이블명 직후 토큰만 확인해 별칭을 해석하고,
+  - Oracle FROM postfix 절(`PARTITION(...)`, `SUBPARTITION(...)`, `SAMPLE(...)`, `SEED(...)`, `AS OF ...`)을 건너뛰지 않았습니다.
+- **수정**:
+  - `skip_relation_postfix_clauses`를 추가하고 `parse_alias_deep` 시작 지점에서 postfix 절을 먼저 건너뛰도록 변경했습니다.
+  - `AS` 키워드는 `AS OF`(flashback clause)일 때 별칭 분기로 진입하지 않도록 가드 처리했습니다.
+
+### [유사 케이스] Oracle relation extension 일괄 보강
+- 발견된 버그와 동일 계열인 `PARTITION/SUBPARTITION`, `SAMPLE/SEED`, `AS OF`를 공통 스킵 경로로 묶어 후속 오탐 가능성을 함께 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `partition_extension_before_alias_is_not_parsed_as_alias`
+- `flashback_as_of_before_alias_is_not_parsed_as_alias`
+
+### [검증]
+- `cargo test -q partition_extension_before_alias_is_not_parsed_as_alias -- --nocapture` 통과
+- `cargo test -q flashback_as_of_before_alias_is_not_parsed_as_alias -- --nocapture` 통과
+- `cargo test -- --test-threads=1` 전체 통과
