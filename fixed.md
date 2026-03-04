@@ -1,5 +1,36 @@
 # 예외 처리 보완 내역
 
+## 2026-03-05 Oracle 공통 파서 엔진 오탐 수정 (`NAME/LANGUAGE/LIBRARY` 식별자)
+
+### [중] 일반 식별자 `NAME/LANGUAGE/LIBRARY`를 `EXTERNAL` call spec으로 오인식해 문장을 조기 분리하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE PROCEDURE ... IS name NUMBER; language NUMBER; library NUMBER; BEGIN ... END; SELECT ...;` 형태에서
+  - 선언부 식별자 `name/language/library`가 외부 루틴 키워드로 오인식되어 statement가 `name ...;`, `language ...;`, `library ...;` 단위로 쪼개졌습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `handle_routine_is_external`가 루틴 depth에서 `EXTERNAL/LANGUAGE/NAME/LIBRARY` 토큰을 문맥 없이 즉시 외부 루틴으로 확정했습니다.
+- **수정**:
+  - `RoutineFrame`에 `external_clause_state` 상태 머신(`SawExternalKeyword`, `AwaitingLanguageTarget`, `Confirmed`)을 추가했습니다.
+  - `LANGUAGE`는 다음 토큰이 실제 언어 타깃(`C/JAVA/JAVASCRIPT/PYTHON`)일 때만 외부 루틴으로 확정하도록 변경했습니다.
+  - `NAME`/`LIBRARY`는 `EXTERNAL` 문맥(`SawExternalKeyword`/`Confirmed`)에서만 외부 루틴 확정에 반영되도록 제한했습니다.
+  - 결과적으로 일반 식별자 `name/language/library`는 더 이상 외부 루틴 세미콜론 정책을 오염시키지 않습니다.
+
+### [유사 케이스] `EXTERNAL` 없이 `AS LANGUAGE C NAME ...` 형태도 함께 검증
+- 외부 루틴 문법 호환성 회귀를 막기 위해 `EXTERNAL` 키워드가 없는 call spec도 테스트로 보강했습니다.
+
+### [테스트] 회귀/호환 케이스 추가
+- `test_procedure_name_language_library_identifiers_do_not_trigger_external_split`
+- `test_split_format_items_name_language_library_identifiers_do_not_trigger_external_split`
+- `test_create_external_function_language_clause_without_external_keyword_splits`
+- `test_split_format_items_external_language_clause_without_external_keyword_splits`
+- `sql_parser_engine::tests::name_language_library_identifiers_do_not_activate_external_clause_policy`
+- `sql_parser_engine::tests::language_clause_without_external_keyword_still_marks_external_routine_split`
+
+### [검증]
+- `cargo test -q name_language_library_identifiers_do_not_trigger_external_split -- --nocapture` 통과
+- `cargo test -q language_clause_without_external_keyword -- --nocapture` 통과
+- `cargo test -q external -- --nocapture` 통과
+- `cargo test` 전체 통과
+
 ## 2026-03-05 Oracle 공통 파서 엔진 `WITH FUNCTION` 복구 키워드 보강 (`AUDIT` / `NOAUDIT`)
 
 ### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `AUDIT`/`NOAUDIT`를 새 문장 시작으로 인식하지 못하던 문제 수정

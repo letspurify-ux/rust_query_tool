@@ -154,6 +154,7 @@ pub(crate) enum PendingDo {
 struct RoutineFrame {
     block_depth: usize,
     semicolon_policy: SemicolonPolicy,
+    external_clause_state: ExternalClauseState,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -163,11 +164,20 @@ enum SemicolonPolicy {
     CloseRoutineBlock,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ExternalClauseState {
+    None,
+    SawExternalKeyword,
+    AwaitingLanguageTarget,
+    Confirmed,
+}
+
 impl RoutineFrame {
     fn new(block_depth: usize) -> Self {
         Self {
             block_depth,
             semicolon_policy: SemicolonPolicy::Default,
+            external_clause_state: ExternalClauseState::None,
         }
     }
 
@@ -179,6 +189,47 @@ impl RoutineFrame {
     fn should_close_routine_block_on_semicolon(self, current_block_depth: usize) -> bool {
         self.block_depth == current_block_depth
             && self.semicolon_policy == SemicolonPolicy::CloseRoutineBlock
+    }
+
+    fn mark_external_clause(&mut self) {
+        self.semicolon_policy = if self.block_depth == 1 {
+            SemicolonPolicy::ForceSplit
+        } else {
+            SemicolonPolicy::CloseRoutineBlock
+        };
+        self.external_clause_state = ExternalClauseState::Confirmed;
+    }
+
+    fn observe_external_clause_token(&mut self, token_upper: &str) {
+        if self.external_clause_state == ExternalClauseState::AwaitingLanguageTarget {
+            self.external_clause_state = ExternalClauseState::None;
+            if is_external_language_target(token_upper) {
+                self.mark_external_clause();
+                return;
+            }
+        }
+
+        match token_upper {
+            "EXTERNAL" => {
+                self.external_clause_state = ExternalClauseState::SawExternalKeyword;
+            }
+            "LANGUAGE" => {
+                self.external_clause_state = ExternalClauseState::AwaitingLanguageTarget;
+            }
+            "NAME" | "LIBRARY" => {
+                if matches!(
+                    self.external_clause_state,
+                    ExternalClauseState::SawExternalKeyword | ExternalClauseState::Confirmed
+                ) {
+                    self.mark_external_clause();
+                }
+            }
+            _ => {
+                if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
+                    self.external_clause_state = ExternalClauseState::None;
+                }
+            }
+        }
     }
 }
 
@@ -619,19 +670,16 @@ impl SplitState {
 
     /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY semicolon behavior.
     fn handle_routine_is_external(&mut self, upper: &str) {
-        if matches!(upper, "EXTERNAL" | "LANGUAGE" | "NAME" | "LIBRARY")
-            && self
-                .routine_is_stack
-                .last()
-                .is_some_and(|frame| frame.block_depth == self.block_depth())
+        if !self
+            .routine_is_stack
+            .last()
+            .is_some_and(|frame| frame.block_depth == self.block_depth())
         {
-            if let Some(frame) = self.routine_is_stack.last_mut() {
-                frame.semicolon_policy = if frame.block_depth == 1 {
-                    SemicolonPolicy::ForceSplit
-                } else {
-                    SemicolonPolicy::CloseRoutineBlock
-                };
-            }
+            return;
+        }
+
+        if let Some(frame) = self.routine_is_stack.last_mut() {
+            frame.observe_external_clause_token(upper);
         }
     }
 
@@ -1143,6 +1191,11 @@ fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
     !delimiter.is_whitespace()
 }
 
+#[inline]
+fn is_external_language_target(token_upper: &str) -> bool {
+    matches!(token_upper, "C" | "JAVA" | "JAVASCRIPT" | "PYTHON")
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -1640,10 +1693,10 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, IfState, IfSymbolEvent, PendingDo,
-        PendingEnd, PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SplitState,
-        SqlParserEngine, SymbolRole, TimingPointState, TriggerKind, WithClauseState,
-        WithDeclarationState,
+        BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, ExternalClauseState, IfState,
+        IfSymbolEvent, PendingDo, PendingEnd, PendingEndSuffix, RoutineFrame, SemicolonAction,
+        SemicolonPolicy, SplitState, SqlParserEngine, SymbolRole, TimingPointState, TriggerKind,
+        WithClauseState, WithDeclarationState,
     };
 
     #[test]
@@ -1676,6 +1729,7 @@ mod tests {
         state.routine_is_stack.push(RoutineFrame {
             block_depth: 1,
             semicolon_policy: SemicolonPolicy::ForceSplit,
+            external_clause_state: ExternalClauseState::Confirmed,
         });
         assert_eq!(
             SemicolonAction::from_state(&state),
@@ -1691,6 +1745,7 @@ mod tests {
         state.routine_is_stack.push(RoutineFrame {
             block_depth: 2,
             semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
+            external_clause_state: ExternalClauseState::Confirmed,
         });
         assert_eq!(
             SemicolonAction::from_state(&state),
@@ -1987,6 +2042,7 @@ mod tests {
         engine.state.routine_is_stack.push(RoutineFrame {
             block_depth: 1,
             semicolon_policy: SemicolonPolicy::ForceSplit,
+            external_clause_state: ExternalClauseState::Confirmed,
         });
         engine.state.pending_end = PendingEnd::End;
         engine.state.pending_do = PendingDo::While {
@@ -2014,6 +2070,7 @@ mod tests {
             routine_is_stack: vec![RoutineFrame {
                 block_depth: 2,
                 semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
+                external_clause_state: ExternalClauseState::Confirmed,
             }],
             ..SplitState::default()
         };
@@ -2226,6 +2283,43 @@ mod tests {
                 "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn name_language_library_identifiers_do_not_activate_external_clause_policy() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_shadow IS");
+        engine.process_line("  name NUMBER := 1;");
+        engine.process_line("  language NUMBER := 2;");
+        engine.process_line("  library NUMBER := 3;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow IS"));
+        assert!(statements[0].contains("name NUMBER := 1;"));
+        assert!(statements[0].contains("language NUMBER := 2;"));
+        assert!(statements[0].contains("library NUMBER := 3;"));
+        assert!(statements[0].contains("END"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_without_external_keyword_still_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C NAME 'ext_lang_only';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C NAME 'ext_lang_only'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]

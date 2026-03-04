@@ -1143,6 +1143,122 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_procedure_name_language_library_identifiers_do_not_trigger_external_split() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow IS
+  name NUMBER := 1;
+  language NUMBER := 2;
+  library NUMBER := 3;
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "identifier tokens NAME/LANGUAGE/LIBRARY must not trigger EXTERNAL split, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow IS"),
+        "first statement should keep full procedure body: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("name NUMBER := 1;")
+            && stmts[0].contains("language NUMBER := 2;")
+            && stmts[0].contains("library NUMBER := 3;")
+            && stmts[0].contains("END"),
+        "procedure body should preserve NAME/LANGUAGE/LIBRARY declarations: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_name_language_library_identifiers_do_not_trigger_external_split() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow IS
+  name NUMBER := 1;
+  language NUMBER := 2;
+  library NUMBER := 3;
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items must keep NAME/LANGUAGE/LIBRARY identifiers inside routine body: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow IS"));
+    assert!(stmts[0].contains("name NUMBER := 1;"));
+    assert!(stmts[0].contains("language NUMBER := 2;"));
+    assert!(stmts[0].contains("library NUMBER := 3;"));
+    assert!(stmts[0].contains("END"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_language_clause_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
+AS LANGUAGE C NAME 'ext_lang_only';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER"),
+        "first statement should keep external call spec function: {}",
+        stmts[0]
+    );
+    assert!(stmts[0].contains("AS LANGUAGE C NAME 'ext_lang_only'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_clause_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
+AS LANGUAGE C NAME 'ext_lang_only';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE call spec function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C NAME 'ext_lang_only'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS
 BEGIN
