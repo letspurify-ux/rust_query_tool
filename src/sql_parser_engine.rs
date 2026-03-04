@@ -212,6 +212,18 @@ enum TimingPointState {
     AwaitingAsOrIs,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CreateState {
+    None,
+    AwaitingObjectType,
+}
+
+impl Default for CreateState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 impl Default for TimingPointState {
     fn default() -> Self {
         Self::None
@@ -250,8 +262,7 @@ pub(crate) struct SplitState {
 
     // -- CREATE PL/SQL tracking --
     pub(crate) in_create_plsql: bool,
-    pub(crate) create_pending: bool,
-    create_or_seen: bool,
+    pub(crate) create_state: CreateState,
     pub(crate) after_declare: bool,
     after_as_is: bool,
     nested_subprogram: bool,
@@ -631,8 +642,7 @@ impl SplitState {
 
     pub(crate) fn reset_create_state(&mut self) {
         self.in_create_plsql = false;
-        self.create_pending = false;
-        self.create_or_seen = false;
+        self.create_state = CreateState::None;
         self.after_as_is = false;
         self.nested_subprogram = false;
         self.pending_subprogram_begins = 0;
@@ -675,10 +685,9 @@ impl SplitState {
             return;
         }
 
-        if self.create_pending {
+        if self.create_state == CreateState::AwaitingObjectType {
             match upper {
                 "OR" => {
-                    self.create_or_seen = true;
                     return;
                 }
                 "NO" | "FORCE" | "REPLACE" => {
@@ -693,20 +702,17 @@ impl SplitState {
                     self.is_trigger = upper == "TRIGGER";
                     self.is_type_create = upper == "TYPE";
                     self.after_type = upper == "TYPE";
-                    self.create_pending = false;
-                    self.create_or_seen = false;
+                    self.create_state = CreateState::None;
                     return;
                 }
                 _ => {
-                    self.create_pending = false;
-                    self.create_or_seen = false;
+                    self.create_state = CreateState::None;
                 }
             }
         }
 
         if upper == "CREATE" {
-            self.create_pending = true;
-            self.create_or_seen = false;
+            self.create_state = CreateState::AwaitingObjectType;
         }
     }
 
@@ -1248,9 +1254,41 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, EndTokenRole, IfState, PendingDo, PendingEnd, PendingEndSuffix, RoutineFrame,
-        SplitState, SqlParserEngine, TimingPointState, WithClauseState,
+        BlockKind, CreateState, EndTokenRole, IfState, PendingDo, PendingEnd, PendingEndSuffix,
+        RoutineFrame, SplitState, SqlParserEngine, TimingPointState, WithClauseState,
     };
+
+    #[test]
+    fn create_state_transitions_to_plsql_on_create_or_replace_function() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("OR");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("REPLACE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("FUNCTION");
+
+        assert!(state.in_create_plsql);
+        assert_eq!(state.create_state, CreateState::None);
+    }
+
+    #[test]
+    fn create_state_clears_when_non_plsql_target_follows_create() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("TABLE");
+
+        assert!(!state.in_create_plsql);
+        assert_eq!(state.create_state, CreateState::None);
+    }
 
     #[test]
     fn end_token_role_requires_pending_end_state() {
