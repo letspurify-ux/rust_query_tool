@@ -3565,16 +3565,50 @@ fn needs_full_rehighlight(buf: &TextBuffer, pos: i32, ins: i32, deleted_text: &s
 }
 
 fn has_stateful_sql_delimiter(text: &str) -> bool {
-    text.contains("/*")
-        || text.contains("*/")
-        || text.contains("--")
-        || text.contains("'")
-        || text.contains("q'")
-        || text.contains("Q'")
-        || text.contains("nq'")
-        || text.contains("NQ'")
-        || text.contains("Nq'")
-        || text.contains("nQ'")
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DelimiterScanState {
+        Normal,
+        SawSlash,
+        SawDash,
+        SawStar,
+    }
+
+    let mut state = DelimiterScanState::Normal;
+
+    for byte in text.bytes() {
+        if byte == b'\'' {
+            return true;
+        }
+
+        state = match state {
+            DelimiterScanState::Normal => match byte {
+                b'/' => DelimiterScanState::SawSlash,
+                b'-' => DelimiterScanState::SawDash,
+                b'*' => DelimiterScanState::SawStar,
+                _ => DelimiterScanState::Normal,
+            },
+            DelimiterScanState::SawSlash => match byte {
+                b'*' => return true,
+                b'/' => DelimiterScanState::SawSlash,
+                b'-' => DelimiterScanState::SawDash,
+                _ => DelimiterScanState::Normal,
+            },
+            DelimiterScanState::SawDash => match byte {
+                b'-' => return true,
+                b'/' => DelimiterScanState::SawSlash,
+                b'*' => DelimiterScanState::SawStar,
+                _ => DelimiterScanState::Normal,
+            },
+            DelimiterScanState::SawStar => match byte {
+                b'/' => return true,
+                b'-' => DelimiterScanState::SawDash,
+                b'*' => DelimiterScanState::SawStar,
+                _ => DelimiterScanState::Normal,
+            },
+        };
+    }
+
+    false
 }
 
 #[allow(dead_code)]

@@ -836,6 +836,20 @@ fn has_stateful_sql_delimiter_detects_comment_and_string_tokens() {
 }
 
 #[test]
+fn has_stateful_sql_delimiter_treats_partial_tokens_as_safe() {
+    assert!(!has_stateful_sql_delimiter("SELECT / value"));
+    assert!(!has_stateful_sql_delimiter("SELECT - value"));
+    assert!(!has_stateful_sql_delimiter("SELECT * value"));
+}
+
+#[test]
+fn has_stateful_sql_delimiter_detects_mixed_sequence_patterns() {
+    assert!(has_stateful_sql_delimiter("a/*b"));
+    assert!(has_stateful_sql_delimiter("a*/b"));
+    assert!(has_stateful_sql_delimiter("a--b"));
+}
+
+#[test]
 fn is_string_or_comment_style_matches_only_comment_or_string() {
     assert!(is_string_or_comment_style(STYLE_COMMENT));
     assert!(is_string_or_comment_style(STYLE_STRING));
