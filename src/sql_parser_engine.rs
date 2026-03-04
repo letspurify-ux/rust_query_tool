@@ -138,6 +138,10 @@ pub(crate) struct SplitState {
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
 
+    // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
+    pending_with_clause: bool,
+    in_with_plsql_declaration: bool,
+
     // -- Reusable buffer --
     token_upper_buf: String,
 }
@@ -204,6 +208,7 @@ impl SplitState {
 
         self.handle_routine_is_external(upper);
         self.track_create_plsql(upper);
+        self.track_top_level_with_plsql(upper);
 
         let was_pending_end = self.pending_end == PendingEnd::End;
         let is_end_case = was_pending_end && upper == "CASE";
@@ -470,7 +475,7 @@ impl SplitState {
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
         if self.pending_end == PendingEnd::End {
             self.resolve_plain_end();
-            if self.block_depth() == 0 {
+            if self.block_depth() == 0 && !self.in_with_plsql_declaration {
                 self.reset_create_state();
             }
             self.pending_end = PendingEnd::None;
@@ -480,7 +485,7 @@ impl SplitState {
     pub(crate) fn resolve_pending_end_on_eof(&mut self) {
         if self.pending_end == PendingEnd::End {
             self.resolve_plain_end();
-            if self.block_depth() == 0 {
+            if self.block_depth() == 0 && !self.in_with_plsql_declaration {
                 self.reset_create_state();
             }
             self.pending_end = PendingEnd::None;
@@ -512,6 +517,8 @@ impl SplitState {
         self.pending_while_do = false;
         self.pending_for_do = false;
         self.if_state = IfState::None;
+        self.pending_with_clause = false;
+        self.in_with_plsql_declaration = false;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -573,6 +580,31 @@ impl SplitState {
         if upper == "CREATE" {
             self.create_pending = true;
             self.create_or_seen = false;
+        }
+    }
+
+    fn track_top_level_with_plsql(&mut self, upper: &str) {
+        if self.block_depth() != 0 {
+            return;
+        }
+
+        if upper == "WITH" {
+            self.pending_with_clause = true;
+            return;
+        }
+
+        if !self.pending_with_clause {
+            return;
+        }
+
+        if matches!(upper, "FUNCTION" | "PROCEDURE") {
+            self.in_with_plsql_declaration = true;
+            return;
+        }
+
+        if sql_text::is_with_main_query_keyword(upper) {
+            self.pending_with_clause = false;
+            self.in_with_plsql_declaration = false;
         }
     }
 }
@@ -978,7 +1010,7 @@ impl SqlParserEngine {
                 self.state.pending_for_do = false;
                 self.state.pending_while_do = false;
                 self.state.resolve_pending_end_on_terminator();
-                if self.state.block_depth() == 0 {
+                if self.state.block_depth() == 0 && !self.state.in_with_plsql_declaration {
                     let trimmed = self.current.trim();
                     if !trimmed.is_empty() {
                         self.statements.push(trimmed.to_string());
