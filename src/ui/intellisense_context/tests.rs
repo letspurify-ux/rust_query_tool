@@ -1183,6 +1183,51 @@ fn lateral_keyword_is_not_parsed_as_left_table_alias() {
 }
 
 #[test]
+fn sample_clause_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE (10) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SAMPLE")),
+        "SAMPLE clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("PARTITION")),
+        "PARTITION clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn tablesample_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("TABLESAMPLE")),
+        "TABLESAMPLE clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn cross_apply_subquery_can_see_outer_table_scope() {
     let ctx = analyze("SELECT * FROM oqt_t_emp jt CROSS APPLY (SELECT jt.| FROM dual) it");
     let names = table_names(&ctx);

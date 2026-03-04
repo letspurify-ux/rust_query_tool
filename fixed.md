@@ -1332,3 +1332,32 @@
 - `cargo test -q recovers_to_comment_statement_head` 통과
 - `cargo test -q recovers_to_rename_statement_head` 통과
 - `cargo test -q` 전체 통과
+
+## 2026-03-06 인텔리센스 누락 구문 보완 (FROM 절 후행 샘플링/파티션 절 alias 오인식)
+
+### [중] `SAMPLE`/`TABLESAMPLE`/`PARTITION`/`SUBPARTITION`/`VERSIONS` 절 키워드를 테이블 alias로 오인식하던 문제 수정
+- **증상**:
+  - `SELECT * FROM oqt_t_emp SAMPLE (10) WHERE |`
+  - `SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |`
+  - `SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |`
+  - 위와 같은 FROM 절 후행 절에서 키워드가 관계 alias로 인식될 수 있어, qualifier 해석과 컬럼 추천 우선순위가 오염될 가능성이 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 alias 차단 키워드 집합(`is_relation_alias_breaker`)과
+  - relation 종료 키워드 집합(`is_table_stop_keyword`)에 Oracle/ANSI 후행 relation 절 키워드 일부가 누락되어 있었습니다.
+- **수정**:
+  - 두 키워드 집합에 `SAMPLE`, `TABLESAMPLE`, `PARTITION`, `SUBPARTITION`, `VERSIONS`를 추가해
+  - 해당 토큰들이 relation alias/테이블명으로 해석되지 않도록 일괄 보강했습니다.
+
+### [유사 케이스] 동일 계열 후행 relation 절 키워드 일괄 점검 및 차단
+- 발견된 오탐 패턴(후행 절 키워드 alias 오인식)과 동일한 계열의 키워드를 함께 반영해 재발 가능성을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sample_clause_keyword_is_not_parsed_as_table_alias`
+- `partition_keyword_is_not_parsed_as_table_alias`
+- `tablesample_keyword_is_not_parsed_as_table_alias`
+
+### [검증]
+- `cargo test -q sample_clause_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q partition_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q tablesample_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q` 전체 통과
