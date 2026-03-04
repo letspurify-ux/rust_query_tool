@@ -1847,11 +1847,11 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
 fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumns> {
     let pivot_idx = find_top_level_word_index(tokens, "PIVOT")?;
     let mut idx = next_non_comment_index(tokens, pivot_idx.saturating_add(1));
-    let mut is_xml_pivot = false;
+    let mut pivot_mode = PivotMode::Regular;
 
     if let Some(SqlToken::Word(word)) = tokens.get(idx) {
         if word.eq_ignore_ascii_case("XML") {
-            is_xml_pivot = true;
+            pivot_mode = PivotMode::Xml;
             idx = next_non_comment_index(tokens, idx.saturating_add(1));
         }
     }
@@ -1867,7 +1867,7 @@ fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumn
 
     let aggregate_columns = parse_pivot_aggregate_columns(&clause_tokens[..for_idx]);
     let for_columns = parse_identifier_segment(&clause_tokens[for_idx + 1..in_idx]);
-    let generated_columns = if is_xml_pivot {
+    let generated_columns = if pivot_mode.should_skip_generated_columns() {
         Vec::new()
     } else {
         parse_pivot_generated_columns_from_in_segment(&clause_tokens[in_idx + 1..])
@@ -2470,22 +2470,24 @@ fn parse_simple_identifier_path_output_column(tokens: &[&SqlToken]) -> Option<St
         return None;
     }
 
-    let mut expect_word = true;
+    let mut parser_state = IdentifierPathState::ExpectIdentifier;
     let mut last_identifier = None;
     for token in tokens {
         match token {
-            SqlToken::Word(word) if expect_word && is_identifier_word_token(word) => {
+            SqlToken::Word(word)
+                if parser_state.expects_identifier() && is_identifier_word_token(word) =>
+            {
                 last_identifier = Some(strip_identifier_quotes(word));
-                expect_word = false;
+                parser_state = IdentifierPathState::ExpectDot;
             }
-            SqlToken::Symbol(sym) if !expect_word && sym == "." => {
-                expect_word = true;
+            SqlToken::Symbol(sym) if parser_state.expects_dot() && sym == "." => {
+                parser_state = IdentifierPathState::ExpectIdentifier;
             }
             _ => return None,
         }
     }
 
-    if expect_word {
+    if parser_state.expects_identifier() {
         return None;
     }
     last_identifier
@@ -2686,22 +2688,22 @@ fn normalize_dotted_identifier_tokens(tokens: &[&SqlToken]) -> Option<String> {
     }
 
     let mut parts = Vec::new();
-    let mut expect_word = true;
+    let mut parser_state = IdentifierPathState::ExpectIdentifier;
     for token in tokens {
-        if expect_word {
+        if parser_state.expects_identifier() {
             if let SqlToken::Word(word) = token {
                 let segment = strip_identifier_quotes(word);
                 if segment.is_empty() {
                     return None;
                 }
                 parts.push(segment);
-                expect_word = false;
+                parser_state = IdentifierPathState::ExpectDot;
             } else {
                 return None;
             }
         } else if let SqlToken::Symbol(sym) = token {
             if sym == "." {
-                expect_word = true;
+                parser_state = IdentifierPathState::ExpectIdentifier;
             } else {
                 return None;
             }
@@ -2710,10 +2712,38 @@ fn normalize_dotted_identifier_tokens(tokens: &[&SqlToken]) -> Option<String> {
         }
     }
 
-    if expect_word || parts.is_empty() {
+    if parser_state.expects_identifier() || parts.is_empty() {
         None
     } else {
         Some(parts.join("."))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PivotMode {
+    Regular,
+    Xml,
+}
+
+impl PivotMode {
+    fn should_skip_generated_columns(self) -> bool {
+        matches!(self, Self::Xml)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentifierPathState {
+    ExpectIdentifier,
+    ExpectDot,
+}
+
+impl IdentifierPathState {
+    fn expects_identifier(self) -> bool {
+        matches!(self, Self::ExpectIdentifier)
+    }
+
+    fn expects_dot(self) -> bool {
+        matches!(self, Self::ExpectDot)
     }
 }
 
