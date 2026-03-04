@@ -3270,7 +3270,11 @@ impl ResultTableWidget {
                 }
             }
 
-            hit_row.unwrap_or(last_row)
+            // Keep drag selection stable even when FLTK temporarily fails to
+            // resolve a row during fast reverse-direction drags.
+            // Falling back to the viewport anchor avoids jumping to the very
+            // last row, which incorrectly expands selection toward bottom.
+            hit_row.unwrap_or(start_row)
         };
 
         // Clamp col
@@ -3319,7 +3323,11 @@ impl ResultTableWidget {
                 }
             }
 
-            hit_col.unwrap_or(last_col)
+            // Keep drag selection stable even when hit-testing momentarily
+            // misses during right->left drags on wide tables.
+            // Using the visible anchor column avoids snapping to the last
+            // column, which can invert the intended selection area.
+            hit_col.unwrap_or(start_col)
         };
 
         Some((row, col))
