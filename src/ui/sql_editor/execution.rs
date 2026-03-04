@@ -173,6 +173,49 @@ enum SelectListBreakState {
     ForceOnNextSelect,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectListLayoutState {
+    Inactive,
+    Pending { anchor: usize, indent: usize },
+    Multiline { indent: usize },
+}
+
+impl SelectListLayoutState {
+    fn activate(&mut self, anchor: usize, indent: usize) {
+        *self = Self::Pending { anchor, indent };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Inactive;
+    }
+
+    fn indent(self) -> Option<usize> {
+        match self {
+            Self::Pending { indent, .. } | Self::Multiline { indent } => Some(indent),
+            Self::Inactive => None,
+        }
+    }
+
+    fn is_multiline(self) -> bool {
+        matches!(self, Self::Multiline { .. })
+    }
+
+    fn force_newline_if_possible(self, out: &mut String) -> Self {
+        match self {
+            Self::Pending { anchor, indent } => {
+                if anchor < out.len() && out.as_bytes().get(anchor) == Some(&b' ') {
+                    let indentation = " ".repeat(indent * 4);
+                    out.replace_range(anchor..anchor + 1, &format!("\n{indentation}"));
+                    Self::Multiline { indent }
+                } else {
+                    self
+                }
+            }
+            _ => self,
+        }
+    }
+}
+
 impl SelectListBreakState {
     fn consume_for_select(&mut self) -> bool {
         if matches!(self, Self::ForceOnNextSelect) {
@@ -1151,9 +1194,7 @@ impl SqlEditorWidget {
         let mut open_cursor_state = OpenCursorFormatState::None;
         let mut case_branch_started: Vec<bool> = Vec::new();
         let mut between_pending = false;
-        let mut select_list_anchor: Option<usize> = None;
-        let mut select_list_indent = 0usize;
-        let mut select_list_multiline_forced = false;
+        let mut select_list_layout_state = SelectListLayoutState::Inactive;
         let mut select_list_break_state = select_list_break_state_on_start;
         let mut exit_condition_state = ExitConditionState::None;
         let mut with_cte_state = WithCteFormatState::None;
@@ -1193,24 +1234,8 @@ impl SqlEditorWidget {
         };
 
         let force_select_list_newline =
-            |out: &mut String,
-             select_list_anchor: &Option<usize>,
-             select_list_indent: usize,
-             select_list_multiline_forced: &mut bool| {
-                if *select_list_multiline_forced {
-                    return;
-                }
-                let Some(pos) = *select_list_anchor else {
-                    return;
-                };
-                if pos >= out.len() {
-                    return;
-                }
-                if out.as_bytes().get(pos) == Some(&b' ') {
-                    let indent = " ".repeat(select_list_indent * 4);
-                    out.replace_range(pos..pos + 1, &format!("\n{indent}"));
-                    *select_list_multiline_forced = true;
-                }
+            |out: &mut String, select_list_layout_state: &mut SelectListLayoutState| {
+                *select_list_layout_state = select_list_layout_state.force_newline_if_possible(out);
             };
 
         let mut idx = 0;
@@ -1255,8 +1280,8 @@ impl SqlEditorWidget {
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
                     let is_trigger_event_keyword = trigger_header_state.is_active()
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
-                    let is_trigger_or_on_keyword = trigger_header_state.is_active()
-                        && matches!(upper.as_str(), "OR" | "ON");
+                    let is_trigger_or_on_keyword =
+                        trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
                     if upper == "END" {
@@ -1452,8 +1477,7 @@ impl SqlEditorWidget {
                         if !is_within_group {
                             current_clause = Some(upper.clone());
                             if upper != "SELECT" {
-                                select_list_anchor = None;
-                                select_list_multiline_forced = false;
+                                select_list_layout_state.clear();
                             }
                             if upper == "SELECT" && open_cursor_state.in_select() {
                                 // Keep OPEN ... FOR SELECT inside the cursor SQL context.
@@ -1744,9 +1768,8 @@ impl SqlEditorWidget {
                     }
                     needs_space = true;
                     if upper == "SELECT" {
-                        select_list_anchor = Some(out.len());
-                        select_list_indent = base_indent(indent_level, open_cursor_state) + 1;
-                        select_list_multiline_forced = false;
+                        select_list_layout_state
+                            .activate(out.len(), base_indent(indent_level, open_cursor_state) + 1);
                         if select_list_break_state.consume_for_select() {
                             newline_with(
                                 &mut out,
@@ -1756,7 +1779,9 @@ impl SqlEditorWidget {
                                 &mut needs_space,
                                 &mut line_indent,
                             );
-                            select_list_multiline_forced = true;
+                            select_list_layout_state = SelectListLayoutState::Multiline {
+                                indent: base_indent(indent_level, open_cursor_state) + 1,
+                            };
                             select_list_break_state.clear();
                         }
                     }
@@ -1892,12 +1917,7 @@ impl SqlEditorWidget {
                     let top_level_select_list =
                         in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     if top_level_select_list && !has_leading_newline {
-                        force_select_list_newline(
-                            &mut out,
-                            &select_list_anchor,
-                            select_list_indent,
-                            &mut select_list_multiline_forced,
-                        );
+                        force_select_list_newline(&mut out, &mut select_list_layout_state);
                     }
 
                     if has_leading_newline {
@@ -1916,15 +1936,18 @@ impl SqlEditorWidget {
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
+                        let select_list_indent =
+                            select_list_layout_state.indent().unwrap_or(base + 1);
                         if has_leading_newline {
-                            line_indent = if in_select_list && select_list_multiline_forced {
-                                base + 1
-                            } else {
-                                base
-                            };
+                            line_indent =
+                                if in_select_list && select_list_layout_state.is_multiline() {
+                                    select_list_indent
+                                } else {
+                                    base
+                                };
                         } else if top_level_select_list {
-                            line_indent = if select_list_multiline_forced {
-                                base + 1
+                            line_indent = if select_list_layout_state.is_multiline() {
+                                select_list_indent
                             } else {
                                 base
                             };
@@ -1982,12 +2005,7 @@ impl SqlEditorWidget {
                                 && !open_cursor_state.in_select()
                                 && suppress_comma_break_depth == 0
                             {
-                                force_select_list_newline(
-                                    &mut out,
-                                    &select_list_anchor,
-                                    select_list_indent,
-                                    &mut select_list_multiline_forced,
-                                );
+                                force_select_list_newline(&mut out, &mut select_list_layout_state);
                             }
                             trim_trailing_space(&mut out);
                             out.push(',');
@@ -2023,7 +2041,11 @@ impl SqlEditorWidget {
                                 if matches!(current_clause.as_deref(), Some("SELECT")) {
                                     // The select list is already multiline after the first comma.
                                     // Avoid retroactively forcing a newline right after SELECT.
-                                    select_list_multiline_forced = true;
+                                    let select_list_indent =
+                                        base_indent(indent_level, open_cursor_state) + 1;
+                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
                                 }
                             } else {
                                 out.push(' ');
@@ -2037,8 +2059,7 @@ impl SqlEditorWidget {
                             trim_trailing_space(&mut out);
                             out.push(';');
                             current_clause = None;
-                            select_list_anchor = None;
-                            select_list_multiline_forced = false;
+                            select_list_layout_state.clear();
                             open_cursor_state = OpenCursorFormatState::None;
                             between_pending = false;
                             trigger_header_state.clear();
