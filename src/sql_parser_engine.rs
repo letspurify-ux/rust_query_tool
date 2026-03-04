@@ -66,7 +66,7 @@ pub(crate) enum BlockKind {
 //    pending_while_do/pending_for_do, pending_timing_point_is.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingEnd {
     None,
     /// Saw END, waiting for next token to determine what it closes.
@@ -93,6 +93,35 @@ struct EndSuffixContext {
     repeat_suffix: bool,
     for_suffix: bool,
     timing_point_suffix: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EndTokenRole {
+    None,
+    Suffix(PendingEndSuffix),
+}
+
+impl EndTokenRole {
+    fn from_token(token_upper: &str, pending_end: PendingEnd, in_compound_trigger: bool) -> Self {
+        if pending_end != PendingEnd::End {
+            return Self::None;
+        }
+
+        PendingEndSuffix::parse(token_upper, in_compound_trigger)
+            .map(Self::Suffix)
+            .unwrap_or(Self::None)
+    }
+
+    fn suffix(self) -> Option<PendingEndSuffix> {
+        match self {
+            Self::Suffix(suffix) => Some(suffix),
+            Self::None => None,
+        }
+    }
+
+    fn as_context(self) -> EndSuffixContext {
+        EndSuffixContext::from_pending_end_suffix(self.suffix())
+    }
 }
 
 impl EndSuffixContext {
@@ -345,18 +374,12 @@ impl SplitState {
         self.track_create_plsql(upper);
         self.track_top_level_with_plsql(upper);
 
-        let pending_end_suffix = if self.pending_end == PendingEnd::End {
-            PendingEndSuffix::parse(upper, self.in_compound_trigger)
-        } else {
-            None
-        };
+        let end_token_role =
+            EndTokenRole::from_token(upper, self.pending_end, self.in_compound_trigger);
 
         self.handle_if_state_on_token(upper);
-        self.handle_pending_end_on_token(pending_end_suffix);
-        self.handle_block_openers(
-            upper,
-            EndSuffixContext::from_pending_end_suffix(pending_end_suffix),
-        );
+        self.handle_pending_end_on_token(end_token_role.suffix());
+        self.handle_block_openers(upper, end_token_role.as_context());
 
         // Return the uppercase buffer so its capacity is reused.
         let _ = upper;
@@ -1231,9 +1254,34 @@ impl SqlParserEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockKind, EndSuffixContext, IfState, PendingDo, PendingEnd, PendingEndSuffix,
-        RoutineFrame, SplitState, SqlParserEngine,
+        BlockKind, EndSuffixContext, EndTokenRole, IfState, PendingDo, PendingEnd,
+        PendingEndSuffix, RoutineFrame, SplitState, SqlParserEngine,
     };
+
+
+    #[test]
+    fn end_token_role_requires_pending_end_state() {
+        assert_eq!(
+            EndTokenRole::from_token("CASE", PendingEnd::None, false),
+            EndTokenRole::None
+        );
+    }
+
+    #[test]
+    fn end_token_role_maps_suffix_with_compound_trigger_scope() {
+        assert_eq!(
+            EndTokenRole::from_token("CASE", PendingEnd::End, false).suffix(),
+            Some(PendingEndSuffix::Case)
+        );
+        assert_eq!(
+            EndTokenRole::from_token("AFTER", PendingEnd::End, false).suffix(),
+            None
+        );
+        assert_eq!(
+            EndTokenRole::from_token("AFTER", PendingEnd::End, true).suffix(),
+            Some(PendingEndSuffix::TimingPoint)
+        );
+    }
 
     #[test]
     fn pending_end_suffix_parse_covers_supported_keywords() {
