@@ -6490,3 +6490,51 @@ fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_ma
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_update() {
+    let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nUPDATE target\nSET id = f()\nWHERE id = 1;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION declaration must stay attached to main UPDATE statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("UPDATE target"),
+        "first statement should include main UPDATE: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_main_delete() {
+    let sql = "WITH\n  PROCEDURE p_noop IS\n  BEGIN\n    NULL;\n  END;\nDELETE FROM target\nWHERE id IN (SELECT 1 FROM dual);\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH PROCEDURE declaration must stay attached to main DELETE statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  PROCEDURE p_noop IS"),
+        "first statement should preserve WITH PROCEDURE declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("DELETE FROM target"),
+        "first statement should include main DELETE: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
