@@ -230,7 +230,13 @@ impl PendingDo {
 enum WithClauseState {
     None,
     PendingClause,
-    InPlsqlDeclaration,
+    InPlsqlDeclaration { waiting_main_query: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TopLevelTokenState {
+    NoneSeen,
+    Seen,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,7 +285,8 @@ enum SemicolonAction {
 
 impl SemicolonAction {
     fn from_state(state: &SplitState) -> Self {
-        if state.block_depth() == 0 && state.paren_depth == 0 && !state.in_with_plsql_declaration() {
+        if state.block_depth() == 0 && state.paren_depth == 0 && !state.in_with_plsql_declaration()
+        {
             return Self::SplitTopLevel;
         }
 
@@ -377,6 +384,12 @@ impl Default for WithClauseState {
     }
 }
 
+impl Default for TopLevelTokenState {
+    fn default() -> Self {
+        Self::NoneSeen
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SplitState – the main parser state, now using the types above.
 // ---------------------------------------------------------------------------
@@ -416,8 +429,7 @@ pub(crate) struct SplitState {
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
     with_clause_state: WithClauseState,
-    with_clause_waiting_main_query: bool,
-    top_level_token_seen: bool,
+    top_level_token_state: TopLevelTokenState,
 
     // -- Reusable buffer --
     token_upper_buf: String,
@@ -446,7 +458,19 @@ impl SplitState {
     }
 
     pub(crate) fn in_with_plsql_declaration(&self) -> bool {
-        self.with_clause_state == WithClauseState::InPlsqlDeclaration
+        matches!(
+            self.with_clause_state,
+            WithClauseState::InPlsqlDeclaration { .. }
+        )
+    }
+
+    fn with_clause_waiting_main_query(&self) -> bool {
+        matches!(
+            self.with_clause_state,
+            WithClauseState::InPlsqlDeclaration {
+                waiting_main_query: true
+            }
+        )
     }
 
     pub(crate) fn has_pending_declare_begin(&self) -> bool {
@@ -533,7 +557,8 @@ impl SplitState {
             return;
         }
         let at_top_level = self.block_depth() == 0 && self.paren_depth == 0;
-        let at_statement_start = at_top_level && !self.top_level_token_seen;
+        let at_statement_start =
+            at_top_level && self.top_level_token_state == TopLevelTokenState::NoneSeen;
         let mut upper_buf = std::mem::take(&mut self.token_upper_buf);
         upper_buf.clear();
         upper_buf.push_str(&self.token);
@@ -556,7 +581,7 @@ impl SplitState {
         self.token_upper_buf = upper_buf;
         self.token.clear();
         if at_top_level {
-            self.top_level_token_seen = true;
+            self.top_level_token_state = TopLevelTokenState::Seen;
         }
     }
 
@@ -833,8 +858,7 @@ impl SplitState {
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
-        self.with_clause_waiting_main_query = false;
-        self.top_level_token_seen = false;
+        self.top_level_token_state = TopLevelTokenState::NoneSeen;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -904,7 +928,6 @@ impl SplitState {
 
         if upper == "WITH" && at_statement_start {
             self.with_clause_state = WithClauseState::PendingClause;
-            self.with_clause_waiting_main_query = false;
             return;
         }
 
@@ -913,8 +936,9 @@ impl SplitState {
         }
 
         if matches!(upper, "FUNCTION" | "PROCEDURE") {
-            self.with_clause_state = WithClauseState::InPlsqlDeclaration;
-            self.with_clause_waiting_main_query = true;
+            self.with_clause_state = WithClauseState::InPlsqlDeclaration {
+                waiting_main_query: true,
+            };
             return;
         }
 
@@ -929,15 +953,18 @@ impl SplitState {
 
         if sql_text::is_with_main_query_keyword(upper) {
             self.with_clause_state = WithClauseState::None;
-            self.with_clause_waiting_main_query = false;
             return;
         }
 
-        if self.with_clause_state == WithClauseState::InPlsqlDeclaration
-            && self.block_depth() == 0
+        if matches!(
+            self.with_clause_state,
+            WithClauseState::InPlsqlDeclaration { .. }
+        ) && self.block_depth() == 0
             && !matches!(upper, "FUNCTION" | "PROCEDURE")
         {
-            self.with_clause_waiting_main_query = true;
+            self.with_clause_state = WithClauseState::InPlsqlDeclaration {
+                waiting_main_query: true,
+            };
         }
     }
 }
@@ -1349,8 +1376,8 @@ impl SqlParserEngine {
             }
 
             if sql_text::is_identifier_char(c) {
-                if self.state.with_clause_state == WithClauseState::InPlsqlDeclaration
-                    && self.state.with_clause_waiting_main_query
+                if self.state.in_with_plsql_declaration()
+                    && self.state.with_clause_waiting_main_query()
                     && self.state.block_depth() == 0
                     && self.state.paren_depth == 0
                 {
@@ -1432,7 +1459,9 @@ impl SqlParserEngine {
                     && self.state.block_depth() == 0
                     && self.state.paren_depth == 0
                 {
-                    self.state.with_clause_waiting_main_query = true;
+                    self.state.with_clause_state = WithClauseState::InPlsqlDeclaration {
+                        waiting_main_query: true,
+                    };
                 }
                 let semicolon_action = SemicolonAction::from_state(&self.state);
                 self.apply_semicolon_action(semicolon_action, c);
@@ -1512,7 +1541,9 @@ mod tests {
     #[test]
     fn semicolon_action_keeps_with_clause_declaration_statement_open() {
         let mut state = SplitState::default();
-        state.with_clause_state = WithClauseState::InPlsqlDeclaration;
+        state.with_clause_state = WithClauseState::InPlsqlDeclaration {
+            waiting_main_query: true,
+        };
         assert_eq!(
             SemicolonAction::from_state(&state),
             SemicolonAction::AppendToCurrent
@@ -1814,7 +1845,9 @@ mod tests {
         let mut state = SplitState {
             pending_end: PendingEnd::End,
             create_plsql_kind: CreatePlsqlKind::Procedure,
-            with_clause_state: WithClauseState::InPlsqlDeclaration,
+            with_clause_state: WithClauseState::InPlsqlDeclaration {
+                waiting_main_query: true,
+            },
             block_stack: vec![BlockKind::Begin],
             ..SplitState::default()
         };
@@ -1833,7 +1866,10 @@ mod tests {
 
         engine.process_line("SELECT col WITH FROM t;");
 
-        assert_eq!(engine.take_statements(), vec!["SELECT col WITH FROM t".to_string()]);
+        assert_eq!(
+            engine.take_statements(),
+            vec!["SELECT col WITH FROM t".to_string()]
+        );
         assert!(!engine.state.in_with_plsql_declaration());
     }
 
