@@ -158,8 +158,12 @@ impl Default for IfState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingDo {
     None,
-    While,
-    For,
+    While {
+        armed_at_block_depth: usize,
+    },
+    For {
+        armed_at_block_depth: usize,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -195,17 +199,33 @@ impl Default for PendingDo {
 }
 
 impl PendingDo {
-    fn arm_for_while(self) -> Self {
+    fn arm_for_while(self, armed_at_block_depth: usize) -> Self {
         match self {
-            Self::None => Self::While,
+            Self::None => Self::While {
+                armed_at_block_depth,
+            },
             active => active,
         }
     }
 
-    fn arm_for_for(self) -> Self {
+    fn arm_for_for(self, armed_at_block_depth: usize) -> Self {
         match self {
-            Self::None => Self::For,
+            Self::None => Self::For {
+                armed_at_block_depth,
+            },
             active => active,
+        }
+    }
+
+    fn resolve_do(self, current_block_depth: usize) -> Option<BlockKind> {
+        match self {
+            Self::While {
+                armed_at_block_depth,
+            } if armed_at_block_depth == current_block_depth => Some(BlockKind::While),
+            Self::For {
+                armed_at_block_depth,
+            } if armed_at_block_depth == current_block_depth => Some(BlockKind::For),
+            _ => None,
         }
     }
 }
@@ -634,12 +654,11 @@ impl SplitState {
             && self.pending_end == PendingEnd::None
             && !end_token_role.is_suffix(PendingEndSuffix::While)
         {
-            self.pending_do = std::mem::take(&mut self.pending_do).arm_for_while();
-        } else if self.pending_do == PendingDo::While && upper == "DO" {
-            self.block_stack.push(BlockKind::While);
-            self.pending_do = PendingDo::None;
+            self.pending_do =
+                std::mem::take(&mut self.pending_do).arm_for_while(self.block_depth());
         }
 
+        // FOR ... DO
         if upper == "FOR"
             && self.pending_end == PendingEnd::None
             && !end_token_role.is_suffix(PendingEndSuffix::For)
@@ -647,10 +666,17 @@ impl SplitState {
             let is_trigger_header_for =
                 self.in_create_plsql() && self.is_trigger() && self.block_depth() == 0;
             if !is_trigger_header_for {
-                self.pending_do = std::mem::take(&mut self.pending_do).arm_for_for();
+                self.pending_do =
+                    std::mem::take(&mut self.pending_do).arm_for_for(self.block_depth());
             }
-        } else if self.pending_do == PendingDo::For && upper == "DO" {
-            self.block_stack.push(BlockKind::For);
+        }
+
+        if upper == "DO" {
+            if let Some(block_kind) =
+                std::mem::take(&mut self.pending_do).resolve_do(self.block_depth())
+            {
+                self.block_stack.push(block_kind);
+            }
             self.pending_do = PendingDo::None;
         }
 
@@ -1537,7 +1563,9 @@ mod tests {
         let mut engine = SqlParserEngine::new();
         engine.current.push_str("SELECT 1");
         engine.state.pending_end = PendingEnd::End;
-        engine.state.pending_do = PendingDo::For;
+        engine.state.pending_do = PendingDo::For {
+            armed_at_block_depth: 0,
+        };
         engine.state.if_state = IfState::AwaitingThen;
         engine.state.paren_depth = 2;
 
@@ -1554,12 +1582,19 @@ mod tests {
     #[test]
     fn pending_do_does_not_get_overwritten_by_new_candidates() {
         let mut state = SplitState {
-            pending_do: PendingDo::While,
+            pending_do: PendingDo::While {
+                armed_at_block_depth: 0,
+            },
             ..SplitState::default()
         };
 
         state.handle_block_openers("FOR", EndTokenRole::None);
-        assert_eq!(state.pending_do, PendingDo::While);
+        assert_eq!(
+            state.pending_do,
+            PendingDo::While {
+                armed_at_block_depth: 0
+            }
+        );
 
         state.handle_block_openers("DO", EndTokenRole::None);
         assert_eq!(state.block_depth(), 1);
@@ -1572,10 +1607,28 @@ mod tests {
         let mut state = SplitState::default();
 
         state.handle_block_openers("FOR", EndTokenRole::None);
-        assert_eq!(state.pending_do, PendingDo::For);
+        assert_eq!(
+            state.pending_do,
+            PendingDo::For {
+                armed_at_block_depth: 0
+            }
+        );
 
         state.handle_block_openers("DO", EndTokenRole::None);
         assert_eq!(state.block_stack.last(), Some(&BlockKind::For));
+        assert_eq!(state.pending_do, PendingDo::None);
+    }
+
+    #[test]
+    fn pending_do_requires_matching_block_depth_for_do_resolution() {
+        let mut state = SplitState::default();
+
+        state.handle_block_openers("FOR", EndTokenRole::None);
+        state.block_stack.push(BlockKind::Begin);
+        state.handle_block_openers("DO", EndTokenRole::None);
+
+        assert_eq!(state.block_depth(), 1);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::Begin));
         assert_eq!(state.pending_do, PendingDo::None);
     }
 
@@ -1589,7 +1642,9 @@ mod tests {
             semicolon_policy: SemicolonPolicy::ForceSplit,
         });
         engine.state.pending_end = PendingEnd::End;
-        engine.state.pending_do = PendingDo::While;
+        engine.state.pending_do = PendingDo::While {
+            armed_at_block_depth: 1,
+        };
         engine.state.if_state = IfState::AfterConditionParen;
         engine.state.paren_depth = 1;
 
