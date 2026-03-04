@@ -36,6 +36,37 @@ fn generate_styles_windowed_for_test(
     styles.into_iter().collect()
 }
 
+
+#[test]
+fn test_number_highlighting_supports_single_decimal_point() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 12.34 FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let start = text.find("12.34").unwrap_or(0);
+    let end = start + "12.34".len();
+    assert!(styles[start..end].chars().all(|c| c == STYLE_NUMBER));
+}
+
+#[test]
+fn test_number_highlighting_stops_before_second_decimal_point() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 12.34.56 FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let first_number_start = text.find("12.34").unwrap_or(0);
+    let first_number_end = first_number_start + "12.34".len();
+    assert!(styles[first_number_start..first_number_end]
+        .chars()
+        .all(|c| c == STYLE_NUMBER));
+
+    let second_dot_pos = first_number_end;
+    let second_number_end = second_dot_pos + ".56".len();
+    assert!(styles[second_dot_pos..second_number_end]
+        .chars()
+        .all(|c| c == STYLE_NUMBER));
+}
+
 #[test]
 fn test_keyword_highlighting() {
     let highlighter = SqlHighlighter::new();
