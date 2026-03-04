@@ -32,6 +32,42 @@ impl DollarQuoteState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTailTokenKind {
+    Word,
+    Comment,
+    String,
+}
+
+impl PendingTailTokenKind {
+    fn from_states(
+        lex_mode: crate::sql_parser_engine::LexMode,
+        dollar_quote_state: &DollarQuoteState,
+    ) -> Self {
+        use crate::sql_parser_engine::LexMode;
+
+        if matches!(dollar_quote_state, DollarQuoteState::Active { .. }) {
+            return Self::String;
+        }
+
+        match lex_mode {
+            LexMode::LineComment | LexMode::BlockComment => Self::Comment,
+            LexMode::SingleQuote | LexMode::QQuote { .. } | LexMode::DollarQuote { .. } => {
+                Self::String
+            }
+            LexMode::DoubleQuote | LexMode::BacktickQuote | LexMode::Idle => Self::Word,
+        }
+    }
+
+    fn into_sql_token(self, text: String) -> SqlToken {
+        match self {
+            Self::Word => SqlToken::Word(text),
+            Self::Comment => SqlToken::Comment(text),
+            Self::String => SqlToken::String(text),
+        }
+    }
+}
+
 /// SQL 문자열을 토큰 단위로 분해합니다.
 ///
 /// 기존 에디터 토크나이저 동작(문자열, 주석, 라벨, 심벌 처리)을 유지합니다.
@@ -410,44 +446,16 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         });
     }
 
-    {
-        use crate::sql_parser_engine::LexMode;
-        let is_comment = matches!(
-            scan_state.lex_mode,
-            LexMode::LineComment | LexMode::BlockComment
-        );
-        let is_string = matches!(
-            scan_state.lex_mode,
-            LexMode::SingleQuote | LexMode::QQuote { .. }
-        ) || matches!(dollar_quote_state, DollarQuoteState::Active { .. });
-        let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
-        if is_comment {
-            if !current.is_empty() {
-                tokens.push(SqlTokenSpan {
-                    token: SqlToken::Comment(std::mem::take(&mut current)),
-                    start: current_start,
-                    end: sql.len(),
-                });
-            }
-        } else if is_string {
-            if !current.is_empty() {
-                tokens.push(SqlTokenSpan {
-                    token: SqlToken::String(std::mem::take(&mut current)),
-                    start: current_start,
-                    end: sql.len(),
-                });
-            }
-        } else if is_dq {
-            if !current.is_empty() {
-                tokens.push(SqlTokenSpan {
-                    token: SqlToken::Word(std::mem::take(&mut current)),
-                    start: current_start,
-                    end: sql.len(),
-                });
-            }
-        } else {
-            flush_word(&mut current, &mut current_start, sql.len(), &mut tokens);
-        }
+    if !current.is_empty() {
+        let token_kind =
+            PendingTailTokenKind::from_states(scan_state.lex_mode, &dollar_quote_state);
+        tokens.push(SqlTokenSpan {
+            token: token_kind.into_sql_token(std::mem::take(&mut current)),
+            start: current_start,
+            end: sql.len(),
+        });
+    } else {
+        flush_word(&mut current, &mut current_start, sql.len(), &mut tokens);
     }
 
     tokens
@@ -610,7 +618,7 @@ mod tests {
     use super::{
         can_execute_while_disconnected, clamp_cursor_to_char_boundary,
         has_connection_bootstrap_command, statement_at_cursor, statement_bounds_in_text,
-        tokenize_sql,
+        tokenize_sql, DollarQuoteState, PendingTailTokenKind,
     };
     use crate::db::SplitState;
     use crate::sql_text;
@@ -934,32 +942,12 @@ mod tests {
             i += 1;
         }
 
-        {
-            use crate::sql_parser_engine::LexMode;
-            let is_comment = matches!(
-                scan_state.lex_mode,
-                LexMode::LineComment | LexMode::BlockComment
-            );
-            let is_string = matches!(
-                scan_state.lex_mode,
-                LexMode::SingleQuote | LexMode::QQuote { .. }
-            );
-            let is_dq = matches!(scan_state.lex_mode, LexMode::DoubleQuote);
-            if is_comment {
-                if !current.is_empty() {
-                    tokens.push(SqlToken::Comment(std::mem::take(&mut current)));
-                }
-            } else if is_string {
-                if !current.is_empty() {
-                    tokens.push(SqlToken::String(std::mem::take(&mut current)));
-                }
-            } else if is_dq {
-                if !current.is_empty() {
-                    tokens.push(SqlToken::Word(std::mem::take(&mut current)));
-                }
-            } else {
-                flush_word(&mut current, &mut tokens);
-            }
+        if !current.is_empty() {
+            let token_kind =
+                PendingTailTokenKind::from_states(scan_state.lex_mode, &DollarQuoteState::Inactive);
+            tokens.push(token_kind.into_sql_token(std::mem::take(&mut current)));
+        } else {
+            flush_word(&mut current, &mut tokens);
         }
 
         tokens
