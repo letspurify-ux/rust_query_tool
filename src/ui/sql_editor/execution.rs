@@ -161,6 +161,63 @@ enum OpenCursorFormatState {
     InSelect { anchor_indent: usize },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectListBreakState {
+    None,
+    ForceOnNextSelect,
+}
+
+impl SelectListBreakState {
+    fn consume_for_select(&mut self) -> bool {
+        if matches!(self, Self::ForceOnNextSelect) {
+            *self = Self::None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn track_statement_tail(&mut self, has_unbalanced_paren: bool) {
+        *self = if has_unbalanced_paren {
+            Self::ForceOnNextSelect
+        } else {
+            Self::None
+        };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitConditionState {
+    None,
+    AwaitingWhen,
+}
+
+impl ExitConditionState {
+    fn on_keyword(&mut self, keyword: &str) {
+        match (keyword, *self) {
+            ("EXIT" | "CONTINUE", _) => {
+                *self = Self::AwaitingWhen;
+            }
+            ("WHEN", Self::AwaitingWhen) => {
+                *self = Self::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn is_exit_when(self, keyword: &str) -> bool {
+        keyword == "WHEN" && matches!(self, Self::AwaitingWhen)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::None;
+    }
+}
+
 impl OpenCursorFormatState {
     fn base_indent(self, indent_level: usize) -> usize {
         match self {
@@ -575,7 +632,7 @@ impl SqlEditorWidget {
             return String::new();
         }
 
-        let mut force_select_list_newline_next = false;
+        let mut select_list_break_state = SelectListBreakState::None;
         let mut idx = 0usize;
         while idx < items.len() {
             let item = &items[idx];
@@ -587,23 +644,24 @@ impl SqlEditorWidget {
                     let formatted_statement = Self::format_statement(
                         statement,
                         &statement_tokens,
-                        force_select_list_newline_next,
+                        select_list_break_state,
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     formatted.push_str(&formatted_statement);
                     if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
                         formatted.push(';');
                     }
-                    force_select_list_newline_next =
-                        Self::statement_has_unbalanced_paren(&statement_tokens);
+                    select_list_break_state.track_statement_tail(
+                        Self::statement_has_unbalanced_paren(&statement_tokens),
+                    );
                 }
                 FormatItem::ToolCommand(command) => {
                     formatted.push_str(&Self::format_tool_command(command));
-                    force_select_list_newline_next = false;
+                    select_list_break_state.clear();
                 }
                 FormatItem::Slash => {
                     formatted.push('/');
-                    force_select_list_newline_next = false;
+                    select_list_break_state.clear();
                 }
             }
 
@@ -966,7 +1024,7 @@ impl SqlEditorWidget {
     fn format_statement(
         statement: &str,
         tokens: &[SqlToken],
-        force_select_list_newline_on_start: bool,
+        select_list_break_state_on_start: SelectListBreakState,
     ) -> String {
         if let Some(formatted) = Self::format_create_table(statement) {
             return formatted;
@@ -1038,8 +1096,8 @@ impl SqlEditorWidget {
         let mut select_list_anchor: Option<usize> = None;
         let mut select_list_indent = 0usize;
         let mut select_list_multiline_forced = false;
-        let mut force_select_list_newline_next = force_select_list_newline_on_start;
-        let mut pending_exit_condition = false;
+        let mut select_list_break_state = select_list_break_state_on_start;
+        let mut exit_condition_state = ExitConditionState::None;
         let mut with_cte_active = false;
         let mut with_cte_paren_depth = 0usize;
         let mut statement_has_with_clause = false;
@@ -1137,7 +1195,7 @@ impl SqlEditorWidget {
                         upper == "GROUP" && matches!(prev_word_upper.as_deref(), Some("WITHIN"));
                     let mut newline_after_keyword = false;
                     let is_between_and = upper == "AND" && between_pending;
-                    let is_exit_when = upper == "WHEN" && pending_exit_condition;
+                    let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
                     let is_trigger_event_keyword = trigger_header_active
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
                     let is_trigger_or_on_keyword =
@@ -1636,7 +1694,7 @@ impl SqlEditorWidget {
                         select_list_anchor = Some(out.len());
                         select_list_indent = base_indent(indent_level, open_cursor_state) + 1;
                         select_list_multiline_forced = false;
-                        if force_select_list_newline_next {
+                        if select_list_break_state.consume_for_select() {
                             newline_with(
                                 &mut out,
                                 base_indent(indent_level, open_cursor_state),
@@ -1646,7 +1704,7 @@ impl SqlEditorWidget {
                                 &mut line_indent,
                             );
                             select_list_multiline_forced = true;
-                            force_select_list_newline_next = false;
+                            select_list_break_state.clear();
                         }
                     }
 
@@ -1746,11 +1804,7 @@ impl SqlEditorWidget {
                     } else if upper == "AND" && between_pending {
                         between_pending = false;
                     }
-                    if matches!(upper.as_str(), "EXIT" | "CONTINUE") {
-                        pending_exit_condition = true;
-                    } else if upper == "WHEN" && pending_exit_condition {
-                        pending_exit_condition = false;
-                    }
+                    exit_condition_state.on_keyword(upper.as_str());
 
                     prev_word_upper = Some(upper);
                 }
@@ -1935,7 +1989,7 @@ impl SqlEditorWidget {
                             select_list_multiline_forced = false;
                             open_cursor_state = OpenCursorFormatState::None;
                             between_pending = false;
-                            pending_exit_condition = false;
+                            exit_condition_state.clear();
                             if pending_package_member_separator
                                 && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
                             {
@@ -1954,7 +2008,7 @@ impl SqlEditorWidget {
                                 column_list_stack.clear();
                                 paren_indent_increase_stack.clear();
                                 if had_unbalanced_paren {
-                                    force_select_list_newline_next = true;
+                                    select_list_break_state.track_statement_tail(true);
                                 }
                             }
                             newline_with(
@@ -2986,13 +3040,8 @@ impl SqlEditorWidget {
         normalized_target_path: &Path,
         base_dir: &Path,
     ) -> Result<ResolvedScriptInclude, String> {
-        let contents = fs::read_to_string(target_path).map_err(|err| {
-            format!(
-                "Failed to read script {}: {}",
-                target_path.display(),
-                err
-            )
-        })?;
+        let contents = fs::read_to_string(target_path)
+            .map_err(|err| format!("Failed to read script {}: {}", target_path.display(), err))?;
 
         let script_dir = normalized_target_path
             .parent()
