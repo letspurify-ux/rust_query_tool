@@ -7264,6 +7264,66 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_disassociate_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+DISASSOCIATE STATISTICS FROM TABLES t_parser_recover;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH FUNCTION declaration mode when DISASSOCIATE starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("DISASSOCIATE STATISTICS FROM TABLES t_parser_recover"),
+        "second statement should start at DISASSOCIATE statement after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_associate_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+ASSOCIATE STATISTICS WITH TABLES t_parser_recover DEFAULT COST (10, 20, 30);
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover WITH FUNCTION declaration mode when ASSOCIATE starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("ASSOCIATE STATISTICS WITH TABLES t_parser_recover DEFAULT COST (10, 20, 30)"),
+        "second statement should start at ASSOCIATE statement after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_purge_statement_head() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
@@ -7414,6 +7474,78 @@ SELECT 2 FROM dual;";
     assert!(
         stmts[1].starts_with("LOCK TABLE t_parser_recover IN EXCLUSIVE MODE"),
         "second formatted statement should start at LOCK TABLE after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_recovers_to_disassociate_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+DISASSOCIATE STATISTICS FROM TABLES t_parser_recover;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "split_format_items should recover WITH FUNCTION declaration mode at DISASSOCIATE statement head: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first formatted statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("DISASSOCIATE STATISTICS FROM TABLES t_parser_recover"),
+        "second formatted statement should start at DISASSOCIATE after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_recovers_to_associate_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+ASSOCIATE STATISTICS WITH TABLES t_parser_recover DEFAULT COST (10, 20, 30);
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "split_format_items should recover WITH FUNCTION declaration mode at ASSOCIATE statement head: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first formatted statement should preserve WITH FUNCTION declaration block: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("ASSOCIATE STATISTICS WITH TABLES t_parser_recover DEFAULT COST (10, 20, 30)"),
+        "second formatted statement should start at ASSOCIATE after recovery: {}",
         stmts[1]
     );
     assert!(stmts[2].starts_with("SELECT 2 FROM dual"));

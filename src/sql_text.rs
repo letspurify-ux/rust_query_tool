@@ -155,6 +155,8 @@ pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
         || word.eq_ignore_ascii_case("ROLLBACK")
         || word.eq_ignore_ascii_case("AUDIT")
         || word.eq_ignore_ascii_case("NOAUDIT")
+        || word.eq_ignore_ascii_case("ASSOCIATE")
+        || word.eq_ignore_ascii_case("DISASSOCIATE")
         || word.eq_ignore_ascii_case("GRANT")
         || word.eq_ignore_ascii_case("REVOKE")
 }
