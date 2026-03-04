@@ -1302,7 +1302,19 @@ pub struct IntellisensePopup {
     suggestions: Arc<Mutex<Vec<String>>>,
     all_suggestions: Arc<Mutex<Vec<String>>>,
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
-    visible: Arc<Mutex<bool>>,
+    state: Arc<Mutex<PopupState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupState {
+    Hidden,
+    Visible,
+}
+
+impl PopupState {
+    fn is_visible(self) -> bool {
+        matches!(self, Self::Visible)
+    }
 }
 
 impl IntellisensePopup {
@@ -1380,7 +1392,7 @@ impl IntellisensePopup {
         let all_suggestions = Arc::new(Mutex::new(Vec::new()));
         let selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> =
             Arc::new(Mutex::new(None));
-        let visible = Arc::new(Mutex::new(false));
+        let state = Arc::new(Mutex::new(PopupState::Hidden));
 
         window.hide();
 
@@ -1390,7 +1402,7 @@ impl IntellisensePopup {
             suggestions,
             all_suggestions,
             selected_callback,
-            visible,
+            state,
         };
 
         popup.setup_callbacks();
@@ -1402,7 +1414,7 @@ impl IntellisensePopup {
         let suggestions = self.suggestions.clone();
         let callback = self.selected_callback.clone();
         let mut window = self.window.clone();
-        let visible = self.visible.clone();
+        let state = self.state.clone();
 
         self.browser.set_callback(move |b| {
             let selected = b.value();
@@ -1420,9 +1432,8 @@ impl IntellisensePopup {
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();
-                    *visible
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+                    *state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        PopupState::Hidden;
                 }
             }
         });
@@ -1449,9 +1460,9 @@ impl IntellisensePopup {
             self.window.show();
         }
         *self
-            .visible
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Visible;
     }
 
     fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
@@ -1519,9 +1530,9 @@ impl IntellisensePopup {
         self.window.hide();
         self.window.resize(0, 0, 0, 0);
         *self
-            .visible
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
     }
 
     pub fn clear_for_close(&mut self) {
@@ -1550,10 +1561,10 @@ impl IntellisensePopup {
     }
 
     pub fn is_visible(&self) -> bool {
-        *self
-            .visible
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible()
     }
 
     pub fn popup_dimensions(&self) -> (i32, i32) {
