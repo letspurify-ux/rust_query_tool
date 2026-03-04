@@ -165,6 +165,21 @@ pub(crate) struct SplitState {
 }
 
 impl SplitState {
+    fn resolve_pending_end_with_policy(&mut self, reset_create_state_when_top_level: bool) {
+        if self.pending_end != PendingEnd::End {
+            return;
+        }
+
+        self.resolve_plain_end();
+        if reset_create_state_when_top_level
+            && self.block_depth() == 0
+            && !self.in_with_plsql_declaration
+        {
+            self.reset_create_state();
+        }
+        self.pending_end = PendingEnd::None;
+    }
+
     // -- Convenience accessors --------------------------------------------------
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -486,30 +501,15 @@ impl SplitState {
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
-        if self.pending_end == PendingEnd::End {
-            self.resolve_plain_end();
-            self.pending_end = PendingEnd::None;
-        }
+        self.resolve_pending_end_with_policy(false);
     }
 
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
-        if self.pending_end == PendingEnd::End {
-            self.resolve_plain_end();
-            if self.block_depth() == 0 && !self.in_with_plsql_declaration {
-                self.reset_create_state();
-            }
-            self.pending_end = PendingEnd::None;
-        }
+        self.resolve_pending_end_with_policy(true);
     }
 
     pub(crate) fn resolve_pending_end_on_eof(&mut self) {
-        if self.pending_end == PendingEnd::End {
-            self.resolve_plain_end();
-            if self.block_depth() == 0 && !self.in_with_plsql_declaration {
-                self.reset_create_state();
-            }
-            self.pending_end = PendingEnd::None;
-        }
+        self.resolve_pending_end_with_policy(true);
     }
 
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
@@ -1114,5 +1114,60 @@ impl SqlParserEngine {
     pub(crate) fn process_line_and_take_statements(&mut self, line: &str) -> Vec<String> {
         self.process_line(line);
         self.take_statements()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockKind, PendingEnd, SplitState};
+
+    #[test]
+    fn separator_resolution_keeps_create_state() {
+        let mut state = SplitState {
+            pending_end: PendingEnd::End,
+            in_create_plsql: true,
+            block_stack: vec![BlockKind::Begin],
+            ..SplitState::default()
+        };
+
+        state.resolve_pending_end_on_separator();
+
+        assert_eq!(state.pending_end, PendingEnd::None);
+        assert_eq!(state.block_depth(), 0);
+        assert!(state.in_create_plsql);
+    }
+
+    #[test]
+    fn terminator_resolution_resets_create_state_at_top_level() {
+        let mut state = SplitState {
+            pending_end: PendingEnd::End,
+            in_create_plsql: true,
+            block_stack: vec![BlockKind::Begin],
+            ..SplitState::default()
+        };
+
+        state.resolve_pending_end_on_terminator();
+
+        assert_eq!(state.pending_end, PendingEnd::None);
+        assert_eq!(state.block_depth(), 0);
+        assert!(!state.in_create_plsql);
+    }
+
+    #[test]
+    fn eof_resolution_preserves_with_plsql_declaration_mode() {
+        let mut state = SplitState {
+            pending_end: PendingEnd::End,
+            in_create_plsql: true,
+            in_with_plsql_declaration: true,
+            block_stack: vec![BlockKind::Begin],
+            ..SplitState::default()
+        };
+
+        state.resolve_pending_end_on_eof();
+
+        assert_eq!(state.pending_end, PendingEnd::None);
+        assert_eq!(state.block_depth(), 0);
+        assert!(state.in_create_plsql);
+        assert!(state.in_with_plsql_declaration);
     }
 }
