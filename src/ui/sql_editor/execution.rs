@@ -118,6 +118,36 @@ impl Drop for QueryExecutionCleanupGuard {
     }
 }
 
+struct QueryRunningReservation {
+    query_running: Arc<Mutex<bool>>,
+    armed: bool,
+}
+
+impl QueryRunningReservation {
+    fn acquire(query_running: Arc<Mutex<bool>>) -> Option<Self> {
+        if try_mark_query_running(&query_running) {
+            Some(Self {
+                query_running,
+                armed: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueryRunningReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            store_mutex_bool(&self.query_running, false);
+        }
+    }
+}
+
 impl SqlEditorWidget {
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
@@ -3014,13 +3044,17 @@ impl SqlEditorWidget {
             return;
         }
 
-        if !try_mark_query_running(&self.query_running) {
-            let _ = self
-                .ui_action_sender
-                .send(UiActionResult::QueryAlreadyRunning);
-            app::awake();
-            return;
-        }
+        let mut query_run_reservation =
+            match QueryRunningReservation::acquire(self.query_running.clone()) {
+                Some(reservation) => reservation,
+                None => {
+                    let _ = self
+                        .ui_action_sender
+                        .send(UiActionResult::QueryAlreadyRunning);
+                    app::awake();
+                    return;
+                }
+            };
 
         // Check if script includes connection bootstrap commands.
         let has_connect_command = super::query_text::has_connection_bootstrap_command(sql);
@@ -3049,6 +3083,9 @@ impl SqlEditorWidget {
                 return;
             }
         } // Release lock early for the pre-check
+
+        // Worker thread cleanup now owns execution state reset.
+        query_run_reservation.disarm();
 
         let shared_connection = self.connection.clone();
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
@@ -9124,5 +9161,48 @@ mod disconnected_precheck_gate_tests {
         assert!(!SqlEditorWidget::requires_connected_session_for_precheck(
             false, true
         ));
+    }
+}
+
+#[cfg(test)]
+mod query_running_reservation_tests {
+    use super::QueryRunningReservation;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reservation_drop_releases_query_running_flag() {
+        let query_running = Arc::new(Mutex::new(false));
+
+        {
+            let _reservation = QueryRunningReservation::acquire(query_running.clone());
+            assert!(_reservation.is_some(), "query flag should be reservable");
+            let running = query_running
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(*running);
+        }
+
+        let running = query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!*running);
+    }
+
+    #[test]
+    fn reservation_disarm_keeps_query_running_flag_set() {
+        let query_running = Arc::new(Mutex::new(false));
+
+        {
+            let mut reservation = QueryRunningReservation::acquire(query_running.clone());
+            assert!(reservation.is_some(), "query flag should be reservable");
+            if let Some(active) = reservation.as_mut() {
+                active.disarm();
+            }
+        }
+
+        let running = query_running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(*running);
     }
 }
