@@ -1369,6 +1369,60 @@ fn flashback_as_of_before_alias_is_not_parsed_as_alias() {
     );
 }
 
+#[test]
+fn flashback_versions_between_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees VERSIONS BETWEEN SCN 1 AND 10 e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("VERSIONS")),
+        "VERSIONS clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following VERSIONS clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn tablesample_repeatable_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM sales TABLESAMPLE BERNOULLI (10) REPEATABLE (7) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("TABLESAMPLE")),
+        "TABLESAMPLE clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following TABLESAMPLE REPEATABLE clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
