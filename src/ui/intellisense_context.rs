@@ -1023,7 +1023,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     last_word = None;
                                 }
-                                if !matches!(tokens.get(after_alias), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                                if !matches!(tokens.get(after_alias), Some(SqlToken::Symbol(sym)) if sym == "(")
+                                {
                                     relation_modifier_state.clear();
                                 }
                                 relation_state.clear();
@@ -2981,28 +2982,7 @@ fn resolve_table_function_column_name(item_tokens: &[&SqlToken]) -> Option<Strin
 }
 
 fn is_table_function_item_leading_keyword(word: &str) -> bool {
-    matches!(
-        word,
-        "NESTED"
-            | "PATH"
-            | "COLUMNS"
-            | "EXISTS"
-            | "FOR"
-            | "ORDINALITY"
-            | "ERROR"
-            | "NULL"
-            | "DEFAULT"
-            | "ON"
-            | "FORMAT"
-            | "WRAPPER"
-            | "WITHOUT"
-            | "WITH"
-            | "CONDITIONAL"
-            | "UNCONDITIONAL"
-            | "KEEP"
-            | "OMIT"
-            | "QUOTES"
-    )
+    sql_text::is_table_function_item_leading_keyword(word)
 }
 
 fn extract_select_list_tokens(tokens: &[SqlToken]) -> &[SqlToken] {

@@ -134,6 +134,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "EACH",
     "EDITION",
     "EDITIONABLE",
+    "EDITIONING",
     "ELSE",
     "ELSEIF",
     "ELSIF",
@@ -321,6 +322,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OF",
     "OFF",
     "OFFSET",
+    "OMIT",
     "ON",
     "ONE",
     "ONLY",
@@ -328,6 +330,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OPTIMIZER_MODE",
     "OR",
     "ORDER",
+    "ORDINALITY",
     "ORGANIZATION",
     "OSERROR",
     "OTHERS",
@@ -335,6 +338,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OUTER",
     "OVER",
     "OVERFLOW",
+    "OVERLAY",
     "PACKAGE",
     "PACKAGE_BODY",
     "PARALLEL",
@@ -366,6 +370,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PLSQL_WARNINGS",
     "PLS_INTEGER",
     "POINT",
+    "POSITION",
     "PRAGMA",
     "PRECEDES",
     "PRECEDING",
@@ -462,6 +467,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "STORE",
     "SUBMULTISET",
     "SUBPARTITION",
+    "SUBSET",
+    "SUBSTRING",
     "SUBTYPE",
     "SUM",
     "SYNONYM",
@@ -533,11 +540,27 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "WRAPPER",
     "WRITE",
     "XML",
+    "XMLATTRIBUTES",
+    "XMLCAST",
+    "XMLCDATA",
+    "XMLCOLATTVAL",
+    "XMLCOMMENT",
+    "XMLCONCAT",
+    "XMLELEMENT",
+    "XMLEXISTS",
+    "XMLFOREST",
+    "XMLPARSE",
+    "XMLPI",
+    "XMLQUERY",
+    "XMLROOT",
+    "XMLSEQUENCE",
+    "XMLSERIALIZE",
+    "XMLTABLE",
+    "XMLTRANSFORM",
     "XMLTYPE",
     "YEAR",
     "ZONE",
     "_ORACLE_SCRIPT",
-
 ];
 
 /// Formatter clause boundaries that should start on a new line.
@@ -654,6 +677,28 @@ pub(crate) const FORMAT_COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
     "COLLATE",
     "GENERATED",
     "IDENTITY",
+];
+
+const TABLE_FUNCTION_ITEM_LEADING_KEYWORDS: &[&str] = &[
+    "NESTED",
+    "PATH",
+    "COLUMNS",
+    "EXISTS",
+    "FOR",
+    "ORDINALITY",
+    "ERROR",
+    "NULL",
+    "DEFAULT",
+    "ON",
+    "FORMAT",
+    "WRAPPER",
+    "WITHOUT",
+    "WITH",
+    "CONDITIONAL",
+    "UNCONDITIONAL",
+    "KEEP",
+    "OMIT",
+    "QUOTES",
 ];
 
 const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
@@ -873,6 +918,11 @@ pub(crate) fn is_format_column_constraint_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_COLUMN_CONSTRAINT_KEYWORDS)
 }
 
+/// Returns true when a token is a leading clause keyword for table-function columns.
+pub(crate) fn is_table_function_item_leading_keyword(word: &str) -> bool {
+    matches_keyword(word, TABLE_FUNCTION_ITEM_LEADING_KEYWORDS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,7 +982,10 @@ mod tests {
             "PRECEDES",
             "REFERENCING",
         ] {
-            assert!(is_oracle_sql_keyword(keyword), "missing shared keyword: {keyword}");
+            assert!(
+                is_oracle_sql_keyword(keyword),
+                "missing shared keyword: {keyword}"
+            );
         }
     }
 
@@ -948,7 +1001,10 @@ mod tests {
             "WRAPPED",
             "XML",
         ] {
-            assert!(is_oracle_sql_keyword(keyword), "missing shared keyword: {keyword}");
+            assert!(
+                is_oracle_sql_keyword(keyword),
+                "missing shared keyword: {keyword}"
+            );
         }
     }
 
@@ -960,5 +1016,27 @@ mod tests {
         assert!(is_external_language_clause_keyword("LANGUAGE"));
         assert!(is_external_language_clause_keyword("parameters"));
         assert!(is_format_column_constraint_keyword("generated"));
+        assert!(is_table_function_item_leading_keyword("ORDINALITY"));
+        assert!(is_table_function_item_leading_keyword("quotes"));
+    }
+
+    #[test]
+    fn shared_keyword_pool_includes_additional_oracle_keywords() {
+        for keyword in [
+            "EDITIONING",
+            "OMIT",
+            "ORDINALITY",
+            "OVERLAY",
+            "POSITION",
+            "SUBSET",
+            "SUBSTRING",
+            "XMLCAST",
+            "XMLTABLE",
+        ] {
+            assert!(
+                is_oracle_sql_keyword(keyword),
+                "missing shared keyword: {keyword}"
+            );
+        }
     }
 }

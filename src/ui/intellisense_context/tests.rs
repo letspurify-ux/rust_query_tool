@@ -1509,7 +1509,11 @@ fn cross_apply_table_function_argument_can_see_outer_table_scope() {
     let ctx = analyze("SELECT * FROM t1 a CROSS APPLY OPENJSON(a.payload) oj WHERE a.|");
     let names = table_names(&ctx);
     assert!(names.contains(&"T1".to_string()), "tables: {:?}", names);
-    assert!(names.contains(&"OPENJSON".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"OPENJSON".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]

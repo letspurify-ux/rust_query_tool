@@ -8708,12 +8708,18 @@ SELECT 2 FROM dual;"#;
 
     let items = QueryExecutor::split_script_items(sql);
 
-    assert!(matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
-        "first item should keep only WITH FUNCTION declaration statement: {items:?}");
-    assert!(matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
-        "second item should parse @child.sql as run-script command: {items:?}");
-    assert!(matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
-        "third item should be trailing SELECT statement: {items:?}");
+    assert!(
+        matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "second item should parse @child.sql as run-script command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
 }
 
 #[test]
@@ -8728,12 +8734,18 @@ SELECT 2 FROM dual;"#;
 
     let items = QueryExecutor::split_script_items(sql);
 
-    assert!(matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
-        "first item should keep only WITH FUNCTION declaration statement: {items:?}");
-    assert!(matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && *relative_to_caller),
-        "second item should parse @@child.sql as relative run-script command: {items:?}");
-    assert!(matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
-        "third item should be trailing SELECT statement: {items:?}");
+    assert!(
+        matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && *relative_to_caller),
+        "second item should parse @@child.sql as relative run-script command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
 }
 
 #[test]
