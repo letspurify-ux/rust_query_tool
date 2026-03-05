@@ -1489,6 +1489,30 @@ fn lateral_subquery_with_comment_before_open_paren_keeps_outer_scope() {
 }
 
 #[test]
+fn lateral_table_function_argument_can_see_outer_table_scope() {
+    let ctx = analyze("SELECT * FROM t1 a, LATERAL JSON_TABLE(a.payload, '$' COLUMNS (id NUMBER PATH '$.id')) jt WHERE a.|");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"T1".to_string()),
+        "lateral table function should inherit outer scope table: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"JSON_TABLE".to_string()),
+        "table function relation should remain visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn cross_apply_table_function_argument_can_see_outer_table_scope() {
+    let ctx = analyze("SELECT * FROM t1 a CROSS APPLY OPENJSON(a.payload) oj WHERE a.|");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T1".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"OPENJSON".to_string()), "tables: {:?}", names);
+}
+
+#[test]
 fn lateral_keyword_is_not_parsed_as_left_table_alias() {
     let ctx = analyze("SELECT * FROM t1 LATERAL (SELECT * FROM t2) l WHERE l.|");
     let aliases: Vec<&str> = ctx
