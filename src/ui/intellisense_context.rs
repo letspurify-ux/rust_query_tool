@@ -255,7 +255,6 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE")
 }
 
-
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
     matches!(keyword, "FUNCTION" | "PROCEDURE")
 }
@@ -1392,6 +1391,18 @@ fn parse_relation_wrapper_table_name(
     }
 
     let open_idx = skip_comment_tokens(tokens, start + 1);
+
+    if relation_upper == "ONLY" {
+        if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            let (inner_range, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
+            let inner_tokens = token_range_slice(tokens, inner_range);
+            let (relation_name, _) = parse_table_name_deep(inner_tokens, 0)?;
+            return Some((relation_name, next_idx));
+        }
+
+        return parse_table_name_deep(tokens, open_idx);
+    }
+
     let Some(SqlToken::Symbol(sym)) = tokens.get(open_idx) else {
         return None;
     };
@@ -1403,11 +1414,6 @@ fn parse_relation_wrapper_table_name(
         return None;
     };
     let inner_tokens = token_range_slice(tokens, inner_range);
-
-    if relation_upper == "ONLY" {
-        let (relation_name, _) = parse_table_name_deep(inner_tokens, 0)?;
-        return Some((relation_name, next_idx));
-    }
 
     // TABLE(...) may contain collection function calls or scalar subqueries.
     // For identifier-like forms (`TABLE(schema.collection_col)`) keep the
@@ -1528,7 +1534,8 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 }
 
                 let mut cursor = skip_comment_tokens(tokens, of_idx + 1);
-                if matches!(tokens.get(cursor), Some(SqlToken::Word(keyword)) if keyword.eq_ignore_ascii_case("PERIOD")) {
+                if matches!(tokens.get(cursor), Some(SqlToken::Word(keyword)) if keyword.eq_ignore_ascii_case("PERIOD"))
+                {
                     let for_idx = skip_comment_tokens(tokens, cursor + 1);
                     if !matches!(tokens.get(for_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FOR"))
                     {
