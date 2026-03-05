@@ -2637,4 +2637,66 @@ mod tests {
         );
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
+
+    #[test]
+    fn with_clause_multiple_plsql_declarations_keep_main_query_attached() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("  PROCEDURE p IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END;");
+        engine.process_line("SELECT f() FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("FUNCTION f RETURN NUMBER IS"),
+            "first statement should contain WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("PROCEDURE p IS"),
+            "first statement should contain WITH PROCEDURE declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("SELECT f() FROM dual"),
+            "first statement should include the main query: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
+    fn compound_trigger_instead_of_each_row_section_splits_on_outer_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_instead");
+        engine.process_line("INSTEAD OF INSERT ON v_orders");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  INSTEAD OF EACH ROW IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END INSTEAD OF EACH ROW;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END INSTEAD OF EACH ROW"),
+            "compound trigger timing-point END must stay inside trigger body: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
 }
