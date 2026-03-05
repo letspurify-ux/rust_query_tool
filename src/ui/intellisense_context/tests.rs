@@ -2649,3 +2649,165 @@ fn normalize_dotted_identifier_rejects_double_dot() {
     let refs: Vec<&SqlToken> = tokens.iter().collect();
     assert_eq!(normalize_dotted_identifier_tokens(&refs), None);
 }
+
+// ─── Oracle grammar coverage regression tests ───────────────────────────
+
+#[test]
+fn grammar_deeply_nested_query_variant_1() {
+    let ctx = analyze("SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT | FROM dual)))");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert_eq!(ctx.depth, 3);
+}
+
+#[test]
+fn grammar_deeply_nested_query_variant_2() {
+    let ctx = analyze(
+        "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id IN (SELECT c.id FROM c WHERE |))",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert_eq!(ctx.depth, 2);
+}
+
+#[test]
+fn grammar_deeply_nested_query_variant_3() {
+    let ctx = analyze(
+        "SELECT * FROM (SELECT x, (SELECT COUNT(*) FROM t3 WHERE t3.k = t2.k AND |) AS cnt FROM t2)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert_eq!(ctx.depth, 2);
+}
+
+#[test]
+fn grammar_nested_case_variant_1() {
+    let ctx = analyze("SELECT CASE WHEN a = 1 THEN CASE WHEN b = 2 THEN | END END FROM t");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn grammar_nested_case_variant_2() {
+    let cols = extract_select_list_columns(&tokenize(
+        "SELECT CASE WHEN a=1 THEN CASE WHEN b=2 THEN c END END AS nested_case_col FROM t",
+    ));
+    assert!(cols.contains(&"nested_case_col".to_string()), "cols: {:?}", cols);
+}
+
+#[test]
+fn grammar_nested_case_variant_3() {
+    let ctx = analyze("SELECT * FROM t WHERE CASE WHEN a = 1 THEN CASE WHEN b = 2 THEN 1 ELSE 0 END ELSE 0 END = |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
+fn grammar_analytic_window_variant_1() {
+    let ctx = analyze("SELECT SUM(sal) OVER (PARTITION BY deptno ORDER BY |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
+fn grammar_analytic_window_variant_2() {
+    let ctx = analyze("SELECT ROW_NUMBER() OVER (PARTITION BY deptno ORDER BY sal) rn FROM emp WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
+fn grammar_analytic_window_variant_3() {
+    let cols = extract_select_list_columns(&tokenize(
+        "SELECT SUM(sal) OVER (PARTITION BY deptno ORDER BY sal) AS analytic_sum FROM emp",
+    ));
+    assert!(cols.contains(&"analytic_sum".to_string()), "cols: {:?}", cols);
+}
+
+#[test]
+fn grammar_hierarchical_query_variant_1() {
+    let ctx = analyze("SELECT * FROM emp START WITH mgr IS NULL CONNECT BY PRIOR empno = | ");
+    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+}
+
+#[test]
+fn grammar_hierarchical_query_variant_2() {
+    let ctx = analyze("SELECT * FROM emp CONNECT BY NOCYCLE PRIOR empno = mgr START WITH |");
+    assert_eq!(ctx.phase, SqlPhase::StartWithClause);
+}
+
+#[test]
+fn grammar_hierarchical_query_variant_3() {
+    let ctx = analyze(
+        "SELECT e.empno FROM emp e WHERE EXISTS (SELECT 1 FROM emp c START WITH c.mgr = e.empno CONNECT BY PRIOR c.empno = c.mgr AND |)",
+    );
+    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+    assert_eq!(ctx.depth, 1);
+}
+
+#[test]
+fn grammar_with_recursive_style_variant_1() {
+    let ctx = analyze(
+        "WITH r(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT * FROM r WHERE |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(cte_names(&ctx).contains(&"R".to_string()));
+}
+
+#[test]
+fn grammar_with_recursive_style_variant_2() {
+    let ctx = analyze("WITH cte(x) AS (SELECT 1 FROM dual), cte2 AS (SELECT x FROM cte) SELECT * FROM cte2 WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(cte_names(&ctx).contains(&"CTE".to_string()));
+    assert!(cte_names(&ctx).contains(&"CTE2".to_string()));
+}
+
+#[test]
+fn grammar_with_recursive_style_variant_3() {
+    let ctx = analyze("SELECT * FROM (WITH cte AS (SELECT 1 AS x FROM dual) SELECT * FROM cte WHERE |)");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert_eq!(ctx.depth, 1);
+}
+
+#[test]
+fn grammar_complex_join_variant_1() {
+    let ctx = analyze("SELECT * FROM emp e LEFT JOIN dept d ON e.deptno = d.deptno JOIN salgrade s ON e.sal BETWEEN s.losal AND | ");
+    assert_eq!(ctx.phase, SqlPhase::JoinCondition);
+}
+
+#[test]
+fn grammar_complex_join_variant_2() {
+    let ctx = analyze("SELECT * FROM emp e CROSS APPLY (SELECT * FROM bonus b WHERE b.empno = e.empno AND |) bx");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn grammar_complex_join_variant_3() {
+    let ctx = analyze("SELECT * FROM emp e JOIN LATERAL (SELECT * FROM dept d WHERE d.deptno = e.deptno AND |) ld ON 1=1");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn grammar_quoted_identifier_variant_1() {
+    let cols = extract_select_list_columns(&tokenize(r#"SELECT "Employee Name" FROM emp"#));
+    assert!(
+        cols.contains(&"Employee Name".to_string()),
+        "cols: {:?}",
+        cols
+    );
+}
+
+#[test]
+fn grammar_quoted_identifier_variant_2() {
+    let cols = extract_select_list_columns(&tokenize(
+        r#"SELECT e."Hire Date" AS "Joined Date" FROM emp e"#,
+    ));
+    assert!(
+        cols.contains(&"Joined Date".to_string()),
+        "cols: {:?}",
+        cols
+    );
+}
+
+#[test]
+fn grammar_quoted_identifier_variant_3() {
+    let cols = extract_select_list_columns(&tokenize(r#"SELECT "Dept"."Code" FROM "Dept""#));
+    assert!(cols.contains(&"Code".to_string()), "cols: {:?}", cols);
+}

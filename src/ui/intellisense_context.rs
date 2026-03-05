@@ -3144,7 +3144,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
         }
         if let Some(SqlToken::Word(kw)) = second_last {
             if kw.eq_ignore_ascii_case("AS") {
-                return Some(alias.clone());
+                return Some(strip_identifier_quotes(alias));
             }
         }
     }
@@ -3165,7 +3165,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
                     _ => false,
                 };
                 if is_implicit {
-                    return Some(alias.clone());
+                    return Some(strip_identifier_quotes(alias));
                 }
             }
         }
@@ -3177,7 +3177,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
             if !is_identifier_word_token(name) {
                 return None;
             }
-            return Some(name.clone());
+            return Some(strip_identifier_quotes(name));
         }
     }
 
@@ -3190,7 +3190,7 @@ fn resolve_item_column_name(item_tokens: &[&SqlToken]) -> Option<String> {
                 if !is_identifier_word_token(col) {
                     return None;
                 }
-                return Some(col.clone());
+                return Some(strip_identifier_quotes(col));
             }
         }
     }
