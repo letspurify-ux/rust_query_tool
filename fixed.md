@@ -1478,3 +1478,27 @@
 ### [검증]
 - `cargo test phase_for_ -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 점검 보강 (`WITH FUNCTION` + SQL*Plus `@`/`@@`)
+
+### [점검] Oracle WITH PL/SQL 선언 상태에서 스크립트 실행 명령 전환 검토
+- **검토 배경**:
+  - 공통 파서 엔진에는 `WITH FUNCTION/PROCEDURE` 선언 모드에서 새 statement head로 복구하는 로직이 있습니다.
+  - 기존 회귀군은 `CREATE/ALTER/DEFINE/CONNECT/...` 등 키워드 중심이라, SQL*Plus 스크립트 실행 명령(`@`, `@@`) 전환 경로가 누락되어 있었습니다.
+- **점검 결과**:
+  - 현재 구현에서 `@child.sql`, `@@child.sql` 모두 statement 경계가 정상 분리되며,
+  - 이후 SQL statement(`SELECT ...`)가 명령 라인과 합쳐지지 않음을 확인했습니다.
+
+### [유사 케이스] cursor 기반 statement 경계 탐색도 동일 계열 검증
+- 실행 분할(`split_script_items`)뿐 아니라 커서 기준 경계 계산(`statement_bounds_at_cursor`)에서도
+- `WITH FUNCTION` 뒤 `@script` 라인이 다음 SQL 경계에 누수되지 않도록 추가 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_run_script_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_relative_run_script_statement_head`
+- `test_statement_bounds_at_cursor_splits_after_with_function_and_run_script_command`
+
+### [검증]
+- `cargo test -q recovers_to_run_script_statement_head` 통과
+- `cargo test -q relative_run_script_statement_head` 통과
+- `cargo test` 전체 통과
