@@ -336,6 +336,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OVER",
     "OVERFLOW",
     "PACKAGE",
+    "PACKAGE_BODY",
     "PARALLEL",
     "PARALLEL_ENABLE",
     "PARAMETERS",
@@ -385,6 +386,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "RANK",
     "RAW",
     "READ",
+    "RECOGNIZE",
     "RECORD",
     "RECURSIVE",
     "RECYCLEBIN",
@@ -399,6 +401,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "REMARK",
     "RENAME",
     "REPEAT",
+    "REPEATABLE",
     "REPLACE",
     "RESOURCE",
     "RESPECT",
@@ -439,6 +442,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SESSIONTIMEZONE",
     "SET",
     "SETTINGS",
+    "SHARE",
     "SHARING",
     "SHOW",
     "SIBLINGS",
@@ -456,6 +460,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "STATISTICS_LEVEL",
     "STORAGE",
     "STORE",
+    "SUBMULTISET",
     "SUBPARTITION",
     "SUBTYPE",
     "SUM",
@@ -467,6 +472,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SYS_OUTPUT",
     "SYS_REFCURSOR",
     "TABLE",
+    "TABLESAMPLE",
     "TABLESPACE",
     "TEMPORARY",
     "THAN",
@@ -523,8 +529,10 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "WINDOW",
     "WITH",
     "WITHIN",
+    "WRAPPED",
     "WRAPPER",
     "WRITE",
+    "XML",
     "XMLTYPE",
     "YEAR",
     "ZONE",
@@ -923,6 +931,22 @@ mod tests {
             "NONEDITIONING",
             "PRECEDES",
             "REFERENCING",
+        ] {
+            assert!(is_oracle_sql_keyword(keyword), "missing shared keyword: {keyword}");
+        }
+    }
+
+    #[test]
+    fn shared_keyword_pool_includes_parser_and_highlighter_keywords() {
+        for keyword in [
+            "PACKAGE_BODY",
+            "RECOGNIZE",
+            "REPEATABLE",
+            "SHARE",
+            "SUBMULTISET",
+            "TABLESAMPLE",
+            "WRAPPED",
+            "XML",
         ] {
             assert!(is_oracle_sql_keyword(keyword), "missing shared keyword: {keyword}");
         }
