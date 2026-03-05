@@ -922,6 +922,30 @@ fn insert_subquery_depth_returns_to_zero_after_closing_values_subquery() {
     assert!(ctx.phase.is_column_context());
 }
 
+#[test]
+fn insert_all_second_into_is_table_context() {
+    let ctx = analyze("INSERT ALL INTO emp_a (id) VALUES (1) INTO | SELECT 1 FROM dual");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn insert_all_collects_all_targets() {
+    let ctx = analyze("INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (id) VALUES (2) SELECT | FROM dual");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP_A".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"EMP_B".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn insert_first_second_into_is_table_context() {
+    let ctx = analyze("INSERT FIRST WHEN 1 = 1 THEN INTO emp_a (id) VALUES (1) INTO | SELECT 1 FROM dual");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
 // ─── Complex real-world query tests ─────────────────────────────────────
 
 #[test]

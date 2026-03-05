@@ -769,7 +769,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "INTO" => {
                         if matches!(
                             current_phase,
-                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::MergeTarget
+                            SqlPhase::SelectList
+                                | SqlPhase::Initial
+                                | SqlPhase::MergeTarget
+                                | SqlPhase::ValuesClause
                         ) {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
