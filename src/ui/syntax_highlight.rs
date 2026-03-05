@@ -8,7 +8,6 @@ use std::collections::HashSet;
 
 use super::intellisense::ORACLE_FUNCTIONS;
 use crate::sql_text;
-use crate::sql_text::ORACLE_SQL_KEYWORDS;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
 
@@ -25,8 +24,6 @@ pub const STYLE_HINT: char = 'I';
 pub const STYLE_DATETIME_LITERAL: char = 'J';
 pub const STYLE_COLUMN: char = 'K';
 
-static SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
-    Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
 
@@ -770,7 +767,7 @@ impl SqlHighlighter {
         let upper = upper.as_ref();
 
         // Check if it's a SQL keyword
-        if SQL_KEYWORDS_SET.contains(upper) {
+        if sql_text::ORACLE_SQL_KEYWORDS_SET.contains(upper) {
             return TokenType::Keyword;
         }
 

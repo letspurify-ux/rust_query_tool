@@ -1,4 +1,7 @@
 //! Shared SQL text helpers used across execution, formatting, and IntelliSense.
+use once_cell::sync::Lazy;
+use std::collections::HashSet;
+
 /// Shared Oracle SQL keywords used by parser, IntelliSense, and formatter.
 pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ABSENT",
@@ -344,6 +347,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "REFERENCES",
     "REFRESH",
     "RELY",
+    "REPEAT",
     "REPLACE",
     "RESOURCE",
     "RESPECT",
@@ -533,6 +537,24 @@ pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
     "SHARING",
 ];
 
+/// JOIN modifier keywords used by SQL formatter line-break rules.
+pub(crate) const FORMAT_JOIN_MODIFIER_KEYWORDS: &[&str] =
+    &["LEFT", "RIGHT", "FULL", "INNER", "CROSS"];
+
+/// Condition keywords that should align in multiline SQL formatter output.
+pub(crate) const FORMAT_CONDITION_KEYWORDS: &[&str] = &["ON", "AND", "OR", "WHEN"];
+
+/// Block-start keywords used by SQL formatter indentation for PL/SQL blocks.
+pub(crate) const FORMAT_BLOCK_START_KEYWORDS: &[&str] = &["DECLARE", "IF", "REPEAT"];
+
+/// Supported qualifiers for `END ...` in formatter block indentation logic.
+pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] =
+    &["LOOP", "IF", "CASE", "REPEAT"];
+
+/// Shared SQL keyword lookup set for lexer/highlighting and IntelliSense checks.
+pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
+
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] =
     &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES"];
 
@@ -706,9 +728,7 @@ pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
 /// Returns true if `word` is one of the shared Oracle SQL keywords.
 #[inline]
 pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {
-    ORACLE_SQL_KEYWORDS
-        .binary_search_by(|candidate| candidate.cmp(&word))
-        .is_ok()
+    ORACLE_SQL_KEYWORDS_SET.contains(word)
 }
 
 /// Returns true when a keyword can start the main query after a WITH clause.
@@ -751,6 +771,18 @@ mod tests {
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
         assert!(FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_JOIN_MODIFIER_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_CONDITION_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_BLOCK_START_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_BLOCK_END_QUALIFIER_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
     }
