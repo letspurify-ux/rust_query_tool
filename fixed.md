@@ -1356,6 +1356,36 @@
 - `cargo test -q recovers_to_rename_statement_head` 통과
 - `cargo test -q` 전체 통과
 
+## 2026-03-05 Oracle 공통 파서 엔진 누락 구문 보완 (`AS LANGUAGE C PARAMETERS (...)` call spec)
+
+### [중] `EXTERNAL` 키워드 없는 call spec에서 `PARAMETERS` 절을 외부 루틴 종료 신호로 인식하지 못하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE FUNCTION ... AS LANGUAGE C PARAMETERS (...); SELECT ...;` 형태에서
+  - `LANGUAGE C` 이후 `PARAMETERS`가 와도 외부 루틴으로 확정되지 않아, 후속 `SELECT`가 같은 statement로 병합될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 외부 루틴 상태 머신이 `LANGUAGE`를 보면 즉시 외부 루틴으로 확정하거나,
+  - `NAME/LIBRARY`만 외부 루틴 확정 트리거로 허용했습니다.
+  - 그 결과 `AS LANGUAGE C PARAMETERS (...)` 패턴은 누락되어 세미콜론 분리 정책이 적용되지 않았습니다.
+- **수정**:
+  - 외부 루틴 상태를 `AwaitingLanguageTargetFromExternal` / `AwaitingLanguageTargetImplicit` / `SawImplicitLanguageTarget`로 세분화했습니다.
+  - `EXTERNAL LANGUAGE <target>`는 기존처럼 즉시 외부 루틴 확정,
+  - `LANGUAGE <target>`(implicit call spec)는 `NAME/LIBRARY/PARAMETERS`가 뒤따를 때만 외부 루틴으로 확정하도록 보정했습니다.
+  - `PARAMETERS`를 implicit call spec 확정 토큰으로 추가해 `AS LANGUAGE C PARAMETERS (...)`를 안정적으로 분리합니다.
+
+### [유사 케이스] 과잉 분리 방지까지 함께 보정
+- `AS LANGUAGE C;`처럼 `NAME/LIBRARY/PARAMETERS` 없이 끝나는 케이스는 외부 루틴으로 확정하지 않도록 하여,
+- 일반 식별자/비표준 문맥에서의 오탐 분리를 방지했습니다.
+
+### [테스트] 회귀/유사 케이스 추가
+- `sql_parser_engine::tests::language_clause_with_parameters_without_external_keyword_still_marks_external_routine_split`
+- `sql_parser_engine::tests::language_clause_without_external_name_or_parameters_does_not_force_split`
+- `db::query::query_tests::test_create_external_function_language_parameters_without_external_keyword_splits`
+- `db::query::query_tests::test_split_format_items_external_language_parameters_without_external_keyword_splits`
+
+### [검증]
+- `cargo test -q language_clause_without_external -- --nocapture` 통과
+- `cargo test -q language_parameters_without_external_keyword -- --nocapture` 통과
+- `cargo test` 전체 통과
 ## 2026-03-06 인텔리센스 누락 구문 보완 (FROM 절 후행 샘플링/파티션 절 alias 오인식)
 
 ### [중] `SAMPLE`/`TABLESAMPLE`/`PARTITION`/`SUBPARTITION`/`VERSIONS` 절 키워드를 테이블 alias로 오인식하던 문제 수정
