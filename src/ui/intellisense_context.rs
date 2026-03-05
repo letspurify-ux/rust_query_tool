@@ -820,12 +820,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
-                    "JOIN" | "APPLY" | "STRAIGHT_JOIN" => {
+                    "JOIN" | "APPLY" => {
                         if upper == "APPLY" {
                             relation_modifier_state.mark_lateral_like();
                         }
                         depth_frames[depth].phase = SqlPhase::FromClause;
                         relation_state.expect_table();
+                    }
+                    "STRAIGHT_JOIN" => {
+                        if matches!(current_phase, SqlPhase::FromClause) {
+                            depth_frames[depth].phase = SqlPhase::FromClause;
+                            relation_state.expect_table();
+                        }
                     }
                     "ON" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
