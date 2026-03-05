@@ -2522,6 +2522,31 @@ mod tests {
     }
 
     #[test]
+    fn external_clause_keywords_used_as_identifiers_do_not_force_external_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_shadow_external IS");
+        engine.process_line("  external NUMBER := 1;");
+        engine.process_line("  parameters NUMBER := 2;");
+        engine.process_line("  calling NUMBER := 3;");
+        engine.process_line("  with NUMBER := 4;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow_external IS"));
+        assert!(statements[0].contains("external NUMBER := 1;"));
+        assert!(statements[0].contains("parameters NUMBER := 2;"));
+        assert!(statements[0].contains("calling NUMBER := 3;"));
+        assert!(statements[0].contains("with NUMBER := 4;"));
+        assert!(statements[0].contains("END"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
     fn language_clause_with_parameters_without_external_keyword_still_marks_external_routine_split()
     {
         let mut engine = SqlParserEngine::new();
@@ -2577,6 +2602,39 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("LANGUAGE C CALLING STANDARD"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn simple_trigger_call_body_splits_on_semicolon_without_slash() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_call");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("CALL do_work;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("CALL do_work"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn simple_trigger_when_clause_splits_on_semicolon_without_slash() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_when");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("WHEN (NEW.id > 0)");
+        engine.process_line("CALL do_work;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("WHEN (NEW.id > 0)"));
+        assert!(statements[0].contains("CALL do_work"));
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
     }
 
     #[test]
