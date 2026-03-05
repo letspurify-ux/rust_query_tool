@@ -174,6 +174,76 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_external_language_clause_without_external_suffix_with_slash_splits_following_select(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER
+AS LANGUAGE C;
+/
+SELECT 2 FROM dual;"#;
+    let cursor = sql.rfind("SELECT 2").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for trailing SELECT");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "cursor on trailing SELECT should resolve only SELECT statement: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_external_language_clause_without_external_suffix_splits_following_select_without_slash(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
+AS LANGUAGE C;
+SELECT 3 FROM dual;"#;
+    let cursor = sql.rfind("SELECT 3").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for trailing SELECT");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 3 FROM dual"),
+        "cursor on trailing SELECT should resolve only SELECT statement: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_language_identifier_with_external_target_like_type_keeps_procedure_body(
+) {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow_c IS
+  language c;
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let cursor = sql.find("NULL").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected procedure statement bounds");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("CREATE OR REPLACE PROCEDURE proc_shadow_c IS"),
+        "procedure header should stay in first statement bounds: {statement}"
+    );
+    assert!(
+        statement.contains("language c;"),
+        "LANGUAGE declaration should stay inside procedure body statement: {statement}"
+    );
+    assert!(
+        statement.contains("END"),
+        "procedure body should include END token: {statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 1 FROM dual"),
+        "trailing SELECT must not be merged into procedure bounds: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");

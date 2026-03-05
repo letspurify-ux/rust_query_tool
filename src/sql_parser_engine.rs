@@ -436,7 +436,7 @@ enum AsIsBlockStart {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum SemicolonAction {
+pub(crate) enum SemicolonAction {
     AppendToCurrent,
     SplitTopLevel,
     SplitForcedRoutine,
@@ -444,7 +444,7 @@ enum SemicolonAction {
 }
 
 impl SemicolonAction {
-    fn from_state(state: &SplitState) -> Self {
+    pub(crate) fn from_state(state: &SplitState) -> Self {
         if state.keep_semicolons_inside_create_body() {
             return Self::AppendToCurrent;
         }
@@ -1012,10 +1012,25 @@ impl SplitState {
         }
     }
 
+    pub(crate) fn prepare_semicolon_action(&mut self) -> SemicolonAction {
+        // FOR/WHILE ... DO candidates cannot span statement terminators.
+        // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
+        self.pending_do = PendingDo::None;
+        self.finalize_external_clause_on_semicolon();
+        self.resolve_pending_end_on_terminator();
+        self.clear_forward_subprogram_declaration_state_on_semicolon();
+        self.advance_with_clause_after_semicolon();
+        SemicolonAction::from_state(self)
+    }
+
     pub(crate) fn should_split_on_semicolon(&self) -> bool {
         self.routine_is_stack
             .last()
             .is_some_and(|frame| frame.should_split_on_semicolon(self.block_depth()))
+    }
+
+    pub(crate) fn can_terminate_on_slash(&self) -> bool {
+        self.block_depth() == 0 || self.pending_implicit_external_top_level_split
     }
 
     fn should_close_routine_block_on_semicolon(&self) -> bool {
@@ -1044,6 +1059,10 @@ impl SplitState {
         {
             self.block_stack.remove(pos);
         }
+    }
+
+    pub(crate) fn apply_close_routine_block_on_semicolon(&mut self) {
+        self.close_external_routine_on_semicolon();
     }
 
     fn clear_forward_subprogram_declaration_state_on_semicolon(&mut self) {
@@ -1348,7 +1367,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn can_terminate_on_slash(&self) -> bool {
-        self.block_depth() == 0 || self.state.pending_implicit_external_top_level_split
+        self.state.can_terminate_on_slash()
     }
 
     pub(crate) fn is_trigger(&self) -> bool {
@@ -1759,15 +1778,7 @@ impl SqlParserEngine {
             }
 
             if symbol_role == SymbolRole::Semicolon {
-                // FOR/WHILE ... DO candidates cannot span statement terminators.
-                // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
-                self.state.pending_do = PendingDo::None;
-                self.state.finalize_external_clause_on_semicolon();
-                self.state.resolve_pending_end_on_terminator();
-                self.state
-                    .clear_forward_subprogram_declaration_state_on_semicolon();
-                self.state.advance_with_clause_after_semicolon();
-                let semicolon_action = SemicolonAction::from_state(&self.state);
+                let semicolon_action = self.state.prepare_semicolon_action();
                 self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
                 continue;

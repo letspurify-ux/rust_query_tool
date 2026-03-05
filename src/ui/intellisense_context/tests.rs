@@ -3023,6 +3023,102 @@ fn model_clause_alias_after_subquery_is_collected_for_qualifier_resolution() {
 }
 
 #[test]
+fn pivot_clause_alias_with_as_keyword_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT pa.| FROM oqt_t_emp PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) AS pa",
+    );
+
+    let pivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("pa"))
+    });
+    assert!(
+        pivot_alias.is_some(),
+        "pivot clause alias pa with AS should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("pa", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "pivot alias with AS should resolve for qualifiers, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unpivot_clause_alias_with_as_keyword_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT ua.| FROM oqt_t_emp UNPIVOT EXCLUDE NULLS (amount FOR metric IN (sal AS 'SAL')) AS ua",
+    );
+
+    let unpivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("ua"))
+    });
+    assert!(
+        unpivot_alias.is_some(),
+        "unpivot clause alias ua with AS should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("ua", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "unpivot alias with AS should resolve for qualifiers, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn model_clause_rules_iterate_alias_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT mi.| FROM oqt_t_emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES ITERATE (2) (sal[deptno] = sal[deptno]) mi",
+    );
+
+    let model_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("mi"))
+    });
+    assert!(
+        model_alias.is_some(),
+        "model iterate alias mi should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("mi", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "model iterate alias should resolve for qualifiers, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn json_table_arguments_can_resolve_left_relation_alias() {
     let ctx = analyze(
         "SELECT * \

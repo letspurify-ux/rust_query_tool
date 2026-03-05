@@ -1772,28 +1772,32 @@ impl QueryExecutor {
                     }
 
                     if c == ';' {
-                        self.state.resolve_pending_end_on_terminator();
-                        if self.state.block_depth() == 0 {
-                            if self.state.in_java_source_create() {
+                        let semicolon_action = self.state.prepare_semicolon_action();
+                        match semicolon_action {
+                            crate::sql_parser_engine::SemicolonAction::AppendToCurrent => {
                                 self.record_char(index, c);
-                                continue;
                             }
-                            if let Some(span) = self.push_current_span(sql) {
-                                if !on_span(span) {
-                                    return false;
+                            crate::sql_parser_engine::SemicolonAction::SplitTopLevel => {
+                                if let Some(span) = self.push_current_span(sql) {
+                                    if !on_span(span) {
+                                        return false;
+                                    }
+                                }
+                                self.state.reset_create_state();
+                            }
+                            crate::sql_parser_engine::SemicolonAction::SplitForcedRoutine => {
+                                self.state.reset_create_state();
+                                self.state.block_stack.clear();
+                                if let Some(span) = self.push_current_span(sql) {
+                                    if !on_span(span) {
+                                        return false;
+                                    }
                                 }
                             }
-                            self.state.reset_create_state();
-                        } else if self.state.should_split_on_semicolon() {
-                            self.state.reset_create_state();
-                            self.state.block_stack.clear();
-                            if let Some(span) = self.push_current_span(sql) {
-                                if !on_span(span) {
-                                    return false;
-                                }
+                            crate::sql_parser_engine::SemicolonAction::CloseRoutineBlock => {
+                                self.record_char(index, c);
+                                self.state.apply_close_routine_block_on_semicolon();
                             }
-                        } else {
-                            self.record_char(index, c);
                         }
                         continue;
                     }
@@ -1839,7 +1843,7 @@ impl QueryExecutor {
 
             if collector.state.is_idle()
                 && collector.state.in_create_plsql()
-                && collector.state.block_depth() == 0
+                && collector.state.can_terminate_on_slash()
                 && !collector.current_is_empty()
                 && !collector.state.is_trigger()
                 && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
@@ -1851,7 +1855,10 @@ impl QueryExecutor {
                 }
             }
 
-            if collector.state.is_idle() && trimmed == "/" && collector.state.block_depth() == 0 {
+            if collector.state.is_idle()
+                && trimmed == "/"
+                && collector.state.can_terminate_on_slash()
+            {
                 if !collector.current_is_empty() {
                     if let Some(span) = collector.force_terminate(sql) {
                         if !on_span(span) {
