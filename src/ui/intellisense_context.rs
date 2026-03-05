@@ -303,6 +303,20 @@ fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize>
     None
 }
 
+fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let mut idx = skip_comment_tokens(tokens, start_idx);
+
+    while matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        idx = skip_comment_tokens(tokens, idx + 1);
+    }
+
+    matches!(
+        tokens.get(idx),
+        Some(SqlToken::Word(word))
+            if matches!(word.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "VALUES")
+    )
+}
+
 #[derive(Debug, Clone)]
 struct ParsedTableEntry {
     table: ScopedTableRef,
@@ -537,7 +551,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 relation_modifier_state.clear();
                 relation_state.clear();
 
-                if matches!(parent_phase, SqlPhase::FromClause) {
+                if matches!(parent_phase, SqlPhase::FromClause)
+                    && is_query_expression_start(tokens, idx + 1)
+                {
                     subquery_tracks.push((depth, idx + 1));
                 }
 
@@ -1006,13 +1022,55 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if relation_state.is_expect_table() {
                             if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
                             {
-                                let (alias, after_alias) = parse_alias_deep(tokens, next_idx);
-                                let alias_present = alias.is_some();
                                 let relation_name_hint = relation_function_name_hint(&table_name);
+                                let relation_arg_range = if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                                {
+                                    extract_parenthesized_range(tokens, next_idx)
+                                        .map(|(range, _)| range)
+                                } else {
+                                    None
+                                };
+                                let relation_arg_end = if relation_arg_range.is_some()
+                                    && relation_name_hint
+                                        .as_deref()
+                                        .is_some_and(is_from_lateral_table_function)
+                                {
+                                    extract_parenthesized_range(tokens, next_idx)
+                                        .map(|(_, arg_end_idx)| arg_end_idx)
+                                        .unwrap_or(next_idx)
+                                } else {
+                                    next_idx
+                                };
+                                let (alias, after_alias) = parse_alias_deep(tokens, relation_arg_end);
+                                let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
+                                let is_lateral_table_function = relation_name_hint
+                                    .as_deref()
+                                    .is_some_and(is_from_lateral_table_function);
+                                let table_scope_name = if is_lateral_table_function {
+                                    alias.clone().unwrap_or_else(|| table_name.clone())
+                                } else {
+                                    table_name.clone()
+                                };
+                                if let (Some(alias_name), Some(body_range), Some(function_name)) = (
+                                    alias.as_ref(),
+                                    relation_arg_range,
+                                    relation_name_hint.as_deref(),
+                                ) {
+                                    if is_from_lateral_table_function(function_name) {
+                                        all_subqueries.push(ParsedSubqueryEntry {
+                                            subquery: SubqueryDefinition {
+                                                alias: alias_name.clone(),
+                                                body_range,
+                                                depth,
+                                            },
+                                            scope_id,
+                                        });
+                                    }
+                                }
                                 all_tables.push(ParsedTableEntry {
                                     table: ScopedTableRef {
-                                        name: table_name,
+                                        name: table_scope_name,
                                         alias,
                                         depth,
                                         is_cte: false,
@@ -1560,6 +1618,16 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
             "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" | "WITH" => {
+                if upper == "WITH"
+                    && matches!(
+                        next_word_upper(tokens, idx + 1),
+                        Some((next, _)) if next == "ORDINALITY"
+                    )
+                {
+                    idx = skip_comment_tokens(tokens, idx + 1);
+                    idx = skip_comment_tokens(tokens, idx + 1);
+                    continue;
+                }
                 let open_idx = skip_comment_tokens(tokens, idx + 1);
                 let open_idx = match tokens.get(open_idx) {
                     Some(SqlToken::Word(_)) if upper == "TABLESAMPLE" => {

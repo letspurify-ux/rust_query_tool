@@ -340,6 +340,40 @@ fn unnest_function_argument_keeps_left_relation_visible() {
 }
 
 #[test]
+fn unnest_relation_alias_is_collected_after_function_arguments() {
+    let ctx = analyze("SELECT u.| FROM orders o, UNNEST(o.items) u WHERE o.id = 1");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("u")
+                && table.alias.as_deref() == Some("u")),
+        "UNNEST relation alias should be collected after function arguments: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn table_function_with_ordinality_keeps_alias_after_postfix_clause() {
+    let ctx = analyze("SELECT u.| FROM orders o, UNNEST(o.items) WITH ORDINALITY u");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("u")
+                && table.alias.as_deref() == Some("u")),
+        "WITH ORDINALITY postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 
@@ -1498,8 +1532,8 @@ fn lateral_table_function_argument_can_see_outer_table_scope() {
         names
     );
     assert!(
-        names.contains(&"JSON_TABLE".to_string()),
-        "table function relation should remain visible: {:?}",
+        names.contains(&"JT".to_string()),
+        "table function alias should remain visible: {:?}",
         names
     );
 }
