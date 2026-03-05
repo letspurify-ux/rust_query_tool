@@ -131,6 +131,40 @@ fn phase_join_using_clause() {
 }
 
 #[test]
+fn phase_left_semi_join_keeps_join_modifier_out_of_aliases() {
+    let ctx = analyze("SELECT * FROM emp e LEFT SEMI JOIN dept d ON e.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "SEMI"),
+        "SEMI must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_left_anti_join_keeps_join_modifier_out_of_aliases() {
+    let ctx = analyze("SELECT * FROM emp e LEFT ANTI JOIN dept d ON e.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "ANTI"),
+        "ANTI must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_group_by() {
     let ctx = analyze("SELECT a FROM t GROUP BY |");
     assert_eq!(ctx.phase, SqlPhase::GroupByClause);
@@ -163,6 +197,18 @@ fn phase_order_siblings_by() {
     let ctx = analyze("SELECT a FROM t ORDER SIBLINGS BY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn straight_join_is_parsed_as_join_boundary() {
+    let ctx = analyze("SELECT d.| FROM emp e STRAIGHT_JOIN dept d ON e.deptno = d.deptno");
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "DEPT"),
+        "STRAIGHT_JOIN should expose right-side relation in scope: {:?}",
+        names
+    );
 }
 
 #[test]

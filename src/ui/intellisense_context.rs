@@ -820,7 +820,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
-                    "JOIN" | "APPLY" => {
+                    "JOIN" | "APPLY" | "STRAIGHT_JOIN" => {
                         if upper == "APPLY" {
                             relation_modifier_state.mark_lateral_like();
                         }
@@ -1768,6 +1768,7 @@ fn is_join_keyword(word: &str) -> bool {
             | "NATURAL"
             | "LATERAL"
             | "APPLY"
+            | "STRAIGHT_JOIN"
     )
 }
 
@@ -1794,6 +1795,7 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "VALUES"
             | "SET"
             | "ON"
+            | "STRAIGHT_JOIN"
             | "PIVOT"
             | "UNPIVOT"
             | "MODEL"
@@ -1827,6 +1829,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "NATURAL"
             | "LATERAL"
             | "APPLY"
+            | "STRAIGHT_JOIN"
             | "WHERE"
             | "GROUP"
             | "ORDER"
