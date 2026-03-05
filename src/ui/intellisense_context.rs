@@ -658,9 +658,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     relation_state.expect_table();
                 }
                 if matches!(cte_state, CteState::Inactive)
-                    && depth == 0
                     && depth_frames
-                        .first()
+                        .get(depth)
                         .is_some_and(|frame| matches!(frame.phase, SqlPhase::WithClause))
                 {
                     cte_state = CteState::ExpectName;
