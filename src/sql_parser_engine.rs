@@ -848,7 +848,15 @@ impl SplitState {
         if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind
             && matches!(
                 upper,
-                "OBJECT" | "VARRAY" | "TABLE" | "REF" | "RECORD" | "OPAQUE" | "VARYING" | "ENUM"
+                "OBJECT"
+                    | "VARRAY"
+                    | "TABLE"
+                    | "REF"
+                    | "RECORD"
+                    | "OPAQUE"
+                    | "VARYING"
+                    | "ENUM"
+                    | "RANGE"
             )
         {
             self.block_stack.pop(); // undo the AS/IS push
@@ -2552,6 +2560,38 @@ mod tests {
             engine.finalize_and_take_statements(),
             vec![
                 "CREATE OR REPLACE TYPE color_t AS ENUM ('RED', 'GREEN')".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_range_declaration_splits_at_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE age_t AS RANGE (SUBTYPE = NUMBER);");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE TYPE age_t AS RANGE (SUBTYPE = NUMBER)".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_range_declaration_with_is_keyword_splits_at_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE age_t IS RANGE (SUBTYPE = NUMBER);");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE TYPE age_t IS RANGE (SUBTYPE = NUMBER)".to_string(),
                 "SELECT 1 FROM dual".to_string(),
             ]
         );
