@@ -296,6 +296,30 @@ fn unnest_function_argument_keeps_left_relation_visible() {
 }
 
 #[test]
+fn unnest_argument_scope_can_resolve_left_relation_columns() {
+    let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "UNNEST argument scope should keep left relation visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn table_collection_argument_scope_can_resolve_left_relation_columns() {
+    let ctx = analyze("SELECT * FROM orders o, TABLE(o.|) t");
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "TABLE(...) argument scope should keep left relation visible: {:?}",
+        names
+    );
+}
+
+#[test]
 fn phase_for_update_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
