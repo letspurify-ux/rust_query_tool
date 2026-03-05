@@ -1414,3 +1414,22 @@
 - `cargo test -q partition_keyword_is_not_parsed_as_table_alias` 통과
 - `cargo test -q tablesample_keyword_is_not_parsed_as_table_alias` 통과
 - `cargo test -q` 전체 통과
+
+## 2026-03-05 Oracle 공통 파서 엔진 구문 점검(추가 회귀 테스트)
+
+### [점검] Oracle 블록 라벨 종료 구문 / COMPOUND TRIGGER 헤더 변형 검토
+- **검토 대상**:
+  - `END <label>;` 형태의 라벨 종료 구문이 다음 문장 split에 영향을 주는지 확인
+  - `COMPOUND TRIGGER` 헤더 앞 `FOR UPDATE ON ...` 토큰이 블록 추적에 간섭하는지 확인
+- **결과**:
+  - 현재 공통 파서 엔진은 두 케이스 모두 정상 처리되었습니다.
+  - 재현 가능한 실패 케이스는 확인되지 않았고, 회귀 방지를 위해 테스트만 추가했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sql_parser_engine::tests::end_with_label_closes_block_and_splits_next_statement`
+- `sql_parser_engine::tests::compound_trigger_for_each_row_header_does_not_affect_statement_split`
+
+### [검증]
+- `cargo test end_with_label_closes_block_and_splits_next_statement -- --nocapture` 통과
+- `cargo test compound_trigger_for_each_row_header_does_not_affect_statement_split -- --nocapture` 통과
+- `cargo test -- --test-threads=1` 통과

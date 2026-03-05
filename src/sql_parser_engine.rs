@@ -2477,4 +2477,45 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn end_with_label_closes_block_and_splits_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END done_label;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("END done_label"));
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_for_each_row_header_does_not_affect_statement_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_each_row");
+        engine.process_line("FOR UPDATE ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE EACH ROW IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE EACH ROW;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "expected trigger + select split");
+        assert!(
+            statements[0].contains("END BEFORE EACH ROW"),
+            "compound trigger body should remain intact: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
 }
