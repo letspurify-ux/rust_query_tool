@@ -255,6 +255,19 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE" | "UNNEST" | "TABLE")
 }
 
+fn relation_function_name_hint(table_name: &str) -> Option<String> {
+    table_name
+        .split('@')
+        .next()
+        .and_then(|name_without_dblink| {
+            name_without_dblink
+                .rsplit('.')
+                .find(|segment| !segment.trim().is_empty())
+        })
+        .map(strip_identifier_quotes)
+        .map(|name| name.to_ascii_uppercase())
+}
+
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
     matches!(keyword, "FUNCTION" | "PROCEDURE")
 }
@@ -995,6 +1008,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             {
                                 let (alias, after_alias) = parse_alias_deep(tokens, next_idx);
                                 let alias_present = alias.is_some();
+                                let relation_name_hint = relation_function_name_hint(&table_name);
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
                                 all_tables.push(ParsedTableEntry {
                                     table: ScopedTableRef {
@@ -1016,7 +1030,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     if sym == "(" && !alias_present {
                                         // Preserve table-function name for immediate
                                         // parenthesized argument scope handling.
-                                        last_word = Some(upper.clone());
+                                        last_word = relation_name_hint;
                                     } else {
                                         last_word = None;
                                     }
