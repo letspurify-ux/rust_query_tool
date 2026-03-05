@@ -118,8 +118,16 @@ fn phase_join_using_clause() {
     assert!(ctx.phase.is_column_context());
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"EMPLOYEES".to_string()), "tables: {:?}", names);
-    assert!(names.contains(&"DEPARTMENTS".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "tables: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"DEPARTMENTS".to_string()),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -1175,6 +1183,51 @@ fn lateral_keyword_is_not_parsed_as_left_table_alias() {
 }
 
 #[test]
+fn sample_clause_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE (10) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SAMPLE")),
+        "SAMPLE clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("PARTITION")),
+        "PARTITION clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn tablesample_keyword_is_not_parsed_as_table_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("TABLESAMPLE")),
+        "TABLESAMPLE clause keyword must not become alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn cross_apply_subquery_can_see_outer_table_scope() {
     let ctx = analyze("SELECT * FROM oqt_t_emp jt CROSS APPLY (SELECT jt.| FROM dual) it");
     let names = table_names(&ctx);
@@ -1257,6 +1310,58 @@ fn table_wrapper_collection_expression_keeps_alias() {
             .iter()
             .any(|table| table.alias.as_deref() == Some("c")),
         "TABLE(collection_expression) should still allow alias-driven completion: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_extension_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM sales PARTITION (p202401) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("PARTITION")),
+        "PARTITION clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following PARTITION clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flashback_as_of_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees AS OF SCN (12345) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("AS")),
+        "AS OF clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following AS OF clause should be collected: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|table| (&table.name, &table.alias))
@@ -2051,6 +2156,23 @@ fn overlay_from_does_not_trigger_from_clause() {
     let ctx = analyze("SELECT OVERLAY(name PLACING 'X' FROM | FOR 1) FROM emp");
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     assert!(ctx.phase.is_column_context());
+}
+
+
+#[test]
+fn position_from_does_not_trigger_from_clause() {
+    // POSITION(sub IN source) uses IN, but POSITION(sub FROM source) is allowed in some dialects
+    // and should not be interpreted as a SQL FROM clause.
+    let ctx = analyze("SELECT POSITION('a' FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn real_from_after_position_still_works() {
+    let ctx = analyze("SELECT POSITION('a' FROM name) FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
 }
 
 #[test]

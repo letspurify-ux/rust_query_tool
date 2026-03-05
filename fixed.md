@@ -1,5 +1,28 @@
 # 예외 처리 보완 내역
 
+## 2026-03-04 인텔리센스 누락 구문 보완 (`POSITION(... FROM ...)` 함수 구문)
+
+### [중] `POSITION(... FROM ...)` 내부 `FROM`을 SQL `FROM` 절로 오인식하던 문제 수정
+- **증상**:
+  - `SELECT POSITION('a' FROM |) FROM emp` 위치에서 컨텍스트가 `FromClause`로 잘못 계산되어 컬럼 컨텍스트 추천이 깨질 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 함수 내부 `FROM` 예외 목록(`is_from_consuming_function`)에 `POSITION`이 누락되어 있었습니다.
+- **수정**:
+  - `is_from_consuming_function`에 `POSITION`을 추가해 함수 내부 `FROM`을 clause 전이에서 제외했습니다.
+
+### [유사 케이스] 실제 외부 `FROM` 절 감지 회귀 확인
+- `SELECT POSITION('a' FROM name) FROM |` 형태에서 외부 `FROM`은 계속 정상적으로 `FromClause`로 인식되는지 테스트로 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `position_from_does_not_trigger_from_clause`
+- `real_from_after_position_still_works`
+
+### [검증]
+- `cargo test -q position_from_does_not_trigger_from_clause -- --nocapture` 통과
+- `cargo test -q real_from_after_position_still_works -- --nocapture` 통과
+- `cargo test -q intellisense_context::tests -- --test-threads=1` 통과
+
+
 ## 2026-03-04 인텔리센스 누락 구문 보완 (`ONLY(...)` / `TABLE(...)` relation wrapper)
 
 ### [중] FROM 절 relation wrapper를 테이블명으로 해석하지 못해 별칭 기반 컬럼 추천이 누락되던 문제 수정
@@ -1278,6 +1301,31 @@
 - `cargo test -q recovers_to_associate_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
 
+## 2026-03-04 인텔리센스 FROM 확장 구문 별칭 파싱 보완 (`PARTITION` / `SUBPARTITION` / `SAMPLE` / `AS OF`)
+
+### [중] 테이블 postfix 절을 별칭으로 오인식해 스코프 해석이 깨지던 문제 수정
+- **증상**:
+  - `SELECT * FROM sales PARTITION (p202401) s WHERE s.|`
+  - `SELECT * FROM employees AS OF SCN (12345) e WHERE e.|`
+  - 위 형태에서 `PARTITION` 또는 `AS`가 별칭으로 잘못 파싱되거나, 실제 별칭(`s`, `e`) 수집이 누락될 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `parse_alias_deep`가 테이블명 직후 토큰만 확인해 별칭을 해석하고,
+  - Oracle FROM postfix 절(`PARTITION(...)`, `SUBPARTITION(...)`, `SAMPLE(...)`, `SEED(...)`, `AS OF ...`)을 건너뛰지 않았습니다.
+- **수정**:
+  - `skip_relation_postfix_clauses`를 추가하고 `parse_alias_deep` 시작 지점에서 postfix 절을 먼저 건너뛰도록 변경했습니다.
+  - `AS` 키워드는 `AS OF`(flashback clause)일 때 별칭 분기로 진입하지 않도록 가드 처리했습니다.
+
+### [유사 케이스] Oracle relation extension 일괄 보강
+- 발견된 버그와 동일 계열인 `PARTITION/SUBPARTITION`, `SAMPLE/SEED`, `AS OF`를 공통 스킵 경로로 묶어 후속 오탐 가능성을 함께 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `partition_extension_before_alias_is_not_parsed_as_alias`
+- `flashback_as_of_before_alias_is_not_parsed_as_alias`
+
+### [검증]
+- `cargo test -q partition_extension_before_alias_is_not_parsed_as_alias -- --nocapture` 통과
+- `cargo test -q flashback_as_of_before_alias_is_not_parsed_as_alias -- --nocapture` 통과
+- `cargo test -- --test-threads=1` 전체 통과
 ## 2026-03-04 Oracle 공통 파서 엔진 `WITH FUNCTION/PROCEDURE` 복구 로직 일괄 보강 (`is_statement_head_keyword` 재사용)
 
 ### [중] `split_script_items` / `split_format_items`가 복구 대상 키워드를 하드코딩해 누락 구문이 계속 재발하던 문제 수정
@@ -1338,3 +1386,31 @@
 - `cargo test -q language_clause_without_external -- --nocapture` 통과
 - `cargo test -q language_parameters_without_external_keyword -- --nocapture` 통과
 - `cargo test` 전체 통과
+## 2026-03-06 인텔리센스 누락 구문 보완 (FROM 절 후행 샘플링/파티션 절 alias 오인식)
+
+### [중] `SAMPLE`/`TABLESAMPLE`/`PARTITION`/`SUBPARTITION`/`VERSIONS` 절 키워드를 테이블 alias로 오인식하던 문제 수정
+- **증상**:
+  - `SELECT * FROM oqt_t_emp SAMPLE (10) WHERE |`
+  - `SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |`
+  - `SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |`
+  - 위와 같은 FROM 절 후행 절에서 키워드가 관계 alias로 인식될 수 있어, qualifier 해석과 컬럼 추천 우선순위가 오염될 가능성이 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 alias 차단 키워드 집합(`is_relation_alias_breaker`)과
+  - relation 종료 키워드 집합(`is_table_stop_keyword`)에 Oracle/ANSI 후행 relation 절 키워드 일부가 누락되어 있었습니다.
+- **수정**:
+  - 두 키워드 집합에 `SAMPLE`, `TABLESAMPLE`, `PARTITION`, `SUBPARTITION`, `VERSIONS`를 추가해
+  - 해당 토큰들이 relation alias/테이블명으로 해석되지 않도록 일괄 보강했습니다.
+
+### [유사 케이스] 동일 계열 후행 relation 절 키워드 일괄 점검 및 차단
+- 발견된 오탐 패턴(후행 절 키워드 alias 오인식)과 동일한 계열의 키워드를 함께 반영해 재발 가능성을 줄였습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sample_clause_keyword_is_not_parsed_as_table_alias`
+- `partition_keyword_is_not_parsed_as_table_alias`
+- `tablesample_keyword_is_not_parsed_as_table_alias`
+
+### [검증]
+- `cargo test -q sample_clause_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q partition_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q tablesample_keyword_is_not_parsed_as_table_alias` 통과
+- `cargo test -q` 전체 통과

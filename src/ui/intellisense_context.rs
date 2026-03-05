@@ -246,7 +246,7 @@ pub fn analyze_cursor_context(
 fn is_from_consuming_function(name: &str) -> bool {
     matches!(
         name,
-        "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY"
+        "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY" | "POSITION"
     )
 }
 
@@ -1359,12 +1359,15 @@ fn parse_relation_wrapper_table_name(
 
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
-    let start = skip_comment_tokens(tokens, start);
+    let start = skip_relation_postfix_clauses(tokens, start);
     if let Some(SqlToken::Word(word)) = tokens.get(start) {
         let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
         let upper = word.to_ascii_uppercase();
         if upper == "AS" {
             let alias_idx = skip_comment_tokens(tokens, start + 1);
+            if matches!(next_word_upper(tokens, start + 1), Some((next, _)) if next == "OF") {
+                return (None, skip_relation_postfix_clauses(tokens, start));
+            }
             if let Some(SqlToken::Word(alias)) = tokens.get(alias_idx) {
                 if !is_identifier_word_token(alias) {
                     return (None, alias_idx + 1);
@@ -1381,6 +1384,57 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
         }
     }
     (None, start)
+}
+
+fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
+    let mut idx = skip_comment_tokens(tokens, start);
+
+    loop {
+        let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+            break;
+        };
+
+        let upper = word.to_ascii_uppercase();
+        match upper.as_str() {
+            "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" => {
+                let open_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                    idx = extract_parenthesized_range(tokens, open_idx)
+                        .map(|(_, next_idx)| next_idx)
+                        .unwrap_or(open_idx.saturating_add(1));
+                    idx = skip_comment_tokens(tokens, idx);
+                    continue;
+                }
+                break;
+            }
+            "AS" => {
+                let of_idx = skip_comment_tokens(tokens, idx + 1);
+                if !matches!(tokens.get(of_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("OF"))
+                {
+                    break;
+                }
+
+                let mut cursor = skip_comment_tokens(tokens, of_idx + 1);
+                if matches!(tokens.get(cursor), Some(SqlToken::Word(kind)) if kind.eq_ignore_ascii_case("SCN") || kind.eq_ignore_ascii_case("TIMESTAMP"))
+                {
+                    cursor = skip_comment_tokens(tokens, cursor + 1);
+                }
+
+                if matches!(tokens.get(cursor), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                    idx = extract_parenthesized_range(tokens, cursor)
+                        .map(|(_, next_idx)| next_idx)
+                        .unwrap_or(cursor.saturating_add(1));
+                } else {
+                    idx = cursor.saturating_add(1);
+                }
+                idx = skip_comment_tokens(tokens, idx);
+                continue;
+            }
+            _ => break,
+        }
+    }
+
+    idx
 }
 
 fn skip_comment_tokens(tokens: &[SqlToken], mut idx: usize) -> usize {
@@ -1498,6 +1552,11 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "MODEL"
             | "MATCH_RECOGNIZE"
             | "USING"
+            | "SAMPLE"
+            | "TABLESAMPLE"
+            | "PARTITION"
+            | "SUBPARTITION"
+            | "VERSIONS"
     )
 }
 
@@ -1546,6 +1605,11 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "SELECT"
             | "FROM"
             | "INTO"
+            | "SAMPLE"
+            | "TABLESAMPLE"
+            | "PARTITION"
+            | "SUBPARTITION"
+            | "VERSIONS"
     )
 }
 
