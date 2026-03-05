@@ -2923,6 +2923,57 @@ mod tests {
     }
 
     #[test]
+    fn with_function_followed_by_recursive_with_query_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("WITH r (n) AS (");
+        engine.process_line("  SELECT 1 FROM dual");
+        engine.process_line("  UNION ALL");
+        engine.process_line("  SELECT n + 1 FROM r WHERE n < 3");
+        engine.process_line(")");
+        engine.process_line("SELECT * FROM r;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH r (n) AS"),
+            "recursive WITH should stay attached to WITH FUNCTION statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].ends_with("SELECT * FROM r"),
+            "main query should remain attached: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
+    fn with_function_followed_by_non_recursive_with_query_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("WITH cte AS (SELECT f() AS v FROM dual)");
+        engine.process_line("SELECT v FROM cte;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH cte AS"),
+            "CTE WITH should be treated as a valid main query head: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
     fn with_clause_multiple_plsql_declarations_keep_main_query_attached() {
         let mut engine = SqlParserEngine::new();
 
