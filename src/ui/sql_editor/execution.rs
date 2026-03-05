@@ -2962,7 +2962,7 @@ impl SqlEditorWidget {
 
         let mut parts: Vec<Vec<SqlToken>> = Vec::new();
 
-        for part in split_top_level_keyword_groups(tokens, &break_keywords) {
+        for part in split_top_level_keyword_groups(tokens, break_keywords) {
             parts.push(part.into_iter().cloned().collect());
         }
 

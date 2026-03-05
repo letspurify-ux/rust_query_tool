@@ -162,6 +162,7 @@ enum SemicolonPolicy {
     Default,
     ForceSplit,
     CloseRoutineBlock,
+    AwaitingImplicitTopLevelDecision,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -196,6 +197,15 @@ impl RoutineFrame {
     fn mark_external_clause(&mut self) {
         self.semicolon_policy = if self.block_depth == 1 {
             SemicolonPolicy::ForceSplit
+        } else {
+            SemicolonPolicy::CloseRoutineBlock
+        };
+        self.external_clause_state = ExternalClauseState::Confirmed;
+    }
+
+    fn mark_implicit_language_target_on_semicolon(&mut self) {
+        self.semicolon_policy = if self.block_depth == 1 {
+            SemicolonPolicy::AwaitingImplicitTopLevelDecision
         } else {
             SemicolonPolicy::CloseRoutineBlock
         };
@@ -248,20 +258,23 @@ impl RoutineFrame {
             return;
         }
 
-        if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-            self.external_clause_state = ExternalClauseState::None;
-        } else if self.external_clause_state == ExternalClauseState::SawImplicitLanguageTarget {
-            self.external_clause_state = ExternalClauseState::None;
-        }
-    }
-
-    fn finalize_external_clause_on_semicolon(&mut self) {
         if matches!(
             self.external_clause_state,
             ExternalClauseState::SawExternalKeyword
                 | ExternalClauseState::SawImplicitLanguageTarget
         ) {
+            self.external_clause_state = ExternalClauseState::None;
+        }
+    }
+
+    fn finalize_external_clause_on_semicolon(&mut self) {
+        if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
             self.mark_external_clause();
+            return;
+        }
+
+        if self.external_clause_state == ExternalClauseState::SawImplicitLanguageTarget {
+            self.mark_implicit_language_target_on_semicolon();
         }
     }
 }
@@ -559,6 +572,7 @@ pub(crate) struct SplitState {
 
     // -- Reusable buffer --
     token_upper_buf: String,
+    pending_implicit_external_top_level_split: bool,
 }
 
 impl SplitState {
@@ -631,12 +645,10 @@ impl SplitState {
         }
     }
 
-    fn is_type_create(&self) -> bool {
+    fn type_as_is_awaits_declarative_kind(&self) -> bool {
         matches!(
             self.create_plsql_kind,
-            CreatePlsqlKind::TypeSpecAwaitingBody
-                | CreatePlsqlKind::TypeSpec
-                | CreatePlsqlKind::TypeBody
+            CreatePlsqlKind::TypeSpecAwaitingBody | CreatePlsqlKind::TypeSpec
         )
     }
 
@@ -904,7 +916,7 @@ impl SplitState {
             } else {
                 self.block_stack.push(BlockKind::AsIs);
             }
-            if self.is_type_create()
+            if self.type_as_is_awaits_declarative_kind()
                 && self.as_is_state != AsIsState::AwaitingNestedSubprogram
                 && as_is_block_start != AsIsBlockStart::TimingPoint
             {
@@ -1051,8 +1063,15 @@ impl SplitState {
             return;
         }
 
+        let current_depth = self.block_depth();
         if let Some(frame) = self.routine_is_stack.last_mut() {
             frame.finalize_external_clause_on_semicolon();
+            if frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
+                && frame.block_depth == current_depth
+                && frame.block_depth == 1
+            {
+                self.pending_implicit_external_top_level_split = true;
+            }
         }
     }
 
@@ -1070,6 +1089,7 @@ impl SplitState {
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
         self.top_level_token_state = TopLevelTokenState::NoneSeen;
+        self.pending_implicit_external_top_level_split = false;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -1325,6 +1345,10 @@ impl SqlParserEngine {
 
     pub(crate) fn paren_depth(&self) -> usize {
         self.state.paren_depth
+    }
+
+    pub(crate) fn can_terminate_on_slash(&self) -> bool {
+        self.block_depth() == 0 || self.state.pending_implicit_external_top_level_split
     }
 
     pub(crate) fn is_trigger(&self) -> bool {
@@ -1638,6 +1662,26 @@ impl SqlParserEngine {
             }
 
             if sql_text::is_identifier_char(c) {
+                if self.state.pending_implicit_external_top_level_split
+                    && self.state.block_depth() == 1
+                    && self.state.paren_depth == 0
+                    && self.state.token.is_empty()
+                {
+                    if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
+                        if candidate_upper == "BEGIN" {
+                            self.state.pending_implicit_external_top_level_split = false;
+                        } else if sql_text::is_with_main_query_keyword(&candidate_upper)
+                            || sql_text::is_statement_head_keyword(&candidate_upper)
+                        {
+                            self.push_current_statement();
+                            self.reset_statement_local_state();
+                            self.state.reset_create_state();
+                        } else {
+                            self.state.pending_implicit_external_top_level_split = false;
+                        }
+                    }
+                }
+
                 if self.state.in_with_plsql_declaration()
                     && self.state.with_clause_waiting_main_query()
                     && self.state.block_depth() == 0
@@ -2534,9 +2578,9 @@ mod tests {
         assert_eq!(engine.state.paren_depth, 0);
     }
     #[test]
-    fn type_as_is_follow_state_is_cleared_by_declarative_kind_token() {
+    fn type_spec_as_is_follow_state_is_cleared_by_declarative_kind_token() {
         let mut state = SplitState {
-            create_plsql_kind: CreatePlsqlKind::TypeBody,
+            create_plsql_kind: CreatePlsqlKind::TypeSpec,
             ..SplitState::default()
         };
 
@@ -2545,6 +2589,20 @@ mod tests {
 
         state.handle_block_openers("OBJECT", EndTokenRole::None);
         assert!(state.block_stack.is_empty());
+    }
+
+    #[test]
+    fn type_body_as_is_does_not_clear_on_type_declarative_kind_tokens() {
+        let mut state = SplitState {
+            create_plsql_kind: CreatePlsqlKind::TypeBody,
+            ..SplitState::default()
+        };
+
+        state.handle_block_openers("AS", EndTokenRole::None);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
+
+        state.handle_block_openers("TABLE", EndTokenRole::None);
+        assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
     }
 
     #[test]
@@ -2674,6 +2732,33 @@ mod tests {
         assert!(statements[0].contains("parameters NUMBER := 2;"));
         assert!(statements[0].contains("calling NUMBER := 3;"));
         assert!(statements[0].contains("with NUMBER := 4;"));
+        assert!(statements[0].contains("END"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_identifier_with_language_target_like_datatype_does_not_force_external_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_shadow_c IS");
+        engine.process_line("  language c;");
+        engine.process_line("  language java;");
+        engine.process_line("  language javascript;");
+        engine.process_line("  language python;");
+        engine.process_line("  marker NUMBER := 1;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow_c IS"));
+        assert!(statements[0].contains("language c;"));
+        assert!(statements[0].contains("language java;"));
+        assert!(statements[0].contains("language javascript;"));
+        assert!(statements[0].contains("language python;"));
+        assert!(statements[0].contains("marker NUMBER := 1;"));
         assert!(statements[0].contains("END"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
@@ -2880,6 +2965,72 @@ mod tests {
                 "SELECT 1 FROM dual".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn type_body_local_table_type_declaration_does_not_split_member_body() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE BODY t_local_types AS");
+        engine.process_line("  MEMBER PROCEDURE p IS");
+        engine.process_line("    TYPE num_tab IS TABLE OF NUMBER;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END;");
+        engine.process_line("END t_local_types;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TYPE BODY t_local_types AS"),
+            "first statement should preserve TYPE BODY header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("TYPE num_tab IS TABLE OF NUMBER;"),
+            "local TABLE type declaration should remain in TYPE BODY: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END t_local_types"),
+            "TYPE BODY should close at final END: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn type_body_local_ref_cursor_type_declaration_does_not_split_member_body() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE BODY t_local_ref AS");
+        engine.process_line("  MEMBER PROCEDURE p IS");
+        engine.process_line("    TYPE rc_t IS REF CURSOR;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END;");
+        engine.process_line("END t_local_ref;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TYPE BODY t_local_ref AS"),
+            "first statement should preserve TYPE BODY header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("TYPE rc_t IS REF CURSOR;"),
+            "local REF CURSOR type declaration should remain in TYPE BODY: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END t_local_ref"),
+            "TYPE BODY should close at final END: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
     }
 
     #[test]

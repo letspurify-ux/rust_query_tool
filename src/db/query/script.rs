@@ -2643,7 +2643,7 @@ impl QueryExecutor {
 
             if builder.is_idle() && trimmed == "/" {
                 builder.prepare_slash_terminator();
-                if builder.block_depth() == 0 {
+                if builder.can_terminate_on_slash() {
                     if !builder.current_is_empty() {
                         for stmt in builder.force_terminate_and_take_statements() {
                             add_statement(stmt, &mut items);
@@ -2788,7 +2788,7 @@ impl QueryExecutor {
 
             if builder.is_idle() && trimmed == "/" {
                 builder.prepare_slash_terminator();
-                if builder.block_depth() == 0 {
+                if builder.can_terminate_on_slash() {
                     if !builder.current_is_empty() {
                         for stmt in builder.force_terminate_and_take_statements() {
                             add_statement(stmt, &mut items);

@@ -344,10 +344,9 @@ fn unnest_relation_alias_is_collected_after_function_arguments() {
     let ctx = analyze("SELECT u.| FROM orders o, UNNEST(o.items) u WHERE o.id = 1");
 
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| table.name.eq_ignore_ascii_case("u")
-                && table.alias.as_deref() == Some("u")),
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("u") && table.alias.as_deref() == Some("u")
+        ),
         "UNNEST relation alias should be collected after function arguments: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -361,10 +360,9 @@ fn table_function_with_ordinality_keeps_alias_after_postfix_clause() {
     let ctx = analyze("SELECT u.| FROM orders o, UNNEST(o.items) WITH ORDINALITY u");
 
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| table.name.eq_ignore_ascii_case("u")
-                && table.alias.as_deref() == Some("u")),
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("u") && table.alias.as_deref() == Some("u")
+        ),
         "WITH ORDINALITY postfix should not block alias parsing: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -432,7 +430,6 @@ fn phase_qualify_clause_is_column_context() {
     assert!(ctx.phase.is_column_context());
 }
 
-
 #[test]
 fn phase_limit_clause_is_not_table_context() {
     let ctx = analyze("SELECT a FROM t LIMIT |");
@@ -462,7 +459,6 @@ fn phase_fetch_clause_is_not_table_context() {
     let names = table_names(&ctx);
     assert!(names.contains(&"T".to_string()), "tables: {:?}", names);
 }
-
 
 #[test]
 fn phase_update_set() {
@@ -1633,6 +1629,68 @@ fn sample_clause_keyword_is_not_parsed_as_table_alias() {
 }
 
 #[test]
+fn sample_block_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE BLOCK (10) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("BLOCK")),
+        "SAMPLE BLOCK clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following SAMPLE BLOCK clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sample_block_seed_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE BLOCK (10) SEED (7) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("BLOCK")),
+        "SAMPLE BLOCK clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SEED")),
+        "SAMPLE SEED clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following SAMPLE BLOCK ... SEED clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn partition_keyword_is_not_parsed_as_table_alias() {
     let ctx = analyze("SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |");
     assert!(
@@ -1803,7 +1861,6 @@ fn partition_extension_before_alias_is_not_parsed_as_alias() {
             .collect::<Vec<_>>()
     );
 }
-
 
 #[test]
 fn with_clause_before_alias_is_not_parsed_as_alias() {
@@ -2647,15 +2704,81 @@ fn match_recognize_spaced_keywords_are_not_parsed_as_table_aliases() {
 }
 
 #[test]
+fn match_recognize_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT mr.| FROM oqt_t_emp MATCH_RECOGNIZE (PARTITION BY deptno ORDER BY empno PATTERN (a) DEFINE a AS sal > 0) mr",
+    );
+
+    let alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("mr"))
+    });
+    assert!(
+        alias.is_some(),
+        "match_recognize alias mr should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("mr", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "match_recognize alias should resolve for qualifiers, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn match_recognize_spaced_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT mrs.| FROM oqt_t_emp MATCH RECOGNIZE (PARTITION BY deptno ORDER BY empno PATTERN (a) DEFINE a AS sal > 0) mrs",
+    );
+
+    let alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("mrs"))
+    });
+    assert!(
+        alias.is_some(),
+        "spaced MATCH RECOGNIZE alias mrs should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("mrs", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "spaced MATCH RECOGNIZE alias should resolve for qualifiers, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn pivot_clause_alias_is_collected_for_qualifier_resolution() {
     let ctx = analyze(
         "SELECT p.| FROM (SELECT deptno, job, sal FROM oqt_t_emp) PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p",
     );
 
-    let pivot_alias = ctx
-        .tables_in_scope
-        .iter()
-        .find(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("p")));
+    let pivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("p"))
+    });
     assert!(
         pivot_alias.is_some(),
         "pivot clause alias p should be present, tables: {:?}",
@@ -2676,17 +2799,18 @@ fn pivot_clause_alias_is_collected_for_qualifier_resolution() {
     );
 }
 
-
 #[test]
 fn unpivot_clause_alias_is_collected_for_qualifier_resolution() {
     let ctx = analyze(
         "SELECT u.| FROM (SELECT deptno, sal FROM oqt_t_emp) UNPIVOT (amount FOR metric IN (sal AS 'SAL')) u",
     );
 
-    let unpivot_alias = ctx
-        .tables_in_scope
-        .iter()
-        .find(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("u")));
+    let unpivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("u"))
+    });
     assert!(
         unpivot_alias.is_some(),
         "unpivot clause alias u should be present, tables: {:?}",
@@ -2700,6 +2824,197 @@ fn unpivot_clause_alias_is_collected_for_qualifier_resolution() {
     assert!(
         !resolved.is_empty(),
         "unpivot clause alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pivot_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
+    let ctx =
+        analyze("SELECT p.| FROM oqt_t_emp PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p");
+
+    let pivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("p"))
+    });
+    assert!(
+        pivot_alias.is_some(),
+        "pivot clause alias p should be present for base table source, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("p", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "pivot base-table alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pivot_xml_clause_alias_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT px.| FROM (SELECT deptno, job, sal FROM oqt_t_emp) PIVOT XML (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) px",
+    );
+
+    let pivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("px"))
+    });
+    assert!(
+        pivot_alias.is_some(),
+        "pivot xml alias px should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("px", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "pivot xml alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unpivot_include_nulls_clause_alias_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT un.| FROM (SELECT deptno, sal, bonus FROM oqt_t_emp) UNPIVOT INCLUDE NULLS (amount FOR metric IN (sal AS 'SAL', bonus AS 'BONUS')) un",
+    );
+
+    let unpivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("un"))
+    });
+    assert!(
+        unpivot_alias.is_some(),
+        "unpivot include nulls alias un should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("un", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "unpivot include nulls alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unpivot_exclude_nulls_clause_alias_after_base_table_is_collected() {
+    let ctx = analyze(
+        "SELECT ux.| FROM oqt_t_emp UNPIVOT EXCLUDE NULLS (amount FOR metric IN (sal AS 'SAL')) ux",
+    );
+
+    let unpivot_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("ux"))
+    });
+    assert!(
+        unpivot_alias.is_some(),
+        "unpivot exclude nulls alias ux should be present for base table source, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("ux", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "unpivot exclude nulls base-table alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn model_clause_alias_after_base_table_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT md.| FROM oqt_t_emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES (sal[deptno] = sal[deptno]) md",
+    );
+
+    let model_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("md"))
+    });
+    assert!(
+        model_alias.is_some(),
+        "model clause alias md should be present for base table source, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("md", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "model base-table alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn model_clause_alias_after_subquery_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT ms.| FROM (SELECT deptno, sal FROM oqt_t_emp) MODEL DIMENSION BY (deptno) MEASURES (sal) RULES (sal[deptno] = sal[deptno]) ms",
+    );
+
+    let model_alias = ctx.tables_in_scope.iter().find(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("ms"))
+    });
+    assert!(
+        model_alias.is_some(),
+        "model clause alias ms should be present for subquery source, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("ms", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "model subquery alias should be collected, tables: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|table| (&table.name, &table.alias))

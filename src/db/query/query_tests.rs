@@ -1162,6 +1162,82 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_type_body_local_table_type_declaration_followed_by_select_splits() {
+    let sql = r#"CREATE OR REPLACE TYPE BODY t_local_types AS
+  MEMBER PROCEDURE p IS
+    TYPE num_tab IS TABLE OF NUMBER;
+  BEGIN
+    NULL;
+  END;
+END t_local_types;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "TYPE BODY with local TABLE type declaration should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE BODY t_local_types AS"),
+        "first statement should keep full TYPE BODY: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("TYPE num_tab IS TABLE OF NUMBER;"),
+        "TYPE BODY should keep local TABLE type declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 1 FROM dual"),
+        "trailing SELECT should remain separate statement"
+    );
+}
+
+#[test]
+fn test_split_format_items_type_body_local_ref_cursor_type_declaration_splits() {
+    let sql = r#"CREATE OR REPLACE TYPE BODY t_local_ref AS
+  MEMBER PROCEDURE p IS
+    TYPE rc_t IS REF CURSOR;
+  BEGIN
+    NULL;
+  END;
+END t_local_ref;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep TYPE BODY with local REF CURSOR type as one statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE BODY t_local_ref AS"),
+        "first formatted statement should keep full TYPE BODY: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("TYPE rc_t IS REF CURSOR;"),
+        "first formatted statement should keep local REF CURSOR type declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "trailing SELECT should remain separate formatted statement: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_procedure_name_language_library_identifiers_do_not_trigger_external_split() {
     let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow IS
   name NUMBER := 1;
@@ -1230,6 +1306,75 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_procedure_language_identifier_with_language_targets_do_not_trigger_external_split() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow_targets IS
+  language c;
+  language java;
+  language javascript;
+  language python;
+  marker NUMBER := 1;
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE + external-target-like datatype declarations must not trigger EXTERNAL split, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow_targets IS"));
+    assert!(stmts[0].contains("language c;"));
+    assert!(stmts[0].contains("language java;"));
+    assert!(stmts[0].contains("language javascript;"));
+    assert!(stmts[0].contains("language python;"));
+    assert!(stmts[0].contains("marker NUMBER := 1;"));
+    assert!(stmts[0].contains("END"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_language_identifier_with_language_targets_do_not_trigger_external_split()
+{
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_shadow_targets IS
+  language c;
+  language java;
+  language javascript;
+  language python;
+  marker NUMBER := 1;
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items must keep LANGUAGE + external-target-like datatype declarations inside routine body: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_shadow_targets IS"));
+    assert!(stmts[0].contains("language c;"));
+    assert!(stmts[0].contains("language java;"));
+    assert!(stmts[0].contains("language javascript;"));
+    assert!(stmts[0].contains("language python;"));
+    assert!(stmts[0].contains("marker NUMBER := 1;"));
+    assert!(stmts[0].contains("END"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_external_function_language_clause_without_external_keyword_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
 AS LANGUAGE C NAME 'ext_lang_only';
@@ -1292,6 +1437,61 @@ SELECT 1 FROM dual;"#;
         stmts
     );
     assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_language_clause_without_external_suffix_with_slash_still_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER
+AS LANGUAGE C;
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE target-only call spec with slash delimiter should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_clause_without_external_suffix_with_slash_still_splits(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER
+AS LANGUAGE C;
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE target-only call spec with slash and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert_eq!(
+        slash_count, 1,
+        "expected one slash terminator, got: {items:?}"
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER"));
     assert!(stmts[0].contains("AS LANGUAGE C"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }

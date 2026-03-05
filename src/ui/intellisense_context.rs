@@ -1047,7 +1047,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     next_idx
                                 };
-                                let (alias, after_alias) = parse_alias_deep(tokens, relation_arg_end);
+                                let (alias, after_alias) =
+                                    parse_alias_deep(tokens, relation_arg_end);
+                                let alias = alias.or_else(|| {
+                                    parse_alias_after_derived_relation_clauses(
+                                        tokens,
+                                        relation_arg_end,
+                                    )
+                                });
                                 let alias_present = alias.is_some();
                                 let scope_id = *scope_stack.last().unwrap_or(&0);
                                 let is_lateral_table_function = relation_name_hint
@@ -1565,9 +1572,7 @@ fn parse_relation_wrapper_table_name(
         return None;
     }
 
-    let Some((inner_range, next_idx)) = extract_parenthesized_range(tokens, open_idx) else {
-        return None;
-    };
+    let (inner_range, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
     let inner_tokens = token_range_slice(tokens, inner_range);
 
     // TABLE(...) may contain collection function calls or scalar subqueries.
@@ -1613,6 +1618,14 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
     (None, start)
 }
 
+fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
+    let derived_end = skip_derived_relation_postfix_clauses(tokens, start);
+    if derived_end == start {
+        return None;
+    }
+    parse_alias_deep(tokens, derived_end).0
+}
+
 fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
     let mut idx = skip_comment_tokens(tokens, start);
 
@@ -1634,13 +1647,16 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                     idx = skip_comment_tokens(tokens, idx + 1);
                     continue;
                 }
-                let open_idx = skip_comment_tokens(tokens, idx + 1);
-                let open_idx = match tokens.get(open_idx) {
-                    Some(SqlToken::Word(_)) if upper == "TABLESAMPLE" => {
-                        skip_comment_tokens(tokens, open_idx + 1)
+                let mut open_idx = skip_comment_tokens(tokens, idx + 1);
+                if upper == "TABLESAMPLE" {
+                    if matches!(tokens.get(open_idx), Some(SqlToken::Word(_))) {
+                        open_idx = skip_comment_tokens(tokens, open_idx + 1);
                     }
-                    _ => open_idx,
-                };
+                } else if upper == "SAMPLE"
+                    && matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BLOCK"))
+                {
+                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                }
                 if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                     idx = extract_parenthesized_range(tokens, open_idx)
                         .map(|(_, next_idx)| next_idx)
@@ -1815,13 +1831,37 @@ fn skip_derived_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> u
         };
 
         let upper = word.to_ascii_uppercase();
+        if upper == "MODEL" {
+            idx = skip_model_clause(tokens, idx + 1);
+            continue;
+        }
+
         let clause_open_idx = match upper.as_str() {
-            "PIVOT" | "UNPIVOT" | "MODEL" | "MATCH_RECOGNIZE" => {
-                skip_comment_tokens(tokens, idx + 1)
+            "PIVOT" => {
+                let mut open_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("XML"))
+                {
+                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                }
+                open_idx
             }
+            "UNPIVOT" => {
+                let mut open_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("INCLUDE") || next.eq_ignore_ascii_case("EXCLUDE"))
+                {
+                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                    if matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("NULLS"))
+                    {
+                        open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                    }
+                }
+                open_idx
+            }
+            "MATCH_RECOGNIZE" => skip_comment_tokens(tokens, idx + 1),
             "MATCH" => {
                 let recognize_idx = skip_comment_tokens(tokens, idx + 1);
-                if !matches!(tokens.get(recognize_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("RECOGNIZE")) {
+                if !matches!(tokens.get(recognize_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("RECOGNIZE"))
+                {
                     break;
                 }
                 skip_comment_tokens(tokens, recognize_idx + 1)
@@ -1841,6 +1881,61 @@ fn skip_derived_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> u
     idx
 }
 
+fn skip_model_clause(tokens: &[SqlToken], start: usize) -> usize {
+    let mut idx = skip_comment_tokens(tokens, start);
+    let mut saw_rules = false;
+    let mut expect_rules_option_paren = false;
+
+    while idx < tokens.len() {
+        idx = skip_comment_tokens(tokens, idx);
+        let Some(token) = tokens.get(idx) else {
+            break;
+        };
+
+        match token {
+            SqlToken::Word(word) => {
+                let upper = word.to_ascii_uppercase();
+                if !saw_rules {
+                    if upper == "RULES" {
+                        saw_rules = true;
+                        idx += 1;
+                        continue;
+                    }
+                    // Malformed MODEL clause recovery: stop when another relation
+                    // boundary starts before RULES appears.
+                    if is_join_keyword(&upper) || is_table_stop_keyword(&upper) {
+                        break;
+                    }
+                    idx += 1;
+                    continue;
+                }
+
+                if matches!(upper.as_str(), "ITERATE" | "UNTIL") {
+                    expect_rules_option_paren = true;
+                }
+                idx += 1;
+            }
+            SqlToken::Symbol(sym) if sym == "(" => {
+                let next_idx = extract_parenthesized_range(tokens, idx)
+                    .map(|(_, next_idx)| next_idx)
+                    .unwrap_or(idx.saturating_add(1));
+                if saw_rules && !expect_rules_option_paren {
+                    // First non-option parenthesized block after RULES is the
+                    // model rules body; alias, if any, starts right after it.
+                    return next_idx;
+                }
+                expect_rules_option_paren = false;
+                idx = next_idx;
+            }
+            SqlToken::Symbol(sym) if sym == "," || sym == ")" => break,
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+
+    idx
+}
 
 /// Parse an alias after a subquery closing ')'.
 fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
