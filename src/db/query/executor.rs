@@ -44,107 +44,78 @@ impl QueryExecutor {
 
     fn tokenized_upper(sql: &str) -> Vec<String> {
         let mut normalized = String::with_capacity(sql.len());
-        let bytes = sql.as_bytes();
-        let mut i = 0usize;
+        let mut chars = sql.chars().peekable();
         let mut in_single_quote = false;
         let mut in_double_quote = false;
         let mut in_line_comment = false;
         let mut in_block_comment = false;
 
-        while i < bytes.len() {
-            let b = bytes[i];
-            let next = bytes.get(i + 1).copied();
+        while let Some(ch) = chars.next() {
+            let next = chars.peek().copied();
 
             if in_line_comment {
-                if b == b'\n' {
+                if ch == '\n' {
                     in_line_comment = false;
                     normalized.push(' ');
                 }
-                i += 1;
                 continue;
             }
 
             if in_block_comment {
-                if b == b'*' && next == Some(b'/') {
+                if ch == '*' && next == Some('/') {
                     in_block_comment = false;
                     normalized.push(' ');
-                    i += 2;
+                    let _ = chars.next();
                     continue;
                 }
-                i += 1;
                 continue;
             }
 
             if in_single_quote {
-                if b == b'\'' {
-                    if next == Some(b'\'') {
-                        i += 2;
+                if ch == '\'' {
+                    if next == Some('\'') {
+                        let _ = chars.next();
                         continue;
                     }
                     in_single_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
             if in_double_quote {
-                if b == b'"' {
-                    if next == Some(b'"') {
-                        i += 2;
+                if ch == '"' {
+                    if next == Some('"') {
+                        let _ = chars.next();
                         continue;
                     }
                     in_double_quote = false;
                 }
-                i += 1;
                 continue;
             }
 
-            if b == b'-' && next == Some(b'-') {
+            if ch == '-' && next == Some('-') {
                 in_line_comment = true;
-                i += 2;
+                let _ = chars.next();
                 continue;
             }
 
-            if b == b'/' && next == Some(b'*') {
+            if ch == '/' && next == Some('*') {
                 in_block_comment = true;
-                i += 2;
+                let _ = chars.next();
                 continue;
             }
 
-            if b == b'\'' {
+            if ch == '\'' {
                 in_single_quote = true;
-                i += 1;
                 continue;
             }
 
-            if b == b'"' {
+            if ch == '"' {
                 in_double_quote = true;
-                i += 1;
                 continue;
             }
 
-            // Push current character to normalized using byte offsets.
-            // ASCII bytes are pushed directly; multi-byte UTF-8 characters are
-            // advanced by computing the char length from the first byte pattern.
-            if b.is_ascii() {
-                normalized.push(b as char);
-                i += 1;
-            } else {
-                let ch_len = if b & 0xF8 == 0xF0 {
-                    4
-                } else if b & 0xF0 == 0xE0 {
-                    3
-                } else if b & 0xE0 == 0xC0 {
-                    2
-                } else {
-                    1
-                };
-                let end = (i + ch_len).min(bytes.len());
-                if let Some(s) = sql.get(i..end) {
-                    normalized.push_str(s);
-                }
-                i = end;
-            }
+            normalized.push(ch);
         }
 
         normalized
