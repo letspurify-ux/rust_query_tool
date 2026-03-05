@@ -2587,6 +2587,74 @@ fn extract_table_function_columns_includes_nested_columns_clause() {
 }
 
 #[test]
+fn xmltable_arguments_can_resolve_left_relation_alias() {
+    let ctx = analyze(
+        "SELECT * \
+         FROM oqt_t_xml x \
+         CROSS JOIN XMLTABLE('/rows/row' PASSING x.| COLUMNS id NUMBER PATH '@id') xt",
+    );
+    let resolved = resolve_qualifier_tables("x", &ctx.tables_in_scope);
+    assert!(
+        resolved
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_xml")),
+        "xmltable argument should resolve left table alias: {:?}",
+        resolved
+    );
+}
+
+#[test]
+fn unqualified_json_table_keeps_left_relation_scope() {
+    let ctx = analyze(
+        "SELECT * \
+         FROM oqt_t_json j \
+         CROSS JOIN json_table(j.|, '$' COLUMNS (id NUMBER PATH '$.id')) jt",
+    );
+    let resolved = resolve_qualifier_tables("j", &ctx.tables_in_scope);
+    assert!(
+        resolved
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_json")),
+        "lowercase json_table should keep left table alias visible: {:?}",
+        resolved
+    );
+}
+
+#[test]
+fn schema_qualified_json_table_keeps_left_relation_scope() {
+    let ctx = analyze(
+        "SELECT * \
+         FROM oqt_t_json j \
+         CROSS JOIN SYS.JSON_TABLE(j.|, '$' COLUMNS (id NUMBER PATH '$.id')) jt",
+    );
+    let resolved = resolve_qualifier_tables("j", &ctx.tables_in_scope);
+    assert!(
+        resolved
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_json")),
+        "schema-qualified json_table should keep left table alias visible: {:?}",
+        resolved
+    );
+}
+
+#[test]
+fn dblink_json_table_keeps_left_relation_scope() {
+    let ctx = analyze(
+        "SELECT * \
+         FROM oqt_t_json j \
+         CROSS JOIN JSON_TABLE@REMDB(j.|, '$' COLUMNS (id NUMBER PATH '$.id')) jt",
+    );
+    let resolved = resolve_qualifier_tables("j", &ctx.tables_in_scope);
+    assert!(
+        resolved
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_json")),
+        "dblink json_table should keep left table alias visible: {:?}",
+        resolved
+    );
+}
+
+#[test]
 fn extract_select_list_leading_qualifiers_reads_incomplete_references() {
     let tokens = tokenize("SELECT jt., jt., jt. FROM dual");
     let qualifiers = extract_select_list_leading_qualifiers(&tokens);
