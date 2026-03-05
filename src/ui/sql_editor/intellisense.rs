@@ -140,28 +140,28 @@ impl SqlEditorWidget {
             InValuesOrSelectBody,
         }
 
-        fn starts_insert_body(word: &str) -> bool {
-            word.eq_ignore_ascii_case("VALUES")
-                || word.eq_ignore_ascii_case("SELECT")
-                || word.eq_ignore_ascii_case("WITH")
-        }
-
-        fn transition_insert_parse_state(state: InsertParseState, word: &str) -> InsertParseState {
-            if word.eq_ignore_ascii_case("INSERT") {
-                return InsertParseState::AfterInsert;
+        impl InsertParseState {
+            fn starts_insert_body(word: &str) -> bool {
+                word.eq_ignore_ascii_case("VALUES")
+                    || word.eq_ignore_ascii_case("SELECT")
+                    || word.eq_ignore_ascii_case("WITH")
             }
 
-            match state {
-                InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
-                    InsertParseState::AfterInto
+            fn next_for_word(self, word: &str) -> Self {
+                if word.eq_ignore_ascii_case("INSERT") {
+                    return Self::AfterInsert;
                 }
-                InsertParseState::AfterInto => InsertParseState::AfterTarget,
-                InsertParseState::AfterTarget | InsertParseState::AfterColumnList
-                    if starts_insert_body(word) =>
-                {
-                    InsertParseState::InValuesOrSelectBody
+
+                match self {
+                    Self::AfterInsert if word.eq_ignore_ascii_case("INTO") => Self::AfterInto,
+                    Self::AfterInto => Self::AfterTarget,
+                    Self::AfterTarget | Self::AfterColumnList
+                        if Self::starts_insert_body(word) =>
+                    {
+                        Self::InValuesOrSelectBody
+                    }
+                    current => current,
                 }
-                current => current,
             }
         }
 
@@ -173,14 +173,11 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
-                    let next_state = transition_insert_parse_state(state, word);
-                    if matches!(next_state, InsertParseState::AfterInsert) {
-                        state = next_state;
+                    state = state.next_for_word(word);
+                    if matches!(state, InsertParseState::AfterInsert) {
                         depth = 0;
                         continue;
                     }
-
-                    state = next_state;
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     if matches!(state, InsertParseState::AfterTarget) {
@@ -192,10 +189,11 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Symbol(sym) if sym == ")" => {
                     if depth > 0 {
-                        if let InsertParseState::InColumnList { start_depth } = state {
-                            if start_depth == depth {
-                                state = InsertParseState::AfterColumnList;
-                            }
+                        if matches!(
+                            state,
+                            InsertParseState::InColumnList { start_depth } if start_depth == depth
+                        ) {
+                            state = InsertParseState::AfterColumnList;
                         }
                         depth -= 1;
                     }
