@@ -1323,7 +1323,9 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         | SqlPhase::SetClause
         | SqlPhase::ConnectByClause
         | SqlPhase::StartWithClause
-        | SqlPhase::PivotClause => SqlContext::ColumnName,
+        | SqlPhase::PivotClause
+        | SqlPhase::MatchRecognizeClause
+        | SqlPhase::ModelClause => SqlContext::ColumnName,
         _ => SqlContext::General,
     }
 }
@@ -1507,6 +1509,36 @@ mod intellisense_tests {
     #[test]
     fn detect_sql_context_pivot_for_expression_is_column_name() {
         let sql_with_cursor = "WITH s AS (SELECT DEPTNO, job, sal FROM oqt_t_emp) SELECT * FROM s PIVOT (SUM(sal) AS sum_sal FOR | IN (10 AS D10))";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_match_recognize_define_is_column_name() {
+        let sql_with_cursor =
+            "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY dept ORDER BY ts DEFINE A AS |)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn detect_sql_context_model_measures_is_column_name() {
+        let sql_with_cursor =
+            "SELECT * FROM sales MODEL DIMENSION BY (deptno) MEASURES (|) RULES ()";
         let cursor = sql_with_cursor
             .find('|')
             .expect("expected cursor marker in SQL");
