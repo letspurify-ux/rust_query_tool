@@ -8274,6 +8274,38 @@ fn test_split_script_items_oracle_parenthesized_with_function_cte_splits_normall
 }
 
 #[test]
+fn test_split_script_items_oracle_recursive_search_cycle_set_clauses_not_tool_commands() {
+    let sql = "WITH t (id, parent_id) AS (\n  SELECT 1, NULL FROM dual\n  UNION ALL\n  SELECT id + 1, id FROM t WHERE id < 3\n)\nSEARCH DEPTH FIRST BY id SET order_col\nCYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'\nSELECT id, parent_id FROM t;\nSELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "recursive WITH SEARCH/CYCLE clauses must remain in a single SQL statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("SEARCH DEPTH FIRST BY id SET order_col"),
+        "SEARCH ... SET clause should remain in first statement: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("CYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'"),
+        "CYCLE ... SET clause should remain in first statement: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 2 FROM dual");
+
+    assert!(
+        items
+            .iter()
+            .all(|item| !matches!(item, ScriptItem::ToolCommand(_))),
+        "SEARCH/CYCLE SET clauses must not be parsed as SQL*Plus SET tool commands: {items:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_create_view_as_with_function_keeps_single_statement() {
     let sql = "CREATE OR REPLACE VIEW v_with_fn AS\nWITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() AS v FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
