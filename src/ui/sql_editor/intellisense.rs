@@ -430,31 +430,37 @@ impl SqlEditorWidget {
     }
 
     fn invoke_void_callback(callback_slot: &Arc<Mutex<Option<Box<dyn FnMut()>>>>) -> bool {
+        Self::invoke_callback(callback_slot, "find/replace callback", |cb| cb())
+    }
+
+    fn invoke_file_drop_callback(
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
+        path: PathBuf,
+    ) -> bool {
+        Self::invoke_callback(callback_slot, "file drop callback", move |cb| cb(path))
+    }
+
+    fn invoke_callback<TCallback, TInvoker>(
+        callback_slot: &Arc<Mutex<Option<TCallback>>>,
+        callback_name: &str,
+        invoker: TInvoker,
+    ) -> bool
+    where
+        TInvoker: FnOnce(&mut TCallback),
+    {
         let callback = {
-            let mut slot = match callback_slot.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
-                    poisoned.into_inner()
-                }
-            };
+            let mut slot = Self::lock_callback_slot(callback_slot);
             slot.take()
         };
 
         if let Some(mut cb) = callback {
-            let result = panic::catch_unwind(AssertUnwindSafe(&mut cb));
-            let mut slot = match callback_slot.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
-                    poisoned.into_inner()
-                }
-            };
+            let result = panic::catch_unwind(AssertUnwindSafe(|| invoker(&mut cb)));
+            let mut slot = Self::lock_callback_slot(callback_slot);
             if slot.is_none() {
                 *slot = Some(cb);
             }
             if let Err(payload) = result {
-                Self::log_callback_panic("find/replace callback", payload.as_ref());
+                Self::log_callback_panic(callback_name, payload.as_ref());
             }
             true
         } else {
@@ -462,39 +468,15 @@ impl SqlEditorWidget {
         }
     }
 
-    fn invoke_file_drop_callback(
-        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
-        path: PathBuf,
-    ) -> bool {
-        let callback = {
-            let mut slot = match callback_slot.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
-                    poisoned.into_inner()
-                }
-            };
-            slot.take()
-        };
-
-        if let Some(mut cb) = callback {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| cb(path)));
-            let mut slot = match callback_slot.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    eprintln!("Warning: callback slot lock was poisoned; recovering.");
-                    poisoned.into_inner()
-                }
-            };
-            if slot.is_none() {
-                *slot = Some(cb);
+    fn lock_callback_slot<TCallback>(
+        callback_slot: &Arc<Mutex<Option<TCallback>>>,
+    ) -> std::sync::MutexGuard<'_, Option<TCallback>> {
+        match callback_slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("Warning: callback slot lock was poisoned; recovering.");
+                poisoned.into_inner()
             }
-            if let Err(payload) = result {
-                Self::log_callback_panic("file drop callback", payload.as_ref());
-            }
-            true
-        } else {
-            false
         }
     }
 
