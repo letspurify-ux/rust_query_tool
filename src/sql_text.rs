@@ -50,8 +50,10 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "BY",
     "CACHE",
     "CALL",
+    "CALLING",
     "CASCADE",
     "CASE",
+    "CAST",
     "CHECK",
     "CHUNK",
     "CLASS",
@@ -91,7 +93,9 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CROSS",
     "CUME_DIST",
     "CURRENT",
+    "CURRENT_DATE",
     "CURRENT_SCHEMA",
+    "CURRENT_TIMESTAMP",
     "CURRENT_USER",
     "CURRVAL",
     "CURSOR",
@@ -99,6 +103,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "DATABASE",
     "DATE",
     "DAY",
+    "DBTIMEZONE",
     "DEBUG",
     "DECLARE",
     "DECODE",
@@ -220,6 +225,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "KEEP",
     "KEY",
     "LAG",
+    "LANGUAGE",
     "LAST",
     "LAST_VALUE",
     "LATERAL",
@@ -235,6 +241,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "LISTAGG",
     "LOB",
     "LOCAL",
+    "LOCALTIMESTAMP",
     "LOCK",
     "LOCKED",
     "LOGGING",
@@ -260,6 +267,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "MODEL",
     "MONITORING",
     "MONTH",
+    "NAME",
     "NATURAL",
     "NAV",
     "NCHAR",
@@ -330,6 +338,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PACKAGE",
     "PARALLEL",
     "PARALLEL_ENABLE",
+    "PARAMETERS",
     "PARTITION",
     "PASSING",
     "PASSWORD",
@@ -416,6 +425,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SAVEPOINT",
     "SCHEMA",
     "SCN",
+    "SEARCH",
     "SECOND",
     "SECUREFILE",
     "SEED",
@@ -426,6 +436,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SERIALIZABLE",
     "SERVEROUTPUT",
     "SESSION",
+    "SESSIONTIMEZONE",
     "SET",
     "SETTINGS",
     "SHARING",
@@ -609,6 +620,16 @@ pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
 const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
 
 const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON"];
+
+const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
+    "EXTERNAL",
+    "LANGUAGE",
+    "NAME",
+    "LIBRARY",
+    "PARAMETERS",
+    "CALLING",
+    "WITH",
+];
 
 pub(crate) const FORMAT_COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
     "CONSTRAINT",
@@ -834,6 +855,11 @@ pub(crate) fn is_external_language_target_keyword(word: &str) -> bool {
     matches_keyword(word, EXTERNAL_LANGUAGE_TARGET_KEYWORDS)
 }
 
+/// Returns true when a token participates in Oracle EXTERNAL routine clauses.
+pub(crate) fn is_external_language_clause_keyword(word: &str) -> bool {
+    matches_keyword(word, EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS)
+}
+
 /// Returns true when a token starts a CREATE TABLE column constraint section.
 pub(crate) fn is_format_column_constraint_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_COLUMN_CONSTRAINT_KEYWORDS)
@@ -907,6 +933,8 @@ mod tests {
         assert!(is_with_plsql_declaration_keyword("FUNCTION"));
         assert!(is_with_plsql_declaration_keyword("procedure"));
         assert!(is_external_language_target_keyword("javascript"));
+        assert!(is_external_language_clause_keyword("LANGUAGE"));
+        assert!(is_external_language_clause_keyword("parameters"));
         assert!(is_format_column_constraint_keyword("generated"));
     }
 }

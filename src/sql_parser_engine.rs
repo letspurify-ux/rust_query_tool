@@ -221,37 +221,37 @@ impl RoutineFrame {
             }
         }
 
-        match token_upper {
-            "EXTERNAL" => {
-                self.external_clause_state = ExternalClauseState::SawExternalKeyword;
-            }
-            "LANGUAGE" => {
-                self.external_clause_state =
-                    if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-                        ExternalClauseState::AwaitingLanguageTargetFromExternal
-                    } else {
-                        ExternalClauseState::AwaitingLanguageTargetImplicit
-                    };
-            }
-            "NAME" | "LIBRARY" | "PARAMETERS" | "CALLING" | "WITH" => {
-                if matches!(
-                    self.external_clause_state,
-                    ExternalClauseState::SawExternalKeyword
-                        | ExternalClauseState::SawImplicitLanguageTarget
-                        | ExternalClauseState::Confirmed
-                ) {
-                    self.mark_external_clause();
-                }
-            }
-            _ => {
+        if token_upper == "EXTERNAL" {
+            self.external_clause_state = ExternalClauseState::SawExternalKeyword;
+            return;
+        }
+
+        if token_upper == "LANGUAGE" {
+            self.external_clause_state =
                 if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-                    self.external_clause_state = ExternalClauseState::None;
-                } else if self.external_clause_state
-                    == ExternalClauseState::SawImplicitLanguageTarget
-                {
-                    self.external_clause_state = ExternalClauseState::None;
-                }
+                    ExternalClauseState::AwaitingLanguageTargetFromExternal
+                } else {
+                    ExternalClauseState::AwaitingLanguageTargetImplicit
+                };
+            return;
+        }
+
+        if sql_text::is_external_language_clause_keyword(token_upper) {
+            if matches!(
+                self.external_clause_state,
+                ExternalClauseState::SawExternalKeyword
+                    | ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::Confirmed
+            ) {
+                self.mark_external_clause();
             }
+            return;
+        }
+
+        if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
+            self.external_clause_state = ExternalClauseState::None;
+        } else if self.external_clause_state == ExternalClauseState::SawImplicitLanguageTarget {
+            self.external_clause_state = ExternalClauseState::None;
         }
     }
 }
