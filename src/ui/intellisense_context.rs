@@ -884,8 +884,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "SET" => {
-                        if matches!(current_phase, SqlPhase::WithClause | SqlPhase::OrderByClause)
-                            && matches!(cte_state, CteState::Inactive)
+                        if matches!(
+                            current_phase,
+                            SqlPhase::WithClause | SqlPhase::OrderByClause
+                        ) && matches!(cte_state, CteState::Inactive)
                         {
                             // Recursive CTE SEARCH/CYCLE clauses use `... BY ... SET ...`
                             // where SET is not a DML SET clause.
@@ -1420,7 +1422,8 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
                         let mut dblink_parts = vec![normalize_table_name_part(link_part)];
                         dblink_idx += 1;
 
-                        while matches!(tokens.get(dblink_idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+                        while matches!(tokens.get(dblink_idx), Some(SqlToken::Symbol(sym)) if sym == ".")
+                        {
                             if let Some(SqlToken::Word(link_part)) = tokens.get(dblink_idx + 1) {
                                 if !is_identifier_word_token(link_part) {
                                     break;
@@ -1776,6 +1779,8 @@ fn is_join_keyword(word: &str) -> bool {
             | "CROSS"
             | "OUTER"
             | "NATURAL"
+            | "SEMI"
+            | "ANTI"
             | "LATERAL"
             | "APPLY"
             | "STRAIGHT_JOIN"
@@ -1837,6 +1842,8 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "CROSS"
             | "OUTER"
             | "NATURAL"
+            | "SEMI"
+            | "ANTI"
             | "LATERAL"
             | "APPLY"
             | "STRAIGHT_JOIN"
