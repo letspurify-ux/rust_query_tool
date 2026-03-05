@@ -24,9 +24,8 @@ use crate::db::{
     QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
 use crate::sql_text::{
-    self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS,
-    FORMAT_CLAUSE_KEYWORDS, FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS,
-    FORMAT_JOIN_MODIFIER_KEYWORDS,
+    self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
+    FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
 use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
@@ -1132,9 +1131,9 @@ impl SqlEditorWidget {
         let join_keyword = "JOIN";
         let outer_keyword = "OUTER";
         let condition_keywords = FORMAT_CONDITION_KEYWORDS; // ELSE handled separately for IF blocks
-                                                              // BEGIN is handled separately to support DECLARE ... BEGIN ... END blocks
-                                                              // CASE is handled separately for SELECT vs PL/SQL context
-                                                              // LOOP is handled separately for FOR ... LOOP on same line
+                                                            // BEGIN is handled separately to support DECLARE ... BEGIN ... END blocks
+                                                            // CASE is handled separately for SELECT vs PL/SQL context
+                                                            // LOOP is handled separately for FOR ... LOOP on same line
         let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
         let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
 
@@ -2766,27 +2765,11 @@ impl SqlEditorWidget {
             let mut type_tokens: Vec<SqlToken> = Vec::new();
             let mut rest_tokens: Vec<SqlToken> = Vec::new();
             let mut in_type = true;
-            let constraint_keywords = [
-                "CONSTRAINT",
-                "NOT",
-                "NULL",
-                "DEFAULT",
-                "PRIMARY",
-                "UNIQUE",
-                "CHECK",
-                "REFERENCES",
-                "ENABLE",
-                "DISABLE",
-                "USING",
-                "COLLATE",
-                "GENERATED",
-                "IDENTITY",
-            ];
 
             for token in tokens_iter {
                 let is_constraint_token = match token {
                     SqlToken::Word(word) => {
-                        constraint_keywords.contains(&word.to_uppercase().as_str())
+                        sql_text::is_format_column_constraint_keyword(word.as_str())
                     }
                     _ => false,
                 };

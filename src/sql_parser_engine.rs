@@ -1154,7 +1154,7 @@ impl SplitState {
             return;
         }
 
-        if matches!(upper, "FUNCTION" | "PROCEDURE") {
+        if sql_text::is_with_plsql_declaration_keyword(upper) {
             self.with_clause_state =
                 WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
             return;
@@ -1176,7 +1176,9 @@ impl SplitState {
 
         if self.block_depth() == 0 {
             match self.with_clause_state {
-                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration) => {
+                WithClauseState::InPlsqlDeclaration(
+                    WithDeclarationState::CollectingDeclaration,
+                ) => {
                     self.with_clause_state = WithClauseState::InPlsqlDeclaration(
                         WithDeclarationState::CollectingDeclaration,
                     );
@@ -1256,7 +1258,7 @@ fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
 
 #[inline]
 fn is_external_language_target(token_upper: &str) -> bool {
-    matches!(token_upper, "C" | "JAVA" | "JAVASCRIPT" | "PYTHON")
+    sql_text::is_external_language_target_keyword(token_upper)
 }
 
 // ---------------------------------------------------------------------------
