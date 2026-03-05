@@ -3310,6 +3310,33 @@ SHOW ERRORS"#;
 }
 
 #[test]
+fn test_compound_trigger_after_statement_splits_following_statement() {
+    let sql = r#"CREATE OR REPLACE TRIGGER test_compound_after_stmt
+FOR UPDATE ON test_tab
+COMPOUND TRIGGER
+  AFTER STATEMENT IS
+  BEGIN
+    NULL;
+  END AFTER STATEMENT;
+END test_compound_after_stmt;
+
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "compound trigger should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("END AFTER STATEMENT"),
+        "first statement should keep timing-point END: {}",
+        stmts[0]
+    );
+    assert_eq!(stmts[1], "SELECT 1 FROM dual");
+}
+
+#[test]
 fn test_create_view_with_subqueries_and_like_patterns() {
     // CREATE VIEW with:
     // - Subqueries in CASE WHEN (SELECT ... IN (subquery))
