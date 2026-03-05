@@ -2208,6 +2208,65 @@ mod tests {
     }
 
     #[test]
+    fn create_view_as_with_procedure_keeps_statement_open_until_main_select_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE VIEW v_with_proc AS");
+        engine.process_line("WITH");
+        engine.process_line("  PROCEDURE p IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END;");
+        engine.process_line("SELECT 1 AS v FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE VIEW v_with_proc AS"),
+            "first statement should preserve CREATE VIEW header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("PROCEDURE p IS"),
+            "first statement should preserve WITH PROCEDURE declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("SELECT 1 AS v FROM dual"),
+            "first statement should include main SELECT body: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
+    fn compound_trigger_with_each_row_timing_point_splits_on_outer_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_each_row");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE EACH ROW IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE EACH ROW;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END BEFORE EACH ROW"),
+            "first statement should preserve EACH ROW timing point closure: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 3 FROM dual"));
+    }
+
+    #[test]
     fn finalize_clears_transient_parser_state_for_reuse() {
         let mut engine = SqlParserEngine::new();
         engine.process_line("FOR i IN 1..10");
