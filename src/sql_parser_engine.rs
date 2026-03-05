@@ -576,6 +576,27 @@ pub(crate) struct SplitState {
 }
 
 impl SplitState {
+    fn active_routine_frame_mut(&mut self) -> Option<&mut RoutineFrame> {
+        let current_depth = self.block_depth();
+        self.routine_is_stack
+            .last_mut()
+            .filter(|frame| frame.block_depth == current_depth)
+    }
+
+    fn pop_case_block(&mut self) {
+        if self.top_is_case() {
+            let _ = self.block_stack.pop();
+            return;
+        }
+
+        if let Some(pos) = self.block_stack.iter().rposition(|k| *k == BlockKind::Case) {
+            self.block_stack.remove(pos);
+            return;
+        }
+
+        let _ = self.block_stack.pop();
+    }
+
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
@@ -735,15 +756,7 @@ impl SplitState {
 
     /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY semicolon behavior.
     fn handle_routine_is_external(&mut self, upper: &str) {
-        if self
-            .routine_is_stack
-            .last()
-            .is_none_or(|frame| frame.block_depth != self.block_depth())
-        {
-            return;
-        }
-
-        if let Some(frame) = self.routine_is_stack.last_mut() {
+        if let Some(frame) = self.active_routine_frame_mut() {
             frame.observe_external_clause_token(upper);
         }
     }
@@ -773,18 +786,7 @@ impl SplitState {
         }
         match suffix {
             Some(PendingEndSuffix::Case) => {
-                // END CASE – pop CASE from stack
-                if self.top_is_case() {
-                    self.block_stack.pop();
-                } else {
-                    // Fallback: pop topmost CASE if any
-                    if let Some(pos) = self.block_stack.iter().rposition(|k| *k == BlockKind::Case)
-                    {
-                        self.block_stack.remove(pos);
-                    } else {
-                        self.block_stack.pop();
-                    }
-                }
+                self.pop_case_block();
             }
             Some(PendingEndSuffix::If) => {
                 self.pop_block_of_kind(BlockKind::If);
@@ -1074,19 +1076,9 @@ impl SplitState {
     }
 
     fn finalize_external_clause_on_semicolon(&mut self) {
-        if self
-            .routine_is_stack
-            .last()
-            .is_none_or(|frame| frame.block_depth != self.block_depth())
-        {
-            return;
-        }
-
-        let current_depth = self.block_depth();
-        if let Some(frame) = self.routine_is_stack.last_mut() {
+        if let Some(frame) = self.active_routine_frame_mut() {
             frame.finalize_external_clause_on_semicolon();
             if frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
-                && frame.block_depth == current_depth
                 && frame.block_depth == 1
             {
                 self.pending_implicit_external_top_level_split = true;
