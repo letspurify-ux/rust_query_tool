@@ -326,29 +326,13 @@ impl IntellisenseData {
         let column_only = prefer_columns && prefix_upper.is_empty();
 
         if prefer_columns && include_columns {
-            match column_tables {
-                Some(tables) if !tables.is_empty() => {
-                    for table in tables {
-                        if let Some(cols) = self.column_entries_for_scope_table(table) {
-                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    if !prefix_upper.is_empty() {
-                        self.ensure_all_columns_entries();
-                        let _ = Self::push_entries(
-                            &self.all_columns_entries,
-                            &prefix_upper,
-                            &mut suggestions,
-                            &mut seen,
-                        );
-                    }
-                }
-            }
+            self.append_column_suggestions(
+                &prefix_upper,
+                column_tables,
+                false,
+                &mut suggestions,
+                &mut seen,
+            );
             if column_only && !suggestions.is_empty() {
                 Self::dedup_suggestions_case_insensitive(&mut suggestions);
                 suggestions.truncate(MAX_SUGGESTIONS);
@@ -475,29 +459,13 @@ impl IntellisenseData {
         }
 
         if include_columns && !prefer_columns {
-            match column_tables {
-                Some(tables) if !tables.is_empty() => {
-                    for table in tables {
-                        if let Some(cols) = self.column_entries_for_scope_table(table) {
-                            if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    if !prefix_upper.is_empty() {
-                        self.ensure_all_columns_entries();
-                        let _ = Self::push_entries(
-                            &self.all_columns_entries,
-                            &prefix_upper,
-                            &mut suggestions,
-                            &mut seen,
-                        );
-                    }
-                }
-            }
+            self.append_column_suggestions(
+                &prefix_upper,
+                column_tables,
+                false,
+                &mut suggestions,
+                &mut seen,
+            );
         }
 
         Self::dedup_suggestions_case_insensitive(&mut suggestions);
@@ -516,26 +484,13 @@ impl IntellisenseData {
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
 
-        match column_tables {
-            Some(tables) if !tables.is_empty() => {
-                for table in tables {
-                    if let Some(cols) = self.column_entries_for_scope_table(table) {
-                        if Self::push_entries(cols, &prefix_upper, &mut suggestions, &mut seen) {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {
-                self.ensure_all_columns_entries();
-                let _ = Self::push_entries(
-                    &self.all_columns_entries,
-                    &prefix_upper,
-                    &mut suggestions,
-                    &mut seen,
-                );
-            }
-        }
+        self.append_column_suggestions(
+            &prefix_upper,
+            column_tables,
+            true,
+            &mut suggestions,
+            &mut seen,
+        );
 
         Self::dedup_suggestions_case_insensitive(&mut suggestions);
         suggestions.truncate(MAX_SUGGESTIONS);
@@ -560,6 +515,38 @@ impl IntellisenseData {
             .get(key)
             .map(Vec::as_slice)
             .or_else(|| self.column_entries_by_table.get(key).map(Vec::as_slice))
+    }
+
+    fn append_column_suggestions(
+        &mut self,
+        prefix_upper: &str,
+        column_tables: Option<&[String]>,
+        allow_empty_prefix_global: bool,
+        suggestions: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        match column_tables {
+            Some(tables) if !tables.is_empty() => {
+                for table in tables {
+                    if let Some(cols) = self.column_entries_for_scope_table(table) {
+                        if Self::push_entries(cols, prefix_upper, suggestions, seen) {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {
+                if allow_empty_prefix_global || !prefix_upper.is_empty() {
+                    self.ensure_all_columns_entries();
+                    let _ = Self::push_entries(
+                        &self.all_columns_entries,
+                        prefix_upper,
+                        suggestions,
+                        seen,
+                    );
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
