@@ -277,6 +277,20 @@ fn should_enter_with_clause(
     depth > 0 && last_word.is_none()
 }
 
+fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize> {
+    let (next_keyword, next_idx) = next_word_upper(tokens, start_idx)?;
+    if next_keyword == "BY" {
+        return Some(next_idx);
+    }
+    if next_keyword == "SIBLINGS" {
+        let (tail_keyword, tail_idx) = next_word_upper(tokens, next_idx + 1)?;
+        if tail_keyword == "BY" {
+            return Some(tail_idx);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct ParsedTableEntry {
     table: ScopedTableRef,
@@ -832,11 +846,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "ORDER" => {
-                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
-                            if next_keyword == "BY" {
-                                depth_frames[depth].phase = SqlPhase::OrderByClause;
-                                idx = next_idx; // skip BY (and any interleaved comments)
-                            }
+                        if let Some(by_idx) = find_order_by_keyword(tokens, idx + 1) {
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            idx = by_idx; // skip BY (and any interleaved comments)
                         }
                         relation_state.clear();
                     }
