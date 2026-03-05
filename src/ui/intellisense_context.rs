@@ -1559,7 +1559,7 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
 
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
-            "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" => {
+            "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" | "WITH" => {
                 let open_idx = skip_comment_tokens(tokens, idx + 1);
                 let open_idx = match tokens.get(open_idx) {
                     Some(SqlToken::Word(_)) if upper == "TABLESAMPLE" => {
@@ -1820,6 +1820,7 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "HAVING"
             | "CONNECT"
             | "START"
+            | "WITH"
             | "UNION"
             | "INTERSECT"
             | "EXCEPT"
@@ -1879,6 +1880,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "HAVING"
             | "CONNECT"
             | "START"
+            | "WITH"
             | "UNION"
             | "INTERSECT"
             | "EXCEPT"
