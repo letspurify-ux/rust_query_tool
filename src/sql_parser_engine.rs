@@ -122,6 +122,18 @@ impl PendingEndSuffix {
             _ => None,
         }
     }
+
+    fn closing_block_kind(self) -> Option<BlockKind> {
+        match self {
+            Self::Case => None,
+            Self::If => Some(BlockKind::If),
+            Self::Loop => Some(BlockKind::Loop),
+            Self::While => Some(BlockKind::While),
+            Self::Repeat => Some(BlockKind::Repeat),
+            Self::For => Some(BlockKind::For),
+            Self::TimingPoint => Some(BlockKind::TimingPoint),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -307,6 +319,14 @@ impl PendingDo {
                 armed_at_block_depth,
             } if armed_at_block_depth == current_block_depth => Some(BlockKind::For),
             _ => None,
+        }
+    }
+
+    fn arm_for_token(self, token_upper: &str, armed_at_block_depth: usize) -> Self {
+        match token_upper {
+            "WHILE" => self.arm_for_while(armed_at_block_depth),
+            "FOR" => self.arm_for_for(armed_at_block_depth),
+            _ => self,
         }
     }
 }
@@ -784,34 +804,22 @@ impl SplitState {
         if self.pending_end != PendingEnd::End {
             return;
         }
-        match suffix {
-            Some(PendingEndSuffix::Case) => {
+
+        if let Some(suffix) = suffix {
+            if suffix == PendingEndSuffix::Case {
                 self.pop_case_block();
+            } else if let Some(kind) = suffix.closing_block_kind() {
+                self.pop_block_of_kind(kind);
             }
-            Some(PendingEndSuffix::If) => {
-                self.pop_block_of_kind(BlockKind::If);
-            }
-            Some(PendingEndSuffix::Loop) => {
-                self.pop_block_of_kind(BlockKind::Loop);
-            }
-            Some(PendingEndSuffix::While) => {
-                self.pop_block_of_kind(BlockKind::While);
-            }
-            Some(PendingEndSuffix::Repeat) => {
-                self.pop_block_of_kind(BlockKind::Repeat);
-            }
-            Some(PendingEndSuffix::For) => {
-                self.pop_block_of_kind(BlockKind::For);
-            }
-            Some(PendingEndSuffix::TimingPoint) => {
-                self.pop_block_of_kind(BlockKind::TimingPoint);
+
+            if suffix == PendingEndSuffix::TimingPoint {
                 self.timing_point_state = TimingPointState::None;
             }
-            None => {
-                // Plain END – CASE expression or PL/SQL block
-                self.resolve_plain_end();
-            }
+        } else {
+            // Plain END – CASE expression or PL/SQL block
+            self.resolve_plain_end();
         }
+
         self.pending_end = PendingEnd::None;
     }
 
@@ -853,25 +861,19 @@ impl SplitState {
             self.block_stack.push(BlockKind::Repeat);
         }
 
-        // WHILE ... DO
-        if upper == "WHILE"
+        // WHILE/FOR ... DO
+        if matches!(upper, "WHILE" | "FOR")
             && self.pending_end == PendingEnd::None
-            && !end_token_role.is_suffix(PendingEndSuffix::While)
+            && !(end_token_role.is_suffix(PendingEndSuffix::While)
+                || end_token_role.is_suffix(PendingEndSuffix::For))
         {
-            self.pending_do =
-                std::mem::take(&mut self.pending_do).arm_for_while(self.block_depth());
-        }
-
-        // FOR ... DO
-        if upper == "FOR"
-            && self.pending_end == PendingEnd::None
-            && !end_token_role.is_suffix(PendingEndSuffix::For)
-        {
-            let is_trigger_header_for =
-                self.in_create_plsql() && self.is_trigger() && self.block_depth() == 0;
+            let is_trigger_header_for = upper == "FOR"
+                && self.in_create_plsql()
+                && self.is_trigger()
+                && self.block_depth() == 0;
             if !is_trigger_header_for {
                 self.pending_do =
-                    std::mem::take(&mut self.pending_do).arm_for_for(self.block_depth());
+                    std::mem::take(&mut self.pending_do).arm_for_token(upper, self.block_depth());
             }
         }
 
@@ -1229,7 +1231,6 @@ impl SplitState {
             self.with_clause_state = WithClauseState::None;
             return;
         }
-
     }
 }
 
