@@ -1817,6 +1817,77 @@ SELECT 1 FROM DUAL;"#;
 }
 
 #[test]
+fn test_slash_terminator_after_end_without_semicolon() {
+    let sql = r#"CREATE PROCEDURE test_proc AS
+BEGIN
+  NULL;
+END
+/
+SELECT 1 FROM DUAL;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "END followed by SQL*Plus slash without semicolon should still split, got: {:?}",
+        stmts
+    );
+}
+
+#[test]
+fn test_split_format_items_slash_terminator_after_end_without_semicolon() {
+    let sql = r#"CREATE PROCEDURE test_proc AS
+BEGIN
+  NULL;
+END
+/
+SELECT 1 FROM DUAL;"#;
+    let items = QueryExecutor::split_format_items(sql);
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "split_format_items should split END + slash without semicolon, got: {:?}",
+        statements
+    );
+    assert_eq!(slash_count, 1, "slash delimiter should be preserved once");
+}
+
+#[test]
+fn test_compound_trigger_end_timing_point_without_semicolon_before_slash() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_compound_view
+FOR INSERT ON test_view
+COMPOUND TRIGGER
+  INSTEAD OF EACH ROW IS
+  BEGIN
+    NULL;
+  END INSTEAD OF EACH ROW
+END
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "compound trigger with END timing point and no semicolon before slash should split, got: {:?}",
+        stmts
+    );
+}
+#[test]
 fn test_split_script_items_slash_line_inside_q_quote_is_not_terminator() {
     let sql = "SELECT q'[\n/\n]' AS txt FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
