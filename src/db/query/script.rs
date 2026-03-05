@@ -3776,47 +3776,15 @@ impl QueryExecutor {
     }
 
     fn parse_errorcontinue_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET ERRORCONTINUE requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetErrorContinue { enabled: true },
-            "OFF" => ToolCommand::SetErrorContinue { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET ERRORCONTINUE supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET ERRORCONTINUE", |enabled| {
+            ToolCommand::SetErrorContinue { enabled }
+        })
     }
 
     fn parse_autocommit_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET AUTOCOMMIT requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetAutoCommit { enabled: true },
-            "OFF" => ToolCommand::SetAutoCommit { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET AUTOCOMMIT supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET AUTOCOMMIT", |enabled| {
+            ToolCommand::SetAutoCommit { enabled }
+        })
     }
 
     fn parse_define_command(raw: &str) -> ToolCommand {
@@ -3873,260 +3841,125 @@ impl QueryExecutor {
     }
 
     fn parse_scan_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET SCAN requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetScan { enabled: true },
-            "OFF" => ToolCommand::SetScan { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET SCAN supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET SCAN", |enabled| ToolCommand::SetScan { enabled })
     }
 
     fn parse_verify_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET VERIFY requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetVerify { enabled: true },
-            "OFF" => ToolCommand::SetVerify { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET VERIFY supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET VERIFY", |enabled| ToolCommand::SetVerify {
+            enabled,
+        })
     }
 
     fn parse_echo_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET ECHO requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetEcho { enabled: true },
-            "OFF" => ToolCommand::SetEcho { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET ECHO supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET ECHO", |enabled| ToolCommand::SetEcho { enabled })
     }
 
     fn parse_timing_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TIMING requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetTiming { enabled: true },
-            "OFF" => ToolCommand::SetTiming { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TIMING supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET TIMING", |enabled| ToolCommand::SetTiming {
+            enabled,
+        })
     }
 
     fn parse_feedback_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET FEEDBACK requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetFeedback { enabled: true },
-            "OFF" => ToolCommand::SetFeedback { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET FEEDBACK supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET FEEDBACK", |enabled| ToolCommand::SetFeedback {
+            enabled,
+        })
     }
 
     fn parse_heading_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET HEADING requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetHeading { enabled: true },
-            "OFF" => ToolCommand::SetHeading { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET HEADING supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET HEADING", |enabled| ToolCommand::SetHeading {
+            enabled,
+        })
     }
 
     fn parse_pagesize_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET PAGESIZE requires a number.".to_string(),
-                is_error: true,
-            };
-        }
-
-        match tokens[2].parse::<u32>() {
-            Ok(size) => ToolCommand::SetPageSize { size },
-            Err(_) => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET PAGESIZE requires a number.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_number_command(raw, "SET PAGESIZE", |size| ToolCommand::SetPageSize {
+            size,
+        })
     }
 
     fn parse_linesize_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET LINESIZE requires a number.".to_string(),
-                is_error: true,
-            };
-        }
-
-        match tokens[2].parse::<u32>() {
-            Ok(size) => ToolCommand::SetLineSize { size },
-            Err(_) => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET LINESIZE requires a number.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_number_command(raw, "SET LINESIZE", |size| ToolCommand::SetLineSize {
+            size,
+        })
     }
 
     fn parse_trimspool_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TRIMSPOOL requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetTrimSpool { enabled: true },
-            "OFF" => ToolCommand::SetTrimSpool { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TRIMSPOOL supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET TRIMSPOOL", |enabled| ToolCommand::SetTrimSpool {
+            enabled,
+        })
     }
 
     fn parse_trimout_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TRIMOUT requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetTrimOut { enabled: true },
-            "OFF" => ToolCommand::SetTrimOut { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET TRIMOUT supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET TRIMOUT", |enabled| ToolCommand::SetTrimOut {
+            enabled,
+        })
     }
 
     fn parse_sqlblanklines_command(raw: &str) -> ToolCommand {
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
-            return ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET SQLBLANKLINES requires ON or OFF.".to_string(),
-                is_error: true,
-            };
-        }
-
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetSqlBlankLines { enabled: true },
-            "OFF" => ToolCommand::SetSqlBlankLines { enabled: false },
-            _ => ToolCommand::Unsupported {
-                raw: raw.to_string(),
-                message: "SET SQLBLANKLINES supports only ON or OFF.".to_string(),
-                is_error: true,
-            },
-        }
+        Self::parse_set_on_off_command(raw, "SET SQLBLANKLINES", |enabled| {
+            ToolCommand::SetSqlBlankLines { enabled }
+        })
     }
 
     fn parse_tab_command(raw: &str) -> ToolCommand {
+        Self::parse_set_on_off_command(raw, "SET TAB", |enabled| ToolCommand::SetTab { enabled })
+    }
+
+    fn parse_set_on_off_command<F>(
+        raw: &str,
+        command_name: &str,
+        enabled_to_command: F,
+    ) -> ToolCommand
+    where
+        F: FnOnce(bool) -> ToolCommand,
+    {
         let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 3 {
+        let Some(mode) = tokens.get(2) else {
             return ToolCommand::Unsupported {
                 raw: raw.to_string(),
-                message: "SET TAB requires ON or OFF.".to_string(),
+                message: format!("{command_name} requires ON or OFF."),
                 is_error: true,
             };
+        };
+
+        if mode.eq_ignore_ascii_case("ON") {
+            return enabled_to_command(true);
         }
 
-        let mode = tokens[2].to_ascii_uppercase();
-        match mode.as_str() {
-            "ON" => ToolCommand::SetTab { enabled: true },
-            "OFF" => ToolCommand::SetTab { enabled: false },
-            _ => ToolCommand::Unsupported {
+        if mode.eq_ignore_ascii_case("OFF") {
+            return enabled_to_command(false);
+        }
+
+        ToolCommand::Unsupported {
+            raw: raw.to_string(),
+            message: format!("{command_name} supports only ON or OFF."),
+            is_error: true,
+        }
+    }
+
+    fn parse_set_number_command<F>(
+        raw: &str,
+        command_name: &str,
+        value_to_command: F,
+    ) -> ToolCommand
+    where
+        F: FnOnce(u32) -> ToolCommand,
+    {
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let Some(raw_value) = tokens.get(2) else {
+            return ToolCommand::Unsupported {
                 raw: raw.to_string(),
-                message: "SET TAB supports only ON or OFF.".to_string(),
+                message: format!("{command_name} requires a number."),
+                is_error: true,
+            };
+        };
+
+        match raw_value.parse::<u32>() {
+            Ok(value) => value_to_command(value),
+            Err(_) => ToolCommand::Unsupported {
+                raw: raw.to_string(),
+                message: format!("{command_name} requires a number."),
                 is_error: true,
             },
         }
