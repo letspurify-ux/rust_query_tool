@@ -240,6 +240,19 @@ fn phase_order_by_with_comment_between_keywords() {
 }
 
 #[test]
+fn unnest_function_argument_keeps_left_relation_visible() {
+    let ctx = analyze("SELECT * FROM orders o, UNNEST(o.items) u WHERE o.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "left relation should remain visible after UNNEST: {:?}",
+        names
+    );
+}
+
+#[test]
 fn phase_for_update_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
