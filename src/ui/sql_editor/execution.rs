@@ -119,9 +119,6 @@ impl QueryExecutionCleanupGuard {
 
 impl Drop for QueryExecutionCleanupGuard {
     fn drop(&mut self) {
-        if let Some(conn) = self.timeout_connection.as_ref() {
-            let _ = conn.set_call_timeout(self.previous_timeout);
-        }
         SqlEditorWidget::set_current_query_connection(&self.current_query_connection, None);
         store_mutex_bool(&self.cancel_flag, false);
         // Keep execution state fail-safe even if the UI progress poller has
@@ -129,6 +126,13 @@ impl Drop for QueryExecutionCleanupGuard {
         store_mutex_bool(&self.query_running, false);
         let _ = self.sender.send(QueryProgress::BatchFinished);
         app::awake();
+
+        // Restoring call timeout is best-effort cleanup. Run it after shared
+        // execution state is reset so cancel/timeout unwind paths never appear
+        // to hang in "running" state if the driver stalls while resetting.
+        if let Some(conn) = self.timeout_connection.as_ref() {
+            let _ = conn.set_call_timeout(self.previous_timeout);
+        }
     }
 }
 
