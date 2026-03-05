@@ -2068,59 +2068,9 @@ fn is_table_stop_keyword(word: &str) -> bool {
 /// join modifiers such as `LATERAL` so table/subquery alias parsing follows the
 /// same boundary rules.
 fn is_relation_alias_breaker(word: &str) -> bool {
-    matches!(
-        word,
-        "ON" | "JOIN"
-            | "INNER"
-            | "LEFT"
-            | "RIGHT"
-            | "FULL"
-            | "CROSS"
-            | "OUTER"
-            | "NATURAL"
-            | "SEMI"
-            | "ANTI"
-            | "ASOF"
-            | "LATERAL"
-            | "APPLY"
-            | "STRAIGHT_JOIN"
-            | "WHERE"
-            | "GROUP"
-            | "ORDER"
-            | "HAVING"
-            | "CONNECT"
-            | "START"
-            | "WITH"
-            | "UNION"
-            | "INTERSECT"
-            | "EXCEPT"
-            | "MINUS"
-            | "FETCH"
-            | "FOR"
-            | "WINDOW"
-            | "QUALIFY"
-            | "LIMIT"
-            | "OFFSET"
-            | "RETURNING"
-            | "VALUES"
-            | "SET"
-            | "USING"
-            | "WHEN"
-            | "PIVOT"
-            | "UNPIVOT"
-            | "MODEL"
-            | "MATCH_RECOGNIZE"
-            | "MATCH"
-            | "RECOGNIZE"
-            | "SELECT"
-            | "FROM"
-            | "INTO"
-            | "SAMPLE"
-            | "TABLESAMPLE"
-            | "PARTITION"
-            | "SUBPARTITION"
-            | "VERSIONS"
-    )
+    is_join_keyword(word)
+        || is_table_stop_keyword(word)
+        || matches!(word, "ON" | "SELECT" | "FROM" | "INTO")
 }
 
 /// Collect top-level tables visible within a standalone statement.
