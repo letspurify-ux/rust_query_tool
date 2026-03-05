@@ -23,7 +23,11 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
-use crate::sql_text::{self, FORMAT_CLAUSE_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS};
+use crate::sql_text::{
+    self, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS, FORMAT_BLOCK_START_KEYWORDS,
+    FORMAT_CLAUSE_KEYWORDS, FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS,
+    FORMAT_JOIN_MODIFIER_KEYWORDS,
+};
 use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
@@ -1124,15 +1128,15 @@ impl SqlEditorWidget {
         }
 
         let clause_keywords = FORMAT_CLAUSE_KEYWORDS;
-        let join_modifiers = ["LEFT", "RIGHT", "FULL", "INNER", "CROSS"];
+        let join_modifiers = FORMAT_JOIN_MODIFIER_KEYWORDS;
         let join_keyword = "JOIN";
         let outer_keyword = "OUTER";
-        let condition_keywords = ["ON", "AND", "OR", "WHEN"]; // ELSE handled separately for IF blocks
+        let condition_keywords = FORMAT_CONDITION_KEYWORDS; // ELSE handled separately for IF blocks
                                                               // BEGIN is handled separately to support DECLARE ... BEGIN ... END blocks
                                                               // CASE is handled separately for SELECT vs PL/SQL context
                                                               // LOOP is handled separately for FOR ... LOOP on same line
-        let block_start_keywords = ["DECLARE", "IF", "REPEAT"];
-        let block_end_qualifiers = ["LOOP", "IF", "CASE", "REPEAT"]; // END LOOP, END IF, END CASE, END REPEAT
+        let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
+        let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
 
         let mut out = String::new();
         let mut indent_level = 0usize;
