@@ -102,6 +102,25 @@ fn test_statement_bounds_at_cursor_splits_around_tool_command_line() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_splits_after_with_function_and_run_script_command() {
+    let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\n@child.sql\nSELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds after @ script command");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "expected trailing SELECT statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("@child.sql"),
+        "run-script command line must not leak into SQL statement: {statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_keeps_multiline_alter_session_set_clause() {
     let sql = "ALTER SESSION\nSET NLS_DATE_FORMAT = 'YYYY-MM-DD';\nSELECT 1 FROM dual;";
     let cursor = sql.find("NLS_DATE_FORMAT").unwrap_or(0);
@@ -8675,6 +8694,46 @@ SELECT 2 FROM dual;";
         matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
         "third item should be trailing SELECT statement: {items:?}"
     );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_run_script_statement_head() {
+    let sql = r#"WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+@child.sql
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}");
+    assert!(matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "second item should parse @child.sql as run-script command: {items:?}");
+    assert!(matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}");
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_relative_run_script_statement_head() {
+    let sql = r#"WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+@@child.sql
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}");
+    assert!(matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && *relative_to_caller),
+        "second item should parse @@child.sql as relative run-script command: {items:?}");
+    assert!(matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}");
 }
 
 #[test]
