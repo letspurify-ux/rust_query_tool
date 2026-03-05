@@ -212,6 +212,20 @@ fn straight_join_is_parsed_as_join_boundary() {
 }
 
 #[test]
+fn straight_join_select_modifier_does_not_switch_to_from_clause() {
+    let ctx = analyze("SELECT STRAIGHT_JOIN d.|, e.empno FROM dept d");
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "DEPT"),
+        "SELECT modifier STRAIGHT_JOIN should not pollute relation scope: {:?}",
+        names
+    );
+}
+
+
+#[test]
 fn phase_order_siblings_by_with_comment_between_keywords() {
     let ctx = analyze("SELECT a FROM t ORDER /*c1*/ SIBLINGS /*c2*/ BY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
