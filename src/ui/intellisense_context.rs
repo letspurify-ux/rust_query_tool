@@ -753,7 +753,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     idx += 1;
                     continue;
                 }
-                relation_modifier_state.clear();
+                if !(relation_modifier_state.blocks_outer_scope_cutoff()
+                    && relation_state.is_expect_table())
+                {
+                    relation_modifier_state.clear();
+                }
 
                 match upper.as_str() {
                     "INSERT" => {
@@ -1003,6 +1007,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 });
                                 if let Some(SqlToken::Symbol(sym)) = tokens.get(after_alias) {
                                     if sym == "," {
+                                        relation_modifier_state.clear();
                                         relation_state.expect_table();
                                         last_word = None;
                                         idx = after_alias + 1;
@@ -1017,6 +1022,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                     }
                                 } else {
                                     last_word = None;
+                                }
+                                if !matches!(tokens.get(after_alias), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                                    relation_modifier_state.clear();
                                 }
                                 relation_state.clear();
                                 idx = after_alias;
