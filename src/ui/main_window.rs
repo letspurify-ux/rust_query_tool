@@ -16,7 +16,7 @@ use fltk::{
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -3830,6 +3830,12 @@ impl MainWindow {
             Arc::new(Mutex::new(conn_receiver));
         let file_receiver: Arc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
             Arc::new(Mutex::new(file_receiver));
+        let idle_poll_cycles = Arc::new(AtomicUsize::new(0));
+
+        const CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
+        const CHANNEL_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.25;
+        const MEMORY_TRIM_IDLE_CYCLE_THRESHOLD: usize =
+            (60.0 / CHANNEL_POLL_IDLE_INTERVAL_SECONDS) as usize;
 
         fn schedule_poll(
             schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
@@ -3838,6 +3844,7 @@ impl MainWindow {
             state_weak: std::sync::Weak<Mutex<AppState>>,
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
+            idle_poll_cycles: Arc<AtomicUsize>,
         ) {
             let Some(state) = state_weak.upgrade() else {
                 return;
@@ -3846,6 +3853,7 @@ impl MainWindow {
             let mut conn_disconnected = false;
             let mut file_disconnected = false;
             let mut deferred_by_borrow_conflict = false;
+            let mut processed_message = false;
 
             // Check for schema updates
             {
@@ -3881,6 +3889,7 @@ impl MainWindow {
                                     continue;
                                 }
                                 latest_update = Some(update);
+                                processed_message = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -3919,67 +3928,73 @@ impl MainWindow {
                         break;
                     };
                     match r.try_recv() {
-                        Ok(result) => match result {
-                            ConnectionResult::Success(info) => {
-                                crate::utils::logging::log_info(
-                                    "connection",
-                                    &format!("Connected to {}", info.name),
-                                );
-                                *s.connection_info
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    Some(info.clone());
-                                s.has_live_connection = true;
-                                s.pending_connection_metadata_refresh = false;
-                                s.status_bar
-                                    .set_label(&format!("Connected | {}", info.name));
-                                MainWindow::start_connection_metadata_refresh(
-                                    &mut s,
-                                    &schema_sender,
-                                );
-                                s.sql_editor.focus();
-                                s.refresh_connection_dependent_controls();
-                            }
-                            ConnectionResult::Failure(err) => {
-                                let current_connection = s
-                                    .connection_info
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .clone();
-                                let current_connection_label =
-                                    current_connection.as_ref().map(|info| info.name.clone());
+                        Ok(result) => {
+                            processed_message = true;
+                            match result {
+                                ConnectionResult::Success(info) => {
+                                    crate::utils::logging::log_info(
+                                        "connection",
+                                        &format!("Connected to {}", info.name),
+                                    );
+                                    *s.connection_info
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        Some(info.clone());
+                                    s.has_live_connection = true;
+                                    s.pending_connection_metadata_refresh = false;
+                                    s.status_bar
+                                        .set_label(&format!("Connected | {}", info.name));
+                                    MainWindow::start_connection_metadata_refresh(
+                                        &mut s,
+                                        &schema_sender,
+                                    );
+                                    s.sql_editor.focus();
+                                    s.refresh_connection_dependent_controls();
+                                }
+                                ConnectionResult::Failure(err) => {
+                                    let current_connection = s
+                                        .connection_info
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clone();
+                                    let current_connection_label =
+                                        current_connection.as_ref().map(|info| info.name.clone());
 
-                                if let Some(current_label) = current_connection_label {
-                                    crate::utils::logging::log_error(
+                                    if let Some(current_label) = current_connection_label {
+                                        crate::utils::logging::log_error(
                                             "connection",
                                             &format!(
                                                 "Connection failed: {} (keeping current connection: {})",
                                                 err, current_label
                                             ),
                                         );
-                                    s.status_bar.set_label(&format_status(
-                                        "Connection failed; keeping current connection",
-                                        &current_connection,
-                                    ));
-                                    let lines = vec![
-                                        format!("Connection failed: {}", err),
-                                        format!("Keeping current connection: {}", current_label),
-                                    ];
-                                    s.result_tabs.append_script_output_lines(&lines);
-                                } else {
-                                    crate::utils::logging::log_error(
-                                        "connection",
-                                        &format!("Connection failed: {}", err),
-                                    );
-                                    s.status_bar.set_label("Connection failed");
-                                    s.result_tabs.append_script_output_lines(&[format!(
-                                        "Connection failed: {}",
-                                        err
-                                    )]);
+                                        s.status_bar.set_label(&format_status(
+                                            "Connection failed; keeping current connection",
+                                            &current_connection,
+                                        ));
+                                        let lines = vec![
+                                            format!("Connection failed: {}", err),
+                                            format!(
+                                                "Keeping current connection: {}",
+                                                current_label
+                                            ),
+                                        ];
+                                        s.result_tabs.append_script_output_lines(&lines);
+                                    } else {
+                                        crate::utils::logging::log_error(
+                                            "connection",
+                                            &format!("Connection failed: {}", err),
+                                        );
+                                        s.status_bar.set_label("Connection failed");
+                                        s.result_tabs.append_script_output_lines(&[format!(
+                                            "Connection failed: {}",
+                                            err
+                                        )]);
+                                    }
+                                    s.result_tabs.select_script_output();
                                 }
-                                s.result_tabs.select_script_output();
                             }
-                        },
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             conn_disconnected = true;
@@ -4001,6 +4016,7 @@ impl MainWindow {
                     };
                     match r.try_recv() {
                         Ok(result) => {
+                            processed_message = true;
                             let mut created_tab_for_open: Option<QueryTabId> = None;
                             let mut created_editor_for_open: Option<SqlEditorWidget> = None;
                             let mut created_right_tile_for_open: Option<Tile> = None;
@@ -4097,7 +4113,7 @@ impl MainWindow {
             }
 
             if deferred_by_borrow_conflict {
-                app::add_timeout3(0.05, move |_| {
+                app::add_timeout3(CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS, move |_| {
                     schedule_poll(
                         schema_receiver.clone(),
                         conn_receiver.clone(),
@@ -4105,6 +4121,7 @@ impl MainWindow {
                         state_weak.clone(),
                         schema_sender.clone(),
                         file_sender.clone(),
+                        idle_poll_cycles.clone(),
                     );
                 });
                 return;
@@ -4115,8 +4132,22 @@ impl MainWindow {
                 return;
             }
 
+            let delay = if processed_message {
+                idle_poll_cycles.store(0, Ordering::Relaxed);
+                CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS
+            } else {
+                let idle_cycles = idle_poll_cycles
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if idle_cycles >= MEMORY_TRIM_IDLE_CYCLE_THRESHOLD {
+                    idle_poll_cycles.store(0, Ordering::Relaxed);
+                    malloc_trim_process();
+                }
+                CHANNEL_POLL_IDLE_INTERVAL_SECONDS
+            };
+
             // Reschedule for next poll
-            app::add_timeout3(0.05, move |_| {
+            app::add_timeout3(delay, move |_| {
                 schedule_poll(
                     schema_receiver.clone(),
                     conn_receiver.clone(),
@@ -4124,6 +4155,7 @@ impl MainWindow {
                     state_weak.clone(),
                     schema_sender.clone(),
                     file_sender.clone(),
+                    idle_poll_cycles.clone(),
                 );
             });
         }
@@ -4145,6 +4177,7 @@ impl MainWindow {
             weak_state_for_poll,
             schema_sender_for_poll,
             file_sender.clone(),
+            idle_poll_cycles,
         );
 
         let tab_ids_for_drop: Vec<QueryTabId> = state
