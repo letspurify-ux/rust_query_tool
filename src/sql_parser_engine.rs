@@ -449,6 +449,10 @@ impl AsIsBlockStart {
             return Self::None;
         }
 
+        if state.paren_depth != 0 {
+            return Self::None;
+        }
+
         if state.timing_point_state == TimingPointState::AwaitingAsOrIs {
             return Self::TimingPoint;
         }
