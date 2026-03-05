@@ -457,6 +457,13 @@ impl AsIsBlockStart {
             return Self::TimingPoint;
         }
 
+        if state.is_trigger() && !state.in_compound_trigger() && state.block_depth() == 0 {
+            // Simple trigger headers can legally include `REFERENCING ... AS ...` aliases.
+            // Treating that `AS` as a routine body opener keeps the parser stuck inside
+            // a synthetic block and prevents semicolon splitting for `CALL`-style bodies.
+            return Self::None;
+        }
+
         if state.as_is_state == AsIsState::AwaitingNestedSubprogram
             || (state.in_create_plsql()
                 && !state.in_java_source_create()
@@ -2635,6 +2642,24 @@ mod tests {
         assert!(statements[0].contains("WHEN (NEW.id > 0)"));
         assert!(statements[0].contains("CALL do_work"));
         assert!(statements[1].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
+    fn trigger_referencing_alias_as_does_not_block_call_body_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW AS n OLD AS o");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("CALL do_work;");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("REFERENCING NEW AS n OLD AS o"));
+        assert!(statements[0].contains("CALL do_work"));
+        assert!(statements[1].starts_with("SELECT 3 FROM dual"));
     }
 
     #[test]
