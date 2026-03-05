@@ -8234,6 +8234,25 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_create_type_json_keeps_single_statement() {
+    let sql = "CREATE OR REPLACE TYPE t_json AS JSON\n(\n  STRICT\n);\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE TYPE ... AS JSON should split at the type terminator: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE TYPE t_json AS JSON"),
+        "first statement should preserve TYPE JSON declaration: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_create_type_body_with_member_function_keeps_single_statement() {
     let sql = "CREATE OR REPLACE TYPE BODY t_demo AS\n  MEMBER FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nEND;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
