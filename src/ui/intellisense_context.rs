@@ -729,9 +729,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 let current_phase = depth_frames[depth].phase;
 
-                if (upper == "LATERAL" || upper == "APPLY")
-                    && matches!(current_phase, SqlPhase::FromClause)
-                {
+                if upper == "LATERAL" && matches!(current_phase, SqlPhase::FromClause) {
                     relation_modifier_state.mark_lateral_like();
                     idx += 1;
                     continue;
@@ -804,6 +802,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "JOIN" | "APPLY" => {
+                        if upper == "APPLY" {
+                            relation_modifier_state.mark_lateral_like();
+                        }
                         depth_frames[depth].phase = SqlPhase::FromClause;
                         relation_state.expect_table();
                     }

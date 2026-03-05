@@ -1274,6 +1274,24 @@ fn cross_apply_subquery_can_see_outer_table_scope() {
 }
 
 #[test]
+fn outer_apply_subquery_can_see_outer_table_scope() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp jt OUTER APPLY (SELECT jt.| FROM dual) it");
+    let names = table_names(&ctx);
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("oqt_t_emp")),
+        "outer apply subquery should inherit outer scope table: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|name| name.eq_ignore_ascii_case("dual")),
+        "outer apply subquery should keep local table scope: {:?}",
+        names
+    );
+}
+
+#[test]
 fn cross_apply_subquery_exposes_alias_in_outer_scope() {
     let ctx = analyze("SELECT a.| FROM t1 CROSS APPLY (SELECT id FROM t2) a");
     let names = table_names(&ctx);
@@ -1286,6 +1304,14 @@ fn outer_apply_keeps_from_phase_before_right_relation() {
     let ctx = analyze("SELECT * FROM t1 OUTER APPLY |");
     assert_eq!(ctx.phase, SqlPhase::FromClause);
     assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn apply_subquery_keeps_outer_scope_visibility() {
+    let ctx = analyze("SELECT * FROM t1 APPLY (SELECT t1.| FROM dual) a");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T1".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
 }
 
 #[test]
