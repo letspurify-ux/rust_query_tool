@@ -1396,16 +1396,51 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
 
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
-            "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" => {
+            "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" => {
                 let open_idx = skip_comment_tokens(tokens, idx + 1);
+                let open_idx = match tokens.get(open_idx) {
+                    Some(SqlToken::Word(_)) if upper == "TABLESAMPLE" => {
+                        skip_comment_tokens(tokens, open_idx + 1)
+                    }
+                    _ => open_idx,
+                };
                 if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                     idx = extract_parenthesized_range(tokens, open_idx)
                         .map(|(_, next_idx)| next_idx)
                         .unwrap_or(open_idx.saturating_add(1));
+                    if upper == "TABLESAMPLE"
+                        && matches!(
+                            next_word_upper(tokens, idx),
+                            Some((repeatable, _)) if repeatable == "REPEATABLE"
+                        )
+                    {
+                        let repeatable_idx = skip_comment_tokens(tokens, idx + 1);
+                        if matches!(tokens.get(repeatable_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                            idx = extract_parenthesized_range(tokens, repeatable_idx)
+                                .map(|(_, next_idx)| next_idx)
+                                .unwrap_or(repeatable_idx.saturating_add(1));
+                        }
+                    }
                     idx = skip_comment_tokens(tokens, idx);
                     continue;
                 }
                 break;
+            }
+            "VERSIONS" => {
+                let between_idx = skip_comment_tokens(tokens, idx + 1);
+                if !matches!(tokens.get(between_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BETWEEN"))
+                {
+                    break;
+                }
+
+                let and_idx = find_top_level_keyword(tokens, between_idx + 1, "AND");
+                let Some(and_idx) = and_idx else {
+                    break;
+                };
+
+                idx = skip_flashback_bound_expression(tokens, and_idx + 1);
+                idx = skip_comment_tokens(tokens, idx);
+                continue;
             }
             "AS" => {
                 let of_idx = skip_comment_tokens(tokens, idx + 1);
@@ -1435,6 +1470,58 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
     }
 
     idx
+}
+
+fn find_top_level_keyword(tokens: &[SqlToken], start: usize, target_keyword: &str) -> Option<usize> {
+    let mut idx = start;
+    let mut paren_depth = 0usize;
+
+    while idx < tokens.len() {
+        match &tokens[idx] {
+            SqlToken::Symbol(sym) if sym == "(" => {
+                paren_depth = paren_depth.saturating_add(1);
+            }
+            SqlToken::Symbol(sym) if sym == ")" => {
+                paren_depth = paren_depth.saturating_sub(1);
+            }
+            SqlToken::Word(word)
+                if paren_depth == 0 && word.eq_ignore_ascii_case(target_keyword) =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
+    let mut idx = skip_comment_tokens(tokens, start);
+
+    if matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SCN") || word.eq_ignore_ascii_case("TIMESTAMP"))
+    {
+        idx = skip_comment_tokens(tokens, idx + 1);
+    }
+
+    if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        return extract_parenthesized_range(tokens, idx)
+            .map(|(_, next_idx)| next_idx)
+            .unwrap_or(idx.saturating_add(1));
+    }
+
+    if matches!(tokens.get(idx), Some(SqlToken::Word(_))) {
+        let next_idx = skip_comment_tokens(tokens, idx + 1);
+        if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return extract_parenthesized_range(tokens, next_idx)
+                .map(|(_, after_fn)| after_fn)
+                .unwrap_or(next_idx.saturating_add(1));
+        }
+        return next_idx;
+    }
+
+    idx.saturating_add(1)
 }
 
 fn skip_comment_tokens(tokens: &[SqlToken], mut idx: usize) -> usize {
