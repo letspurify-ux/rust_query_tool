@@ -422,7 +422,7 @@ enum SemicolonAction {
 
 impl SemicolonAction {
     fn from_state(state: &SplitState) -> Self {
-        if state.in_java_source_create() {
+        if state.keep_semicolons_inside_create_body() {
             return Self::AppendToCurrent;
         }
 
@@ -489,6 +489,7 @@ enum CreatePlsqlKind {
     TypeBody,
     Trigger(TriggerKind),
     JavaSource,
+    Wrapped,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -593,6 +594,14 @@ impl SplitState {
 
     pub(crate) fn in_java_source_create(&self) -> bool {
         self.create_plsql_kind == CreatePlsqlKind::JavaSource
+    }
+
+    pub(crate) fn in_wrapped_create(&self) -> bool {
+        self.create_plsql_kind == CreatePlsqlKind::Wrapped
+    }
+
+    fn keep_semicolons_inside_create_body(&self) -> bool {
+        self.in_java_source_create() || self.in_wrapped_create()
     }
 
     fn in_compound_trigger(&self) -> bool {
@@ -1054,6 +1063,10 @@ impl SplitState {
         }
 
         if self.in_create_plsql() {
+            if self.block_depth() == 0 && upper == "WRAPPED" {
+                self.create_plsql_kind = CreatePlsqlKind::Wrapped;
+                self.create_state = CreateState::None;
+            }
             return;
         }
 

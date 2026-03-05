@@ -8202,6 +8202,82 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_oracle_create_wrapped_keeps_body_until_slash() {
+    let sql = "CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED
+a000000
+1
+abcd;
+efgh;
+/
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE ... WRAPPED should keep wrapped body semicolons inside one statement until slash delimiter: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED"),
+        "first statement should preserve WRAPPED header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("abcd;
+efgh;"),
+        "first statement should preserve wrapped body with internal semicolons: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_create_wrapped_keeps_body_until_slash() {
+    let sql = "CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED
+a000000
+1
+abcd;
+efgh;
+/
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        items.iter().any(|item| matches!(item, FormatItem::Slash)),
+        "CREATE WRAPPED should keep SQL*Plus slash delimiter in format items"
+    );
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep WRAPPED body as one statement and split trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED"),
+        "first formatted statement should preserve WRAPPED header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("abcd;
+efgh;"),
+        "first formatted statement should preserve wrapped body semicolons: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_cte_using_function_call_splits_normally() {
     let sql =
         "WITH cte AS (SELECT 1 AS n FROM dual)\nSELECT ABS(n) AS v FROM cte;\nSELECT 2 FROM dual;";
