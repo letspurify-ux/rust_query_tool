@@ -140,6 +140,31 @@ impl SqlEditorWidget {
             InValuesOrSelectBody,
         }
 
+        fn starts_insert_body(word: &str) -> bool {
+            word.eq_ignore_ascii_case("VALUES")
+                || word.eq_ignore_ascii_case("SELECT")
+                || word.eq_ignore_ascii_case("WITH")
+        }
+
+        fn transition_insert_parse_state(state: InsertParseState, word: &str) -> InsertParseState {
+            if word.eq_ignore_ascii_case("INSERT") {
+                return InsertParseState::AfterInsert;
+            }
+
+            match state {
+                InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
+                    InsertParseState::AfterInto
+                }
+                InsertParseState::AfterInto => InsertParseState::AfterTarget,
+                InsertParseState::AfterTarget | InsertParseState::AfterColumnList
+                    if starts_insert_body(word) =>
+                {
+                    InsertParseState::InValuesOrSelectBody
+                }
+                current => current,
+            }
+        }
+
         let cursor_token_len = cursor_token_len.min(tokens.len());
         let mut state = InsertParseState::Idle;
         let mut depth = 0usize;
@@ -148,26 +173,14 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
-                    if word.eq_ignore_ascii_case("INSERT") {
-                        state = InsertParseState::AfterInsert;
+                    let next_state = transition_insert_parse_state(state, word);
+                    if matches!(next_state, InsertParseState::AfterInsert) {
+                        state = next_state;
                         depth = 0;
                         continue;
                     }
 
-                    state = match state {
-                        InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
-                            InsertParseState::AfterInto
-                        }
-                        InsertParseState::AfterInto => InsertParseState::AfterTarget,
-                        InsertParseState::AfterTarget | InsertParseState::AfterColumnList
-                            if word.eq_ignore_ascii_case("VALUES")
-                                || word.eq_ignore_ascii_case("SELECT")
-                                || word.eq_ignore_ascii_case("WITH") =>
-                        {
-                            InsertParseState::InValuesOrSelectBody
-                        }
-                        current => current,
-                    };
+                    state = next_state;
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     if matches!(state, InsertParseState::AfterTarget) {
