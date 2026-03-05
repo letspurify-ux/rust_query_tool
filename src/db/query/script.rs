@@ -153,6 +153,23 @@ impl QueryExecutor {
                 || leading_word.eq_ignore_ascii_case("ELSEIF")
                 || leading_word.eq_ignore_ascii_case("EXCEPTION")
         }
+
+        fn is_end_suffix_keyword(leading_word: Option<&str>) -> bool {
+            leading_word.is_some_and(|word| {
+                matches!(
+                    word,
+                    _ if word.eq_ignore_ascii_case("CASE")
+                        || word.eq_ignore_ascii_case("IF")
+                        || word.eq_ignore_ascii_case("LOOP")
+                        || word.eq_ignore_ascii_case("WHILE")
+                        || word.eq_ignore_ascii_case("FOR")
+                        || word.eq_ignore_ascii_case("BEFORE")
+                        || word.eq_ignore_ascii_case("AFTER")
+                        || word.eq_ignore_ascii_case("INSTEAD")
+                        || word.eq_ignore_ascii_case("REPEAT")
+                )
+            })
+        }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
 
         let mut builder = SqlParserEngine::new();
@@ -226,10 +243,7 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !leading_is_any(&[
-                        "CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD",
-                        "REPEAT",
-                    ])
+                    && !is_end_suffix_keyword(leading_word)
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -256,10 +270,7 @@ impl QueryExecutor {
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
-                    && leading_is_any(&[
-                        "CASE", "IF", "LOOP", "WHILE", "FOR", "BEFORE", "AFTER", "INSTEAD",
-                        "REPEAT",
-                    ])
+                    && is_end_suffix_keyword(leading_word)
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 }
@@ -368,13 +379,15 @@ impl QueryExecutor {
                 exception_depth_stack.pop();
                 exception_handler_body = false;
             }
-            if at_case_header_level && leading_is_any(&["WHEN", "ELSE"]) {
-                if let Some(last) = case_branch_stack.last_mut() {
-                    *last = true;
-                }
-            } else if at_case_header_level && leading_is("END") {
-                if let Some(last) = case_branch_stack.last_mut() {
-                    *last = false;
+            if at_case_header_level {
+                if leading_is_any(&["WHEN", "ELSE"]) {
+                    if let Some(last) = case_branch_stack.last_mut() {
+                        *last = true;
+                    }
+                } else if leading_is("END") {
+                    if let Some(last) = case_branch_stack.last_mut() {
+                        *last = false;
+                    }
                 }
             }
 
