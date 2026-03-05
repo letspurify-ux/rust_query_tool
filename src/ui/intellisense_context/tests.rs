@@ -1731,6 +1731,49 @@ fn partition_extension_before_alias_is_not_parsed_as_alias() {
     );
 }
 
+
+#[test]
+fn with_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees WITH (NOLOCK) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("WITH")),
+        "WITH clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following WITH (...) clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn with_clause_without_alias_does_not_capture_hint_as_alias() {
+    let ctx = analyze("SELECT * FROM employees WITH (INDEX(idx_emp_name)) WHERE |");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref().is_none()),
+        "WITH (...) tokens must not be captured as aliases when no alias exists: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn flashback_as_of_before_alias_is_not_parsed_as_alias() {
     let ctx = analyze("SELECT * FROM employees AS OF SCN (12345) e WHERE e.|");
