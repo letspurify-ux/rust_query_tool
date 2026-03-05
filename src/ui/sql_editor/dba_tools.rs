@@ -7017,6 +7017,16 @@ fn column_value_by_name<'a>(
     row_values.get(index).map(|value| value.as_str())
 }
 
+fn column_value_by_names<'a>(
+    row_values: &'a [String],
+    columns: &[String],
+    target_names: &[&str],
+) -> Option<&'a str> {
+    target_names
+        .iter()
+        .find_map(|name| column_value_by_name(row_values, columns, name))
+}
+
 fn parse_positive_i64(value: &str) -> Option<i64> {
     let parsed = value.trim().parse::<i64>().ok()?;
     if parsed <= 0 {
@@ -7030,16 +7040,13 @@ fn parse_sql_monitor_session_target(
     columns: &[String],
 ) -> Option<(Option<i64>, i64, i64)> {
     let sid_text = column_value_by_name(row_values, columns, "SID")?;
-    let serial_text = column_value_by_name(row_values, columns, "SERIAL#")
-        .or_else(|| column_value_by_name(row_values, columns, "SERIAL"))?;
+    let serial_text = column_value_by_names(row_values, columns, &["SERIAL#", "SERIAL"])?;
     let sid = parse_positive_i64(sid_text)?;
     let serial = parse_positive_i64(serial_text)?;
-    let instance_id =
-        if let Some(instance_text) = column_value_by_name(row_values, columns, "INST_ID") {
-            Some(parse_positive_i64(instance_text)?)
-        } else {
-            None
-        };
+    let instance_id = match column_value_by_name(row_values, columns, "INST_ID") {
+        Some(instance_text) => Some(parse_positive_i64(instance_text)?),
+        None => None,
+    };
 
     Some((instance_id, sid, serial))
 }
@@ -7485,16 +7492,11 @@ fn parse_sql_id_child_row(
     let sql_id_text = column_value_by_name(row_values, columns, "SQL_ID")?;
     let sql_id = sql_id_text.trim().to_uppercase();
     normalize_optional_sql_id(&sql_id).ok().flatten()?;
-    let child_text = column_value_by_name(row_values, columns, "CHILD_NUMBER")
-        .or_else(|| column_value_by_name(row_values, columns, "CHILD#"));
-    let child = if let Some(text) = child_text {
-        match parse_optional_non_negative_i32(text, "Child#") {
-            Ok(value) => value,
-            Err(_) => return None,
-        }
-    } else {
-        None
-    };
+    let child = column_value_by_names(row_values, columns, &["CHILD_NUMBER", "CHILD#"])
+        .map(|text| parse_optional_non_negative_i32(text, "Child#"))
+        .transpose()
+        .ok()?
+        .flatten();
     Some((sql_id, child))
 }
 
@@ -7659,16 +7661,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        column_value_by_name, current_selected_row_index, dataguard_db_unique_name_from_snapshot,
-        dataguard_role_allows_apply_control, dataguard_role_from_snapshot, default_rman_job_name,
-        filter_alert_rows, is_ascii_identifier, normalize_optional_sql_id,
-        normalize_required_identifier, normalize_required_system_privilege,
-        normalize_security_view_filters, parse_bounded_positive_u32,
-        parse_optional_non_negative_i32, parse_percentage_thresholds, parse_positive_u32,
-        parse_sid_serial_row, parse_sql_id_child_row, parse_sql_monitor_session_target,
-        qualified_owner_object, security_autofill_values, security_mode_uses_profile,
-        security_mode_uses_role, security_mode_uses_user, security_quick_action_hint,
-        sql_monitor_session_target_label, QueryResult, SecurityViewMode,
+        column_value_by_name, column_value_by_names, current_selected_row_index,
+        dataguard_db_unique_name_from_snapshot, dataguard_role_allows_apply_control,
+        dataguard_role_from_snapshot, default_rman_job_name, filter_alert_rows,
+        is_ascii_identifier, normalize_optional_sql_id, normalize_required_identifier,
+        normalize_required_system_privilege, normalize_security_view_filters,
+        parse_bounded_positive_u32, parse_optional_non_negative_i32, parse_percentage_thresholds,
+        parse_positive_u32, parse_sid_serial_row, parse_sql_id_child_row,
+        parse_sql_monitor_session_target, qualified_owner_object, security_autofill_values,
+        security_mode_uses_profile, security_mode_uses_role, security_mode_uses_user,
+        security_quick_action_hint, sql_monitor_session_target_label, QueryResult,
+        SecurityViewMode,
     };
 
     #[test]
@@ -7887,6 +7890,16 @@ mod tests {
         let columns = vec!["SID".to_string(), "SERIAL#".to_string()];
         let row = vec!["111".to_string(), "222".to_string()];
         assert_eq!(column_value_by_name(&row, &columns, "serial#"), Some("222"));
+    }
+
+    #[test]
+    fn column_value_by_names_returns_first_matching_alias() {
+        let columns = vec!["SID".to_string(), "SERIAL".to_string()];
+        let row = vec!["111".to_string(), "222".to_string()];
+        assert_eq!(
+            column_value_by_names(&row, &columns, &["SERIAL#", "SERIAL"]),
+            Some("222")
+        );
     }
 
     #[test]
