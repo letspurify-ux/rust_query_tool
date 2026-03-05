@@ -70,6 +70,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "COMMIT_WAIT",
     "COMPILE",
     "COMPLETE",
+    "COMPOUND",
     "COMPRESS",
     "COMPUTE",
     "COMPUTES",
@@ -118,6 +119,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "DISC",
     "DISCONNECT",
     "DISTINCT",
+    "DO",
     "DOCUMENT",
     "DROP",
     "DUAL",
@@ -154,6 +156,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "FIRST_VALUE",
     "FLASHBACK",
     "FOLLOWING",
+    "FOLLOWS",
     "FOR",
     "FORALL",
     "FORCE",
@@ -189,6 +192,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "INNER",
     "INSERT",
     "INSERTING",
+    "INSTEAD",
     "INTEGER",
     "INTERSECT",
     "INTERVAL",
@@ -273,10 +277,12 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "NOCOPY",
     "NOCYCLE",
     "NOEXCEPTIONS",
+    "NOFORCE",
     "NOLOGGING",
     "NOMONITORING",
     "NONE",
     "NONEDITIONABLE",
+    "NONEDITIONING",
     "NOPARALLEL",
     "NORELY",
     "NOSORT",
@@ -339,6 +345,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PLS_INTEGER",
     "POINT",
     "PRAGMA",
+    "PRECEDES",
     "PRECEDING",
     "PRESERVE",
     "PRIMARY",
@@ -364,6 +371,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "REFCURSOR",
     "REFERENCE",
     "REFERENCES",
+    "REFERENCING",
     "REFRESH",
     "RELY",
     "REM",
@@ -852,6 +860,22 @@ mod tests {
         assert!(FORMAT_COLUMN_CONSTRAINT_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
+    }
+
+    #[test]
+    fn shared_keyword_pool_includes_oracle_trigger_and_edition_keywords() {
+        for keyword in [
+            "COMPOUND",
+            "DO",
+            "FOLLOWS",
+            "INSTEAD",
+            "NOFORCE",
+            "NONEDITIONING",
+            "PRECEDES",
+            "REFERENCING",
+        ] {
+            assert!(is_oracle_sql_keyword(keyword), "missing shared keyword: {keyword}");
+        }
     }
 
     #[test]
