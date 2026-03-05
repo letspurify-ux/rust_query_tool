@@ -2613,6 +2613,10 @@ impl MainWindow {
                         result_tabs.display_result(tab_index, &result);
                     }
                 }
+                QueryProgress::WorkerPanicked { message } => {
+                    s.set_status_message(&message);
+                    s.refresh_result_edit_controls();
+                }
                 QueryProgress::BatchFinished => {
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
