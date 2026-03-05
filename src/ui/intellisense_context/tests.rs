@@ -1738,6 +1738,34 @@ fn recursive_cte_keyword() {
     assert!(cte_n.contains(&"TREE".to_string()), "CTEs: {:?}", cte_n);
 }
 
+#[test]
+fn with_plsql_function_declaration_is_not_parsed_as_cte() {
+    let ctx = analyze(
+        "WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual",
+    );
+
+    let cte_n = cte_names(&ctx);
+    assert!(cte_n.is_empty(), "PL/SQL declaration should not create CTEs: {:?}", cte_n);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn with_plsql_procedure_declaration_is_not_parsed_as_cte() {
+    let ctx = analyze(
+        "WITH PROCEDURE p IS BEGIN NULL; END; SELECT | FROM dual",
+    );
+
+    let cte_n = cte_names(&ctx);
+    assert!(cte_n.is_empty(), "PL/SQL declaration should not create CTEs: {:?}", cte_n);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
 // ─── Oracle-specific: PIVOT/UNPIVOT ──────────────────────────────────────
 
 #[test]
