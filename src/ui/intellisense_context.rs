@@ -857,6 +857,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                         relation_state.clear();
                     }
+                    "FOR" => {
+                        if let Some((next_keyword, _)) = next_word_upper(tokens, idx + 1) {
+                            if matches!(next_keyword.as_str(), "UPDATE" | "SHARE") {
+                                // Locking clauses (`FOR UPDATE [OF ...]`, `FOR SHARE [OF ...]`)
+                                // can accept column references after `OF`.
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                            }
+                        }
+                        relation_state.clear();
+                    }
                     "WINDOW" => {
                         // Treat SQL-standard WINDOW clause expressions as column context.
                         depth_frames[depth].phase = SqlPhase::OrderByClause;
@@ -893,10 +903,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "UPDATE" => {
-                        depth_frames[depth].phase = SqlPhase::UpdateTarget;
-                        depth_frames[depth].statement_kind = StatementKind::Unknown;
-                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        relation_state.expect_table();
+                        if matches!(last_word.as_deref(), Some("FOR")) {
+                            // `FOR UPDATE` lock clause inside SELECT statements.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::UpdateTarget;
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.expect_table();
+                        }
                     }
                     "DELETE" => {
                         depth_frames[depth].phase = SqlPhase::DeleteTarget;
