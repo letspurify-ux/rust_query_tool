@@ -258,7 +258,8 @@ impl RoutineFrame {
     fn finalize_external_clause_on_semicolon(&mut self) {
         if matches!(
             self.external_clause_state,
-            ExternalClauseState::SawExternalKeyword | ExternalClauseState::SawImplicitLanguageTarget
+            ExternalClauseState::SawExternalKeyword
+                | ExternalClauseState::SawImplicitLanguageTarget
         ) {
             self.mark_external_clause();
         }
@@ -1742,6 +1743,18 @@ impl SqlParserEngine {
         scratch_chars.extend(line.chars());
         scratch_chars.push('\n');
         self.process_chars_with_observer(&scratch_chars, &mut on_symbol);
+
+        if self.state.is_idle()
+            && self.state.block_depth() == 0
+            && self.state.paren_depth == 0
+            && !self.state.in_with_plsql_declaration()
+            && sql_text::is_auto_terminated_tool_command(line)
+        {
+            self.push_current_statement();
+            self.reset_statement_local_state();
+            self.state.reset_create_state();
+        }
+
         self.scratch_chars = scratch_chars;
     }
 
@@ -2309,6 +2322,59 @@ mod tests {
         assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
     }
 
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_conn_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("CONN scott/tiger");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with(
+                "WITH
+  FUNCTION f RETURN NUMBER IS"
+            ),
+            "first statement should keep only WITH declaration: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "CONN scott/tiger".to_string());
+        assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_disc_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("DISC");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with(
+                "WITH
+  FUNCTION f RETURN NUMBER IS"
+            ),
+            "first statement should keep only WITH declaration: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "DISC".to_string());
+        assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
+    }
     #[test]
     fn create_view_as_with_function_keeps_statement_open_until_main_select_terminator() {
         let mut engine = SqlParserEngine::new();
