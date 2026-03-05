@@ -55,6 +55,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CLOSE",
     "CLUSTER",
     "COALESCE",
+    "COLLATE",
     "COLLECT",
     "COLSEP",
     "COLUMN",
@@ -151,6 +152,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "FROM",
     "FULL",
     "FUNCTION",
+    "GENERATED",
     "GLOBAL",
     "GLOBALLY",
     "GOTO",
@@ -161,6 +163,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "HEAP",
     "HOUR",
     "IDENTIFIED",
+    "IDENTITY",
     "IF",
     "IGNORE",
     "IMMEDIATE",
@@ -548,8 +551,7 @@ pub(crate) const FORMAT_CONDITION_KEYWORDS: &[&str] = &["ON", "AND", "OR", "WHEN
 pub(crate) const FORMAT_BLOCK_START_KEYWORDS: &[&str] = &["DECLARE", "IF", "REPEAT"];
 
 /// Supported qualifiers for `END ...` in formatter block indentation logic.
-pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] =
-    &["LOOP", "IF", "CASE", "REPEAT"];
+pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] = &["LOOP", "IF", "CASE", "REPEAT"];
 
 /// Shared SQL keyword lookup set for lexer/highlighting and IntelliSense checks.
 pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
@@ -557,6 +559,27 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] =
     &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES"];
+
+const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
+
+const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON"];
+
+pub(crate) const FORMAT_COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
+    "CONSTRAINT",
+    "NOT",
+    "NULL",
+    "DEFAULT",
+    "PRIMARY",
+    "UNIQUE",
+    "CHECK",
+    "REFERENCES",
+    "ENABLE",
+    "DISABLE",
+    "USING",
+    "COLLATE",
+    "GENERATED",
+    "IDENTITY",
+];
 
 const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "DECLARE",
@@ -736,6 +759,11 @@ pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_MAIN_QUERY_KEYWORDS)
 }
 
+/// Returns true when a keyword starts an Oracle top-level `WITH FUNCTION/PROCEDURE` declaration.
+pub(crate) fn is_with_plsql_declaration_keyword(word: &str) -> bool {
+    matches_keyword(word, WITH_PLSQL_DECLARATION_KEYWORDS)
+}
+
 /// Returns true when a token can reasonably start a new top-level statement.
 ///
 /// Used as a recovery signal when the parser stayed inside an Oracle
@@ -753,6 +781,16 @@ pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
 /// Returns true when a CTE state machine should recover back to normal parsing.
 pub(crate) fn is_cte_recovery_keyword(word: &str) -> bool {
     is_subquery_head_keyword(word)
+}
+
+/// Returns true when a token is a valid Oracle `EXTERNAL LANGUAGE` target.
+pub(crate) fn is_external_language_target_keyword(word: &str) -> bool {
+    matches_keyword(word, EXTERNAL_LANGUAGE_TARGET_KEYWORDS)
+}
+
+/// Returns true when a token starts a CREATE TABLE column constraint section.
+pub(crate) fn is_format_column_constraint_keyword(word: &str) -> bool {
+    matches_keyword(word, FORMAT_COLUMN_CONSTRAINT_KEYWORDS)
 }
 
 #[cfg(test)]
@@ -785,5 +823,16 @@ mod tests {
         assert!(FORMAT_BLOCK_END_QUALIFIER_KEYWORDS
             .iter()
             .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_COLUMN_CONSTRAINT_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+    }
+
+    #[test]
+    fn parser_and_intellisense_keyword_groups_are_shared() {
+        assert!(is_with_plsql_declaration_keyword("FUNCTION"));
+        assert!(is_with_plsql_declaration_keyword("procedure"));
+        assert!(is_external_language_target_keyword("javascript"));
+        assert!(is_format_column_constraint_keyword("generated"));
     }
 }
