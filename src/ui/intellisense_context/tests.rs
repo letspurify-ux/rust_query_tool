@@ -180,6 +180,20 @@ fn phase_order_by_with_comment_between_keywords() {
 }
 
 #[test]
+fn phase_for_update_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_share_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR SHARE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_window_clause_is_column_context() {
     let ctx = analyze("SELECT a FROM t WINDOW w AS (PARTITION BY |)");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);

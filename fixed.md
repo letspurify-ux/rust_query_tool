@@ -1454,3 +1454,27 @@
 - `cargo test merge_when_not_matched_insert -- --nocapture` 통과
 - `cargo test merge_when_matched_delete_where_is_column_context -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-05 인텔리센스 누락 구문 보완 (`SELECT ... FOR UPDATE/SHARE OF` 락킹 절)
+
+### [중] `FOR UPDATE OF` 컬럼 리스트를 DML `UPDATE`로 오인식하던 문제 수정
+- **증상**:
+  - `SELECT * FROM emp FOR UPDATE OF |` 위치에서 컨텍스트가 `UpdateTarget`으로 잘못 전이되어, 테이블 컨텍스트처럼 처리될 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `UPDATE` 키워드 분기가 문맥을 구분하지 않아,
+  - `FOR UPDATE`(SELECT 락킹 절)에서도 DML `UPDATE` 진입 로직(`UpdateTarget + expect_table`)을 실행했습니다.
+- **수정**:
+  - `UPDATE` 분기에서 직전 키워드가 `FOR`인 경우를 별도로 처리해 `SetClause`(컬럼 컨텍스트)로 유지하도록 보정했습니다.
+  - 함께 `FOR SHARE [OF ...]` 경로도 동일한 컬럼 컨텍스트로 고정했습니다.
+
+### [유사 케이스] 락킹 절 변형 일괄 점검
+- `FOR UPDATE OF ...`와 `FOR SHARE OF ...`를 모두 회귀 테스트로 추가하여,
+- 동일 계열의 `FOR <lock-mode> OF <column-list>` 구문에서 컨텍스트 전이가 일관되게 동작하도록 보강했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `phase_for_update_of_is_column_context`
+- `phase_for_share_of_is_column_context`
+
+### [검증]
+- `cargo test phase_for_ -- --nocapture` 통과
+- `cargo test` 전체 통과
