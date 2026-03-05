@@ -1389,7 +1389,35 @@ fn parse_table_name_deep(tokens: &[SqlToken], start: usize) -> Option<(String, u
                 }
                 break;
             }
-            let table = parts.join(".");
+            let mut table = parts.join(".");
+
+            // Handle database-link suffixes like `schema.table@remote_link`.
+            if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "@") {
+                let mut dblink_idx = idx + 1;
+                if let Some(SqlToken::Word(link_part)) = tokens.get(dblink_idx) {
+                    if is_identifier_word_token(link_part) {
+                        let mut dblink_parts = vec![normalize_table_name_part(link_part)];
+                        dblink_idx += 1;
+
+                        while matches!(tokens.get(dblink_idx), Some(SqlToken::Symbol(sym)) if sym == ".") {
+                            if let Some(SqlToken::Word(link_part)) = tokens.get(dblink_idx + 1) {
+                                if !is_identifier_word_token(link_part) {
+                                    break;
+                                }
+                                dblink_parts.push(normalize_table_name_part(link_part));
+                                dblink_idx += 2;
+                                continue;
+                            }
+                            break;
+                        }
+
+                        table.push('@');
+                        table.push_str(&dblink_parts.join("."));
+                        idx = dblink_idx;
+                    }
+                }
+            }
+
             Some((table, idx))
         }
         _ => None,
