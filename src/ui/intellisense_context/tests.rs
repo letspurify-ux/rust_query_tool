@@ -931,7 +931,9 @@ fn insert_all_second_into_is_table_context() {
 
 #[test]
 fn insert_all_collects_all_targets() {
-    let ctx = analyze("INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (id) VALUES (2) SELECT | FROM dual");
+    let ctx = analyze(
+        "INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (id) VALUES (2) SELECT | FROM dual",
+    );
     assert_eq!(ctx.phase, SqlPhase::SelectList);
 
     let names = table_names(&ctx);
@@ -941,7 +943,9 @@ fn insert_all_collects_all_targets() {
 
 #[test]
 fn insert_first_second_into_is_table_context() {
-    let ctx = analyze("INSERT FIRST WHEN 1 = 1 THEN INTO emp_a (id) VALUES (1) INTO | SELECT 1 FROM dual");
+    let ctx = analyze(
+        "INSERT FIRST WHEN 1 = 1 THEN INTO emp_a (id) VALUES (1) INTO | SELECT 1 FROM dual",
+    );
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
     assert!(ctx.phase.is_table_context());
 }
@@ -1395,9 +1399,7 @@ fn flashback_as_of_before_alias_is_not_parsed_as_alias() {
 
 #[test]
 fn flashback_versions_between_before_alias_is_not_parsed_as_alias() {
-    let ctx = analyze(
-        "SELECT * FROM employees VERSIONS BETWEEN SCN 1 AND 10 e WHERE e.|",
-    );
+    let ctx = analyze("SELECT * FROM employees VERSIONS BETWEEN SCN 1 AND 10 e WHERE e.|");
 
     assert!(
         ctx.tables_in_scope
@@ -1817,10 +1819,30 @@ fn match_recognize_partition_by_phase_is_column_context() {
 }
 
 #[test]
+fn match_recognize_spaced_keywords_partition_by_phase_is_column_context() {
+    let ctx = analyze(
+        "SELECT * FROM oqt_t_emp \
+         MATCH RECOGNIZE (PARTITION BY | ORDER BY hiredate PATTERN (a b+) DEFINE b AS b.sal > PREV(b.sal))",
+    );
+    assert_eq!(ctx.phase, SqlPhase::MatchRecognizeClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn match_recognize_pattern_variables_extracted() {
     let tokens = tokenize(
         "SELECT * FROM oqt_t_emp \
          MATCH_RECOGNIZE (PARTITION BY deptno ORDER BY hiredate PATTERN (a b+) DEFINE b AS b.sal > PREV(b.sal))",
+    );
+    let vars = extract_match_recognize_pattern_variables(&tokens);
+    assert_eq!(vars, vec!["a", "b"]);
+}
+
+#[test]
+fn match_recognize_pattern_variables_extracted_with_spaced_keywords() {
+    let tokens = tokenize(
+        "SELECT * FROM oqt_t_emp \
+         MATCH RECOGNIZE (PARTITION BY deptno ORDER BY hiredate PATTERN (a b+) DEFINE b AS b.sal > PREV(b.sal))",
     );
     let vars = extract_match_recognize_pattern_variables(&tokens);
     assert_eq!(vars, vec!["a", "b"]);
@@ -1834,6 +1856,21 @@ fn match_recognize_keyword_is_not_parsed_as_table_alias() {
             .iter()
             .all(|t| t.alias.as_deref() != Some("MATCH_RECOGNIZE")),
         "MATCH_RECOGNIZE should not be parsed as table alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|t| (&t.name, &t.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn match_recognize_spaced_keywords_are_not_parsed_as_table_aliases() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp MATCH RECOGNIZE (PATTERN (a)) WHERE |");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|t| t.alias.as_deref() != Some("MATCH") && t.alias.as_deref() != Some("RECOGNIZE")),
+        "MATCH/RECOGNIZE should not be parsed as table alias: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|t| (&t.name, &t.alias))
@@ -2257,7 +2294,6 @@ fn overlay_from_does_not_trigger_from_clause() {
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     assert!(ctx.phase.is_column_context());
 }
-
 
 #[test]
 fn position_from_does_not_trigger_from_clause() {
