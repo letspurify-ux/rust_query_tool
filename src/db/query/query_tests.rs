@@ -8284,3 +8284,45 @@ SELECT 2 FROM dual;"#;
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_whenever_statement_head() {
+    let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nWHENEVER SQLERROR EXIT SQL.SQLCODE\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("WHENEVER SQLERROR")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::WheneverSqlError { exit, action }) if *exit && action.as_deref() == Some("SQL.SQLCODE")),
+        "second item should parse WHENEVER SQLERROR EXIT SQL.SQLCODE: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_variable_statement_head() {
+    let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nVARIABLE v NUMBER\nPRINT v\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("VARIABLE v NUMBER")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Var { name, .. }) if name == "v"),
+        "second item should parse VARIABLE command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::ToolCommand(ToolCommand::Print { name }) if name.as_deref() == Some("v")),
+        "third item should parse PRINT command: {items:?}"
+    );
+    assert!(
+        matches!(&items[3], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "fourth item should be trailing SELECT statement: {items:?}"
+    );
+}
