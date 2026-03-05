@@ -721,10 +721,8 @@ impl SqlEditorWidget {
         }
 
         let mut select_list_break_state = SelectListBreakState::None;
-        let mut idx = 0usize;
-        while idx < items.len() {
-            let item = &items[idx];
-            let consumed = 1usize;
+        for (idx, item) in items.iter().enumerate() {
+            let next_item = items.get(idx + 1);
 
             match item {
                 FormatItem::Statement(statement) => {
@@ -753,23 +751,20 @@ impl SqlEditorWidget {
                 }
             }
 
-            if idx + consumed < items.len() {
-                let next_item = &items[idx + consumed];
-                if matches!(next_item, FormatItem::Slash) {
-                    formatted.push('\n');
-                } else if matches!(item, FormatItem::Slash) {
-                    formatted.push_str("\n\n");
-                } else if Self::keeps_tight_spacing(item, next_item) {
-                    formatted.push('\n');
-                } else {
-                    formatted.push_str("\n\n");
-                }
+            if let Some(next_item) = next_item {
+                formatted.push_str(Self::item_separator(item, next_item));
             }
-
-            idx += consumed;
         }
 
         formatted
+    }
+
+    fn item_separator(current: &FormatItem, next: &FormatItem) -> &'static str {
+        if matches!(next, FormatItem::Slash) || Self::keeps_tight_spacing(current, next) {
+            "\n"
+        } else {
+            "\n\n"
+        }
     }
 
     fn keeps_tight_spacing(current: &FormatItem, next: &FormatItem) -> bool {
@@ -786,8 +781,7 @@ impl SqlEditorWidget {
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
-            ) => true,
-            (
+            ) | (
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
             ) => true,
