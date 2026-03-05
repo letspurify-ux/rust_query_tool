@@ -544,20 +544,10 @@ impl SqlEditorWidget {
             return without_semicolon;
         }
 
-        if let Some(without_semicolon) =
-            Self::remove_trailing_line_comment_semicolon(source, &formatted)
-        {
-            return without_semicolon;
-        }
-
         formatted
     }
 
-    fn remove_trailing_line_comment_semicolon(source: &str, formatted: &str) -> Option<String> {
-        if Self::statement_ends_with_semicolon(source) {
-            return None;
-        }
-
+    fn removable_trailing_semicolon_span(formatted: &str) -> Option<(usize, usize)> {
         let trimmed_len = formatted.trim_end().len();
         if trimmed_len == 0 {
             return None;
@@ -565,43 +555,41 @@ impl SqlEditorWidget {
         let trimmed = &formatted[..trimmed_len];
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
-        let last_span = spans.last()?;
-        let SqlToken::Comment(comment_text) = &last_span.token else {
-            return None;
-        };
-        if !comment_text.starts_with("--") {
-            return None;
+        let mut trailing_line_comment: Option<(usize, usize)> = None;
+        let mut semicolon_span: Option<(usize, usize)> = None;
+
+        for span in spans.iter().rev() {
+            match &span.token {
+                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => {
+                    if trailing_line_comment.is_none() {
+                        trailing_line_comment = Some((span.start, span.end));
+                    }
+                }
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == ";" => {
+                    semicolon_span = Some((span.start, span.end));
+                    break;
+                }
+                _ => break,
+            }
         }
 
-        let semicolon_idx = trimmed[last_span.start..last_span.end].rfind(';')? + last_span.start;
-        let mut out = String::with_capacity(formatted.len().saturating_sub(1));
-        out.push_str(&formatted[..semicolon_idx]);
-        out.push_str(&formatted[semicolon_idx + 1..]);
-        Some(out)
+        if let Some(span) = semicolon_span {
+            return Some(span);
+        }
+
+        let (comment_start, comment_end) = trailing_line_comment?;
+        let comment_text = trimmed.get(comment_start..comment_end)?;
+        let comment_semicolon = comment_text.rfind(';')?;
+
+        Some((
+            comment_start.saturating_add(comment_semicolon),
+            comment_start.saturating_add(comment_semicolon).saturating_add(1),
+        ))
     }
 
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
-        let trimmed_len = formatted.trim_end().len();
-        let trimmed = &formatted[..trimmed_len];
-
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        let semicolon_span = spans.iter().rev().find_map(|span| match &span.token {
-            SqlToken::Comment(_) => None,
-            SqlToken::Symbol(sym) if sym == ";" => Some((span.start, span.end)),
-            _ => Some((0, 0)),
-        })?;
-
-        if semicolon_span == (0, 0) {
-            return None;
-        }
-
-        let (semicolon_start, semicolon_end) = semicolon_span;
-        let has_non_comment_after_semicolon = spans
-            .iter()
-            .any(|span| span.start >= semicolon_end && !matches!(span.token, SqlToken::Comment(_)));
-        if has_non_comment_after_semicolon {
-            return None;
-        }
+        let (semicolon_start, semicolon_end) = Self::removable_trailing_semicolon_span(formatted)?;
 
         let mut out = String::with_capacity(
             formatted
