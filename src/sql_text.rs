@@ -329,6 +329,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PROFILE",
     "PUBLIC",
     "PURGE",
+    "QUALIFY",
     "RAISE",
     "RANGE",
     "RANK",
@@ -460,6 +461,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "WHENEVER",
     "WHERE",
     "WHILE",
+    "WINDOW",
     "WITH",
     "WITHIN",
     "WRAPPER",
@@ -468,6 +470,67 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "YEAR",
     "ZONE",
     "_ORACLE_SCRIPT",
+];
+
+/// Formatter clause boundaries that should start on a new line.
+pub(crate) const FORMAT_CLAUSE_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "UNION",
+    "INTERSECT",
+    "MINUS",
+    "EXCEPT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "VALUES",
+    "SET",
+    "INTO",
+    "OFFSET",
+    "FETCH",
+    "LIMIT",
+    "CONNECT",
+    "START",
+    "RETURNING",
+    "MODEL",
+    "WINDOW",
+    "MATCH_RECOGNIZE",
+    "QUALIFY",
+    "WITH",
+];
+
+/// `CREATE TABLE ...` suffix keywords used by formatter to split storage clauses.
+pub(crate) const FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS: &[&str] = &[
+    "PCTFREE",
+    "PCTUSED",
+    "INITRANS",
+    "MAXTRANS",
+    "COMPRESS",
+    "NOCOMPRESS",
+    "LOGGING",
+    "NOLOGGING",
+    "STORAGE",
+    "TABLESPACE",
+    "USING",
+    "ENABLE",
+    "DISABLE",
+    "CACHE",
+    "NOCACHE",
+    "PARALLEL",
+    "NOPARALLEL",
+    "MONITORING",
+    "NOMONITORING",
+    "ORGANIZATION",
+    "INCLUDING",
+    "LOB",
+    "PARTITION",
+    "SUBPARTITION",
+    "SHARING",
 ];
 
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] =
@@ -640,6 +703,14 @@ pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
     trimmed.starts_with("--") || is_sqlplus_remark_comment_line(trimmed)
 }
 
+/// Returns true if `word` is one of the shared Oracle SQL keywords.
+#[inline]
+pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {
+    ORACLE_SQL_KEYWORDS
+        .binary_search_by(|candidate| candidate.cmp(&word))
+        .is_ok()
+}
+
 /// Returns true when a keyword can start the main query after a WITH clause.
 pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_MAIN_QUERY_KEYWORDS)
@@ -662,4 +733,25 @@ pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
 /// Returns true when a CTE state machine should recover back to normal parsing.
 pub(crate) fn is_cte_recovery_keyword(word: &str) -> bool {
     is_subquery_head_keyword(word)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oracle_sql_keyword_lookup_uses_uppercase_tokens() {
+        assert!(is_oracle_sql_keyword("SELECT"));
+        assert!(!is_oracle_sql_keyword("select"));
+    }
+
+    #[test]
+    fn formatter_keyword_groups_stay_in_shared_keyword_pool() {
+        assert!(FORMAT_CLAUSE_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+        assert!(FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS
+            .iter()
+            .all(|keyword| is_oracle_sql_keyword(keyword)));
+    }
 }

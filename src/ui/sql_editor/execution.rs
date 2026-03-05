@@ -23,7 +23,7 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
-use crate::sql_text::{self, ORACLE_SQL_KEYWORDS};
+use crate::sql_text::{self, FORMAT_CLAUSE_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS};
 use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
@@ -1123,36 +1123,7 @@ impl SqlEditorWidget {
             return formatted;
         }
 
-        let clause_keywords = [
-            "SELECT",
-            "FROM",
-            "WHERE",
-            "GROUP",
-            "HAVING",
-            "ORDER",
-            "UNION",
-            "INTERSECT",
-            "MINUS",
-            "EXCEPT",
-            "INSERT",
-            "UPDATE",
-            "DELETE",
-            "MERGE",
-            "VALUES",
-            "SET",
-            "INTO",
-            "OFFSET",
-            "FETCH",
-            "LIMIT",
-            "CONNECT",
-            "START",
-            "RETURNING",
-            "MODEL",
-            "WINDOW",
-            "MATCH_RECOGNIZE",
-            "QUALIFY",
-            "WITH",
-        ];
+        let clause_keywords = FORMAT_CLAUSE_KEYWORDS;
         let join_modifiers = ["LEFT", "RIGHT", "FULL", "INNER", "CROSS"];
         let join_keyword = "JOIN";
         let outer_keyword = "OUTER";
@@ -1255,7 +1226,7 @@ impl SqlEditorWidget {
                                 | "INTO"
                         )
                     );
-                    let is_keyword = ORACLE_SQL_KEYWORDS.iter().any(|&kw| kw == upper);
+                    let is_keyword = sql_text::is_oracle_sql_keyword(upper.as_str());
                     let is_or_in_create = upper == "OR"
                         && matches!(prev_word_upper.as_deref(), Some("CREATE"))
                         && next_word_is("REPLACE");
@@ -2878,7 +2849,7 @@ impl SqlEditorWidget {
         match token {
             SqlToken::Word(word) => {
                 let upper = word.to_uppercase();
-                if ORACLE_SQL_KEYWORDS.iter().any(|&kw| kw == upper) {
+                if sql_text::is_oracle_sql_keyword(upper.as_str()) {
                     upper
                 } else {
                     word.clone()
@@ -2996,33 +2967,7 @@ impl SqlEditorWidget {
             return String::new();
         }
 
-        let break_keywords = [
-            "PCTFREE",
-            "PCTUSED",
-            "INITRANS",
-            "MAXTRANS",
-            "COMPRESS",
-            "NOCOMPRESS",
-            "LOGGING",
-            "NOLOGGING",
-            "STORAGE",
-            "TABLESPACE",
-            "USING",
-            "ENABLE",
-            "DISABLE",
-            "CACHE",
-            "NOCACHE",
-            "PARALLEL",
-            "NOPARALLEL",
-            "MONITORING",
-            "NOMONITORING",
-            "ORGANIZATION",
-            "INCLUDING",
-            "LOB",
-            "PARTITION",
-            "SUBPARTITION",
-            "SHARING",
-        ];
+        let break_keywords = FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS;
 
         let mut parts: Vec<Vec<SqlToken>> = Vec::new();
 
