@@ -8232,3 +8232,55 @@ SELECT 2 FROM dual;"#;
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
+
+#[test]
+fn test_split_script_items_simple_trigger_referencing_new_old_aliases() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_ref_alias
+BEFORE INSERT OR UPDATE ON t
+REFERENCING NEW AS n OLD AS o
+FOR EACH ROW
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger REFERENCING ... AS aliases must not create fake AS/IS block depth: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("REFERENCING NEW AS n OLD AS o"),
+        "first statement should preserve REFERENCING aliases: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_simple_trigger_when_with_parenthesized_as_expression() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_when_case
+BEFORE INSERT ON t
+FOR EACH ROW
+WHEN ((CASE WHEN NEW.status = 'A' THEN 1 ELSE 0 END) = 1)
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger WHEN expression containing nested parentheses must not affect AS/IS block detection: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("WHEN ((CASE WHEN NEW.status = 'A' THEN 1 ELSE 0 END) = 1)"),
+        "first statement should preserve WHEN expression: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
