@@ -214,6 +214,56 @@ fn phase_values() {
 }
 
 #[test]
+fn phase_insert_returning_is_column_context() {
+    let ctx = analyze("INSERT INTO t (a) VALUES (1) RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_update_returning_is_column_context() {
+    let ctx = analyze("UPDATE t SET a = 1 RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_delete_returning_is_column_context() {
+    let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn only_without_parentheses_keeps_underlying_table_name_and_alias() {
+    let ctx = analyze("SELECT e.| FROM ONLY employees e WHERE e.id > 0");
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMPLOYEES"),
+        "ONLY relation wrapper should preserve underlying table name: {:?}",
+        names
+    );
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().any(|alias| alias == "E"),
+        "ONLY relation wrapper alias should be captured: {:?}",
+        aliases
+    );
+
+    assert!(
+        aliases.iter().all(|alias| alias != "ONLY"),
+        "ONLY keyword must not be parsed as alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_connect_by() {
     let ctx = analyze("SELECT a FROM t START WITH a = 1 CONNECT BY |");
     assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
@@ -1877,12 +1927,14 @@ fn recursive_cte_keyword() {
 
 #[test]
 fn with_plsql_function_declaration_is_not_parsed_as_cte() {
-    let ctx = analyze(
-        "WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual",
-    );
+    let ctx = analyze("WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual");
 
     let cte_n = cte_names(&ctx);
-    assert!(cte_n.is_empty(), "PL/SQL declaration should not create CTEs: {:?}", cte_n);
+    assert!(
+        cte_n.is_empty(),
+        "PL/SQL declaration should not create CTEs: {:?}",
+        cte_n
+    );
 
     let names = table_names(&ctx);
     assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
@@ -1891,12 +1943,14 @@ fn with_plsql_function_declaration_is_not_parsed_as_cte() {
 
 #[test]
 fn with_plsql_procedure_declaration_is_not_parsed_as_cte() {
-    let ctx = analyze(
-        "WITH PROCEDURE p IS BEGIN NULL; END; SELECT | FROM dual",
-    );
+    let ctx = analyze("WITH PROCEDURE p IS BEGIN NULL; END; SELECT | FROM dual");
 
     let cte_n = cte_names(&ctx);
-    assert!(cte_n.is_empty(), "PL/SQL declaration should not create CTEs: {:?}", cte_n);
+    assert!(
+        cte_n.is_empty(),
+        "PL/SQL declaration should not create CTEs: {:?}",
+        cte_n
+    );
 
     let names = table_names(&ctx);
     assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
