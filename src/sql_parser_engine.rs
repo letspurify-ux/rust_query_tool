@@ -1071,7 +1071,10 @@ impl SplitState {
                 "OR" => {
                     return;
                 }
-                "NO" | "FORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE" => {
+                "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE" => {
+                    return;
+                }
+                "IF" | "NOT" | "EXISTS" => {
                     return;
                 }
                 "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" => {
@@ -1873,6 +1876,47 @@ mod tests {
         assert!(state.in_create_plsql());
         assert_eq!(state.create_plsql_kind, CreatePlsqlKind::JavaSource);
         assert_eq!(state.create_state, CreateState::None);
+    }
+
+    #[test]
+    fn create_state_accepts_noforce_modifier_before_trigger() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("NOFORCE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("TRIGGER");
+
+        assert!(state.in_create_plsql());
+        assert_eq!(
+            state.create_plsql_kind,
+            CreatePlsqlKind::Trigger(TriggerKind::Simple)
+        );
+    }
+
+    #[test]
+    fn create_state_accepts_if_not_exists_before_procedure() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("IF");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("NOT");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("EXISTS");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("PROCEDURE");
+
+        assert!(state.in_create_plsql());
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Procedure);
     }
 
     #[test]

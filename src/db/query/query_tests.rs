@@ -8414,3 +8414,60 @@ fn test_split_script_items_oracle_with_function_recovers_to_variable_statement_h
         "fourth item should be trailing SELECT statement: {items:?}"
     );
 }
+
+#[test]
+fn test_split_script_items_create_noforce_trigger_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE NOFORCE TRIGGER trg_noforce
+BEFORE INSERT ON t
+FOR EACH ROW
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE NOFORCE TRIGGER should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE NOFORCE TRIGGER trg_noforce"),
+        "first statement should preserve NOFORCE TRIGGER DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_create_if_not_exists_procedure_splits_before_trailing_select() {
+    let sql = r#"CREATE IF NOT EXISTS PROCEDURE p_if_not_exists
+IS
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE IF NOT EXISTS PROCEDURE should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE IF NOT EXISTS PROCEDURE p_if_not_exists"),
+        "first statement should preserve IF NOT EXISTS PROCEDURE DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
