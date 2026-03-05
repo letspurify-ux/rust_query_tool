@@ -5942,6 +5942,7 @@ impl SqlEditorWidget {
                                             if let Some(timeout_duration) = query_timeout {
                                                 if cursor_start.elapsed() >= timeout_duration {
                                                     cursor_timed_out = true;
+                                                    let _ = conn.break_execution();
                                                     return false;
                                                 }
                                             }
@@ -6129,6 +6130,7 @@ impl SqlEditorWidget {
                                             if let Some(timeout_duration) = query_timeout {
                                                 if cursor_start.elapsed() >= timeout_duration {
                                                     cursor_timed_out = true;
+                                                    let _ = conn.break_execution();
                                                     return false;
                                                 }
                                             }
@@ -6437,6 +6439,7 @@ impl SqlEditorWidget {
                                             if let Some(timeout_duration) = query_timeout {
                                                 if statement_start.elapsed() >= timeout_duration {
                                                     timed_out = true;
+                                                    let _ = conn.break_execution();
                                                     return false;
                                                 }
                                             }
