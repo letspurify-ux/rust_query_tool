@@ -767,7 +767,7 @@ impl SqlHighlighter {
         let upper = upper.as_ref();
 
         // Check if it's a SQL keyword
-        if sql_text::ORACLE_SQL_KEYWORDS_SET.contains(upper) {
+        if sql_text::is_oracle_sql_keyword(upper) {
             return TokenType::Keyword;
         }
 
