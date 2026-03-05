@@ -165,6 +165,50 @@ fn phase_left_anti_join_keeps_join_modifier_out_of_aliases() {
 }
 
 #[test]
+fn phase_semi_join_without_left_modifier_keeps_join_modifier_out_of_aliases() {
+    let ctx = analyze("SELECT * FROM emp SEMI JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "SEMI"),
+        "SEMI must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_anti_join_without_left_modifier_keeps_join_modifier_out_of_aliases() {
+    let ctx = analyze("SELECT * FROM emp ANTI JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "ANTI"),
+        "ANTI must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_group_by() {
     let ctx = analyze("SELECT a FROM t GROUP BY |");
     assert_eq!(ctx.phase, SqlPhase::GroupByClause);
@@ -223,7 +267,6 @@ fn straight_join_select_modifier_does_not_switch_to_from_clause() {
         names
     );
 }
-
 
 #[test]
 fn phase_order_siblings_by_with_comment_between_keywords() {
@@ -1726,9 +1769,8 @@ fn tablesample_repeatable_before_alias_is_not_parsed_as_alias() {
 
 #[test]
 fn table_alias_after_as_of_timestamp_clause_is_collected() {
-    let ctx = analyze(
-        "SELECT e.| FROM employees AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' DAY) e",
-    );
+    let ctx =
+        analyze("SELECT e.| FROM employees AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' DAY) e");
 
     let names = table_names(&ctx);
     assert!(
@@ -1751,9 +1793,7 @@ fn table_alias_after_as_of_scn_clause_is_collected() {
 
 #[test]
 fn table_alias_after_as_of_period_for_clause_is_collected() {
-    let ctx = analyze(
-        "SELECT e.| FROM employees AS OF PERIOD FOR valid_time (SYSTIMESTAMP) e",
-    );
+    let ctx = analyze("SELECT e.| FROM employees AS OF PERIOD FOR valid_time (SYSTIMESTAMP) e");
 
     let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
     assert_eq!(resolved, vec!["employees".to_string()]);
@@ -2002,7 +2042,8 @@ fn delete_using_source_table_is_collected() {
 
 #[test]
 fn delete_using_source_without_alias_does_not_capture_where_keyword_as_alias() {
-    let ctx = analyze("DELETE FROM target_table t USING source_table WHERE t.id = source_table.id AND |");
+    let ctx =
+        analyze("DELETE FROM target_table t USING source_table WHERE t.id = source_table.id AND |");
 
     let source = ctx
         .tables_in_scope
@@ -2942,7 +2983,11 @@ fn grammar_nested_case_variant_2() {
     let cols = extract_select_list_columns(&tokenize(
         "SELECT CASE WHEN a=1 THEN CASE WHEN b=2 THEN c END END AS nested_case_col FROM t",
     ));
-    assert!(cols.contains(&"nested_case_col".to_string()), "cols: {:?}", cols);
+    assert!(
+        cols.contains(&"nested_case_col".to_string()),
+        "cols: {:?}",
+        cols
+    );
 }
 
 #[test]
@@ -2959,7 +3004,8 @@ fn grammar_analytic_window_variant_1() {
 
 #[test]
 fn grammar_analytic_window_variant_2() {
-    let ctx = analyze("SELECT ROW_NUMBER() OVER (PARTITION BY deptno ORDER BY sal) rn FROM emp WHERE |");
+    let ctx =
+        analyze("SELECT ROW_NUMBER() OVER (PARTITION BY deptno ORDER BY sal) rn FROM emp WHERE |");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
@@ -2968,7 +3014,11 @@ fn grammar_analytic_window_variant_3() {
     let cols = extract_select_list_columns(&tokenize(
         "SELECT SUM(sal) OVER (PARTITION BY deptno ORDER BY sal) AS analytic_sum FROM emp",
     ));
-    assert!(cols.contains(&"analytic_sum".to_string()), "cols: {:?}", cols);
+    assert!(
+        cols.contains(&"analytic_sum".to_string()),
+        "cols: {:?}",
+        cols
+    );
 }
 
 #[test]
@@ -3011,7 +3061,8 @@ fn grammar_with_recursive_style_variant_2() {
 
 #[test]
 fn grammar_with_recursive_style_variant_3() {
-    let ctx = analyze("SELECT * FROM (WITH cte AS (SELECT 1 AS x FROM dual) SELECT * FROM cte WHERE |)");
+    let ctx =
+        analyze("SELECT * FROM (WITH cte AS (SELECT 1 AS x FROM dual) SELECT * FROM cte WHERE |)");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert_eq!(ctx.depth, 1);
 }
@@ -3024,7 +3075,9 @@ fn grammar_complex_join_variant_1() {
 
 #[test]
 fn grammar_complex_join_variant_2() {
-    let ctx = analyze("SELECT * FROM emp e CROSS APPLY (SELECT * FROM bonus b WHERE b.empno = e.empno AND |) bx");
+    let ctx = analyze(
+        "SELECT * FROM emp e CROSS APPLY (SELECT * FROM bonus b WHERE b.empno = e.empno AND |) bx",
+    );
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     let names = table_names(&ctx);
     assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
