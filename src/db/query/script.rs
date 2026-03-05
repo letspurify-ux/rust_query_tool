@@ -49,13 +49,9 @@ impl QueryExecutor {
         }
 
         fn chars_word_is_subquery_head_keyword(chars: &[char], start: usize, end: usize) -> bool {
-            chars_word_eq_ignore_ascii_case(chars, start, end, "SELECT")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "INSERT")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "UPDATE")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "DELETE")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "MERGE")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "VALUES")
-                || chars_word_eq_ignore_ascii_case(chars, start, end, "WITH")
+            sql_text::SUBQUERY_HEAD_KEYWORDS
+                .iter()
+                .any(|keyword| chars_word_eq_ignore_ascii_case(chars, start, end, keyword))
         }
 
         fn leading_keyword_after_comments(line: &str) -> Option<&str> {
@@ -199,9 +195,7 @@ impl QueryExecutor {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).
                 // VALUES can head a nested query block in dialects that support table value
                 // constructors in FROM/subquery positions.
-                let promote_to_subquery = leading_is_any(&[
-                    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "WITH",
-                ]);
+                let promote_to_subquery = leading_is_any(sql_text::SUBQUERY_HEAD_KEYWORDS);
                 if promote_to_subquery {
                     subquery_paren_depth =
                         subquery_paren_depth.saturating_add(pending_subquery_paren);

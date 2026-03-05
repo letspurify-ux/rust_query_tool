@@ -74,6 +74,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "COMPUTE",
     "COMPUTES",
     "CONDITIONAL",
+    "CONN",
     "CONNECT",
     "CONNECT_BY_ISCYCLE",
     "CONNECT_BY_ISLEAF",
@@ -114,6 +115,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "DIRECTORY",
     "DISABLE",
     "DISASSOCIATE",
+    "DISC",
     "DISCONNECT",
     "DISTINCT",
     "DOCUMENT",
@@ -123,6 +125,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "EDITION",
     "EDITIONABLE",
     "ELSE",
+    "ELSEIF",
     "ELSIF",
     "EMPTY",
     "ENABLE",
@@ -135,6 +138,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "EXCEPTION",
     "EXCEPTIONS",
     "EXCEPTION_INIT",
+    "EXCLUDE",
     "EXEC",
     "EXECUTE",
     "EXISTS",
@@ -176,6 +180,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "IGNORE",
     "IMMEDIATE",
     "IN",
+    "INCLUDE",
     "INCLUDING",
     "INCREMENT",
     "INDEX",
@@ -361,6 +366,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "REFERENCES",
     "REFRESH",
     "RELY",
+    "REM",
+    "REMARK",
     "RENAME",
     "REPEAT",
     "REPLACE",
@@ -395,6 +402,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SELECT",
     "SEQUENCE",
     "SEQUENTIAL",
+    "SERIAL",
     "SERIALIZABLE",
     "SERVEROUTPUT",
     "SESSION",
@@ -490,6 +498,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "YEAR",
     "ZONE",
     "_ORACLE_SCRIPT",
+
 ];
 
 /// Formatter clause boundaries that should start on a new line.
@@ -572,6 +581,10 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] =
     &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES"];
+
+pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "WITH",
+];
 
 const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
 
@@ -788,7 +801,7 @@ pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
 
 /// Returns true when a keyword can head a subquery body after `(`.
 pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
-    is_with_main_query_keyword(word) || word.eq_ignore_ascii_case("WITH")
+    matches_keyword(word, SUBQUERY_HEAD_KEYWORDS)
 }
 
 /// Returns true when a CTE state machine should recover back to normal parsing.
