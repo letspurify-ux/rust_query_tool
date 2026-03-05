@@ -233,7 +233,7 @@ impl RoutineFrame {
                         ExternalClauseState::AwaitingLanguageTargetImplicit
                     };
             }
-            "NAME" | "LIBRARY" | "PARAMETERS" => {
+            "NAME" | "LIBRARY" | "PARAMETERS" | "CALLING" | "WITH" => {
                 if matches!(
                     self.external_clause_state,
                     ExternalClauseState::SawExternalKeyword
@@ -2440,6 +2440,34 @@ mod tests {
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C NAME 'ext_lang_only'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_calling_standard_without_external_keyword_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_calling RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C CALLING STANDARD;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("LANGUAGE C CALLING STANDARD"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_with_context_without_external_keyword_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_with_context RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C WITH CONTEXT;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("LANGUAGE C WITH CONTEXT"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 

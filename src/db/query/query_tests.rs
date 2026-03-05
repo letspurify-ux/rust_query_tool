@@ -1278,6 +1278,94 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_calling_standard_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_calling RETURN NUMBER
+AS LANGUAGE C CALLING STANDARD;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE ... CALLING STANDARD without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_calling RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C CALLING STANDARD"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_calling_standard_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_calling RETURN NUMBER
+AS LANGUAGE C CALLING STANDARD;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE ... CALLING STANDARD function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_calling RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C CALLING STANDARD"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_language_with_context_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_context RETURN NUMBER
+AS LANGUAGE C WITH CONTEXT;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE ... WITH CONTEXT without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_context RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C WITH CONTEXT"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_with_context_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_context RETURN NUMBER
+AS LANGUAGE C WITH CONTEXT;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE ... WITH CONTEXT function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_context RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C WITH CONTEXT"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_external_language_parameters_without_external_keyword_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_params RETURN NUMBER
 AS LANGUAGE C PARAMETERS (CONTEXT);
