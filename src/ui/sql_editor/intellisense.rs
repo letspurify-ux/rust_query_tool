@@ -944,6 +944,36 @@ impl SqlEditorWidget {
 
                                 return true;
                             }
+                            Key::PageUp => {
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_prev_page();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
+                            Key::PageDown => {
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_next_page();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
                             Key::Enter | Key::KPEnter | Key::Tab => {
                                 // Insert selected suggestion, consume event
                                 let selected = intellisense_popup_for_handle
@@ -1246,7 +1276,7 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    if matches!(key, Key::Up | Key::Down) {
+                    if matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
                         let mut nav_state = navigation_keyup_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1319,6 +1349,8 @@ impl SqlEditorWidget {
                             key,
                             Key::Up
                                 | Key::Down
+                                | Key::PageUp
+                                | Key::PageDown
                                 | Key::Escape
                                 | Key::Enter
                                 | Key::KPEnter
@@ -1501,7 +1533,7 @@ impl SqlEditorWidget {
                             &connection_for_handle,
                         );
                     }
-                    if matches!(key, Key::Up | Key::Down) {
+                    if matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
                         widget_for_shortcuts.refresh_highlighting();
                     }
                     false
@@ -1569,7 +1601,13 @@ impl SqlEditorWidget {
                     if popup_visible
                         && matches!(
                             key,
-                            Key::Up | Key::Down | Key::Enter | Key::KPEnter | Key::Tab
+                            Key::Up
+                                | Key::Down
+                                | Key::PageUp
+                                | Key::PageDown
+                                | Key::Enter
+                                | Key::KPEnter
+                                | Key::Tab
                         )
                     {
                         return true;
