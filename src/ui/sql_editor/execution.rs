@@ -6998,14 +6998,8 @@ impl SqlEditorWidget {
                     "sql_editor::execution",
                     &format!("Query worker thread panicked: {panic_payload}"),
                 );
-                let _ = sender.send(QueryProgress::StatementFinished {
-                    index: 0,
-                    result: QueryResult::new_error(
-                        &sql_text,
-                        &format!("Query execution thread panicked: {panic_payload}"),
-                    ),
-                    connection_name: String::new(),
-                    timed_out: false,
+                let _ = sender.send(QueryProgress::WorkerPanicked {
+                    message: format!("Query execution thread panicked: {panic_payload}"),
                 });
                 app::awake();
                 eprintln!("Query thread panicked: {panic_payload}");

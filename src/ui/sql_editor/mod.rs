@@ -743,6 +743,9 @@ pub enum QueryProgress {
     ConnectionChanged {
         info: Option<ConnectionInfo>,
     },
+    WorkerPanicked {
+        message: String,
+    },
     StatementFinished {
         index: usize,
         result: QueryResult,
