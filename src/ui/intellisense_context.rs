@@ -255,6 +255,11 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE")
 }
 
+
+fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
+    matches!(keyword, "FUNCTION" | "PROCEDURE")
+}
+
 fn should_enter_with_clause(
     current_phase: SqlPhase,
     depth: usize,
@@ -678,7 +683,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 // CTE state machine
                 match cte_state {
                     CteState::ExpectName if upper != "RECURSIVE" => {
-                        cte_state = CteState::AfterName;
+                        if is_with_plsql_declaration_keyword(upper.as_str()) {
+                            cte_state = CteState::Inactive;
+                        } else {
+                            cte_state = CteState::AfterName;
+                        }
                         idx += 1;
                         continue;
                     }
@@ -1140,6 +1149,9 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
                     u.as_str(),
                     "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
                 ) {
+                    break;
+                }
+                if is_with_plsql_declaration_keyword(u.as_str()) {
                     break;
                 }
                 w.clone()
