@@ -1718,6 +1718,12 @@ impl SqlParserEngine {
         self.process_line(line);
         self.take_statements()
     }
+
+    pub(crate) fn prepare_slash_terminator(&mut self) {
+        if self.state.pending_end == PendingEnd::End && self.state.is_idle() {
+            self.state.resolve_pending_end_on_terminator();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2488,7 +2494,8 @@ mod tests {
     }
 
     #[test]
-    fn language_clause_with_calling_standard_without_external_keyword_marks_external_routine_split() {
+    fn language_clause_with_calling_standard_without_external_keyword_marks_external_routine_split()
+    {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE FUNCTION ext_calling RETURN NUMBER");

@@ -2647,13 +2647,16 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle() && trimmed == "/" && builder.block_depth() == 0 {
-                if !builder.current_is_empty() {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
+            if builder.is_idle() && trimmed == "/" {
+                builder.prepare_slash_terminator();
+                if builder.block_depth() == 0 {
+                    if !builder.current_is_empty() {
+                        for stmt in builder.force_terminate_and_take_statements() {
+                            add_statement(stmt, &mut items);
+                        }
                     }
+                    continue;
                 }
-                continue;
             }
 
             // Handle lone semicolon line after CREATE PL/SQL statement
@@ -2789,14 +2792,17 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle() && trimmed == "/" && builder.block_depth() == 0 {
-                if !builder.current_is_empty() {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
+            if builder.is_idle() && trimmed == "/" {
+                builder.prepare_slash_terminator();
+                if builder.block_depth() == 0 {
+                    if !builder.current_is_empty() {
+                        for stmt in builder.force_terminate_and_take_statements() {
+                            add_statement(stmt, &mut items);
+                        }
                     }
+                    items.push(FormatItem::Slash);
+                    continue;
                 }
-                items.push(FormatItem::Slash);
-                continue;
             }
 
             if builder.is_idle()
