@@ -1805,6 +1805,43 @@ fn skip_comment_tokens(tokens: &[SqlToken], mut idx: usize) -> usize {
     idx
 }
 
+fn skip_derived_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
+    let mut idx = start;
+
+    loop {
+        idx = skip_comment_tokens(tokens, idx);
+        let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+            break;
+        };
+
+        let upper = word.to_ascii_uppercase();
+        let clause_open_idx = match upper.as_str() {
+            "PIVOT" | "UNPIVOT" | "MODEL" | "MATCH_RECOGNIZE" => {
+                skip_comment_tokens(tokens, idx + 1)
+            }
+            "MATCH" => {
+                let recognize_idx = skip_comment_tokens(tokens, idx + 1);
+                if !matches!(tokens.get(recognize_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("RECOGNIZE")) {
+                    break;
+                }
+                skip_comment_tokens(tokens, recognize_idx + 1)
+            }
+            _ => break,
+        };
+
+        if !matches!(tokens.get(clause_open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            break;
+        }
+
+        idx = extract_parenthesized_range(tokens, clause_open_idx)
+            .map(|(_, next_idx)| next_idx)
+            .unwrap_or(clause_open_idx.saturating_add(1));
+    }
+
+    idx
+}
+
+
 /// Parse an alias after a subquery closing ')'.
 fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
     fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
@@ -1834,6 +1871,9 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
         }
         break;
     }
+
+    idx = skip_relation_postfix_clauses(tokens, idx);
+    idx = skip_derived_relation_postfix_clauses(tokens, idx);
 
     match tokens.get(idx) {
         Some(SqlToken::Word(word)) => {

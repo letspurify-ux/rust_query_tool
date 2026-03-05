@@ -2647,6 +2647,67 @@ fn match_recognize_spaced_keywords_are_not_parsed_as_table_aliases() {
 }
 
 #[test]
+fn pivot_clause_alias_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT p.| FROM (SELECT deptno, job, sal FROM oqt_t_emp) PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p",
+    );
+
+    let pivot_alias = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("p")));
+    assert!(
+        pivot_alias.is_some(),
+        "pivot clause alias p should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("p", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "pivot clause alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+
+#[test]
+fn unpivot_clause_alias_is_collected_for_qualifier_resolution() {
+    let ctx = analyze(
+        "SELECT u.| FROM (SELECT deptno, sal FROM oqt_t_emp) UNPIVOT (amount FOR metric IN (sal AS 'SAL')) u",
+    );
+
+    let unpivot_alias = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("u")));
+    assert!(
+        unpivot_alias.is_some(),
+        "unpivot clause alias u should be present, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+
+    let resolved = resolve_qualifier_tables("u", &ctx.tables_in_scope);
+    assert!(
+        !resolved.is_empty(),
+        "unpivot clause alias should be collected, tables: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn json_table_arguments_can_resolve_left_relation_alias() {
     let ctx = analyze(
         "SELECT * \
