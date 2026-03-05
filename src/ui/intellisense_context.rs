@@ -252,7 +252,7 @@ fn is_from_consuming_function(name: &str) -> bool {
 
 /// FROM-clause table functions that may reference left-side row source aliases.
 fn is_from_lateral_table_function(name: &str) -> bool {
-    matches!(name, "JSON_TABLE" | "XMLTABLE")
+    matches!(name, "JSON_TABLE" | "XMLTABLE" | "UNNEST" | "TABLE")
 }
 
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
