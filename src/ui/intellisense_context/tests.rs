@@ -1697,6 +1697,41 @@ fn tablesample_repeatable_before_alias_is_not_parsed_as_alias() {
     );
 }
 
+#[test]
+fn table_alias_after_as_of_timestamp_clause_is_collected() {
+    let ctx = analyze(
+        "SELECT e.| FROM employees AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' DAY) e",
+    );
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMPLOYEES"),
+        "expected employees table in scope, got {:?}",
+        names
+    );
+    assert_eq!(ctx.qualifier_tables, Vec::<String>::new());
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn table_alias_after_as_of_scn_clause_is_collected() {
+    let ctx = analyze("SELECT e.| FROM employees AS OF SCN 12345 e");
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn table_alias_after_as_of_period_for_clause_is_collected() {
+    let ctx = analyze(
+        "SELECT e.| FROM employees AS OF PERIOD FOR valid_time (SYSTIMESTAMP) e",
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
