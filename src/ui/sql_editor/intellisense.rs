@@ -242,19 +242,10 @@ impl SqlEditorWidget {
 
         // While editing WITH cte(col1, ...), prefer body projection columns as completion
         // candidates even when an explicit list is already partially typed.
-        let mut columns = if prefer_body_projection {
-            intellisense_context::extract_select_list_columns(body_tokens)
-        } else if !cte.explicit_columns.is_empty() {
-            cte.explicit_columns.clone()
-        } else if !cte.body_range.is_empty() {
-            intellisense_context::extract_select_list_columns(body_tokens)
-        } else {
-            Vec::new()
-        };
+        let mut columns = Self::collect_cte_base_columns(cte, body_tokens, prefer_body_projection);
 
         let mut wildcard_tables = Vec::new();
-        if (cte.explicit_columns.is_empty() || prefer_body_projection) && !cte.body_range.is_empty()
-        {
+        if Self::should_expand_cte_wildcards(cte, prefer_body_projection) {
             let body_tables_in_scope =
                 intellisense_context::collect_tables_in_statement(body_tokens);
             let (wildcard_columns, deps) = Self::expand_virtual_table_wildcards(
@@ -275,6 +266,33 @@ impl SqlEditorWidget {
         );
         Self::dedup_column_names_case_insensitive(&mut columns);
         (columns, wildcard_tables)
+    }
+
+    fn collect_cte_base_columns(
+        cte: &intellisense_context::CteDefinition,
+        body_tokens: &[SqlToken],
+        prefer_body_projection: bool,
+    ) -> Vec<String> {
+        if prefer_body_projection {
+            return intellisense_context::extract_select_list_columns(body_tokens);
+        }
+
+        if !cte.explicit_columns.is_empty() {
+            return cte.explicit_columns.clone();
+        }
+
+        if cte.body_range.is_empty() {
+            Vec::new()
+        } else {
+            intellisense_context::extract_select_list_columns(body_tokens)
+        }
+    }
+
+    fn should_expand_cte_wildcards(
+        cte: &intellisense_context::CteDefinition,
+        prefer_body_projection: bool,
+    ) -> bool {
+        !cte.body_range.is_empty() && (cte.explicit_columns.is_empty() || prefer_body_projection)
     }
 
     fn classify_intellisense_context(
