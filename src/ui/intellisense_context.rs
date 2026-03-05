@@ -894,6 +894,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
                         relation_state.clear();
                     }
+                    "MATCH" => {
+                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
+                            if next_keyword == "RECOGNIZE" {
+                                depth_frames[depth].phase = SqlPhase::MatchRecognizeClause;
+                                relation_state.clear();
+                                idx = next_idx;
+                            }
+                        }
+                    }
                     "PIVOT" | "UNPIVOT" => {
                         depth_frames[depth].phase = SqlPhase::PivotClause;
                         relation_state.clear();
@@ -1436,7 +1445,8 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                         )
                     {
                         let repeatable_idx = skip_comment_tokens(tokens, idx + 1);
-                        if matches!(tokens.get(repeatable_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                        if matches!(tokens.get(repeatable_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                        {
                             idx = extract_parenthesized_range(tokens, repeatable_idx)
                                 .map(|(_, next_idx)| next_idx)
                                 .unwrap_or(repeatable_idx.saturating_add(1));
@@ -1493,7 +1503,11 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
     idx
 }
 
-fn find_top_level_keyword(tokens: &[SqlToken], start: usize, target_keyword: &str) -> Option<usize> {
+fn find_top_level_keyword(
+    tokens: &[SqlToken],
+    start: usize,
+    target_keyword: &str,
+) -> Option<usize> {
     let mut idx = start;
     let mut paren_depth = 0usize;
 
@@ -1659,6 +1673,8 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "UNPIVOT"
             | "MODEL"
             | "MATCH_RECOGNIZE"
+            | "MATCH"
+            | "RECOGNIZE"
             | "USING"
             | "SAMPLE"
             | "TABLESAMPLE"
@@ -1710,6 +1726,8 @@ fn is_relation_alias_breaker(word: &str) -> bool {
             | "UNPIVOT"
             | "MODEL"
             | "MATCH_RECOGNIZE"
+            | "MATCH"
+            | "RECOGNIZE"
             | "SELECT"
             | "FROM"
             | "INTO"
@@ -1972,11 +1990,20 @@ pub fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String
 /// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)`.
 /// Example: `PATTERN (a b+)` -> `["a", "b"]`.
 pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
-    let Some(match_idx) = find_top_level_word_index(tokens, "MATCH_RECOGNIZE") else {
+    let match_idx = find_top_level_word_index(tokens, "MATCH_RECOGNIZE")
+        .or_else(|| find_top_level_keyword_pair_index(tokens, "MATCH", "RECOGNIZE"));
+    let Some(match_idx) = match_idx else {
         return Vec::new();
     };
 
-    let clause_open_idx = next_non_comment_index(tokens, match_idx.saturating_add(1));
+    let mut clause_start_idx = match_idx.saturating_add(1);
+    if let Some((next_keyword, next_idx)) = next_word_upper(tokens, clause_start_idx) {
+        if next_keyword == "RECOGNIZE" {
+            clause_start_idx = next_idx.saturating_add(1);
+        }
+    }
+
+    let clause_open_idx = next_non_comment_index(tokens, clause_start_idx);
     let Some(SqlToken::Symbol(sym)) = tokens.get(clause_open_idx) else {
         return Vec::new();
     };
@@ -2036,6 +2063,35 @@ pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<Str
 
     dedup_columns_case_insensitive(&mut variables);
     variables
+}
+
+fn find_top_level_keyword_pair_index(
+    tokens: &[SqlToken],
+    first: &str,
+    second: &str,
+) -> Option<usize> {
+    let mut paren_state = ParenDepthState::default();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        apply_paren_token(&mut paren_state, token);
+        if paren_state.depth() != 0 {
+            continue;
+        }
+        let SqlToken::Word(word) = token else {
+            continue;
+        };
+        if !word.eq_ignore_ascii_case(first) {
+            continue;
+        }
+        let Some((next_word, _)) = next_word_upper(tokens, idx + 1) else {
+            continue;
+        };
+        if next_word.eq_ignore_ascii_case(second) {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) -> Vec<String> {
