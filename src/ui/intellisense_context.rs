@@ -638,7 +638,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 idx += 1;
                 continue;
             }
-            SqlToken::Comment(_) | SqlToken::String(_) => {
+            SqlToken::Comment(_) => {
+                // Keep parser lookbehind state across comments so syntactic pairs like
+                // `EXTRACT /*...*/ (...)` and `LATERAL /*...*/ (...)` are treated the
+                // same as comment-free statements.
+                idx += 1;
+                continue;
+            }
+            SqlToken::String(_) => {
                 idx += 1;
                 continue;
             }

@@ -1197,6 +1197,18 @@ fn lateral_subquery_can_see_outer_table_scope() {
 }
 
 #[test]
+fn lateral_subquery_with_comment_before_open_paren_keeps_outer_scope() {
+    let ctx = analyze("SELECT * FROM t1 a, LATERAL /* keep */ (SELECT a.| FROM t2 b) l");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"T1".to_string()),
+        "lateral subquery should inherit outer scope table even with comment: {:?}",
+        names
+    );
+    assert!(names.contains(&"T2".to_string()), "tables: {:?}", names);
+}
+
+#[test]
 fn lateral_keyword_is_not_parsed_as_left_table_alias() {
     let ctx = analyze("SELECT * FROM t1 LATERAL (SELECT * FROM t2) l WHERE l.|");
     let aliases: Vec<&str> = ctx
@@ -2420,6 +2432,13 @@ fn extract_from_does_not_trigger_from_clause() {
     // EXTRACT(YEAR FROM ...) uses FROM as function syntax, not as a SQL clause.
     // The cursor inside EXTRACT should stay in column context (SelectList).
     let ctx = analyze("SELECT EXTRACT(YEAR FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn extract_with_comment_before_open_paren_keeps_function_from_context() {
+    let ctx = analyze("SELECT EXTRACT /*inline*/ (YEAR FROM |) FROM emp");
     assert_eq!(ctx.phase, SqlPhase::SelectList);
     assert!(ctx.phase.is_column_context());
 }
