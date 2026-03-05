@@ -1692,6 +1692,30 @@ fn depth_zero_after_nested_with_subquery_closes() {
 }
 
 #[test]
+fn nested_with_multiple_ctes_after_comma_tracks_cte_state() {
+    let ctx = analyze(
+        "SELECT * FROM (WITH c1 AS (SELECT 1 AS id FROM dual), c2 AS (SELECT id FROM c1) SELECT | FROM c2) sub",
+    );
+
+    assert_eq!(ctx.depth, 1);
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+}
+
+#[test]
+fn nested_with_multiple_ctes_exposes_second_cte_table() {
+    let ctx = analyze(
+        "SELECT * FROM (WITH c1 AS (SELECT 1 AS id FROM dual), c2 AS (SELECT id FROM c1) SELECT * FROM c2 WHERE c2.|) sub",
+    );
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "C2"),
+        "expected second nested CTE to remain in scope, got {:?}",
+        names
+    );
+}
+
+#[test]
 fn nested_with_in_where_subquery_cte_body_depth_counts_parent_query() {
     let ctx = analyze(
         "SELECT * FROM outer_t o WHERE o.id IN (WITH cte AS (SELECT | FROM inner_t) SELECT id FROM cte)",
