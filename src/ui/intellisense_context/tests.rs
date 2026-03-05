@@ -1597,6 +1597,28 @@ fn merge_using_phase_is_table_context() {
     assert!(ctx.phase.is_table_context());
 }
 
+#[test]
+fn delete_using_phase_is_table_context() {
+    let ctx = analyze("DELETE FROM target_table t USING |");
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn delete_using_source_table_is_collected() {
+    let ctx = analyze("DELETE FROM target_table t USING source_table s WHERE t.id = s.id AND |");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"TARGET_TABLE".to_string()),
+        "tables: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"SOURCE_TABLE".to_string()),
+        "tables: {:?}",
+        names
+    );
+}
+
 // ─── Analytic function with OVER clause ──────────────────────────────────
 
 #[test]
