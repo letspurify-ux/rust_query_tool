@@ -2300,6 +2300,56 @@ mod tests {
     }
 
     #[test]
+    fn with_function_keeps_statement_open_until_main_merge_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION pick_id RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("MERGE INTO target_table t");
+        engine.process_line("USING dual d");
+        engine.process_line("ON (t.id = pick_id())");
+        engine.process_line("WHEN MATCHED THEN UPDATE SET t.val = 'Y';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "expected merge + select split");
+        assert!(
+            statements[0].starts_with("WITH FUNCTION pick_id RETURN NUMBER IS"),
+            "first statement should preserve WITH FUNCTION header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("WHEN MATCHED THEN UPDATE SET t.val = 'Y'"),
+            "first statement should include MERGE body: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn create_noneditionable_package_body_with_external_library_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY pkg_ext AS");
+        engine.process_line("  FUNCTION ext_call RETURN NUMBER IS");
+        engine.process_line("  EXTERNAL LIBRARY extlib LANGUAGE C;");
+        engine.process_line("END pkg_ext;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "expected package body + select split");
+        assert_eq!(
+            statements[0],
+            "CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY pkg_ext AS\n  FUNCTION ext_call RETURN NUMBER IS\n  EXTERNAL LIBRARY extlib LANGUAGE C;\nEND pkg_ext".to_string()
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
     fn compound_trigger_with_each_row_timing_point_splits_on_outer_end() {
         let mut engine = SqlParserEngine::new();
 
