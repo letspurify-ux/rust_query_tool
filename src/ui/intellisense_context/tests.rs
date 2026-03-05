@@ -1926,6 +1926,23 @@ fn recursive_cte_keyword() {
 }
 
 #[test]
+fn recursive_cte_search_by_is_column_context() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) SEARCH DEPTH FIRST BY | SET ord SELECT * FROM t",
+    );
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn recursive_cte_cycle_set_does_not_switch_to_dml_set_clause() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) CYCLE n SET | TO 1 DEFAULT 0 SELECT * FROM t",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WithClause);
+}
+
+#[test]
 fn with_plsql_function_declaration_is_not_parsed_as_cte() {
     let ctx = analyze("WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual");
 

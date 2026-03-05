@@ -869,7 +869,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "SET" => {
-                        depth_frames[depth].phase = SqlPhase::SetClause;
+                        if matches!(current_phase, SqlPhase::WithClause | SqlPhase::OrderByClause)
+                            && matches!(cte_state, CteState::Inactive)
+                        {
+                            // Recursive CTE SEARCH/CYCLE clauses use `... BY ... SET ...`
+                            // where SET is not a DML SET clause.
+                            depth_frames[depth].phase = SqlPhase::WithClause;
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                        }
+                        relation_state.clear();
+                    }
+                    "SEARCH" | "CYCLE" => {
+                        if matches!(current_phase, SqlPhase::WithClause) {
+                            // Oracle recursive CTE clauses (`SEARCH ... BY ...`,
+                            // `CYCLE ... SET ...`) expect column expressions.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        }
                         relation_state.clear();
                     }
                     "RETURNING" => {
