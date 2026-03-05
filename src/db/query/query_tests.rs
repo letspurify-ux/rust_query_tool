@@ -1278,6 +1278,44 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_clause_without_external_suffix_still_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
+AS LANGUAGE C;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE target-only call spec should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_external_clause_without_suffix_still_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_external_only RETURN NUMBER
+AS EXTERNAL;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "EXTERNAL-only call spec should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_external_only RETURN NUMBER"));
+    assert!(stmts[0].contains("AS EXTERNAL"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_external_function_language_parameters_without_external_keyword_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_params RETURN NUMBER
 AS LANGUAGE C PARAMETERS (CONTEXT);

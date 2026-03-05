@@ -254,6 +254,15 @@ impl RoutineFrame {
             self.external_clause_state = ExternalClauseState::None;
         }
     }
+
+    fn finalize_external_clause_on_semicolon(&mut self) {
+        if matches!(
+            self.external_clause_state,
+            ExternalClauseState::SawExternalKeyword | ExternalClauseState::SawImplicitLanguageTarget
+        ) {
+            self.mark_external_clause();
+        }
+    }
 }
 
 impl PendingDo {
@@ -1031,6 +1040,20 @@ impl SplitState {
         }
     }
 
+    fn finalize_external_clause_on_semicolon(&mut self) {
+        if self
+            .routine_is_stack
+            .last()
+            .is_none_or(|frame| frame.block_depth != self.block_depth())
+        {
+            return;
+        }
+
+        if let Some(frame) = self.routine_is_stack.last_mut() {
+            frame.finalize_external_clause_on_semicolon();
+        }
+    }
+
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
@@ -1693,6 +1716,7 @@ impl SqlParserEngine {
                 // FOR/WHILE ... DO candidates cannot span statement terminators.
                 // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
                 self.state.pending_do = PendingDo::None;
+                self.state.finalize_external_clause_on_semicolon();
                 self.state.resolve_pending_end_on_terminator();
                 self.state
                     .clear_forward_subprogram_declaration_state_on_semicolon();
@@ -2603,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn language_clause_without_external_name_or_parameters_does_not_force_split() {
+    fn language_clause_without_external_name_or_parameters_still_marks_external_routine_split() {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER");
@@ -2611,9 +2635,23 @@ mod tests {
         engine.process_line("SELECT 1 FROM dual;");
 
         let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C"));
-        assert!(statements[0].contains("SELECT 1 FROM dual"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn external_clause_without_language_target_still_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_external_only RETURN NUMBER");
+        engine.process_line("AS EXTERNAL;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS EXTERNAL"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
