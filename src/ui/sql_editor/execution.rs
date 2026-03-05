@@ -5799,6 +5799,11 @@ impl SqlEditorWidget {
                                     success: true,
                                 };
 
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+
                                 let mut out_messages: Vec<String> = Vec::new();
                                 let (_colsep, null_text, _trimspool_enabled) =
                                     SqlEditorWidget::current_text_output_settings(&session);
@@ -5836,6 +5841,11 @@ impl SqlEditorWidget {
                                     );
                                 }
 
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+
                                 if auto_commit {
                                     if let Err(err) = conn.commit() {
                                         result = QueryResult::new_error(
@@ -5846,6 +5856,135 @@ impl SqlEditorWidget {
                                         result.message =
                                             format!("{} | Auto-commit applied", result.message);
                                     }
+                                }
+
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+
+                                let ref_cursors =
+                                    match QueryExecutor::extract_ref_cursors(&stmt, &binds) {
+                                        Ok(cursors) => cursors,
+                                        Err(err) => {
+                                            let cancelled = SqlEditorWidget::is_cancel_error(&err);
+                                            timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                            let message =
+                                                SqlEditorWidget::choose_execution_error_message(
+                                                    cancelled,
+                                                    timed_out,
+                                                    query_timeout,
+                                                    format!(
+                                                        "Failed to fetch REF CURSOR results: {err}"
+                                                    ),
+                                                );
+                                            if script_mode {
+                                                let error_result =
+                                                    QueryResult::new_error(&sql_text, &message);
+                                                SqlEditorWidget::emit_script_result(
+                                                    &sender,
+                                                    &conn_name,
+                                                    result_index,
+                                                    error_result,
+                                                    timed_out,
+                                                );
+                                            } else {
+                                                let index = result_index;
+                                                let _ = sender
+                                                    .send(QueryProgress::StatementStart { index });
+                                                app::awake();
+                                                SqlEditorWidget::append_spool_output(
+                                                    &session,
+                                                    std::slice::from_ref(&message),
+                                                );
+                                                let error_result =
+                                                    QueryResult::new_error(&sql_text, &message);
+                                                let _ =
+                                                    sender.send(QueryProgress::StatementFinished {
+                                                        index,
+                                                        result: error_result,
+                                                        connection_name: conn_name.clone(),
+                                                        timed_out,
+                                                    });
+                                                app::awake();
+                                                result_index += 1;
+                                            }
+                                            SqlEditorWidget::emit_timing_if_enabled(
+                                                &sender,
+                                                &session,
+                                                timing_duration,
+                                            );
+                                            if timed_out || cancelled || !continue_on_error {
+                                                stop_execution = true;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+                                let implicit_results = match QueryExecutor::extract_implicit_results(
+                                    &stmt,
+                                ) {
+                                    Ok(cursors) => cursors,
+                                    Err(err) => {
+                                        let cancelled = SqlEditorWidget::is_cancel_error(&err);
+                                        timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                        let message =
+                                                SqlEditorWidget::choose_execution_error_message(
+                                                    cancelled,
+                                                    timed_out,
+                                                    query_timeout,
+                                                    format!(
+                                                        "Failed to fetch implicit result cursors: {err}"
+                                                    ),
+                                                );
+                                        if script_mode {
+                                            let error_result =
+                                                QueryResult::new_error(&sql_text, &message);
+                                            SqlEditorWidget::emit_script_result(
+                                                &sender,
+                                                &conn_name,
+                                                result_index,
+                                                error_result,
+                                                timed_out,
+                                            );
+                                        } else {
+                                            let index = result_index;
+                                            let _ = sender
+                                                .send(QueryProgress::StatementStart { index });
+                                            app::awake();
+                                            SqlEditorWidget::append_spool_output(
+                                                &session,
+                                                std::slice::from_ref(&message),
+                                            );
+                                            let error_result =
+                                                QueryResult::new_error(&sql_text, &message);
+                                            let _ = sender.send(QueryProgress::StatementFinished {
+                                                index,
+                                                result: error_result,
+                                                connection_name: conn_name.clone(),
+                                                timed_out,
+                                            });
+                                            app::awake();
+                                            result_index += 1;
+                                        }
+                                        SqlEditorWidget::emit_timing_if_enabled(
+                                            &sender,
+                                            &session,
+                                            timing_duration,
+                                        );
+                                        if timed_out || cancelled || !continue_on_error {
+                                            stop_execution = true;
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
                                 }
 
                                 if script_mode {
@@ -5882,12 +6021,6 @@ impl SqlEditorWidget {
                                     app::awake();
                                     result_index += 1;
                                 }
-
-                                let ref_cursors = QueryExecutor::extract_ref_cursors(&stmt, &binds)
-                                    .unwrap_or_default();
-                                let implicit_results =
-                                    QueryExecutor::extract_implicit_results(&stmt)
-                                        .unwrap_or_default();
 
                                 for (cursor_name, mut cursor) in ref_cursors {
                                     if stop_execution || load_mutex_bool(&cancel_flag) {
@@ -5972,14 +6105,6 @@ impl SqlEditorWidget {
 
                                     match cursor_result {
                                         Ok((mut query_result, was_cancelled)) => {
-                                            if !buffered_rows.is_empty() {
-                                                let rows = std::mem::take(&mut buffered_rows);
-                                                SqlEditorWidget::append_spool_rows(&session, &rows);
-                                                let _ = sender
-                                                    .send(QueryProgress::Rows { index, rows });
-                                                app::awake();
-                                            }
-
                                             if cursor_timed_out {
                                                 query_result.message =
                                                     SqlEditorWidget::timeout_message(query_timeout);
@@ -5990,6 +6115,14 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
                                             }
+                                            let interrupted = cursor_timed_out || was_cancelled;
+                                            SqlEditorWidget::flush_buffered_rows(
+                                                &sender,
+                                                &session,
+                                                index,
+                                                &mut buffered_rows,
+                                                interrupted,
+                                            );
                                             SqlEditorWidget::apply_heading_to_result(
                                                 &mut query_result,
                                                 heading_enabled,
@@ -6159,14 +6292,6 @@ impl SqlEditorWidget {
 
                                     match cursor_result {
                                         Ok((mut query_result, was_cancelled)) => {
-                                            if !buffered_rows.is_empty() {
-                                                let rows = std::mem::take(&mut buffered_rows);
-                                                SqlEditorWidget::append_spool_rows(&session, &rows);
-                                                let _ = sender
-                                                    .send(QueryProgress::Rows { index, rows });
-                                                app::awake();
-                                            }
-
                                             if cursor_timed_out {
                                                 query_result.message =
                                                     SqlEditorWidget::timeout_message(query_timeout);
@@ -6177,6 +6302,14 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
                                             }
+                                            let interrupted = cursor_timed_out || was_cancelled;
+                                            SqlEditorWidget::flush_buffered_rows(
+                                                &sender,
+                                                &session,
+                                                index,
+                                                &mut buffered_rows,
+                                                interrupted,
+                                            );
                                             SqlEditorWidget::apply_heading_to_result(
                                                 &mut query_result,
                                                 heading_enabled,
@@ -6244,23 +6377,31 @@ impl SqlEditorWidget {
                                     }
                                 }
 
-                                let _ = SqlEditorWidget::emit_dbms_output(
-                                    &sender,
-                                    &conn_name,
-                                    conn.as_ref(),
-                                    &session,
-                                    &mut result_index,
-                                );
+                                let cancel_requested = load_mutex_bool(&cancel_flag);
+                                let should_stop_after_statement = stop_execution
+                                    || cancel_requested
+                                    || timed_out
+                                    || (!result.success && !continue_on_error);
+                                if SqlEditorWidget::should_capture_post_execution_output(
+                                    cancel_requested,
+                                    timed_out,
+                                    should_stop_after_statement,
+                                ) {
+                                    let _ = SqlEditorWidget::emit_dbms_output(
+                                        &sender,
+                                        &conn_name,
+                                        conn.as_ref(),
+                                        &session,
+                                        &mut result_index,
+                                    );
+                                }
                                 SqlEditorWidget::emit_timing_if_enabled(
                                     &sender,
                                     &session,
                                     timing_duration,
                                 );
 
-                                if load_mutex_bool(&cancel_flag)
-                                    || timed_out
-                                    || (!result.success && !continue_on_error)
-                                {
+                                if should_stop_after_statement {
                                     stop_execution = true;
                                 }
                             } else if is_select {
@@ -6319,6 +6460,7 @@ impl SqlEditorWidget {
                                 let mut has_flushed_rows = false;
                                 let statement_start = Instant::now();
                                 let mut timed_out = false;
+                                let mut statement_interrupted = false;
                                 let (colsep, null_text, _trimspool_enabled) =
                                     SqlEditorWidget::current_text_output_settings(&session);
                                 let (break_column, compute_config) = match session.lock() {
@@ -6554,10 +6696,12 @@ impl SqlEditorWidget {
                                                     SqlEditorWidget::timeout_message(query_timeout);
                                                 query_result.success = false;
                                                 timed_out = true;
+                                                statement_interrupted = true;
                                             } else if was_cancelled {
                                                 query_result.message =
                                                     SqlEditorWidget::cancel_message();
                                                 query_result.success = false;
+                                                statement_interrupted = true;
                                             }
                                             if !feedback_enabled {
                                                 query_result.message.clear();
@@ -6573,6 +6717,7 @@ impl SqlEditorWidget {
                                         Err(err) => {
                                             let cancelled = SqlEditorWidget::is_cancel_error(&err);
                                             timed_out = SqlEditorWidget::is_timeout_error(&err);
+                                            statement_interrupted = timed_out || cancelled;
                                             let message =
                                                 SqlEditorWidget::choose_execution_error_message(
                                                     cancelled,
@@ -6597,12 +6742,13 @@ impl SqlEditorWidget {
                                     }
                                 };
 
-                                if !buffered_rows.is_empty() {
-                                    let rows = std::mem::take(&mut buffered_rows);
-                                    SqlEditorWidget::append_spool_rows(&session, &rows);
-                                    let _ = sender.send(QueryProgress::Rows { index, rows });
-                                    app::awake();
-                                }
+                                SqlEditorWidget::flush_buffered_rows(
+                                    &sender,
+                                    &session,
+                                    index,
+                                    &mut buffered_rows,
+                                    statement_interrupted,
+                                );
 
                                 if !result.message.trim().is_empty() {
                                     SqlEditorWidget::append_spool_output(
@@ -6668,23 +6814,32 @@ impl SqlEditorWidget {
                                 app::awake();
                                 result_index += 1;
 
-                                let _ = SqlEditorWidget::emit_dbms_output(
-                                    &sender,
-                                    &conn_name,
-                                    conn.as_ref(),
-                                    &session,
-                                    &mut result_index,
-                                );
+                                let cancel_requested = load_mutex_bool(&cancel_flag);
+                                let should_stop_after_statement = cancel_requested
+                                    || timed_out
+                                    || (!result.success && !continue_on_error);
+                                let skip_post_execution_output =
+                                    should_stop_after_statement || statement_interrupted;
+                                if SqlEditorWidget::should_capture_post_execution_output(
+                                    cancel_requested,
+                                    timed_out,
+                                    skip_post_execution_output,
+                                ) {
+                                    let _ = SqlEditorWidget::emit_dbms_output(
+                                        &sender,
+                                        &conn_name,
+                                        conn.as_ref(),
+                                        &session,
+                                        &mut result_index,
+                                    );
+                                }
                                 SqlEditorWidget::emit_timing_if_enabled(
                                     &sender,
                                     &session,
                                     timing_duration,
                                 );
 
-                                if load_mutex_bool(&cancel_flag)
-                                    || timed_out
-                                    || (!result.success && !continue_on_error)
-                                {
+                                if should_stop_after_statement {
                                     stop_execution = true;
                                 }
                             } else {
@@ -6835,6 +6990,11 @@ impl SqlEditorWidget {
                                     }
                                 };
 
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+
                                 let mut out_messages: Vec<String> = Vec::new();
                                 let (_colsep, null_text, _trimspool_enabled) =
                                     SqlEditorWidget::current_text_output_settings(&session);
@@ -6872,6 +7032,11 @@ impl SqlEditorWidget {
                                     );
                                 }
 
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
+                                }
+
                                 let mut compile_errors: Option<Vec<Vec<String>>> = None;
                                 if let Some(object) = compiled_object.clone() {
                                     match QueryExecutor::fetch_compilation_errors(
@@ -6901,6 +7066,11 @@ impl SqlEditorWidget {
                                 if dml_type.is_some() && !auto_commit && result.success {
                                     result.message =
                                         format!("{} | Commit required", result.message);
+                                }
+
+                                if load_mutex_bool(&cancel_flag) {
+                                    stop_execution = true;
+                                    continue;
                                 }
 
                                 if auto_commit && result.success {
@@ -6974,23 +7144,30 @@ impl SqlEditorWidget {
                                     result_index += 1;
                                 }
 
-                                let _ = SqlEditorWidget::emit_dbms_output(
-                                    &sender,
-                                    &conn_name,
-                                    conn.as_ref(),
-                                    &session,
-                                    &mut result_index,
-                                );
+                                let cancel_requested = load_mutex_bool(&cancel_flag);
+                                let should_stop_after_statement = cancel_requested
+                                    || timed_out
+                                    || (!result.success && !continue_on_error);
+                                if SqlEditorWidget::should_capture_post_execution_output(
+                                    cancel_requested,
+                                    timed_out,
+                                    should_stop_after_statement,
+                                ) {
+                                    let _ = SqlEditorWidget::emit_dbms_output(
+                                        &sender,
+                                        &conn_name,
+                                        conn.as_ref(),
+                                        &session,
+                                        &mut result_index,
+                                    );
+                                }
                                 SqlEditorWidget::emit_timing_if_enabled(
                                     &sender,
                                     &session,
                                     timing_duration,
                                 );
 
-                                if load_mutex_bool(&cancel_flag)
-                                    || timed_out
-                                    || (!result.success && !continue_on_error)
-                                {
+                                if should_stop_after_statement {
                                     stop_execution = true;
                                 }
                             }
@@ -7433,6 +7610,38 @@ impl SqlEditorWidget {
         };
 
         buffered_len >= row_threshold || last_flush.elapsed() >= PROGRESS_ROWS_FLUSH_INTERVAL
+    }
+
+    fn should_capture_post_execution_output(
+        cancel_requested: bool,
+        timed_out: bool,
+        stop_execution: bool,
+    ) -> bool {
+        !cancel_requested && !timed_out && !stop_execution
+    }
+
+    fn flush_buffered_rows(
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        index: usize,
+        buffered_rows: &mut Vec<Vec<String>>,
+        interrupted: bool,
+    ) {
+        if buffered_rows.is_empty() {
+            return;
+        }
+
+        if interrupted {
+            // Prefer immediate cancel/timeout completion over flushing a large
+            // buffered tail that has not been rendered yet.
+            buffered_rows.clear();
+            return;
+        }
+
+        let rows = std::mem::take(buffered_rows);
+        SqlEditorWidget::append_spool_rows(session, &rows);
+        let _ = sender.send(QueryProgress::Rows { index, rows });
+        app::awake();
     }
 
     fn emit_select_result(
@@ -8221,9 +8430,18 @@ impl SqlEditorWidget {
         QueryExecutor::ddl_message(sql_upper)
     }
 
+    fn timeout_error_message_contains_timeout_signal(message: &str) -> bool {
+        let lowered = message.trim().to_ascii_lowercase();
+        // Keep timeout detection strict so non-call timeout errors
+        // (e.g. lock wait timeout expired) are not misclassified.
+        lowered.contains("dpi-1067")
+            || lowered.contains("call timeout")
+            || lowered.contains("query timed out")
+            || lowered.contains("timed out after")
+    }
+
     fn is_timeout_error(err: &OracleError) -> bool {
-        let message = err.to_string();
-        message.contains("DPI-1067")
+        Self::timeout_error_message_contains_timeout_signal(&err.to_string())
     }
 
     fn is_cancel_error(err: &OracleError) -> bool {
@@ -8290,7 +8508,9 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_regression_tests {
-    use super::{ScriptItem, SqlEditorWidget};
+    use super::{QueryProgress, ScriptItem, SqlEditorWidget};
+    use crate::db::SessionState;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -8704,6 +8924,103 @@ END oqt_mega_pkg;"#;
             "ORA-00001: unique constraint".to_string(),
         );
         assert_eq!(message, "ORA-00001: unique constraint");
+    }
+
+    #[test]
+    fn timeout_error_message_signal_detects_dpi_call_timeout() {
+        assert!(
+            SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "DPI-1067: call timeout of 5000 ms reached",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_detects_timeout_keyword_with_ora_01013() {
+        assert!(
+            SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-01013: user requested cancel of current operation (call timeout reached)",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_does_not_treat_plain_cancel_as_timeout() {
+        assert!(
+            !SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-01013: user requested cancel of current operation",
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_signal_does_not_treat_lock_wait_timeout_expired_as_call_timeout() {
+        assert!(
+            !SqlEditorWidget::timeout_error_message_contains_timeout_signal(
+                "ORA-00054: resource busy and acquire with NOWAIT specified or timeout expired",
+            )
+        );
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_cancel_requested() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            true, false, false
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_timed_out() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            false, true, false
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_skipped_when_execution_should_stop() {
+        assert!(!SqlEditorWidget::should_capture_post_execution_output(
+            false, false, true
+        ));
+    }
+
+    #[test]
+    fn post_execution_output_is_allowed_for_normal_completion() {
+        assert!(SqlEditorWidget::should_capture_post_execution_output(
+            false, false, false
+        ));
+    }
+
+    #[test]
+    fn flush_buffered_rows_drops_pending_rows_when_interrupted() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_rows = vec![vec!["1".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_rows(&sender, &session, 7, &mut buffered_rows, true);
+
+        assert!(buffered_rows.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn flush_buffered_rows_emits_rows_when_not_interrupted() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_rows = vec![vec!["1".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_rows(&sender, &session, 3, &mut buffered_rows, false);
+
+        assert!(buffered_rows.is_empty());
+        let message = receiver
+            .try_recv()
+            .unwrap_or_else(|err| panic!("expected buffered rows progress message: {err}"));
+        match message {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(index, 3);
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected QueryProgress::Rows"),
+        }
     }
 
     #[test]
