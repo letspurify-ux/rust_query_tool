@@ -1433,3 +1433,24 @@
 - `cargo test end_with_label_closes_block_and_splits_next_statement -- --nocapture` 통과
 - `cargo test compound_trigger_for_each_row_header_does_not_affect_statement_split -- --nocapture` 통과
 - `cargo test -- --test-threads=1` 통과
+
+## 2026-03-05 인텔리센스 MERGE 분기 구문 회귀 점검 보강 (`WHEN NOT MATCHED INSERT` / `WHEN MATCHED DELETE WHERE`)
+
+### [점검] MERGE 후속 분기 문맥 전이 검증
+- **배경**:
+  - 기존 테스트는 `MERGE ... USING` 및 `UPDATE SET` 경로 중심이어서,
+  - `WHEN NOT MATCHED THEN INSERT (...) VALUES (...)`와 `WHEN MATCHED THEN DELETE WHERE ...` 분기 문맥 전이가 누락되어 있었습니다.
+- **점검 결과**:
+  - 현재 구현에서 해당 분기들은 각각 컬럼 컨텍스트/VALUES 컨텍스트/WHERE 컨텍스트로 올바르게 전이됨을 확인했습니다.
+- **유사 케이스 일괄 확인**:
+  - `INSERT` 컬럼 리스트(`(...)`), `VALUES (...)`, `DELETE WHERE ...`의 세 경로를 함께 테스트로 고정해 향후 회귀를 방지했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `merge_when_not_matched_insert_column_list_is_column_context`
+- `merge_when_not_matched_insert_values_is_values_clause`
+- `merge_when_matched_delete_where_is_column_context`
+
+### [검증]
+- `cargo test merge_when_not_matched_insert -- --nocapture` 통과
+- `cargo test merge_when_matched_delete_where_is_column_context -- --nocapture` 통과
+- `cargo test` 전체 통과

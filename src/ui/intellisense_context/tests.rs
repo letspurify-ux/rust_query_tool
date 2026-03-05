@@ -1725,6 +1725,37 @@ fn merge_using_subquery_depth_returns_to_zero_after_close() {
 }
 
 #[test]
+fn merge_when_not_matched_insert_column_list_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert!(ctx.phase.is_column_context(), "phase: {:?}", ctx.phase);
+}
+
+#[test]
+fn merge_when_not_matched_insert_values_is_values_clause() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (|)",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
+#[test]
+fn merge_when_matched_delete_where_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN DELETE WHERE |",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn lateral_values_subquery_in_from_increases_depth() {
     let ctx = analyze("SELECT * FROM base b CROSS APPLY (VALUES (|)) v(c)");
     assert_eq!(ctx.depth, 1);
