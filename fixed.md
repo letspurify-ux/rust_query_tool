@@ -1,5 +1,28 @@
 # 예외 처리 보완 내역
 
+## 2026-03-04 인텔리센스 누락 구문 보완 (`POSITION(... FROM ...)` 함수 구문)
+
+### [중] `POSITION(... FROM ...)` 내부 `FROM`을 SQL `FROM` 절로 오인식하던 문제 수정
+- **증상**:
+  - `SELECT POSITION('a' FROM |) FROM emp` 위치에서 컨텍스트가 `FromClause`로 잘못 계산되어 컬럼 컨텍스트 추천이 깨질 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 함수 내부 `FROM` 예외 목록(`is_from_consuming_function`)에 `POSITION`이 누락되어 있었습니다.
+- **수정**:
+  - `is_from_consuming_function`에 `POSITION`을 추가해 함수 내부 `FROM`을 clause 전이에서 제외했습니다.
+
+### [유사 케이스] 실제 외부 `FROM` 절 감지 회귀 확인
+- `SELECT POSITION('a' FROM name) FROM |` 형태에서 외부 `FROM`은 계속 정상적으로 `FromClause`로 인식되는지 테스트로 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `position_from_does_not_trigger_from_clause`
+- `real_from_after_position_still_works`
+
+### [검증]
+- `cargo test -q position_from_does_not_trigger_from_clause -- --nocapture` 통과
+- `cargo test -q real_from_after_position_still_works -- --nocapture` 통과
+- `cargo test -q intellisense_context::tests -- --test-threads=1` 통과
+
+
 ## 2026-03-04 인텔리센스 누락 구문 보완 (`ONLY(...)` / `TABLE(...)` relation wrapper)
 
 ### [중] FROM 절 relation wrapper를 테이블명으로 해석하지 못해 별칭 기반 컬럼 추천이 누락되던 문제 수정
