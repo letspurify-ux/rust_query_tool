@@ -1318,6 +1318,26 @@ impl PopupState {
 }
 
 impl IntellisensePopup {
+    const POPUP_PAGE_STEP: i32 = 10;
+
+    fn next_page_selection(current: i32, count: i32) -> Option<i32> {
+        if count <= 0 {
+            return None;
+        }
+
+        let normalized = current.max(1);
+        Some((normalized + Self::POPUP_PAGE_STEP).min(count))
+    }
+
+    fn prev_page_selection(current: i32, count: i32) -> Option<i32> {
+        if count <= 0 {
+            return None;
+        }
+
+        let normalized = current.max(1);
+        Some((normalized - Self::POPUP_PAGE_STEP).max(1))
+    }
+
     fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
         if let Some(msg) = payload.downcast_ref::<&str>() {
             (*msg).to_string()
@@ -1606,6 +1626,22 @@ impl IntellisensePopup {
         let current = self.browser.value();
         if current > 1 {
             self.browser.select(current - 1);
+        }
+    }
+
+    pub fn select_next_page(&mut self) {
+        let count = self.browser.size();
+        let current = self.browser.value();
+        if let Some(next) = Self::next_page_selection(current, count) {
+            self.browser.select(next);
+        }
+    }
+
+    pub fn select_prev_page(&mut self) {
+        let count = self.browser.size();
+        let current = self.browser.value();
+        if let Some(prev) = Self::prev_page_selection(current, count) {
+            self.browser.select(prev);
         }
     }
 
@@ -1996,6 +2032,22 @@ mod intellisense_tests {
         let suggestions = vec!["SELECT".to_string(), "FROM".to_string()];
         let filtered = filter_suggestions_by_prefix(&suggestions, "zz");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn popup_page_selection_advances_by_page_size_and_clamps_to_end() {
+        assert_eq!(IntellisensePopup::next_page_selection(1, 25), Some(11));
+        assert_eq!(IntellisensePopup::next_page_selection(20, 25), Some(25));
+        assert_eq!(IntellisensePopup::next_page_selection(0, 7), Some(7));
+        assert_eq!(IntellisensePopup::next_page_selection(1, 0), None);
+    }
+
+    #[test]
+    fn popup_page_selection_moves_up_by_page_size_and_clamps_to_start() {
+        assert_eq!(IntellisensePopup::prev_page_selection(21, 30), Some(11));
+        assert_eq!(IntellisensePopup::prev_page_selection(5, 30), Some(1));
+        assert_eq!(IntellisensePopup::prev_page_selection(0, 8), Some(1));
+        assert_eq!(IntellisensePopup::prev_page_selection(3, 0), None);
     }
 
     #[test]
