@@ -1471,7 +1471,22 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 break;
             }
             "VERSIONS" => {
-                let between_idx = skip_comment_tokens(tokens, idx + 1);
+                let mut between_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(tokens.get(between_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("PERIOD"))
+                {
+                    let for_idx = skip_comment_tokens(tokens, between_idx + 1);
+                    if !matches!(tokens.get(for_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FOR"))
+                    {
+                        break;
+                    }
+                    between_idx = skip_comment_tokens(tokens, for_idx + 1);
+                    if !matches!(tokens.get(between_idx), Some(SqlToken::Word(period_name)) if is_identifier_word_token(period_name))
+                    {
+                        break;
+                    }
+                    between_idx = skip_comment_tokens(tokens, between_idx + 1);
+                }
+
                 if !matches!(tokens.get(between_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BETWEEN"))
                 {
                     break;
@@ -1494,7 +1509,19 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 }
 
                 let mut cursor = skip_comment_tokens(tokens, of_idx + 1);
-                if matches!(tokens.get(cursor), Some(SqlToken::Word(kind)) if kind.eq_ignore_ascii_case("SCN") || kind.eq_ignore_ascii_case("TIMESTAMP"))
+                if matches!(tokens.get(cursor), Some(SqlToken::Word(keyword)) if keyword.eq_ignore_ascii_case("PERIOD")) {
+                    let for_idx = skip_comment_tokens(tokens, cursor + 1);
+                    if !matches!(tokens.get(for_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FOR"))
+                    {
+                        break;
+                    }
+                    let period_name_idx = skip_comment_tokens(tokens, for_idx + 1);
+                    if !matches!(tokens.get(period_name_idx), Some(SqlToken::Word(period_name)) if is_identifier_word_token(period_name))
+                    {
+                        break;
+                    }
+                    cursor = skip_comment_tokens(tokens, period_name_idx + 1);
+                } else if matches!(tokens.get(cursor), Some(SqlToken::Word(kind)) if kind.eq_ignore_ascii_case("SCN") || kind.eq_ignore_ascii_case("TIMESTAMP"))
                 {
                     cursor = skip_comment_tokens(tokens, cursor + 1);
                 }

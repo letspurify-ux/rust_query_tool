@@ -1450,6 +1450,60 @@ fn flashback_versions_between_before_alias_is_not_parsed_as_alias() {
 }
 
 #[test]
+fn flashback_as_of_period_for_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees AS OF PERIOD FOR valid_time (TIMESTAMP '2025-01-01 00:00:00') e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("AS")),
+        "AS OF PERIOD FOR clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following AS OF PERIOD FOR clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flashback_versions_period_for_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees VERSIONS PERIOD FOR valid_time BETWEEN TIMESTAMP '2024-01-01 00:00:00' AND TIMESTAMP '2024-12-31 23:59:59' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("VERSIONS")),
+        "VERSIONS PERIOD FOR clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following VERSIONS PERIOD FOR clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn tablesample_repeatable_before_alias_is_not_parsed_as_alias() {
     let ctx = analyze("SELECT * FROM sales TABLESAMPLE BERNOULLI (10) REPEATABLE (7) s WHERE s.|");
 
