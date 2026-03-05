@@ -1530,6 +1530,14 @@ impl QueryExecutor {
                 self.push_current_span(sql)
             }
 
+            fn prepare_slash_terminator(&mut self) {
+                use crate::sql_parser_engine::PendingEnd;
+
+                if self.state.pending_end == PendingEnd::End && self.state.is_idle() {
+                    self.state.resolve_pending_end_on_terminator();
+                }
+            }
+
             fn consume_next_char(
                 iter: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
                 base_offset: usize,
@@ -1826,12 +1834,13 @@ impl QueryExecutor {
             let line = &sql[line_start..line_end];
             let trimmed = line.trim();
 
-            if !sqlblanklines_enabled
-                && trimmed.is_empty()
-                && collector.state.is_idle()
-                && collector.state.block_depth() == 0
-                && !collector.current_is_empty()
-            {
+            if Self::should_force_terminate_on_blank_line(
+                sqlblanklines_enabled,
+                trimmed,
+                collector.state.is_idle(),
+                collector.state.block_depth(),
+                collector.current_is_empty(),
+            ) {
                 if let Some(span) = collector.force_terminate(sql) {
                     if !on_span(span) {
                         return;
@@ -1841,13 +1850,14 @@ impl QueryExecutor {
                 continue;
             }
 
-            if collector.state.is_idle()
-                && collector.state.in_create_plsql()
-                && collector.state.can_terminate_on_slash()
-                && !collector.current_is_empty()
-                && !collector.state.is_trigger()
-                && Self::line_starts_new_statement_keyword_for_bounds(trimmed)
-            {
+            if Self::should_force_terminate_incomplete_create(
+                collector.state.is_idle(),
+                collector.state.in_create_plsql(),
+                collector.state.can_terminate_on_slash(),
+                collector.current_is_empty(),
+                collector.state.is_trigger(),
+                Self::line_starts_new_statement_keyword_for_bounds(trimmed),
+            ) {
                 if let Some(span) = collector.force_terminate(sql) {
                     if !on_span(span) {
                         return;
@@ -1855,8 +1865,10 @@ impl QueryExecutor {
                 }
             }
 
-            if collector.state.is_idle()
-                && trimmed == "/"
+            if Self::should_attempt_slash_terminator(collector.state.is_idle(), trimmed) {
+                collector.prepare_slash_terminator();
+            }
+            if Self::should_attempt_slash_terminator(collector.state.is_idle(), trimmed)
                 && collector.state.can_terminate_on_slash()
             {
                 if !collector.current_is_empty() {
@@ -1870,12 +1882,13 @@ impl QueryExecutor {
                 continue;
             }
 
-            if collector.state.is_idle()
-                && trimmed == ";"
-                && collector.state.in_create_plsql()
-                && collector.state.block_depth() == 0
-                && !collector.current_is_empty()
-            {
+            if Self::should_force_terminate_lone_semicolon(
+                collector.state.is_idle(),
+                trimmed,
+                collector.state.in_create_plsql(),
+                collector.state.block_depth(),
+                collector.current_is_empty(),
+            ) {
                 if let Some(span) = collector.force_terminate(sql) {
                     if !on_span(span) {
                         return;
@@ -1885,15 +1898,15 @@ impl QueryExecutor {
                 continue;
             }
 
-            let is_alter_session_set_clause = collector.starts_with_alter_session()
-                && (trimmed.eq_ignore_ascii_case("SET")
-                    || Self::starts_with_ignore_ascii_case(trimmed, "SET "));
+            let is_alter_session_set_clause =
+                collector.starts_with_alter_session() && Self::is_set_clause_line(trimmed);
 
-            if collector.state.is_idle()
-                && !collector.current_is_empty()
-                && collector.state.block_depth() == 0
-                && !is_alter_session_set_clause
-                && Self::line_might_be_tool_command_for_bounds(trimmed)
+            if Self::should_try_tool_command_with_open_statement(
+                collector.state.is_idle(),
+                collector.current_is_empty(),
+                collector.state.block_depth() == 0,
+                is_alter_session_set_clause,
+            ) && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let Some(span) = collector.force_terminate(sql) {
@@ -1909,10 +1922,11 @@ impl QueryExecutor {
                 }
             }
 
-            if collector.state.is_idle()
-                && collector.current_is_empty()
-                && collector.state.block_depth() == 0
-                && Self::line_might_be_tool_command_for_bounds(trimmed)
+            if Self::should_try_tool_command_without_open_statement(
+                collector.state.is_idle(),
+                collector.current_is_empty(),
+                collector.state.block_depth() == 0,
+            ) && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = command {
@@ -1935,22 +1949,101 @@ impl QueryExecutor {
         }
     }
 
+    fn line_first_word(trimmed: &str) -> Option<&str> {
+        trimmed.split_whitespace().next()
+    }
+
+    pub(crate) fn line_starts_statement_head_keyword(trimmed: &str) -> bool {
+        Self::line_first_word(trimmed).is_some_and(sql_text::is_statement_head_keyword)
+    }
+
     fn line_starts_new_statement_keyword_for_bounds(trimmed: &str) -> bool {
-        Self::starts_with_ignore_ascii_case(trimmed, "CREATE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "ALTER")
-            || Self::starts_with_ignore_ascii_case(trimmed, "DROP")
-            || Self::starts_with_ignore_ascii_case(trimmed, "TRUNCATE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "GRANT")
-            || Self::starts_with_ignore_ascii_case(trimmed, "REVOKE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "COMMIT")
-            || Self::starts_with_ignore_ascii_case(trimmed, "ROLLBACK")
-            || Self::starts_with_ignore_ascii_case(trimmed, "SAVEPOINT")
-            || Self::starts_with_ignore_ascii_case(trimmed, "SELECT")
-            || Self::starts_with_ignore_ascii_case(trimmed, "INSERT")
-            || Self::starts_with_ignore_ascii_case(trimmed, "UPDATE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "DELETE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "MERGE")
-            || Self::starts_with_ignore_ascii_case(trimmed, "WITH")
+        Self::line_first_word(trimmed).is_some_and(|word| {
+            word.eq_ignore_ascii_case("CREATE")
+                || word.eq_ignore_ascii_case("ALTER")
+                || word.eq_ignore_ascii_case("DROP")
+                || word.eq_ignore_ascii_case("TRUNCATE")
+                || word.eq_ignore_ascii_case("GRANT")
+                || word.eq_ignore_ascii_case("REVOKE")
+                || word.eq_ignore_ascii_case("COMMIT")
+                || word.eq_ignore_ascii_case("ROLLBACK")
+                || word.eq_ignore_ascii_case("SAVEPOINT")
+                || word.eq_ignore_ascii_case("SELECT")
+                || word.eq_ignore_ascii_case("INSERT")
+                || word.eq_ignore_ascii_case("UPDATE")
+                || word.eq_ignore_ascii_case("DELETE")
+                || word.eq_ignore_ascii_case("MERGE")
+                || word.eq_ignore_ascii_case("WITH")
+        })
+    }
+
+    pub(crate) fn is_set_clause_line(trimmed: &str) -> bool {
+        trimmed.eq_ignore_ascii_case("SET") || Self::starts_with_ignore_ascii_case(trimmed, "SET ")
+    }
+
+    pub(crate) fn should_force_terminate_on_blank_line(
+        sqlblanklines_enabled: bool,
+        trimmed: &str,
+        is_idle: bool,
+        block_depth: usize,
+        current_is_empty: bool,
+    ) -> bool {
+        !sqlblanklines_enabled
+            && trimmed.is_empty()
+            && is_idle
+            && block_depth == 0
+            && !current_is_empty
+    }
+
+    pub(crate) fn should_force_terminate_incomplete_create(
+        is_idle: bool,
+        in_create_plsql: bool,
+        at_create_boundary: bool,
+        current_is_empty: bool,
+        is_trigger: bool,
+        starts_new_statement_head: bool,
+    ) -> bool {
+        is_idle
+            && in_create_plsql
+            && at_create_boundary
+            && !current_is_empty
+            && !is_trigger
+            && starts_new_statement_head
+    }
+
+    pub(crate) fn should_attempt_slash_terminator(is_idle: bool, trimmed: &str) -> bool {
+        is_idle && trimmed == "/"
+    }
+
+    pub(crate) fn should_force_terminate_lone_semicolon(
+        is_idle: bool,
+        trimmed: &str,
+        in_create_plsql: bool,
+        block_depth: usize,
+        current_is_empty: bool,
+    ) -> bool {
+        is_idle
+            && trimmed == ";"
+            && in_create_plsql
+            && block_depth == 0
+            && !current_is_empty
+    }
+
+    pub(crate) fn should_try_tool_command_with_open_statement(
+        is_idle: bool,
+        current_is_empty: bool,
+        at_top_level: bool,
+        is_alter_session_set_clause: bool,
+    ) -> bool {
+        is_idle && !current_is_empty && at_top_level && !is_alter_session_set_clause
+    }
+
+    pub(crate) fn should_try_tool_command_without_open_statement(
+        is_idle: bool,
+        current_is_empty: bool,
+        at_top_level: bool,
+    ) -> bool {
+        is_idle && current_is_empty && at_top_level
     }
 
     fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
@@ -1972,11 +2065,9 @@ impl QueryExecutor {
             return true;
         }
 
-        let first = trimmed
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(';');
+        let first = Self::line_first_word(trimmed)
+            .map(|word| word.trim_end_matches(';'))
+            .unwrap_or_default();
         if first.is_empty() {
             return false;
         }

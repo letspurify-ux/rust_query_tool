@@ -547,13 +547,31 @@ impl QueryExecutor {
             return String::new();
         }
 
-        // Check if this is a PL/SQL statement that needs trailing semicolon
-        let upper = without_semis.to_ascii_uppercase();
-        if upper.ends_with("END") || upper.contains("END ") {
+        if Self::should_preserve_single_trailing_semicolon(without_semis) {
             format!("{};", without_semis)
         } else {
             without_semis.to_string()
         }
+    }
+
+    fn should_preserve_single_trailing_semicolon(sql: &str) -> bool {
+        let mut trailing_tokens = sql
+            .split_whitespace()
+            .rev()
+            .map(|token| token.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)))
+            .filter(|token| !token.is_empty());
+
+        let Some(last_token) = trailing_tokens.next() else {
+            return false;
+        };
+
+        if last_token.eq_ignore_ascii_case("END") {
+            return true;
+        }
+
+        trailing_tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("END"))
     }
 
     pub fn leading_keyword(sql: &str) -> Option<String> {
@@ -2607,14 +2625,14 @@ impl QueryExecutor {
 
         for line in sql.lines() {
             let trimmed = line.trim();
-            let trimmed_upper = trimmed.to_ascii_uppercase();
 
-            if !sqlblanklines_enabled
-                && trimmed.is_empty()
-                && builder.is_idle()
-                && builder.block_depth() == 0
-                && !builder.current_is_empty()
-            {
+            if Self::should_force_terminate_on_blank_line(
+                sqlblanklines_enabled,
+                trimmed,
+                builder.is_idle(),
+                builder.block_depth(),
+                builder.current_is_empty(),
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
@@ -2624,57 +2642,58 @@ impl QueryExecutor {
             // TRIGGER 헤더에서는 INSERT/UPDATE/DELETE/SELECT 등이 이벤트 타입으로
             // block_depth == 0 상태에서 나올 수 있으므로, TRIGGER의 block_depth == 0 구간에서는
             // 이 강제 종료를 건너뜀
-            let leading_word = trimmed_upper.split_whitespace().next();
-            let starts_new_statement_head =
-                leading_word.is_some_and(sql_text::is_statement_head_keyword);
+            let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
 
-            if builder.is_idle()
-                && builder.in_create_plsql()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-                && !builder.current_is_empty()
-                && !builder.is_trigger()
-                && starts_new_statement_head
-            {
+            if Self::should_force_terminate_incomplete_create(
+                builder.is_idle(),
+                builder.in_create_plsql(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                builder.current_is_empty(),
+                builder.is_trigger(),
+                starts_new_statement_head,
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
             }
 
-            if builder.is_idle() && trimmed == "/" {
+            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed) {
                 builder.prepare_slash_terminator();
-                if builder.can_terminate_on_slash() {
-                    if !builder.current_is_empty() {
-                        for stmt in builder.force_terminate_and_take_statements() {
-                            add_statement(stmt, &mut items);
-                        }
+            }
+            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed)
+                && builder.can_terminate_on_slash()
+            {
+                if !builder.current_is_empty() {
+                    for stmt in builder.force_terminate_and_take_statements() {
+                        add_statement(stmt, &mut items);
                     }
-                    continue;
                 }
+                continue;
             }
 
             // Handle lone semicolon line after CREATE PL/SQL statement
             // This prevents ";;" issue when extra ";" is on its own line
-            if builder.is_idle()
-                && trimmed == ";"
-                && builder.in_create_plsql()
-                && builder.block_depth() == 0
-                && !builder.current_is_empty()
-            {
+            if Self::should_force_terminate_lone_semicolon(
+                builder.is_idle(),
+                trimmed,
+                builder.in_create_plsql(),
+                builder.block_depth(),
+                builder.current_is_empty(),
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
                 continue;
             }
 
-            let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
+            let is_set_clause = Self::is_set_clause_line(trimmed);
             let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
-            if builder.is_idle()
-                && !builder.current_is_empty()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-                && !is_alter_session_set_clause
-            {
+            if Self::should_try_tool_command_with_open_statement(
+                builder.is_idle(),
+                builder.current_is_empty(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                is_alter_session_set_clause,
+            ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     for stmt in builder.force_terminate_and_take_statements() {
                         add_statement(stmt, &mut items);
@@ -2687,11 +2706,11 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle()
-                && builder.current_is_empty()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-            {
+            if Self::should_try_tool_command_without_open_statement(
+                builder.is_idle(),
+                builder.current_is_empty(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+            ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
@@ -2728,15 +2747,15 @@ impl QueryExecutor {
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
-            let trimmed_upper = trimmed.to_ascii_uppercase();
             let is_remark_line = sql_text::is_sqlplus_comment_line(trimmed);
 
-            if !sqlblanklines_enabled
-                && trimmed.is_empty()
-                && builder.is_idle()
-                && builder.block_depth() == 0
-                && !builder.current_is_empty()
-            {
+            if Self::should_force_terminate_on_blank_line(
+                sqlblanklines_enabled,
+                trimmed,
+                builder.is_idle(),
+                builder.block_depth(),
+                builder.current_is_empty(),
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
@@ -2769,56 +2788,56 @@ impl QueryExecutor {
                 }
             }
 
-            let leading_word = trimmed_upper.split_whitespace().next();
-            let starts_new_statement_head =
-                leading_word.is_some_and(sql_text::is_statement_head_keyword);
-
-            if builder.is_idle()
-                && builder.in_create_plsql()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-                && !builder.current_is_empty()
-                && !builder.is_trigger()
-                && starts_new_statement_head
-            {
+            let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
+            if Self::should_force_terminate_incomplete_create(
+                builder.is_idle(),
+                builder.in_create_plsql(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                builder.current_is_empty(),
+                builder.is_trigger(),
+                starts_new_statement_head,
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
             }
 
-            if builder.is_idle() && trimmed == "/" {
+            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed) {
                 builder.prepare_slash_terminator();
-                if builder.can_terminate_on_slash() {
-                    if !builder.current_is_empty() {
-                        for stmt in builder.force_terminate_and_take_statements() {
-                            add_statement(stmt, &mut items);
-                        }
+            }
+            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed)
+                && builder.can_terminate_on_slash()
+            {
+                if !builder.current_is_empty() {
+                    for stmt in builder.force_terminate_and_take_statements() {
+                        add_statement(stmt, &mut items);
                     }
-                    items.push(FormatItem::Slash);
-                    continue;
                 }
+                items.push(FormatItem::Slash);
+                continue;
             }
 
-            if builder.is_idle()
-                && trimmed == ";"
-                && builder.in_create_plsql()
-                && builder.block_depth() == 0
-                && !builder.current_is_empty()
-            {
+            if Self::should_force_terminate_lone_semicolon(
+                builder.is_idle(),
+                trimmed,
+                builder.in_create_plsql(),
+                builder.block_depth(),
+                builder.current_is_empty(),
+            ) {
                 for stmt in builder.force_terminate_and_take_statements() {
                     add_statement(stmt, &mut items);
                 }
                 continue;
             }
 
-            let is_set_clause = trimmed_upper == "SET" || trimmed_upper.starts_with("SET ");
+            let is_set_clause = Self::is_set_clause_line(trimmed);
             let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
-            if builder.is_idle()
-                && !builder.current_is_empty()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-                && !is_alter_session_set_clause
-            {
+            if Self::should_try_tool_command_with_open_statement(
+                builder.is_idle(),
+                builder.current_is_empty(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                is_alter_session_set_clause,
+            ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     for stmt in builder.force_terminate_and_take_statements() {
                         add_statement(stmt, &mut items);
@@ -2831,11 +2850,11 @@ impl QueryExecutor {
                 }
             }
 
-            if builder.is_idle()
-                && builder.current_is_empty()
-                && builder.block_depth() == 0
-                && builder.paren_depth() == 0
-            {
+            if Self::should_try_tool_command_without_open_statement(
+                builder.is_idle(),
+                builder.current_is_empty(),
+                builder.block_depth() == 0 && builder.paren_depth() == 0,
+            ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
@@ -4257,5 +4276,30 @@ impl QueryExecutor {
         let start = value.find('(')?;
         let end = value[start + 1..].find(')')? + start + 1;
         value[start + 1..end].trim().parse::<u8>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryExecutor;
+
+    #[test]
+    fn strip_extra_trailing_semicolons_preserves_plsql_end_terminator() {
+        assert_eq!(
+            QueryExecutor::strip_extra_trailing_semicolons("BEGIN NULL; END;;"),
+            "BEGIN NULL; END;"
+        );
+        assert_eq!(
+            QueryExecutor::strip_extra_trailing_semicolons("END pkg_name;;"),
+            "END pkg_name;"
+        );
+    }
+
+    #[test]
+    fn strip_extra_trailing_semicolons_does_not_keep_semicolon_for_end_substring() {
+        assert_eq!(
+            QueryExecutor::strip_extra_trailing_semicolons("SELECT 'WEEKEND REPORT' FROM dual;;"),
+            "SELECT 'WEEKEND REPORT' FROM dual"
+        );
     }
 }

@@ -683,7 +683,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
-                if matches!(current_phase, SqlPhase::FromClause) {
+                if matches!(
+                    current_phase,
+                    SqlPhase::FromClause
+                        | SqlPhase::PivotClause
+                        | SqlPhase::ModelClause
+                        | SqlPhase::MatchRecognizeClause
+                ) {
+                    depth_frames[depth].phase = SqlPhase::FromClause;
                     relation_state.expect_table();
                 }
                 if matches!(cte_state, CteState::Inactive)
@@ -1585,37 +1592,67 @@ fn parse_relation_wrapper_table_name(
     }
 }
 
+fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
+    let idx = skip_comment_tokens(tokens, start);
+    match tokens.get(idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => extract_parenthesized_range(tokens, idx)
+            .map(|(_, next_idx)| next_idx)
+            .unwrap_or(idx),
+        _ => idx,
+    }
+}
+
+fn parse_relation_alias_at(
+    tokens: &[SqlToken],
+    start: usize,
+    allow_alias_column_list: bool,
+) -> (Option<String>, usize) {
+    let idx = skip_comment_tokens(tokens, start);
+    let Some(SqlToken::Word(word)) = tokens.get(idx) else {
+        return (None, idx);
+    };
+
+    let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
+    let upper = word.to_ascii_uppercase();
+
+    if upper == "AS" {
+        if matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "OF") {
+            return (None, idx);
+        }
+        let alias_idx = skip_comment_tokens(tokens, idx + 1);
+        let Some(SqlToken::Word(alias_word)) = tokens.get(alias_idx) else {
+            return (None, alias_idx);
+        };
+        if !is_identifier_word_token(alias_word) {
+            return (None, alias_idx + 1);
+        }
+        let next_idx = if allow_alias_column_list {
+            consume_optional_alias_column_list(tokens, alias_idx + 1)
+        } else {
+            alias_idx + 1
+        };
+        return (Some(strip_identifier_quotes(alias_word)), next_idx);
+    }
+
+    if !is_identifier_word_token(word) {
+        return (None, idx);
+    }
+    if is_quoted || !is_relation_alias_breaker(&upper) {
+        let next_idx = if allow_alias_column_list {
+            consume_optional_alias_column_list(tokens, idx + 1)
+        } else {
+            idx + 1
+        };
+        return (Some(strip_identifier_quotes(word)), next_idx);
+    }
+
+    (None, idx)
+}
+
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
     let start = skip_relation_postfix_clauses(tokens, start);
-    if let Some(SqlToken::Word(word)) = tokens.get(start) {
-        let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-        let upper = word.to_ascii_uppercase();
-        if upper == "AS" {
-            let alias_idx = skip_comment_tokens(tokens, start + 1);
-            if matches!(next_word_upper(tokens, start + 1), Some((next, _)) if next == "OF") {
-                let advanced_idx = skip_relation_postfix_clauses(tokens, start);
-                if advanced_idx > start {
-                    return parse_alias_deep(tokens, advanced_idx);
-                }
-                return (None, advanced_idx);
-            }
-            if let Some(SqlToken::Word(alias)) = tokens.get(alias_idx) {
-                if !is_identifier_word_token(alias) {
-                    return (None, alias_idx + 1);
-                }
-                return (Some(strip_identifier_quotes(alias)), alias_idx + 1);
-            }
-            return (None, alias_idx);
-        }
-        if !is_identifier_word_token(word) {
-            return (None, start);
-        }
-        if is_quoted || !is_relation_alias_breaker(&upper) {
-            return (Some(strip_identifier_quotes(word)), start + 1);
-        }
-    }
-    (None, start)
+    parse_relation_alias_at(tokens, start, false)
 }
 
 fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
@@ -1623,7 +1660,8 @@ fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize)
     if derived_end == start {
         return None;
     }
-    parse_alias_deep(tokens, derived_end).0
+    let alias_start = skip_relation_postfix_clauses(tokens, derived_end);
+    parse_relation_alias_at(tokens, alias_start, false).0
 }
 
 fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
@@ -1939,16 +1977,6 @@ fn skip_model_clause(tokens: &[SqlToken], start: usize) -> usize {
 
 /// Parse an alias after a subquery closing ')'.
 fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, usize)> {
-    fn consume_optional_alias_column_list(tokens: &[SqlToken], start: usize) -> usize {
-        let idx = skip_comment_tokens(tokens, start);
-        match tokens.get(idx) {
-            Some(SqlToken::Symbol(sym)) if sym == "(" => extract_parenthesized_range(tokens, idx)
-                .map(|(_, next_idx)| next_idx)
-                .unwrap_or(idx),
-            _ => idx,
-        }
-    }
-
     let mut idx = start;
     // Skip comments and stray closing parens to recover from malformed SQL like:
     // `FROM (SELECT ...) ) alias`
@@ -1969,35 +1997,8 @@ fn parse_subquery_alias(tokens: &[SqlToken], start: usize) -> Option<(String, us
 
     idx = skip_relation_postfix_clauses(tokens, idx);
     idx = skip_derived_relation_postfix_clauses(tokens, idx);
-
-    match tokens.get(idx) {
-        Some(SqlToken::Word(word)) => {
-            let is_quoted = word.trim().starts_with('"') && word.trim().ends_with('"');
-            let upper = word.to_ascii_uppercase();
-            if upper == "AS" {
-                idx += 1;
-                // Skip comments after AS
-                idx = skip_comment_tokens(tokens, idx);
-                if let Some(SqlToken::Word(alias)) = tokens.get(idx) {
-                    if !is_identifier_word_token(alias) {
-                        return None;
-                    }
-                    let next_idx = consume_optional_alias_column_list(tokens, idx + 1);
-                    return Some((strip_identifier_quotes(alias), next_idx));
-                }
-                return None;
-            }
-            if !is_identifier_word_token(word) {
-                return None;
-            }
-            if is_quoted || !is_relation_alias_breaker(&upper) {
-                let next_idx = consume_optional_alias_column_list(tokens, idx + 1);
-                return Some((strip_identifier_quotes(word), next_idx));
-            }
-            None
-        }
-        _ => None,
-    }
+    let (alias, next_idx) = parse_relation_alias_at(tokens, idx, true);
+    alias.map(|name| (name, next_idx))
 }
 
 fn is_join_keyword(word: &str) -> bool {

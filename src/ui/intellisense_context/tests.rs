@@ -3055,6 +3055,78 @@ fn pivot_clause_alias_with_as_keyword_is_collected_for_qualifier_resolution() {
 }
 
 #[test]
+fn pivot_clause_source_followed_by_comma_relation_collects_next_table() {
+    let ctx = analyze(
+        "SELECT d.| FROM oqt_t_emp PIVOT (SUM(sal) FOR job IN ('CLERK' AS clerk_sal)) p, dept d WHERE p.clerk_sal > 0",
+    );
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "DEPT"),
+        "table after pivot source should remain in scope: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        "alias for relation after pivot source should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn model_clause_source_followed_by_comma_relation_collects_next_table() {
+    let ctx = analyze(
+        "SELECT d.| FROM oqt_t_emp MODEL DIMENSION BY (deptno) MEASURES (sal) RULES (sal[deptno] = sal[deptno]) md, dept d WHERE md.sal > 0",
+    );
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "DEPT"),
+        "table after model source should remain in scope: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        "alias for relation after model source should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn match_recognize_source_followed_by_comma_relation_collects_next_table() {
+    let ctx = analyze(
+        "SELECT d.| FROM oqt_t_emp MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS sal > 0) mr, dept d WHERE mr.a IS NOT NULL",
+    );
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "DEPT"),
+        "table after match_recognize source should remain in scope: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        "alias for relation after match_recognize source should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unpivot_clause_alias_with_as_keyword_is_collected_for_qualifier_resolution() {
     let ctx = analyze(
         "SELECT ua.| FROM oqt_t_emp UNPIVOT EXCLUDE NULLS (amount FOR metric IN (sal AS 'SAL')) AS ua",

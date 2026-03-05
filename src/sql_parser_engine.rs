@@ -1238,22 +1238,6 @@ impl SplitState {
             return;
         }
 
-        if self.block_depth() == 0 {
-            match self.with_clause_state {
-                WithClauseState::InPlsqlDeclaration(
-                    WithDeclarationState::CollectingDeclaration,
-                ) => {
-                    self.with_clause_state = WithClauseState::InPlsqlDeclaration(
-                        WithDeclarationState::CollectingDeclaration,
-                    );
-                }
-                WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery) => {
-                    // Keep waiting for the main query keyword so intermediate CTE tokens
-                    // (`cte_name AS (...)`) do not incorrectly re-enter declaration mode.
-                }
-                _ => {}
-            }
-        }
     }
 }
 

@@ -244,6 +244,29 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_slash_after_end_without_semicolon_returns_previous_block() {
+    let sql = "BEGIN\n  NULL;\nEND\n/\nSELECT 2 FROM dual;";
+    let cursor = sql.find('/').unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected previous PL/SQL statement bounds on slash line");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("BEGIN"),
+        "slash line should resolve to preceding block statement: {statement}"
+    );
+    assert!(
+        statement.contains("END"),
+        "preceding block statement should include END token: {statement}"
+    );
+    assert!(
+        !statement.contains("SELECT 2 FROM dual"),
+        "trailing SELECT must not leak into slash-line statement bounds: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");
