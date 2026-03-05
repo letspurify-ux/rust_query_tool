@@ -2109,6 +2109,48 @@ fn merge_using_source_without_alias_does_not_capture_when_keyword_as_alias() {
 }
 
 #[test]
+fn merge_using_source_without_alias_does_not_capture_when_not_matched_as_alias() {
+    let ctx = analyze(
+        "MERGE INTO target_table t USING source_table ON t.id = source_table.id \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (source_table.id) WHERE |",
+    );
+
+    let source = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("source_table"));
+    assert!(source.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        source
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("WHEN")),
+        "source table alias must not be parsed as WHEN: {:?}",
+        source
+    );
+}
+
+#[test]
+fn delete_using_source_without_alias_does_not_capture_when_keyword_as_alias() {
+    let ctx = analyze(
+        "DELETE FROM target_table t USING source_table \
+         WHERE t.id = source_table.id RETURNING t.id INTO :id WHEN |",
+    );
+
+    let source = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("source_table"));
+    assert!(source.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        source
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("WHEN")),
+        "source table alias must not be parsed as WHEN: {:?}",
+        source
+    );
+}
+
+#[test]
 fn merge_using_phase_is_table_context() {
     let ctx = analyze("MERGE INTO target_table t USING |");
     assert!(ctx.phase.is_table_context());
