@@ -726,7 +726,9 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "START",
     "PROMPT",
     "CONNECT",
+    "CONN",
     "DISCONNECT",
+    "DISC",
     "SPOOL",
     "DEFINE",
     "WHENEVER",
@@ -900,6 +902,34 @@ pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
     matches_keyword(word, STATEMENT_HEAD_KEYWORDS)
 }
 
+pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+
+    if first.eq_ignore_ascii_case("DISC") || first.eq_ignore_ascii_case("DISCONNECT") {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("CONN") {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("CONNECT") {
+        return !words
+            .next()
+            .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
+    }
+
+    false
+}
+
 /// Returns true when a keyword can head a subquery body after `(`.
 pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
     matches_keyword(word, SUBQUERY_HEAD_KEYWORDS)
@@ -1013,6 +1043,21 @@ mod tests {
                 "missing shared keyword: {keyword}"
             );
         }
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_detects_connect_aliases() {
+        assert!(is_auto_terminated_tool_command("CONNECT scott/tiger"));
+        assert!(is_auto_terminated_tool_command("CONN scott/tiger"));
+        assert!(is_auto_terminated_tool_command("DISCONNECT"));
+        assert!(is_auto_terminated_tool_command("DISC"));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_ignores_connect_by_sql_clause() {
+        assert!(!is_auto_terminated_tool_command(
+            "CONNECT BY PRIOR id = parent_id"
+        ));
     }
 
     #[test]
