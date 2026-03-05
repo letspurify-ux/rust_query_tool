@@ -1174,14 +1174,19 @@ impl SplitState {
             return;
         }
 
-        if matches!(
-            self.with_clause_state,
-            WithClauseState::InPlsqlDeclaration(_)
-        ) && self.block_depth() == 0
-            && !matches!(upper, "FUNCTION" | "PROCEDURE")
-        {
-            self.with_clause_state =
-                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
+        if self.block_depth() == 0 {
+            match self.with_clause_state {
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration) => {
+                    self.with_clause_state = WithClauseState::InPlsqlDeclaration(
+                        WithDeclarationState::CollectingDeclaration,
+                    );
+                }
+                WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery) => {
+                    // Keep waiting for the main query keyword so intermediate CTE tokens
+                    // (`cte_name AS (...)`) do not incorrectly re-enter declaration mode.
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -2249,6 +2254,33 @@ mod tests {
             vec!["SELECT col WITH FROM t".to_string()]
         );
         assert!(!engine.state.in_with_plsql_declaration());
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_new_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("CREATE TABLE t_recover_with_fn (id NUMBER);");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+            "first statement should keep only WITH declaration: {}",
+            statements[0]
+        );
+        assert_eq!(
+            statements[1],
+            "CREATE TABLE t_recover_with_fn (id NUMBER)".to_string()
+        );
+        assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
     }
 
     #[test]
