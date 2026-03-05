@@ -330,8 +330,15 @@ fn snapshot_cursor_state(
 struct ParserDepthFrame {
     phase: SqlPhase,
     is_query_scope: bool,
+    statement_kind: StatementKind,
     paren_func: Option<String>,
     function_from_state: FunctionFromState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementKind {
+    Unknown,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +393,7 @@ impl Default for ParserDepthFrame {
         Self {
             phase: SqlPhase::Initial,
             is_query_scope: false,
+            statement_kind: StatementKind::Unknown,
             paren_func: None,
             function_from_state: FunctionFromState::NotApplicable,
         }
@@ -736,6 +744,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "SELECT" => {
                         depth_frames[depth].phase = SqlPhase::SelectList;
+                        depth_frames[depth].statement_kind = StatementKind::Unknown;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }
@@ -767,7 +776,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "USING" => {
-                        if matches!(current_phase, SqlPhase::MergeTarget | SqlPhase::IntoClause) {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_phase, SqlPhase::MergeTarget | SqlPhase::IntoClause)
+                            || matches!(current_statement_kind, StatementKind::Delete)
+                        {
                             depth_frames[depth].phase = SqlPhase::FromClause;
                             relation_state.expect_table();
                         } else if matches!(current_phase, SqlPhase::FromClause) {
@@ -833,16 +848,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "UPDATE" => {
                         depth_frames[depth].phase = SqlPhase::UpdateTarget;
+                        depth_frames[depth].statement_kind = StatementKind::Unknown;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.expect_table();
                     }
                     "DELETE" => {
                         depth_frames[depth].phase = SqlPhase::DeleteTarget;
+                        depth_frames[depth].statement_kind = StatementKind::Delete;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.expect_table();
                     }
                     "MERGE" => {
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
+                        depth_frames[depth].statement_kind = StatementKind::Unknown;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }
