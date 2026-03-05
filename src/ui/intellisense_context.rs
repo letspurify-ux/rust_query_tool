@@ -1493,7 +1493,11 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
         if upper == "AS" {
             let alias_idx = skip_comment_tokens(tokens, start + 1);
             if matches!(next_word_upper(tokens, start + 1), Some((next, _)) if next == "OF") {
-                return (None, skip_relation_postfix_clauses(tokens, start));
+                let advanced_idx = skip_relation_postfix_clauses(tokens, start);
+                if advanced_idx > start {
+                    return parse_alias_deep(tokens, advanced_idx);
+                }
+                return (None, advanced_idx);
             }
             if let Some(SqlToken::Word(alias)) = tokens.get(alias_idx) {
                 if !is_identifier_word_token(alias) {
