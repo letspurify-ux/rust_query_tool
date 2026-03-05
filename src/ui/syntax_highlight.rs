@@ -6,8 +6,9 @@ use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use super::intellisense::{ORACLE_FUNCTIONS, SQL_KEYWORDS};
+use super::intellisense::ORACLE_FUNCTIONS;
 use crate::sql_text;
+use crate::sql_text::ORACLE_SQL_KEYWORDS;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::theme;
 
@@ -25,7 +26,7 @@ pub const STYLE_DATETIME_LITERAL: char = 'J';
 pub const STYLE_COLUMN: char = 'K';
 
 static SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
-    Lazy::new(|| SQL_KEYWORDS.iter().copied().collect());
+    Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
 

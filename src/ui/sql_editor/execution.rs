@@ -23,12 +23,11 @@ use crate::db::{
     lock_connection_with_activity, BindValue, BindVar, ColumnInfo, CursorResult, FormatItem,
     QueryExecutor, QueryResult, ScriptItem, SessionState, ToolCommand,
 };
-use crate::sql_text;
+use crate::sql_text::{self, ORACLE_SQL_KEYWORDS};
 use crate::ui::sql_depth::{
     is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
 };
-use crate::ui::SQL_KEYWORDS;
 
 use super::*;
 
@@ -1256,7 +1255,7 @@ impl SqlEditorWidget {
                                 | "INTO"
                         )
                     );
-                    let is_keyword = SQL_KEYWORDS.iter().any(|&kw| kw == upper);
+                    let is_keyword = ORACLE_SQL_KEYWORDS.iter().any(|&kw| kw == upper);
                     let is_or_in_create = upper == "OR"
                         && matches!(prev_word_upper.as_deref(), Some("CREATE"))
                         && next_word_is("REPLACE");
@@ -2879,7 +2878,7 @@ impl SqlEditorWidget {
         match token {
             SqlToken::Word(word) => {
                 let upper = word.to_uppercase();
-                if SQL_KEYWORDS.iter().any(|&kw| kw == upper) {
+                if ORACLE_SQL_KEYWORDS.iter().any(|&kw| kw == upper) {
                     upper
                 } else {
                     word.clone()
