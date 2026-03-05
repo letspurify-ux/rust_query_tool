@@ -8220,14 +8220,18 @@ SELECT 2 FROM dual;";
         "CREATE ... WRAPPED should keep wrapped body semicolons inside one statement until slash delimiter: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped_demo
-WRAPPED"),
+        stmts[0].starts_with(
+            "CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED"
+        ),
         "first statement should preserve WRAPPED header: {}",
         stmts[0]
     );
     assert!(
-        stmts[0].contains("abcd;
-efgh;"),
+        stmts[0].contains(
+            "abcd;
+efgh;"
+        ),
         "first statement should preserve wrapped body with internal semicolons: {}",
         stmts[0]
     );
@@ -8263,14 +8267,18 @@ SELECT 2 FROM dual;";
         "split_format_items should keep WRAPPED body as one statement and split trailing SELECT: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped_demo
-WRAPPED"),
+        stmts[0].starts_with(
+            "CREATE OR REPLACE PROCEDURE wrapped_demo
+WRAPPED"
+        ),
         "first formatted statement should preserve WRAPPED header: {}",
         stmts[0]
     );
     assert!(
-        stmts[0].contains("abcd;
-efgh;"),
+        stmts[0].contains(
+            "abcd;
+efgh;"
+        ),
         "first formatted statement should preserve wrapped body semicolons: {}",
         stmts[0]
     );
@@ -8594,7 +8602,6 @@ fn test_split_script_items_oracle_with_function_recovers_to_variable_statement_h
     );
 }
 
-
 #[test]
 fn test_split_script_items_oracle_with_function_recovers_to_connect_statement_head() {
     let sql = "WITH
@@ -8725,4 +8732,20 @@ SELECT 2 FROM dual;"#;
         "second statement should be trailing SELECT: {}",
         stmts[1]
     );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_without_semicolon_uses_slash_terminator() {
+    let sql = "WITH FUNCTION f RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND\n/\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "expected WITH FUNCTION and SELECT split, got: {stmts:?}"
+    );
+    assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
+    assert!(stmts[0].contains("RETURN 1;"));
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
 }
