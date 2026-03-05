@@ -419,11 +419,50 @@ fn phase_window_clause_is_column_context() {
 }
 
 #[test]
+fn phase_window_keyword_is_column_context() {
+    let ctx = analyze("SELECT a FROM t WINDOW |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_qualify_clause_is_column_context() {
     let ctx = analyze("SELECT a FROM t QUALIFY |");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert!(ctx.phase.is_column_context());
 }
+
+
+#[test]
+fn phase_limit_clause_is_not_table_context() {
+    let ctx = analyze("SELECT a FROM t LIMIT |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn phase_offset_clause_is_not_table_context() {
+    let ctx = analyze("SELECT a FROM t OFFSET |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn phase_fetch_clause_is_not_table_context() {
+    let ctx = analyze("SELECT a FROM t FETCH FIRST | ROWS ONLY");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"T".to_string()), "tables: {:?}", names);
+}
+
 
 #[test]
 fn phase_update_set() {

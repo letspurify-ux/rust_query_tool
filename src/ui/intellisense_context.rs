@@ -916,6 +916,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::WhereClause;
                         relation_state.clear();
                     }
+                    "LIMIT" | "OFFSET" | "FETCH" => {
+                        // Pagination clauses are post-FROM boundaries; they must not keep
+                        // relation-target parsing active even when ORDER BY is omitted.
+                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        relation_state.clear();
+                    }
                     "SET" => {
                         if matches!(
                             current_phase,
