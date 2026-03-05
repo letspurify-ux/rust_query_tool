@@ -391,6 +391,38 @@ fn collect_table_with_schema_prefix() {
 }
 
 #[test]
+fn collect_table_with_dblink_suffix() {
+    let ctx = analyze("SELECT | FROM hr.employees@prod_link");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.EMPLOYEES@PROD_LINK".to_string()),
+        "dblink-qualified relation should be preserved as a single table reference: {:?}",
+        names
+    );
+}
+
+#[test]
+fn collect_table_with_dotted_dblink_suffix() {
+    let ctx = analyze("SELECT | FROM employees@hq.prod_link e");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES@HQ.PROD_LINK".to_string()),
+        "dotted dblink-qualified relation should be preserved as a single table reference: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias after dblink-qualified relation should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn collect_quoted_table_and_alias() {
     let ctx = analyze(r#"SELECT "e".| FROM "Emp Table" "e""#);
     let names = table_names(&ctx);
