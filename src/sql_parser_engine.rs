@@ -880,6 +880,7 @@ impl SplitState {
                     | "REF"
                     | "RECORD"
                     | "OPAQUE"
+                    | "JSON"
                     | "VARYING"
                     | "ENUM"
                     | "RANGE"
