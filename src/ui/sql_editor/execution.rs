@@ -5893,6 +5893,7 @@ impl SqlEditorWidget {
                                     if stop_execution || load_mutex_bool(&cancel_flag) {
                                         break;
                                     }
+                                    let conn_for_cancel = Arc::clone(conn);
                                     let index = result_index;
                                     let _ = sender.send(QueryProgress::StatementStart { index });
                                     app::awake();
@@ -5937,11 +5938,13 @@ impl SqlEditorWidget {
                                         },
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
+                                                let _ = conn_for_cancel.break_execution();
                                                 return false;
                                             }
                                             if let Some(timeout_duration) = query_timeout {
                                                 if cursor_start.elapsed() >= timeout_duration {
                                                     cursor_timed_out = true;
+                                                    let _ = conn_for_cancel.break_execution();
                                                     return false;
                                                 }
                                             }
@@ -6081,6 +6084,7 @@ impl SqlEditorWidget {
                                     if stop_execution || load_mutex_bool(&cancel_flag) {
                                         break;
                                     }
+                                    let conn_for_cancel = Arc::clone(conn);
                                     let index = result_index;
                                     let _ = sender.send(QueryProgress::StatementStart { index });
                                     app::awake();
@@ -6124,11 +6128,13 @@ impl SqlEditorWidget {
                                         },
                                         &mut |row| {
                                             if load_mutex_bool(&cancel_flag) {
+                                                let _ = conn_for_cancel.break_execution();
                                                 return false;
                                             }
                                             if let Some(timeout_duration) = query_timeout {
                                                 if cursor_start.elapsed() >= timeout_duration {
                                                     cursor_timed_out = true;
+                                                    let _ = conn_for_cancel.break_execution();
                                                     return false;
                                                 }
                                             }
