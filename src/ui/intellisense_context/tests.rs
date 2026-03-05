@@ -159,6 +159,20 @@ fn phase_order_by() {
 }
 
 #[test]
+fn phase_order_siblings_by() {
+    let ctx = analyze("SELECT a FROM t ORDER SIBLINGS BY |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_order_siblings_by_with_comment_between_keywords() {
+    let ctx = analyze("SELECT a FROM t ORDER /*c1*/ SIBLINGS /*c2*/ BY |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_order_by_with_comment_between_keywords() {
     let ctx = analyze("SELECT a FROM t ORDER /*c*/ BY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
