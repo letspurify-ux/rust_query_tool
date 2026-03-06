@@ -248,7 +248,6 @@ fn is_from_consuming_function(name: &str) -> bool {
         name,
         "EXTRACT"
             | "TRIM"
-            | "XMLCAST"
             | "SUBSTRING"
             | "OVERLAY"
             | "POSITION"

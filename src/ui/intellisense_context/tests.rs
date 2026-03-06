@@ -4689,6 +4689,21 @@ fn trim_from_does_not_trigger_from_clause() {
 }
 
 #[test]
+fn xmlcast_from_inside_function_recognizes_real_from_clause() {
+    let ctx = analyze("SELECT XMLCAST(doc AS CLOB FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn xmlcast_from_inside_function_keeps_table_scope_after_where() {
+    let ctx = analyze("SELECT XMLCAST(doc AS CLOB FROM employees) FROM dual WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DUAL".to_string()), "tables: {:?}", names);
+}
+
+#[test]
 fn substring_from_does_not_trigger_from_clause() {
     // SUBSTRING(col FROM start FOR count) uses FROM as function syntax.
     let ctx = analyze("SELECT SUBSTRING(name FROM | FOR 2) FROM emp");
