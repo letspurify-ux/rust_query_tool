@@ -525,6 +525,25 @@ fn close_parenthesis_scope(
     }
 }
 
+fn begin_set_operator_operand_scope(
+    scope_stack: &mut [usize],
+    next_scope_id: &mut usize,
+    visible_parent: &mut HashMap<usize, Option<usize>>,
+) {
+    let Some(current_scope) = scope_stack.last_mut() else {
+        return;
+    };
+
+    let parent_scope = visible_parent
+        .get(current_scope)
+        .copied()
+        .unwrap_or(None);
+    let operand_scope = *next_scope_id;
+    *next_scope_id = next_scope_id.saturating_add(1);
+    visible_parent.insert(operand_scope, parent_scope);
+    *current_scope = operand_scope;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
     Unknown,
@@ -1240,6 +1259,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
                         depth_frames[depth].phase = SqlPhase::Initial;
                         relation_state.clear();
+                        begin_set_operator_operand_scope(
+                            &mut scope_stack,
+                            &mut next_scope_id,
+                            &mut visible_parent,
+                        );
                     }
                     kw if is_table_stop_keyword(kw) && relation_state.is_expect_table() => {
                         relation_state.clear();

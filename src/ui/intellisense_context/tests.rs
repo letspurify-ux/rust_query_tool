@@ -1294,6 +1294,57 @@ fn union_collects_tables_from_both_parts() {
     assert!(names.contains(&"T2".to_string()), "tables: {:?}", names);
 }
 
+#[test]
+fn union_second_select_does_not_leak_left_operand_tables_into_scope() {
+    let ctx = analyze("SELECT a FROM t1 UNION ALL SELECT | FROM t2");
+    let names = table_names(&ctx);
+
+    assert!(
+        !names.contains(&"T1".to_string()),
+        "left UNION operand tables must not leak into right SELECT scope: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"T2".to_string()),
+        "right UNION operand table should remain visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn intersect_second_select_does_not_leak_left_operand_tables_into_scope() {
+    let ctx = analyze("SELECT a FROM t1 INTERSECT SELECT | FROM t2");
+    let names = table_names(&ctx);
+
+    assert!(
+        !names.contains(&"T1".to_string()),
+        "left INTERSECT operand tables must not leak into right SELECT scope: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"T2".to_string()),
+        "right INTERSECT operand table should remain visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn minus_second_select_does_not_leak_left_operand_tables_into_scope() {
+    let ctx = analyze("SELECT a FROM t1 MINUS SELECT | FROM t2");
+    let names = table_names(&ctx);
+
+    assert!(
+        !names.contains(&"T1".to_string()),
+        "left MINUS operand tables must not leak into right SELECT scope: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"T2".to_string()),
+        "right MINUS operand table should remain visible: {:?}",
+        names
+    );
+}
+
 // ─── Qualifier resolution tests ──────────────────────────────────────────
 
 #[test]
