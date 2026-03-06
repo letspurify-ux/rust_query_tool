@@ -2299,6 +2299,34 @@ SELECT 1 FROM dual;"#;
         stmts
     );
 }
+
+#[test]
+fn test_compound_trigger_timing_point_without_is_splits_before_following_select() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_compound_no_is
+FOR INSERT ON test_table
+COMPOUND TRIGGER
+  BEFORE STATEMENT
+  BEGIN
+    NULL;
+  END BEFORE STATEMENT;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "compound trigger timing-point without IS should split, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].contains("END BEFORE STATEMENT"),
+        "timing-point END without IS must remain in trigger statement: {}",
+        stmts[0]
+    );
+}
+
 #[test]
 fn test_split_script_items_slash_line_inside_q_quote_is_not_terminator() {
     let sql = "SELECT q'[\n/\n]' AS txt FROM dual;\nSELECT 2 FROM dual;";
