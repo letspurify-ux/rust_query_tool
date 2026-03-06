@@ -4153,4 +4153,64 @@ BEGIN"
             statements[1]
         );
     }
+
+    #[test]
+    fn with_function_recovers_before_alter_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"),
+            "ALTER statement should start a new statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT statement should remain standalone after ALTER recovery split: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
+    fn with_function_recovers_before_create_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("CREATE TABLE t_recovery_head (id NUMBER);");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("CREATE TABLE t_recovery_head (id NUMBER)"),
+            "CREATE statement should start a new statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT statement should remain standalone after CREATE recovery split: {}",
+            statements[2]
+        );
+    }
 }
