@@ -246,7 +246,9 @@ impl RoutineFrame {
             let from_external = self.external_clause_state
                 == ExternalClauseState::AwaitingLanguageTargetFromExternal;
             self.external_clause_state = ExternalClauseState::None;
-            if is_external_language_target(token_upper) {
+            if is_external_language_target(token_upper)
+                || (from_external && is_identifier_language_target(token_upper))
+            {
                 if from_external {
                     self.mark_external_clause();
                 } else {
@@ -1425,6 +1427,11 @@ fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
 #[inline]
 fn is_external_language_target(token_upper: &str) -> bool {
     sql_text::is_external_language_target_keyword(token_upper)
+}
+
+#[inline]
+fn is_identifier_language_target(token_upper: &str) -> bool {
+    !token_upper.is_empty() && token_upper.chars().all(sql_text::is_identifier_char)
 }
 
 fn is_line_leading_run_script_marker(chars: &[char], marker_idx: usize) -> bool {
@@ -3387,6 +3394,48 @@ BEGIN"
             statements[0]
         );
         assert!(statements[1].starts_with("SELECT 7 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_unknown_identifier_target_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_unknown RETURN NUMBER");
+        engine.process_line("AS EXTERNAL LANGUAGE WASM MODULE ext_unknown_impl;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("LANGUAGE WASM MODULE ext_unknown_impl"),
+            "first statement should preserve unknown LANGUAGE target call-spec: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn package_body_nested_language_clause_with_unknown_identifier_target_closes_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_unknown_lang AS");
+        engine.process_line("  PROCEDURE p IS EXTERNAL LANGUAGE WASM MODULE impl;");
+        engine.process_line("END pkg_unknown_lang;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROCEDURE p IS EXTERNAL LANGUAGE WASM MODULE impl;"),
+            "nested LANGUAGE clause with unknown target should stay in package body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END pkg_unknown_lang"),
+            "package body should close normally after unknown nested routine language target: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
     }
 
     #[test]
