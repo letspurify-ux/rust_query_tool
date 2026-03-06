@@ -3493,6 +3493,24 @@ BEGIN"
     }
 
     #[test]
+    fn language_clause_with_language_mle_module_without_external_keyword_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER");
+        engine.process_line("AS LANGUAGE MLE MODULE ext_language_mle_impl;");
+        engine.process_line("SELECT 9 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE MLE MODULE ext_language_mle_impl"),
+            "first statement should keep LANGUAGE MLE MODULE clause tokens: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 9 FROM dual"));
+    }
+
+    #[test]
     fn language_clause_with_mle_module_without_external_keyword_still_splits() {
         let mut engine = SqlParserEngine::new();
 
