@@ -1841,16 +1841,9 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                         break;
                     }
                     cursor = skip_comment_tokens(tokens, period_name_idx + 1);
-                } else if matches!(tokens.get(cursor), Some(SqlToken::Word(kind)) if kind.eq_ignore_ascii_case("SCN") || kind.eq_ignore_ascii_case("TIMESTAMP"))
-                {
-                    cursor = skip_comment_tokens(tokens, cursor + 1);
                 }
 
-                if matches!(tokens.get(cursor), Some(SqlToken::Symbol(sym)) if sym == "(") {
-                    idx = skip_parenthesized_clause(tokens, cursor);
-                } else {
-                    idx = cursor.saturating_add(1);
-                }
+                idx = skip_flashback_bound_expression(tokens, cursor);
                 idx = skip_comment_tokens(tokens, idx);
                 continue;
             }
@@ -1946,19 +1939,104 @@ fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
         idx = skip_comment_tokens(tokens, idx + 1);
     }
 
+    // Parenthesized bound expressions are unambiguous and can be consumed in one step.
     if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
         return skip_parenthesized_clause(tokens, idx);
     }
 
-    if matches!(tokens.get(idx), Some(SqlToken::Word(_))) {
-        let next_idx = skip_comment_tokens(tokens, idx + 1);
-        if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-            return skip_parenthesized_clause(tokens, next_idx);
+    // Consume a simple leading operand.
+    idx = consume_flashback_operand(tokens, idx);
+
+    // Also consume optional arithmetic/interval suffixes often used in Oracle
+    // flashback clauses, e.g.:
+    //   AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '1' HOUR
+    loop {
+        let operator_idx = skip_comment_tokens(tokens, idx);
+        let Some(SqlToken::Symbol(op)) = tokens.get(operator_idx) else {
+            break;
+        };
+        if op != "+" && op != "-" {
+            break;
         }
-        return next_idx;
+
+        let rhs_idx = skip_comment_tokens(tokens, operator_idx + 1);
+        let Some(rhs_token) = tokens.get(rhs_idx) else {
+            idx = rhs_idx;
+            break;
+        };
+
+        let consumed_rhs = match rhs_token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("INTERVAL") => {
+                consume_interval_literal(tokens, rhs_idx)
+            }
+            _ => consume_flashback_operand(tokens, rhs_idx),
+        };
+
+        if consumed_rhs == rhs_idx {
+            idx = rhs_idx;
+            break;
+        }
+        idx = consumed_rhs;
     }
 
-    idx.saturating_add(1)
+    idx
+}
+
+fn consume_flashback_operand(tokens: &[SqlToken], start: usize) -> usize {
+    let idx = skip_comment_tokens(tokens, start);
+    match tokens.get(idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => skip_parenthesized_clause(tokens, idx),
+        Some(SqlToken::Word(_)) => {
+            let next_idx = skip_comment_tokens(tokens, idx + 1);
+            if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+                skip_parenthesized_clause(tokens, next_idx)
+            } else {
+                next_idx
+            }
+        }
+        Some(SqlToken::String(_)) => skip_comment_tokens(tokens, idx + 1),
+        Some(SqlToken::Symbol(sym)) if sym == ":" => {
+            // Bind variable form `:b1`
+            let bind_name_idx = skip_comment_tokens(tokens, idx + 1);
+            if matches!(tokens.get(bind_name_idx), Some(SqlToken::Word(_))) {
+                skip_comment_tokens(tokens, bind_name_idx + 1)
+            } else {
+                bind_name_idx
+            }
+        }
+        Some(_) => idx.saturating_add(1),
+        None => idx,
+    }
+}
+
+fn consume_interval_literal(tokens: &[SqlToken], interval_idx: usize) -> usize {
+    let mut idx = skip_comment_tokens(tokens, interval_idx + 1);
+
+    if matches!(tokens.get(idx), Some(SqlToken::String(_))) {
+        idx = skip_comment_tokens(tokens, idx + 1);
+    }
+
+    if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        idx = skip_parenthesized_clause(tokens, idx);
+    }
+
+    if matches!(tokens.get(idx), Some(SqlToken::Word(_))) {
+        idx = skip_comment_tokens(tokens, idx + 1);
+        if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            idx = skip_parenthesized_clause(tokens, idx);
+        }
+    }
+
+    let maybe_to_idx = skip_comment_tokens(tokens, idx);
+    if matches!(tokens.get(maybe_to_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TO"))
+    {
+        idx = skip_comment_tokens(tokens, maybe_to_idx + 1);
+        if matches!(tokens.get(idx), Some(SqlToken::Word(_))) {
+            idx = skip_comment_tokens(tokens, idx + 1);
+        }
+    }
+
+    idx
 }
 
 fn skip_parenthesized_clause(tokens: &[SqlToken], open_paren_idx: usize) -> usize {
