@@ -1244,14 +1244,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
                             {
                                 let relation_name_hint = relation_function_name_hint(&table_name);
+                                let has_immediate_argument_list = matches!(
+                                    tokens.get(next_idx),
+                                    Some(SqlToken::Symbol(sym)) if sym == "("
+                                );
                                 let can_consume_relation_arguments =
                                     matches!(current_phase, SqlPhase::FromClause)
+                                        && has_immediate_argument_list
                                         && (relation_modifier_state.blocks_outer_scope_cutoff()
-                                            || relation_name_hint
-                                                .as_deref()
-                                                .is_some_and(is_from_lateral_table_function));
+                                            || relation_name_hint.is_some());
                                 let relation_arg_parsed = if can_consume_relation_arguments
-                                    && matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                                    && has_immediate_argument_list
                                 {
                                     extract_parenthesized_range(tokens, next_idx)
                                 } else {
@@ -1317,6 +1320,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                         // Preserve table-function name for immediate
                                         // parenthesized argument scope handling.
                                         last_word = relation_name_hint;
+                                        relation_modifier_state.mark_lateral_like();
                                     } else {
                                         last_word = None;
                                     }
