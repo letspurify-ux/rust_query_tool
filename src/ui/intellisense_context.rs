@@ -269,7 +269,19 @@ fn relation_function_name_hint(table_name: &str) -> Option<String> {
 }
 
 fn is_table_target_statement_keyword(word: &str) -> bool {
-    matches!(word, "ALTER" | "DROP" | "LOCK" | "TRUNCATE" | "FLASHBACK")
+    matches!(
+        word,
+        "ALTER"
+            | "DROP"
+            | "LOCK"
+            | "TRUNCATE"
+            | "FLASHBACK"
+            | "RENAME"
+            | "ANALYZE"
+            | "OPTIMIZE"
+            | "CHECK"
+            | "REPAIR"
+    )
 }
 
 fn is_comment_on_table_target(tokens: &[SqlToken], idx: usize, last_word: Option<&str>) -> bool {
