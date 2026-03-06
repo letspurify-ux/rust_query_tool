@@ -309,6 +309,34 @@ fn is_comment_on_table_target(tokens: &[SqlToken], idx: usize, last_word: Option
     false
 }
 
+fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
+    let mut scan_idx = idx;
+    let mut saw_create_keyword = false;
+    let mut saw_object_keyword = false;
+
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Symbol(sym)) if sym == ";" => break,
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                if upper == "CREATE" {
+                    saw_create_keyword = true;
+                    break;
+                }
+
+                if matches!(upper.as_str(), "INDEX" | "TRIGGER") {
+                    saw_object_keyword = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    saw_create_keyword && saw_object_keyword
+}
+
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
     matches!(keyword, "FUNCTION" | "PROCEDURE")
 }
@@ -974,8 +1002,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "ON" => {
                         if matches!(current_phase, SqlPhase::FromClause) {
                             depth_frames[depth].phase = SqlPhase::JoinCondition;
+                        } else if is_create_on_table_target(tokens, idx) {
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
+                            relation_state.expect_table();
+                        } else {
+                            relation_state.clear();
                         }
-                        relation_state.clear();
                     }
                     "WHERE" => {
                         depth_frames[depth].phase = SqlPhase::WhereClause;

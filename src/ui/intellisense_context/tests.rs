@@ -582,6 +582,27 @@ fn phase_comment_on_table_with_inline_comment_is_table_context() {
 }
 
 #[test]
+fn phase_create_index_on_is_table_context() {
+    let ctx = analyze("CREATE INDEX idx_emp_dept ON |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_create_trigger_on_is_table_context() {
+    let ctx = analyze("CREATE TRIGGER trg_emp_audit ON |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_join_on_remains_join_condition_context() {
+    let ctx = analyze("SELECT * FROM emp e JOIN dept d ON |");
+    assert_eq!(ctx.phase, SqlPhase::JoinCondition);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_values() {
     let ctx = analyze("INSERT INTO t (a) VALUES |");
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
