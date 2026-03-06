@@ -1873,6 +1873,50 @@ fn update_with_alias_qualifier_resolution() {
     assert_eq!(resolved, vec!["employees"]);
 }
 
+#[test]
+fn update_from_clause_keeps_target_and_source_tables_in_scope() {
+    let ctx = analyze("UPDATE employees e SET salary = s.new_salary FROM salary_stage s WHERE e.empno = s.empno AND |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "target table should remain visible in UPDATE ... FROM: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"SALARY_STAGE".to_string()),
+        "source table should be visible in UPDATE ... FROM: {:?}",
+        names
+    );
+
+    assert_eq!(
+        resolve_qualifier_tables("e", &ctx.tables_in_scope),
+        vec!["employees"]
+    );
+    assert_eq!(
+        resolve_qualifier_tables("s", &ctx.tables_in_scope),
+        vec!["salary_stage"]
+    );
+}
+
+#[test]
+fn update_set_substring_from_expression_does_not_switch_to_from_clause() {
+    let ctx = analyze("UPDATE employees e SET nick = SUBSTRING(e.name FROM | FOR 3)");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"EMPLOYEES".to_string()),
+        "update target should stay visible inside SUBSTRING(... FROM ...): {:?}",
+        names
+    );
+    assert_eq!(
+        resolve_qualifier_tables("e", &ctx.tables_in_scope),
+        vec!["employees"]
+    );
+}
+
 // ─── DELETE statement tests ──────────────────────────────────────────────
 
 #[test]
