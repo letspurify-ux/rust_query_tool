@@ -3301,6 +3301,24 @@ mod tests {
     }
 
     #[test]
+    fn external_clause_with_credential_keyword_still_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_cred RETURN NUMBER");
+        engine.process_line("AS EXTERNAL CREDENTIAL ext_credential NAME 'ext_cred';");
+        engine.process_line("SELECT 101 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("CREDENTIAL ext_credential"),
+            "external clause with credential should remain in first statement: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 101 FROM dual"));
+    }
+
+    #[test]
     fn language_clause_without_external_keyword_still_marks_external_routine_split() {
         let mut engine = SqlParserEngine::new();
 
