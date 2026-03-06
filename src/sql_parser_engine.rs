@@ -349,7 +349,27 @@ impl RoutineFrame {
             return;
         }
 
-        if matches!(ch, ':' | '=' | '+' | '-' | '*' | '/' | '%' | '<' | '>' | '|' | ',' | ';' | '.' | '(' | ')' | '[' | ']' | '{' | '}') {
+        if matches!(
+            ch,
+            ':' | '='
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '<'
+                | '>'
+                | '|'
+                | ','
+                | ';'
+                | '.'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+        ) {
             self.external_clause_state = ExternalClauseState::None;
         }
     }
@@ -1146,7 +1166,9 @@ impl SplitState {
     }
 
     pub(crate) fn can_terminate_on_slash(&self) -> bool {
-        self.block_depth() == 0 || self.pending_implicit_external_top_level_split
+        self.block_depth() == 0
+            || self.pending_implicit_external_top_level_split
+            || (self.paren_depth == 0 && self.should_split_on_semicolon())
     }
 
     fn should_close_routine_block_on_semicolon(&self) -> bool {
@@ -2043,7 +2065,15 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn prepare_slash_terminator(&mut self) {
-        if self.state.pending_end == PendingEnd::End && self.state.is_idle() {
+        if !self.state.is_idle() {
+            return;
+        }
+
+        // SQL*Plus slash terminator should behave like a statement terminator for
+        // external routine call specs (e.g. `AS LANGUAGE C` without trailing `;`).
+        self.state.finalize_external_clause_on_semicolon();
+
+        if self.state.pending_end == PendingEnd::End {
             self.state.resolve_pending_end_on_terminator();
         }
     }

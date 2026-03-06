@@ -1623,6 +1623,120 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_clause_without_semicolon_uses_slash_terminator() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash_no_semicolon RETURN NUMBER
+AS LANGUAGE C
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE target-only call spec without semicolon should still split at slash delimiter, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0]
+        .starts_with("CREATE OR REPLACE FUNCTION ext_lang_only_slash_no_semicolon RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_external_clause_without_semicolon_uses_slash_terminator() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_external_only_slash_no_semicolon RETURN NUMBER
+AS EXTERNAL
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "EXTERNAL-only call spec without semicolon should still split at slash delimiter, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with(
+        "CREATE OR REPLACE FUNCTION ext_external_only_slash_no_semicolon RETURN NUMBER"
+    ));
+    assert!(stmts[0].contains("AS EXTERNAL"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_clause_without_semicolon_uses_slash_terminator() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_external_only_slash_no_semicolon RETURN NUMBER
+AS EXTERNAL
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should split EXTERNAL-only call spec without semicolon at slash, got: {:?}",
+        stmts
+    );
+    assert_eq!(
+        slash_count, 1,
+        "expected one slash terminator, got: {items:?}"
+    );
+    assert!(stmts[0].starts_with(
+        "CREATE OR REPLACE FUNCTION ext_external_only_slash_no_semicolon RETURN NUMBER"
+    ));
+    assert!(stmts[0].contains("AS EXTERNAL"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_clause_without_semicolon_uses_slash_terminator() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash_no_semicolon RETURN NUMBER
+AS LANGUAGE C
+/
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should split LANGUAGE target-only call spec without semicolon at slash, got: {:?}",
+        stmts
+    );
+    assert_eq!(
+        slash_count, 1,
+        "expected one slash terminator, got: {items:?}"
+    );
+    assert!(stmts[0]
+        .starts_with("CREATE OR REPLACE FUNCTION ext_lang_only_slash_no_semicolon RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_external_language_clause_without_external_suffix_with_slash_still_splits(
 ) {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only_slash RETURN NUMBER
@@ -1841,9 +1955,7 @@ SELECT 1 FROM dual;"#;
         "AS MLE SIGNATURE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
         stmts
     );
-    assert!(
-        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_signature RETURN NUMBER")
-    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_signature RETURN NUMBER"));
     assert!(stmts[0].contains("AS MLE SIGNATURE ext_signature_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -1868,9 +1980,7 @@ SELECT 1 FROM dual;"#;
         "split_format_items should keep AS MLE SIGNATURE function together and split trailing SELECT: {:?}",
         stmts
     );
-    assert!(
-        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_signature RETURN NUMBER")
-    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_signature RETURN NUMBER"));
     assert!(stmts[0].contains("AS MLE SIGNATURE ext_signature_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -9292,7 +9402,8 @@ SELECT 4 FROM dual;"#;
 }
 
 #[test]
-fn test_split_script_items_simple_trigger_as_header_with_declaration_keeps_single_trigger_statement() {
+fn test_split_script_items_simple_trigger_as_header_with_declaration_keeps_single_trigger_statement(
+) {
     let sql = r#"CREATE OR REPLACE TRIGGER trg_as_header_decl
 BEFORE INSERT ON t
 FOR EACH ROW
@@ -9460,7 +9571,6 @@ SELECT 2 FROM dual;";
         "third item should be trailing SELECT statement: {items:?}"
     );
 }
-
 
 #[test]
 fn test_split_script_items_oracle_with_function_recovers_to_define_statement_head() {
@@ -9777,9 +9887,7 @@ SELECT 2 FROM dual;"#;
 
     assert!(
         stmts.first().is_some_and(|stmt| {
-            stmt.contains("WITH")
-                && stmt.contains("FUNCTION f")
-                && !stmt.contains("RUN child.sql")
+            stmt.contains("WITH") && stmt.contains("FUNCTION f") && !stmt.contains("RUN child.sql")
         }),
         "first formatted statement should keep only WITH FUNCTION declaration statement: {stmts:?}"
     );
@@ -9816,9 +9924,7 @@ SELECT 2 FROM dual;"#;
 
     assert!(
         stmts.first().is_some_and(|stmt| {
-            stmt.contains("WITH")
-                && stmt.contains("FUNCTION f")
-                && !stmt.contains("R child.sql")
+            stmt.contains("WITH") && stmt.contains("FUNCTION f") && !stmt.contains("R child.sql")
         }),
         "first formatted statement should keep only WITH FUNCTION declaration statement: {stmts:?}"
     );
@@ -10115,7 +10221,8 @@ fn test_split_script_items_create_sharing_wrapped_procedure_keeps_body_until_sla
         "CREATE SHARING WRAPPED should keep wrapped body semicolons inside one statement until slash delimiter: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("CREATE OR REPLACE SHARING=METADATA PROCEDURE wrapped_sharing\nWRAPPED"),
+        stmts[0]
+            .starts_with("CREATE OR REPLACE SHARING=METADATA PROCEDURE wrapped_sharing\nWRAPPED"),
         "first statement should preserve SHARING WRAPPED header: {}",
         stmts[0]
     );
