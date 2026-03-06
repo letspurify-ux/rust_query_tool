@@ -713,6 +713,11 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "DECLARE",
     "BEGIN",
     "WITH",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
     "CALL",
     "EXPLAIN",
     "ANALYZE",
@@ -1126,6 +1131,35 @@ mod tests {
             assert!(
                 is_oracle_sql_keyword(keyword),
                 "missing shared keyword: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn statement_head_keywords_include_common_oracle_ddl_dcl_and_tcl() {
+        for keyword in [
+            "ALTER",
+            "CREATE",
+            "DROP",
+            "TRUNCATE",
+            "RENAME",
+            "GRANT",
+            "REVOKE",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "LOCK",
+            "FLASHBACK",
+            "PURGE",
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "MERGE",
+        ] {
+            assert!(
+                is_statement_head_keyword(keyword),
+                "missing statement head keyword: {keyword}"
             );
         }
     }
