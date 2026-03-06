@@ -1291,6 +1291,9 @@ impl SplitState {
                 | "REVERSE" | "CROSSEDITION" => {
                     return;
                 }
+                "SHARING" | "METADATA" | "DATA" | "EXTENDED" | "NONE" => {
+                    return;
+                }
                 "JAVA" => {
                     self.create_state = CreateState::AwaitingJavaTarget;
                     return;

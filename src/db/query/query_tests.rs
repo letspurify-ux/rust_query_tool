@@ -9913,6 +9913,89 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_create_sharing_metadata_procedure_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE SHARING=METADATA PROCEDURE p_sharing
+IS
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE SHARING=METADATA PROCEDURE should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE SHARING=METADATA PROCEDURE p_sharing"),
+        "first statement should preserve SHARING=METADATA PROCEDURE DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_create_sharing_none_function_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE SHARING=NONE FUNCTION f_sharing
+RETURN NUMBER
+IS
+BEGIN
+  RETURN 1;
+END;
+SELECT 3 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE SHARING=NONE FUNCTION should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE SHARING=NONE FUNCTION f_sharing"),
+        "first statement should preserve SHARING=NONE FUNCTION DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 3 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_create_sharing_data_package_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE SHARING=DATA PACKAGE pkg_sharing_data AS
+  PROCEDURE p;
+END pkg_sharing_data;
+SELECT 4 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE SHARING=DATA PACKAGE should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE SHARING=DATA PACKAGE pkg_sharing_data AS"),
+        "first statement should preserve SHARING=DATA PACKAGE DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 4 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_without_semicolon_uses_slash_terminator() {
     let sql = "WITH FUNCTION f RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND\n/\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
@@ -9926,4 +10009,32 @@ fn test_split_script_items_oracle_with_function_without_semicolon_uses_slash_ter
     assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
     assert!(stmts[0].contains("RETURN 1;"));
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_create_sharing_wrapped_procedure_keeps_body_until_slash() {
+    let sql = "CREATE OR REPLACE SHARING=METADATA PROCEDURE wrapped_sharing\nWRAPPED\na b c;\nd e f;\n/\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE SHARING WRAPPED should keep wrapped body semicolons inside one statement until slash delimiter: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE SHARING=METADATA PROCEDURE wrapped_sharing\nWRAPPED"),
+        "first statement should preserve SHARING WRAPPED header: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("a b c;\nd e f;"),
+        "first statement should preserve wrapped body with internal semicolons: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
 }
