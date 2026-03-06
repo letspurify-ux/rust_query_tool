@@ -331,7 +331,6 @@ impl PendingDo {
             _ => None,
         }
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -506,7 +505,7 @@ impl AsIsBlockStart {
         if state.is_trigger()
             && !state.in_compound_trigger()
             && state.block_depth() == 0
-            && upper == "AS"
+            && (upper == "AS" || (upper == "IS" && state.saw_trigger_alias_subject))
         {
             // Simple trigger headers can legally include `REFERENCING ... AS ...` aliases.
             // Treating that `AS` as a routine body opener keeps the parser stuck inside
@@ -589,6 +588,7 @@ pub(crate) struct SplitState {
     routine_is_stack: Vec<RoutineFrame>,
     timing_point_state: TimingPointState,
     saw_compound_keyword: bool,
+    saw_trigger_alias_subject: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
@@ -824,6 +824,16 @@ impl SplitState {
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
     fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
+        if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
+            if matches!(upper, "NEW" | "OLD" | "PARENT") {
+                self.saw_trigger_alias_subject = true;
+            } else if !matches!(upper, "AS" | "IS") {
+                self.saw_trigger_alias_subject = false;
+            }
+        } else {
+            self.saw_trigger_alias_subject = false;
+        }
+
         if self.saw_compound_keyword && upper != "TRIGGER" {
             self.saw_compound_keyword = false;
         }
@@ -1116,6 +1126,7 @@ impl SplitState {
         self.routine_is_stack.clear();
         self.timing_point_state = TimingPointState::None;
         self.saw_compound_keyword = false;
+        self.saw_trigger_alias_subject = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.with_clause_state = WithClauseState::None;
@@ -1181,13 +1192,8 @@ impl SplitState {
                 "IF" | "NOT" | "EXISTS" => {
                     return;
                 }
-                "EDITIONABLE"
-                | "NONEDITIONABLE"
-                | "EDITIONING"
-                | "NONEDITIONING"
-                | "FORWARD"
-                | "REVERSE"
-                | "CROSSEDITION" => {
+                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" | "FORWARD"
+                | "REVERSE" | "CROSSEDITION" => {
                     return;
                 }
                 "JAVA" => {
@@ -3016,6 +3022,31 @@ mod tests {
     }
 
     #[test]
+    fn trigger_referencing_alias_is_does_not_block_is_header_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias_is");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW IS n OLD IS o");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 5 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("REFERENCING NEW IS n OLD IS o"));
+        assert!(statements[0].contains(
+            "FOR EACH ROW
+IS
+BEGIN"
+        ));
+        assert!(statements[1].starts_with("SELECT 5 FROM dual"));
+    }
+
+    #[test]
     fn trigger_header_is_still_opens_simple_trigger_body() {
         let mut engine = SqlParserEngine::new();
 
@@ -3180,8 +3211,7 @@ mod tests {
         assert_eq!(
             engine.finalize_and_take_statements(),
             vec![
-                "CREATE OR REPLACE TYPE t_future AS FUTURE_KIND (\n  attr NUMBER\n)"
-                    .to_string(),
+                "CREATE OR REPLACE TYPE t_future AS FUTURE_KIND (\n  attr NUMBER\n)".to_string(),
                 "SELECT 1 FROM dual".to_string(),
             ]
         );

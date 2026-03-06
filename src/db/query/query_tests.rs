@@ -7730,8 +7730,7 @@ fn test_split_script_items_oracle_with_function_keeps_single_statement_until_mai
 
 #[test]
 fn test_split_script_items_oracle_with_procedure_without_semicolon_uses_slash_terminator() {
-    let sql =
-        "WITH PROCEDURE p IS\nBEGIN\n  NULL;\nEND\n/\nSELECT 2 FROM dual;";
+    let sql = "WITH PROCEDURE p IS\nBEGIN\n  NULL;\nEND\n/\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
 
@@ -9063,6 +9062,42 @@ SELECT 2 FROM dual;"#;
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_simple_trigger_referencing_new_old_is_aliases() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_ref_alias_is
+BEFORE INSERT OR UPDATE ON t
+REFERENCING NEW IS n OLD IS o
+FOR EACH ROW
+IS
+BEGIN
+  NULL;
+END;
+SELECT 5 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger REFERENCING ... IS aliases must not consume the body IS header: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("REFERENCING NEW IS n OLD IS o"),
+        "first statement should preserve REFERENCING IS aliases: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains(
+            "FOR EACH ROW
+IS
+BEGIN"
+        ),
+        "first statement should preserve trigger body IS header: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 5 FROM dual"));
 }
 
 #[test]
