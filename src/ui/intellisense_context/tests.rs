@@ -2215,6 +2215,44 @@ fn table_wrapper_collection_expression_keeps_alias() {
 }
 
 #[test]
+fn rows_from_wrapper_relation_keeps_alias() {
+    let ctx = analyze("SELECT rf.| FROM ROWS FROM (generate_series(1, 2)) AS rf");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("rf")),
+        "ROWS FROM wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lateral_rows_from_wrapper_keeps_left_relation_visible() {
+    let ctx = analyze("SELECT * FROM orders o, LATERAL ROWS FROM (expand_order(o.id)) rf WHERE o.|");
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "left relation should remain visible around LATERAL ROWS FROM: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("rf")),
+        "LATERAL ROWS FROM alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn partition_extension_before_alias_is_not_parsed_as_alias() {
     let ctx = analyze("SELECT * FROM sales PARTITION (p202401) s WHERE s.|");
 
