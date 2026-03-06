@@ -39,6 +39,7 @@ struct ScriptOutputTab {
     group: Group,
     display: TextDisplay,
     buffer: TextBuffer,
+    line_count: i32,
 }
 
 impl ResultTabsWidget {
@@ -115,24 +116,37 @@ impl ResultTabsWidget {
             .unwrap_or(false)
     }
 
-    fn trim_script_output_buffer(buffer: &mut TextBuffer) {
+    fn count_newlines(text: &str) -> i32 {
+        text.as_bytes()
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as i32
+    }
+
+    fn trim_script_output_buffer(buffer: &mut TextBuffer) -> i32 {
         let max_chars = constants::SCRIPT_OUTPUT_MAX_CHARS;
         let target_chars = constants::SCRIPT_OUTPUT_TRIM_TARGET_CHARS.min(max_chars);
         let len = buffer.length().max(0) as usize;
         if len <= max_chars {
-            return;
+            return 0;
         }
 
         let remove_upto = len.saturating_sub(target_chars);
         if remove_upto == 0 {
-            return;
+            return 0;
         }
 
         let prefix = buffer.text_range(0, remove_upto as i32).unwrap_or_default();
         let cut = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(remove_upto);
         if cut > 0 {
+            let removed_lines = match prefix.get(..cut) {
+                Some(removed_text) => Self::count_newlines(removed_text),
+                None => 0,
+            };
             buffer.remove(0, cut as i32);
+            return removed_lines;
         }
+        0
     }
 
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
@@ -197,6 +211,7 @@ impl ResultTabsWidget {
             group: script_group,
             display: script_display,
             buffer: script_buffer,
+            line_count: 0,
         }));
 
         let data_for_cb = data.clone();
@@ -396,6 +411,7 @@ impl ResultTabsWidget {
         }
         if buffer.length() > 0 && !Self::buffer_ends_with_newline(&buffer) {
             buffer.append("\n");
+            script_output.line_count = script_output.line_count.saturating_add(1);
         }
         for (idx, line) in lines.iter().enumerate() {
             buffer.append(line);
@@ -404,9 +420,14 @@ impl ResultTabsWidget {
             }
         }
         buffer.append("\n");
-        Self::trim_script_output_buffer(&mut buffer);
-        let line_count = script_output.display.count_lines(0, buffer.length(), true);
-        script_output.display.scroll(line_count, 0);
+        script_output.line_count = script_output.line_count.saturating_add(lines.len() as i32);
+        let removed_lines = Self::trim_script_output_buffer(&mut buffer);
+        script_output.line_count = script_output
+            .line_count
+            .saturating_sub(removed_lines)
+            .max(0);
+        let scroll_line = script_output.line_count;
+        script_output.display.scroll(scroll_line, 0);
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
@@ -870,6 +891,7 @@ impl ResultTabsWidget {
         new_buffer.set_text("");
         script_output.display.set_buffer(new_buffer.clone());
         script_output.buffer = new_buffer;
+        script_output.line_count = 0;
         script_output.display.scroll(0, 0);
     }
 }
