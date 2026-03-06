@@ -1205,6 +1205,12 @@ impl SplitState {
         }
     }
 
+    fn consume_trigger_alias_subject_on_quoted_identifier(&mut self) {
+        if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
+            self.saw_trigger_alias_subject = false;
+        }
+    }
+
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
@@ -1807,6 +1813,8 @@ impl SqlParserEngine {
             if c == '"' {
                 self.state.flush_token();
                 self.state.observe_external_clause_literal_target();
+                self.state
+                    .consume_trigger_alias_subject_on_quoted_identifier();
                 self.state.lex_mode = LexMode::DoubleQuote;
                 self.current.push(c);
                 i += 1;
@@ -3589,6 +3597,66 @@ BEGIN"
 
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("END done_label"));
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn trigger_referencing_alias_with_quoted_identifier_does_not_block_body_as_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias_quoted");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW AS \"N\"");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("AS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("REFERENCING NEW AS \"N\""),
+            "first statement should preserve quoted alias clause: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("AS\nBEGIN"),
+            "trigger body AS should remain part of trigger statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn trigger_referencing_alias_with_quoted_identifier_does_not_block_body_is_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias_quoted_is");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW IS \"N\"");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("REFERENCING NEW IS \"N\""),
+            "first statement should preserve quoted alias clause: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("IS\nBEGIN"),
+            "trigger body IS should remain part of trigger statement: {}",
+            statements[0]
+        );
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
 
