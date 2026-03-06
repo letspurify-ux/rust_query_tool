@@ -2723,6 +2723,46 @@ fn from_subquery_with_merge_body_increases_depth() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
+#[test]
+fn merge_update_set_expression_does_not_start_new_update_target_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET update = |",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+}
+
+#[test]
+fn merge_update_where_expression_does_not_start_new_update_target_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET val = 1 WHERE update = |",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
+#[test]
+fn merge_insert_values_expression_does_not_start_new_insert_statement_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (insert + |)",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
+#[test]
+fn merge_delete_where_expression_does_not_start_new_delete_target_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN DELETE WHERE delete = |",
+    );
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]
