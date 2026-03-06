@@ -784,6 +784,34 @@ fn phase_delete_returning_is_column_context() {
 }
 
 #[test]
+fn phase_insert_returning_into_does_not_switch_to_table_context() {
+    let ctx = analyze("INSERT INTO t (a) VALUES (1) RETURNING a INTO |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_update_returning_into_does_not_switch_to_table_context() {
+    let ctx = analyze("UPDATE t SET a = 1 RETURNING a INTO |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_delete_returning_into_does_not_switch_to_table_context() {
+    let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING a INTO |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_delete_returning_bulk_collect_into_does_not_switch_to_table_context() {
+    let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING a BULK COLLECT INTO |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn only_without_parentheses_keeps_underlying_table_name_and_alias() {
     let ctx = analyze("SELECT e.| FROM ONLY employees e WHERE e.id > 0");
 
@@ -2025,12 +2053,10 @@ fn implicit_lateral_set_returning_function_alias_is_collected() {
     let ctx = analyze("SELECT gs.| FROM orders o, generate_series(1, o.max_n) gs");
 
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| {
-                table.name.eq_ignore_ascii_case("generate_series")
-                    && table.alias.as_deref() == Some("gs")
-            }),
+        ctx.tables_in_scope.iter().any(|table| {
+            table.name.eq_ignore_ascii_case("generate_series")
+                && table.alias.as_deref() == Some("gs")
+        }),
         "set-returning function alias should be collected after argument list: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -2402,7 +2428,8 @@ fn rows_from_wrapper_relation_keeps_alias() {
 
 #[test]
 fn lateral_rows_from_wrapper_keeps_left_relation_visible() {
-    let ctx = analyze("SELECT * FROM orders o, LATERAL ROWS FROM (expand_order(o.id)) rf WHERE o.|");
+    let ctx =
+        analyze("SELECT * FROM orders o, LATERAL ROWS FROM (expand_order(o.id)) rf WHERE o.|");
 
     let names = table_names(&ctx);
     assert!(
