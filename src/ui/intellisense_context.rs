@@ -952,6 +952,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 | SqlPhase::Initial
                                 | SqlPhase::MergeTarget
                                 | SqlPhase::ValuesClause
+                                | SqlPhase::SetClause
                         ) {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
