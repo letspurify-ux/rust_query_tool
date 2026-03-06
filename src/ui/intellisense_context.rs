@@ -967,6 +967,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "FROM" => {
+                        let from_belongs_to_distinct_predicate =
+                            is_distinct_from_operator(tokens, idx)
+                                && current_phase.is_column_context();
                         let should_treat_as_function_from = depth_frames
                             .get(depth)
                             .map(|frame| {
@@ -979,6 +982,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             if let Some(frame) = depth_frames.get_mut(depth) {
                                 frame.function_from_state.consume();
                             }
+                        } else if from_belongs_to_distinct_predicate {
+                            relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::FromClause;
                             relation_state.expect_table();
@@ -1631,6 +1636,34 @@ fn next_word_upper(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+fn prev_word_upper(tokens: &[SqlToken], before_idx: usize) -> Option<(String, usize)> {
+    let mut current_idx = before_idx;
+    while current_idx > 0 {
+        current_idx -= 1;
+        match &tokens[current_idx] {
+            SqlToken::Comment(_) => continue,
+            SqlToken::Word(word) => return Some((word.to_ascii_uppercase(), current_idx)),
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn is_distinct_from_operator(tokens: &[SqlToken], from_idx: usize) -> bool {
+    let Some((prev_word, prev_idx)) = prev_word_upper(tokens, from_idx) else {
+        return false;
+    };
+    if prev_word != "DISTINCT" {
+        return false;
+    }
+
+    let Some((second_prev_word, _)) = prev_word_upper(tokens, prev_idx) else {
+        return false;
+    };
+
+    second_prev_word == "IS" || second_prev_word == "NOT"
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
