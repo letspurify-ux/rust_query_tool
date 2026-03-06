@@ -2647,7 +2647,7 @@ impl QueryExecutor {
 
         for line in sql.lines() {
             let trimmed = line.trim();
-            let parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
+            let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
@@ -2698,6 +2698,16 @@ impl QueryExecutor {
             ) {
                 Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
+            }
+
+            if builder.is_idle()
+                && !builder.current_is_empty()
+                && builder.paren_depth() == 0
+                && builder.can_terminate_on_slash()
+                && Self::parse_tool_command(trimmed).is_some()
+            {
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
+                parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
             }
 
             let is_set_clause = Self::is_set_clause_line(trimmed);
@@ -2758,7 +2768,7 @@ impl QueryExecutor {
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
             let is_remark_line = sql_text::is_sqlplus_comment_line(trimmed);
-            let parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
+            let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
@@ -2830,6 +2840,16 @@ impl QueryExecutor {
             ) {
                 Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
+            }
+
+            if builder.is_idle()
+                && !builder.current_is_empty()
+                && builder.paren_depth() == 0
+                && builder.can_terminate_on_slash()
+                && Self::parse_tool_command(trimmed).is_some()
+            {
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
+                parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
             }
 
             let is_set_clause = Self::is_set_clause_line(trimmed);
