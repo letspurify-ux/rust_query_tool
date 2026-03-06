@@ -105,6 +105,32 @@ fn phase_where_clause() {
 }
 
 #[test]
+fn distinct_from_in_where_clause_does_not_trigger_from_clause() {
+    let ctx = analyze("SELECT * FROM emp e WHERE e.sal IS DISTINCT FROM |");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP to remain in scope after IS DISTINCT FROM, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn not_distinct_from_in_where_clause_does_not_trigger_from_clause() {
+    let ctx = analyze("SELECT * FROM emp e WHERE e.sal IS NOT DISTINCT FROM |");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP to remain in scope after IS NOT DISTINCT FROM, got {:?}",
+        names
+    );
+}
+
+#[test]
 fn phase_join_on_clause() {
     let ctx = analyze("SELECT a FROM t1 JOIN t2 ON |");
     assert_eq!(ctx.phase, SqlPhase::JoinCondition);
