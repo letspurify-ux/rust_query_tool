@@ -549,6 +549,44 @@ fn phase_for_key_share_of_is_column_context() {
 }
 
 #[test]
+fn phase_for_read_only_clause_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp FOR READ ONLY |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "FOR" && alias != "READ"),
+        "FOR READ ONLY keywords must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_for_read_write_clause_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp FOR READ WRITE |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases
+            .iter()
+            .all(|alias| alias != "FOR" && alias != "READ" && alias != "WRITE"),
+        "FOR READ WRITE keywords must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_window_clause_is_column_context() {
     let ctx = analyze("SELECT a FROM t WINDOW w AS (PARTITION BY |)");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
