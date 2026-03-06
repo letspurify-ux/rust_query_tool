@@ -4131,16 +4131,22 @@ BEGIN"
         engine.process_line("SELECT local_fn() FROM dual;");
 
         let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
         assert!(
             statements[0].contains("END local_fn"),
             "first statement should keep WITH FUNCTION declaration: {}",
             statements[0]
         );
-        assert!(
-            statements[1].starts_with("REM trailing sqlplus comment\nSELECT local_fn() FROM dual"),
-            "REM line should be part of next statement after WITH FUNCTION recovery: {}",
+        assert_eq!(
+            statements[1],
+            "REM trailing sqlplus comment".to_string(),
+            "REM command should be auto-terminated as standalone statement: {}",
             statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT should remain standalone after REM command split: {}",
+            statements[2]
         );
     }
 
@@ -4156,16 +4162,22 @@ BEGIN"
         engine.process_line("SELECT 13 FROM dual;");
 
         let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
         assert!(
             statements[0].contains("END local_proc"),
             "first statement should keep WITH PROCEDURE declaration: {}",
             statements[0]
         );
-        assert!(
-            statements[1].starts_with("REMARK trailing sqlplus comment\nSELECT 13 FROM dual"),
-            "REMARK line should be part of next statement after WITH PROCEDURE recovery: {}",
+        assert_eq!(
+            statements[1],
+            "REMARK trailing sqlplus comment".to_string(),
+            "REMARK command should be auto-terminated as standalone statement: {}",
             statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 13 FROM dual"),
+            "SELECT should remain standalone after REMARK command split: {}",
+            statements[2]
         );
     }
 
@@ -4261,6 +4273,47 @@ BEGIN"
             "double run-script marker should start the next statement after external routine split: {}",
             statements[1]
         );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_prompt_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_prompt RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("PROMPT after external");
+        engine.process_line("SELECT 33 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert_eq!(
+            statements[1],
+            "PROMPT after external\nSELECT 33 FROM dual;".to_string()
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_host_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_host RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("HOST ls");
+        engine.process_line("SELECT 34 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "HOST ls\nSELECT 34 FROM dual;".to_string());
     }
 
     #[test]
