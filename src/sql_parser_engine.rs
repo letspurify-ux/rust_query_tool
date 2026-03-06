@@ -134,6 +134,18 @@ impl PendingEndSuffix {
             Self::TimingPoint => Some(BlockKind::TimingPoint),
         }
     }
+
+    fn apply_to_state(self, state: &mut SplitState) {
+        if self == Self::Case {
+            state.pop_case_block();
+        } else if let Some(kind) = self.closing_block_kind() {
+            state.pop_block_of_kind(kind);
+        }
+
+        if self == Self::TimingPoint {
+            state.timing_point_state = TimingPointState::None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -292,21 +304,19 @@ impl RoutineFrame {
 }
 
 impl PendingDo {
-    fn arm_for_while(self, armed_at_block_depth: usize) -> Self {
-        match self {
-            Self::None => Self::While {
-                armed_at_block_depth,
-            },
-            active => active,
+    fn arm_for_token(self, token_upper: &str, armed_at_block_depth: usize) -> Self {
+        if self != Self::None {
+            return self;
         }
-    }
 
-    fn arm_for_for(self, armed_at_block_depth: usize) -> Self {
-        match self {
-            Self::None => Self::For {
+        match token_upper {
+            "WHILE" => Self::While {
                 armed_at_block_depth,
             },
-            active => active,
+            "FOR" => Self::For {
+                armed_at_block_depth,
+            },
+            _ => Self::None,
         }
     }
 
@@ -322,13 +332,6 @@ impl PendingDo {
         }
     }
 
-    fn arm_for_token(self, token_upper: &str, armed_at_block_depth: usize) -> Self {
-        match token_upper {
-            "WHILE" => self.arm_for_while(armed_at_block_depth),
-            "FOR" => self.arm_for_for(armed_at_block_depth),
-            _ => self,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -806,15 +809,7 @@ impl SplitState {
         }
 
         if let Some(suffix) = suffix {
-            if suffix == PendingEndSuffix::Case {
-                self.pop_case_block();
-            } else if let Some(kind) = suffix.closing_block_kind() {
-                self.pop_block_of_kind(kind);
-            }
-
-            if suffix == PendingEndSuffix::TimingPoint {
-                self.timing_point_state = TimingPointState::None;
-            }
+            suffix.apply_to_state(self);
         } else {
             // Plain END – CASE expression or PL/SQL block
             self.resolve_plain_end();
