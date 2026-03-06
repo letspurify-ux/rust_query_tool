@@ -2615,6 +2615,33 @@ fn lateral_rows_from_wrapper_keeps_left_relation_visible() {
 }
 
 #[test]
+fn implicit_lateral_rows_from_function_argument_can_see_left_relation_scope() {
+    let ctx = analyze("SELECT * FROM orders o, ROWS FROM (generate_series(1, o.|)) rf");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "implicit lateral ROWS FROM function arguments should keep left relation visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn parenthesized_table_wrapper_relation_keeps_alias() {
+    let ctx = analyze("SELECT c.| FROM (TABLE(get_rows())) c");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "parenthesized TABLE(...) relation should keep alias visibility: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn partition_extension_before_alias_is_not_parsed_as_alias() {
     let ctx = analyze("SELECT * FROM sales PARTITION (p202401) s WHERE s.|");
 
