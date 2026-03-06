@@ -255,6 +255,16 @@ impl RoutineFrame {
                 }
                 return;
             }
+
+            if from_external && sql_text::is_external_language_clause_keyword(token_upper) {
+                // Be permissive for malformed call specs such as
+                // `EXTERNAL LANGUAGE PARAMETERS ...` without an explicit
+                // language target. Once `EXTERNAL` was observed, subsequent
+                // call-spec tokens still belong to an external routine clause
+                // and semicolon handling should keep routine boundaries stable.
+                self.mark_external_clause();
+                return;
+            }
         }
 
         if token_upper == "EXTERNAL" {
@@ -4234,6 +4244,52 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS PIPELINED USING ext_pipe_impl"));
         assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn external_language_without_target_but_clause_keywords_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn RETURN NUMBER");
+        engine.process_line("AS EXTERNAL LANGUAGE PARAMETERS('x') NAME 'ext_fn';");
+        engine.process_line("SELECT 13 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS EXTERNAL LANGUAGE PARAMETERS('x') NAME 'ext_fn'"),
+            "external call spec should stay in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SELECT 13 FROM dual"),
+            "SELECT should be split into next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn package_nested_external_without_language_target_closes_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_ext_missing_target AS");
+        engine.process_line("  PROCEDURE p IS EXTERNAL LANGUAGE PARAMETERS('x') NAME 'p';");
+        engine.process_line("END pkg_ext_missing_target;");
+        engine.process_line("SELECT 14 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROCEDURE p IS EXTERNAL LANGUAGE PARAMETERS('x') NAME 'p'"),
+            "nested external routine should remain inside package body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END pkg_ext_missing_target"),
+            "package body END should stay in first statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 14 FROM dual".to_string());
     }
 
     #[test]
