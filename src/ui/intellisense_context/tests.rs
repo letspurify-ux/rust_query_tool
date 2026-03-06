@@ -603,6 +603,24 @@ fn phase_for_key_share_of_is_column_context() {
 }
 
 #[test]
+fn phase_for_update_wait_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE WAIT |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
+fn phase_for_update_nowait_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE NOWAIT |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
+fn phase_for_update_skip_locked_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE SKIP LOCKED |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
 fn phase_for_read_only_clause_is_not_table_context() {
     let ctx = analyze("SELECT * FROM emp FOR READ ONLY |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
