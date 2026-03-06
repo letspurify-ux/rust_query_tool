@@ -291,6 +291,21 @@ impl RoutineFrame {
         }
     }
 
+    fn observe_external_clause_literal_target(&mut self) {
+        let from_external = match self.external_clause_state {
+            ExternalClauseState::AwaitingLanguageTargetFromExternal => true,
+            ExternalClauseState::AwaitingLanguageTargetImplicit => false,
+            _ => return,
+        };
+
+        self.external_clause_state = ExternalClauseState::None;
+        if from_external {
+            self.mark_external_clause();
+        } else {
+            self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+        }
+    }
+
     fn finalize_external_clause_on_semicolon(&mut self) {
         if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
             self.mark_external_clause();
@@ -1118,6 +1133,12 @@ impl SplitState {
         }
     }
 
+    fn observe_external_clause_literal_target(&mut self) {
+        if let Some(frame) = self.active_routine_frame_mut() {
+            frame.observe_external_clause_literal_target();
+        }
+    }
+
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
@@ -1643,6 +1664,7 @@ impl SqlParserEngine {
                         continue;
                     }
                     self.state.flush_token();
+                    self.state.observe_external_clause_literal_target();
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);
                     self.current.push(chars[i + 1]);
@@ -1663,6 +1685,7 @@ impl SqlParserEngine {
                         continue;
                     }
                     self.state.flush_token();
+                    self.state.observe_external_clause_literal_target();
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);
                     self.current.push('\'');
@@ -1690,6 +1713,7 @@ impl SqlParserEngine {
 
             if c == '\'' {
                 self.state.flush_token();
+                self.state.observe_external_clause_literal_target();
                 self.state.lex_mode = LexMode::SingleQuote;
                 self.current.push(c);
                 i += 1;
@@ -1698,6 +1722,7 @@ impl SqlParserEngine {
 
             if c == '"' {
                 self.state.flush_token();
+                self.state.observe_external_clause_literal_target();
                 self.state.lex_mode = LexMode::DoubleQuote;
                 self.current.push(c);
                 i += 1;
@@ -2954,6 +2979,51 @@ mod tests {
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C NAME 'ext_lang_only'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_single_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_quoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE 'C' NAME 'ext_lang_quoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE 'C' NAME 'ext_lang_quoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_q_quoted_target_without_external_keyword_marks_external_routine_split()
+    {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_qquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE q'[C]' NAME 'ext_lang_qquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE q'[C]' NAME 'ext_lang_qquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_nq_quoted_target_without_external_keyword_marks_external_routine_split()
+    {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_nqquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
