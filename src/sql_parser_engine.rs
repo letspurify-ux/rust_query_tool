@@ -1310,6 +1310,29 @@ fn is_external_language_target(token_upper: &str) -> bool {
     sql_text::is_external_language_target_keyword(token_upper)
 }
 
+fn is_line_leading_run_script_marker(chars: &[char], marker_idx: usize) -> bool {
+    if chars.get(marker_idx).copied() != Some('@') {
+        return false;
+    }
+
+    let mut lookbehind = marker_idx;
+    while lookbehind > 0 {
+        let prev_idx = lookbehind - 1;
+        let Some(prev) = chars.get(prev_idx).copied() else {
+            break;
+        };
+        if prev == '\n' {
+            break;
+        }
+        if !prev.is_whitespace() {
+            return false;
+        }
+        lookbehind = prev_idx;
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -1705,6 +1728,19 @@ impl SqlParserEngine {
                 self.current.push(c);
                 i += 1;
                 continue;
+            }
+
+            if self.state.in_with_plsql_declaration()
+                && self.state.with_clause_waiting_main_query()
+                && self.state.block_depth() == 0
+                && self.state.paren_depth == 0
+                && self.state.token.is_empty()
+                && c == '@'
+                && is_line_leading_run_script_marker(chars, i)
+            {
+                self.push_current_statement();
+                self.reset_statement_local_state();
+                self.state.reset_create_state();
             }
 
             self.state.flush_token();
@@ -2414,6 +2450,60 @@ mod tests {
             statements[0]
         );
         assert_eq!(statements[1], "DISC".to_string());
+        assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_run_script_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("@child.sql");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with(
+                "WITH
+  FUNCTION f RETURN NUMBER IS"
+            ),
+            "first statement should keep only WITH declaration: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "@child.sql".to_string());
+        assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_relative_run_script_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("@@child.sql");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with(
+                "WITH
+  FUNCTION f RETURN NUMBER IS"
+            ),
+            "first statement should keep only WITH declaration: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "@@child.sql".to_string());
         assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
     }
     #[test]

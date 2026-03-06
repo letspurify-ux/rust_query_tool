@@ -909,6 +909,10 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return false;
     }
 
+    if trimmed.starts_with("@@") || trimmed.starts_with('@') {
+        return true;
+    }
+
     let mut words = trimmed.split_whitespace();
     let Some(first) = words.next() else {
         return false;
@@ -1052,6 +1056,8 @@ mod tests {
         assert!(is_auto_terminated_tool_command("CONN scott/tiger"));
         assert!(is_auto_terminated_tool_command("DISCONNECT"));
         assert!(is_auto_terminated_tool_command("DISC"));
+        assert!(is_auto_terminated_tool_command("@child.sql"));
+        assert!(is_auto_terminated_tool_command("  @@child.sql"));
     }
 
     #[test]
