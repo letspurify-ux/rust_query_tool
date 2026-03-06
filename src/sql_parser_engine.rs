@@ -87,12 +87,12 @@ enum EndTokenRole {
 }
 
 impl EndTokenRole {
-    fn from_token(token_upper: &str, pending_end: PendingEnd, in_compound_trigger: bool) -> Self {
+    fn from_token(token_upper: &str, pending_end: PendingEnd, allow_timing_point_suffix: bool) -> Self {
         if pending_end != PendingEnd::End {
             return Self::None;
         }
 
-        PendingEndSuffix::parse(token_upper, in_compound_trigger)
+        PendingEndSuffix::parse(token_upper, allow_timing_point_suffix)
             .map(Self::Suffix)
             .unwrap_or(Self::None)
     }
@@ -110,7 +110,7 @@ impl EndTokenRole {
 }
 
 impl PendingEndSuffix {
-    fn parse(token_upper: &str, in_compound_trigger: bool) -> Option<Self> {
+    fn parse(token_upper: &str, allow_timing_point_suffix: bool) -> Option<Self> {
         match token_upper {
             "CASE" => Some(Self::Case),
             "IF" => Some(Self::If),
@@ -118,7 +118,7 @@ impl PendingEndSuffix {
             "WHILE" => Some(Self::While),
             "REPEAT" => Some(Self::Repeat),
             "FOR" => Some(Self::For),
-            "BEFORE" | "AFTER" | "INSTEAD" if in_compound_trigger => Some(Self::TimingPoint),
+            "BEFORE" | "AFTER" | "INSTEAD" if allow_timing_point_suffix => Some(Self::TimingPoint),
             _ => None,
         }
     }
@@ -752,6 +752,18 @@ impl SplitState {
         self.create_plsql_kind == CreatePlsqlKind::Trigger(TriggerKind::Compound)
     }
 
+    fn allow_timing_point_end_suffix(&self) -> bool {
+        if !self.in_compound_trigger() {
+            return false;
+        }
+
+        self.block_stack
+            .iter()
+            .rev()
+            .find(|kind| **kind != BlockKind::Begin)
+            .is_some_and(|kind| *kind == BlockKind::TimingPoint)
+    }
+
     fn mark_compound_trigger(&mut self) {
         if self.is_trigger() {
             self.create_plsql_kind = CreatePlsqlKind::Trigger(TriggerKind::Compound);
@@ -830,8 +842,11 @@ impl SplitState {
         self.track_create_plsql(upper);
         self.track_top_level_with_plsql(upper, at_statement_start);
 
-        let end_token_role =
-            EndTokenRole::from_token(upper, self.pending_end, self.in_compound_trigger());
+        let end_token_role = EndTokenRole::from_token(
+            upper,
+            self.pending_end,
+            self.allow_timing_point_end_suffix(),
+        );
 
         self.handle_if_state_on_token(upper);
         self.handle_pending_end_on_token(end_token_role.suffix());
@@ -3791,6 +3806,44 @@ BEGIN"
         assert!(
             statements[0].starts_with("CREATE OR REPLACE TRIGGER trg_nested_before"),
             "compound trigger should stay in a single statement: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn compound_trigger_nested_subprogram_named_after_keeps_timing_point_balance() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_nested_after");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("    PROCEDURE after IS");
+        engine.process_line("    BEGIN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END after;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    after;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("  AFTER STATEMENT IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END AFTER STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END BEFORE STATEMENT"),
+            "first timing-point END should stay in trigger statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END AFTER STATEMENT"),
+            "second timing-point END should stay in trigger statement: {}",
             statements[0]
         );
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
