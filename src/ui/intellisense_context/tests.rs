@@ -1870,6 +1870,36 @@ fn join_lateral_unknown_table_function_alias_is_collected() {
 }
 
 #[test]
+fn implicit_lateral_set_returning_function_argument_can_see_left_relation_scope() {
+    let ctx = analyze("SELECT * FROM orders o, generate_series(1, o.|) gs");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "implicit lateral set-returning function arguments should keep left relation visible: {:?}",
+        names
+    );
+}
+
+#[test]
+fn implicit_lateral_set_returning_function_alias_is_collected() {
+    let ctx = analyze("SELECT gs.| FROM orders o, generate_series(1, o.max_n) gs");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| {
+                table.name.eq_ignore_ascii_case("generate_series")
+                    && table.alias.as_deref() == Some("gs")
+            }),
+        "set-returning function alias should be collected after argument list: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn lateral_keyword_is_not_parsed_as_left_table_alias() {
     let ctx = analyze("SELECT * FROM t1 LATERAL (SELECT * FROM t2) l WHERE l.|");
     let aliases: Vec<&str> = ctx
