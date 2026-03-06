@@ -3849,6 +3849,7 @@ impl MainWindow {
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
             idle_poll_cycles: Arc<AtomicUsize>,
+            pending_schema_update: Option<SchemaUpdate>,
         ) {
             let Some(state) = state_weak.upgrade() else {
                 return;
@@ -3858,41 +3859,18 @@ impl MainWindow {
             let mut file_disconnected = false;
             let mut deferred_by_borrow_conflict = false;
             let mut processed_message = false;
+            let mut pending_schema_update = pending_schema_update;
 
             // Check for schema updates
             {
-                let r = schema_receiver
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let current_generation = match state.try_lock() {
-                    Ok(s) => {
-                        let guard = try_lock_connection_with_activity(
-                            &s.connection,
-                            "Checking schema update generation",
-                        );
-                        match guard {
-                            Some(connection_guard) => connection_guard.connection_generation(),
-                            None => {
-                                deferred_by_borrow_conflict = true;
-                                0
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        deferred_by_borrow_conflict = true;
-                        0
-                    }
-                };
-
-                if !deferred_by_borrow_conflict {
-                    let mut latest_update: Option<SchemaUpdate> = None;
+                if pending_schema_update.is_none() {
+                    let r = schema_receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     loop {
                         match r.try_recv() {
                             Ok(update) => {
-                                if update.connection_generation != current_generation {
-                                    continue;
-                                }
-                                latest_update = Some(update);
+                                pending_schema_update = Some(update);
                                 processed_message = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -3902,20 +3880,35 @@ impl MainWindow {
                             }
                         }
                     }
+                }
 
-                    if let Some(update) = latest_update {
-                        match state.try_lock() {
-                            Ok(mut s) => {
-                                MainWindow::update_schema_snapshot(
-                                    &mut s,
-                                    update.data,
-                                    update.highlight_data,
-                                );
-                                s.apply_schema_to_active_tab_if_needed();
+                if let Some(update) = pending_schema_update.take() {
+                    match state.try_lock() {
+                        Ok(mut s) => {
+                            let current_generation = try_lock_connection_with_activity(
+                                &s.connection,
+                                "Checking schema update generation",
+                            )
+                            .map(|connection_guard| connection_guard.connection_generation());
+                            match current_generation {
+                                Some(generation) if update.connection_generation == generation => {
+                                    MainWindow::update_schema_snapshot(
+                                        &mut s,
+                                        update.data,
+                                        update.highlight_data,
+                                    );
+                                    s.apply_schema_to_active_tab_if_needed();
+                                }
+                                Some(_) => {}
+                                None => {
+                                    deferred_by_borrow_conflict = true;
+                                    pending_schema_update = Some(update);
+                                }
                             }
-                            Err(_) => {
-                                deferred_by_borrow_conflict = true;
-                            }
+                        }
+                        Err(_) => {
+                            deferred_by_borrow_conflict = true;
+                            pending_schema_update = Some(update);
                         }
                     }
                 }
@@ -4126,6 +4119,7 @@ impl MainWindow {
                         schema_sender.clone(),
                         file_sender.clone(),
                         idle_poll_cycles.clone(),
+                        pending_schema_update.clone(),
                     );
                 });
                 return;
@@ -4160,6 +4154,7 @@ impl MainWindow {
                     schema_sender.clone(),
                     file_sender.clone(),
                     idle_poll_cycles.clone(),
+                    None,
                 );
             });
         }
@@ -4182,6 +4177,7 @@ impl MainWindow {
             schema_sender_for_poll,
             file_sender.clone(),
             idle_poll_cycles,
+            None,
         );
 
         let tab_ids_for_drop: Vec<QueryTabId> = state
