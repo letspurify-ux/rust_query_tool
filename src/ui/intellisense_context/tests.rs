@@ -643,6 +643,42 @@ fn phase_for_read_write_clause_is_not_table_context() {
 }
 
 #[test]
+fn phase_for_json_clause_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp FOR JSON PATH, ROOT('employees') |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "JSON"),
+        "FOR JSON keywords must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_for_xml_clause_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp FOR XML PATH('employee'), TYPE |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "XML"),
+        "FOR XML keywords must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_window_clause_is_column_context() {
     let ctx = analyze("SELECT a FROM t WINDOW w AS (PARTITION BY |)");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);

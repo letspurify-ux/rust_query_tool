@@ -1233,6 +1233,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // Read-consistency qualifiers (`FOR READ ONLY`, `FOR READ WRITE`)
                             // are end-of-query boundaries and must not keep table context.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        } else if matches!(current_phase, SqlPhase::FromClause) {
+                            // Dialect-specific trailing clauses such as SQL Server
+                            // `FOR JSON` / `FOR XML` appear after FROM/WHERE and are not
+                            // relation-target contexts.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
                         }
                         relation_state.clear();
                     }
