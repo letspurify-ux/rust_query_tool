@@ -1897,16 +1897,25 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 }
                 if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                     idx = skip_parenthesized_clause(tokens, open_idx);
-                    if upper == "TABLESAMPLE"
-                        && matches!(
-                            next_word_upper(tokens, idx),
-                            Some((repeatable, _)) if repeatable == "REPEATABLE"
-                        )
-                    {
-                        let repeatable_idx = skip_comment_tokens(tokens, idx + 1);
-                        if matches!(tokens.get(repeatable_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
-                        {
-                            idx = skip_parenthesized_clause(tokens, repeatable_idx);
+                    if upper == "TABLESAMPLE" {
+                        loop {
+                            let option = next_word_upper(tokens, idx).map(|(word, _)| word);
+                            let Some(option) = option else {
+                                break;
+                            };
+
+                            if option != "REPEATABLE" && option != "SEED" {
+                                break;
+                            }
+
+                            let option_idx = skip_comment_tokens(tokens, idx + 1);
+                            if matches!(tokens.get(option_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                            {
+                                idx = skip_parenthesized_clause(tokens, option_idx);
+                                continue;
+                            }
+
+                            break;
                         }
                     }
                     idx = skip_comment_tokens(tokens, idx);
