@@ -455,6 +455,34 @@ fn is_read_consistency_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool
     )
 }
 
+fn is_insert_upsert_update_keyword(tokens: &[SqlToken], update_idx: usize) -> bool {
+    let Some((prev_word, prev_idx)) = prev_word_upper(tokens, update_idx) else {
+        return false;
+    };
+
+    if prev_word == "DO" {
+        // PostgreSQL upsert tail: `... ON CONFLICT (...) DO UPDATE SET ...`
+        return true;
+    }
+
+    if prev_word != "KEY" {
+        return false;
+    }
+
+    let Some((second_prev_word, second_prev_idx)) = prev_word_upper(tokens, prev_idx) else {
+        return false;
+    };
+    if second_prev_word != "DUPLICATE" {
+        return false;
+    }
+
+    // MySQL upsert tail: `... ON DUPLICATE KEY UPDATE ...`
+    matches!(
+        prev_word_upper(tokens, second_prev_idx),
+        Some((third_prev_word, _)) if third_prev_word == "ON"
+    )
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1242,6 +1270,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 && matches!(current_phase, SqlPhase::JoinCondition);
                         if matches!(last_word.as_deref(), Some("FOR")) {
                             // `FOR UPDATE` lock clause inside SELECT statements.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
+                        } else if is_insert_upsert_update_keyword(tokens, idx) {
+                            // Upsert action (`ON DUPLICATE KEY UPDATE`,
+                            // `ON CONFLICT ... DO UPDATE`) expects assignment expressions.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
                         } else if is_expression_context {

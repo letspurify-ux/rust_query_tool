@@ -694,6 +694,27 @@ fn phase_insert_into() {
 }
 
 #[test]
+fn phase_insert_on_duplicate_key_update_is_column_context() {
+    let ctx = analyze("INSERT INTO emp (id, name) VALUES (1, 'A') ON DUPLICATE KEY UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn phase_insert_on_conflict_do_update_set_is_column_context() {
+    let ctx =
+        analyze("INSERT INTO emp (id, name) VALUES (1, 'A') ON CONFLICT (id) DO UPDATE SET |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+}
+
+#[test]
 fn phase_replace_without_into_is_table_context() {
     let ctx = analyze("REPLACE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
