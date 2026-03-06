@@ -486,6 +486,7 @@ struct ParserDepthFrame {
     statement_kind: StatementKind,
     paren_func: Option<String>,
     function_from_state: FunctionFromState,
+    returning_clause_active: bool,
 }
 
 fn reset_relation_lookbehind(
@@ -587,6 +588,7 @@ impl Default for ParserDepthFrame {
             statement_kind: StatementKind::Unknown,
             paren_func: None,
             function_from_state: FunctionFromState::NotApplicable,
+            returning_clause_active: false,
         }
     }
 }
@@ -674,6 +676,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
                     frame.function_from_state =
                         FunctionFromState::from_function_name(frame.paren_func.as_deref());
+                    frame.returning_clause_active = false;
                 }
 
                 let scope_id = next_scope_id;
@@ -929,6 +932,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 match upper.as_str() {
                     "INSERT" => {
+                        depth_frames[depth].returning_clause_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -963,6 +967,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "SELECT" => {
                         depth_frames[depth].phase = SqlPhase::SelectList;
                         depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        depth_frames[depth].returning_clause_active = false;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }
@@ -990,16 +995,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "INTO" => {
+                        let in_returning_clause = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.returning_clause_active)
+                            .unwrap_or(false);
                         if matches!(
                             current_phase,
                             SqlPhase::SelectList
                                 | SqlPhase::Initial
                                 | SqlPhase::MergeTarget
                                 | SqlPhase::ValuesClause
-                                | SqlPhase::SetClause
-                        ) {
+                        ) || (matches!(current_phase, SqlPhase::SetClause)
+                            && !in_returning_clause)
+                        {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
+                        } else {
+                            relation_state.clear();
                         }
                     }
                     "USING" => {
@@ -1131,9 +1143,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "RETURNING" => {
                         // DML RETURNING lists target columns/expressions.
                         depth_frames[depth].phase = SqlPhase::SetClause;
+                        depth_frames[depth].returning_clause_active = true;
                         relation_state.clear();
                     }
                     "UPDATE" => {
+                        depth_frames[depth].returning_clause_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -1163,6 +1177,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "DELETE" => {
+                        depth_frames[depth].returning_clause_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -1188,6 +1203,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "MERGE" => {
+                        depth_frames[depth].returning_clause_active = false;
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
                         depth_frames[depth].statement_kind = StatementKind::Merge;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
