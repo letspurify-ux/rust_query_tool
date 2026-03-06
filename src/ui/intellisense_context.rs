@@ -1177,6 +1177,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
+                    "OVERWRITE"
+                        if matches!(last_word.as_deref(), Some("INSERT")) =>
+                    {
+                        // Hive/Spark-style `INSERT OVERWRITE TABLE ...` keeps
+                        // target relation context after OVERWRITE.
+                        depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
+                    }
                     "USING" => {
                         let current_statement_kind = depth_frames
                             .get(depth)
@@ -1206,6 +1214,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // `CREATE [GLOBAL TEMPORARY] TABLE ...`)
                         // should provide table-name completion.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
+                    }
+                    "TABLE"
+                        if matches!(current_phase, SqlPhase::IntoClause)
+                            && relation_state.is_expect_table()
+                            && !matches!(
+                                tokens.get(skip_comment_tokens(tokens, idx + 1)),
+                                Some(SqlToken::Symbol(sym)) if sym == "("
+                            ) =>
+                    {
+                        // Optional `TABLE` introducer in DML target syntax
+                        // (`INSERT INTO TABLE t`, `INSERT OVERWRITE TABLE t`).
                         relation_state.expect_table();
                     }
 
