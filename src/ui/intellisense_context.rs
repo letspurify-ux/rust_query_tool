@@ -440,6 +440,21 @@ fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     false
 }
 
+fn is_read_consistency_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
+        return false;
+    };
+
+    if first_keyword != "READ" {
+        return false;
+    }
+
+    matches!(
+        next_word_upper(tokens, first_idx + 1),
+        Some((second_keyword, _)) if second_keyword == "ONLY" || second_keyword == "WRITE"
+    )
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1146,6 +1161,10 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // `FOR NO KEY UPDATE [OF ...]`, `FOR KEY SHARE [OF ...]`)
                             // can accept column references after `OF`.
                             depth_frames[depth].phase = SqlPhase::SetClause;
+                        } else if is_read_consistency_for_clause(tokens, idx + 1) {
+                            // Read-consistency qualifiers (`FOR READ ONLY`, `FOR READ WRITE`)
+                            // are end-of-query boundaries and must not keep table context.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
                         }
                         relation_state.clear();
                     }
