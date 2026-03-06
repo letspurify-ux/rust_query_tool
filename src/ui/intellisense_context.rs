@@ -380,6 +380,43 @@ struct ParserDepthFrame {
     function_from_state: FunctionFromState,
 }
 
+fn reset_relation_lookbehind(
+    relation_modifier_state: &mut RelationModifierState,
+    relation_state: &mut RelationParseState,
+    last_word: &mut Option<String>,
+) {
+    relation_modifier_state.clear();
+    relation_state.clear();
+    *last_word = None;
+}
+
+fn close_parenthesis_scope(
+    parser_state: &mut SplitState,
+    depth: &mut usize,
+    query_depth: &mut usize,
+    depth_frames: &mut Vec<ParserDepthFrame>,
+    scope_stack: &mut Vec<usize>,
+) {
+    if depth_frames
+        .get(*depth)
+        .map(|frame| frame.is_query_scope)
+        .unwrap_or(false)
+        && *depth > 0
+    {
+        *query_depth = query_depth.saturating_sub(1);
+    }
+
+    parser_state.paren_depth = parser_state.paren_depth.saturating_sub(1);
+    *depth = parser_state.paren_depth;
+
+    if scope_stack.len() > 1 {
+        scope_stack.pop();
+    }
+    if depth_frames.len() > 1 {
+        depth_frames.pop();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
     Unknown,
@@ -601,26 +638,19 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 },
                                 scope_id: parent_scope_id,
                             });
-                            if depth_frames
-                                .get(depth)
-                                .map(|frame| frame.is_query_scope)
-                                .unwrap_or(false)
-                                && depth > 0
-                            {
-                                query_depth = query_depth.saturating_sub(1);
-                            }
                             idx = next_idx;
-                            depth = depth.saturating_sub(1);
-                            parser_state.paren_depth = depth;
-                            if scope_stack.len() > 1 {
-                                scope_stack.pop();
-                            }
-                            if depth_frames.len() > 1 {
-                                depth_frames.pop();
-                            }
-                            relation_modifier_state.clear();
-                            relation_state.clear();
-                            last_word = None;
+                            close_parenthesis_scope(
+                                &mut parser_state,
+                                &mut depth,
+                                &mut query_depth,
+                                &mut depth_frames,
+                                &mut scope_stack,
+                            );
+                            reset_relation_lookbehind(
+                                &mut relation_modifier_state,
+                                &mut relation_state,
+                                &mut last_word,
+                            );
                             continue;
                         }
 
@@ -645,25 +675,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                 }
 
-                if depth_frames
-                    .get(depth)
-                    .map(|frame| frame.is_query_scope)
-                    .unwrap_or(false)
-                    && depth > 0
-                {
-                    query_depth = query_depth.saturating_sub(1);
-                }
-                parser_state.paren_depth = parser_state.paren_depth.saturating_sub(1);
-                depth = parser_state.paren_depth;
-                if scope_stack.len() > 1 {
-                    scope_stack.pop();
-                }
-                if depth_frames.len() > 1 {
-                    depth_frames.pop();
-                }
-                relation_modifier_state.clear();
-                relation_state.clear();
-                last_word = None;
+                close_parenthesis_scope(
+                    &mut parser_state,
+                    &mut depth,
+                    &mut query_depth,
+                    &mut depth_frames,
+                    &mut scope_stack,
+                );
+                reset_relation_lookbehind(
+                    &mut relation_modifier_state,
+                    &mut relation_state,
+                    &mut last_word,
+                );
                 idx += 1;
                 continue;
             }
@@ -1874,7 +1897,8 @@ fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<us
     }
 
     idx = skip_comment_tokens(tokens, idx + 1);
-    if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SYSTEM_TIME") || word.eq_ignore_ascii_case("APPLICATION_TIME")) {
+    if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SYSTEM_TIME") || word.eq_ignore_ascii_case("APPLICATION_TIME"))
+    {
         return None;
     }
 
@@ -1887,7 +1911,8 @@ fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<us
     match keyword.as_str() {
         "AS" => {
             idx = skip_comment_tokens(tokens, idx + 1);
-            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF")) {
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF"))
+            {
                 return None;
             }
             Some(skip_flashback_bound_expression(tokens, idx + 1))
@@ -1902,7 +1927,8 @@ fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<us
         }
         "CONTAINED" => {
             idx = skip_comment_tokens(tokens, idx + 1);
-            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IN")) {
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IN"))
+            {
                 return None;
             }
             Some(skip_flashback_bound_expression(tokens, idx + 1))
