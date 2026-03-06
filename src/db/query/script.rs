@@ -2638,6 +2638,7 @@ impl QueryExecutor {
 
         for line in sql.lines() {
             let trimmed = line.trim();
+            let parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
@@ -2646,9 +2647,7 @@ impl QueryExecutor {
                 builder.block_depth(),
                 builder.current_is_empty(),
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
             }
 
@@ -2660,26 +2659,21 @@ impl QueryExecutor {
             if Self::should_force_terminate_incomplete_create(
                 builder.is_idle(),
                 builder.in_create_plsql(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
                 builder.current_is_empty(),
                 builder.is_trigger(),
                 starts_new_statement_head,
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
             }
 
-            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed) {
+            let should_attempt_slash = Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
+            if should_attempt_slash {
                 builder.prepare_slash_terminator();
             }
-            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed)
-                && builder.can_terminate_on_slash()
-            {
+            if should_attempt_slash && builder.can_terminate_on_slash() {
                 if !builder.current_is_empty() {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
-                    }
+                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 }
                 continue;
             }
@@ -2693,9 +2687,7 @@ impl QueryExecutor {
                 builder.block_depth(),
                 builder.current_is_empty(),
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
             }
 
@@ -2704,13 +2696,11 @@ impl QueryExecutor {
             if Self::should_try_tool_command_with_open_statement(
                 builder.is_idle(),
                 builder.current_is_empty(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
                 is_alter_session_set_clause,
             ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
-                    }
+                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
                     }
@@ -2722,7 +2712,7 @@ impl QueryExecutor {
             if Self::should_try_tool_command_without_open_statement(
                 builder.is_idle(),
                 builder.current_is_empty(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
             ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
@@ -2738,9 +2728,7 @@ impl QueryExecutor {
             }
         }
 
-        for stmt in builder.finalize_and_take_statements() {
-            add_statement(stmt, &mut items);
-        }
+        Self::append_finalized_statements(&mut builder, &mut items, add_statement);
 
         items
     }
@@ -2761,6 +2749,7 @@ impl QueryExecutor {
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
             let is_remark_line = sql_text::is_sqlplus_comment_line(trimmed);
+            let parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
@@ -2769,9 +2758,7 @@ impl QueryExecutor {
                 builder.block_depth(),
                 builder.current_is_empty(),
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
             }
 
@@ -2805,26 +2792,21 @@ impl QueryExecutor {
             if Self::should_force_terminate_incomplete_create(
                 builder.is_idle(),
                 builder.in_create_plsql(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
                 builder.current_is_empty(),
                 builder.is_trigger(),
                 starts_new_statement_head,
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
             }
 
-            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed) {
+            let should_attempt_slash = Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
+            if should_attempt_slash {
                 builder.prepare_slash_terminator();
             }
-            if Self::should_attempt_slash_terminator(builder.is_idle(), trimmed)
-                && builder.can_terminate_on_slash()
-            {
+            if should_attempt_slash && builder.can_terminate_on_slash() {
                 if !builder.current_is_empty() {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
-                    }
+                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 }
                 items.push(FormatItem::Slash);
                 continue;
@@ -2837,9 +2819,7 @@ impl QueryExecutor {
                 builder.block_depth(),
                 builder.current_is_empty(),
             ) {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, &mut items);
-                }
+                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                 continue;
             }
 
@@ -2848,13 +2828,11 @@ impl QueryExecutor {
             if Self::should_try_tool_command_with_open_statement(
                 builder.is_idle(),
                 builder.current_is_empty(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
                 is_alter_session_set_clause,
             ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
-                    for stmt in builder.force_terminate_and_take_statements() {
-                        add_statement(stmt, &mut items);
-                    }
+                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                         sqlblanklines_enabled = *enabled;
                     }
@@ -2866,7 +2844,7 @@ impl QueryExecutor {
             if Self::should_try_tool_command_without_open_statement(
                 builder.is_idle(),
                 builder.current_is_empty(),
-                builder.block_depth() == 0 && builder.paren_depth() == 0,
+                parser_is_top_level,
             ) {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
                     if let ToolCommand::SetSqlBlankLines { enabled } = &command {
@@ -2882,11 +2860,33 @@ impl QueryExecutor {
             }
         }
 
-        for stmt in builder.finalize_and_take_statements() {
-            add_statement(stmt, &mut items);
-        }
+        Self::append_finalized_statements(&mut builder, &mut items, add_statement);
 
         items
+    }
+
+    fn append_terminated_statements<T, F>(
+        builder: &mut SqlParserEngine,
+        items: &mut Vec<T>,
+        mut add_statement: F,
+    ) where
+        F: FnMut(String, &mut Vec<T>),
+    {
+        for stmt in builder.force_terminate_and_take_statements() {
+            add_statement(stmt, items);
+        }
+    }
+
+    fn append_finalized_statements<T, F>(
+        builder: &mut SqlParserEngine,
+        items: &mut Vec<T>,
+        mut add_statement: F,
+    ) where
+        F: FnMut(String, &mut Vec<T>),
+    {
+        for stmt in builder.finalize_and_take_statements() {
+            add_statement(stmt, items);
+        }
     }
 
     pub fn parse_tool_command(line: &str) -> Option<ToolCommand> {
