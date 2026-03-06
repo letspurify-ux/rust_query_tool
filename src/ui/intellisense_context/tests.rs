@@ -856,6 +856,13 @@ fn phase_insert_overwrite_table_is_table_context() {
 }
 
 #[test]
+fn phase_insert_overwrite_directory_is_not_table_context() {
+    let ctx = analyze("INSERT OVERWRITE DIRECTORY |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_insert_into_table_is_table_context() {
     let ctx = analyze("INSERT INTO TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
