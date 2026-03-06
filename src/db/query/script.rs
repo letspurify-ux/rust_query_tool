@@ -5,6 +5,11 @@ use crate::sql_text;
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 
 impl QueryExecutor {
+    #[inline]
+    fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
+        !delimiter.is_whitespace()
+    }
+
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
         #[derive(Copy, Clone, Eq, PartialEq)]
         enum SubqueryParenKind {
@@ -2551,19 +2556,23 @@ impl QueryExecutor {
                 && chars.get(i + 2) == Some(&'\'')
             {
                 if let Some(&delimiter) = chars.get(i + 3) {
-                    in_q_quote = true;
-                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                    i += 4;
-                    continue;
+                    if Self::is_valid_q_quote_delimiter(delimiter) {
+                        in_q_quote = true;
+                        q_quote_end = Some(sql_text::q_quote_closing(delimiter));
+                        i += 4;
+                        continue;
+                    }
                 }
             }
 
             if (c == 'q' || c == 'Q') && next == Some('\'') {
                 if let Some(&delimiter) = chars.get(i + 2) {
-                    in_q_quote = true;
-                    q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                    i += 3;
-                    continue;
+                    if Self::is_valid_q_quote_delimiter(delimiter) {
+                        in_q_quote = true;
+                        q_quote_end = Some(sql_text::q_quote_closing(delimiter));
+                        i += 3;
+                        continue;
+                    }
                 }
             }
 
