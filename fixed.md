@@ -1576,3 +1576,30 @@
 ### [검증]
 - `cargo test --quiet external_language_clause_splits_before_trailing_ -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 복구 키워드 보완 (`REM` / `REMARK`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 SQL*Plus `REM`/`REMARK`를 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; REM ...; SELECT ...;`
+  - `WITH PROCEDURE ... END; REMARK ...; SELECT ...;`
+  - 위 형태에서 `REM`/`REMARK` 라인이 앞 statement에 붙어 다음 `SELECT` 분리가 지연될 수 있었습니다.
+- **원인**:
+  - `src/sql_text.rs`의 `STATEMENT_HEAD_KEYWORDS`에 `REM`/`REMARK`가 누락되어,
+  - `src/sql_parser_engine.rs`의 `WITH FUNCTION/PROCEDURE` 복구 분기에서 새 statement head로 감지되지 않았습니다.
+- **수정**:
+  - `STATEMENT_HEAD_KEYWORDS`에 `REM`, `REMARK`를 추가했습니다.
+  - 회귀 테스트 2건으로 `WITH FUNCTION`/`WITH PROCEDURE` 뒤 `REM`/`REMARK` 진입 시 즉시 statement 분리가 일어나는지 확인했습니다.
+
+### [유사 케이스] 동일 복구 분기 일괄 점검
+- 기존에 보강된 `AUDIT/NOAUDIT`, `COMMENT/RENAME`, `START/@` 계열과 동일한 recovery 경로에서 동작하므로,
+- 동일 클래스의 SQL*Plus command head 누락이 없도록 head keyword 테이블 기준으로 추가 점검했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `with_function_recovers_to_rem_statement_head`
+- `with_function_recovers_to_remark_statement_head`
+
+### [검증]
+- `cargo test -q with_function_recovers_to_rem_statement_head -- --nocapture` 통과
+- `cargo test -q with_function_recovers_to_remark_statement_head -- --nocapture` 통과
+- `cargo test` 전체 통과

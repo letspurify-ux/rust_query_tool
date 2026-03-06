@@ -3699,6 +3699,56 @@ BEGIN"
     }
 
     #[test]
+    fn with_function_recovers_to_rem_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("REM trailing sqlplus comment");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("REM trailing sqlplus comment\nSELECT local_fn() FROM dual"),
+            "REM line should be part of next statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn with_function_recovers_to_remark_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH PROCEDURE local_proc IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END local_proc;");
+        engine.process_line("REMARK trailing sqlplus comment");
+        engine.process_line("SELECT 13 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_proc"),
+            "first statement should keep WITH PROCEDURE declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("REMARK trailing sqlplus comment\nSELECT 13 FROM dual"),
+            "REMARK line should be part of next statement after WITH PROCEDURE recovery: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_trailing_block_comment_and_select() {
         let mut engine = SqlParserEngine::new();
 
