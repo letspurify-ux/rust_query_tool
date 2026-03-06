@@ -1073,6 +1073,14 @@ impl SplitState {
         if self.in_with_plsql_declaration() && self.block_depth() == 0 && self.paren_depth == 0 {
             self.with_clause_state =
                 WithClauseState::InPlsqlDeclaration(WithDeclarationState::AwaitingMainQuery);
+            return;
+        }
+
+        if self.with_clause_state == WithClauseState::PendingClause
+            && self.block_depth() == 0
+            && self.paren_depth == 0
+        {
+            self.with_clause_state = WithClauseState::None;
         }
     }
 
@@ -3768,6 +3776,33 @@ BEGIN"
             statements[1].starts_with("/* next statement comment */\nSELECT 2 FROM dual"),
             "block comment should stay with the following statement: {}",
             statements[1]
+        );
+    }
+
+    #[test]
+    fn non_cte_with_clause_keyword_does_not_leak_into_following_comment_on_function() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("GRANT CREATE SESSION TO app_user WITH ADMIN OPTION;");
+        engine.process_line("COMMENT ON FUNCTION app_user.f IS 'ok';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("GRANT CREATE SESSION TO app_user WITH ADMIN OPTION"),
+            "first statement should remain the GRANT statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("COMMENT ON FUNCTION app_user.f IS 'ok'"),
+            "second statement should remain a standalone COMMENT ON FUNCTION statement: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 1 FROM dual"),
+            "third statement should remain a standalone SELECT statement: {}",
+            statements[2]
         );
     }
 }
