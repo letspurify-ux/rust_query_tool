@@ -269,7 +269,32 @@ fn relation_function_name_hint(table_name: &str) -> Option<String> {
 }
 
 fn is_table_target_statement_keyword(word: &str) -> bool {
-    matches!(word, "ALTER" | "DROP" | "LOCK" | "TRUNCATE")
+    matches!(word, "ALTER" | "DROP" | "LOCK" | "TRUNCATE" | "FLASHBACK")
+}
+
+fn is_comment_on_table_target(tokens: &[SqlToken], idx: usize, last_word: Option<&str>) -> bool {
+    if !matches!(last_word, Some("ON")) {
+        return false;
+    }
+
+    let mut saw_on_keyword = false;
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Word(word)) => {
+                if !saw_on_keyword && word.eq_ignore_ascii_case("ON") {
+                    saw_on_keyword = true;
+                    continue;
+                }
+                return saw_on_keyword && word.eq_ignore_ascii_case("COMMENT");
+            }
+            _ => return false,
+        }
+    }
+
+    false
 }
 
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
@@ -911,10 +936,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     "TABLE"
                         if last_word
                             .as_deref()
-                            .is_some_and(is_table_target_statement_keyword) =>
+                            .is_some_and(is_table_target_statement_keyword)
+                            || is_comment_on_table_target(tokens, idx, last_word.as_deref()) =>
                     {
                         // DDL/DCL target object position (`TRUNCATE TABLE ...`,
-                        // `LOCK TABLE ...`, `ALTER TABLE ...`, `DROP TABLE ...`)
+                        // `LOCK TABLE ...`, `ALTER TABLE ...`, `DROP TABLE ...`,
+                        // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`)
                         // should provide table-name completion.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();

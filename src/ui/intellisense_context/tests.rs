@@ -526,6 +526,27 @@ fn phase_alter_table_is_table_context() {
 }
 
 #[test]
+fn phase_flashback_table_is_table_context() {
+    let ctx = analyze("FLASHBACK TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_table_is_table_context() {
+    let ctx = analyze("COMMENT ON TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_table_with_inline_comment_is_table_context() {
+    let ctx = analyze("COMMENT ON /* inline */ TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_values() {
     let ctx = analyze("INSERT INTO t (a) VALUES |");
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
