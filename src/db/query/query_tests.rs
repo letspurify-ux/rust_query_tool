@@ -7659,6 +7659,51 @@ fn test_split_script_items_oracle_with_procedure_keeps_single_statement_until_ma
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_values() {
+    let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nVALUES (f());\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION declaration must stay attached to main VALUES statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("VALUES (f())"),
+        "first statement should include main VALUES body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_procedure_without_semicolon_uses_slash_terminator() {
+    let sql =
+        "WITH PROCEDURE p IS\nBEGIN\n  NULL;\nEND\n/\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "expected WITH PROCEDURE declaration and trailing SELECT split, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH PROCEDURE p IS"),
+        "first statement should preserve WITH PROCEDURE block, got: {}",
+        stmts[0]
+    );
+    assert!(stmts[0].contains("END"));
+    assert_eq!(stmts[1], "SELECT 2 FROM dual");
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_create_statement_head() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
