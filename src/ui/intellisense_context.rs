@@ -2135,6 +2135,29 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                     idx = skip_comment_tokens(tokens, idx + 1);
                     continue;
                 }
+                if upper == "WITH"
+                    && matches!(
+                        next_word_upper(tokens, idx + 1),
+                        Some((next, _)) if next == "OFFSET"
+                    )
+                {
+                    idx = skip_comment_tokens(tokens, idx + 1);
+                    idx = skip_comment_tokens(tokens, idx + 1);
+
+                    if matches!(
+                        tokens.get(idx),
+                        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS")
+                    ) {
+                        idx = skip_comment_tokens(tokens, idx + 1);
+                    }
+
+                    if matches!(tokens.get(idx), Some(SqlToken::Word(word)) if is_identifier_word_token(word))
+                    {
+                        idx = skip_comment_tokens(tokens, idx + 1);
+                    }
+
+                    continue;
+                }
                 let mut open_idx = skip_comment_tokens(tokens, idx + 1);
                 if matches!(upper.as_str(), "PARTITION" | "SUBPARTITION")
                     && matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FOR"))
