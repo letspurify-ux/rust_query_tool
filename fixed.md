@@ -1603,3 +1603,30 @@
 - `cargo test -q with_function_recovers_to_rem_statement_head -- --nocapture` 통과
 - `cargo test -q with_function_recovers_to_remark_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 구문 보완 (`LANGUAGE <target> <future-token>` call spec)
+
+### [중] `AS LANGUAGE <target> ...;` 뒤 확장 토큰이 오면 외부 루틴 분리 상태가 해제되던 문제 수정
+- **증상**:
+  - `CREATE FUNCTION ... AS LANGUAGE JAVASCRIPT MODULE impl; SELECT ...;`
+  - 위 형태에서 `MODULE` 같은 확장 토큰을 만나면 외부 루틴 상태가 `None`으로 되돌아가 세미콜론 분리가 누락될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `RoutineFrame::observe_external_clause_token`에서
+  - `SawImplicitLanguageTarget` 상태에서 비-절 키워드 토큰을 만나면 상태를 해제하는 fallback이 동작했습니다.
+  - 하지만 `LANGUAGE C/JAVA/...` 이후에는 Oracle 확장 토큰이 추가될 수 있어 상태 해제가 과도했습니다.
+- **수정**:
+  - `SawImplicitLanguageTarget` 상태는 fallback 해제 대상에서 제외해,
+  - `LANGUAGE <target>`을 확인한 뒤에는 절 종료 세미콜론까지 외부 루틴 분리 정책을 유지하도록 보정했습니다.
+
+### [유사 케이스] 중첩 루틴(`PACKAGE BODY`)도 함께 검증
+- top-level 함수뿐 아니라 `PACKAGE BODY` 내부 `PROCEDURE ... IS LANGUAGE JAVASCRIPT MODULE ...;`도
+- 세미콜론에서 내부 루틴 블록만 정상 종료되는지 회귀 테스트로 같이 확인했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `language_clause_with_future_tokens_without_external_keyword_still_splits`
+- `package_body_nested_language_clause_with_future_tokens_closes_on_semicolon`
+
+### [검증]
+- `cargo test -q language_clause_with_future_tokens_without_external_keyword_still_splits -- --nocapture` 통과
+- `cargo test -q package_body_nested_language_clause_with_future_tokens_closes_on_semicolon -- --nocapture` 통과
+- `cargo test` 전체 통과

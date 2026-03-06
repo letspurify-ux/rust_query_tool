@@ -299,7 +299,6 @@ impl RoutineFrame {
             self.external_clause_state,
             ExternalClauseState::SawExternalKeyword
                 | ExternalClauseState::SawUsingClauseSubject
-                | ExternalClauseState::SawImplicitLanguageTarget
         ) {
             self.external_clause_state = ExternalClauseState::None;
         }
@@ -3199,6 +3198,48 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("LANGUAGE C WITH CONTEXT"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_future_tokens_without_external_keyword_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_future RETURN NUMBER");
+        engine.process_line("AS LANGUAGE JAVASCRIPT MODULE ext_future_impl;");
+        engine.process_line("SELECT 6 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("LANGUAGE JAVASCRIPT MODULE ext_future_impl"),
+            "first statement should keep future LANGUAGE clause tokens: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 6 FROM dual"));
+    }
+
+    #[test]
+    fn package_body_nested_language_clause_with_future_tokens_closes_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_future AS");
+        engine.process_line("  PROCEDURE p IS LANGUAGE JAVASCRIPT MODULE impl;");
+        engine.process_line("END pkg_future;");
+        engine.process_line("SELECT 7 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROCEDURE p IS LANGUAGE JAVASCRIPT MODULE impl;"),
+            "nested LANGUAGE clause should stay inside package body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END pkg_future"),
+            "package body should close normally after nested routine: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 7 FROM dual"));
     }
 
     #[test]
