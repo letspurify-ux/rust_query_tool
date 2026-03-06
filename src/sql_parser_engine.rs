@@ -268,7 +268,14 @@ impl RoutineFrame {
         }
 
         if token_upper == "MLE" {
-            self.external_clause_state = ExternalClauseState::SawMleKeyword;
+            if matches!(
+                self.external_clause_state,
+                ExternalClauseState::SawImplicitLanguageTarget | ExternalClauseState::Confirmed
+            ) {
+                self.mark_external_clause();
+            } else {
+                self.external_clause_state = ExternalClauseState::SawMleKeyword;
+            }
             return;
         }
 
@@ -3526,6 +3533,48 @@ BEGIN"
             statements[0]
         );
         assert!(statements[1].starts_with("SELECT 10 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_mle_marker_after_language_target_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_marker RETURN NUMBER");
+        engine.process_line("AS LANGUAGE JAVASCRIPT MLE;");
+        engine.process_line("SELECT 11 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE JAVASCRIPT MLE"),
+            "first statement should keep LANGUAGE ... MLE clause tokens: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 11 FROM dual"));
+    }
+
+    #[test]
+    fn package_body_nested_language_clause_with_mle_marker_closes_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_mle_marker AS");
+        engine.process_line("  PROCEDURE p IS LANGUAGE JAVASCRIPT MLE;");
+        engine.process_line("END pkg_mle_marker;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROCEDURE p IS LANGUAGE JAVASCRIPT MLE;"),
+            "nested LANGUAGE ... MLE clause should stay in package body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END pkg_mle_marker"),
+            "package body should close normally after nested routine: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
     }
 
     #[test]
