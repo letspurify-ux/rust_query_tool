@@ -275,6 +275,72 @@ fn phase_asof_join_without_left_modifier_keeps_join_modifier_out_of_aliases() {
 }
 
 #[test]
+fn phase_hash_join_hint_is_not_parsed_as_left_table_alias() {
+    let ctx = analyze("SELECT * FROM emp HASH JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "HASH"),
+        "HASH must remain a join hint keyword, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_loop_join_hint_is_not_parsed_as_left_table_alias() {
+    let ctx = analyze("SELECT * FROM emp LOOP JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "LOOP"),
+        "LOOP must remain a join hint keyword, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_merge_join_hint_is_not_parsed_as_left_table_alias() {
+    let ctx = analyze("SELECT * FROM emp MERGE JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "MERGE"),
+        "MERGE must remain a join hint keyword, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_group_by() {
     let ctx = analyze("SELECT a FROM t GROUP BY |");
     assert_eq!(ctx.phase, SqlPhase::GroupByClause);

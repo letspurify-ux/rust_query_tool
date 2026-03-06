@@ -1527,3 +1527,28 @@
 - `cargo test -q trigger_header_is_still_opens_simple_trigger_body -- --nocapture` 통과
 - `cargo test -q test_split_script_items_simple_trigger_is_header_splits_normally -- --nocapture` 통과
 - `cargo test -q` 전체 통과
+
+## 2026-03-06 인텔리센스 JOIN 힌트 구문 보완 (`HASH/LOOP/MERGE JOIN`)
+
+### [중] `HASH/LOOP/MERGE JOIN`에서 왼쪽 테이블 별칭이 힌트 키워드로 오염되던 문제 수정
+- **증상**:
+  - `SELECT * FROM emp HASH JOIN dept d ...`
+  - `SELECT * FROM emp LOOP JOIN dept d ...`
+  - `SELECT * FROM emp MERGE JOIN dept d ...`
+  - 위 케이스에서 `emp`의 alias가 각각 `HASH/LOOP/MERGE`로 잘못 수집되어, qualifier 기반 추천 스코프가 오염되었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs`의 `is_join_keyword`/alias breaker 집합에 해당 JOIN 힌트 키워드가 누락되어, 일반 alias 토큰으로 해석되었습니다.
+- **수정**:
+  - `is_join_keyword`에 `HASH`, `LOOP`, `MERGE`를 추가해 relation alias 파서가 해당 토큰을 alias로 채택하지 않도록 보정했습니다.
+
+### [유사 케이스] JOIN 힌트 계열 일괄 점검
+- 동일 계열 힌트 키워드가 alias로 유입되지 않도록 회귀 테스트를 3건 추가해 한 번에 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `phase_hash_join_hint_is_not_parsed_as_left_table_alias`
+- `phase_loop_join_hint_is_not_parsed_as_left_table_alias`
+- `phase_merge_join_hint_is_not_parsed_as_left_table_alias`
+
+### [검증]
+- `cargo test join_hint_is_not_parsed_as_left_table_alias -- --nocapture` 통과
+- `cargo test -- --test-threads=1` 통과
