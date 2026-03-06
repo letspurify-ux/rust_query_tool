@@ -7650,17 +7650,24 @@ impl SqlEditorWidget {
         if !column_names.is_empty() {
             SqlEditorWidget::append_spool_output(session, &[column_names.join(&colsep)]);
         }
-        let display_rows: Vec<Vec<String>> = rows
-            .iter()
-            .map(|row| SqlEditorWidget::display_row_values(row, &null_text))
-            .collect();
+
+        let mut display_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         if !rows.is_empty() {
-            let _ = sender.send(QueryProgress::Rows {
-                index,
-                rows: display_rows.clone(),
-            });
-            app::awake();
-            SqlEditorWidget::append_spool_rows(session, &rows);
+            for row_chunk in rows.chunks(PROGRESS_ROWS_MAX_BATCH) {
+                let display_chunk: Vec<Vec<String>> = row_chunk
+                    .iter()
+                    .map(|row| SqlEditorWidget::display_row_values(row, &null_text))
+                    .collect();
+
+                display_rows.extend(display_chunk.iter().cloned());
+
+                let _ = sender.send(QueryProgress::Rows {
+                    index,
+                    rows: display_chunk,
+                });
+                app::awake();
+                SqlEditorWidget::append_spool_rows(session, row_chunk);
+            }
         }
         let column_info: Vec<ColumnInfo> = column_names
             .iter()
