@@ -896,6 +896,20 @@ fn phase_delete_returning_bulk_collect_into_does_not_switch_to_table_context() {
 }
 
 #[test]
+fn phase_insert_on_conflict_do_update_is_column_context() {
+    let ctx = analyze("INSERT INTO t (id, v) VALUES (1, 10) ON CONFLICT (id) DO UPDATE SET |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_insert_on_duplicate_key_update_is_column_context() {
+    let ctx = analyze("INSERT INTO t (id, v) VALUES (1, 10) ON DUPLICATE KEY UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn only_without_parentheses_keeps_underlying_table_name_and_alias() {
     let ctx = analyze("SELECT e.| FROM ONLY employees e WHERE e.id > 0");
 

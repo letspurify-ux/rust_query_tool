@@ -1244,6 +1244,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // `FOR UPDATE` lock clause inside SELECT statements.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
+                        } else if is_insert_upsert_update_action(tokens, idx) {
+                            // PostgreSQL/SQLite upsert action (`ON CONFLICT ... DO UPDATE`)
+                            // and MySQL upsert action (`ON DUPLICATE KEY UPDATE`) use
+                            // UPDATE as a clause keyword, not a standalone target-table start.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
                         } else if is_expression_context {
                             // Inside expressions, UPDATE can be a valid identifier/token.
                             relation_state.clear();
@@ -1776,6 +1782,28 @@ fn is_within_group_keyword(tokens: &[SqlToken], group_idx: usize) -> bool {
     };
 
     prev_word == "WITHIN"
+}
+
+fn is_insert_upsert_update_action(tokens: &[SqlToken], update_idx: usize) -> bool {
+    let Some((prev_word, prev_idx)) = prev_word_upper(tokens, update_idx) else {
+        return false;
+    };
+
+    if prev_word == "DO" {
+        return matches!(
+            prev_word_upper(tokens, prev_idx),
+            Some((second_prev, _)) if second_prev == "CONFLICT"
+        );
+    }
+
+    if prev_word == "KEY" {
+        return matches!(
+            prev_word_upper(tokens, prev_idx),
+            Some((second_prev, _)) if second_prev == "DUPLICATE"
+        );
+    }
+
+    false
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
