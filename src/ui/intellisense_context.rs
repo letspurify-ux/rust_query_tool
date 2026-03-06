@@ -1689,6 +1689,11 @@ fn parse_relation_alias_at(
         if !is_identifier_word_token(alias_word) {
             return (None, alias_idx + 1);
         }
+        let alias_is_quoted = alias_word.trim().starts_with('"') && alias_word.trim().ends_with('"');
+        let alias_upper = alias_word.to_ascii_uppercase();
+        if !alias_is_quoted && is_relation_alias_breaker(&alias_upper) {
+            return (None, alias_idx);
+        }
         let next_idx = if allow_alias_column_list {
             consume_optional_alias_column_list(tokens, alias_idx + 1)
         } else {
