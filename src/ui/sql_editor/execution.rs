@@ -584,7 +584,9 @@ impl SqlEditorWidget {
 
         Some((
             comment_start.saturating_add(comment_semicolon),
-            comment_start.saturating_add(comment_semicolon).saturating_add(1),
+            comment_start
+                .saturating_add(comment_semicolon)
+                .saturating_add(1),
         ))
     }
 
@@ -781,7 +783,8 @@ impl SqlEditorWidget {
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
-            ) | (
+            )
+            | (
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
             ) => true,
@@ -3389,160 +3392,182 @@ impl SqlEditorWidget {
                                     );
                                 }
                                 ToolCommand::Print { name } => {
-                                    let binds_snapshot = match session.lock() {
-                                        Ok(guard) => guard.binds.clone(),
-                                        Err(poisoned) => {
-                                            eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
-                                            poisoned.into_inner().binds.clone()
-                                        }
-                                    };
                                     let (heading_enabled, feedback_enabled) =
                                         SqlEditorWidget::current_output_settings(&session);
                                     let (_colsep, null_text, _trimspool_enabled) =
                                         SqlEditorWidget::current_text_output_settings(&session);
 
                                     if let Some(name) = name {
-                                        let key = SessionState::normalize_name(&name);
-                                        if let Some(bind) = binds_snapshot.get(&key) {
-                                            match &bind.value {
-                                                BindValue::Scalar(value) => {
-                                                    let columns = vec![
-                                                        "NAME".to_string(),
-                                                        "VALUE".to_string(),
-                                                    ];
-                                                    let rows = vec![vec![
-                                                        key.clone(),
-                                                        value
-                                                            .clone()
-                                                            .unwrap_or_else(|| null_text.clone()),
-                                                    ]];
-                                                    let headers =
-                                                        SqlEditorWidget::apply_heading_setting(
-                                                            columns,
-                                                            heading_enabled,
-                                                        );
-                                                    SqlEditorWidget::emit_select_result(
-                                                        &sender,
-                                                        &session,
-                                                        &conn_name,
-                                                        result_index,
-                                                        &format!("PRINT {}", key),
-                                                        headers,
-                                                        rows,
-                                                        true,
-                                                        feedback_enabled,
-                                                    );
-                                                    result_index += 1;
-                                                }
-                                                BindValue::Cursor(Some(cursor)) => {
-                                                    let columns = cursor.columns.clone();
-                                                    let headers =
-                                                        SqlEditorWidget::apply_heading_setting(
-                                                            columns,
-                                                            heading_enabled,
-                                                        );
-                                                    SqlEditorWidget::emit_select_result(
-                                                        &sender,
-                                                        &session,
-                                                        &conn_name,
-                                                        result_index,
-                                                        &format!("PRINT {}", key),
-                                                        headers,
-                                                        cursor.rows.clone(),
-                                                        true,
-                                                        feedback_enabled,
-                                                    );
-                                                    result_index += 1;
-                                                }
-                                                BindValue::Cursor(None) => {
-                                                    SqlEditorWidget::emit_script_message(
-                                                        &sender,
-                                                        &session,
-                                                        &format!("PRINT {}", key),
-                                                        &format!(
-                                                        "Error: Cursor :{} has no data to print.",
-                                                        key
-                                                    ),
-                                                    );
-                                                    command_error = true;
-                                                }
-                                            }
-                                        } else {
-                                            SqlEditorWidget::emit_script_message(
-                                                &sender,
-                                                &session,
-                                                &format!("PRINT {}", key),
-                                                &format!(
-                                                    "Error: Bind variable :{} is not defined.",
-                                                    key
-                                                ),
-                                            );
-                                            command_error = true;
+                                        enum PrintValue {
+                                            Missing,
+                                            Scalar(Option<String>),
+                                            Cursor(CursorResult),
+                                            CursorEmpty,
                                         }
-                                    } else if binds_snapshot.is_empty() {
-                                        SqlEditorWidget::emit_script_message(
-                                            &sender,
-                                            &session,
-                                            "PRINT",
-                                            "No bind variables declared.",
-                                        );
-                                    } else {
-                                        let mut summary_rows: Vec<Vec<String>> = Vec::new();
-                                        let mut cursor_results: Vec<(String, CursorResult)> =
-                                            Vec::new();
 
-                                        for (name, bind) in binds_snapshot {
-                                            let value_display = match &bind.value {
-                                                BindValue::Scalar(value) => value
-                                                    .clone()
-                                                    .unwrap_or_else(|| null_text.clone()),
-                                                BindValue::Cursor(Some(cursor)) => {
-                                                    cursor_results
-                                                        .push((name.clone(), cursor.clone()));
-                                                    format!(
-                                                        "REFCURSOR ({} rows)",
-                                                        cursor.rows.len()
-                                                    )
-                                                }
-                                                BindValue::Cursor(None) => {
-                                                    "REFCURSOR (empty)".to_string()
+                                        let key = SessionState::normalize_name(&name);
+                                        let print_value = {
+                                            let mut guard = match session.lock() {
+                                                Ok(guard) => guard,
+                                                Err(poisoned) => {
+                                                    eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                    poisoned.into_inner()
                                                 }
                                             };
 
-                                            summary_rows.push(vec![
-                                                name.clone(),
-                                                bind.data_type.display(),
-                                                value_display,
-                                            ]);
+                                            match guard.binds.get_mut(&key) {
+                                                Some(bind) => match &mut bind.value {
+                                                    BindValue::Scalar(value) => {
+                                                        PrintValue::Scalar(value.clone())
+                                                    }
+                                                    BindValue::Cursor(cursor_slot) => {
+                                                        if let Some(cursor) = cursor_slot.take() {
+                                                            PrintValue::Cursor(cursor)
+                                                        } else {
+                                                            PrintValue::CursorEmpty
+                                                        }
+                                                    }
+                                                },
+                                                None => PrintValue::Missing,
+                                            }
+                                        };
+
+                                        match print_value {
+                                            PrintValue::Scalar(value) => {
+                                                let columns =
+                                                    vec!["NAME".to_string(), "VALUE".to_string()];
+                                                let rows = vec![vec![
+                                                    key.clone(),
+                                                    value.unwrap_or_else(|| null_text.clone()),
+                                                ]];
+                                                let headers =
+                                                    SqlEditorWidget::apply_heading_setting(
+                                                        columns,
+                                                        heading_enabled,
+                                                    );
+                                                SqlEditorWidget::emit_select_result(
+                                                    &sender,
+                                                    &session,
+                                                    &conn_name,
+                                                    result_index,
+                                                    &format!("PRINT {}", key),
+                                                    headers,
+                                                    rows,
+                                                    true,
+                                                    feedback_enabled,
+                                                );
+                                                result_index += 1;
+                                            }
+                                            PrintValue::Cursor(cursor) => {
+                                                let rows = cursor.rows.clone();
+                                                let headers =
+                                                    SqlEditorWidget::apply_heading_setting(
+                                                        cursor.columns.clone(),
+                                                        heading_enabled,
+                                                    );
+                                                SqlEditorWidget::emit_select_result(
+                                                    &sender,
+                                                    &session,
+                                                    &conn_name,
+                                                    result_index,
+                                                    &format!("PRINT {}", key),
+                                                    headers,
+                                                    rows,
+                                                    true,
+                                                    feedback_enabled,
+                                                );
+                                                result_index += 1;
+
+                                                let mut guard = match session.lock() {
+                                                    Ok(guard) => guard,
+                                                    Err(poisoned) => {
+                                                        eprintln!("Warning: session state lock was poisoned; recovering.");
+                                                        poisoned.into_inner()
+                                                    }
+                                                };
+                                                if let Some(bind) = guard.binds.get_mut(&key) {
+                                                    bind.value = BindValue::Cursor(Some(cursor));
+                                                }
+                                            }
+                                            PrintValue::CursorEmpty => {
+                                                SqlEditorWidget::emit_script_message(
+                                                    &sender,
+                                                    &session,
+                                                    &format!("PRINT {}", key),
+                                                    &format!(
+                                                        "Error: Cursor :{} has no data to print.",
+                                                        key
+                                                    ),
+                                                );
+                                                command_error = true;
+                                            }
+                                            PrintValue::Missing => {
+                                                SqlEditorWidget::emit_script_message(
+                                                    &sender,
+                                                    &session,
+                                                    &format!("PRINT {}", key),
+                                                    &format!(
+                                                        "Error: Bind variable :{} is not defined.",
+                                                        key
+                                                    ),
+                                                );
+                                                command_error = true;
+                                            }
                                         }
+                                    } else {
+                                        let binds_snapshot = match session.lock() {
+                                            Ok(guard) => guard.binds.clone(),
+                                            Err(poisoned) => {
+                                                eprintln!(
+                                                    "Warning: session state lock was poisoned; recovering."
+                                                );
+                                                poisoned.into_inner().binds.clone()
+                                            }
+                                        };
 
-                                        let headers = SqlEditorWidget::apply_heading_setting(
-                                            vec![
-                                                "NAME".to_string(),
-                                                "TYPE".to_string(),
-                                                "VALUE".to_string(),
-                                            ],
-                                            heading_enabled,
-                                        );
-                                        SqlEditorWidget::emit_select_result(
-                                            &sender,
-                                            &session,
-                                            &conn_name,
-                                            result_index,
-                                            "PRINT",
-                                            headers,
-                                            summary_rows,
-                                            true,
-                                            feedback_enabled,
-                                        );
-                                        result_index += 1;
+                                        if binds_snapshot.is_empty() {
+                                            SqlEditorWidget::emit_script_message(
+                                                &sender,
+                                                &session,
+                                                "PRINT",
+                                                "No bind variables declared.",
+                                            );
+                                        } else {
+                                            let mut summary_rows: Vec<Vec<String>> = Vec::new();
+                                            let mut cursor_results: Vec<(String, CursorResult)> =
+                                                Vec::new();
 
-                                        for (cursor_name, cursor) in cursor_results {
-                                            let columns = cursor.columns.clone();
+                                            for (name, bind) in binds_snapshot {
+                                                let value_display = match &bind.value {
+                                                    BindValue::Scalar(value) => value
+                                                        .clone()
+                                                        .unwrap_or_else(|| null_text.clone()),
+                                                    BindValue::Cursor(Some(cursor)) => {
+                                                        cursor_results
+                                                            .push((name.clone(), cursor.clone()));
+                                                        format!(
+                                                            "REFCURSOR ({} rows)",
+                                                            cursor.rows.len()
+                                                        )
+                                                    }
+                                                    BindValue::Cursor(None) => {
+                                                        "REFCURSOR (empty)".to_string()
+                                                    }
+                                                };
+
+                                                summary_rows.push(vec![
+                                                    name.clone(),
+                                                    bind.data_type.display(),
+                                                    value_display,
+                                                ]);
+                                            }
+
                                             let headers = SqlEditorWidget::apply_heading_setting(
-                                                columns,
+                                                vec![
+                                                    "NAME".to_string(),
+                                                    "TYPE".to_string(),
+                                                    "VALUE".to_string(),
+                                                ],
                                                 heading_enabled,
                                             );
                                             SqlEditorWidget::emit_select_result(
@@ -3550,13 +3575,34 @@ impl SqlEditorWidget {
                                                 &session,
                                                 &conn_name,
                                                 result_index,
-                                                &format!("PRINT {}", cursor_name),
+                                                "PRINT",
                                                 headers,
-                                                cursor.rows.clone(),
+                                                summary_rows,
                                                 true,
                                                 feedback_enabled,
                                             );
                                             result_index += 1;
+
+                                            for (cursor_name, cursor) in cursor_results {
+                                                let columns = cursor.columns.clone();
+                                                let headers =
+                                                    SqlEditorWidget::apply_heading_setting(
+                                                        columns,
+                                                        heading_enabled,
+                                                    );
+                                                SqlEditorWidget::emit_select_result(
+                                                    &sender,
+                                                    &session,
+                                                    &conn_name,
+                                                    result_index,
+                                                    &format!("PRINT {}", cursor_name),
+                                                    headers,
+                                                    cursor.rows.clone(),
+                                                    true,
+                                                    feedback_enabled,
+                                                );
+                                                result_index += 1;
+                                            }
                                         }
                                     }
                                 }
