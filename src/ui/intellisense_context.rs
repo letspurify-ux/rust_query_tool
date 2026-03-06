@@ -1382,6 +1382,8 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         return ctes;
     }
 
+    idx = skip_comment_tokens(tokens, idx);
+
     // Skip RECURSIVE if present
     if let Some(SqlToken::Word(w)) = tokens.get(idx) {
         if w.eq_ignore_ascii_case("RECURSIVE") {
@@ -1394,6 +1396,8 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         if idx >= tokens.len() {
             break;
         }
+
+        idx = skip_comment_tokens(tokens, idx);
 
         // Expect CTE name
         let cte_name = match tokens.get(idx) {
@@ -1413,6 +1417,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             _ => break,
         };
         idx += 1;
+        idx = skip_comment_tokens(tokens, idx);
 
         let mut explicit_columns = Vec::new();
         let mut explicit_column_range = None;
@@ -1437,12 +1442,29 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
             }
         }
 
+        idx = skip_comment_tokens(tokens, idx);
+
         // Expect AS
         if let Some(SqlToken::Word(w)) = tokens.get(idx) {
             if w.eq_ignore_ascii_case("AS") {
                 idx += 1;
             }
         }
+
+        idx = skip_comment_tokens(tokens, idx);
+        if let Some(SqlToken::Word(w)) = tokens.get(idx) {
+            if w.eq_ignore_ascii_case("NOT") {
+                let materialized_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(tokens.get(materialized_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("MATERIALIZED"))
+                {
+                    idx = materialized_idx + 1;
+                }
+            } else if w.eq_ignore_ascii_case("MATERIALIZED") {
+                idx += 1;
+            }
+        }
+
+        idx = skip_comment_tokens(tokens, idx);
 
         // Capture CTE body token range (balanced parens).
         let mut body_range = TokenRange::empty();
@@ -1463,6 +1485,7 @@ fn parse_ctes(tokens: &[SqlToken]) -> Vec<CteDefinition> {
         });
 
         // Check for comma (another CTE) or end
+        idx = skip_comment_tokens(tokens, idx);
         match tokens.get(idx) {
             Some(SqlToken::Symbol(s)) if s == "," => {
                 idx += 1;
