@@ -1790,6 +1790,22 @@ fn parse_relation_wrapper_table_name(
     relation_word: &str,
 ) -> Option<(String, usize)> {
     let relation_upper = relation_word.to_ascii_uppercase();
+    if relation_upper == "ROWS" {
+        let from_idx = skip_comment_tokens(tokens, start + 1);
+        if !matches!(tokens.get(from_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FROM"))
+        {
+            return None;
+        }
+
+        let open_idx = skip_comment_tokens(tokens, from_idx + 1);
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return None;
+        }
+
+        let (_, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
+        return Some((relation_upper, next_idx));
+    }
+
     if !matches!(
         relation_upper.as_str(),
         "ONLY" | "TABLE" | "CONTAINERS" | "SHARDS"
