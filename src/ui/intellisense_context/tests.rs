@@ -846,6 +846,20 @@ fn phase_comment_on_table_with_inline_comment_is_table_context() {
 }
 
 #[test]
+fn phase_comment_on_view_is_table_context() {
+    let ctx = analyze("COMMENT ON VIEW |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_materialized_view_is_table_context() {
+    let ctx = analyze("COMMENT ON MATERIALIZED VIEW |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_create_index_on_is_table_context() {
     let ctx = analyze("CREATE INDEX idx_emp_dept ON |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
