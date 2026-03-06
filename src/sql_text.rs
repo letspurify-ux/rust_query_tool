@@ -726,6 +726,8 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "EXECUTE",
     "START",
     "PROMPT",
+    "REM",
+    "REMARK",
     "CONNECT",
     "CONN",
     "DISCONNECT",
