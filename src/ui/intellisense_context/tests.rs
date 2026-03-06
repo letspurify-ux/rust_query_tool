@@ -2454,6 +2454,27 @@ fn table_wrapper_relation_with_identifier_argument_is_collected() {
 }
 
 #[test]
+fn the_wrapper_relation_with_identifier_argument_is_collected() {
+    let ctx = analyze("SELECT c.| FROM THE(hr.order_rows) c");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.ORDER_ROWS".to_string()),
+        "THE wrapper should preserve identifier-like relation path: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "THE wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn containers_wrapper_relation_with_identifier_argument_is_collected() {
     let ctx = analyze("SELECT c.| FROM CONTAINERS(hr.orders) c");
     let names = table_names(&ctx);
@@ -2503,6 +2524,21 @@ fn table_wrapper_collection_expression_keeps_alias() {
             .iter()
             .any(|table| table.alias.as_deref() == Some("c")),
         "TABLE(collection_expression) should still allow alias-driven completion: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_wrapper_collection_expression_keeps_alias() {
+    let ctx = analyze("SELECT c.| FROM THE(get_rows()) c");
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "THE(collection_expression) should still allow alias-driven completion: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|table| (&table.name, &table.alias))

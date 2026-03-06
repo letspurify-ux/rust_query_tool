@@ -1997,7 +1997,7 @@ fn parse_relation_wrapper_table_name(
 
     if !matches!(
         relation_upper.as_str(),
-        "ONLY" | "TABLE" | "CONTAINERS" | "SHARDS"
+        "ONLY" | "TABLE" | "THE" | "CONTAINERS" | "SHARDS"
     ) {
         return None;
     }
@@ -2025,7 +2025,7 @@ fn parse_relation_wrapper_table_name(
     let (inner_range, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
     let inner_tokens = token_range_slice(tokens, inner_range);
 
-    // TABLE/CONTAINERS/SHARDS wrappers may contain collection function calls
+    // TABLE/THE/CONTAINERS/SHARDS wrappers may contain collection function calls
     // or scalar subqueries. For identifier-like forms
     // (`TABLE(schema.collection_col)`, `CONTAINERS(schema.table)`) keep the
     // underlying name so alias resolution can target stable relation keys.
