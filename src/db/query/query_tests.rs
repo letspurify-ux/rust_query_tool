@@ -4408,6 +4408,29 @@ fn test_connect_tool_command_still_works() {
 }
 
 #[test]
+fn test_conn_tool_command_without_arguments_is_classified_as_tool_command() {
+    let sql = "CONN";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let has_connect_error = items.iter().any(|item| {
+        matches!(
+            item,
+            ScriptItem::ToolCommand(ToolCommand::Unsupported {
+                message,
+                is_error: true,
+                ..
+            }) if message.contains("CONNECT requires connection string")
+        )
+    });
+
+    assert!(
+        has_connect_error,
+        "bare CONN should be treated as CONNECT tool command error, got: {:?}",
+        items
+    );
+}
+
+#[test]
 fn test_connect_tool_command_supports_at_sign_in_password() {
     let sql = "CONNECT user/p@ss@localhost:1521/ORCL";
     let items = QueryExecutor::split_script_items(sql);
@@ -9320,6 +9343,32 @@ SELECT 2 FROM dual;";
         "third item should be trailing SELECT statement: {items:?}"
     );
 }
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_conn_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+CONN
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("CONN")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { message, is_error: true, .. }) if message.contains("CONNECT requires connection string")),
+        "second item should classify bare CONN as CONNECT syntax error command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
 
 #[test]
 fn test_split_script_items_oracle_with_function_recovers_to_define_statement_head() {
