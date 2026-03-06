@@ -511,6 +511,35 @@ fn table_function_with_ordinality_keeps_alias_after_postfix_clause() {
 }
 
 #[test]
+fn table_function_with_offset_postfix_does_not_switch_to_pagination_phase() {
+    let ctx = analyze("SELECT * FROM orders o, UNNEST(o.items) WITH OFFSET AS off WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"ORDERS".to_string()),
+        "WITH OFFSET postfix should not reset relation scope: {:?}",
+        names
+    );
+}
+
+#[test]
+fn table_function_with_offset_postfix_keeps_alias_after_postfix_clause() {
+    let ctx = analyze("SELECT u.| FROM orders o, UNNEST(o.items) WITH OFFSET AS off u");
+
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("u") && table.alias.as_deref() == Some("u")
+        ),
+        "WITH OFFSET postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 
