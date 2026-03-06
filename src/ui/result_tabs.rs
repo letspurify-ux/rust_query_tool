@@ -394,19 +394,24 @@ impl ResultTabsWidget {
         if lines.is_empty() {
             return;
         }
-        if buffer.length() > 0 && !Self::buffer_ends_with_newline(&buffer) {
-            buffer.append("\n");
+        let has_prefix_newline = buffer.length() > 0 && !Self::buffer_ends_with_newline(&buffer);
+        let mut append_capacity = lines.iter().map(|line| line.len() + 1).sum::<usize>();
+        if has_prefix_newline {
+            append_capacity = append_capacity.saturating_add(1);
         }
-        for (idx, line) in lines.iter().enumerate() {
-            buffer.append(line);
-            if idx + 1 < lines.len() {
-                buffer.append("\n");
-            }
+        let mut appended = String::with_capacity(append_capacity);
+        if has_prefix_newline {
+            appended.push('\n');
         }
-        buffer.append("\n");
+        for line in lines {
+            appended.push_str(line);
+            appended.push('\n');
+        }
+        buffer.append(&appended);
         Self::trim_script_output_buffer(&mut buffer);
-        let line_count = script_output.display.count_lines(0, buffer.length(), true);
-        script_output.display.scroll(line_count, 0);
+        let end_pos = buffer.length();
+        script_output.display.set_insert_position(end_pos);
+        script_output.display.show_insert_position();
     }
 
     pub fn start_statement(&mut self, index: usize, label: &str) {
