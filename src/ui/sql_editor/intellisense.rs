@@ -140,30 +140,11 @@ impl SqlEditorWidget {
             InValuesOrSelectBody,
         }
 
-        impl InsertParseState {
-            fn starts_insert_body(word: &str) -> bool {
-                word.eq_ignore_ascii_case("VALUES")
-                    || word.eq_ignore_ascii_case("SELECT")
-                    || word.eq_ignore_ascii_case("WITH")
-            }
-
-            fn next_for_word(self, word: &str) -> Self {
-                if word.eq_ignore_ascii_case("INSERT") {
-                    return Self::AfterInsert;
-                }
-
-                match self {
-                    Self::AfterInsert if word.eq_ignore_ascii_case("INTO") => Self::AfterInto,
-                    Self::AfterInto => Self::AfterTarget,
-                    Self::AfterTarget | Self::AfterColumnList
-                        if Self::starts_insert_body(word) =>
-                    {
-                        Self::InValuesOrSelectBody
-                    }
-                    current => current,
-                }
-            }
-        }
+        let starts_insert_body = |word: &str| {
+            word.eq_ignore_ascii_case("VALUES")
+                || word.eq_ignore_ascii_case("SELECT")
+                || word.eq_ignore_ascii_case("WITH")
+        };
 
         let cursor_token_len = cursor_token_len.min(tokens.len());
         let mut state = InsertParseState::Idle;
@@ -173,11 +154,24 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Word(word) => {
-                    state = state.next_for_word(word);
-                    if matches!(state, InsertParseState::AfterInsert) {
+                    if word.eq_ignore_ascii_case("INSERT") {
+                        state = InsertParseState::AfterInsert;
                         depth = 0;
                         continue;
                     }
+
+                    state = match state {
+                        InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
+                            InsertParseState::AfterInto
+                        }
+                        InsertParseState::AfterInto => InsertParseState::AfterTarget,
+                        InsertParseState::AfterTarget | InsertParseState::AfterColumnList
+                            if starts_insert_body(word) =>
+                        {
+                            InsertParseState::InValuesOrSelectBody
+                        }
+                        current => current,
+                    };
                 }
                 SqlToken::Symbol(sym) if sym == "(" => {
                     if matches!(state, InsertParseState::AfterTarget) {
