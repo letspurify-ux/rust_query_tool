@@ -687,6 +687,22 @@ fn phase_update_set() {
 }
 
 #[test]
+fn phase_mysql_on_duplicate_key_update_is_column_context() {
+    let ctx = analyze("INSERT INTO t (id, val) VALUES (1, 2) ON DUPLICATE KEY UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_postgres_on_conflict_do_update_is_column_context() {
+    let ctx = analyze("INSERT INTO t (id, val) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_insert_into() {
     let ctx = analyze("INSERT INTO |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
