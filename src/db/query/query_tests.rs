@@ -9414,6 +9414,63 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_external_language_clause_splits_before_run_script_command() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_cmd RETURN NUMBER
+AS LANGUAGE C;
+@child.sql
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("AS LANGUAGE C") && !stmt.contains("@child.sql")),
+        "first item should keep only LANGUAGE call spec statement: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "second item should parse @child.sql as run-script command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_external_language_clause_splits_before_run_script_command() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_cmd RETURN NUMBER
+AS LANGUAGE C;
+@child.sql
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        stmts
+            .first()
+            .is_some_and(|stmt| stmt.contains("AS LANGUAGE C") && !stmt.contains("@child.sql")),
+        "first formatted statement should keep only LANGUAGE call spec statement: {stmts:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(FormatItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "second item should parse @child.sql as run-script command: {items:?}"
+    );
+    assert!(
+        stmts
+            .get(1)
+            .is_some_and(|stmt| stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "second formatted statement should be trailing SELECT statement: {stmts:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_create_noforce_trigger_splits_before_trailing_select() {
     let sql = r#"CREATE OR REPLACE NOFORCE TRIGGER trg_noforce
 BEFORE INSERT ON t
