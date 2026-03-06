@@ -2181,6 +2181,32 @@ pub fn resolve_qualifier_tables(
     qualifier: &str,
     tables_in_scope: &[ScopedTableRef],
 ) -> Vec<String> {
+    fn update_match_if_deeper(
+        slot: &mut Option<(usize, String)>,
+        candidate_depth: usize,
+        candidate_name: &str,
+    ) {
+        if slot
+            .as_ref()
+            .is_none_or(|(depth, _)| candidate_depth >= *depth)
+        {
+            *slot = Some((candidate_depth, candidate_name.to_string()));
+        }
+    }
+
+    fn push_first_unique(
+        seen: &mut HashSet<String>,
+        candidate: Option<(usize, String)>,
+    ) -> Option<Vec<String>> {
+        if let Some((_, name)) = candidate {
+            let normalized = name.to_ascii_uppercase();
+            if seen.insert(normalized) {
+                return Some(vec![name]);
+            }
+        }
+        None
+    }
+
     let qualifier_upper = normalize_identifier_for_lookup(qualifier);
     let mut alias_match: Option<(usize, String)> = None;
     let mut name_match: Option<(usize, String)> = None;
@@ -2195,50 +2221,32 @@ pub fn resolve_qualifier_tables(
             .map(|a| normalize_identifier_for_lookup(a));
 
         if alias_upper.as_deref() == Some(qualifier_upper.as_str()) {
-            if alias_match
-                .as_ref()
-                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
-            {
-                alias_match = Some((table_ref.depth, table_ref.name.clone()));
-            }
+            update_match_if_deeper(&mut alias_match, table_ref.depth, &table_ref.name);
             continue;
         }
 
-        if name_upper == qualifier_upper
-            && name_match
-                .as_ref()
-                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
-        {
-            name_match = Some((table_ref.depth, table_ref.name.clone()));
+        if name_upper == qualifier_upper {
+            update_match_if_deeper(&mut name_match, table_ref.depth, &table_ref.name);
             continue;
         }
 
         if last_identifier_part_for_lookup(&table_ref.name)
             .is_some_and(|short| short.eq_ignore_ascii_case(&qualifier_upper))
-            && short_name_match
-                .as_ref()
-                .is_none_or(|(depth, _)| table_ref.depth >= *depth)
         {
-            short_name_match = Some((table_ref.depth, table_ref.name.clone()));
+            update_match_if_deeper(&mut short_name_match, table_ref.depth, &table_ref.name);
         }
     }
 
-    if let Some((_, name)) = alias_match {
-        if seen.insert(name.to_ascii_uppercase()) {
-            return vec![name];
-        }
+    if let Some(result) = push_first_unique(&mut seen, alias_match) {
+        return result;
     }
 
-    if let Some((_, name)) = name_match {
-        if seen.insert(name.to_ascii_uppercase()) {
-            return vec![name];
-        }
+    if let Some(result) = push_first_unique(&mut seen, name_match) {
+        return result;
     }
 
-    if let Some((_, name)) = short_name_match {
-        if seen.insert(name.to_ascii_uppercase()) {
-            return vec![name];
-        }
+    if let Some(result) = push_first_unique(&mut seen, short_name_match) {
+        return result;
     }
 
     // If no match found, try the qualifier as a direct table name
