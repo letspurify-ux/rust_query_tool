@@ -48,14 +48,15 @@ struct SelectTransformState {
     compute_seen_numeric: Vec<bool>,
 }
 
-// Flush streamed rows in larger batches to reduce UI churn on huge result sets.
+// Flush streamed rows in bounded batches so very large fetches still surface
+// progressive UI updates without waiting for oversized buffers.
 // Send buffered rows when either:
 // - first batch reaches 100 rows
-// - 1 second passes
-// - an additional batch reaches 100,000 rows
+// - 200ms passes
+// - an additional batch reaches 10,000 rows
 const PROGRESS_ROWS_INITIAL_BATCH: usize = 100;
-const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const PROGRESS_ROWS_MAX_BATCH: usize = 100_000;
+const PROGRESS_ROWS_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
 // For huge buffers, avoid an additional full/prefix reformat pass when remapping cursor position.
 const CURSOR_MAPPING_FULL_REFORMAT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;

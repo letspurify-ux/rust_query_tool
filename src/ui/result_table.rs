@@ -5789,7 +5789,7 @@ impl ResultTableWidget {
     }
 
     /// Append rows and flush immediately so each progress message is rendered.
-    pub fn append_rows(&mut self, rows: Vec<Vec<String>>) {
+    pub fn append_rows(&mut self, mut rows: Vec<Vec<String>>) {
         if self.is_save_pending() {
             return;
         }
@@ -5828,7 +5828,7 @@ impl ResultTableWidget {
         self.pending_rows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(rows);
+            .append(&mut rows);
 
         self.flush_pending();
     }
@@ -5845,12 +5845,13 @@ impl ResultTableWidget {
             return;
         }
 
-        let rows_to_add: Vec<Vec<String>> = self
-            .pending_rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect();
+        let rows_to_add: Vec<Vec<String>> = {
+            let mut pending_rows = self
+                .pending_rows
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *pending_rows)
+        };
         if rows_to_add.is_empty() {
             return;
         }
