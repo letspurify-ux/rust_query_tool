@@ -1031,6 +1031,7 @@ impl SplitState {
             self.saw_compound_keyword = false;
         } else if matches!(upper, "BEFORE" | "AFTER" | "INSTEAD")
             && self.in_compound_trigger()
+            && self.block_stack.last() == Some(&BlockKind::Compound)
             && !end_token_role.is_suffix(PendingEndSuffix::TimingPoint)
         {
             self.timing_point_state = TimingPointState::AwaitingAsOrIs;
@@ -3426,6 +3427,57 @@ BEGIN"
             statements[0]
         );
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_nested_subprogram_named_before_does_not_start_new_timing_point() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_nested_before");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("    PROCEDURE before IS");
+        engine.process_line("    BEGIN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END before;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    before;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TRIGGER trg_nested_before"),
+            "compound trigger should stay in a single statement: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn compound_trigger_body_identifier_before_followed_by_is_does_not_open_timing_point() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_before_ident");
+        engine.process_line("FOR UPDATE ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    IF before_value IS NULL THEN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END IF;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
