@@ -1832,6 +1832,18 @@ impl SqlParserEngine {
                 self.state.reset_create_state();
             }
 
+            if self.state.pending_implicit_external_top_level_split
+                && self.state.block_depth() == 1
+                && self.state.paren_depth == 0
+                && self.state.token.is_empty()
+                && c == '@'
+                && is_line_leading_run_script_marker(chars, i)
+            {
+                self.push_current_statement();
+                self.reset_statement_local_state();
+                self.state.reset_create_state();
+            }
+
             self.state.flush_token();
             on_symbol(chars, i, c, next);
             let symbol_role = SymbolRole::from_char(c, next);
@@ -3844,6 +3856,52 @@ BEGIN"
             statements[2].starts_with("SELECT 1 FROM dual"),
             "third statement should remain a standalone SELECT statement: {}",
             statements[2]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_following_run_script_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn3 RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("@child.sql");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("@child.sql\nSELECT 3 FROM dual"),
+            "second statement should start with run-script command after split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_following_relative_run_script_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn4 RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("@@child.sql");
+        engine.process_line("SELECT 4 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("@@child.sql\nSELECT 4 FROM dual"),
+            "second statement should start with relative run-script command after split: {}",
+            statements[1]
         );
     }
 }
