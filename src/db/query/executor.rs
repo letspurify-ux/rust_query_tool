@@ -14,7 +14,21 @@ use super::{
 
 pub struct QueryExecutor;
 
+const STREAM_FETCH_ARRAY_SIZE: u32 = 2_000;
+const STREAM_PREFETCH_ROWS: u32 = STREAM_FETCH_ARRAY_SIZE + 1;
+
 impl QueryExecutor {
+    fn build_streaming_statement(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Statement, OracleError> {
+        let mut builder = conn.statement(sql);
+        let _ = builder
+            .fetch_array_size(STREAM_FETCH_ARRAY_SIZE)
+            .prefetch_rows(STREAM_PREFETCH_ROWS);
+        builder.build()
+    }
+
     fn can_retry_without_rowid(err: &OracleError) -> bool {
         let message = err.to_string();
         Self::is_retryable_rowid_injection_error(&message)
@@ -2297,7 +2311,7 @@ impl QueryExecutor {
         // This is an intentional trade-off: SQ_INTERNAL_ROWID is an internal sentinel name that
         // real queries should never use, so the collision risk is negligible.
         let mut normalize_internal_rowid_alias = sql_for_execution != sql;
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut stmt = match Self::build_streaming_statement(conn, &sql_for_execution) {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -2308,7 +2322,7 @@ impl QueryExecutor {
             Ok(result_set) => result_set,
             Err(err) => {
                 if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
-                    stmt = match conn.statement(sql).build() {
+                    stmt = match Self::build_streaming_statement(conn, sql) {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
                             logging::log_error(
@@ -2398,7 +2412,7 @@ impl QueryExecutor {
         // internal sentinel that user queries should never name a column, so the collision risk
         // from this flag being incorrectly set true is negligible.
         let mut normalize_internal_rowid_alias = sql_for_execution != sql;
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut stmt = match Self::build_streaming_statement(conn, &sql_for_execution) {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -2409,7 +2423,7 @@ impl QueryExecutor {
             Ok(result_set) => result_set,
             Err(err) => {
                 if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
-                    stmt = match conn.statement(sql).build() {
+                    stmt = match Self::build_streaming_statement(conn, sql) {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
                             logging::log_error(
@@ -2501,7 +2515,7 @@ impl QueryExecutor {
         let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
         let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
         let mut normalize_internal_rowid_alias = sql_for_execution != sql;
-        let mut stmt = match conn.statement(&sql_for_execution).build() {
+        let mut stmt = match Self::build_streaming_statement(conn, &sql_for_execution) {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -2516,7 +2530,7 @@ impl QueryExecutor {
             Ok(result_set) => result_set,
             Err(err) => {
                 if sql_for_execution != sql && Self::can_retry_without_rowid(&err) {
-                    stmt = match conn.statement(sql).build() {
+                    stmt = match Self::build_streaming_statement(conn, sql) {
                         Ok(stmt) => stmt,
                         Err(retry_err) => {
                             logging::log_error(
