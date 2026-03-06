@@ -2629,6 +2629,7 @@ fn is_table_stop_keyword(word: &str) -> bool {
 fn is_relation_alias_breaker(word: &str) -> bool {
     is_join_keyword(word)
         || is_table_stop_keyword(word)
+        || matches!(word, "SEARCH" | "CYCLE")
         || matches!(word, "ON" | "SELECT" | "FROM" | "INTO")
 }
 

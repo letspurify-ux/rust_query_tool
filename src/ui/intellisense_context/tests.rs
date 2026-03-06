@@ -3497,6 +3497,44 @@ fn recursive_cte_cycle_set_does_not_switch_to_dml_set_clause() {
 }
 
 #[test]
+fn recursive_cte_search_keyword_is_not_parsed_as_alias_without_explicit_alias() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual) SEARCH DEPTH FIRST BY n SET ord SELECT t.| FROM t",
+    );
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+
+    assert!(
+        aliases.iter().all(|alias| alias != "SEARCH"),
+        "SEARCH keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn recursive_cte_cycle_keyword_is_not_parsed_as_alias_without_explicit_alias() {
+    let ctx = analyze(
+        "WITH t(n) AS (SELECT 1 FROM dual) CYCLE n SET ord TO 1 DEFAULT 0 SELECT t.| FROM t",
+    );
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+
+    assert!(
+        aliases.iter().all(|alias| alias != "CYCLE"),
+        "CYCLE keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn with_plsql_function_declaration_is_not_parsed_as_cte() {
     let ctx = analyze("WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual");
 
