@@ -926,6 +926,12 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
+    if first.eq_ignore_ascii_case("START") {
+        return !words
+            .next()
+            .is_some_and(|second| second.eq_ignore_ascii_case("WITH"));
+    }
+
     if first.eq_ignore_ascii_case("CONNECT") {
         return !words
             .next()
@@ -1065,6 +1071,12 @@ mod tests {
         assert!(!is_auto_terminated_tool_command(
             "CONNECT BY PRIOR id = parent_id"
         ));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
+        assert!(is_auto_terminated_tool_command("START child.sql"));
+        assert!(!is_auto_terminated_tool_command("START WITH parent_id IS NULL"));
     }
 
     #[test]
