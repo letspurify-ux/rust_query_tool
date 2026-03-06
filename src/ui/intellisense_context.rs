@@ -268,6 +268,10 @@ fn relation_function_name_hint(table_name: &str) -> Option<String> {
         .map(|name| name.to_ascii_uppercase())
 }
 
+fn is_table_target_statement_keyword(word: &str) -> bool {
+    matches!(word, "ALTER" | "DROP" | "LOCK" | "TRUNCATE")
+}
+
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
     matches!(keyword, "FUNCTION" | "PROCEDURE")
 }
@@ -903,6 +907,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::JoinCondition;
                             relation_state.clear();
                         }
+                    }
+                    "TABLE"
+                        if last_word
+                            .as_deref()
+                            .is_some_and(is_table_target_statement_keyword) =>
+                    {
+                        // DDL/DCL target object position (`TRUNCATE TABLE ...`,
+                        // `LOCK TABLE ...`, `ALTER TABLE ...`, `DROP TABLE ...`)
+                        // should provide table-name completion.
+                        depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
                     }
                     "JOIN" | "APPLY" => {
                         if upper == "APPLY" {
@@ -2278,6 +2293,13 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "PARTITION"
             | "SUBPARTITION"
             | "VERSIONS"
+            | "DROP"
+            | "REUSE"
+            | "CASCADE"
+            | "RESTRICT"
+            | "PURGE"
+            | "STORAGE"
+            | "MATERIALIZED"
     )
 }
 
