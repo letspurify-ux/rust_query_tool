@@ -726,6 +726,8 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "EXECUTE",
     "START",
     "PROMPT",
+    "RUN",
+    "R",
     "REM",
     "REMARK",
     "CONNECT",
@@ -932,6 +934,14 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return !words
             .next()
             .is_some_and(|second| second.eq_ignore_ascii_case("WITH"));
+    }
+
+    if first.eq_ignore_ascii_case("RUN") {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("R") {
+        return words.next().is_none();
     }
 
     if first.eq_ignore_ascii_case("CONNECT") {
