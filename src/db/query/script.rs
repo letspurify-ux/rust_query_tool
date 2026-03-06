@@ -3121,6 +3121,18 @@ impl QueryExecutor {
             return Some(ToolCommand::Disconnect);
         }
 
+        if upper == "PASSWORD"
+            || upper.starts_with("PASSWORD ")
+            || upper == "PASSW"
+            || upper.starts_with("PASSW ")
+        {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "PASSWORD command is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
         None
     }
 
