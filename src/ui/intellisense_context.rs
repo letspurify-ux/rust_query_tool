@@ -1240,17 +1240,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let is_merge_action_keyword =
                             matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(current_phase, SqlPhase::JoinCondition);
+                        let is_mysql_conflict_update =
+                            is_mysql_on_duplicate_key_update(tokens, idx);
+                        let is_postgres_conflict_update =
+                            is_postgres_on_conflict_do_update(tokens, idx);
                         if matches!(last_word.as_deref(), Some("FOR")) {
                             // `FOR UPDATE` lock clause inside SELECT statements.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
+                        } else if is_merge_action_keyword
+                            || is_mysql_conflict_update
+                            || is_postgres_conflict_update
+                        {
+                            // `... ON DUPLICATE KEY UPDATE ...` and
+                            // `... ON CONFLICT ... DO UPDATE ...` use UPDATE as an action keyword.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
                         } else if is_expression_context {
                             // Inside expressions, UPDATE can be a valid identifier/token.
-                            relation_state.clear();
-                        } else if is_merge_action_keyword {
-                            // `MERGE ... WHEN MATCHED THEN UPDATE SET ...` UPDATE is an
-                            // action keyword, not a new table-target clause.
-                            depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
@@ -1776,6 +1783,44 @@ fn is_within_group_keyword(tokens: &[SqlToken], group_idx: usize) -> bool {
     };
 
     prev_word == "WITHIN"
+}
+
+fn previous_word_chain_matches(tokens: &[SqlToken], before_idx: usize, chain: &[&str]) -> bool {
+    let mut cursor = before_idx;
+    for expected in chain {
+        let Some((word, word_idx)) = prev_word_upper(tokens, cursor) else {
+            return false;
+        };
+        if word != *expected {
+            return false;
+        }
+        cursor = word_idx;
+    }
+    true
+}
+
+fn is_mysql_on_duplicate_key_update(tokens: &[SqlToken], update_idx: usize) -> bool {
+    previous_word_chain_matches(tokens, update_idx, &["KEY", "DUPLICATE", "ON"])
+}
+
+fn is_postgres_on_conflict_do_update(tokens: &[SqlToken], update_idx: usize) -> bool {
+    let Some((prev_word, do_idx)) = prev_word_upper(tokens, update_idx) else {
+        return false;
+    };
+    if prev_word != "DO" {
+        return false;
+    }
+
+    let mut cursor = do_idx;
+    while let Some((word, word_idx)) = prev_word_upper(tokens, cursor) {
+        if word == "CONFLICT" {
+            return prev_word_upper(tokens, word_idx)
+                .is_some_and(|(maybe_on, _)| maybe_on == "ON");
+        }
+        cursor = word_idx;
+    }
+
+    false
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
