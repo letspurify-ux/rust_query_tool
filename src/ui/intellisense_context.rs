@@ -564,10 +564,7 @@ fn begin_set_operator_operand_scope(
         return;
     };
 
-    let parent_scope = visible_parent
-        .get(current_scope)
-        .copied()
-        .unwrap_or(None);
+    let parent_scope = visible_parent.get(current_scope).copied().unwrap_or(None);
     let operand_scope = *next_scope_id;
     *next_scope_id = next_scope_id.saturating_add(1);
     visible_parent.insert(operand_scope, parent_scope);
@@ -1002,6 +999,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         } else {
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.clear();
+                        }
+                    }
+                    "REPLACE" => {
+                        depth_frames[depth].returning_clause_active = false;
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            // Inside expressions, REPLACE can be a scalar function name.
+                            relation_state.clear();
+                        } else {
+                            // MySQL `REPLACE [INTO] table ...` behaves like INSERT for
+                            // completion purposes: expect a target relation right after
+                            // REPLACE, even when INTO is omitted.
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.expect_table();
                         }
                     }
                     "WITH"

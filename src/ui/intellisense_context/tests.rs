@@ -631,6 +631,27 @@ fn phase_insert_into() {
 }
 
 #[test]
+fn phase_replace_without_into_is_table_context() {
+    let ctx = analyze("REPLACE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_replace_into_is_table_context() {
+    let ctx = analyze("REPLACE INTO |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn replace_function_call_in_select_list_stays_column_context() {
+    let ctx = analyze("SELECT REPLACE(|, 'a', 'b') FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_truncate_table_is_table_context() {
     let ctx = analyze("TRUNCATE TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
