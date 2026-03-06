@@ -1944,6 +1944,53 @@ SELECT 1 FROM dual;"#;
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
 
+
+#[test]
+fn test_create_external_function_language_national_single_quoted_target_without_external_keyword_splits()
+{
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER
+AS LANGUAGE N'C' NAME 'ext_lang_nquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE N'...' without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE N'C' NAME 'ext_lang_nquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_national_single_quoted_target_without_external_keyword_splits(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER
+AS LANGUAGE N'C' NAME 'ext_lang_nquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE N'...' function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE N'C' NAME 'ext_lang_nquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
 #[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS

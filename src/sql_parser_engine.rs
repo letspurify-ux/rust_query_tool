@@ -1805,6 +1805,17 @@ impl SqlParserEngine {
                 }
             }
 
+            // n'...'
+            if self.state.token.is_empty() && (c == 'n' || c == 'N') && next == Some('\'') {
+                self.state.flush_token();
+                self.state.observe_external_clause_literal_target();
+                self.state.lex_mode = LexMode::SingleQuote;
+                self.current.push(c);
+                self.current.push('\'');
+                i += 2;
+                continue;
+            }
+
             // $$tag$$
             if self.state.token.is_empty() && c == '$' {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
@@ -3204,6 +3215,21 @@ mod tests {
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
+
+    #[test]
+    fn language_clause_with_national_single_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE N'C' NAME 'ext_lang_nquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE N'C' NAME 'ext_lang_nquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
     #[test]
     fn language_clause_with_q_quoted_target_without_external_keyword_marks_external_routine_split()
     {
