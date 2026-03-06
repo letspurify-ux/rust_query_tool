@@ -1726,6 +1726,11 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                     continue;
                 }
                 let mut open_idx = skip_comment_tokens(tokens, idx + 1);
+                if matches!(upper.as_str(), "PARTITION" | "SUBPARTITION")
+                    && matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("FOR"))
+                {
+                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                }
                 if upper == "TABLESAMPLE" {
                     if matches!(tokens.get(open_idx), Some(SqlToken::Word(_))) {
                         open_idx = skip_comment_tokens(tokens, open_idx + 1);

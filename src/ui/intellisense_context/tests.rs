@@ -1706,6 +1706,58 @@ fn partition_keyword_is_not_parsed_as_table_alias() {
 }
 
 #[test]
+fn partition_for_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM sales PARTITION FOR (DATE '2024-01-01') s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("FOR")),
+        "PARTITION FOR clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following PARTITION FOR clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn subpartition_for_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM sales SUBPARTITION FOR (1, 2) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("FOR")),
+        "SUBPARTITION FOR clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following SUBPARTITION FOR clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn tablesample_keyword_is_not_parsed_as_table_alias() {
     let ctx = analyze("SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |");
     assert!(
