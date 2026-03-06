@@ -3172,6 +3172,104 @@ fn tablesample_repeatable_and_seed_before_alias_is_not_parsed_as_alias() {
 }
 
 #[test]
+fn mysql_use_index_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees USE INDEX (idx_empno) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("USE")),
+        "USE INDEX clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following USE INDEX clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mysql_ignore_index_for_join_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees IGNORE INDEX FOR JOIN (idx_empno) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("IGNORE")),
+        "IGNORE INDEX clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("FOR")),
+        "FOR JOIN scope keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following IGNORE INDEX FOR JOIN clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mysql_force_key_for_order_by_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees FORCE KEY FOR ORDER BY (idx_empno) e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("FORCE")),
+        "FORCE KEY clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("ORDER")),
+        "FOR ORDER BY scope keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following FORCE KEY FOR ORDER BY clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn table_alias_after_as_of_timestamp_clause_is_collected() {
     let ctx =
         analyze("SELECT e.| FROM employees AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '1' DAY) e");

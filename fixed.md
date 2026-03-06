@@ -1656,3 +1656,30 @@
 - `cargo test -q recovers_to_host_statement_head -- --nocapture` 통과
 - `cargo test -q recovers_to_bang_host_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 인텔리센스 구문 누락 보완 (MySQL INDEX 힌트)
+
+### [중] FROM 테이블 뒤 MySQL 인덱스 힌트(`USE/IGNORE/FORCE INDEX|KEY`)를 alias로 오인하던 문제 수정
+- **증상**:
+  - `SELECT * FROM employees USE INDEX (idx_empno) e ...`
+  - `SELECT * FROM employees IGNORE INDEX FOR JOIN (idx_empno) e ...`
+  - `SELECT * FROM employees FORCE KEY FOR ORDER BY (idx_empno) e ...`
+  - 위 형태에서 `USE/IGNORE/FORCE` 또는 `FOR/ORDER` 등이 relation alias 파싱 경계에 걸려 테이블 alias 인식이 깨질 수 있었습니다.
+- **원인**:
+  - `src/ui/intellisense_context.rs::skip_relation_postfix_clauses`가 Oracle/Postgres 계열 후행 절은 건너뛰지만,
+  - MySQL index hint 문법(`USE|IGNORE|FORCE {INDEX|KEY} [FOR ...] (...)`)을 건너뛰지 못했습니다.
+- **수정**:
+  - `skip_mysql_index_hint_clause`를 추가해 위 문법을 일괄 소비하도록 보강했습니다.
+  - alias breaker 키워드에 `USE/IGNORE/FORCE`를 추가해 비정상 구문/부분 입력에서도 오인식 가능성을 낮췄습니다.
+
+### [유사 케이스] INDEX/KEY + FOR scope 변형 일괄 점검
+- `INDEX`/`KEY` 동의어, `FOR JOIN`, `FOR ORDER BY` 변형을 모두 테스트로 추가해 동일 계열 회귀를 함께 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `mysql_use_index_clause_before_alias_is_not_parsed_as_alias`
+- `mysql_ignore_index_for_join_clause_before_alias_is_not_parsed_as_alias`
+- `mysql_force_key_for_order_by_clause_before_alias_is_not_parsed_as_alias`
+
+### [검증]
+- `cargo test -q mysql_ -- --nocapture` 통과
+- `cargo test -q` 전체 통과

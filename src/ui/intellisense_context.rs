@@ -2240,6 +2240,13 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
 
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
+            "USE" | "IGNORE" | "FORCE" => {
+                let Some(next_idx) = skip_mysql_index_hint_clause(tokens, idx) else {
+                    break;
+                };
+                idx = skip_comment_tokens(tokens, next_idx);
+                continue;
+            }
             "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" | "WITH" => {
                 if upper == "WITH"
                     && matches!(
@@ -2396,6 +2403,51 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
     }
 
     idx
+}
+
+fn skip_mysql_index_hint_clause(tokens: &[SqlToken], start: usize) -> Option<usize> {
+    // MySQL table hint grammar:
+    //   USE|IGNORE|FORCE {INDEX|KEY} [FOR {JOIN|ORDER BY|GROUP BY}] (idx1, idx2)
+    let mut idx = skip_comment_tokens(tokens, start + 1);
+
+    if !matches!(
+        tokens.get(idx),
+        Some(SqlToken::Word(keyword))
+            if keyword.eq_ignore_ascii_case("INDEX") || keyword.eq_ignore_ascii_case("KEY")
+    ) {
+        return None;
+    }
+    idx = skip_comment_tokens(tokens, idx + 1);
+
+    if matches!(tokens.get(idx), Some(SqlToken::Word(keyword)) if keyword.eq_ignore_ascii_case("FOR"))
+    {
+        idx = skip_comment_tokens(tokens, idx + 1);
+        if !matches!(
+            tokens.get(idx),
+            Some(SqlToken::Word(scope))
+                if scope.eq_ignore_ascii_case("JOIN")
+                    || scope.eq_ignore_ascii_case("ORDER")
+                    || scope.eq_ignore_ascii_case("GROUP")
+        ) {
+            return None;
+        }
+
+        if matches!(tokens.get(idx), Some(SqlToken::Word(scope)) if scope.eq_ignore_ascii_case("ORDER") || scope.eq_ignore_ascii_case("GROUP"))
+        {
+            idx = skip_comment_tokens(tokens, idx + 1);
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(by)) if by.eq_ignore_ascii_case("BY")) {
+                return None;
+            }
+        }
+
+        idx = skip_comment_tokens(tokens, idx + 1);
+    }
+
+    if !matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+        return None;
+    }
+
+    Some(skip_parenthesized_clause(tokens, idx))
 }
 
 fn find_top_level_keyword(
@@ -2786,6 +2838,9 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "LIMIT"
             | "OFFSET"
             | "RETURNING"
+            | "USE"
+            | "IGNORE"
+            | "FORCE"
             | "VALUES"
             | "SET"
             | "ON"
