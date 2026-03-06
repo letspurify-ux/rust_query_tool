@@ -9758,6 +9758,56 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_exit_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+EXIT
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("EXIT")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Exit)),
+        "second item should parse EXIT command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_quit_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+QUIT
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("QUIT")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Quit)),
+        "second item should parse QUIT command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_password_statement_head() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS

@@ -4537,6 +4537,25 @@ BEGIN"
     }
 
     #[test]
+    fn external_language_clause_splits_before_exit_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_exit RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("EXIT");
+        engine.process_line("SELECT 36 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "EXIT\nSELECT 36 FROM dual;".to_string());
+    }
+
+    #[test]
     fn with_function_recovers_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
