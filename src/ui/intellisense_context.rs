@@ -825,9 +825,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        if matches!(current_statement_kind, StatementKind::Merge)
-                            && matches!(current_phase, SqlPhase::JoinCondition)
-                        {
+                        let is_expression_context =
+                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_merge_action_keyword =
+                            matches!(current_statement_kind, StatementKind::Merge)
+                                && matches!(current_phase, SqlPhase::JoinCondition);
+                        if is_expression_context {
+                            // Inside expressions, INSERT can be a valid identifier/token.
+                            relation_state.clear();
+                        } else if is_merge_action_keyword {
                             // `MERGE ... WHEN ... THEN INSERT (...) VALUES (...)` reuses
                             // INSERT as an action keyword (no target table). Keep it in
                             // expression/column context instead of table-target context.
@@ -995,18 +1001,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "UPDATE" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        let is_expression_context =
+                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_merge_action_keyword =
+                            matches!(current_statement_kind, StatementKind::Merge)
+                                && matches!(current_phase, SqlPhase::JoinCondition);
                         if matches!(last_word.as_deref(), Some("FOR")) {
                             // `FOR UPDATE` lock clause inside SELECT statements.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
-                        } else if depth_frames
-                            .get(depth)
-                            .map(|frame| frame.statement_kind)
-                            .is_some_and(|kind| {
-                                matches!(kind, StatementKind::Merge)
-                                    && matches!(current_phase, SqlPhase::JoinCondition)
-                            })
-                        {
+                        } else if is_expression_context {
+                            // Inside expressions, UPDATE can be a valid identifier/token.
+                            relation_state.clear();
+                        } else if is_merge_action_keyword {
                             // `MERGE ... WHEN MATCHED THEN UPDATE SET ...` UPDATE is an
                             // action keyword, not a new table-target clause.
                             depth_frames[depth].phase = SqlPhase::SetClause;
@@ -1023,9 +1034,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        if matches!(current_statement_kind, StatementKind::Merge)
-                            && matches!(current_phase, SqlPhase::JoinCondition)
-                        {
+                        let is_expression_context =
+                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_merge_action_keyword =
+                            matches!(current_statement_kind, StatementKind::Merge)
+                                && matches!(current_phase, SqlPhase::JoinCondition);
+                        if is_expression_context {
+                            // Inside expressions, DELETE can be a valid identifier/token.
+                            relation_state.clear();
+                        } else if is_merge_action_keyword {
                             // `MERGE ... WHEN MATCHED THEN DELETE WHERE ...` DELETE is an
                             // action keyword, not a standalone DML target clause.
                             depth_frames[depth].phase = SqlPhase::WhereClause;
