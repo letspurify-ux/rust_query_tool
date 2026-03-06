@@ -533,6 +533,41 @@ fn phase_flashback_table_is_table_context() {
 }
 
 #[test]
+fn phase_rename_table_is_table_context() {
+    let ctx = analyze("RENAME TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_analyze_table_is_table_context() {
+    let ctx = analyze("ANALYZE TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_optimize_table_is_table_context() {
+    let ctx = analyze("OPTIMIZE TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_check_table_is_table_context() {
+    let ctx = analyze("CHECK TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_repair_table_is_table_context() {
+    let ctx = analyze("REPAIR TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_comment_on_table_is_table_context() {
     let ctx = analyze("COMMENT ON TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
