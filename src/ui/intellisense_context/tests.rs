@@ -992,6 +992,55 @@ fn cte_with_mismatched_close_before_with_is_still_detected() {
     );
 }
 
+#[test]
+fn cte_with_comment_between_with_and_name_is_detected() {
+    let ctx = analyze("WITH /*hint*/ cte AS (SELECT 1 AS n FROM dual) SELECT | FROM cte");
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.contains(&"CTE".to_string()),
+        "CTE name should be detected even with comment after WITH: {:?}",
+        cte_n
+    );
+}
+
+#[test]
+fn cte_as_materialized_is_detected() {
+    let ctx =
+        analyze("WITH cte AS MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte");
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.contains(&"CTE".to_string()),
+        "CTE with AS MATERIALIZED should be detected: {:?}",
+        cte_n
+    );
+}
+
+#[test]
+fn cte_as_not_materialized_is_detected() {
+    let ctx = analyze(
+        "WITH cte AS NOT MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte",
+    );
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.contains(&"CTE".to_string()),
+        "CTE with AS NOT MATERIALIZED should be detected: {:?}",
+        cte_n
+    );
+}
+
+#[test]
+fn cte_with_comment_between_as_and_materialized_is_detected() {
+    let ctx = analyze(
+        "WITH cte AS /*hint*/ MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte",
+    );
+    let cte_n = cte_names(&ctx);
+    assert!(
+        cte_n.contains(&"CTE".to_string()),
+        "CTE with comments around MATERIALIZED should be detected: {:?}",
+        cte_n
+    );
+}
+
 // ─── Complex nested query tests ─────────────────────────────────────────
 
 #[test]
