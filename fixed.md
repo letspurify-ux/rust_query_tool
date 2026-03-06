@@ -1681,3 +1681,31 @@
 ### [검증]
 - `cargo test bang_host -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 구문 보완 (`EXTERNAL LANGUAGE` 타깃 생략 + 절 키워드 후행)
+
+### [중] `EXTERNAL LANGUAGE` 다음 언어 타깃이 생략된 call spec에서 세미콜론 분리가 누락되던 문제 수정
+- **증상**:
+  - `CREATE FUNCTION ... AS EXTERNAL LANGUAGE PARAMETERS('x') NAME 'f'; SELECT ...;`
+  - 위 형태에서 `LANGUAGE` 뒤 토큰(`PARAMETERS`, `NAME`)이 오면 외부 루틴 상태가 해제되어, 세미콜론 뒤 `SELECT`가 같은 statement로 붙을 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `RoutineFrame::observe_external_clause_token`가
+  - `AwaitingLanguageTargetFromExternal` 상태에서 언어 타깃(`C/JAVA/...`)이 아니면 즉시 `None`으로 리셋했습니다.
+  - 그러나 `EXTERNAL` 문맥에서는 `LANGUAGE` 다음에 절 키워드가 이어지는 비정형/호환 구문도 외부 루틴 call spec으로 취급하는 편이 statement 경계 안정성에 유리합니다.
+- **수정**:
+  - `AwaitingLanguageTargetFromExternal` 상태에서 `EXTERNAL` 절 키워드(`NAME/LIBRARY/AGENT/PARAMETERS/...`)를 만나면
+  - 외부 루틴 정책을 유지(`mark_external_clause`)하도록 보정했습니다.
+  - 결과적으로 언어 타깃 생략/비정형 call spec에서도 세미콜론 경계가 안정적으로 유지됩니다.
+
+### [유사 케이스] 중첩 루틴(`PACKAGE BODY`)도 함께 검증
+- 같은 상태 전이 문제는 중첩 `PROCEDURE ... IS EXTERNAL ...;`에서도 재현 가능하므로,
+- `PACKAGE BODY` 내부 케이스를 함께 테스트해 세미콜론에서 내부 루틴 블록이 정상 종료되고 바깥 statement 경계가 유지되는지 검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `external_language_without_target_but_clause_keywords_still_splits`
+- `package_nested_external_without_language_target_closes_on_semicolon`
+
+### [검증]
+- `cargo test -q external_language_without_target_but_clause_keywords_still_splits -- --nocapture` 통과
+- `cargo test -q package_nested_external_without_language_target_closes_on_semicolon -- --nocapture` 통과
+- `cargo test` 전체 통과
