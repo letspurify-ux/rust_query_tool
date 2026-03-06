@@ -7651,15 +7651,14 @@ impl SqlEditorWidget {
             SqlEditorWidget::append_spool_output(session, &[column_names.join(&colsep)]);
         }
 
-        let mut display_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+        let mut row_count = 0usize;
         if !rows.is_empty() {
             for row_chunk in rows.chunks(PROGRESS_ROWS_MAX_BATCH) {
                 let display_chunk: Vec<Vec<String>> = row_chunk
                     .iter()
                     .map(|row| SqlEditorWidget::display_row_values(row, &null_text))
                     .collect();
-
-                display_rows.extend(display_chunk.iter().cloned());
+                row_count += display_chunk.len();
 
                 let _ = sender.send(QueryProgress::Rows {
                     index,
@@ -7677,7 +7676,7 @@ impl SqlEditorWidget {
             })
             .collect();
         let mut result =
-            QueryResult::new_select(sql, column_info, display_rows, Duration::from_secs(0));
+            QueryResult::new_select_streamed(sql, column_info, row_count, Duration::from_secs(0));
         result.success = success;
         if !feedback_enabled {
             result.message.clear();
