@@ -3112,6 +3112,7 @@ impl QueryExecutor {
 
         if (upper == "CONNECT"
             || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY")))
+            || upper == "CONN"
             || upper.starts_with("CONN ")
         {
             return Some(Self::parse_connect_command(trimmed));
