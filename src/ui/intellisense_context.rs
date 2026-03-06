@@ -1185,6 +1185,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
+                    "DIRECTORY"
+                        if matches!(last_word.as_deref(), Some("OVERWRITE")) =>
+                    {
+                        // `INSERT OVERWRITE DIRECTORY ...` targets a filesystem
+                        // location rather than a table relation.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        relation_state.clear();
+                    }
                     "USING" => {
                         let current_statement_kind = depth_frames
                             .get(depth)
