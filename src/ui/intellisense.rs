@@ -1567,6 +1567,35 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn detect_sql_context_insert_all_into_clause_is_table_name() {
+        let sql_with_cursor = "INSERT ALL INTO | (id) VALUES (1) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::TableName);
+    }
+
+    #[test]
+    fn detect_sql_context_insert_all_after_first_values_into_clause_is_table_name() {
+        let sql_with_cursor =
+            "INSERT ALL INTO t1 (id) VALUES (1) INTO | (id) VALUES (2) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::TableName);
+    }
+
+    #[test]
     fn get_suggestions_excludes_exact_prefix_match() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["AB".to_string(), "ABC_TABLE".to_string()];
