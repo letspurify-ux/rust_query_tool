@@ -503,7 +503,11 @@ impl AsIsBlockStart {
             return Self::TimingPoint;
         }
 
-        if state.is_trigger() && !state.in_compound_trigger() && state.block_depth() == 0 {
+        if state.is_trigger()
+            && !state.in_compound_trigger()
+            && state.block_depth() == 0
+            && upper == "AS"
+        {
             // Simple trigger headers can legally include `REFERENCING ... AS ...` aliases.
             // Treating that `AS` as a routine body opener keeps the parser stuck inside
             // a synthetic block and prevents semicolon splitting for `CALL`-style bodies.
@@ -2970,6 +2974,34 @@ mod tests {
         assert!(statements[0].contains("REFERENCING NEW AS n OLD AS o"));
         assert!(statements[0].contains("CALL do_work"));
         assert!(statements[1].starts_with("SELECT 3 FROM dual"));
+    }
+
+    #[test]
+    fn trigger_header_is_still_opens_simple_trigger_body() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_is_header");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 4 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TRIGGER trg_is_header"),
+            "first statement should preserve trigger header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("FOR EACH ROW\nIS\nBEGIN"),
+            "IS header must remain attached to trigger body: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 4 FROM dual"));
     }
 
     #[test]
