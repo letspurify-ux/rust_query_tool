@@ -524,6 +524,20 @@ fn phase_for_share_of_is_column_context() {
 }
 
 #[test]
+fn phase_for_no_key_update_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR NO KEY UPDATE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_key_share_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR KEY SHARE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_window_clause_is_column_context() {
     let ctx = analyze("SELECT a FROM t WINDOW w AS (PARTITION BY |)");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);

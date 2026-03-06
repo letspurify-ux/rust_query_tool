@@ -411,6 +411,38 @@ fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize>
     None
 }
 
+fn is_for_locking_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
+        return false;
+    };
+
+    if matches!(first_keyword.as_str(), "UPDATE" | "SHARE") {
+        return true;
+    }
+
+    if first_keyword == "NO" {
+        let Some((second_keyword, second_idx)) = next_word_upper(tokens, first_idx + 1) else {
+            return false;
+        };
+        if second_keyword != "KEY" {
+            return false;
+        }
+        return matches!(
+            next_word_upper(tokens, second_idx + 1),
+            Some((keyword, _)) if keyword == "UPDATE"
+        );
+    }
+
+    if first_keyword == "KEY" {
+        return matches!(
+            next_word_upper(tokens, first_idx + 1),
+            Some((keyword, _)) if keyword == "SHARE"
+        );
+    }
+
+    false
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1081,12 +1113,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "FOR" => {
-                        if let Some((next_keyword, _)) = next_word_upper(tokens, idx + 1) {
-                            if matches!(next_keyword.as_str(), "UPDATE" | "SHARE") {
-                                // Locking clauses (`FOR UPDATE [OF ...]`, `FOR SHARE [OF ...]`)
-                                // can accept column references after `OF`.
-                                depth_frames[depth].phase = SqlPhase::SetClause;
-                            }
+                        if is_for_locking_clause(tokens, idx + 1) {
+                            // Locking clauses (`FOR UPDATE [OF ...]`,
+                            // `FOR NO KEY UPDATE [OF ...]`,
+                            // `FOR SHARE [OF ...]`, `FOR KEY SHARE [OF ...]`)
+                            // can accept column references after `OF`.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
                         }
                         relation_state.clear();
                     }
