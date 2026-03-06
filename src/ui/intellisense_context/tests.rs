@@ -2068,6 +2068,94 @@ fn table_alias_after_as_of_period_for_clause_is_collected() {
     assert_eq!(resolved, vec!["employees".to_string()]);
 }
 
+#[test]
+fn system_versioning_for_system_time_as_of_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR SYSTEM_TIME AS OF TIMESTAMP '2025-01-01 00:00:00' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SYSTEM_TIME")),
+        "FOR SYSTEM_TIME clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_system_time_between_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR SYSTEM_TIME BETWEEN TIMESTAMP '2024-01-01 00:00:00' AND TIMESTAMP '2024-12-31 23:59:59' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SYSTEM_TIME")),
+        "FOR SYSTEM_TIME clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_system_time_from_to_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR SYSTEM_TIME FROM TIMESTAMP '2024-01-01 00:00:00' TO TIMESTAMP '2024-12-31 23:59:59' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SYSTEM_TIME")),
+        "FOR SYSTEM_TIME clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_system_time_all_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM employees FOR SYSTEM_TIME ALL e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SYSTEM_TIME")),
+        "FOR SYSTEM_TIME clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_application_time_contained_in_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR APPLICATION_TIME CONTAINED IN (DATE '2024-01-01', DATE '2024-12-31') e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("APPLICATION_TIME")),
+        "FOR APPLICATION_TIME clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
