@@ -1718,6 +1718,13 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 }
                 break;
             }
+            "FOR" => {
+                if let Some(next_idx) = skip_relation_temporal_clause(tokens, idx) {
+                    idx = skip_comment_tokens(tokens, next_idx);
+                    continue;
+                }
+                break;
+            }
             "VERSIONS" => {
                 let mut between_idx = skip_comment_tokens(tokens, idx + 1);
                 if matches!(tokens.get(between_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("PERIOD"))
@@ -1819,6 +1826,51 @@ fn find_top_level_keyword(
     }
 
     None
+}
+
+fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<usize> {
+    let mut idx = skip_comment_tokens(tokens, start);
+    if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FOR")) {
+        return None;
+    }
+
+    idx = skip_comment_tokens(tokens, idx + 1);
+    if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SYSTEM_TIME") || word.eq_ignore_ascii_case("APPLICATION_TIME")) {
+        return None;
+    }
+
+    idx = skip_comment_tokens(tokens, idx + 1);
+    let keyword = match tokens.get(idx) {
+        Some(SqlToken::Word(word)) => word.to_ascii_uppercase(),
+        _ => return None,
+    };
+
+    match keyword.as_str() {
+        "AS" => {
+            idx = skip_comment_tokens(tokens, idx + 1);
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF")) {
+                return None;
+            }
+            Some(skip_flashback_bound_expression(tokens, idx + 1))
+        }
+        "BETWEEN" => {
+            let and_idx = find_top_level_keyword(tokens, idx + 1, "AND")?;
+            Some(skip_flashback_bound_expression(tokens, and_idx + 1))
+        }
+        "FROM" => {
+            let to_idx = find_top_level_keyword(tokens, idx + 1, "TO")?;
+            Some(skip_flashback_bound_expression(tokens, to_idx + 1))
+        }
+        "CONTAINED" => {
+            idx = skip_comment_tokens(tokens, idx + 1);
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IN")) {
+                return None;
+            }
+            Some(skip_flashback_bound_expression(tokens, idx + 1))
+        }
+        "ALL" => Some(skip_comment_tokens(tokens, idx + 1)),
+        _ => None,
+    }
 }
 
 fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
