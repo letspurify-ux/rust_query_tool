@@ -661,6 +661,24 @@ fn phase_for_json_clause_is_not_table_context() {
 }
 
 #[test]
+fn phase_for_json_clause_after_where_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp WHERE deptno = 10 FOR JSON PATH |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "JSON"),
+        "FOR JSON after WHERE must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_for_xml_clause_is_not_table_context() {
     let ctx = analyze("SELECT * FROM emp FOR XML PATH('employee'), TYPE |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
@@ -674,6 +692,42 @@ fn phase_for_xml_clause_is_not_table_context() {
     assert!(
         aliases.iter().all(|alias| alias != "XML"),
         "FOR XML keywords must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_for_xml_clause_after_where_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp WHERE deptno = 10 FOR XML PATH('employee') |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "XML"),
+        "FOR XML after WHERE must not be parsed as relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn phase_for_browse_clause_after_where_is_not_table_context() {
+    let ctx = analyze("SELECT * FROM emp WHERE deptno = 10 FOR BROWSE |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "BROWSE"),
+        "FOR BROWSE after WHERE must not be parsed as relation aliases: {:?}",
         aliases
     );
 }
