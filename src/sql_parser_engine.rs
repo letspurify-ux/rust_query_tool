@@ -3249,4 +3249,65 @@ mod tests {
         );
         assert_eq!(statements[1], "SELECT 7 FROM dual".to_string());
     }
+
+    #[test]
+    fn with_function_followed_by_insert_all_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION normalize_id(p_id NUMBER) RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN p_id;");
+        engine.process_line("END;");
+        engine.process_line("INSERT ALL");
+        engine.process_line("  INTO audit_log(id) VALUES (normalize_id(1))");
+        engine.process_line("SELECT 1 FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("WITH FUNCTION normalize_id"),
+            "first statement should preserve WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("INSERT ALL"),
+            "main INSERT ALL query should remain attached: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("VALUES (normalize_id(1))"),
+            "INSERT ALL branches should remain attached: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_procedure_followed_by_values_statement_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH PROCEDURE touch_ctx IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("VALUES (1);");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("WITH PROCEDURE touch_ctx IS"),
+            "first statement should preserve WITH PROCEDURE declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].ends_with("VALUES (1)"),
+            "VALUES main query should remain attached: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
+    }
 }
