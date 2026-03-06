@@ -1486,6 +1486,56 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_procedure_language_assignment_does_not_trigger_external_split() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_assign IS
+  language := 'C';
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE assignment must not trigger EXTERNAL split, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_assign IS"));
+    assert!(stmts[0].contains("language := 'C';"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_language_assignment_does_not_trigger_external_split() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE proc_assign IS
+  language := 'C';
+BEGIN
+  NULL;
+END;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items must keep LANGUAGE assignment inside routine body: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE PROCEDURE proc_assign IS"));
+    assert!(stmts[0].contains("language := 'C';"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_external_function_language_clause_without_external_keyword_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
 AS LANGUAGE C NAME 'ext_lang_only';

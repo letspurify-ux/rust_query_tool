@@ -319,6 +319,24 @@ impl RoutineFrame {
         }
     }
 
+    fn observe_external_clause_symbol(&mut self, ch: char) {
+        if !matches!(
+            self.external_clause_state,
+            ExternalClauseState::AwaitingLanguageTargetFromExternal
+                | ExternalClauseState::AwaitingLanguageTargetImplicit
+        ) {
+            return;
+        }
+
+        if ch.is_whitespace() {
+            return;
+        }
+
+        if matches!(ch, ':' | '=' | '+' | '-' | '*' | '/' | '%' | '<' | '>' | '|' | ',' | ';' | '.' | '(' | ')' | '[' | ']' | '{' | '}') {
+            self.external_clause_state = ExternalClauseState::None;
+        }
+    }
+
     fn finalize_external_clause_on_semicolon(&mut self) {
         if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
             self.mark_external_clause();
@@ -1161,6 +1179,12 @@ impl SplitState {
         }
     }
 
+    fn observe_external_clause_symbol(&mut self, ch: char) {
+        if let Some(frame) = self.active_routine_frame_mut() {
+            frame.observe_external_clause_symbol(ch);
+        }
+    }
+
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
@@ -1833,6 +1857,7 @@ impl SqlParserEngine {
             }
 
             self.state.flush_token();
+            self.state.observe_external_clause_symbol(c);
             on_symbol(chars, i, c, next);
             let symbol_role = SymbolRole::from_char(c, next);
 
@@ -2962,6 +2987,42 @@ mod tests {
         assert!(statements[0].contains("language python;"));
         assert!(statements[0].contains("marker NUMBER := 1;"));
         assert!(statements[0].contains("END"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_assignment_operator_cancels_implicit_external_detection() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_assign IS");
+        engine.process_line("  language := 'C';");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_assign IS"));
+        assert!(statements[0].contains("language := 'C';"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_comparison_operator_cancels_implicit_external_detection() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_compare IS");
+        engine.process_line("  language = 'C';");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_compare IS"));
+        assert!(statements[0].contains("language = 'C';"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
