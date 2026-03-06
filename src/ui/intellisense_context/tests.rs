@@ -231,6 +231,28 @@ fn phase_left_asof_join_keeps_join_modifier_out_of_aliases() {
 }
 
 #[test]
+fn phase_left_join_after_as_does_not_capture_join_modifier_as_alias() {
+    let ctx = analyze("SELECT * FROM emp AS LEFT JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "LEFT"),
+        "LEFT must remain a join modifier, not a relation alias: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "right relation alias should remain visible: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_asof_join_without_left_modifier_keeps_join_modifier_out_of_aliases() {
     let ctx = analyze("SELECT * FROM emp ASOF JOIN dept d ON emp.deptno = d.deptno WHERE d.|");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
