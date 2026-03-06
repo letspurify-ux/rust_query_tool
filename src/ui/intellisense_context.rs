@@ -45,9 +45,11 @@ impl SqlPhase {
                 | SqlPhase::HavingClause
                 | SqlPhase::OrderByClause
                 | SqlPhase::SetClause
+                | SqlPhase::ValuesClause
                 | SqlPhase::ConnectByClause
                 | SqlPhase::StartWithClause
                 | SqlPhase::MatchRecognizeClause
+                | SqlPhase::PivotClause
                 | SqlPhase::ModelClause
         )
     }
@@ -246,13 +248,7 @@ pub fn analyze_cursor_context(
 fn is_from_consuming_function(name: &str) -> bool {
     matches!(
         name,
-        "EXTRACT"
-            | "TRIM"
-            | "SUBSTRING"
-            | "OVERLAY"
-            | "POSITION"
-            | "NORMALIZE"
-            | "TRIM_ARRAY"
+        "EXTRACT" | "TRIM" | "SUBSTRING" | "OVERLAY" | "POSITION" | "NORMALIZE" | "TRIM_ARRAY"
     )
 }
 
@@ -1823,8 +1819,7 @@ fn is_postgres_on_conflict_do_update(tokens: &[SqlToken], update_idx: usize) -> 
     let mut cursor = do_idx;
     while let Some((word, word_idx)) = prev_word_upper(tokens, cursor) {
         if word == "CONFLICT" {
-            return prev_word_upper(tokens, word_idx)
-                .is_some_and(|(maybe_on, _)| maybe_on == "ON");
+            return prev_word_upper(tokens, word_idx).is_some_and(|(maybe_on, _)| maybe_on == "ON");
         }
         cursor = word_idx;
     }
