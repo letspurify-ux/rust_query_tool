@@ -193,6 +193,7 @@ enum SemicolonPolicy {
 enum ExternalClauseState {
     None,
     SawExternalKeyword,
+    SawUsingClauseSubject,
     AwaitingLanguageTargetFromExternal,
     AwaitingLanguageTargetImplicit,
     SawImplicitLanguageTarget,
@@ -260,6 +261,18 @@ impl RoutineFrame {
             return;
         }
 
+        if matches!(token_upper, "AGGREGATE" | "PIPELINED") {
+            self.external_clause_state = ExternalClauseState::SawUsingClauseSubject;
+            return;
+        }
+
+        if token_upper == "USING" {
+            if self.external_clause_state == ExternalClauseState::SawUsingClauseSubject {
+                self.mark_external_clause();
+            }
+            return;
+        }
+
         if token_upper == "LANGUAGE" {
             self.external_clause_state =
                 if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
@@ -285,6 +298,7 @@ impl RoutineFrame {
         if matches!(
             self.external_clause_state,
             ExternalClauseState::SawExternalKeyword
+                | ExternalClauseState::SawUsingClauseSubject
                 | ExternalClauseState::SawImplicitLanguageTarget
         ) {
             self.external_clause_state = ExternalClauseState::None;
@@ -3557,5 +3571,32 @@ BEGIN"
             statements[0]
         );
         assert_eq!(statements[1], "SELECT 9 FROM dual".to_string());
+    }
+    #[test]
+    fn aggregate_using_clause_without_external_keyword_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_agg RETURN NUMBER");
+        engine.process_line("AS AGGREGATE USING ext_agg_impl;");
+        engine.process_line("SELECT 11 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS AGGREGATE USING ext_agg_impl"));
+        assert!(statements[1].starts_with("SELECT 11 FROM dual"));
+    }
+
+    #[test]
+    fn pipelined_using_clause_without_external_keyword_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_pipe RETURN sys.odcinumberlist");
+        engine.process_line("AS PIPELINED USING ext_pipe_impl;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS PIPELINED USING ext_pipe_impl"));
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
     }
 }
