@@ -1656,3 +1656,28 @@
 - `cargo test -q recovers_to_host_statement_head -- --nocapture` 통과
 - `cargo test -q recovers_to_bang_host_statement_head -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 구문 보완 (EXTERNAL call spec 후행 `!` host 명령)
+
+### [중] `AS LANGUAGE ...;` 뒤 line-leading `!` host alias가 새 statement head로 복구되지 않던 문제 수정
+- **증상**:
+  - `CREATE FUNCTION ... AS LANGUAGE C;` 다음 줄에 `! ls`가 오면,
+  - 외부 루틴 statement와 `!` host command가 하나로 붙어 분리되지 않았습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 recovery 분기에서 line-leading 비식별자 시작문을 `@` run-script marker만 별도 처리하고,
+  - SQL*Plus host alias인 `!`는 동일 경계 조건에서 누락되어 pending split이 해제되지 않았습니다.
+- **수정**:
+  - `is_line_leading_bang_host_marker` 헬퍼를 추가하고,
+  - `pending_implicit_external_top_level_split` 경로와 `WITH FUNCTION/PROCEDURE` main-query 대기 복구 경로 모두에 `!` marker 처리를 일괄 적용했습니다.
+
+### [유사 케이스] 동일 복구 경로 일괄 점검
+- 동일 구조의 복구 분기 2곳(`WITH FUNCTION` 대기 복구 / EXTERNAL top-level implicit split)을 함께 수정해,
+- `!` alias 누락이 다른 statement 경계에서도 재발하지 않도록 정리했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sql_parser_engine::tests::external_language_clause_splits_before_bang_host_command`
+- `sql_parser_engine::tests::with_function_waiting_main_query_recovers_on_bang_host_statement_head`
+
+### [검증]
+- `cargo test bang_host -- --nocapture` 통과
+- `cargo test` 전체 통과
