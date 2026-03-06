@@ -1974,6 +1974,48 @@ fn table_wrapper_relation_with_identifier_argument_is_collected() {
 }
 
 #[test]
+fn containers_wrapper_relation_with_identifier_argument_is_collected() {
+    let ctx = analyze("SELECT c.| FROM CONTAINERS(hr.orders) c");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.ORDERS".to_string()),
+        "CONTAINERS wrapper should preserve identifier-like relation path: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("c")),
+        "CONTAINERS wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn shards_wrapper_relation_with_identifier_argument_is_collected() {
+    let ctx = analyze("SELECT s.| FROM SHARDS(hr.orders) s");
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"HR.ORDERS".to_string()),
+        "SHARDS wrapper should preserve identifier-like relation path: {:?}",
+        names
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "SHARDS wrapper alias should be captured: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn table_wrapper_collection_expression_keeps_alias() {
     let ctx = analyze("SELECT c.| FROM TABLE(get_rows()) c");
     assert!(

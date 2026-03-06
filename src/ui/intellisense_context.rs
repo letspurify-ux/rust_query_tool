@@ -1673,7 +1673,7 @@ fn parse_relation_wrapper_table_name(
     relation_word: &str,
 ) -> Option<(String, usize)> {
     let relation_upper = relation_word.to_ascii_uppercase();
-    if !matches!(relation_upper.as_str(), "ONLY" | "TABLE") {
+    if !matches!(relation_upper.as_str(), "ONLY" | "TABLE" | "CONTAINERS" | "SHARDS") {
         return None;
     }
 
@@ -1700,8 +1700,9 @@ fn parse_relation_wrapper_table_name(
     let (inner_range, next_idx) = extract_parenthesized_range(tokens, open_idx)?;
     let inner_tokens = token_range_slice(tokens, inner_range);
 
-    // TABLE(...) may contain collection function calls or scalar subqueries.
-    // For identifier-like forms (`TABLE(schema.collection_col)`) keep the
+    // TABLE/CONTAINERS/SHARDS wrappers may contain collection function calls
+    // or scalar subqueries. For identifier-like forms
+    // (`TABLE(schema.collection_col)`, `CONTAINERS(schema.table)`) keep the
     // underlying name so alias resolution can target stable relation keys.
     if let Some((relation_name, _)) = parse_table_name_deep(inner_tokens, 0) {
         Some((relation_name, next_idx))
