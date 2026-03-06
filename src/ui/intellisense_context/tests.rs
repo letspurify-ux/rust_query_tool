@@ -540,6 +540,39 @@ fn table_function_with_offset_postfix_keeps_alias_after_postfix_clause() {
 }
 
 #[test]
+fn sqlite_indexed_by_postfix_keeps_alias_after_clause() {
+    let ctx = analyze("SELECT o.| FROM orders INDEXED BY idx_orders_date o");
+
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("ORDERS") && table.alias.as_deref() == Some("o")
+        ),
+        "INDEXED BY postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sqlite_not_indexed_postfix_keeps_alias_after_clause() {
+    let ctx = analyze("SELECT o.| FROM orders NOT INDEXED o");
+
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("ORDERS") && table.alias.as_deref() == Some("o")
+        ),
+        "NOT INDEXED postfix should not block alias parsing: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 

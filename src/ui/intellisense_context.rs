@@ -2268,6 +2268,32 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
 
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
+            "INDEXED" => {
+                let by_idx = skip_comment_tokens(tokens, idx + 1);
+                if !matches!(tokens.get(by_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BY"))
+                {
+                    break;
+                }
+
+                let index_name_idx = skip_comment_tokens(tokens, by_idx + 1);
+                if !matches!(tokens.get(index_name_idx), Some(SqlToken::Word(index_name)) if is_identifier_word_token(index_name))
+                {
+                    break;
+                }
+
+                idx = skip_comment_tokens(tokens, index_name_idx + 1);
+                continue;
+            }
+            "NOT" => {
+                let indexed_idx = skip_comment_tokens(tokens, idx + 1);
+                if !matches!(tokens.get(indexed_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("INDEXED"))
+                {
+                    break;
+                }
+
+                idx = skip_comment_tokens(tokens, indexed_idx + 1);
+                continue;
+            }
             "PARTITION" | "SUBPARTITION" | "SAMPLE" | "SEED" | "TABLESAMPLE" | "WITH" => {
                 if upper == "WITH"
                     && matches!(
