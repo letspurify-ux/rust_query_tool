@@ -885,6 +885,18 @@ impl SplitState {
             self.pending_do = PendingDo::None;
         }
 
+        if upper == "BEGIN"
+            && self.timing_point_state == TimingPointState::AwaitingAsOrIs
+            && self.in_compound_trigger()
+        {
+            self.block_stack.push(BlockKind::TimingPoint);
+            self.as_is_state = AsIsState::None;
+            self.timing_point_state = TimingPointState::None;
+            self.routine_is_stack
+                .push(RoutineFrame::new(self.block_depth()));
+            self.pending_subprogram_begins += 1;
+        }
+
         // CREATE TYPE (spec) AS/IS <declarative-kind> is never a PL/SQL block opener.
         // We still keep an allow-list for known Oracle kinds, but also fall back to
         // the same behavior for forward-compatible kinds that may appear in newer
@@ -3418,5 +3430,30 @@ mod tests {
             statements[0]
         );
         assert_eq!(statements[1], "SELECT 7 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_timing_point_without_is_still_splits_on_outer_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_no_is");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 9 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END BEFORE STATEMENT"),
+            "timing-point END without IS must stay inside trigger body: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 9 FROM dual".to_string());
     }
 }
