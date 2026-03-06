@@ -438,6 +438,24 @@ SELECT txt FROM t";
 }
 
 #[test]
+fn test_is_select_statement_with_clause_invalid_q_quote_delimiter_does_not_hide_select() {
+    let sql = "WITH t AS (SELECT q' INSERT INTO t2 VALUES(1)' AS txt FROM dual)\nSELECT txt FROM t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "invalid q-quote delimiter should not leave parser stuck in quote mode"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_invalid_nq_quote_delimiter_does_not_hide_select() {
+    let sql = "WITH t AS (SELECT nq' UPDATE t2 SET c = 1' AS txt FROM dual)\nSELECT txt FROM t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "invalid nq-quote delimiter should not leave parser stuck in quote mode"
+    );
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_injects_for_simple_single_table_select() {
     let sql = "SELECT ENAME, JOB FROM EMP";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
