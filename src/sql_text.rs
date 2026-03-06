@@ -665,6 +665,7 @@ const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "NAME",
     "LIBRARY",
     "AGENT",
+    "CREDENTIAL",
     "PARAMETERS",
     "CALLING",
     "WITH",
@@ -1132,6 +1133,7 @@ mod tests {
         assert!(is_external_language_target_keyword("mle"));
         assert!(is_external_language_clause_keyword("LANGUAGE"));
         assert!(is_external_language_clause_keyword("AGENT"));
+        assert!(is_external_language_clause_keyword("CREDENTIAL"));
         assert!(is_external_language_clause_keyword("parameters"));
         assert!(is_format_column_constraint_keyword("generated"));
         assert!(is_table_function_item_leading_keyword("ORDINALITY"));
