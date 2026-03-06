@@ -618,6 +618,27 @@ fn resolve_progress_tab_index(
     base_offset.saturating_add(statement_index)
 }
 
+fn resolve_active_progress_tab_index(state: &AppState, statement_index: usize) -> Option<usize> {
+    let has_running_queries = state.sql_editor.is_query_running()
+        || state
+            .editor_tabs
+            .iter()
+            .any(|tab| tab.sql_editor.is_query_running());
+    if should_ignore_query_progress_when_disconnected(
+        state.has_live_connection,
+        has_running_queries,
+    ) {
+        return None;
+    }
+
+    Some(resolve_progress_tab_index(
+        state.result_tabs.tab_count(),
+        state.result_tab_offset,
+        state.result_grid_execution_target,
+        statement_index,
+    ))
+}
+
 impl MainWindow {
     fn clone_result_tabs_for_edit_action(
         state: &Arc<Mutex<AppState>>,
@@ -2488,23 +2509,9 @@ impl MainWindow {
                     result_tabs.start_streaming(tab_index, &columns, &null_text);
                 }
                 QueryProgress::Rows { index, rows } => {
-                    let has_live_connection = s.has_live_connection;
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    if should_ignore_query_progress_when_disconnected(
-                        has_live_connection,
-                        has_running_queries,
-                    ) {
+                    let Some(tab_index) = resolve_active_progress_tab_index(&s, index) else {
                         return;
-                    }
-                    let tab_index = resolve_progress_tab_index(
-                        s.result_tabs.tab_count(),
-                        s.result_tab_offset,
-                        s.result_grid_execution_target,
-                        index,
-                    );
+                    };
                     let rows_len = rows.len();
                     let mut result_tabs = s.result_tabs.clone();
                     let new_count = {
