@@ -1898,6 +1898,94 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_mle_module_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER
+AS LANGUAGE MLE MODULE ext_mle_impl;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "AS LANGUAGE MLE MODULE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE MLE MODULE ext_mle_impl"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_mle_module_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER
+AS LANGUAGE MLE MODULE ext_mle_impl;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep AS LANGUAGE MLE MODULE function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE MLE MODULE ext_mle_impl"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_language_mle_signature_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER
+AS LANGUAGE MLE SIGNATURE ext_signature_impl;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "AS LANGUAGE MLE SIGNATURE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE MLE SIGNATURE ext_signature_impl"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_mle_signature_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER
+AS LANGUAGE MLE SIGNATURE ext_signature_impl;
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep AS LANGUAGE MLE SIGNATURE function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE MLE SIGNATURE ext_signature_impl"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_external_function_mle_module_without_external_keyword_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_mle_module RETURN NUMBER
 AS MLE MODULE ext_mle_impl;

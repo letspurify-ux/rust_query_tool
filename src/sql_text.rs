@@ -657,7 +657,7 @@ pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
 
 const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
 
-const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON"];
+const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"];
 
 const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "EXTERNAL",
@@ -1123,6 +1123,7 @@ mod tests {
         assert!(is_with_plsql_declaration_keyword("FUNCTION"));
         assert!(is_with_plsql_declaration_keyword("procedure"));
         assert!(is_external_language_target_keyword("javascript"));
+        assert!(is_external_language_target_keyword("mle"));
         assert!(is_external_language_clause_keyword("LANGUAGE"));
         assert!(is_external_language_clause_keyword("AGENT"));
         assert!(is_external_language_clause_keyword("parameters"));
