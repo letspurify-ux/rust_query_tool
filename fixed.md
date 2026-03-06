@@ -1552,3 +1552,27 @@
 ### [검증]
 - `cargo test join_hint_is_not_parsed_as_left_table_alias -- --nocapture` 통과
 - `cargo test -- --test-threads=1` 통과
+## 2026-03-06 Oracle 공통 파서 엔진 누락 구문 보완 (EXTERNAL ROUTINE 후행 주석 경계)
+
+### [중] `AS LANGUAGE ...;` 직후 주석 라인을 다음 문장으로 분리하지 못하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE FUNCTION ... AS LANGUAGE C;` 다음 줄이 `-- comment` 또는 `/* comment */`인 경우,
+  - 후행 주석이 외부 루틴 statement에 붙고, 뒤 `SELECT ...;`와의 statement 경계가 부정확해질 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `pending_implicit_external_top_level_split` 처리 로직이 식별자 시작(`is_identifier_char`)에서만 동작했습니다.
+  - 따라서 다음 토큰이 주석으로 시작할 때는 분기하지 못하고 기존 statement에 주석을 계속 누적했습니다.
+- **수정**:
+  - Idle 상태에서 `--`/`/*` 진입 직전에, `pending_implicit_external_top_level_split && block_depth == 1 && paren_depth == 0` 조건이면
+  - 현재 statement를 먼저 push하고 파서 상태를 reset하도록 보강했습니다.
+  - 이후 주석은 자연스럽게 다음 statement의 선행 주석으로 유지됩니다.
+
+### [유사 케이스] 라인/블록 주석 변형 동시 검증
+- 동일 계열 회귀 방지를 위해 `-- ...`와 `/* ... */` 두 형태를 모두 단위 테스트로 추가했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `external_language_clause_splits_before_trailing_line_comment_and_select`
+- `external_language_clause_splits_before_trailing_block_comment_and_select`
+
+### [검증]
+- `cargo test --quiet external_language_clause_splits_before_trailing_ -- --nocapture` 통과
+- `cargo test` 전체 통과

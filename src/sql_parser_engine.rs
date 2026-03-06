@@ -1645,6 +1645,15 @@ impl SqlParserEngine {
 
             if c == '-' && next == Some('-') {
                 self.state.flush_token();
+                if self.state.pending_implicit_external_top_level_split
+                    && self.state.block_depth() == 1
+                    && self.state.paren_depth == 0
+                    && self.state.token.is_empty()
+                {
+                    self.push_current_statement();
+                    self.reset_statement_local_state();
+                    self.state.reset_create_state();
+                }
                 self.state.lex_mode = LexMode::LineComment;
                 self.current.push('-');
                 self.current.push('-');
@@ -1654,6 +1663,15 @@ impl SqlParserEngine {
 
             if c == '/' && next == Some('*') {
                 self.state.flush_token();
+                if self.state.pending_implicit_external_top_level_split
+                    && self.state.block_depth() == 1
+                    && self.state.paren_depth == 0
+                    && self.state.token.is_empty()
+                {
+                    self.push_current_statement();
+                    self.reset_statement_local_state();
+                    self.state.reset_create_state();
+                }
                 self.state.lex_mode = LexMode::BlockComment;
                 self.current.push('/');
                 self.current.push('*');
@@ -3598,5 +3616,56 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS PIPELINED USING ext_pipe_impl"));
         assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_trailing_line_comment_and_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("-- next statement comment");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            !statements[0].contains("next statement comment"),
+            "line comment after external routine should belong to next statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("-- next statement comment\nSELECT 1 FROM dual"),
+            "line comment should stay with the following statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_trailing_block_comment_and_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn2 RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("/* next statement comment */");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            !statements[0].contains("next statement comment"),
+            "block comment after external routine should belong to next statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("/* next statement comment */\nSELECT 2 FROM dual"),
+            "block comment should stay with the following statement: {}",
+            statements[1]
+        );
     }
 }
