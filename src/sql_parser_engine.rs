@@ -813,6 +813,16 @@ impl SplitState {
 
     /// Sub-handler: mark EXTERNAL/LANGUAGE/NAME/LIBRARY semicolon behavior.
     fn handle_routine_is_external(&mut self, upper: &str) {
+        let should_track = self.block_depth() > 1
+            || matches!(
+                self.create_plsql_kind,
+                CreatePlsqlKind::Procedure | CreatePlsqlKind::Function
+            );
+
+        if !should_track {
+            return;
+        }
+
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.observe_external_clause_token(upper);
         }
@@ -1156,6 +1166,16 @@ impl SplitState {
     }
 
     fn observe_external_clause_literal_target(&mut self) {
+        let should_track = self.block_depth() > 1
+            || matches!(
+                self.create_plsql_kind,
+                CreatePlsqlKind::Procedure | CreatePlsqlKind::Function
+            );
+
+        if !should_track {
+            return;
+        }
+
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.observe_external_clause_literal_target();
         }
@@ -2900,6 +2920,52 @@ mod tests {
                 "CREATE OR REPLACE PACKAGE BODY pkg AS\n  PROCEDURE ext_proc IS\n  EXTERNAL NAME \"ext_proc\" LANGUAGE C;\nEND pkg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn package_spec_with_external_procedure_declaration_does_not_split_mid_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE pkg_spec_ext AS");
+        engine.process_line("  PROCEDURE ext_proc LANGUAGE C;");
+        engine.process_line("END pkg_spec_ext;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE PACKAGE pkg_spec_ext AS"),
+            "first statement should preserve package specification body: {}",
+            statements[0]
+        );
+        assert!(statements[0].contains("PROCEDURE ext_proc LANGUAGE C;"));
+        assert!(statements[0].contains("END pkg_spec_ext"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn package_spec_with_external_name_clause_does_not_split_mid_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE pkg_spec_call AS");
+        engine.process_line(r#"  PROCEDURE ext_proc IS EXTERNAL NAME "ext_proc" LANGUAGE C;"#);
+        engine.process_line("END pkg_spec_call;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE PACKAGE pkg_spec_call AS"),
+            "first statement should preserve package specification body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains(r#"PROCEDURE ext_proc IS EXTERNAL NAME "ext_proc" LANGUAGE C;"#),
+            "call-spec declaration should stay in package spec statement: {}",
+            statements[0]
+        );
+        assert!(statements[0].contains("END pkg_spec_call"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
