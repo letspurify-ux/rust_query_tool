@@ -562,7 +562,6 @@ fn phase_insert_into() {
     assert!(ctx.phase.is_table_context());
 }
 
-
 #[test]
 fn phase_truncate_table_is_table_context() {
     let ctx = analyze("TRUNCATE TABLE |");
@@ -1148,8 +1147,7 @@ fn cte_with_comment_between_with_and_name_is_detected() {
 
 #[test]
 fn cte_as_materialized_is_detected() {
-    let ctx =
-        analyze("WITH cte AS MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte");
+    let ctx = analyze("WITH cte AS MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte");
     let cte_n = cte_names(&ctx);
     assert!(
         cte_n.contains(&"CTE".to_string()),
@@ -1160,9 +1158,7 @@ fn cte_as_materialized_is_detected() {
 
 #[test]
 fn cte_as_not_materialized_is_detected() {
-    let ctx = analyze(
-        "WITH cte AS NOT MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte",
-    );
+    let ctx = analyze("WITH cte AS NOT MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte");
     let cte_n = cte_names(&ctx);
     assert!(
         cte_n.contains(&"CTE".to_string()),
@@ -1173,9 +1169,8 @@ fn cte_as_not_materialized_is_detected() {
 
 #[test]
 fn cte_with_comment_between_as_and_materialized_is_detected() {
-    let ctx = analyze(
-        "WITH cte AS /*hint*/ MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte",
-    );
+    let ctx =
+        analyze("WITH cte AS /*hint*/ MATERIALIZED (SELECT 1 AS n FROM dual) SELECT | FROM cte");
     let cte_n = cte_names(&ctx);
     assert!(
         cte_n.contains(&"CTE".to_string()),
@@ -1825,6 +1820,52 @@ fn cross_apply_table_function_argument_can_see_outer_table_scope() {
         names.contains(&"OPENJSON".to_string()),
         "tables: {:?}",
         names
+    );
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.contains(&"OJ".to_string()),
+        "aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn outer_apply_table_function_alias_is_collected() {
+    let ctx = analyze("SELECT * FROM t1 a OUTER APPLY OPENJSON(a.payload) oj WHERE oj.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.contains(&"OJ".to_string()),
+        "aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn join_lateral_unknown_table_function_alias_is_collected() {
+    let ctx =
+        analyze("SELECT * FROM t1 a JOIN LATERAL custom_table_fn(a.id) cf ON 1 = 1 WHERE cf.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.contains(&"CF".to_string()),
+        "aliases: {:?}",
+        aliases
     );
 }
 
@@ -3672,9 +3713,10 @@ fn pivot_clause_source_followed_by_comma_relation_collects_next_table() {
         names
     );
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        ctx.tables_in_scope.iter().any(|table| table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
         "alias for relation after pivot source should be collected: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -3696,9 +3738,10 @@ fn model_clause_source_followed_by_comma_relation_collects_next_table() {
         names
     );
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        ctx.tables_in_scope.iter().any(|table| table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
         "alias for relation after model source should be collected: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -3720,9 +3763,10 @@ fn match_recognize_source_followed_by_comma_relation_collects_next_table() {
         names
     );
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .any(|table| table.alias.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
+        ctx.tables_in_scope.iter().any(|table| table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("d"))),
         "alias for relation after match_recognize source should be collected: {:?}",
         ctx.tables_in_scope
             .iter()

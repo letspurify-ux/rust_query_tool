@@ -901,8 +901,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let is_expression_context =
-                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
                         let is_merge_action_keyword =
                             matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(current_phase, SqlPhase::JoinCondition);
@@ -1099,8 +1099,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let is_expression_context =
-                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
                         let is_merge_action_keyword =
                             matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(current_phase, SqlPhase::JoinCondition);
@@ -1128,8 +1128,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
-                        let is_expression_context =
-                            current_phase.is_column_context() || matches!(current_phase, SqlPhase::ValuesClause);
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
                         let is_merge_action_keyword =
                             matches!(current_statement_kind, StatementKind::Merge)
                                 && matches!(current_phase, SqlPhase::JoinCondition);
@@ -1210,24 +1210,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             if let Some((table_name, next_idx)) = parse_table_name_deep(tokens, idx)
                             {
                                 let relation_name_hint = relation_function_name_hint(&table_name);
-                                let relation_arg_range = if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                                let can_consume_relation_arguments =
+                                    matches!(current_phase, SqlPhase::FromClause)
+                                        && (relation_modifier_state.blocks_outer_scope_cutoff()
+                                            || relation_name_hint
+                                                .as_deref()
+                                                .is_some_and(is_from_lateral_table_function));
+                                let relation_arg_parsed = if can_consume_relation_arguments
+                                    && matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
                                 {
                                     extract_parenthesized_range(tokens, next_idx)
-                                        .map(|(range, _)| range)
                                 } else {
                                     None
                                 };
-                                let relation_arg_end = if relation_arg_range.is_some()
-                                    && relation_name_hint
-                                        .as_deref()
-                                        .is_some_and(is_from_lateral_table_function)
-                                {
-                                    extract_parenthesized_range(tokens, next_idx)
-                                        .map(|(_, arg_end_idx)| arg_end_idx)
-                                        .unwrap_or(next_idx)
-                                } else {
-                                    next_idx
-                                };
+                                let relation_arg_range =
+                                    relation_arg_parsed.map(|(range, _)| range);
+                                let relation_arg_end = relation_arg_parsed
+                                    .map(|(_, arg_end_idx)| arg_end_idx)
+                                    .unwrap_or(next_idx);
                                 let (alias, after_alias) =
                                     parse_alias_deep(tokens, relation_arg_end);
                                 let alias = alias.or_else(|| {
@@ -1752,7 +1752,10 @@ fn parse_relation_wrapper_table_name(
     relation_word: &str,
 ) -> Option<(String, usize)> {
     let relation_upper = relation_word.to_ascii_uppercase();
-    if !matches!(relation_upper.as_str(), "ONLY" | "TABLE" | "CONTAINERS" | "SHARDS") {
+    if !matches!(
+        relation_upper.as_str(),
+        "ONLY" | "TABLE" | "CONTAINERS" | "SHARDS"
+    ) {
         return None;
     }
 
@@ -1824,7 +1827,8 @@ fn parse_relation_alias_at(
         if !is_identifier_word_token(alias_word) {
             return (None, alias_idx + 1);
         }
-        let alias_is_quoted = alias_word.trim().starts_with('"') && alias_word.trim().ends_with('"');
+        let alias_is_quoted =
+            alias_word.trim().starts_with('"') && alias_word.trim().ends_with('"');
         let alias_upper = alias_word.to_ascii_uppercase();
         if !alias_is_quoted && is_relation_alias_breaker(&alias_upper) {
             return (None, alias_idx);
