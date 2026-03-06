@@ -384,6 +384,7 @@ struct ParserDepthFrame {
 enum StatementKind {
     Unknown,
     Delete,
+    Merge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,8 +798,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 match upper.as_str() {
                     "INSERT" => {
-                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        relation_state.clear();
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::Merge)
+                            && matches!(current_phase, SqlPhase::JoinCondition)
+                        {
+                            // `MERGE ... WHEN ... THEN INSERT (...) VALUES (...)` reuses
+                            // INSERT as an action keyword (no target table). Keep it in
+                            // expression/column context instead of table-target context.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
+                        } else {
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.clear();
+                        }
                     }
                     "WITH"
                         if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
@@ -961,6 +976,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // `FOR UPDATE` lock clause inside SELECT statements.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
+                        } else if depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .is_some_and(|kind| {
+                                matches!(kind, StatementKind::Merge)
+                                    && matches!(current_phase, SqlPhase::JoinCondition)
+                            })
+                        {
+                            // `MERGE ... WHEN MATCHED THEN UPDATE SET ...` UPDATE is an
+                            // action keyword, not a new table-target clause.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            relation_state.clear();
                         } else {
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
                             depth_frames[depth].statement_kind = StatementKind::Unknown;
@@ -969,14 +996,27 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "DELETE" => {
-                        depth_frames[depth].phase = SqlPhase::DeleteTarget;
-                        depth_frames[depth].statement_kind = StatementKind::Delete;
-                        mark_query_scope(depth, &mut depth_frames, &mut query_depth);
-                        relation_state.expect_table();
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::Merge)
+                            && matches!(current_phase, SqlPhase::JoinCondition)
+                        {
+                            // `MERGE ... WHEN MATCHED THEN DELETE WHERE ...` DELETE is an
+                            // action keyword, not a standalone DML target clause.
+                            depth_frames[depth].phase = SqlPhase::WhereClause;
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::DeleteTarget;
+                            depth_frames[depth].statement_kind = StatementKind::Delete;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.expect_table();
+                        }
                     }
                     "MERGE" => {
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
-                        depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        depth_frames[depth].statement_kind = StatementKind::Merge;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                         relation_state.clear();
                     }

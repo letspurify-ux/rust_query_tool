@@ -6188,6 +6188,75 @@ CROSS APPLY (
     }
 
     #[test]
+    fn classify_intellisense_context_treats_merge_insert_column_list_as_column_context() {
+        let sql_with_cursor =
+            "MERGE INTO target t USING source s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(deep_ctx.phase.is_column_context(), "phase should be column-oriented in MERGE insert action: {:?}", deep_ctx.phase);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_merge_update_set_as_column_context() {
+        let sql_with_cursor =
+            "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.value = |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(deep_ctx.phase.is_column_context(), "phase: {:?}", deep_ctx.phase);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_merge_delete_where_as_column_context() {
+        let sql_with_cursor =
+            "MERGE INTO target t USING source s ON (t.id = s.id) WHEN MATCHED THEN DELETE WHERE |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert!(deep_ctx.phase.is_column_context(), "phase: {:?}", deep_ctx.phase);
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
     fn finalize_completion_after_selection_clears_pending_and_invalidates_generation() {
         let completion_range = Arc::new(Mutex::new(Some((5usize, 10usize))));
         let pending = Arc::new(Mutex::new(Some(PendingIntellisense { cursor_pos: 10 })));
