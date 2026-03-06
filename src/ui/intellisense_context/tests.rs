@@ -496,6 +496,35 @@ fn phase_insert_into() {
     assert!(ctx.phase.is_table_context());
 }
 
+
+#[test]
+fn phase_truncate_table_is_table_context() {
+    let ctx = analyze("TRUNCATE TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_lock_table_is_table_context() {
+    let ctx = analyze("LOCK TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_drop_table_is_table_context() {
+    let ctx = analyze("DROP TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_alter_table_is_table_context() {
+    let ctx = analyze("ALTER TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
 #[test]
 fn phase_values() {
     let ctx = analyze("INSERT INTO t (a) VALUES |");
