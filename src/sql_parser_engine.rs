@@ -1899,6 +1899,7 @@ impl SqlParserEngine {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
                     self.state.flush_token();
+                    self.state.observe_external_clause_literal_target();
                     self.state.lex_mode = LexMode::DollarQuote { tag };
                     if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
                         for quote_ch in tag.chars() {
@@ -3371,6 +3372,21 @@ mod tests {
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_dollar_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_dollar RETURN NUMBER");
+        engine.process_line("AS LANGUAGE $lang$C$lang$ NAME 'ext_lang_dollar';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE $lang$C$lang$ NAME 'ext_lang_dollar'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
