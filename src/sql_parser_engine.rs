@@ -1414,6 +1414,17 @@ impl SplitState {
             return;
         }
     }
+
+    fn track_with_main_query_symbol(&mut self, ch: char) {
+        if !self.with_clause_waiting_main_query() || self.block_depth() != 0 || self.paren_depth != 0
+        {
+            return;
+        }
+
+        if ch == '(' {
+            self.with_clause_state = WithClauseState::None;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,6 +1976,7 @@ impl SqlParserEngine {
             }
 
             self.state.flush_token();
+            self.state.track_with_main_query_symbol(c);
             self.state.observe_external_clause_symbol(c);
             on_symbol(chars, i, c, next);
             let symbol_role = SymbolRole::from_char(c, next);
@@ -4320,6 +4332,58 @@ BEGIN"
             statements[2].starts_with("SELECT local_fn() FROM dual"),
             "SELECT statement should remain standalone after CREATE recovery split: {}",
             statements[2]
+        );
+    }
+
+    #[test]
+    fn with_function_followed_by_parenthesized_main_query_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("(SELECT f() AS v FROM dual)");
+        engine.process_line("UNION ALL");
+        engine.process_line("SELECT 2 AS v FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("(SELECT f() AS v FROM dual)"),
+            "parenthesized main query should remain attached to WITH FUNCTION statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].ends_with("SELECT 2 AS v FROM dual"),
+            "union tail should remain attached: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
+    fn with_procedure_followed_by_parenthesized_main_query_stays_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH PROCEDURE p IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("(SELECT 1 AS v FROM dual)");
+        engine.process_line("UNION ALL");
+        engine.process_line("SELECT 2 AS v FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("(SELECT 1 AS v FROM dual)"),
+            "parenthesized main query should remain attached to WITH PROCEDURE statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].ends_with("SELECT 2 AS v FROM dual"),
+            "union tail should remain attached: {}",
+            statements[0]
         );
     }
 }
