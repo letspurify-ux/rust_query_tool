@@ -9127,6 +9127,33 @@ SELECT 4 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_simple_trigger_as_header_with_declaration_keeps_single_trigger_statement() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_as_header_decl
+BEFORE INSERT ON t
+FOR EACH ROW
+AS
+  v_count NUMBER;
+BEGIN
+  v_count := 1;
+END;
+SELECT 6 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger AS header with declaration must not split at declaration semicolon: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("AS\n  v_count NUMBER;\nBEGIN"),
+        "first statement should preserve AS declarative section: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 6 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_simple_trigger_when_with_parenthesized_as_expression() {
     let sql = r#"CREATE OR REPLACE TRIGGER trg_when_case
 BEFORE INSERT ON t

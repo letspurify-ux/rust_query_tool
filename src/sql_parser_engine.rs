@@ -505,11 +505,13 @@ impl AsIsBlockStart {
         if state.is_trigger()
             && !state.in_compound_trigger()
             && state.block_depth() == 0
-            && (upper == "AS" || (upper == "IS" && state.saw_trigger_alias_subject))
+            && state.saw_trigger_alias_subject
+            && matches!(upper, "AS" | "IS")
         {
-            // Simple trigger headers can legally include `REFERENCING ... AS ...` aliases.
-            // Treating that `AS` as a routine body opener keeps the parser stuck inside
-            // a synthetic block and prevents semicolon splitting for `CALL`-style bodies.
+            // In simple trigger headers, `REFERENCING NEW/OLD/PARENT AS|IS alias`
+            // uses AS/IS for alias clauses, not for opening the declarative section.
+            // Ignore only that alias form so `FOR EACH ROW AS ... BEGIN ... END;`
+            // still enters the trigger body block correctly.
             return Self::None;
         }
 
