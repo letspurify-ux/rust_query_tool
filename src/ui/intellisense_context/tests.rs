@@ -490,6 +490,30 @@ fn phase_update_set() {
 }
 
 #[test]
+fn phase_update_from_clause_is_table_context() {
+    let ctx = analyze("UPDATE t SET a = 1 FROM |");
+    assert_eq!(ctx.phase, SqlPhase::FromClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_update_from_where_clause_keeps_source_aliases_visible() {
+    let ctx = analyze("UPDATE target t SET val = source.val FROM source_table source WHERE source.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().any(|alias| alias == "SOURCE"),
+        "source alias from UPDATE ... FROM should be collected: {:?}",
+        aliases
+    );
+}
+
+#[test]
 fn phase_insert_into() {
     let ctx = analyze("INSERT INTO |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
