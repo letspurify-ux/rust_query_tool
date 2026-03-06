@@ -386,6 +386,31 @@ fn phase_having() {
     assert_eq!(ctx.phase, SqlPhase::HavingClause);
     assert!(ctx.phase.is_column_context());
 }
+#[test]
+fn within_group_order_by_does_not_switch_to_group_by_phase() {
+    let ctx = analyze("SELECT LISTAGG(empno, ',') WITHIN GROUP (ORDER BY |) FROM emp");
+
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "WITHIN GROUP ORDER BY should preserve FROM scope: {:?}",
+        names
+    );
+}
+
+#[test]
+fn within_group_order_by_with_comment_does_not_switch_to_group_by_phase() {
+    let ctx = analyze("SELECT LISTAGG(empno, ',') WITHIN /*x*/ GROUP /*y*/ (ORDER BY |) FROM emp");
+
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "WITHIN GROUP ORDER BY with comments should preserve FROM scope: {:?}",
+        names
+    );
+}
 
 #[test]
 fn phase_order_by() {
