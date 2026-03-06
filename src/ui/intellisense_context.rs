@@ -482,6 +482,14 @@ fn is_read_consistency_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool
     )
 }
 
+fn is_post_query_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let Some((first_keyword, _)) = next_word_upper(tokens, start_idx) else {
+        return false;
+    };
+
+    matches!(first_keyword.as_str(), "JSON" | "XML" | "BROWSE")
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1233,9 +1241,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // Read-consistency qualifiers (`FOR READ ONLY`, `FOR READ WRITE`)
                             // are end-of-query boundaries and must not keep table context.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
-                        } else if matches!(current_phase, SqlPhase::FromClause) {
+                        } else if is_post_query_for_clause(tokens, idx + 1)
+                            || matches!(current_phase, SqlPhase::FromClause)
+                        {
                             // Dialect-specific trailing clauses such as SQL Server
-                            // `FOR JSON` / `FOR XML` appear after FROM/WHERE and are not
+                            // `FOR JSON` / `FOR XML` / `FOR BROWSE` appear after
+                            // FROM/WHERE and are not
                             // relation-target contexts.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                         }
