@@ -1502,3 +1502,28 @@
 - `cargo test -q recovers_to_run_script_statement_head` 통과
 - `cargo test -q relative_run_script_statement_head` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 구문 보완 (Simple Trigger `IS` 헤더)
+
+### [중] Simple Trigger 헤더의 단독 `IS`를 `REFERENCING ... AS ...` 예외와 동일 처리해 바디 시작을 놓치던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE TRIGGER ... FOR EACH ROW IS BEGIN ... END; SELECT ...;` 형태에서
+  - 헤더의 `IS`가 바디 오프너로 인식되지 않아 트리거 body depth 추적이 깨질 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 `AsIsBlockStart::from_token`에서 simple trigger 예외를 `AS`/`IS` 공통으로 적용해,
+  - `REFERENCING ... AS ...` 오탐을 막는 과정에서 실제 헤더 `IS`까지 차단되었습니다.
+- **수정**:
+  - simple trigger 헤더 예외를 `AS`에만 적용하고 `IS`는 기존대로 바디 오프너로 허용했습니다.
+
+### [유사 케이스] 엔진 단위 + 실행 분할 경로 동시 보강
+- 파서 엔진 단위 테스트와 `QueryExecutor::split_script_items` 통합 테스트를 함께 추가해,
+- 동일 계열(트리거 헤더 `IS`)에서 statement split 회귀를 방지했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sql_parser_engine::tests::trigger_header_is_still_opens_simple_trigger_body`
+- `test_split_script_items_simple_trigger_is_header_splits_normally`
+
+### [검증]
+- `cargo test -q trigger_header_is_still_opens_simple_trigger_body -- --nocapture` 통과
+- `cargo test -q test_split_script_items_simple_trigger_is_header_splits_normally -- --nocapture` 통과
+- `cargo test -q` 전체 통과

@@ -9038,6 +9038,32 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_simple_trigger_is_header_splits_normally() {
+    let sql = r#"CREATE OR REPLACE TRIGGER trg_is_header
+BEFORE INSERT ON t
+FOR EACH ROW
+IS
+BEGIN
+  NULL;
+END;
+SELECT 4 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "simple trigger IS header must keep trigger body as one statement; got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("FOR EACH ROW\nIS\nBEGIN"),
+        "first statement should preserve simple trigger IS header: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 4 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_simple_trigger_when_with_parenthesized_as_expression() {
     let sql = r#"CREATE OR REPLACE TRIGGER trg_when_case
 BEFORE INSERT ON t
