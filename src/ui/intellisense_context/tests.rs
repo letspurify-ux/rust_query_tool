@@ -2366,6 +2366,58 @@ fn sample_block_seed_clause_before_alias_is_not_parsed_as_alias() {
 }
 
 #[test]
+fn sample_bernoulli_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE BERNOULLI (10) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("BERNOULLI")),
+        "SAMPLE BERNOULLI clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following SAMPLE BERNOULLI clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sample_system_clause_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze("SELECT * FROM oqt_t_emp SAMPLE SYSTEM (10) s WHERE s.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SYSTEM")),
+        "SAMPLE SYSTEM clause keyword must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("s")),
+        "alias following SAMPLE SYSTEM clause should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn partition_keyword_is_not_parsed_as_table_alias() {
     let ctx = analyze("SELECT * FROM oqt_t_emp PARTITION (p_202401) WHERE |");
     assert!(

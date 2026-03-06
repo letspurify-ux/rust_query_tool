@@ -2228,6 +2228,15 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                     && matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BLOCK"))
                 {
                     open_idx = skip_comment_tokens(tokens, open_idx + 1);
+                } else if upper == "SAMPLE"
+                    && matches!(
+                        tokens.get(open_idx),
+                        Some(SqlToken::Word(next))
+                            if next.eq_ignore_ascii_case("BERNOULLI")
+                                || next.eq_ignore_ascii_case("SYSTEM")
+                    )
+                {
+                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
                 }
                 if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
                     idx = skip_parenthesized_clause(tokens, open_idx);
