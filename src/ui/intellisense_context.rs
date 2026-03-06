@@ -244,8 +244,20 @@ pub fn analyze_cursor_context(
 /// the function call rather than a SQL clause (e.g. `EXTRACT(YEAR FROM ...)`,
 /// `TRIM(LEADING '0' FROM ...)`, `SUBSTRING(col FROM ...)`).
 fn is_from_consuming_function(name: &str) -> bool {
+    let normalized = name
+        .split('@')
+        .next()
+        .and_then(|without_dblink| {
+            without_dblink
+                .rsplit('.')
+                .find(|segment| !segment.trim().is_empty())
+        })
+        .map(strip_identifier_quotes)
+        .map(|function_name| function_name.to_ascii_uppercase())
+        .unwrap_or_else(|| name.to_ascii_uppercase());
+
     matches!(
-        name,
+        normalized.as_str(),
         "EXTRACT"
             | "TRIM"
             | "SUBSTRING"
@@ -476,6 +488,35 @@ fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
                     | "ROWS"
             )
     )
+}
+
+fn previous_non_comment_index(tokens: &[SqlToken], start_exclusive: usize) -> Option<usize> {
+    let mut idx = start_exclusive;
+    while idx > 0 {
+        idx -= 1;
+        if !matches!(tokens.get(idx), Some(SqlToken::Comment(_))) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn function_name_before_open_paren(tokens: &[SqlToken], open_paren_idx: usize) -> Option<String> {
+    let candidate_idx = previous_non_comment_index(tokens, open_paren_idx)?;
+    let SqlToken::Word(candidate_word) = tokens.get(candidate_idx)? else {
+        return None;
+    };
+
+    let prev_idx = previous_non_comment_index(tokens, candidate_idx);
+    if matches!(prev_idx.and_then(|idx| tokens.get(idx)), Some(SqlToken::Symbol(sym)) if sym == "@")
+    {
+        let function_idx = prev_idx.and_then(|idx| previous_non_comment_index(tokens, idx))?;
+        if let Some(SqlToken::Word(function_name)) = tokens.get(function_idx) {
+            return Some(function_name.to_ascii_uppercase());
+        }
+    }
+
+    Some(candidate_word.to_ascii_uppercase())
 }
 
 #[derive(Debug, Clone)]
@@ -742,11 +783,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     frame.is_query_scope = false;
                     // Record the function name that preceded this '(' so we can
                     // distinguish function-internal FROM from SQL FROM clauses.
-                    frame.paren_func = last_word.take().map(|w| w.to_ascii_uppercase());
+                    frame.paren_func = function_name_before_open_paren(tokens, idx)
+                        .or_else(|| last_word.clone().map(|w| w.to_ascii_uppercase()));
                     frame.function_from_state =
                         FunctionFromState::from_function_name(frame.paren_func.as_deref());
                     frame.returning_clause_active = false;
                 }
+                last_word = None;
 
                 let scope_id = next_scope_id;
                 next_scope_id += 1;

@@ -4837,6 +4837,27 @@ fn trim_array_from_does_not_trigger_from_clause() {
 }
 
 #[test]
+fn schema_qualified_extract_from_does_not_trigger_from_clause() {
+    let ctx = analyze("SELECT pg_catalog.EXTRACT(YEAR FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn quoted_schema_qualified_trim_from_does_not_trigger_from_clause() {
+    let ctx = analyze("SELECT \"PG_CATALOG\".TRIM(LEADING '0' FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn dblink_qualified_substring_from_does_not_trigger_from_clause() {
+    let ctx = analyze("SELECT SUBSTRING@remdb(name FROM | FOR 2) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn real_from_after_position_still_works() {
     let ctx = analyze("SELECT POSITION('a' FROM name) FROM |");
     assert_eq!(ctx.phase, SqlPhase::FromClause);
