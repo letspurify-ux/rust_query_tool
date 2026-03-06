@@ -614,7 +614,9 @@ fn phase_for_read_only_clause_is_not_table_context() {
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
     assert!(
-        aliases.iter().all(|alias| alias != "FOR" && alias != "READ"),
+        aliases
+            .iter()
+            .all(|alias| alias != "FOR" && alias != "READ"),
         "FOR READ ONLY keywords must not be parsed as relation aliases: {:?}",
         aliases
     );
@@ -839,6 +841,20 @@ fn phase_comment_on_table_is_table_context() {
 #[test]
 fn phase_comment_on_table_with_inline_comment_is_table_context() {
     let ctx = analyze("COMMENT ON /* inline */ TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_view_is_table_context() {
+    let ctx = analyze("COMMENT ON VIEW |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_materialized_view_is_table_context() {
+    let ctx = analyze("COMMENT ON MATERIALIZED VIEW |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
     assert!(ctx.phase.is_table_context());
 }
@@ -5093,7 +5109,6 @@ fn grammar_with_table_statement_after_recursive_with_keeps_cte_scope() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert!(cte_names(&ctx).contains(&"CTE".to_string()));
 }
-
 
 #[test]
 fn grammar_complex_join_variant_1() {

@@ -246,13 +246,7 @@ pub fn analyze_cursor_context(
 fn is_from_consuming_function(name: &str) -> bool {
     matches!(
         name,
-        "EXTRACT"
-            | "TRIM"
-            | "SUBSTRING"
-            | "OVERLAY"
-            | "POSITION"
-            | "NORMALIZE"
-            | "TRIM_ARRAY"
+        "EXTRACT" | "TRIM" | "SUBSTRING" | "OVERLAY" | "POSITION" | "NORMALIZE" | "TRIM_ARRAY"
     )
 }
 
@@ -290,7 +284,7 @@ fn is_table_target_statement_keyword(word: &str) -> bool {
     )
 }
 
-fn is_comment_on_table_target(tokens: &[SqlToken], idx: usize, last_word: Option<&str>) -> bool {
+fn is_comment_on_target(tokens: &[SqlToken], idx: usize, last_word: Option<&str>) -> bool {
     if !matches!(last_word, Some("ON")) {
         return false;
     }
@@ -315,6 +309,31 @@ fn is_comment_on_table_target(tokens: &[SqlToken], idx: usize, last_word: Option
     false
 }
 
+fn is_comment_on_materialized_view_target(
+    tokens: &[SqlToken],
+    idx: usize,
+    last_word: Option<&str>,
+) -> bool {
+    if !matches!(last_word, Some(prev) if prev.eq_ignore_ascii_case("MATERIALIZED")) {
+        return false;
+    }
+
+    let mut significant_words = Vec::with_capacity(3);
+    let mut scan_idx = idx;
+    while scan_idx > 0 && significant_words.len() < 3 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Word(word)) => significant_words.push(word.to_ascii_uppercase()),
+            _ => break,
+        }
+    }
+
+    matches!(
+        significant_words.as_slice(),
+        [first, second, third] if first == "MATERIALIZED" && second == "ON" && third == "COMMENT"
+    )
+}
 fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
     let mut scan_idx = idx;
     let mut saw_create_keyword = false;
@@ -335,6 +354,13 @@ fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
                 if matches!(upper.as_str(), "INDEX" | "TRIGGER") {
                     saw_object_keyword = true;
                 }
+
+                // CREATE INDEX / CREATE TRIGGER statements often include
+                // additional modifiers before the ON-target table name
+                // (e.g. `CREATE UNIQUE INDEX ... ON`,
+                // `CREATE OR REPLACE TRIGGER ... ON`).
+                // Keep scanning until statement start instead of treating
+                // intermediate keywords as hard failures.
             }
             _ => {}
         }
@@ -1120,7 +1146,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if last_word
                             .as_deref()
                             .is_some_and(is_table_target_statement_keyword)
-                            || is_comment_on_table_target(tokens, idx, last_word.as_deref())
+                            || is_comment_on_target(tokens, idx, last_word.as_deref())
                             || is_create_table_target(tokens, idx) =>
                     {
                         // DDL/DCL target object position (`TRUNCATE TABLE ...`,
@@ -1128,6 +1154,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`,
                         // `CREATE [GLOBAL TEMPORARY] TABLE ...`)
                         // should provide table-name completion.
+                        depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
+                    }
+
+                    "VIEW"
+                        if is_comment_on_target(tokens, idx, last_word.as_deref())
+                            || is_comment_on_materialized_view_target(
+                                tokens,
+                                idx,
+                                last_word.as_deref(),
+                            ) =>
+                    {
+                        // `COMMENT ON VIEW ...` and `COMMENT ON MATERIALIZED VIEW ...`
+                        // use the same object-target position as COMMENT ON TABLE.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
@@ -1823,8 +1863,7 @@ fn is_postgres_on_conflict_do_update(tokens: &[SqlToken], update_idx: usize) -> 
     let mut cursor = do_idx;
     while let Some((word, word_idx)) = prev_word_upper(tokens, cursor) {
         if word == "CONFLICT" {
-            return prev_word_upper(tokens, word_idx)
-                .is_some_and(|(maybe_on, _)| maybe_on == "ON");
+            return prev_word_upper(tokens, word_idx).is_some_and(|(maybe_on, _)| maybe_on == "ON");
         }
         cursor = word_idx;
     }
