@@ -514,11 +514,36 @@ fn phase_for_update_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
     assert!(ctx.phase.is_column_context());
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "FOR"),
+        "FOR locking clause keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
 }
 
 #[test]
 fn phase_for_share_of_is_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR SHARE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_no_key_update_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR NO KEY UPDATE OF |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_key_share_of_is_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR KEY SHARE OF |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
     assert!(ctx.phase.is_column_context());
 }
@@ -552,6 +577,23 @@ fn phase_limit_clause_is_not_table_context() {
 
     let names = table_names(&ctx);
     assert!(names.contains(&"T".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn fetch_first_clause_keyword_is_not_parsed_as_relation_alias() {
+    let ctx = analyze("SELECT * FROM emp FETCH FIRST | ROWS ONLY");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "FETCH"),
+        "FETCH pagination keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
 }
 
 #[test]
