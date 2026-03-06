@@ -881,9 +881,12 @@ impl SplitState {
             self.pending_do = PendingDo::None;
         }
 
-        // TYPE AS/IS OBJECT/VARRAY/TABLE/REF/RECORD/OPAQUE/ENUM – not a real block
-        if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind
-            && matches!(
+        // CREATE TYPE (spec) AS/IS <declarative-kind> is never a PL/SQL block opener.
+        // We still keep an allow-list for known Oracle kinds, but also fall back to
+        // the same behavior for forward-compatible kinds that may appear in newer
+        // Oracle versions.
+        if self.as_is_follow_state == AsIsFollowState::AwaitingTypeDeclarativeKind {
+            let known_type_declarative_kind = matches!(
                 upper,
                 "OBJECT"
                     | "VARRAY"
@@ -895,10 +898,14 @@ impl SplitState {
                     | "VARYING"
                     | "ENUM"
                     | "RANGE"
-            )
-        {
-            self.block_stack.pop(); // undo the AS/IS push
-            self.as_is_follow_state = AsIsFollowState::None;
+            );
+
+            // `BODY` is handled by CREATE TYPE BODY classification and should not
+            // appear as a declarative kind token for CREATE TYPE specs.
+            if known_type_declarative_kind || upper != "BODY" {
+                self.block_stack.pop(); // undo the AS/IS push
+                self.as_is_follow_state = AsIsFollowState::None;
+            }
         }
 
         // Nested PROCEDURE/FUNCTION
@@ -2995,6 +3002,25 @@ mod tests {
             engine.finalize_and_take_statements(),
             vec![
                 "CREATE OR REPLACE TYPE age_t IS RANGE (SUBTYPE = NUMBER)".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_declaration_with_unknown_declarative_kind_splits_at_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE t_future AS FUTURE_KIND (");
+        engine.process_line("  attr NUMBER");
+        engine.process_line(");");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE TYPE t_future AS FUTURE_KIND (\n  attr NUMBER\n)"
+                    .to_string(),
                 "SELECT 1 FROM dual".to_string(),
             ]
         );
