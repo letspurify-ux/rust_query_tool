@@ -467,6 +467,47 @@ fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     false
 }
 
+fn locking_for_clause_has_of_target(tokens: &[SqlToken], start_idx: usize) -> bool {
+    let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
+        return false;
+    };
+
+    let after_locking_idx = match first_keyword.as_str() {
+        "UPDATE" | "SHARE" => first_idx + 1,
+        "NO" => {
+            let Some((second_keyword, second_idx)) = next_word_upper(tokens, first_idx + 1) else {
+                return false;
+            };
+            if second_keyword != "KEY" {
+                return false;
+            }
+
+            let Some((third_keyword, third_idx)) = next_word_upper(tokens, second_idx + 1) else {
+                return false;
+            };
+            if third_keyword != "UPDATE" {
+                return false;
+            }
+            third_idx + 1
+        }
+        "KEY" => {
+            let Some((second_keyword, second_idx)) = next_word_upper(tokens, first_idx + 1) else {
+                return false;
+            };
+            if second_keyword != "SHARE" {
+                return false;
+            }
+            second_idx + 1
+        }
+        _ => return false,
+    };
+
+    matches!(
+        next_word_upper(tokens, after_locking_idx),
+        Some((keyword, _)) if keyword == "OF"
+    )
+}
+
 fn is_read_consistency_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
         return false;
@@ -1236,7 +1277,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // Locking clauses (`FOR UPDATE [OF ...]`, `FOR SHARE [OF ...]`,
                             // `FOR NO KEY UPDATE [OF ...]`, `FOR KEY SHARE [OF ...]`)
                             // can accept column references after `OF`.
-                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            if locking_for_clause_has_of_target(tokens, idx + 1) {
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                            } else {
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            }
                         } else if is_read_consistency_for_clause(tokens, idx + 1) {
                             // Read-consistency qualifiers (`FOR READ ONLY`, `FOR READ WRITE`)
                             // are end-of-query boundaries and must not keep table context.
@@ -1312,8 +1357,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
                         if matches!(last_word.as_deref(), Some("FOR")) {
-                            // `FOR UPDATE` lock clause inside SELECT statements.
-                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            // `FOR UPDATE OF ...` lock clause inside SELECT statements.
+                            if locking_for_clause_has_of_target(tokens, idx) {
+                                depth_frames[depth].phase = SqlPhase::SetClause;
+                            } else {
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            }
                             relation_state.clear();
                         } else if is_merge_action_keyword
                             || is_mysql_conflict_update
