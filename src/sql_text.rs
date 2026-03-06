@@ -961,6 +961,17 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
+    if first.eq_ignore_ascii_case("HOST") || first == "!" {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("PROMPT")
+        || first.eq_ignore_ascii_case("REM")
+        || first.eq_ignore_ascii_case("REMARK")
+    {
+        return true;
+    }
+
     false
 }
 
@@ -1087,6 +1098,11 @@ mod tests {
         assert!(is_auto_terminated_tool_command("DISC"));
         assert!(is_auto_terminated_tool_command("@child.sql"));
         assert!(is_auto_terminated_tool_command("  @@child.sql"));
+        assert!(is_auto_terminated_tool_command("PROMPT hello"));
+        assert!(is_auto_terminated_tool_command("REM comment"));
+        assert!(is_auto_terminated_tool_command("REMARK comment"));
+        assert!(is_auto_terminated_tool_command("HOST ls"));
+        assert!(is_auto_terminated_tool_command("! ls"));
     }
 
     #[test]
