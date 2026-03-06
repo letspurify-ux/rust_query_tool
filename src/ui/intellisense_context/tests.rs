@@ -661,6 +661,27 @@ fn phase_create_trigger_on_is_table_context() {
 }
 
 #[test]
+fn phase_create_table_is_table_context() {
+    let ctx = analyze("CREATE TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_create_global_temporary_table_is_table_context() {
+    let ctx = analyze("CREATE GLOBAL TEMPORARY TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_create_table_as_select_is_table_context_before_name() {
+    let ctx = analyze("CREATE TABLE | AS SELECT 1");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_join_on_remains_join_condition_context() {
     let ctx = analyze("SELECT * FROM emp e JOIN dept d ON |");
     assert_eq!(ctx.phase, SqlPhase::JoinCondition);

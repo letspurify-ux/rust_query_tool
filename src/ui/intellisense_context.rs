@@ -344,6 +344,38 @@ fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
     saw_create_keyword && saw_object_keyword
 }
 
+fn is_create_table_target(tokens: &[SqlToken], idx: usize) -> bool {
+    let mut scan_idx = idx;
+    let mut saw_create_keyword = false;
+
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Symbol(sym)) if sym == ";" => break,
+            Some(SqlToken::Word(word)) => {
+                let upper = word.to_ascii_uppercase();
+                if upper == "CREATE" {
+                    saw_create_keyword = true;
+                    break;
+                }
+
+                if matches!(
+                    upper.as_str(),
+                    "GLOBAL" | "LOCAL" | "TEMP" | "TEMPORARY" | "UNLOGGED" | "TRANSIENT"
+                ) {
+                    continue;
+                }
+
+                return false;
+            }
+            _ => return false,
+        }
+    }
+
+    saw_create_keyword
+}
+
 fn is_with_plsql_declaration_keyword(keyword: &str) -> bool {
     matches!(keyword, "FUNCTION" | "PROCEDURE")
 }
@@ -985,11 +1017,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if last_word
                             .as_deref()
                             .is_some_and(is_table_target_statement_keyword)
-                            || is_comment_on_table_target(tokens, idx, last_word.as_deref()) =>
+                            || is_comment_on_table_target(tokens, idx, last_word.as_deref())
+                            || is_create_table_target(tokens, idx) =>
                     {
                         // DDL/DCL target object position (`TRUNCATE TABLE ...`,
                         // `LOCK TABLE ...`, `ALTER TABLE ...`, `DROP TABLE ...`,
-                        // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`)
+                        // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`,
+                        // `CREATE [GLOBAL TEMPORARY] TABLE ...`)
                         // should provide table-name completion.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
