@@ -564,10 +564,7 @@ fn begin_set_operator_operand_scope(
         return;
     };
 
-    let parent_scope = visible_parent
-        .get(current_scope)
-        .copied()
-        .unwrap_or(None);
+    let parent_scope = visible_parent.get(current_scope).copied().unwrap_or(None);
     let operand_scope = *next_scope_id;
     *next_scope_id = next_scope_id.saturating_add(1);
     visible_parent.insert(operand_scope, parent_scope);
@@ -1121,10 +1118,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "GROUP" => {
-                        if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1) {
-                            if next_keyword == "BY" {
-                                depth_frames[depth].phase = SqlPhase::GroupByClause;
-                                idx = next_idx; // skip BY (and any interleaved comments)
+                        if !is_within_group_keyword(tokens, idx) {
+                            if let Some((next_keyword, next_idx)) = next_word_upper(tokens, idx + 1)
+                            {
+                                if next_keyword == "BY" {
+                                    depth_frames[depth].phase = SqlPhase::GroupByClause;
+                                    idx = next_idx; // skip BY (and any interleaved comments)
+                                }
                             }
                         }
                         relation_state.clear();
@@ -1732,6 +1732,14 @@ fn is_distinct_from_operator(tokens: &[SqlToken], from_idx: usize) -> bool {
     };
 
     second_prev_word == "IS" || second_prev_word == "NOT"
+}
+
+fn is_within_group_keyword(tokens: &[SqlToken], group_idx: usize) -> bool {
+    let Some((prev_word, _)) = prev_word_upper(tokens, group_idx) else {
+        return false;
+    };
+
+    prev_word == "WITHIN"
 }
 
 fn strip_identifier_quotes(value: &str) -> String {
