@@ -1016,6 +1016,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
+                    "REPLACE" => {
+                        depth_frames[depth].returning_clause_active = false;
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            // Inside expressions, REPLACE can be a scalar function name.
+                            relation_state.clear();
+                        } else {
+                            // MySQL `REPLACE [INTO] table ...` behaves like INSERT for
+                            // completion purposes: expect a target relation right after
+                            // REPLACE, even when INTO is omitted.
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                            relation_state.expect_table();
+                        }
+                    }
                     "WITH"
                         if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
                     {
