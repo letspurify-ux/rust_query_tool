@@ -460,6 +460,39 @@ fn table_function_with_ordinality_keeps_alias_after_postfix_clause() {
 }
 
 #[test]
+fn unnest_alias_column_list_is_collected_for_derived_function_relations() {
+    let ctx = analyze("SELECT i.| FROM orders o, UNNEST(o.items) i(item_value) WHERE o.id = 1");
+
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.name.eq_ignore_ascii_case("i") && table.alias.as_deref() == Some("i")
+        ),
+        "UNNEST alias with derived-column list should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn table_wrapper_alias_column_list_is_collected_for_derived_function_relations() {
+    let ctx = analyze("SELECT t.| FROM orders o, TABLE(o.items) t(item_value) WHERE o.id = 1");
+
+    assert!(
+        ctx.tables_in_scope.iter().any(
+            |table| table.alias.as_deref() == Some("t")
+        ),
+        "TABLE wrapper alias with derived-column list should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+
+#[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
     let ctx = analyze("SELECT * FROM orders o, UNNEST(o.|) u");
 

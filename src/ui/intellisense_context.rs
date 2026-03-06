@@ -1221,8 +1221,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 } else {
                                     next_idx
                                 };
-                                let (alias, after_alias) =
-                                    parse_alias_deep(tokens, relation_arg_end);
+                                let (alias, after_alias) = parse_alias_deep(
+                                    tokens,
+                                    relation_arg_end,
+                                    relation_arg_range.is_some(),
+                                );
                                 let alias = alias.or_else(|| {
                                     parse_alias_after_derived_relation_clauses(
                                         tokens,
@@ -1846,9 +1849,13 @@ fn parse_relation_alias_at(
 }
 
 /// Parse an optional alias after a table name.
-fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
+fn parse_alias_deep(
+    tokens: &[SqlToken],
+    start: usize,
+    allow_alias_column_list: bool,
+) -> (Option<String>, usize) {
     let start = skip_relation_postfix_clauses(tokens, start);
-    parse_relation_alias_at(tokens, start, false)
+    parse_relation_alias_at(tokens, start, allow_alias_column_list)
 }
 
 fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
