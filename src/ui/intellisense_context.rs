@@ -1102,6 +1102,22 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
+                    "OVERWRITE"
+                        if matches!(last_word.as_deref(), Some(prev) if prev.eq_ignore_ascii_case("INSERT")) =>
+                    {
+                        // Hive/SparkSQL dialect: `INSERT OVERWRITE [TABLE] target ...`
+                        // behaves like INSERT INTO regarding target relation completion.
+                        depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
+                    }
+                    "DIRECTORY"
+                        if matches!(last_word.as_deref(), Some(prev) if prev.eq_ignore_ascii_case("OVERWRITE")) =>
+                    {
+                        // `INSERT OVERWRITE DIRECTORY ...` writes to a filesystem target,
+                        // not a relation name; table completion should stop here.
+                        depth_frames[depth].phase = SqlPhase::Initial;
+                        relation_state.clear();
+                    }
                     "REPLACE" => {
                         depth_frames[depth].returning_clause_active = false;
                         let is_expression_context = current_phase.is_column_context()

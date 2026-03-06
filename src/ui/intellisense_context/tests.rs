@@ -849,6 +849,23 @@ fn phase_insert_into() {
 }
 
 #[test]
+fn phase_insert_overwrite_table_is_table_context() {
+    let ctx = analyze("INSERT OVERWRITE TABLE |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_insert_overwrite_directory_is_not_table_context() {
+    let ctx = analyze("INSERT OVERWRITE DIRECTORY |");
+    assert!(
+        !ctx.phase.is_table_context(),
+        "DIRECTORY target should not be treated as table context: {:?}",
+        ctx.phase
+    );
+}
+
+#[test]
 fn phase_replace_without_into_is_table_context() {
     let ctx = analyze("REPLACE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);

@@ -133,6 +133,7 @@ impl SqlEditorWidget {
         enum InsertParseState {
             Idle,
             AfterInsert,
+            AfterOverwrite,
             AfterInto,
             AfterTarget,
             InColumnList { start_depth: usize },
@@ -164,6 +165,20 @@ impl SqlEditorWidget {
                         InsertParseState::AfterInsert if word.eq_ignore_ascii_case("INTO") => {
                             InsertParseState::AfterInto
                         }
+                        InsertParseState::AfterInsert
+                            if word.eq_ignore_ascii_case("OVERWRITE") =>
+                        {
+                            InsertParseState::AfterOverwrite
+                        }
+                        InsertParseState::AfterOverwrite if word.eq_ignore_ascii_case("TABLE") => {
+                            InsertParseState::AfterInto
+                        }
+                        InsertParseState::AfterOverwrite
+                            if word.eq_ignore_ascii_case("DIRECTORY") =>
+                        {
+                            InsertParseState::InValuesOrSelectBody
+                        }
+                        InsertParseState::AfterOverwrite => InsertParseState::AfterTarget,
                         InsertParseState::AfterInto => InsertParseState::AfterTarget,
                         InsertParseState::AfterTarget | InsertParseState::AfterColumnList
                             if starts_insert_body(word) =>
@@ -5819,6 +5834,76 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
             deep_ctx.statement_tokens.as_ref(),
         );
         assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_insert_overwrite_table_column_list_as_column_context() {
+        let sql_with_cursor = "INSERT OVERWRITE TABLE employees (|) SELECT * FROM staging_employees";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(SqlEditorWidget::is_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_insert_overwrite_column_list_as_column_context() {
+        let sql_with_cursor = "INSERT OVERWRITE employees (|) SELECT * FROM staging_employees";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(SqlEditorWidget::is_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn insert_overwrite_directory_is_not_insert_column_list_context() {
+        let sql_with_cursor = "INSERT OVERWRITE DIRECTORY /tmp/out SELECT | FROM src_table";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+
+        assert!(
+            !SqlEditorWidget::is_insert_column_list_context(&full_tokens, split_idx),
+            "INSERT OVERWRITE DIRECTORY must not be parsed as target column-list context"
+        );
     }
 
     #[test]
