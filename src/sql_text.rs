@@ -750,6 +750,8 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "EXIT",
     "QUIT",
     "HOST",
+    "PASSWORD",
+    "PASSW",
     "CREATE",
     "ALTER",
     "DROP",
@@ -948,6 +950,10 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return !words
             .next()
             .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
+    }
+
+    if first.eq_ignore_ascii_case("PASSWORD") || first.eq_ignore_ascii_case("PASSW") {
+        return true;
     }
 
     false

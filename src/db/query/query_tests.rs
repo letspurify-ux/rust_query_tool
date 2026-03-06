@@ -9222,6 +9222,31 @@ fn test_split_script_items_oracle_with_function_recovers_to_variable_statement_h
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_passw_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+PASSW scott
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("PASSW scott")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == "PASSW scott" && message.contains("PASSWORD") && *is_error),
+        "second item should classify PASSW command as unsupported SQL*Plus command without leaking into SQL statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_connect_statement_head() {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
@@ -9289,6 +9314,31 @@ SELECT 2 FROM dual;";
     assert!(
         matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Disconnect)),
         "second item should parse DISCONNECT command: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_password_statement_head() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+PASSWORD scott
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains("PASSWORD scott")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == "PASSWORD scott" && message.contains("PASSWORD") && *is_error),
+        "second item should classify PASSWORD command as unsupported SQL*Plus command without leaking into SQL statement: {items:?}"
     );
     assert!(
         matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
