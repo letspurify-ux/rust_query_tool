@@ -9199,6 +9199,62 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_create_forward_crossedition_trigger_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE FORWARD CROSSEDITION TRIGGER trg_forward
+BEFORE INSERT ON t
+BEGIN
+  NULL;
+END;
+SELECT 2 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE FORWARD CROSSEDITION TRIGGER should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FORWARD CROSSEDITION TRIGGER trg_forward"),
+        "first statement should preserve FORWARD CROSSEDITION TRIGGER DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_script_items_create_reverse_crossedition_trigger_splits_before_trailing_select() {
+    let sql = r#"CREATE OR REPLACE REVERSE CROSSEDITION TRIGGER trg_reverse
+BEFORE INSERT ON t
+BEGIN
+  NULL;
+END;
+SELECT 3 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "CREATE REVERSE CROSSEDITION TRIGGER should split before trailing SELECT, got: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE REVERSE CROSSEDITION TRIGGER trg_reverse"),
+        "first statement should preserve REVERSE CROSSEDITION TRIGGER DDL: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 3 FROM dual"),
+        "second statement should be trailing SELECT: {}",
+        stmts[1]
+    );
+}
+
+#[test]
 fn test_split_script_items_create_if_not_exists_procedure_splits_before_trailing_select() {
     let sql = r#"CREATE IF NOT EXISTS PROCEDURE p_if_not_exists
 IS

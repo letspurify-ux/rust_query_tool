@@ -1163,7 +1163,13 @@ impl SplitState {
                 "IF" | "NOT" | "EXISTS" => {
                     return;
                 }
-                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" => {
+                "EDITIONABLE"
+                | "NONEDITIONABLE"
+                | "EDITIONING"
+                | "NONEDITIONING"
+                | "FORWARD"
+                | "REVERSE"
+                | "CROSSEDITION" => {
                     return;
                 }
                 "JAVA" => {
@@ -2886,6 +2892,50 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("LANGUAGE C WITH CONTEXT"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn create_forward_crossedition_trigger_splits_before_trailing_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FORWARD CROSSEDITION TRIGGER trg_forward");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE FORWARD CROSSEDITION TRIGGER"),
+            "first statement should preserve trigger header: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn create_reverse_crossedition_trigger_splits_before_trailing_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE REVERSE CROSSEDITION TRIGGER trg_reverse");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE REVERSE CROSSEDITION TRIGGER"),
+            "first statement should preserve trigger header: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 2 FROM dual"));
     }
 
     #[test]
