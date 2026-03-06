@@ -246,7 +246,14 @@ pub fn analyze_cursor_context(
 fn is_from_consuming_function(name: &str) -> bool {
     matches!(
         name,
-        "EXTRACT" | "TRIM" | "XMLCAST" | "SUBSTRING" | "OVERLAY" | "POSITION"
+        "EXTRACT"
+            | "TRIM"
+            | "XMLCAST"
+            | "SUBSTRING"
+            | "OVERLAY"
+            | "POSITION"
+            | "NORMALIZE"
+            | "TRIM_ARRAY"
     )
 }
 

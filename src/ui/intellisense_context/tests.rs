@@ -4297,6 +4297,22 @@ fn position_from_does_not_trigger_from_clause() {
 }
 
 #[test]
+fn normalize_from_does_not_trigger_from_clause() {
+    // PostgreSQL NORMALIZE(value FROM form) consumes FROM inside function syntax.
+    let ctx = analyze("SELECT NORMALIZE(name FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn trim_array_from_does_not_trigger_from_clause() {
+    // PostgreSQL TRIM_ARRAY(array FROM n) uses FROM as a function keyword.
+    let ctx = analyze("SELECT TRIM_ARRAY(items FROM |) FROM emp");
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn real_from_after_position_still_works() {
     let ctx = analyze("SELECT POSITION('a' FROM name) FROM |");
     assert_eq!(ctx.phase, SqlPhase::FromClause);
