@@ -614,7 +614,9 @@ fn phase_for_read_only_clause_is_not_table_context() {
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
     assert!(
-        aliases.iter().all(|alias| alias != "FOR" && alias != "READ"),
+        aliases
+            .iter()
+            .all(|alias| alias != "FOR" && alias != "READ"),
         "FOR READ ONLY keywords must not be parsed as relation aliases: {:?}",
         aliases
     );
@@ -889,6 +891,20 @@ fn phase_join_on_remains_join_condition_context() {
 fn phase_values() {
     let ctx = analyze("INSERT INTO t (a) VALUES |");
     assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
+#[test]
+fn values_clause_is_column_context_for_expression_completion() {
+    let ctx = analyze("INSERT INTO t (a) VALUES (|");
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn pivot_clause_is_column_context_for_aggregate_and_for_expression() {
+    let ctx = analyze("SELECT * FROM src PIVOT (SUM(|) AS sum_sal FOR deptno IN (10 AS d10))");
+    assert_eq!(ctx.phase, SqlPhase::PivotClause);
+    assert!(ctx.phase.is_column_context());
 }
 
 #[test]
@@ -5093,7 +5109,6 @@ fn grammar_with_table_statement_after_recursive_with_keeps_cte_scope() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert!(cte_names(&ctx).contains(&"CTE".to_string()));
 }
-
 
 #[test]
 fn grammar_complex_join_variant_1() {

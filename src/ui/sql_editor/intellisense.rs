@@ -6182,6 +6182,33 @@ CROSS APPLY (
     }
 
     #[test]
+    fn classify_intellisense_context_treats_insert_values_expression_as_column_context() {
+        let sql_with_cursor = "INSERT INTO target (id) VALUES (|)";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::ValuesClause);
+        assert!(
+            deep_ctx.phase.is_column_context(),
+            "phase: {:?}",
+            deep_ctx.phase
+        );
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
     fn classify_intellisense_context_treats_merge_insert_column_list_as_column_context() {
         let sql_with_cursor =
             "MERGE INTO target t USING source s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)";
@@ -6195,7 +6222,11 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(deep_ctx.phase.is_column_context(), "phase should be column-oriented in MERGE insert action: {:?}", deep_ctx.phase);
+        assert!(
+            deep_ctx.phase.is_column_context(),
+            "phase should be column-oriented in MERGE insert action: {:?}",
+            deep_ctx.phase
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -6218,7 +6249,11 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(deep_ctx.phase.is_column_context(), "phase: {:?}", deep_ctx.phase);
+        assert!(
+            deep_ctx.phase.is_column_context(),
+            "phase: {:?}",
+            deep_ctx.phase
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
@@ -6241,7 +6276,11 @@ CROSS APPLY (
         let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
         let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
-        assert!(deep_ctx.phase.is_column_context(), "phase: {:?}", deep_ctx.phase);
+        assert!(
+            deep_ctx.phase.is_column_context(),
+            "phase: {:?}",
+            deep_ctx.phase
+        );
 
         let context = SqlEditorWidget::classify_intellisense_context(
             &deep_ctx,
