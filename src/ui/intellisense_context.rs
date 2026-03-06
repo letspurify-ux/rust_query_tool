@@ -1741,9 +1741,7 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                     open_idx = skip_comment_tokens(tokens, open_idx + 1);
                 }
                 if matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-                    idx = extract_parenthesized_range(tokens, open_idx)
-                        .map(|(_, next_idx)| next_idx)
-                        .unwrap_or(open_idx.saturating_add(1));
+                    idx = skip_parenthesized_clause(tokens, open_idx);
                     if upper == "TABLESAMPLE"
                         && matches!(
                             next_word_upper(tokens, idx),
@@ -1753,9 +1751,7 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                         let repeatable_idx = skip_comment_tokens(tokens, idx + 1);
                         if matches!(tokens.get(repeatable_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
                         {
-                            idx = extract_parenthesized_range(tokens, repeatable_idx)
-                                .map(|(_, next_idx)| next_idx)
-                                .unwrap_or(repeatable_idx.saturating_add(1));
+                            idx = skip_parenthesized_clause(tokens, repeatable_idx);
                         }
                     }
                     idx = skip_comment_tokens(tokens, idx);
@@ -1828,9 +1824,7 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                 }
 
                 if matches!(tokens.get(cursor), Some(SqlToken::Symbol(sym)) if sym == "(") {
-                    idx = extract_parenthesized_range(tokens, cursor)
-                        .map(|(_, next_idx)| next_idx)
-                        .unwrap_or(cursor.saturating_add(1));
+                    idx = skip_parenthesized_clause(tokens, cursor);
                 } else {
                     idx = cursor.saturating_add(1);
                 }
@@ -1927,22 +1921,24 @@ fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
     }
 
     if matches!(tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-        return extract_parenthesized_range(tokens, idx)
-            .map(|(_, next_idx)| next_idx)
-            .unwrap_or(idx.saturating_add(1));
+        return skip_parenthesized_clause(tokens, idx);
     }
 
     if matches!(tokens.get(idx), Some(SqlToken::Word(_))) {
         let next_idx = skip_comment_tokens(tokens, idx + 1);
         if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
-            return extract_parenthesized_range(tokens, next_idx)
-                .map(|(_, after_fn)| after_fn)
-                .unwrap_or(next_idx.saturating_add(1));
+            return skip_parenthesized_clause(tokens, next_idx);
         }
         return next_idx;
     }
 
     idx.saturating_add(1)
+}
+
+fn skip_parenthesized_clause(tokens: &[SqlToken], open_paren_idx: usize) -> usize {
+    extract_parenthesized_range(tokens, open_paren_idx)
+        .map(|(_, next_idx)| next_idx)
+        .unwrap_or(open_paren_idx.saturating_add(1))
 }
 
 fn skip_comment_tokens(tokens: &[SqlToken], mut idx: usize) -> usize {
