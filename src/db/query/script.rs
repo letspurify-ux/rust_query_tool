@@ -3018,6 +3018,14 @@ impl QueryExecutor {
             return Some(Self::parse_spool_command(trimmed));
         }
 
+        if Self::is_word_command(&upper, "HOST") || trimmed.starts_with('!') {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "HOST command is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
         if upper.starts_with("SET ERRORCONTINUE") {
             return Some(Self::parse_errorcontinue_command(trimmed));
         }

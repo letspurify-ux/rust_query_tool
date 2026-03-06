@@ -1630,3 +1630,29 @@
 - `cargo test -q language_clause_with_future_tokens_without_external_keyword_still_splits -- --nocapture` 통과
 - `cargo test -q package_body_nested_language_clause_with_future_tokens_closes_on_semicolon -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+
+## 2026-03-06 Oracle 공통 파서 엔진 누락 복구 키워드 보완 (`HOST` / `!`)
+
+### [중] `WITH FUNCTION/PROCEDURE` 복구 경로에서 `HOST`/`!` 명령을 새 문장 시작으로 인식하지 못하던 문제 수정
+- **증상**:
+  - `WITH FUNCTION ... END; HOST ls` 또는 `WITH FUNCTION ... END; ! ls` 형태에서
+  - `HOST` 계열 라인이 이전 SQL statement에 붙어 버려 SQL*Plus 명령 분리가 깨질 수 있었습니다.
+- **원인**:
+  - `src/db/query/script.rs::parse_tool_command`가 SQL*Plus `HOST` 및 `!` alias를 인식하지 않아,
+  - 상위 복구 로직(`line_starts_statement_head_keyword`)이 감지해도 실제 분리 시점에 ToolCommand로 확정되지 않았습니다.
+- **수정**:
+  - `parse_tool_command`에 `HOST`/`!` 분기를 추가해 `ToolCommand::Unsupported`로 명시 분리하도록 보강했습니다.
+  - `PASSWORD/PASSW`와 동일하게 "지원하지 않음"으로 처리하되 statement 경계는 안정적으로 유지합니다.
+
+### [유사 케이스] alias 형태(`!`) 일괄 점검
+- SQL*Plus에서 동일 의미로 쓰이는 `!` alias 케이스를 함께 테스트해 동일 회귀를 일괄 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_oracle_with_function_recovers_to_host_statement_head`
+- `test_split_script_items_oracle_with_function_recovers_to_bang_host_statement_head`
+
+### [검증]
+- `cargo test -q recovers_to_host_statement_head -- --nocapture` 통과
+- `cargo test -q recovers_to_bang_host_statement_head -- --nocapture` 통과
+- `cargo test` 전체 통과
