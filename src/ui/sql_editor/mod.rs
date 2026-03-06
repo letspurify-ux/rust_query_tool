@@ -1447,26 +1447,6 @@ impl SqlEditorWidget {
             let mut disconnected = false;
             let mut processed = 0usize;
             let mut hit_budget = false;
-            let mut pending_rows: Vec<(usize, Vec<Vec<String>>)> = Vec::new();
-            let mut pending_row_index_map: HashMap<usize, usize> = HashMap::new();
-
-            let flush_rows =
-                |pending_rows: &mut Vec<(usize, Vec<Vec<String>>)>,
-                 pending_row_index_map: &mut HashMap<usize, usize>| {
-                    if pending_rows.is_empty() {
-                        return;
-                    }
-                    // IMPORTANT: Do not drop buffered rows when cancel is requested.
-                    // Users expect rows fetched before cancel to remain visible, and
-                    // cancel only stops additional fetches from the worker side.
-                    for (index, rows) in pending_rows.drain(..) {
-                        SqlEditorWidget::invoke_progress_callback(
-                            &progress_callback,
-                            QueryProgress::Rows { index, rows },
-                        );
-                    }
-                    pending_row_index_map.clear();
-                };
             // Process any pending messages
             loop {
                 if processed >= MAX_PROGRESS_MESSAGES_PER_POLL {
@@ -1486,31 +1466,10 @@ impl SqlEditorWidget {
                         processed += 1;
                         match &message {
                             QueryProgress::Rows { .. } => {
-                                // Keep aggregating Rows even after cancel_flag is set.
-                                // The cancel path must preserve already-received data.
-                                if let QueryProgress::Rows { index, rows } = message {
-                                    if let Some(buffer_index) =
-                                        pending_row_index_map.get(&index).copied()
-                                    {
-                                        if let Some((_, buffered)) =
-                                            pending_rows.get_mut(buffer_index)
-                                        {
-                                            buffered.extend(rows);
-                                        } else {
-                                            let next_index = pending_rows.len();
-                                            pending_rows.push((index, rows));
-                                            pending_row_index_map.insert(index, next_index);
-                                        }
-                                    } else {
-                                        let next_index = pending_rows.len();
-                                        pending_rows.push((index, rows));
-                                        pending_row_index_map.insert(index, next_index);
-                                    }
-                                }
+                                SqlEditorWidget::invoke_progress_callback(&progress_callback, message);
                                 continue;
                             }
                             QueryProgress::PromptInput { prompt, response } => {
-                                flush_rows(&mut pending_rows, &mut pending_row_index_map);
                                 let value = SqlEditorWidget::prompt_input_dialog(prompt);
                                 let _ = response.send(value);
                                 app::awake();
@@ -1521,7 +1480,6 @@ impl SqlEditorWidget {
                                 timed_out,
                                 ..
                             } => {
-                                flush_rows(&mut pending_rows, &mut pending_row_index_map);
                                 if *timed_out {
                                     SqlEditorWidget::show_alert_dialog(&format!(
                                         "Query timed out!\n\n{}",
@@ -1548,7 +1506,6 @@ impl SqlEditorWidget {
                                 );
                             }
                             QueryProgress::BatchFinished => {
-                                flush_rows(&mut pending_rows, &mut pending_row_index_map);
                                 SqlEditorWidget::finalize_execution_state(
                                     &query_running,
                                     &cancel_flag,
@@ -1568,8 +1525,6 @@ impl SqlEditorWidget {
                     }
                 }
             }
-
-            flush_rows(&mut pending_rows, &mut pending_row_index_map);
 
             if disconnected {
                 // Fail-safe cleanup: if the worker thread exits unexpectedly and the
