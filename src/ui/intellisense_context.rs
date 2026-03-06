@@ -464,7 +464,17 @@ fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     matches!(
         tokens.get(idx),
         Some(SqlToken::Word(word))
-            if matches!(word.to_ascii_uppercase().as_str(), "SELECT" | "WITH" | "VALUES")
+            if matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT"
+                    | "WITH"
+                    | "VALUES"
+                    | "TABLE"
+                    | "ONLY"
+                    | "CONTAINERS"
+                    | "SHARDS"
+                    | "ROWS"
+            )
     )
 }
 
