@@ -4918,6 +4918,23 @@ fn grammar_with_recursive_style_variant_3() {
 }
 
 #[test]
+fn grammar_with_table_statement_after_with_keeps_cte_scope() {
+    let ctx = analyze("WITH cte AS (SELECT 1 AS id FROM dual) TABLE cte WHERE |");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(cte_names(&ctx).contains(&"CTE".to_string()));
+}
+
+#[test]
+fn grammar_with_table_statement_after_recursive_with_keeps_cte_scope() {
+    let ctx = analyze(
+        "WITH RECURSIVE cte(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM cte WHERE n < 3) TABLE cte WHERE |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(cte_names(&ctx).contains(&"CTE".to_string()));
+}
+
+
+#[test]
 fn grammar_complex_join_variant_1() {
     let ctx = analyze("SELECT * FROM emp e LEFT JOIN dept d ON e.deptno = d.deptno JOIN salgrade s ON e.sal BETWEEN s.losal AND | ");
     assert_eq!(ctx.phase, SqlPhase::JoinCondition);
