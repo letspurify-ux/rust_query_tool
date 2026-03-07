@@ -1022,6 +1022,19 @@ impl SplitState {
             self.pending_do = PendingDo::None;
         }
 
+        if upper == "CALL"
+            && self.is_trigger()
+            && !self.in_compound_trigger()
+            && self.block_depth() == 1
+            && self.block_stack.last() == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins > 0
+        {
+            if let Some(frame) = self.active_routine_frame_mut() {
+                frame.semicolon_policy = SemicolonPolicy::ForceSplit;
+            }
+            self.pending_subprogram_begins = 0;
+        }
+
         if upper == "BEGIN"
             && self.timing_point_state == TimingPointState::AwaitingAsOrIs
             && self.in_compound_trigger()
@@ -4683,5 +4696,49 @@ BEGIN"
             "union tail should remain attached: {}",
             statements[0]
         );
+    }
+
+    #[test]
+    fn trigger_referencing_alias_with_quoted_identifier_keeps_call_body_is_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias_quoted_call_is");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW IS \"N\"");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("IS");
+        engine.process_line("CALL pkg_trg.fire();");
+        engine.process_line("SELECT 37 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("CALL pkg_trg.fire()"),
+            "trigger CALL body should remain in first statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 37 FROM dual".to_string());
+    }
+
+    #[test]
+    fn trigger_referencing_alias_with_quoted_identifier_keeps_call_body_as_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias_quoted_call_as");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW AS \"N\"");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("AS");
+        engine.process_line("CALL pkg_trg.fire();");
+        engine.process_line("SELECT 38 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("CALL pkg_trg.fire()"),
+            "trigger CALL body should remain in first statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 38 FROM dual".to_string());
     }
 }
