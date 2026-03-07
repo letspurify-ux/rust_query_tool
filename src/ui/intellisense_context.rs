@@ -677,6 +677,7 @@ enum StatementKind {
     Unknown,
     Delete,
     Merge,
+    Rename,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1441,6 +1442,30 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
                         depth_frames[depth].statement_kind = StatementKind::Merge;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
+                        relation_state.clear();
+                    }
+                    "RENAME" => {
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::IntoClause;
+                            depth_frames[depth].statement_kind = StatementKind::Rename;
+                            relation_state.expect_table();
+                        }
+                    }
+                    "TO" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::Rename)
+                            && matches!(current_phase, SqlPhase::IntoClause)
+                        {
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                        }
                         relation_state.clear();
                     }
                     "CONNECT" => {
@@ -2864,6 +2889,7 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "PURGE"
             | "STORAGE"
             | "MATERIALIZED"
+            | "TO"
     )
 }
 
