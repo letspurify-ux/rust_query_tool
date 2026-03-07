@@ -438,6 +438,33 @@ fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize>
     None
 }
 
+fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
+    let mut idx = start_idx;
+    while idx > 0 {
+        idx -= 1;
+        match tokens.get(idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Word(word)) => return Some((word.to_ascii_uppercase(), idx)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn is_log_errors_into_clause(tokens: &[SqlToken], into_idx: usize) -> bool {
+    let Some((prev_word, prev_idx)) = previous_word_upper(tokens, into_idx) else {
+        return false;
+    };
+    if prev_word != "ERRORS" {
+        return false;
+    }
+
+    matches!(
+        previous_word_upper(tokens, prev_idx),
+        Some((word, _)) if word == "LOG"
+    )
+}
+
 fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
         return false;
@@ -1190,10 +1217,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 StatementKind::Insert | StatementKind::Update | StatementKind::Delete
                             )
                             && !in_returning_clause;
+                        let is_log_errors_target = matches!(
+                            current_statement_kind,
+                            StatementKind::Insert
+                                | StatementKind::Update
+                                | StatementKind::Delete
+                                | StatementKind::Merge
+                        ) && is_log_errors_into_clause(tokens, idx);
 
                         if should_expect_table_target
                             || should_expect_merge_target
                             || should_expect_set_clause_target
+                            || is_log_errors_target
                         {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
