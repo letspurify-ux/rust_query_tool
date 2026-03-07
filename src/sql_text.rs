@@ -797,7 +797,6 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "LOCK",
     "COMMIT",
     "ROLLBACK",
-    "RECOVER",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",
@@ -1014,7 +1013,11 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
-    if first.eq_ignore_ascii_case("STARTUP") || first.eq_ignore_ascii_case("SHUTDOWN") {
+    if first.eq_ignore_ascii_case("STARTUP")
+        || first.eq_ignore_ascii_case("SHUTDOWN")
+        || first.eq_ignore_ascii_case("RECOVER")
+        || first.eq_ignore_ascii_case("ARCHIVE")
+    {
         return true;
     }
 
@@ -1413,6 +1416,12 @@ mod tests {
         assert!(is_auto_terminated_tool_command("PASSWO scott"));
         assert!(is_auto_terminated_tool_command("PASSWOR scott"));
         assert!(is_auto_terminated_tool_command("PASSWORD scott"));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_detects_recover_and_archive_heads() {
+        assert!(is_auto_terminated_tool_command("RECOVER DATABASE"));
+        assert!(is_auto_terminated_tool_command("ARCHIVE LOG LIST"));
     }
 
     #[test]
