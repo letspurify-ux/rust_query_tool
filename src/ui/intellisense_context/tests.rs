@@ -1301,6 +1301,95 @@ fn phase_merge_log_errors_into_is_table_context() {
 }
 
 #[test]
+fn merge_log_errors_into_does_not_capture_reject_keyword_as_alias() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET t.val = s.val \
+         LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED WHERE |",
+    );
+
+    let err_table = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("err$_target"));
+
+    assert!(err_table.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        err_table
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("REJECT")),
+        "LOG ERRORS INTO table alias must not be parsed as REJECT: {:?}",
+        err_table
+    );
+}
+
+#[test]
+fn insert_log_errors_into_does_not_capture_reject_keyword_as_alias() {
+    let ctx = analyze(
+        "INSERT INTO target_table (id) VALUES (1) \
+         LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED RETURNING |",
+    );
+
+    let err_table = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("err$_target"));
+
+    assert!(err_table.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        err_table
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("REJECT")),
+        "LOG ERRORS INTO table alias must not be parsed as REJECT: {:?}",
+        err_table
+    );
+}
+
+#[test]
+fn update_log_errors_into_does_not_capture_reject_keyword_as_alias() {
+    let ctx = analyze(
+        "UPDATE target_table SET val = 1 \
+         LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED RETURNING |",
+    );
+
+    let err_table = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("err$_target"));
+
+    assert!(err_table.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        err_table
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("REJECT")),
+        "LOG ERRORS INTO table alias must not be parsed as REJECT: {:?}",
+        err_table
+    );
+}
+
+#[test]
+fn delete_log_errors_into_does_not_capture_reject_keyword_as_alias() {
+    let ctx = analyze(
+        "DELETE FROM target_table WHERE id > 0 \
+         LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED RETURNING |",
+    );
+
+    let err_table = ctx
+        .tables_in_scope
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case("err$_target"));
+
+    assert!(err_table.is_some(), "tables: {:?}", ctx.tables_in_scope);
+    assert!(
+        err_table
+            .and_then(|table| table.alias.as_deref())
+            .is_none_or(|alias| !alias.eq_ignore_ascii_case("REJECT")),
+        "LOG ERRORS INTO table alias must not be parsed as REJECT: {:?}",
+        err_table
+    );
+}
+
+#[test]
 fn phase_select_json_value_returning_clause_stays_column_context() {
     let ctx = analyze("SELECT JSON_VALUE(payload, '$.id' RETURNING | NUMBER) FROM events e");
 
