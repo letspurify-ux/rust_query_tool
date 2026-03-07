@@ -1000,11 +1000,6 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
             .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
     }
 
-    let mut words = trimmed.split_whitespace();
-    let Some(first) = words.next() else {
-        return false;
-    };
-
     if is_password_command_keyword(first) {
         return true;
     }
@@ -1046,7 +1041,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("SET") {
-        let Some(second) = words.next() else {
+        let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
             return false;
         };
         return matches_keyword(
@@ -1117,7 +1112,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("SHOW") {
-        let Some(second) = words.next() else {
+        let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
             return false;
         };
         return matches_keyword(
@@ -1451,6 +1446,11 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn auto_terminated_tool_command_set_with_block_comment_is_detected() {
+        assert!(is_auto_terminated_tool_command("SET /*sqlplus*/ TERMOUT ON"));
+        assert!(is_auto_terminated_tool_command("SET /*a*/ /*b*/ PAGESIZE 100"));
+    }
     #[test]
     fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
         assert!(is_auto_terminated_tool_command("START child.sql"));
