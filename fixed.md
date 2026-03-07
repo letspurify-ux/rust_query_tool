@@ -1764,3 +1764,29 @@
 - `cargo test -q language_clause_with_single_quoted_target_without_external_keyword_marks_external_routine_split` 통과
 - `cargo test -q language_followed_by_` 통과
 - `cargo test -q` 전체 통과
+
+## 2026-03-07 Oracle 공통 파서 엔진 누락 구문 보완 (EXTERNAL routine 후행 `(` 시작 main query 복구)
+
+### [중] `AS LANGUAGE ...;` 뒤 괄호 시작 query(`(SELECT ...)`)가 새 statement head로 분리되지 않던 문제 수정
+- **증상**:
+  - `CREATE FUNCTION ... AS LANGUAGE U'C';` 다음 줄이 `(SELECT ... ) UNION ALL ...;`로 시작하면,
+  - 외부 루틴 선언과 뒤 query가 하나의 statement로 붙어 분리되지 않았습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`에서 `pending_implicit_external_top_level_split` 복구 분기가
+  - 식별자/`@`/`!` 시작문만 새 statement head 후보로 처리했고, line-leading `(` 시작 query를 누락했습니다.
+- **수정**:
+  - `is_line_leading_open_paren_marker` 헬퍼를 추가해 line-leading `(`를 안정적으로 감지합니다.
+  - `pending_implicit_external_top_level_split` 복구 조건에 `(` 케이스를 추가해,
+  - 외부 루틴 직후 괄호 시작 query도 즉시 statement 경계를 복구하도록 보완했습니다.
+
+### [유사 케이스] statement-head 누락 패턴 일괄 점검
+- 동일 복구 경로에서 이미 처리 중인 line-leading `@` run-script marker, `!` host alias와 함께
+- `(` 시작 set-operator query까지 포함하도록 확장해 같은 계열의 head 누락을 한 번에 정리했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sql_parser_engine::tests::external_language_clause_splits_before_parenthesized_query_statement_head`
+
+### [검증]
+- `cargo test -q external_language_clause_splits_before_parenthesized_query_statement_head -- --nocapture` 통과
+- `cargo test -q oracle_with_function_recovers_to_ -- --nocapture` 통과
+- `cargo test` 전체 통과
