@@ -5603,6 +5603,30 @@ fn grammar_hierarchical_query_variant_3() {
 }
 
 #[test]
+fn grammar_hierarchical_search_by_clause_stays_column_context() {
+    let ctx = analyze(
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY | SET ord_seq",
+    );
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn grammar_hierarchical_search_set_alias_does_not_switch_to_with_clause() {
+    let ctx = analyze(
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+}
+
+#[test]
+fn grammar_hierarchical_cycle_set_alias_does_not_switch_to_set_clause() {
+    let ctx = analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'");
+    assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn grammar_with_recursive_style_variant_1() {
     let ctx = analyze(
         "WITH r(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT * FROM r WHERE |",
