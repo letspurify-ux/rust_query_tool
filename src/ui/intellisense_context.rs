@@ -4061,6 +4061,18 @@ fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String
         idx += 1;
     }
 
+    if meaningful.len() == 1 {
+        match meaningful.first().copied() {
+            Some(SqlToken::String(value)) => {
+                return parse_pivot_in_string_literal_output(value);
+            }
+            Some(SqlToken::Word(word)) if is_numeric_literal_word(word) => {
+                return Some(word.to_string());
+            }
+            _ => {}
+        }
+    }
+
     if let Some(SqlToken::Word(last_word)) = meaningful.last().copied() {
         if is_identifier_word_token(last_word) {
             return Some(strip_identifier_quotes(last_word));
@@ -4074,6 +4086,37 @@ fn parse_pivot_in_item_output_column(item_tokens: &[&SqlToken]) -> Option<String
     }
 
     None
+}
+
+fn parse_pivot_in_string_literal_output(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+    if !trimmed.starts_with('\'') || !trimmed.ends_with('\'') {
+        return None;
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    Some(inner.replace("''", "'"))
+}
+
+fn is_numeric_literal_word(word: &str) -> bool {
+    let mut has_digit = false;
+    for ch in word.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+            continue;
+        }
+
+        if matches!(ch, '+' | '-' | '.' | '_' | 'e' | 'E') {
+            continue;
+        }
+
+        return false;
+    }
+
+    has_digit
 }
 
 fn parse_unpivot_output_segment(tokens: &[SqlToken]) -> Vec<String> {

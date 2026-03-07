@@ -5007,6 +5007,32 @@ fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
 }
 
 #[test]
+fn extract_oracle_pivot_projection_columns_from_string_literals_without_alias() {
+    let tokens = tokenize(
+        "SELECT * FROM sales PIVOT (SUM(amount) FOR product IN ('A', 'B', 'C'))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["A", "B", "C"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_columns_from_numeric_literals_without_alias() {
+    let tokens = tokenize("SELECT * FROM sales PIVOT (SUM(amount) FOR quarter_id IN (1, 2, 3))");
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["1", "2", "3"]);
+}
+
+#[test]
+fn extract_oracle_pivot_projection_columns_unescapes_string_literals_without_alias() {
+    let tokens = tokenize("SELECT * FROM sales PIVOT (SUM(amount) FOR product IN ('O''CLOCK'))");
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["O'CLOCK"]);
+}
+
+#[test]
 fn extract_oracle_pivot_xml_projection_keeps_source_columns_without_generated_aliases() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
