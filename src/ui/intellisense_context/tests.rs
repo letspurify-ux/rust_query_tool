@@ -1024,6 +1024,20 @@ fn phase_lock_table_in_clause_is_not_table_context() {
 }
 
 #[test]
+fn phase_lock_table_share_update_mode_does_not_switch_to_update_target() {
+    let ctx = analyze("LOCK TABLE emp IN SHARE UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_lock_table_row_share_update_mode_does_not_switch_to_update_target() {
+    let ctx = analyze("LOCK TABLE emp IN ROW SHARE UPDATE |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_drop_table_is_table_context() {
     let ctx = analyze("DROP TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
