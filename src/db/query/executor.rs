@@ -18,10 +18,7 @@ const STREAM_FETCH_ARRAY_SIZE: u32 = 2_000;
 const STREAM_PREFETCH_ROWS: u32 = STREAM_FETCH_ARRAY_SIZE + 1;
 
 impl QueryExecutor {
-    fn build_streaming_statement(
-        conn: &Connection,
-        sql: &str,
-    ) -> Result<Statement, OracleError> {
+    fn build_streaming_statement(conn: &Connection, sql: &str) -> Result<Statement, OracleError> {
         let mut builder = conn.statement(sql);
         let _ = builder
             .fetch_array_size(STREAM_FETCH_ARRAY_SIZE)
@@ -2024,11 +2021,7 @@ impl QueryExecutor {
         block_depth: usize,
         current_is_empty: bool,
     ) -> bool {
-        is_idle
-            && trimmed == ";"
-            && in_create_plsql
-            && block_depth == 0
-            && !current_is_empty
+        is_idle && trimmed == ";" && in_create_plsql && block_depth == 0 && !current_is_empty
     }
 
     pub(crate) fn should_try_tool_command_with_open_statement(
@@ -2909,9 +2902,9 @@ impl QueryExecutor {
                     idx += 1;
                 } else if token == "SHARING"
                     && tokens.get(idx + 1).is_some_and(|t| *t == "=")
-                    && tokens.get(idx + 2).is_some_and(|t| {
-                        matches!(*t, "METADATA" | "DATA" | "EXTENDED" | "NONE")
-                    })
+                    && tokens
+                        .get(idx + 2)
+                        .is_some_and(|t| matches!(*t, "METADATA" | "DATA" | "EXTENDED" | "NONE"))
                 {
                     idx += 3;
                 }
@@ -2924,6 +2917,12 @@ impl QueryExecutor {
             {
                 idx += 1;
             }
+
+            // Skip SHARED database link modifier.
+            if tokens.get(idx).is_some_and(|t| *t == "SHARED") {
+                idx += 1;
+            }
+
             // Skip NOFORCE trigger modifier.
             if tokens.get(idx).is_some_and(|t| *t == "NOFORCE") {
                 idx += 1;

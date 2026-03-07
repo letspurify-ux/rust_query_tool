@@ -7322,6 +7322,26 @@ fn test_parse_ddl_object_type_create_database_link() {
 }
 
 #[test]
+fn test_parse_ddl_object_type_create_shared_database_link() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE SHARED DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS USING 'TNS'"
+        ),
+        "Database Link"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_or_replace_shared_public_database_link() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE SHARED PUBLIC DATABASE LINK MY_LINK CONNECT TO USER IDENTIFIED BY PASS USING 'TNS'"
+        ),
+        "Database Link"
+    );
+}
+
+#[test]
 fn test_parse_ddl_object_type_create_or_replace_editionable_function() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type(
