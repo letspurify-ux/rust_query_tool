@@ -1461,6 +1461,12 @@ impl SplitState {
                 | "REVERSE" | "CROSSEDITION" => {
                     return;
                 }
+                "MEMBER" | "STATIC" | "CONSTRUCTOR" | "MAP" | "ORDER" | "FINAL"
+                | "INSTANTIABLE" | "OVERRIDING" => {
+                    if self.create_plsql_kind == CreatePlsqlKind::TypeBody {
+                        return;
+                    }
+                }
                 "SHARING" | "METADATA" | "DATA" | "EXTENDED" | "NONE" => {
                     return;
                 }
@@ -2674,6 +2680,53 @@ mod tests {
 
         assert!(state.in_create_plsql());
         assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Procedure);
+    }
+
+    #[test]
+    fn create_type_body_member_modifier_is_not_treated_as_new_create_target() {
+        let mut state = SplitState {
+            create_plsql_kind: CreatePlsqlKind::TypeBody,
+            create_state: CreateState::AwaitingObjectType,
+            ..SplitState::default()
+        };
+
+        state.track_create_plsql("MEMBER");
+        assert!(state.in_create_plsql());
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::TypeBody);
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("FUNCTION");
+        assert!(state.in_create_plsql());
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::TypeBody);
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+    }
+
+    #[test]
+    fn create_type_body_member_function_splits_before_trailing_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE BODY t_member AS");
+        engine.process_line("  MEMBER FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END f;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE TYPE BODY t_member AS"),
+            "first statement should preserve type body text: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("MEMBER FUNCTION f RETURN NUMBER IS"),
+            "first statement should include member function declarative header: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
