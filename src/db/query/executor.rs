@@ -1997,7 +1997,20 @@ impl QueryExecutor {
     }
 
     pub(crate) fn should_attempt_slash_terminator(is_idle: bool, trimmed: &str) -> bool {
-        is_idle && trimmed == "/"
+        if !is_idle {
+            return false;
+        }
+
+        if trimmed == "/" {
+            return true;
+        }
+
+        let Some(rest) = trimmed.strip_prefix('/') else {
+            return false;
+        };
+
+        let rest = rest.trim_start();
+        rest.starts_with("--") || rest.starts_with("/*")
     }
 
     pub(crate) fn should_force_terminate_lone_semicolon(
