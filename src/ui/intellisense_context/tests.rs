@@ -4138,6 +4138,40 @@ fn system_versioning_for_named_period_between_before_alias_is_not_parsed_as_alia
     assert_eq!(resolved, vec!["employees".to_string()]);
 }
 
+#[test]
+fn system_versioning_for_named_period_as_of_date_literal_keeps_alias_visible() {
+    let ctx = analyze("SELECT * FROM employees FOR valid_time AS OF DATE '2025-01-01' e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("VALID_TIME")),
+        "FOR <period> AS OF DATE clause period name must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_named_period_between_date_literals_keeps_alias_visible() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR valid_time BETWEEN DATE '2024-01-01' AND DATE '2024-12-31' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("VALID_TIME")),
+        "FOR <period> BETWEEN DATE literals must not capture period name as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
