@@ -1334,9 +1334,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
+                            && !locking_of_list_can_accept_identifier(tokens, idx)
                         {
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
-                            // modifiers, not expression/table contexts.
+                            // modifiers, not expression/table contexts. Treat WAIT/NOWAIT
+                            // as identifiers at the start of `OF <column list>`.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
@@ -1345,11 +1347,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
+                            && (!locking_of_list_can_accept_identifier(tokens, idx)
+                                || matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED"))
                         {
                             // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
                             // just like NOWAIT/WAIT. Keep `SKIP` as an identifier candidate
-                            // inside `OF <column list>` unless the next keyword is LOCKED.
+                            // while parsing the start of `OF <column list>` (after `OF` or `,`).
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
@@ -1975,6 +1978,30 @@ fn prev_word_upper(tokens: &[SqlToken], before_idx: usize) -> Option<(String, us
         }
     }
     None
+}
+
+fn prev_non_comment_token(tokens: &[SqlToken], before_idx: usize) -> Option<(usize, &SqlToken)> {
+    let mut current_idx = before_idx;
+    while current_idx > 0 {
+        current_idx -= 1;
+        match tokens.get(current_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(token) => return Some((current_idx, token)),
+            None => continue,
+        }
+    }
+
+    None
+}
+
+fn locking_of_list_can_accept_identifier(tokens: &[SqlToken], keyword_idx: usize) -> bool {
+    matches!(
+        prev_non_comment_token(tokens, keyword_idx),
+        Some((_, SqlToken::Word(prev))) if prev.eq_ignore_ascii_case("OF")
+    ) || matches!(
+        prev_non_comment_token(tokens, keyword_idx),
+        Some((_, SqlToken::Symbol(sym))) if sym == ","
+    )
 }
 
 fn is_distinct_from_operator(tokens: &[SqlToken], from_idx: usize) -> bool {
