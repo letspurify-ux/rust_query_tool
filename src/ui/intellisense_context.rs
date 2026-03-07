@@ -1354,6 +1354,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
+                    "COLUMN" if is_comment_on_target(tokens, idx, last_word.as_deref()) => {
+                        // `COMMENT ON COLUMN ...` starts from a table-qualified
+                        // target (`table.column`) and should provide relation
+                        // completions for the leading table/view segment.
+                        depth_frames[depth].phase = SqlPhase::IntoClause;
+                        relation_state.expect_table();
+                    }
                     "JOIN" | "APPLY" => {
                         if upper == "APPLY" {
                             relation_modifier_state.mark_lateral_like();

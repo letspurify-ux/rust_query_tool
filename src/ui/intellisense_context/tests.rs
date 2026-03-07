@@ -1144,6 +1144,20 @@ fn phase_comment_on_editioning_view_with_inline_comment_is_table_context() {
 }
 
 #[test]
+fn phase_comment_on_column_is_table_context() {
+    let ctx = analyze("COMMENT ON COLUMN |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_column_with_inline_comment_is_table_context() {
+    let ctx = analyze("COMMENT ON /* inline */ COLUMN |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_create_index_on_is_table_context() {
     let ctx = analyze("CREATE INDEX idx_emp_dept ON |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
