@@ -1911,7 +1911,9 @@ SELECT 1 FROM dual;"#;
         "AS LANGUAGE MLE MODULE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
         stmts
     );
-    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER"));
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER")
+    );
     assert!(stmts[0].contains("AS LANGUAGE MLE MODULE ext_mle_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -1936,7 +1938,9 @@ SELECT 1 FROM dual;"#;
         "split_format_items should keep AS LANGUAGE MLE MODULE function together and split trailing SELECT: {:?}",
         stmts
     );
-    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER"));
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_module RETURN NUMBER")
+    );
     assert!(stmts[0].contains("AS LANGUAGE MLE MODULE ext_mle_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -1955,7 +1959,9 @@ SELECT 1 FROM dual;"#;
         "AS LANGUAGE MLE SIGNATURE call spec without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
         stmts
     );
-    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER"));
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER")
+    );
     assert!(stmts[0].contains("AS LANGUAGE MLE SIGNATURE ext_signature_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -1980,7 +1986,9 @@ SELECT 1 FROM dual;"#;
         "split_format_items should keep AS LANGUAGE MLE SIGNATURE function together and split trailing SELECT: {:?}",
         stmts
     );
-    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER"));
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_language_mle_signature RETURN NUMBER")
+    );
     assert!(stmts[0].contains("AS LANGUAGE MLE SIGNATURE ext_signature_impl"));
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
@@ -2142,10 +2150,9 @@ SELECT 1 FROM dual;"#;
     assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
 }
 
-
 #[test]
-fn test_create_external_function_language_national_single_quoted_target_without_external_keyword_splits()
-{
+fn test_create_external_function_language_national_single_quoted_target_without_external_keyword_splits(
+) {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_nquoted RETURN NUMBER
 AS LANGUAGE N'C' NAME 'ext_lang_nquoted';
 SELECT 1 FROM dual;"#;
@@ -6521,6 +6528,39 @@ SELECT * FROM cte;"#;
         depths[cte_select_idx] > depths[main_select_idx],
         "CTE SELECT should be deeper than main SELECT"
     );
+}
+
+#[test]
+fn test_line_block_depths_q_quote_invalid_apostrophe_delimiter_does_not_swallow_next_line() {
+    let sql = "SELECT q'' AS val FROM dual;
+SELECT 2 FROM dual;";
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(depths.len(), 2, "unexpected depths: {depths:?}");
+    assert_eq!(depths[0], 0, "first SELECT should stay at top level");
+    assert_eq!(depths[1], 0, "second SELECT should stay at top level");
+}
+
+#[test]
+fn test_split_script_items_q_quote_invalid_apostrophe_delimiter_splits_normally() {
+    let sql = "SELECT q'' AS val FROM dual;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            if let ScriptItem::Statement(s) = item {
+                Some(s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(stmts.len(), 2, "unexpected statements: {stmts:?}");
+    assert_eq!(stmts[0], "SELECT q'' AS val FROM dual".to_string());
+    assert_eq!(stmts[1], "SELECT 2 FROM dual".to_string());
 }
 
 #[test]

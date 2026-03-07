@@ -7,7 +7,7 @@ use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 impl QueryExecutor {
     #[inline]
     fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-        !delimiter.is_whitespace()
+        !delimiter.is_whitespace() && delimiter != '\''
     }
 
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
@@ -2676,7 +2676,8 @@ impl QueryExecutor {
                 Self::append_terminated_statements(&mut builder, &mut items, add_statement);
             }
 
-            let should_attempt_slash = Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
+            let should_attempt_slash =
+                Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
             if should_attempt_slash {
                 builder.prepare_slash_terminator();
             }
@@ -2819,7 +2820,8 @@ impl QueryExecutor {
                 Self::append_terminated_statements(&mut builder, &mut items, add_statement);
             }
 
-            let should_attempt_slash = Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
+            let should_attempt_slash =
+                Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
             if should_attempt_slash {
                 builder.prepare_slash_terminator();
             }
