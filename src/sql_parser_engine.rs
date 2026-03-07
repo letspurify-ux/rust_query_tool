@@ -698,6 +698,8 @@ pub(crate) struct SplitState {
     // -- CREATE PL/SQL tracking --
     create_plsql_kind: CreatePlsqlKind,
     pub(crate) create_state: CreateState,
+    create_object_name_seen: bool,
+    last_symbol_was_dot: bool,
     begin_state: BeginState,
     as_is_follow_state: AsIsFollowState,
     as_is_state: AsIsState,
@@ -967,6 +969,7 @@ impl SplitState {
         self.token_upper_buf = upper_buf;
         self.token.clear();
         self.token_prefixed_with_dollar = false;
+        self.last_symbol_was_dot = false;
         if at_top_level {
             self.top_level_token_state = TopLevelTokenState::Seen;
         }
@@ -1405,6 +1408,8 @@ impl SplitState {
         self.with_clause_state = WithClauseState::None;
         self.top_level_token_state = TopLevelTokenState::NoneSeen;
         self.pending_implicit_external_top_level_split = false;
+        self.create_object_name_seen = false;
+        self.last_symbol_was_dot = false;
     }
 
     /// Reset all state to idle for force-terminate scenarios.
@@ -1422,6 +1427,7 @@ impl SplitState {
     fn track_create_plsql(&mut self, upper: &str) {
         if self.create_plsql_kind == CreatePlsqlKind::TypeSpecAwaitingBody && upper == "BODY" {
             self.create_plsql_kind = CreatePlsqlKind::TypeBody;
+            self.create_object_name_seen = false;
             return;
         }
 
@@ -1430,9 +1436,14 @@ impl SplitState {
         }
 
         if self.in_create_plsql() {
-            if self.block_depth() == 0 && upper == "WRAPPED" {
-                self.create_plsql_kind = CreatePlsqlKind::Wrapped;
-                self.create_state = CreateState::None;
+            if self.block_depth() == 0 {
+                if upper == "WRAPPED" && self.create_object_name_seen && !self.last_symbol_was_dot {
+                    self.create_plsql_kind = CreatePlsqlKind::Wrapped;
+                    self.create_state = CreateState::None;
+                }
+                if !self.create_object_name_seen {
+                    self.create_object_name_seen = true;
+                }
             }
             return;
         }
@@ -1492,6 +1503,7 @@ impl SplitState {
                         _ => CreatePlsqlKind::None,
                     };
                     self.create_state = CreateState::None;
+                    self.create_object_name_seen = false;
                     return;
                 }
                 _ => {
@@ -2406,6 +2418,12 @@ impl SqlParserEngine {
                     self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
                 }
                 _ => {}
+            }
+
+            if c == '.' {
+                self.state.last_symbol_was_dot = true;
+            } else if !c.is_whitespace() {
+                self.state.last_symbol_was_dot = false;
             }
 
             // Pending END on separator
@@ -7030,5 +7048,65 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("$IF $$PLSQL_DEBUG $THEN"));
         assert_eq!(statements[1], "SELECT 41 FROM dual".to_string());
+    }
+
+    #[test]
+    fn wrapped_procedure_without_semicolon_splits_on_slash_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE p_wrapped wrapped");
+        engine.process_line("a000000");
+        engine.process_line("/");
+        engine.process_line("SELECT 43 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE PROCEDURE p_wrapped wrapped"),
+            "wrapped unit should terminate on slash line: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].contains("SELECT 43 FROM dual"),
+            "trailing SELECT should split into second statement after slash: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_function_named_wrapped_splits_before_following_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION wrapped RETURN NUMBER");
+        engine.process_line("EXTERNAL NAME \"wrapped\" LANGUAGE C;");
+        engine.process_line("SELECT 44 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("EXTERNAL NAME \"wrapped\" LANGUAGE C"),
+            "call specification should remain in CREATE statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 44 FROM dual".to_string());
+    }
+    #[test]
+    fn create_procedure_named_wrapped_does_not_require_slash_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE wrapped IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 42 FROM dual;");
+
+        let statements = engine.take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped IS"),
+            "procedure named wrapped should terminate on END; without slash: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 42 FROM dual".to_string());
     }
 }
