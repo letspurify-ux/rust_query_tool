@@ -3572,9 +3572,6 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
         columns = extract_table_function_columns(tokens);
     }
     if columns.is_empty() {
-        columns = extract_oracle_pivot_unpivot_projection_columns(tokens);
-    }
-    if columns.is_empty() {
         columns = extract_oracle_model_generated_columns(tokens);
     }
     if columns.is_empty() {

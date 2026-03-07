@@ -5060,6 +5060,29 @@ fn extract_oracle_unpivot_projection_with_nested_pivot_source() {
     assert_eq!(cols, vec!["job", "sum_sal", "dept_tag"]);
 }
 
+#[test]
+fn extract_oracle_pivot_projection_with_multi_column_for_clause() {
+    let tokens = tokenize(
+        "SELECT * FROM (SELECT year_key, quarter_key, sales_amt FROM sales_fact) \
+         PIVOT (SUM(sales_amt) FOR (year_key, quarter_key) IN ((2024, 'Q1') AS y2024_q1))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["y2024_q1"]);
+}
+
+#[test]
+fn extract_oracle_unpivot_projection_with_multi_column_output_and_for_clause() {
+    let tokens = tokenize(
+        "SELECT * FROM sales_half \
+         UNPIVOT ((sales_amt, cost_amt) FOR (half_year, quarter_tag) \
+         IN ((h1_sales, h1_cost) AS ('H1', 'QX'), (h2_sales, h2_cost) AS ('H2', 'QY')))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["sales_amt", "cost_amt", "half_year", "quarter_tag"]);
+}
+
 // ─── SELECT list column extraction tests ─────────────────────────────────
 
 #[test]
