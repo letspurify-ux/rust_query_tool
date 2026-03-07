@@ -5565,7 +5565,7 @@ impl SqlEditorWidget {
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
-                                            &[result.message.clone()],
+                                            std::slice::from_ref(&result.message),
                                         );
                                     }
                                     let _ = sender.send(QueryProgress::StatementFinished {
@@ -5635,7 +5635,7 @@ impl SqlEditorWidget {
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
-                                            &[result.message.clone()],
+                                            std::slice::from_ref(&result.message),
                                         );
                                     }
                                     let _ = sender.send(QueryProgress::StatementFinished {
@@ -6017,8 +6017,11 @@ impl SqlEditorWidget {
                                     continue;
                                 }
 
+                                // Capture success before moving result into the channel
+                                // to avoid cloning the entire QueryResult.
+                                let result_success = result.success;
                                 if script_mode {
-                                    if result.success {
+                                    if result_success {
                                         SqlEditorWidget::emit_script_lines(
                                             &sender,
                                             &session,
@@ -6029,7 +6032,7 @@ impl SqlEditorWidget {
                                         &sender,
                                         &conn_name,
                                         result_index,
-                                        result.clone(),
+                                        result,
                                         timed_out,
                                     );
                                 } else {
@@ -6039,12 +6042,12 @@ impl SqlEditorWidget {
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
-                                            &[result.message.clone()],
+                                            std::slice::from_ref(&result.message),
                                         );
                                     }
                                     let _ = sender.send(QueryProgress::StatementFinished {
                                         index,
-                                        result: result.clone(),
+                                        result,
                                         connection_name: conn_name.clone(),
                                         timed_out,
                                     });
@@ -6167,19 +6170,22 @@ impl SqlEditorWidget {
                                                 .map(|c| c.name.clone())
                                                 .collect();
 
+                                            // Spool output before sending to avoid
+                                            // cloning the message string a second time.
+                                            if !query_result.message.trim().is_empty() {
+                                                SqlEditorWidget::append_spool_output(
+                                                    &session,
+                                                    std::slice::from_ref(&query_result.message),
+                                                );
+                                            }
+                                            let cursor_success = query_result.success;
                                             let _ = sender.send(QueryProgress::StatementFinished {
                                                 index,
-                                                result: query_result.clone(),
+                                                result: query_result,
                                                 connection_name: conn_name.clone(),
                                                 timed_out: cursor_timed_out,
                                             });
                                             app::awake();
-                                            if !query_result.message.trim().is_empty() {
-                                                SqlEditorWidget::append_spool_output(
-                                                    &session,
-                                                    &[query_result.message.clone()],
-                                                );
-                                            }
                                             result_index += 1;
 
                                             let mut guard = match session.lock() {
@@ -6201,7 +6207,7 @@ impl SqlEditorWidget {
                                                 stop_execution = true;
                                                 break;
                                             }
-                                            if !query_result.success && !continue_on_error {
+                                            if !cursor_success && !continue_on_error {
                                                 stop_execution = true;
                                                 break;
                                             }
@@ -6348,26 +6354,29 @@ impl SqlEditorWidget {
                                                 query_result.message.clear();
                                             }
 
+                                            // Spool output before sending to avoid
+                                            // cloning the message string a second time.
+                                            if !query_result.message.trim().is_empty() {
+                                                SqlEditorWidget::append_spool_output(
+                                                    &session,
+                                                    std::slice::from_ref(&query_result.message),
+                                                );
+                                            }
+                                            let cursor_success = query_result.success;
                                             let _ = sender.send(QueryProgress::StatementFinished {
                                                 index,
-                                                result: query_result.clone(),
+                                                result: query_result,
                                                 connection_name: conn_name.clone(),
                                                 timed_out: cursor_timed_out,
                                             });
                                             app::awake();
-                                            if !query_result.message.trim().is_empty() {
-                                                SqlEditorWidget::append_spool_output(
-                                                    &session,
-                                                    &[query_result.message.clone()],
-                                                );
-                                            }
                                             result_index += 1;
 
                                             if cursor_timed_out {
                                                 stop_execution = true;
                                                 break;
                                             }
-                                            if !query_result.success && !continue_on_error {
+                                            if !cursor_success && !continue_on_error {
                                                 stop_execution = true;
                                                 break;
                                             }
@@ -6411,7 +6420,7 @@ impl SqlEditorWidget {
                                 let should_stop_after_statement = stop_execution
                                     || cancel_requested
                                     || timed_out
-                                    || (!result.success && !continue_on_error);
+                                    || (!result_success && !continue_on_error);
                                 if SqlEditorWidget::should_capture_post_execution_output(
                                     cancel_requested,
                                     timed_out,
@@ -6739,7 +6748,7 @@ impl SqlEditorWidget {
                                             if !query_result.message.trim().is_empty() {
                                                 SqlEditorWidget::append_spool_output(
                                                     &session,
-                                                    &[query_result.message.clone()],
+                                                    std::slice::from_ref(&query_result.message),
                                                 );
                                             }
                                             query_result
@@ -6835,9 +6844,10 @@ impl SqlEditorWidget {
                                 } else {
                                     result.execution_time
                                 };
+                                let result_success = result.success;
                                 let _ = sender.send(QueryProgress::StatementFinished {
                                     index,
-                                    result: result.clone(),
+                                    result,
                                     connection_name: conn_name.clone(),
                                     timed_out,
                                 });
@@ -6847,7 +6857,7 @@ impl SqlEditorWidget {
                                 let cancel_requested = load_mutex_bool(&cancel_flag);
                                 let should_stop_after_statement = cancel_requested
                                     || timed_out
-                                    || (!result.success && !continue_on_error);
+                                    || (!result_success && !continue_on_error);
                                 let skip_post_execution_output =
                                     should_stop_after_statement || statement_interrupted;
                                 if SqlEditorWidget::should_capture_post_execution_output(
@@ -7115,8 +7125,11 @@ impl SqlEditorWidget {
                                     }
                                 }
 
+                                // Capture success before moving result into the channel
+                                // to avoid cloning the entire QueryResult.
+                                let result_success = result.success;
                                 if script_mode {
-                                    if result.success {
+                                    if result_success {
                                         SqlEditorWidget::emit_script_lines(
                                             &sender,
                                             &session,
@@ -7127,7 +7140,7 @@ impl SqlEditorWidget {
                                         &sender,
                                         &conn_name,
                                         result_index,
-                                        result.clone(),
+                                        result,
                                         timed_out,
                                     );
                                 } else {
@@ -7137,12 +7150,12 @@ impl SqlEditorWidget {
                                     if !result.message.trim().is_empty() {
                                         SqlEditorWidget::append_spool_output(
                                             &session,
-                                            &[result.message.clone()],
+                                            std::slice::from_ref(&result.message),
                                         );
                                     }
                                     let _ = sender.send(QueryProgress::StatementFinished {
                                         index,
-                                        result: result.clone(),
+                                        result,
                                         connection_name: conn_name.clone(),
                                         timed_out,
                                     });
@@ -7177,7 +7190,7 @@ impl SqlEditorWidget {
                                 let cancel_requested = load_mutex_bool(&cancel_flag);
                                 let should_stop_after_statement = cancel_requested
                                     || timed_out
-                                    || (!result.success && !continue_on_error);
+                                    || (!result_success && !continue_on_error);
                                 if SqlEditorWidget::should_capture_post_execution_output(
                                     cancel_requested,
                                     timed_out,
@@ -7730,7 +7743,7 @@ impl SqlEditorWidget {
             result.message.clear();
         }
         if !result.message.trim().is_empty() {
-            SqlEditorWidget::append_spool_output(session, &[result.message.clone()]);
+            SqlEditorWidget::append_spool_output(session, std::slice::from_ref(&result.message));
         }
         let _ = sender.send(QueryProgress::StatementFinished {
             index,
