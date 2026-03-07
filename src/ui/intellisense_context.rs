@@ -3078,6 +3078,8 @@ fn is_table_stop_keyword(word: &str) -> bool {
             | "PURGE"
             | "STORAGE"
             | "MATERIALIZED"
+            | "REJECT"
+            | "UNLIMITED"
             | "TO"
     )
 }
