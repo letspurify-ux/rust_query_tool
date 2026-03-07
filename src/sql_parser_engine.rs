@@ -6460,6 +6460,34 @@ BEGIN"
         assert_eq!(statements[0], "SHUTDOWN IMMEDIATE".to_string());
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
+
+    #[test]
+    fn sqlplus_archive_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("ARCHIVE LOG LIST");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "ARCHIVE LOG LIST".to_string());
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn sqlplus_recover_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("RECOVER DATABASE");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "RECOVER DATABASE".to_string());
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
     #[test]
     fn external_language_clause_splits_before_shutdown_statement_head() {
         let mut engine = SqlParserEngine::new();
@@ -6484,7 +6512,7 @@ BEGIN"
 
 
     #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
+    fn external_language_clause_splits_before_recover_statement_head_with_following_statement() {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE FUNCTION ext_recover_head RETURN NUMBER");
