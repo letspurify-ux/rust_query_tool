@@ -6345,6 +6345,23 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_set_command_with_block_comment_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SET /*sqlplus*/ SERVEROUTPUT ON");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "SET /*sqlplus*/ SERVEROUTPUT ON".to_string(),
+                "SELECT 1 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn sqlplus_show_command_is_auto_terminated() {
         let mut engine = SqlParserEngine::new();
 
