@@ -1725,13 +1725,29 @@ fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
         }
 
         if !ch.is_whitespace() {
-            return false;
+            break;
         }
 
         idx += 1;
     }
 
-    true
+    if idx >= chars.len() || chars[idx] == '\n' {
+        return true;
+    }
+
+    if chars[idx] == '-' && chars.get(idx + 1).copied() == Some('-') {
+        return true;
+    }
+
+    let is_ascii_boundary = |offset: usize| {
+        chars
+            .get(offset)
+            .copied()
+            .is_none_or(|ch| ch.is_whitespace())
+    };
+
+    chars_starts_with(chars, idx, "REM") && is_ascii_boundary(idx + 3)
+        || chars_starts_with(chars, idx, "REMARK") && is_ascii_boundary(idx + 6)
 }
 
 // ---------------------------------------------------------------------------
@@ -5531,6 +5547,53 @@ BEGIN"
         assert!(
             statements[1].starts_with("@@child_script.sql"),
             "double run-script marker should start the next statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_slash_line_with_sqlplus_comment() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("/");
+        engine.process_line("-- rerun statement");
+        engine.process_line("SELECT f() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("WITH\n  FUNCTION f RETURN NUMBER IS"),
+            "WITH FUNCTION declaration should remain the first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("/\n-- rerun statement\nSELECT f() FROM dual"),
+            "slash terminator with SQL*Plus comment should start the next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_slash_line_with_sqlplus_remark() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_slash_rem RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("/ REM rerun external");
+        engine.process_line("SELECT 52 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("/ REM rerun external\nSELECT 52 FROM dual"),
+            "slash line with REM comment should start the next statement: {}",
             statements[1]
         );
     }
