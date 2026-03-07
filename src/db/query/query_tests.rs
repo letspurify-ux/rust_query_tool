@@ -10562,6 +10562,86 @@ SELECT 2 FROM dual;"
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_recovers_to_sqlplus_admin_commands() {
+    for admin_command in [
+        "STARTUP",
+        "SHUTDOWN IMMEDIATE",
+        "ARCHIVE LOG LIST",
+        "RECOVER DATABASE",
+    ] {
+        let sql = format!(
+            "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+{admin_command}
+SELECT 2 FROM dual;"
+        );
+        let items = QueryExecutor::split_script_items(&sql);
+
+        assert!(
+            matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains(admin_command)),
+            "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+        );
+        assert!(
+            matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == admin_command && message.contains("not supported") && *is_error),
+            "second item should classify {admin_command} as unsupported SQL*Plus admin command without leaking into SQL statement: {items:?}"
+        );
+        assert!(
+            matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+            "third item should be trailing SELECT statement: {items:?}"
+        );
+    }
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_recovers_to_sqlplus_admin_commands() {
+    for admin_command in [
+        "STARTUP",
+        "SHUTDOWN IMMEDIATE",
+        "ARCHIVE LOG LIST",
+        "RECOVER DATABASE",
+    ] {
+        let sql = format!(
+            "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+{admin_command}
+SELECT 2 FROM dual;"
+        );
+
+        let items = QueryExecutor::split_format_items(&sql);
+        let stmts: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                FormatItem::Statement(stmt) => Some(stmt.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            stmts.first().is_some_and(|stmt| {
+                stmt.contains("WITH") && stmt.contains("FUNCTION f") && !stmt.contains(admin_command)
+            }),
+            "first formatted statement should keep only WITH FUNCTION declaration statement: {stmts:?}"
+        );
+        assert!(
+            matches!(&items[1], FormatItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == admin_command && message.contains("not supported") && *is_error),
+            "second item should classify {admin_command} as unsupported SQL*Plus admin command without leaking into SQL statement: {items:?}"
+        );
+        assert!(
+            stmts
+                .get(1)
+                .is_some_and(|stmt| stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+            "second formatted statement should be trailing SELECT statement: {stmts:?}"
+        );
+    }
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_run_script_statement_head() {
     let sql = r#"WITH
   FUNCTION f RETURN NUMBER IS
