@@ -4390,6 +4390,70 @@ fn merge_delete_where_expression_does_not_start_new_delete_target_context() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 }
 
+#[test]
+fn merge_when_not_matched_by_source_delete_where_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE WHERE |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn merge_when_not_matched_by_target_insert_values_is_values_clause() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED BY TARGET THEN INSERT (id) VALUES (|)",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::ValuesClause);
+}
+
+#[test]
+fn merge_when_not_matched_by_source_update_set_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED BY SOURCE THEN UPDATE SET t.val = |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn insert_first_else_into_is_table_context() {
+    let ctx = analyze(
+        "INSERT FIRST WHEN deptno = 10 THEN INTO emp10 (id) VALUES (id) ELSE INTO | SELECT id, deptno FROM emp",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn insert_first_else_into_does_not_capture_else_as_alias() {
+    let ctx = analyze(
+        "INSERT FIRST WHEN deptno = 10 THEN INTO emp10 (id) VALUES (id) ELSE INTO emp_other (id) VALUES (id) SELECT | FROM dual",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(
+        aliases.iter().all(|alias| alias != "ELSE"),
+        "ELSE keyword must not be parsed as relation alias: {:?}",
+        aliases
+    );
+}
+
 // ─── Complex CTE with multiple levels ────────────────────────────────────
 
 #[test]
@@ -5445,6 +5509,17 @@ fn extract_oracle_pivot_projection_with_multi_column_for_clause() {
 }
 
 #[test]
+fn extract_oracle_pivot_projection_with_quoted_generated_alias() {
+    let tokens = tokenize(
+        "SELECT * FROM sales_fact \
+         PIVOT (SUM(sales_amt) FOR quarter_key IN ('Q1' AS \"Q1 SALES\"))",
+    );
+
+    let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
+    assert_eq!(cols, vec!["Q1 SALES"]);
+}
+
+#[test]
 fn extract_oracle_unpivot_projection_with_multi_column_output_and_for_clause() {
     let tokens = tokenize(
         "SELECT * FROM sales_half \
@@ -5454,6 +5529,17 @@ fn extract_oracle_unpivot_projection_with_multi_column_output_and_for_clause() {
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["sales_amt", "cost_amt", "half_year", "quarter_tag"]);
+}
+
+#[test]
+fn extract_oracle_unpivot_generated_columns_strip_quotes() {
+    let tokens = tokenize(
+        "SELECT * FROM sales_half \
+         UNPIVOT ((\"sales amount\") FOR \"quarter tag\" IN (h1_sales AS 'H1'))",
+    );
+
+    let cols = extract_oracle_unpivot_generated_columns(&tokens);
+    assert_eq!(cols, vec!["sales amount", "quarter tag"]);
 }
 
 // ─── SELECT list column extraction tests ─────────────────────────────────
