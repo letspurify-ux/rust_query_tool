@@ -745,6 +745,9 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "COMMENT",
     "SET",
     "SHOW",
+    "STORE",
+    "GET",
+    "SAVE",
     "USE",
     "DESCRIBE",
     "DESC",
@@ -1159,6 +1162,9 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("SPOOL")
+        || first.eq_ignore_ascii_case("STORE")
+        || first.eq_ignore_ascii_case("GET")
+        || first.eq_ignore_ascii_case("SAVE")
         || first.eq_ignore_ascii_case("DESCRIBE")
         || first.eq_ignore_ascii_case("DESC")
         || first.eq_ignore_ascii_case("EXEC")
@@ -1405,6 +1411,9 @@ mod tests {
         assert!(is_auto_terminated_tool_command("ARCHIVE LOG LIST"));
         assert!(is_auto_terminated_tool_command("RECOVER DATABASE"));
         assert!(is_auto_terminated_tool_command("SPOOL out.log"));
+        assert!(is_auto_terminated_tool_command("STORE SET out.sql REPLACE"));
+        assert!(is_auto_terminated_tool_command("GET script.sql"));
+        assert!(is_auto_terminated_tool_command("SAVE script.sql"));
         assert!(is_auto_terminated_tool_command("DESCRIBE emp"));
         assert!(is_auto_terminated_tool_command("DESC emp"));
         assert!(is_auto_terminated_tool_command("EXEC dbms_output.put_line('x')"));
