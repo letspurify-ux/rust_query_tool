@@ -384,7 +384,6 @@ impl RoutineFrame {
                 | '>'
                 | '|'
                 | ','
-                | ';'
                 | '.'
                 | '('
                 | ')'
@@ -398,13 +397,16 @@ impl RoutineFrame {
     }
 
     fn finalize_external_clause_on_semicolon(&mut self) {
-        if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-            self.mark_external_clause();
-            return;
-        }
-
-        if self.external_clause_state == ExternalClauseState::SawImplicitLanguageTarget {
-            self.mark_implicit_language_target_on_semicolon();
+        match self.external_clause_state {
+            ExternalClauseState::SawExternalKeyword
+            | ExternalClauseState::AwaitingLanguageTargetFromExternal => {
+                self.mark_external_clause();
+            }
+            ExternalClauseState::SawImplicitLanguageTarget
+            | ExternalClauseState::AwaitingLanguageTargetImplicit => {
+                self.mark_implicit_language_target_on_semicolon();
+            }
+            _ => {}
         }
     }
 }
@@ -4625,6 +4627,28 @@ BEGIN"
     }
 
     #[test]
+    fn external_language_without_target_still_splits_at_top_level() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_missing_target RETURN NUMBER");
+        engine.process_line("AS EXTERNAL LANGUAGE;");
+        engine.process_line("SELECT 13 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS EXTERNAL LANGUAGE"),
+            "external call spec should stay in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SELECT 13 FROM dual"),
+            "SELECT should be split into next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn package_nested_external_without_language_target_closes_on_semicolon() {
         let mut engine = SqlParserEngine::new();
 
@@ -4642,6 +4666,30 @@ BEGIN"
         );
         assert!(
             statements[0].contains("END pkg_ext_missing_target"),
+            "package body END should stay in first statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 14 FROM dual".to_string());
+    }
+
+    #[test]
+    fn package_nested_external_language_without_target_closes_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_ext_missing_lang_target AS");
+        engine.process_line("  PROCEDURE p IS EXTERNAL LANGUAGE;");
+        engine.process_line("END pkg_ext_missing_lang_target;");
+        engine.process_line("SELECT 14 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROCEDURE p IS EXTERNAL LANGUAGE"),
+            "nested external routine should remain inside package body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END pkg_ext_missing_lang_target"),
             "package body END should stay in first statement: {}",
             statements[0]
         );
