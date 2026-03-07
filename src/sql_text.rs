@@ -765,6 +765,11 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "EXIT",
     "QUIT",
     "HOST",
+    "TIMING",
+    "TTITLE",
+    "BTITLE",
+    "REPHEADER",
+    "REPFOOTER",
     "PASSWORD",
     "PASSW",
     "CREATE",
@@ -978,6 +983,15 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("HOST") || first == "!" {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("TIMING")
+        || first.eq_ignore_ascii_case("TTITLE")
+        || first.eq_ignore_ascii_case("BTITLE")
+        || first.eq_ignore_ascii_case("REPHEADER")
+        || first.eq_ignore_ascii_case("REPFOOTER")
+    {
         return true;
     }
 

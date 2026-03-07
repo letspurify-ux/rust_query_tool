@@ -3030,6 +3030,19 @@ impl QueryExecutor {
             });
         }
 
+        if Self::is_word_command(&upper, "TIMING")
+            || Self::is_word_command(&upper, "TTITLE")
+            || Self::is_word_command(&upper, "BTITLE")
+            || Self::is_word_command(&upper, "REPHEADER")
+            || Self::is_word_command(&upper, "REPFOOTER")
+        {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "SQL*Plus report command is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
         if upper.starts_with("SET ERRORCONTINUE") {
             return Some(Self::parse_errorcontinue_command(trimmed));
         }
