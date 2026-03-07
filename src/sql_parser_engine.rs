@@ -2304,6 +2304,17 @@ impl SqlParserEngine {
                 self.split_current_statement();
             }
 
+            if self.state.in_create_plsql()
+                && self.state.block_depth() == 0
+                && self.state.paren_depth == 0
+                && self.state.token.is_empty()
+                && c == '/'
+                && is_line_leading_slash_marker(chars, i)
+            {
+                self.split_current_statement();
+                self.state.reset_create_state();
+            }
+
             self.state.flush_token();
             self.state.track_with_main_query_symbol(c);
             self.state.observe_external_clause_symbol(c, next);
@@ -6385,5 +6396,48 @@ BEGIN"
             statements[0]
         );
         assert_eq!(statements[1], "SELECT 38 FROM dual".to_string());
+    }
+
+    #[test]
+    fn create_function_aggregate_using_clause_splits_before_following_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION median_agg(x NUMBER)");
+        engine.process_line("RETURN NUMBER");
+        engine.process_line("AGGREGATE USING median_impl;");
+        engine.process_line("SELECT 39 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AGGREGATE USING median_impl"),
+            "AGGREGATE USING call spec should stay in CREATE statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 39 FROM dual".to_string());
+    }
+
+    #[test]
+    fn create_function_pipelined_using_clause_without_semicolon_uses_slash_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION stream_rows");
+        engine.process_line("RETURN row_tab_t PIPELINED");
+        engine.process_line("USING stream_rows_impl");
+        engine.process_line("/");
+        engine.process_line("SELECT 40 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("USING stream_rows_impl"),
+            "PIPELINED USING clause should stay in CREATE statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].contains("SELECT 40 FROM dual"),
+            "trailing SELECT should split after slash terminator: {}",
+            statements[1]
+        );
     }
 }
