@@ -966,6 +966,28 @@ fn phase_rename_table_is_table_context() {
 }
 
 #[test]
+fn phase_oracle_rename_target_is_table_context() {
+    let ctx = analyze("RENAME |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn oracle_rename_to_clause_is_not_treated_as_table_alias() {
+    let ctx = analyze("RENAME employees TO |");
+
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("TO")),
+        "TO keyword in RENAME syntax must not be parsed as relation alias: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+#[test]
 fn phase_analyze_table_is_table_context() {
     let ctx = analyze("ANALYZE TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
