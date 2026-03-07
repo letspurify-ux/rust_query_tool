@@ -791,6 +791,7 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "RENAME",
     "PURGE",
     "FLASHBACK",
+    "RECOVER",
     "SAVEPOINT",
     "LOCK",
     "COMMIT",
