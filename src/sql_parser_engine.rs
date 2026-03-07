@@ -2222,7 +2222,7 @@ impl SqlParserEngine {
                             && (sql_text::is_with_main_query_keyword(&candidate_upper)
                                 || sql_text::is_statement_head_keyword(&candidate_upper))
                         {
-                            self.split_current_statement();
+                            self.split_current_and_reset_external_boundary();
                         } else if self
                             .state
                             .should_split_before_implicit_external_begin_block(&candidate_upper)
@@ -4525,6 +4525,24 @@ BEGIN"
     }
 
     #[test]
+    fn implicit_external_split_clears_routine_boundary_before_next_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_name_first RETURN NUMBER");
+        engine.process_line("AS EXTERNAL");
+        engine.process_line("NAME \"ext_name_first\" LIBRARY extlib LANGUAGE C;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        assert_eq!(
+            engine.finalize_and_take_statements(),
+            vec![
+                "CREATE OR REPLACE FUNCTION ext_name_first RETURN NUMBER\nAS EXTERNAL\nNAME \"ext_name_first\" LIBRARY extlib LANGUAGE C;".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn end_if_with_label_closes_block_and_splits_next_statement() {
         let mut engine = SqlParserEngine::new();
 
@@ -5572,7 +5590,7 @@ BEGIN"
         );
         assert_eq!(
             statements[1],
-            "PROMPT after external\nSELECT 33 FROM dual;".to_string()
+            "PROMPT after external\nSELECT 33 FROM dual".to_string()
         );
     }
 
@@ -5592,7 +5610,7 @@ BEGIN"
             "first statement should keep EXTERNAL call spec: {}",
             statements[0]
         );
-        assert_eq!(statements[1], "HOST ls\nSELECT 34 FROM dual;".to_string());
+        assert_eq!(statements[1], "HOST ls\nSELECT 34 FROM dual".to_string());
     }
 
     #[test]
@@ -5630,7 +5648,7 @@ BEGIN"
             "first statement should keep EXTERNAL call spec: {}",
             statements[0]
         );
-        assert_eq!(statements[1], "EXIT\nSELECT 36 FROM dual;".to_string());
+        assert_eq!(statements[1], "EXIT\nSELECT 36 FROM dual".to_string());
     }
 
     #[test]
