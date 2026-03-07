@@ -2063,6 +2063,45 @@ fn minus_second_select_does_not_leak_left_operand_tables_into_scope() {
     );
 }
 
+#[test]
+fn multiset_union_inside_expression_keeps_where_phase_and_table_scope() {
+    let ctx = analyze("SELECT * FROM t WHERE nested_col MULTISET UNION DISTINCT | IS NOT NULL");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"T".to_string()),
+        "MULTISET UNION in expression should not reset statement scope: {:?}",
+        names
+    );
+}
+
+#[test]
+fn multiset_except_inside_expression_keeps_where_phase_and_table_scope() {
+    let ctx = analyze("SELECT * FROM t WHERE nested_col MULTISET EXCEPT | IS NOT NULL");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"T".to_string()),
+        "MULTISET EXCEPT in expression should not reset statement scope: {:?}",
+        names
+    );
+}
+
+#[test]
+fn multiset_intersect_inside_expression_keeps_where_phase_and_table_scope() {
+    let ctx = analyze("SELECT * FROM t WHERE nested_col MULTISET INTERSECT | IS NOT NULL");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.contains(&"T".to_string()),
+        "MULTISET INTERSECT in expression should not reset statement scope: {:?}",
+        names
+    );
+}
+
 // ─── Qualifier resolution tests ──────────────────────────────────────────
 
 #[test]
