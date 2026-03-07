@@ -1678,6 +1678,10 @@ impl SqlParserEngine {
         self.state.can_terminate_on_slash()
     }
 
+    pub(crate) fn has_pending_end(&self) -> bool {
+        self.state.pending_end == PendingEnd::End
+    }
+
     pub(crate) fn is_trigger(&self) -> bool {
         self.state.is_trigger()
     }

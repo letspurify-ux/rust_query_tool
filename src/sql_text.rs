@@ -775,6 +775,8 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "DISASSOCIATE",
     "GRANT",
     "REVOKE",
+    "VALUES",
+    "TABLE",
 ];
 
 #[inline]
