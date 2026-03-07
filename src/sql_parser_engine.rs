@@ -87,7 +87,11 @@ enum EndTokenRole {
 }
 
 impl EndTokenRole {
-    fn from_token(token_upper: &str, pending_end: PendingEnd, allow_timing_point_suffix: bool) -> Self {
+    fn from_token(
+        token_upper: &str,
+        pending_end: PendingEnd,
+        allow_timing_point_suffix: bool,
+    ) -> Self {
         if pending_end != PendingEnd::End {
             return Self::None;
         }
@@ -1446,7 +1450,9 @@ impl SplitState {
     }
 
     fn track_with_main_query_symbol(&mut self, ch: char) {
-        if !self.with_clause_waiting_main_query() || self.block_depth() != 0 || self.paren_depth != 0
+        if !self.with_clause_waiting_main_query()
+            || self.block_depth() != 0
+            || self.paren_depth != 0
         {
             return;
         }
@@ -3000,6 +3006,31 @@ mod tests {
     }
 
     #[test]
+    fn compound_trigger_with_statement_timing_point_splits_on_outer_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_stmt");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 4 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END BEFORE STATEMENT"),
+            "first statement should preserve STATEMENT timing point closure: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 4 FROM dual"));
+    }
+
+    #[test]
     fn finalize_clears_transient_parser_state_for_reuse() {
         let mut engine = SqlParserEngine::new();
         engine.process_line("FOR i IN 1..10");
@@ -3370,7 +3401,6 @@ mod tests {
         assert!(statements[0].contains("AS LANGUAGE 'C' NAME 'ext_lang_quoted'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
-
 
     #[test]
     fn language_clause_with_national_single_quoted_target_without_external_keyword_marks_external_routine_split(
