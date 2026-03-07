@@ -262,6 +262,11 @@ impl RoutineFrame {
                 return;
             }
 
+            if from_external && token_upper.chars().all(sql_text::is_identifier_char) {
+                self.mark_external_clause();
+                return;
+            }
+
             if from_external && sql_text::is_external_language_clause_keyword(token_upper) {
                 // Be permissive for malformed call specs such as
                 // `EXTERNAL LANGUAGE PARAMETERS ...` without an explicit

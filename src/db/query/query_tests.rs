@@ -1655,6 +1655,48 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_name_identifier_without_quotes_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_ident RETURN NUMBER
+AS LANGUAGE C NAME ext_lang_ident;
+SELECT 7 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "external call spec with identifier NAME target should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].contains("NAME ext_lang_ident"));
+    assert!(stmts[1].starts_with("SELECT 7 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_function_name_identifier_without_quotes_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_ident RETURN NUMBER
+AS LANGUAGE C NAME ext_lang_ident;
+SELECT 7 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep identifier NAME call spec function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].contains("NAME ext_lang_ident"));
+    assert!(stmts[1].starts_with("SELECT 7 FROM dual"));
+}
+
+#[test]
 fn test_split_format_items_external_language_clause_with_nqquoted_target_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_nqquoted RETURN NUMBER
 AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted';
