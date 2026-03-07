@@ -510,6 +510,13 @@ fn is_locking_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     false
 }
 
+fn is_multiset_set_operator(tokens: &[SqlToken], idx: usize) -> bool {
+    matches!(
+        previous_word_upper(tokens, idx),
+        Some((prev, _)) if prev == "MULTISET"
+    )
+}
+
 fn locking_for_clause_has_of_target(tokens: &[SqlToken], start_idx: usize) -> bool {
     let Some((first_keyword, first_idx)) = next_word_upper(tokens, start_idx) else {
         return false;
@@ -1708,14 +1715,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
-                        depth_frames[depth].phase = SqlPhase::Initial;
-                        depth_frames[depth].hierarchical_clause_active = false;
-                        relation_state.clear();
-                        begin_set_operator_operand_scope(
-                            &mut scope_stack,
-                            &mut next_scope_id,
-                            &mut visible_parent,
-                        );
+                        if is_multiset_set_operator(tokens, idx) {
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            depth_frames[depth].hierarchical_clause_active = false;
+                            relation_state.clear();
+                            begin_set_operator_operand_scope(
+                                &mut scope_stack,
+                                &mut next_scope_id,
+                                &mut visible_parent,
+                            );
+                        }
                     }
                     kw if is_table_stop_keyword(kw) && relation_state.is_expect_table() => {
                         relation_state.clear();
