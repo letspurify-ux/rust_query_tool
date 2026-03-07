@@ -225,7 +225,7 @@ impl<'a> Iterator for TopLevelScanner<'a> {
 impl QueryExecutor {
     #[inline]
     fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-        !delimiter.is_whitespace() && delimiter != '\''
+        delimiter.is_ascii() && !delimiter.is_ascii_whitespace() && delimiter != '\''
     }
 
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
@@ -2063,7 +2063,7 @@ impl QueryExecutor {
                 && bytes.get(pos + 2) == Some(&b'\'')
             {
                 if let Some(&delim) = bytes.get(pos + 3) {
-                    if !delim.is_ascii_whitespace() && delim != b'\'' {
+                    if Self::is_valid_q_quote_delimiter(char::from(delim)) {
                         q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
                         pos += 4;
                         continue;
@@ -2072,7 +2072,7 @@ impl QueryExecutor {
             }
             if (b == b'q' || b == b'Q') && bytes.get(pos + 1) == Some(&b'\'') {
                 if let Some(&delim) = bytes.get(pos + 2) {
-                    if !delim.is_ascii_whitespace() && delim != b'\'' {
+                    if Self::is_valid_q_quote_delimiter(char::from(delim)) {
                         q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
                         pos += 3;
                         continue;

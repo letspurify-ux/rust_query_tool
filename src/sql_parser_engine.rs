@@ -1682,7 +1682,7 @@ fn chars_starts_with_ascii_case_insensitive(chars: &[char], start: usize, patter
 
 #[inline]
 fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-    !delimiter.is_whitespace() && delimiter != '\''
+    delimiter.is_ascii() && !delimiter.is_ascii_whitespace() && delimiter != '\''
 }
 
 #[inline]
