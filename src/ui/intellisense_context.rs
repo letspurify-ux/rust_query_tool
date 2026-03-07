@@ -267,6 +267,17 @@ fn is_merge_action_context(
             || matches!(last_word, Some("THEN")))
 }
 
+fn is_merge_delete_where_action(
+    tokens: &[SqlToken],
+    idx: usize,
+    statement_kind: StatementKind,
+    current_phase: SqlPhase,
+) -> bool {
+    matches!(statement_kind, StatementKind::Merge)
+        && matches!(current_phase, SqlPhase::SetClause)
+        && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "WHERE")
+}
+
 fn relation_function_name_hint(table_name: &str) -> Option<String> {
     table_name
         .split('@')
@@ -1653,10 +1664,16 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             last_word.as_deref(),
                         );
+                        let is_merge_delete_where = is_merge_delete_where_action(
+                            tokens,
+                            idx,
+                            current_statement_kind,
+                            current_phase,
+                        );
                         if is_expression_context {
                             // Inside expressions, DELETE can be a valid identifier/token.
                             relation_state.clear();
-                        } else if is_merge_action_keyword {
+                        } else if is_merge_action_keyword || is_merge_delete_where {
                             // `MERGE ... WHEN MATCHED THEN DELETE WHERE ...` DELETE is an
                             // action keyword, not a standalone DML target clause.
                             depth_frames[depth].phase = SqlPhase::WhereClause;
