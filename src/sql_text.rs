@@ -810,6 +810,10 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "TABLE",
 ];
 
+/// O(1) lookup set for `STATEMENT_HEAD_KEYWORDS` (80+ entries).
+static STATEMENT_HEAD_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| STATEMENT_HEAD_KEYWORDS.iter().copied().collect());
+
 #[inline]
 fn matches_keyword(keyword: &str, candidates: &[&str]) -> bool {
     candidates
@@ -959,7 +963,8 @@ pub(crate) fn is_with_non_plsql_clause_keyword(word: &str) -> bool {
 /// `WITH FUNCTION/PROCEDURE` declaration mode but encountered another
 /// statement head instead of a main query keyword.
 pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
-    matches_keyword(word, STATEMENT_HEAD_KEYWORDS) || is_password_command_keyword(word)
+    let upper = word.to_ascii_uppercase();
+    STATEMENT_HEAD_KEYWORDS_SET.contains(upper.as_str()) || is_password_command_keyword(word)
 }
 
 pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
@@ -972,216 +977,78 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
+    if trimmed.starts_with('!') {
+        return true;
+    }
+
     let Some(first) = next_meaningful_word(trimmed, 0).map(|(word, _)| word) else {
         return false;
     };
 
-    if first.eq_ignore_ascii_case("DISC") || first.eq_ignore_ascii_case("DISCONNECT") {
-        return true;
+    let first_upper = first.to_ascii_uppercase();
+    match first_upper.as_str() {
+        // Keywords requiring second-word disambiguation
+        "START" => {
+            let second = next_meaningful_word(trimmed, 1).map(|(word, _)| word);
+            !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+        }
+        "R" => next_meaningful_word(trimmed, 1).is_none(),
+        "CONNECT" => {
+            !next_meaningful_word(trimmed, 1)
+                .map(|(word, _)| word)
+                .is_some_and(|second| second.eq_ignore_ascii_case("BY"))
+        }
+        "SET" => {
+            let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
+                return false;
+            };
+            matches!(
+                second.to_ascii_uppercase().as_str(),
+                "APPINFO" | "ARRAYSIZE" | "AUTOCOMMIT" | "AUTOPRINT"
+                | "AUTORECOVERY" | "AUTOTRACE" | "BLOCKTERMINATOR" | "CMDSEP"
+                | "COLINVISIBLE" | "COLSEP" | "CONCAT" | "COPYCOMMIT"
+                | "COPYTYPECHECK" | "DEFINE" | "DESCRIBE" | "ECHO" | "EDITFILE"
+                | "EMBEDDED" | "ESCAPE" | "FEEDBACK" | "FLAGGER" | "FLUSH"
+                | "HEADING" | "HEADSEP" | "INSTANCE" | "LINESIZE" | "LOBOFFSET"
+                | "LONG" | "LONGCHUNKSIZE" | "MARKUP" | "NEWPAGE" | "NULL"
+                | "NUMFORMAT" | "NUMWIDTH" | "PAGESIZE" | "PAUSE" | "RECSEP"
+                | "RECSEPCHAR" | "ROWLIMIT" | "SERVEROUTPUT" | "SHIFTINOUT"
+                | "SHOWMODE" | "SQLBLANKLINES" | "SQLCASE" | "SQLCONTINUE"
+                | "SQLFORMAT" | "SQLNUMBER" | "SQLPLUSCOMPATIBILITY" | "SQLPREFIX"
+                | "SQLPROMPT" | "SQLTERMINATOR" | "SUFFIX" | "TAB" | "TERMOUT"
+                | "TIMING" | "TRIMOUT" | "TRIMSPOOL" | "UNDERLINE" | "VERIFY"
+                | "WRAP"
+            )
+        }
+        "SHOW" => {
+            let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
+                return false;
+            };
+            matches!(
+                second.to_ascii_uppercase().as_str(),
+                "ALL" | "APPINFO" | "AUTOCOMMIT" | "COLSEP" | "COPYCOMMIT"
+                | "DEFINE" | "DESCRIBE" | "ECHO" | "EDITFILE" | "ESCAPE"
+                | "FEEDBACK" | "HEADING" | "LINESIZE" | "LONG" | "LONGCHUNKSIZE"
+                | "NEWPAGE" | "NULL" | "NUMFORMAT" | "NUMWIDTH" | "PAGESIZE"
+                | "PAUSE" | "RELEASE" | "SERVEROUTPUT" | "SQLCODE" | "SQLCONTINUE"
+                | "SQLNUMBER" | "SQLPLUSCOMPATIBILITY" | "SQLPROMPT"
+                | "SQLTERMINATOR" | "SUFFIX" | "TERMOUT" | "TIMING" | "USER"
+                | "VERIFY" | "VERSION" | "WRAP"
+            )
+        }
+        // PASSWORD abbreviations
+        "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD" => true,
+        // Simple auto-terminated keywords (no second-word check needed)
+        "DISC" | "DISCONNECT" | "CONN" | "RUN" | "EXIT" | "QUIT"
+        | "STARTUP" | "SHUTDOWN" | "RECOVER" | "ARCHIVE" | "HOST"
+        | "TIMING" | "TTITLE" | "BTITLE" | "REPHEADER" | "REPFOOTER"
+        | "PROMPT" | "REM" | "REMARK"
+        | "SPOOL" | "STORE" | "GET" | "SAVE" | "DESCRIBE" | "DESC"
+        | "EXEC" | "EXECUTE" | "DEFINE" | "UNDEFINE" | "VARIABLE" | "VAR"
+        | "PRINT" | "ACCEPT" | "PAUSE" | "WHENEVER" | "COLUMN" | "BREAK"
+        | "CLEAR" | "COMPUTE" => true,
+        _ => false,
     }
-
-    if first.eq_ignore_ascii_case("CONN") {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("START") {
-        let second = next_meaningful_word(trimmed, 1).map(|(word, _)| word);
-        return !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"));
-    }
-
-    if first.eq_ignore_ascii_case("RUN") {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("R") {
-        return next_meaningful_word(trimmed, 1).is_none();
-    }
-
-    if first.eq_ignore_ascii_case("CONNECT") {
-        return !next_meaningful_word(trimmed, 1)
-            .map(|(word, _)| word)
-            .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
-    }
-
-    if is_password_command_keyword(first) {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("EXIT") || first.eq_ignore_ascii_case("QUIT") {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("STARTUP")
-        || first.eq_ignore_ascii_case("SHUTDOWN")
-        || first.eq_ignore_ascii_case("RECOVER")
-        || first.eq_ignore_ascii_case("ARCHIVE")
-    {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("HOST") || first == "!" {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("TIMING")
-        || first.eq_ignore_ascii_case("TTITLE")
-        || first.eq_ignore_ascii_case("BTITLE")
-        || first.eq_ignore_ascii_case("REPHEADER")
-        || first.eq_ignore_ascii_case("REPFOOTER")
-    {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("PROMPT")
-        || first.eq_ignore_ascii_case("REM")
-        || first.eq_ignore_ascii_case("REMARK")
-    {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("SET") {
-        let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
-            return false;
-        };
-        return matches_keyword(
-            second,
-            &[
-                "APPINFO",
-                "ARRAYSIZE",
-                "AUTOCOMMIT",
-                "AUTOPRINT",
-                "AUTORECOVERY",
-                "AUTOTRACE",
-                "BLOCKTERMINATOR",
-                "CMDSEP",
-                "COLINVISIBLE",
-                "COLSEP",
-                "CONCAT",
-                "COPYCOMMIT",
-                "COPYTYPECHECK",
-                "DEFINE",
-                "DESCRIBE",
-                "ECHO",
-                "EDITFILE",
-                "EMBEDDED",
-                "ESCAPE",
-                "FEEDBACK",
-                "FLAGGER",
-                "FLUSH",
-                "HEADING",
-                "HEADSEP",
-                "INSTANCE",
-                "LINESIZE",
-                "LOBOFFSET",
-                "LONG",
-                "LONGCHUNKSIZE",
-                "MARKUP",
-                "NEWPAGE",
-                "NULL",
-                "NUMFORMAT",
-                "NUMWIDTH",
-                "PAGESIZE",
-                "PAUSE",
-                "RECSEP",
-                "RECSEPCHAR",
-                "ROWLIMIT",
-                "SERVEROUTPUT",
-                "SHIFTINOUT",
-                "SHOWMODE",
-                "SQLBLANKLINES",
-                "SQLCASE",
-                "SQLCONTINUE",
-                "SQLFORMAT",
-                "SQLNUMBER",
-                "SQLPLUSCOMPATIBILITY",
-                "SQLPREFIX",
-                "SQLPROMPT",
-                "SQLTERMINATOR",
-                "SUFFIX",
-                "TAB",
-                "TERMOUT",
-                "TIMING",
-                "TRIMOUT",
-                "TRIMSPOOL",
-                "UNDERLINE",
-                "VERIFY",
-                "WRAP",
-            ],
-        );
-    }
-
-    if first.eq_ignore_ascii_case("SHOW") {
-        let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
-            return false;
-        };
-        return matches_keyword(
-            second,
-            &[
-                "ALL",
-                "APPINFO",
-                "AUTOCOMMIT",
-                "COLSEP",
-                "COPYCOMMIT",
-                "DEFINE",
-                "DESCRIBE",
-                "ECHO",
-                "EDITFILE",
-                "ESCAPE",
-                "FEEDBACK",
-                "HEADING",
-                "LINESIZE",
-                "LONG",
-                "LONGCHUNKSIZE",
-                "NEWPAGE",
-                "NULL",
-                "NUMFORMAT",
-                "NUMWIDTH",
-                "PAGESIZE",
-                "PAUSE",
-                "RELEASE",
-                "SERVEROUTPUT",
-                "SQLCODE",
-                "SQLCONTINUE",
-                "SQLNUMBER",
-                "SQLPLUSCOMPATIBILITY",
-                "SQLPROMPT",
-                "SQLTERMINATOR",
-                "SUFFIX",
-                "TERMOUT",
-                "TIMING",
-                "USER",
-                "VERIFY",
-                "VERSION",
-                "WRAP",
-            ],
-        );
-    }
-
-    if first.eq_ignore_ascii_case("SPOOL")
-        || first.eq_ignore_ascii_case("STORE")
-        || first.eq_ignore_ascii_case("GET")
-        || first.eq_ignore_ascii_case("SAVE")
-        || first.eq_ignore_ascii_case("DESCRIBE")
-        || first.eq_ignore_ascii_case("DESC")
-        || first.eq_ignore_ascii_case("EXEC")
-        || first.eq_ignore_ascii_case("EXECUTE")
-        || first.eq_ignore_ascii_case("DEFINE")
-        || first.eq_ignore_ascii_case("UNDEFINE")
-        || first.eq_ignore_ascii_case("VARIABLE")
-        || first.eq_ignore_ascii_case("VAR")
-        || first.eq_ignore_ascii_case("PRINT")
-        || first.eq_ignore_ascii_case("ACCEPT")
-        || first.eq_ignore_ascii_case("PAUSE")
-        || first.eq_ignore_ascii_case("WHENEVER")
-        || first.eq_ignore_ascii_case("COLUMN")
-        || first.eq_ignore_ascii_case("BREAK")
-        || first.eq_ignore_ascii_case("CLEAR")
-        || first.eq_ignore_ascii_case("COMPUTE")
-    {
-        return true;
-    }
-
-    false
 }
 
 fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> {
