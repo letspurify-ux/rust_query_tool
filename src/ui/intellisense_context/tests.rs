@@ -3820,6 +3820,59 @@ fn flashback_versions_between_scn_multiplicative_bounds_keep_alias_visible() {
 }
 
 #[test]
+fn flashback_as_of_scn_signed_bound_keeps_alias_visible() {
+    let ctx = analyze("SELECT * FROM employees AS OF SCN -100 e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SCN")),
+        "AS OF SCN signed bound tokens must not be captured as aliases: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following AS OF SCN signed bound should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flashback_versions_between_scn_signed_bounds_keep_alias_visible() {
+    let ctx =
+        analyze("SELECT * FROM employees VERSIONS BETWEEN SCN -1 AND SCN +2 e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SCN")),
+        "VERSIONS SCN signed bound tokens must not be captured as aliases: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following VERSIONS BETWEEN SCN signed bounds should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn tablesample_repeatable_before_alias_is_not_parsed_as_alias() {
     let ctx = analyze("SELECT * FROM sales TABLESAMPLE BERNOULLI (10) REPEATABLE (7) s WHERE s.|");
 

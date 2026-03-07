@@ -2897,6 +2897,14 @@ fn consume_flashback_operand(tokens: &[SqlToken], start: usize) -> usize {
     let idx = skip_comment_tokens(tokens, start);
     match tokens.get(idx) {
         Some(SqlToken::Symbol(sym)) if sym == "(" => skip_parenthesized_clause(tokens, idx),
+        Some(SqlToken::Symbol(sym)) if sym == "+" || sym == "-" => {
+            let signed_operand_idx = consume_flashback_operand(tokens, idx + 1);
+            if signed_operand_idx == idx {
+                idx.saturating_add(1)
+            } else {
+                signed_operand_idx
+            }
+        }
         Some(SqlToken::Word(_)) => {
             let next_idx = skip_comment_tokens(tokens, idx + 1);
             if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
