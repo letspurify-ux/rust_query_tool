@@ -1295,6 +1295,12 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         .collect::<Vec<_>>();
     let ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
 
+    let in_with_cte_explicit_column_list = ctx.ctes.iter().any(|cte| {
+        cte.explicit_column_range.is_some_and(|range| {
+            ctx.cursor_token_len >= range.start && ctx.cursor_token_len <= range.end
+        })
+    });
+
     match ctx.phase {
         SqlPhase::FromClause
         | SqlPhase::IntoClause
@@ -1302,6 +1308,7 @@ pub fn detect_sql_context(text: &str, cursor_pos: usize) -> SqlContext {
         | SqlPhase::DeleteTarget
         | SqlPhase::MergeTarget => SqlContext::TableName,
         SqlPhase::SelectList => SqlContext::ColumnOrAll,
+        _ if in_with_cte_explicit_column_list => SqlContext::ColumnName,
         SqlPhase::WhereClause
         | SqlPhase::JoinCondition
         | SqlPhase::GroupByClause
@@ -1623,6 +1630,37 @@ mod intellisense_tests {
         );
         assert_eq!(detect_sql_context(&sql, cursor), SqlContext::TableName);
     }
+
+    #[test]
+    fn detect_sql_context_with_cte_explicit_column_list_is_column_name() {
+        let sql_with_cursor = "WITH cte(id, |) AS (SELECT 1, 2 FROM dual) SELECT * FROM cte";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
+
+    #[test]
+    fn detect_sql_context_second_cte_explicit_column_list_is_column_name() {
+        let sql_with_cursor =
+            "WITH c1(a) AS (SELECT 1 FROM dual), c2(x, |) AS (SELECT 1, 2 FROM dual) SELECT * FROM c2";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
+    }
+
 
     #[test]
     fn get_suggestions_excludes_exact_prefix_match() {
