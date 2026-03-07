@@ -1165,18 +1165,32 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "INTO" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
                         let in_returning_clause = depth_frames
                             .get(depth)
                             .map(|frame| frame.returning_clause_active)
                             .unwrap_or(false);
-                        if matches!(
+                        let should_expect_table_target = matches!(
+                            current_statement_kind,
+                            StatementKind::Insert | StatementKind::Delete
+                        ) && matches!(
                             current_phase,
-                            SqlPhase::SelectList
-                                | SqlPhase::Initial
-                                | SqlPhase::MergeTarget
-                                | SqlPhase::ValuesClause
-                        ) || (matches!(current_phase, SqlPhase::SetClause)
-                            && !in_returning_clause)
+                            SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
+                        );
+                        let should_expect_merge_target = matches!(current_phase, SqlPhase::MergeTarget);
+                        let should_expect_set_clause_target = matches!(current_phase, SqlPhase::SetClause)
+                            && matches!(
+                                current_statement_kind,
+                                StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+                            )
+                            && !in_returning_clause;
+
+                        if should_expect_table_target
+                            || should_expect_merge_target
+                            || should_expect_set_clause_target
                         {
                             depth_frames[depth].phase = SqlPhase::IntoClause;
                             relation_state.expect_table();
