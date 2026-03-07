@@ -2899,6 +2899,24 @@ impl QueryExecutor {
             {
                 idx += 2;
             }
+
+            // Skip SHARING clause used by Oracle 21c+ package/type DDL.
+            // Examples:
+            // - CREATE SHARING=DATA PACKAGE ...
+            // - CREATE SHARING = METADATA PACKAGE ...
+            if let Some(token) = tokens.get(idx).copied() {
+                if token.starts_with("SHARING=") {
+                    idx += 1;
+                } else if token == "SHARING"
+                    && tokens.get(idx + 1).is_some_and(|t| *t == "=")
+                    && tokens.get(idx + 2).is_some_and(|t| {
+                        matches!(*t, "METADATA" | "DATA" | "EXTENDED" | "NONE")
+                    })
+                {
+                    idx += 3;
+                }
+            }
+
             // Skip EDITIONABLE/NONEDITIONABLE
             if tokens
                 .get(idx)
@@ -2906,6 +2924,22 @@ impl QueryExecutor {
             {
                 idx += 1;
             }
+            // Skip NOFORCE trigger modifier.
+            if tokens.get(idx).is_some_and(|t| *t == "NOFORCE") {
+                idx += 1;
+            }
+
+            // Skip FORWARD/REVERSE [CROSSEDITION] trigger modifiers.
+            if tokens
+                .get(idx)
+                .is_some_and(|t| *t == "FORWARD" || *t == "REVERSE")
+            {
+                idx += 1;
+                if tokens.get(idx).is_some_and(|t| *t == "CROSSEDITION") {
+                    idx += 1;
+                }
+            }
+
             // Skip FORCE / NO FORCE (for views/synonyms)
             if tokens.get(idx).is_some_and(|t| *t == "NO")
                 && tokens.get(idx + 1).is_some_and(|t| *t == "FORCE")

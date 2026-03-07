@@ -5929,6 +5929,62 @@ BEGIN"
     }
 
     #[test]
+    fn trigger_follows_precedes_and_instead_of_forms_split_normally() {
+        let cases = [
+            (
+                vec![
+                    "CREATE OR REPLACE TRIGGER trg_follows",
+                    "AFTER INSERT ON emp",
+                    "FOLLOWS trg_base",
+                    "BEGIN",
+                    "  NULL;",
+                    "END;",
+                    "SELECT 1 FROM dual;",
+                ],
+                "SELECT 1 FROM dual",
+            ),
+            (
+                vec![
+                    "CREATE OR REPLACE TRIGGER trg_precedes",
+                    "BEFORE UPDATE ON emp",
+                    "PRECEDES trg_base",
+                    "BEGIN",
+                    "  NULL;",
+                    "END;",
+                    "SELECT 2 FROM dual;",
+                ],
+                "SELECT 2 FROM dual",
+            ),
+            (
+                vec![
+                    "CREATE OR REPLACE TRIGGER trg_instead_view",
+                    "INSTEAD OF INSERT ON emp_v",
+                    "BEGIN",
+                    "  NULL;",
+                    "END;",
+                    "SELECT 3 FROM dual;",
+                ],
+                "SELECT 3 FROM dual",
+            ),
+        ];
+
+        for (lines, tail_head) in cases {
+            let mut engine = SqlParserEngine::new();
+            for line in lines {
+                engine.process_line(line);
+            }
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+            assert!(
+                statements[1].starts_with(tail_head),
+                "trailing SELECT should split from trigger DDL: {}",
+                statements[1]
+            );
+        }
+    }
+
+    #[test]
     fn trigger_referencing_alias_with_quoted_identifier_keeps_call_body_is_split() {
         let mut engine = SqlParserEngine::new();
 
