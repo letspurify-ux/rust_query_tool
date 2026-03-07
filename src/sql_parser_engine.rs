@@ -779,10 +779,7 @@ impl SplitState {
 
         if let Some(pos) = self.block_stack.iter().rposition(|k| *k == BlockKind::Case) {
             self.block_stack.remove(pos);
-            return;
         }
-
-        let _ = self.block_stack.pop();
     }
 
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
@@ -4604,6 +4601,65 @@ BEGIN"
 
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("END CASE \"case_done\";"));
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn end_case_with_inner_end_if_label_stays_in_same_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  CASE");
+        engine.process_line("    WHEN 1 = 1 THEN");
+        engine.process_line("      IF 1 = 1 THEN");
+        engine.process_line("        NULL;");
+        engine.process_line("      END IF cond_done;");
+        engine.process_line("  END CASE case_done;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END IF cond_done;"),
+            "END IF label should stay in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END CASE case_done;"),
+            "END CASE should remain in first statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn end_if_with_nested_case_label_stays_in_same_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  IF 1 = 1 THEN");
+        engine.process_line("    CASE");
+        engine.process_line("      WHEN 1 = 1 THEN NULL;");
+        engine.process_line("    END CASE case_done;");
+        engine.process_line("  END IF cond_done;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END CASE case_done;"),
+            "END CASE label should stay in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END IF cond_done;"),
+            "END IF should remain in first statement: {}",
+            statements[0]
+        );
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
 
