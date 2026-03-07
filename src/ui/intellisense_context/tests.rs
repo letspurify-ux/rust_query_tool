@@ -1123,6 +1123,20 @@ fn phase_comment_on_materialized_view_is_table_context() {
 }
 
 #[test]
+fn phase_comment_on_column_is_table_context() {
+    let ctx = analyze("COMMENT ON COLUMN |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_comment_on_column_with_schema_prefix_is_table_context() {
+    let ctx = analyze("COMMENT ON COLUMN hr.employees.| IS 'desc'");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_create_index_on_is_table_context() {
     let ctx = analyze("CREATE INDEX idx_emp_dept ON |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
