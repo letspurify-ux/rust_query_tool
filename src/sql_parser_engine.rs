@@ -715,11 +715,37 @@ pub(crate) struct SplitState {
 }
 
 impl SplitState {
+    fn active_routine_frame(&self) -> Option<&RoutineFrame> {
+        let current_depth = self.block_depth();
+        self.routine_is_stack
+            .last()
+            .filter(|frame| frame.block_depth == current_depth)
+    }
+
     fn active_routine_frame_mut(&mut self) -> Option<&mut RoutineFrame> {
         let current_depth = self.block_depth();
         self.routine_is_stack
             .last_mut()
             .filter(|frame| frame.block_depth == current_depth)
+    }
+
+    fn should_split_before_implicit_external_begin_block(&self, token_upper: &str) -> bool {
+        if token_upper != "BEGIN" {
+            return false;
+        }
+
+        if self.block_depth() != 1 || self.paren_depth != 0 {
+            return false;
+        }
+
+        self.active_routine_frame().is_some_and(|frame| {
+            matches!(
+                frame.external_clause_state,
+                ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::AwaitingLanguageTargetImplicit
+            ) && (sql_text::is_with_main_query_keyword(token_upper)
+                || sql_text::is_statement_head_keyword(token_upper))
+        })
     }
 
     fn pop_case_block(&mut self) {
@@ -1749,6 +1775,17 @@ impl SqlParserEngine {
         }
     }
 
+    fn split_current_statement(&mut self) {
+        self.push_current_statement();
+        self.reset_statement_local_state();
+        self.state.reset_create_state();
+    }
+
+    fn split_current_and_reset_external_boundary(&mut self) {
+        self.split_current_statement();
+        self.state.block_stack.clear();
+    }
+
     pub(crate) fn starts_with_alter_session(&self) -> bool {
         let mut remaining = self.current.as_str();
 
@@ -1926,9 +1963,7 @@ impl SqlParserEngine {
                     && self.state.paren_depth == 0
                     && self.state.token.is_empty()
                 {
-                    self.push_current_statement();
-                    self.reset_statement_local_state();
-                    self.state.reset_create_state();
+                    self.split_current_statement();
                 }
                 self.state.lex_mode = LexMode::LineComment;
                 self.current.push('-');
@@ -1944,9 +1979,7 @@ impl SqlParserEngine {
                     && self.state.paren_depth == 0
                     && self.state.token.is_empty()
                 {
-                    self.push_current_statement();
-                    self.reset_statement_local_state();
-                    self.state.reset_create_state();
+                    self.split_current_statement();
                 }
                 self.state.lex_mode = LexMode::BlockComment;
                 self.current.push('/');
@@ -2121,21 +2154,26 @@ impl SqlParserEngine {
             }
 
             if sql_text::is_identifier_char(c) {
-                if self.state.pending_implicit_external_top_level_split
-                    && self.state.block_depth() == 1
+                if self.state.block_depth() == 1
                     && self.state.paren_depth == 0
                     && self.state.token.is_empty()
                 {
                     if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
-                        if candidate_upper == "BEGIN" {
-                            self.state.pending_implicit_external_top_level_split = false;
-                        } else if sql_text::is_with_main_query_keyword(&candidate_upper)
-                            || sql_text::is_statement_head_keyword(&candidate_upper)
+                        if candidate_upper == "BEGIN"
+                            && self.state.pending_implicit_external_top_level_split
                         {
-                            self.push_current_statement();
-                            self.reset_statement_local_state();
-                            self.state.reset_create_state();
-                        } else {
+                            self.state.pending_implicit_external_top_level_split = false;
+                        } else if self.state.pending_implicit_external_top_level_split
+                            && (sql_text::is_with_main_query_keyword(&candidate_upper)
+                                || sql_text::is_statement_head_keyword(&candidate_upper))
+                        {
+                            self.split_current_statement();
+                        } else if self
+                            .state
+                            .should_split_before_implicit_external_begin_block(&candidate_upper)
+                        {
+                            self.split_current_and_reset_external_boundary();
+                        } else if self.state.pending_implicit_external_top_level_split {
                             self.state.pending_implicit_external_top_level_split = false;
                         }
                     }
@@ -2183,9 +2221,7 @@ impl SqlParserEngine {
                     || (c == '!' && is_line_leading_bang_host_marker(chars, i))
                     || (c == '(' && is_line_leading_open_paren_marker(chars, i)))
             {
-                self.push_current_statement();
-                self.reset_statement_local_state();
-                self.state.reset_create_state();
+                self.split_current_statement();
             }
 
             self.state.flush_token();
@@ -5196,6 +5232,51 @@ BEGIN"
             "third statement should remain a standalone SELECT statement: {}",
             statements[2]
         );
+    }
+
+    #[test]
+    fn non_cte_with_clause_keyword_does_not_leak_into_following_comment_on_procedure() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("GRANT CREATE SESSION TO app_user WITH ADMIN OPTION;");
+        engine.process_line("COMMENT ON PROCEDURE app_user.p IS 'ok';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("GRANT CREATE SESSION TO app_user WITH ADMIN OPTION"),
+            "first statement should remain the GRANT statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("COMMENT ON PROCEDURE app_user.p IS 'ok'"),
+            "second statement should remain a standalone COMMENT ON PROCEDURE statement: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 1 FROM dual"),
+            "third statement should remain a standalone SELECT statement: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
+    fn implicit_external_language_clause_splits_before_following_begin_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_begin RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
+        assert!(statements[2].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
