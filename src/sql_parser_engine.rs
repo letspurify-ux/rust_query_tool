@@ -1524,7 +1524,7 @@ fn looks_like_oracle_conditional_compilation_flag(chars: &[char], start: usize) 
     chars
         .get(start + 2)
         .copied()
-        .is_some_and(sql_text::is_identifier_char)
+        .is_some_and(sql_text::is_identifier_start_char)
 }
 
 fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
@@ -3517,6 +3517,36 @@ mod tests {
     }
 
     #[test]
+    fn dollar_prefixed_numeric_token_does_not_trigger_conditional_compilation_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT $$1$$ FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SELECT $$1$$ FROM dual".to_string());
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn oracle_conditional_compilation_flag_with_numeric_suffix_does_not_hang_statement_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  IF $$PLSQL_LINE_1 > 0 THEN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END IF;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("IF $$PLSQL_LINE_1 > 0 THEN"));
+        assert_eq!(statements[1], "SELECT 12 FROM dual".to_string());
+    }
+
+    #[test]
     fn language_clause_with_dollar_quoted_target_without_external_keyword_marks_external_routine_split(
     ) {
         let mut engine = SqlParserEngine::new();
@@ -4451,6 +4481,31 @@ BEGIN"
             statements[0]
         );
         assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_timing_point_end_with_label_stays_in_trigger_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_compound_label");
+        engine.process_line("FOR UPDATE ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE EACH ROW IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END BEFORE EACH ROW tp_done;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END BEFORE EACH ROW tp_done;"),
+            "timing-point END label should stay in compound trigger statement: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
 
     #[test]
