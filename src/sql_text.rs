@@ -967,8 +967,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
-    let mut words = trimmed.split_whitespace();
-    let Some(first) = words.next() else {
+    let Some(first) = next_meaningful_word(trimmed, 0).map(|(word, _)| word) else {
         return false;
     };
 
@@ -981,7 +980,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("START") {
-        let second = words.next();
+        let second = next_meaningful_word(trimmed, 1).map(|(word, _)| word);
         return !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"));
     }
 
@@ -990,14 +989,19 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("R") {
-        return words.next().is_none();
+        return next_meaningful_word(trimmed, 1).is_none();
     }
 
     if first.eq_ignore_ascii_case("CONNECT") {
-        return !words
-            .next()
+        return !next_meaningful_word(trimmed, 1)
+            .map(|(word, _)| word)
             .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
     }
+
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
 
     if is_password_command_keyword(first) {
         return true;
@@ -1171,6 +1175,51 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     false
+}
+
+fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> {
+    let mut idx = 0usize;
+    let mut seen_words = 0usize;
+
+    while idx < line.len() {
+        let ch = line[idx..].chars().next()?;
+        let ch_len = ch.len_utf8();
+
+        if ch.is_whitespace() {
+            idx += ch_len;
+            continue;
+        }
+
+        if line[idx..].starts_with("--") {
+            return None;
+        }
+
+        if line[idx..].starts_with("/*") {
+            let comment_start = idx + 2;
+            let comment_tail = &line[comment_start..];
+            let comment_len = comment_tail.find("*/")?;
+            idx = comment_start + comment_len + 2;
+            continue;
+        }
+
+        let mut end = idx;
+        while end < line.len() {
+            let word_ch = line[end..].chars().next()?;
+            if word_ch.is_whitespace() || line[end..].starts_with("/*") || line[end..].starts_with("--") {
+                break;
+            }
+            end += word_ch.len_utf8();
+        }
+
+        if seen_words == skip_words {
+            return Some((&line[idx..end], idx));
+        }
+
+        seen_words += 1;
+        idx = end;
+    }
+
+    None
 }
 
 /// Returns true when a keyword can head a subquery body after `(`.
@@ -1376,12 +1425,19 @@ mod tests {
         assert!(!is_auto_terminated_tool_command(
             "CONNECT BY PRIOR id = parent_id"
         ));
+        assert!(!is_auto_terminated_tool_command(
+            "CONNECT /*hierarchical*/ BY PRIOR id = parent_id"
+        ));
+        assert!(!is_auto_terminated_tool_command(
+            "CONNECT /*+ hint */ BY PRIOR id = parent_id"
+        ));
     }
 
     #[test]
     fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
         assert!(is_auto_terminated_tool_command("START child.sql"));
         assert!(!is_auto_terminated_tool_command("START WITH"));
+        assert!(!is_auto_terminated_tool_command("START /*tree*/ WITH"));
         assert!(!is_auto_terminated_tool_command(
             "START WITH parent_id IS NULL"
         ));
