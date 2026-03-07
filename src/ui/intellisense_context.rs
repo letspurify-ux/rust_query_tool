@@ -1351,11 +1351,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let locking_clause_active = depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && !locking_of_clause_identifier_position(tokens, idx)
+                            && (!is_for_update_of_identifier_slot(tokens, idx)
+                                || matches!(
+                                    next_word_upper(tokens, idx + 1),
+                                    Some((next, _)) if next == "LOCKED"
+                                ))
                         {
-                            // Treat `SKIP` after at least one target column as the start of
-                            // trailing lock options (`SKIP LOCKED`), even when `LOCKED` has
-                            // not been typed yet.
+                            // Oracle `FOR UPDATE ... SKIP LOCKED` and in-progress `... SKIP`
+                            // lock options close lock target list just like NOWAIT/WAIT.
+                            // Keep `SKIP` as an identifier candidate for `OF <column list>`
+                            // when it appears in an identifier slot (`OF skip`, `, skip`,
+                            // `t.skip`).
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
@@ -2002,6 +2008,31 @@ fn prev_word_upper(tokens: &[SqlToken], before_idx: usize) -> Option<(String, us
         }
     }
     None
+}
+
+fn prev_non_comment_token(tokens: &[SqlToken], before_idx: usize) -> Option<(&SqlToken, usize)> {
+    let mut current_idx = before_idx;
+    while current_idx > 0 {
+        current_idx -= 1;
+        match tokens.get(current_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(token) => return Some((token, current_idx)),
+            None => return None,
+        }
+    }
+    None
+}
+
+fn is_for_update_of_identifier_slot(tokens: &[SqlToken], idx: usize) -> bool {
+    let Some((prev_token, _)) = prev_non_comment_token(tokens, idx) else {
+        return false;
+    };
+
+    match prev_token {
+        SqlToken::Word(word) => word.eq_ignore_ascii_case("OF"),
+        SqlToken::Symbol(sym) => matches!(sym.as_str(), "," | "."),
+        _ => false,
+    }
 }
 
 fn is_distinct_from_operator(tokens: &[SqlToken], from_idx: usize) -> bool {
