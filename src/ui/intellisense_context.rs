@@ -1561,6 +1561,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .map(|frame| frame.statement_kind)
                             .unwrap_or(StatementKind::Unknown);
+                        let is_lock_mode_update_keyword =
+                            matches!(current_statement_kind, StatementKind::Lock)
+                                && matches!(current_phase, SqlPhase::Initial)
+                                && matches!(
+                                    last_word.as_deref(),
+                                    Some("IN") | Some("ROW") | Some("SHARE")
+                                );
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
                         let is_merge_action_keyword = is_merge_action_context(
@@ -1573,7 +1580,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
                         let is_locking_update_keyword = matches!(last_word.as_deref(), Some("FOR"));
-                        if is_locking_update_keyword {
+                        if is_lock_mode_update_keyword {
+                            // Oracle `LOCK TABLE ... IN [ROW] SHARE UPDATE MODE` uses
+                            // UPDATE as a lock-mode keyword, not a new DML statement.
+                            relation_state.clear();
+                        } else if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
                                 depth_frames[depth].phase = SqlPhase::SetClause;
