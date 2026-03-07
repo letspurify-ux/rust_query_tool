@@ -1357,20 +1357,31 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
                         {
-                            let in_lock_target_list = matches!(
-                                previous_significant_token(tokens, idx),
-                                Some((_, SqlToken::Word(prev))) if prev.eq_ignore_ascii_case("OF")
-                            ) || matches!(
-                                previous_significant_token(tokens, idx),
-                                Some((_, SqlToken::Symbol(sym))) if sym == ","
-                            );
-                            let followed_by_locked =
+                            let follows_skip_locked =
                                 matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED");
+                            let prev_word = prev_word_upper(tokens, idx);
+                            let previous_token_is_word_target =
+                                matches!(prev_word.as_ref(), Some((prev, _)) if prev != "OF");
+                            let previous_token_is_column_separator = (0..idx)
+                                .rev()
+                                .find_map(|lookback| match tokens.get(lookback) {
+                                    Some(SqlToken::Comment(_)) => None,
+                                    Some(SqlToken::Symbol(sym)) if sym == "," || sym == "." => {
+                                        Some(true)
+                                    }
+                                    Some(_) => Some(false),
+                                    None => Some(false),
+                                })
+                                .unwrap_or(false);
 
-                            // Oracle `FOR UPDATE ... SKIP LOCKED` is a trailing lock option.
-                            // Keep `SKIP` as an identifier candidate only inside an `OF`
-                            // target list when it is not followed by LOCKED.
-                            if followed_by_locked || !in_lock_target_list {
+                            if follows_skip_locked
+                                || (previous_token_is_word_target
+                                    && !previous_token_is_column_separator)
+                            {
+                                // Oracle lock modifiers (`SKIP [LOCKED]`) start right after
+                                // the final `OF` column expression and should end column
+                                // completion. Keep `SKIP` as an identifier candidate for
+                                // `OF skip` and qualified forms like `OF t.skip`.
                                 depth_frames[depth].phase = SqlPhase::OrderByClause;
                                 relation_state.clear();
                             }
