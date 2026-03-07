@@ -702,6 +702,7 @@ pub(crate) struct SplitState {
     as_is_follow_state: AsIsFollowState,
     as_is_state: AsIsState,
     pub(crate) pending_subprogram_begins: usize,
+    pending_sql_macro_call_spec: bool,
     routine_is_stack: Vec<RoutineFrame>,
     timing_point_state: TimingPointState,
     saw_compound_keyword: bool,
@@ -943,6 +944,7 @@ impl SplitState {
 
         self.handle_routine_is_external(upper);
         self.track_create_plsql(upper);
+        self.track_sql_macro_call_spec(upper);
         self.track_top_level_with_plsql(upper, at_statement_start);
 
         let token_prefixed_with_dollar = self.token_prefixed_with_dollar;
@@ -1178,6 +1180,12 @@ impl SplitState {
             if needs_begin_tracking {
                 self.routine_is_stack
                     .push(RoutineFrame::new(self.block_depth()));
+                if self.pending_sql_macro_call_spec {
+                    if let Some(frame) = self.routine_is_stack.last_mut() {
+                        frame.mark_external_clause();
+                    }
+                    self.pending_sql_macro_call_spec = false;
+                }
                 self.pending_subprogram_begins += 1;
             }
         } else if upper == "DECLARE" {
@@ -1280,6 +1288,7 @@ impl SplitState {
     }
 
     pub(crate) fn prepare_semicolon_action(&mut self) -> SemicolonAction {
+        self.pending_sql_macro_call_spec = false;
         // FOR/WHILE ... DO candidates cannot span statement terminators.
         // Reset them so keywords like `FOR UPDATE; DO ...` don't create false loop depth.
         self.pending_do = PendingDo::None;
@@ -1394,6 +1403,7 @@ impl SplitState {
         self.begin_state = BeginState::None;
         self.as_is_state = AsIsState::None;
         self.pending_subprogram_begins = 0;
+        self.pending_sql_macro_call_spec = false;
         self.routine_is_stack.clear();
         self.timing_point_state = TimingPointState::None;
         self.saw_compound_keyword = false;
@@ -1500,6 +1510,29 @@ impl SplitState {
 
         if upper == "CREATE" {
             self.create_state = CreateState::AwaitingObjectType;
+        }
+    }
+
+    fn track_sql_macro_call_spec(&mut self, upper: &str) {
+        if upper != "SQL_MACRO" {
+            return;
+        }
+
+        let top_level_function_macro =
+            self.create_plsql_kind == CreatePlsqlKind::Function && self.in_create_plsql();
+        let nested_function_macro =
+            self.block_depth() > 0 && self.as_is_state == AsIsState::AwaitingNestedSubprogram;
+        let function_call_spec_macro =
+            self.block_stack.last() == Some(&BlockKind::AsIs) && self.pending_subprogram_begins > 0;
+
+        if !(top_level_function_macro || nested_function_macro || function_call_spec_macro) {
+            return;
+        }
+
+        self.pending_sql_macro_call_spec = true;
+        if let Some(frame) = self.active_routine_frame_mut() {
+            frame.mark_external_clause();
+            self.pending_sql_macro_call_spec = false;
         }
     }
 
@@ -5579,6 +5612,38 @@ BEGIN"
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS PIPELINED USING ext_pipe_impl"));
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn sql_macro_call_spec_without_external_keyword_splits_before_following_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_macro RETURN VARCHAR2");
+        engine.process_line("AS SQL_MACRO;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS SQL_MACRO"));
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn package_nested_sql_macro_call_spec_closes_nested_function_block_on_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_sql_macro AS");
+        engine.process_line("  FUNCTION f RETURN VARCHAR2");
+        engine.process_line("  IS SQL_MACRO;");
+        engine.process_line("END pkg_sql_macro;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("FUNCTION f RETURN VARCHAR2"));
+        assert!(statements[0].contains("IS SQL_MACRO"));
+        assert!(statements[0].contains("END pkg_sql_macro"));
         assert!(statements[1].starts_with("SELECT 12 FROM dual"));
     }
 
