@@ -4616,6 +4616,32 @@ fn merge_delete_where_expression_does_not_start_new_delete_target_context() {
 }
 
 #[test]
+fn merge_when_matched_update_set_delete_where_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET t.val = s.val DELETE WHERE |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn merge_when_matched_update_set_delete_where_keeps_source_table_in_scope() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET t.val = s.val DELETE WHERE s.| IS NOT NULL",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(names.iter().any(|name| name == "TARGET"), "tables: {:?}", names);
+    assert!(names.iter().any(|name| name == "SOURCE"), "tables: {:?}", names);
+}
+
+#[test]
 fn merge_when_not_matched_by_source_delete_where_is_column_context() {
     let ctx = analyze(
         "MERGE INTO target t USING source s ON (t.id = s.id) \
