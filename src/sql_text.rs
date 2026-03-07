@@ -711,6 +711,15 @@ const TABLE_FUNCTION_ITEM_LEADING_KEYWORDS: &[&str] = &[
 ];
 
 const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "RENAME",
+    "GRANT",
+    "REVOKE",
+    "COMMIT",
+    "ROLLBACK",
     "DECLARE",
     "BEGIN",
     "WITH",
@@ -1018,6 +1027,19 @@ mod tests {
     fn oracle_sql_keyword_lookup_uses_uppercase_tokens() {
         assert!(is_oracle_sql_keyword("SELECT"));
         assert!(!is_oracle_sql_keyword("select"));
+    }
+
+    #[test]
+    fn statement_head_keyword_includes_ddl_and_tcl_roots() {
+        assert!(is_statement_head_keyword("CREATE"));
+        assert!(is_statement_head_keyword("ALTER"));
+        assert!(is_statement_head_keyword("DROP"));
+        assert!(is_statement_head_keyword("TRUNCATE"));
+        assert!(is_statement_head_keyword("RENAME"));
+        assert!(is_statement_head_keyword("GRANT"));
+        assert!(is_statement_head_keyword("REVOKE"));
+        assert!(is_statement_head_keyword("COMMIT"));
+        assert!(is_statement_head_keyword("ROLLBACK"));
     }
 
     #[test]
