@@ -2663,8 +2663,16 @@ fn partitioned_outer_join_does_not_treat_partition_keyword_as_alias() {
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
     assert!(aliases.iter().all(|alias| alias != "PARTITION"));
-    assert!(aliases.iter().any(|alias| alias == "S"), "aliases: {:?}", aliases);
-    assert!(aliases.iter().any(|alias| alias == "T"), "aliases: {:?}", aliases);
+    assert!(
+        aliases.iter().any(|alias| alias == "S"),
+        "aliases: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "T"),
+        "aliases: {:?}",
+        aliases
+    );
 }
 
 #[test]
@@ -2677,27 +2685,42 @@ fn table_function_alias_column_list_keeps_alias_visible_in_where_clause() {
         .iter()
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
-    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
+    assert!(
+        aliases.iter().any(|alias| alias == "R"),
+        "aliases: {:?}",
+        aliases
+    );
 }
 
 #[test]
 fn table_function_alias_column_list_before_join_keeps_following_join_relation_visible() {
-    let ctx = analyze(
-        "SELECT * FROM TABLE(get_rows()) r(id, val) JOIN dept d ON d.id = r.id WHERE d.|",
-    );
+    let ctx =
+        analyze("SELECT * FROM TABLE(get_rows()) r(id, val) JOIN dept d ON d.id = r.id WHERE d.|");
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 
     let names = table_names(&ctx);
     assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
-    assert!(names.contains(&"GET_ROWS".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"GET_ROWS".to_string()),
+        "tables: {:?}",
+        names
+    );
 
     let aliases: Vec<String> = ctx
         .tables_in_scope
         .iter()
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
-    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
-    assert!(aliases.iter().any(|alias| alias == "D"), "aliases: {:?}", aliases);
+    assert!(
+        aliases.iter().any(|alias| alias == "R"),
+        "aliases: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "aliases: {:?}",
+        aliases
+    );
     assert!(
         aliases.iter().all(|alias| alias != "ID" && alias != "VAL"),
         "alias column-list identifiers must not leak into relation aliases: {:?}",
@@ -2711,7 +2734,11 @@ fn table_function_alias_column_list_before_comma_keeps_following_relation_visibl
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
 
     let names = table_names(&ctx);
-    assert!(names.contains(&"GET_ROWS".to_string()), "tables: {:?}", names);
+    assert!(
+        names.contains(&"GET_ROWS".to_string()),
+        "tables: {:?}",
+        names
+    );
     assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
 
     let aliases: Vec<String> = ctx
@@ -2719,8 +2746,16 @@ fn table_function_alias_column_list_before_comma_keeps_following_relation_visibl
         .iter()
         .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
         .collect();
-    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
-    assert!(aliases.iter().any(|alias| alias == "D"), "aliases: {:?}", aliases);
+    assert!(
+        aliases.iter().any(|alias| alias == "R"),
+        "aliases: {:?}",
+        aliases
+    );
+    assert!(
+        aliases.iter().any(|alias| alias == "D"),
+        "aliases: {:?}",
+        aliases
+    );
 }
 
 #[test]
@@ -3660,12 +3695,9 @@ fn flashback_versions_between_snapshot_bounds_before_alias_is_not_parsed_as_alia
             .collect::<Vec<_>>()
     );
     assert!(
-        ctx.tables_in_scope
-            .iter()
-            .all(|table| {
-                table.alias.as_deref() != Some("snap_old")
-                    && table.alias.as_deref() != Some("snap_new")
-            }),
+        ctx.tables_in_scope.iter().all(|table| {
+            table.alias.as_deref() != Some("snap_old") && table.alias.as_deref() != Some("snap_new")
+        }),
         "VERSIONS BETWEEN SNAPSHOT bound identifiers must not be captured as aliases: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -3847,8 +3879,7 @@ fn flashback_as_of_scn_signed_bound_keeps_alias_visible() {
 
 #[test]
 fn flashback_versions_between_scn_signed_bounds_keep_alias_visible() {
-    let ctx =
-        analyze("SELECT * FROM employees VERSIONS BETWEEN SCN -1 AND SCN +2 e WHERE e.|");
+    let ctx = analyze("SELECT * FROM employees VERSIONS BETWEEN SCN -1 AND SCN +2 e WHERE e.|");
 
     assert!(
         ctx.tables_in_scope
@@ -5579,9 +5610,7 @@ fn extract_oracle_pivot_projection_columns_from_subquery_star_select() {
 
 #[test]
 fn extract_oracle_pivot_projection_columns_from_string_literals_without_alias() {
-    let tokens = tokenize(
-        "SELECT * FROM sales PIVOT (SUM(amount) FOR product IN ('A', 'B', 'C'))",
-    );
+    let tokens = tokenize("SELECT * FROM sales PIVOT (SUM(amount) FOR product IN ('A', 'B', 'C'))");
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
     assert_eq!(cols, vec!["A", "B", "C"]);
@@ -5669,7 +5698,8 @@ fn extract_match_recognize_generated_columns_accepts_measures_alias_without_as()
 }
 
 #[test]
-fn extract_match_recognize_generated_columns_keeps_pattern_variables_with_subset_after_after_match_skip() {
+fn extract_match_recognize_generated_columns_keeps_pattern_variables_with_subset_after_after_match_skip(
+) {
     let tokens = tokenize(
         "SELECT * FROM emp MATCH_RECOGNIZE ( \
             PATTERN (a b c) \
@@ -5707,6 +5737,37 @@ fn infer_source_columns_uses_match_recognize_generated_columns_when_select_list_
         "expected MATCH_RECOGNIZE MEASURES alias to be inferred, got: {:?}",
         cols
     );
+}
+
+#[test]
+fn extract_match_recognize_generated_columns_ignores_nested_recognize_keyword_without_top_level_clause(
+) {
+    let tokens = tokenize(
+        "SELECT * FROM ( \
+            SELECT MATCH(1) AS match_token, RECOGNIZE(1) AS recognize_token FROM dual \
+         ) src",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert!(
+        cols.is_empty(),
+        "non-MATCH_RECOGNIZE SQL should not synthesize MATCH_RECOGNIZE columns: {:?}",
+        cols
+    );
+}
+
+#[test]
+fn extract_match_recognize_generated_columns_accepts_comment_split_keyword_pair() {
+    let tokens = tokenize(
+        "SELECT * FROM emp MATCH /* split */ RECOGNIZE ( \
+            MEASURES FIRST(ename) AS first_name \
+            PATTERN (a+) \
+            DEFINE a AS a.sal > 0 \
+        )",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert_eq!(cols, vec!["first_name", "a"]);
 }
 
 #[test]
@@ -5753,7 +5814,10 @@ fn extract_oracle_unpivot_projection_with_multi_column_output_and_for_clause() {
     );
 
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
-    assert_eq!(cols, vec!["sales_amt", "cost_amt", "half_year", "quarter_tag"]);
+    assert_eq!(
+        cols,
+        vec!["sales_amt", "cost_amt", "half_year", "quarter_tag"]
+    );
 }
 
 #[test]
@@ -6336,15 +6400,16 @@ fn grammar_hierarchical_search_by_clause_stays_column_context() {
 
 #[test]
 fn grammar_hierarchical_search_set_alias_does_not_switch_to_with_clause() {
-    let ctx = analyze(
-        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |",
-    );
+    let ctx =
+        analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr SEARCH DEPTH FIRST BY empno SET |");
     assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
 }
 
 #[test]
 fn grammar_hierarchical_cycle_set_alias_does_not_switch_to_set_clause() {
-    let ctx = analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'");
+    let ctx = analyze(
+        "SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'",
+    );
     assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
     assert!(ctx.phase.is_column_context());
 }
