@@ -5794,10 +5794,18 @@ impl ResultTableWidget {
             return;
         }
 
-        // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows
+        // Only compute column widths for the first WIDTH_SAMPLE_ROWS rows.
+        // After that threshold the sampling path is skipped entirely to avoid
+        // locking pending_widths and iterating rows on the UI thread.
         let sampled = mutex_load_usize(&self.width_sampled_rows);
         if sampled < WIDTH_SAMPLE_ROWS {
-            let max_cols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+            let remaining = WIDTH_SAMPLE_ROWS - sampled;
+            let sample_count = rows.len().min(remaining);
+            let max_cols = rows[..sample_count]
+                .iter()
+                .map(|row| row.len())
+                .max()
+                .unwrap_or(0);
             let mut widths = self
                 .pending_widths
                 .lock()
@@ -5810,8 +5818,6 @@ impl ResultTableWidget {
             if widths.len() < max_cols {
                 widths.resize(max_cols, min_width);
             }
-            let remaining = WIDTH_SAMPLE_ROWS - sampled;
-            let sample_count = rows.len().min(remaining);
             for row in rows[..sample_count].iter() {
                 Self::update_widths_with_row(
                     &mut widths,
@@ -5860,26 +5866,31 @@ impl ResultTableWidget {
         let current_rows = self.table.rows();
         let new_total = current_rows + new_rows_count;
 
-        // Update column widths
-        {
-            let widths = self
-                .pending_widths
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let max_cols = widths.len().max(self.table.cols() as usize);
-            if max_cols as i32 > self.table.cols() {
-                self.table.set_cols(max_cols as i32);
-            }
-            for (col_idx, &width) in widths.iter().enumerate() {
-                if col_idx < max_cols {
-                    let current_width = self.table.col_width(col_idx as i32);
-                    if width > current_width {
-                        self.table.set_col_width(col_idx as i32, width);
+        // Update column widths only while sampling is still active.
+        // Once WIDTH_SAMPLE_ROWS rows have been measured, column widths are
+        // finalized and we skip the lock + per-column iteration entirely.
+        let sampled = mutex_load_usize(&self.width_sampled_rows);
+        if sampled < WIDTH_SAMPLE_ROWS {
+            {
+                let widths = self
+                    .pending_widths
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let max_cols = widths.len().max(self.table.cols() as usize);
+                if max_cols as i32 > self.table.cols() {
+                    self.table.set_cols(max_cols as i32);
+                }
+                for (col_idx, &width) in widths.iter().enumerate() {
+                    if col_idx < max_cols {
+                        let current_width = self.table.col_width(col_idx as i32);
+                        if width > current_width {
+                            self.table.set_col_width(col_idx as i32, width);
+                        }
                     }
                 }
             }
+            self.apply_hidden_rowid_column_width();
         }
-        self.apply_hidden_rowid_column_width();
 
         // Move data into full_data — zero-copy, no clone!
         self.full_data
@@ -5889,7 +5900,6 @@ impl ResultTableWidget {
 
         // Just update row count — draw_cell reads from full_data on demand
         self.table.set_rows(new_total);
-        self.apply_table_metrics_for_current_font();
 
         mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         self.table.redraw();
@@ -5898,8 +5908,18 @@ impl ResultTableWidget {
     /// Call this when streaming is complete to flush any remaining buffered rows
     pub fn finish_streaming(&mut self) {
         mutex_store_bool(&self.streaming_in_progress, false);
+        // flush_pending() already calls table.redraw() when rows are flushed.
+        // Only issue an explicit redraw when the pending buffer was empty so the
+        // streaming-complete state change is still rendered.
+        let had_pending = !self
+            .pending_rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
         self.flush_pending();
-        self.table.redraw();
+        if !had_pending {
+            self.table.redraw();
+        }
     }
 
     /// Recover from an interrupted edit-save batch that ended without a final

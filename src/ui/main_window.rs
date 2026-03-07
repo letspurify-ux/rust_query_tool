@@ -2519,9 +2519,13 @@ impl MainWindow {
                         *count += rows_len;
                         *count
                     };
-                    if s.last_fetch_status_update.elapsed() >= FETCH_STATUS_UPDATE_INTERVAL {
-                        s.update_status_animation(&format!("Fetching rows: {}", new_count));
+                    // Throttle status bar updates to avoid formatting a new string
+                    // and touching the label widget on every row batch.
+                    let needs_status_update =
+                        s.last_fetch_status_update.elapsed() >= FETCH_STATUS_UPDATE_INTERVAL;
+                    if needs_status_update {
                         s.last_fetch_status_update = Instant::now();
+                        s.update_status_animation(&format!("Fetching rows: {}", new_count));
                     }
                     drop(s);
                     result_tabs.append_rows(tab_index, rows);
