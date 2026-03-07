@@ -1584,6 +1584,54 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_clause_with_qquoted_target_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_qquoted RETURN NUMBER
+AS LANGUAGE q'[C]' NAME 'ext_lang_qquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE q-quoted target call spec should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_qquoted RETURN NUMBER"),
+        "first statement should keep q-quoted LANGUAGE call spec function: {}",
+        stmts[0]
+    );
+    assert!(stmts[0].contains("AS LANGUAGE q'[C]' NAME 'ext_lang_qquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_clause_with_nqquoted_target_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_nqquoted RETURN NUMBER
+AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep nq-quoted LANGUAGE call spec function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_nqquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_external_function_language_clause_without_external_suffix_still_splits() {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_only RETURN NUMBER
 AS LANGUAGE C;
