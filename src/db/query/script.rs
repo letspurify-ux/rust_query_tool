@@ -4,6 +4,187 @@ use crate::sql_text;
 
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
 
+// ── TopLevelScanner ─────────────────────────────────────────────────────────
+//
+// Byte-based SQL scanner that yields top-level tokens while skipping
+// comments, string literals, and tracking parenthesis depth.
+//
+// This replaces 8+ near-identical scanning state machines that were
+// duplicated across `find_top_level_keyword`, `has_top_level_identifier_token`,
+// `find_first_top_level_comma`, `select_clause_has_top_level_aggregate`,
+// `select_clause_has_top_level_analytic`, `is_single_table_from_clause`,
+// and `select_clause_has_distinct_or_unique`.
+
+/// Token yielded by [`TopLevelScanner`] at parenthesis depth 0.
+enum ScanToken<'a> {
+    /// An identifier or keyword at depth 0.
+    Word { text: &'a str, start: usize },
+    /// A non-structural symbol at depth 0 (e.g. `,`, `*`, `;`).
+    Symbol { byte: u8, pos: usize },
+}
+
+/// Scans SQL text yielding only meaningful tokens at parenthesis depth 0,
+/// automatically skipping comments (`--`, `/* */`), string literals (`'...'`),
+/// quoted identifiers (`"..."`), and nested parenthesised expressions.
+///
+/// Uses byte-level iteration (no `Vec<(usize, char)>` allocation) since all
+/// SQL delimiters and keywords are ASCII.
+struct TopLevelScanner<'a> {
+    sql: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+}
+
+impl<'a> TopLevelScanner<'a> {
+    #[inline]
+    fn new(sql: &'a str) -> Self {
+        Self {
+            sql,
+            bytes: sql.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Peek at the next non-whitespace byte without consuming it.
+    fn peek_next_non_ws_byte(&self) -> Option<u8> {
+        let mut pos = self.pos;
+        while pos < self.bytes.len() {
+            if !self.bytes[pos].is_ascii_whitespace() {
+                return Some(self.bytes[pos]);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    fn skip_single_quoted(&mut self) {
+        self.pos += 1;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'\'' {
+                self.pos += 1;
+                if self.pos < self.bytes.len() && self.bytes[self.pos] == b'\'' {
+                    self.pos += 1;
+                    continue;
+                }
+                return;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn skip_double_quoted(&mut self) {
+        self.pos += 1;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'"' {
+                self.pos += 1;
+                if self.pos < self.bytes.len() && self.bytes[self.pos] == b'"' {
+                    self.pos += 1;
+                    continue;
+                }
+                return;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn skip_line_comment(&mut self) {
+        self.pos += 2;
+        while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+            self.pos += 1;
+        }
+    }
+
+    fn skip_block_comment(&mut self) {
+        self.pos += 2;
+        while self.pos + 1 < self.bytes.len() {
+            if self.bytes[self.pos] == b'*' && self.bytes[self.pos + 1] == b'/' {
+                self.pos += 2;
+                return;
+            }
+            self.pos += 1;
+        }
+        self.pos = self.bytes.len();
+    }
+}
+
+impl<'a> Iterator for TopLevelScanner<'a> {
+    type Item = ScanToken<'a>;
+
+    fn next(&mut self) -> Option<ScanToken<'a>> {
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+
+            if b == b'-' && self.bytes.get(self.pos + 1) == Some(&b'-') {
+                self.skip_line_comment();
+                continue;
+            }
+            if b == b'/' && self.bytes.get(self.pos + 1) == Some(&b'*') {
+                self.skip_block_comment();
+                continue;
+            }
+            if b == b'\'' {
+                self.skip_single_quoted();
+                continue;
+            }
+            if b == b'"' {
+                self.skip_double_quoted();
+                continue;
+            }
+
+            if b == b'(' {
+                self.depth += 1;
+                self.pos += 1;
+                continue;
+            }
+            if b == b')' {
+                self.depth = self.depth.saturating_sub(1);
+                self.pos += 1;
+                continue;
+            }
+
+            if b.is_ascii_whitespace() {
+                self.pos += 1;
+                continue;
+            }
+
+            // At depth > 0, skip tokens without yielding
+            if self.depth > 0 {
+                if sql_text::is_identifier_start_byte(b) {
+                    self.pos += 1;
+                    while self.pos < self.bytes.len()
+                        && sql_text::is_identifier_byte(self.bytes[self.pos])
+                    {
+                        self.pos += 1;
+                    }
+                } else {
+                    self.pos += 1;
+                }
+                continue;
+            }
+
+            // Depth 0: yield tokens
+            if sql_text::is_identifier_start_byte(b) {
+                let start = self.pos;
+                self.pos += 1;
+                while self.pos < self.bytes.len()
+                    && sql_text::is_identifier_byte(self.bytes[self.pos])
+                {
+                    self.pos += 1;
+                }
+                let text = &self.sql[start..self.pos];
+                return Some(ScanToken::Word { text, start });
+            }
+
+            let pos = self.pos;
+            self.pos += 1;
+            return Some(ScanToken::Symbol { byte: b, pos });
+        }
+        None
+    }
+}
+
 impl QueryExecutor {
     #[inline]
     fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
@@ -852,86 +1033,11 @@ impl QueryExecutor {
     }
 
     fn find_first_top_level_comma(sql: &str) -> Option<usize> {
-        let mut chars = sql.char_indices().peekable();
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while let Some((byte_idx, c)) = chars.next() {
-            let next = chars.peek().map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    chars.next(); // consume '/'
-                }
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        chars.next(); // consume escaped quote
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        chars.next(); // consume escaped quote
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                chars.next(); // consume second '-'
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                chars.next(); // consume '*'
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                continue;
-            }
-
-            if depth == 0 && c == ',' {
-                return Some(byte_idx);
+        for token in TopLevelScanner::new(sql) {
+            if let ScanToken::Symbol { byte: b',', pos } = token {
+                return Some(pos);
             }
         }
-
         None
     }
 
@@ -983,125 +1089,16 @@ impl QueryExecutor {
         }
 
         let select_list = &sql[select_body_start..from_idx];
-        let chars: Vec<(usize, char)> = select_list.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let (_, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                i += 1;
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                continue;
-            }
-
-            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
-                let start = chars[i].0;
-                let mut end_i = i + 1;
-                while end_i < len {
-                    let ch = chars[end_i].1;
-                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
-                        end_i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let end = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    select_list.len()
-                };
-                let word = &select_list[start..end];
-                let mut lookahead = end_i;
-                while lookahead < len && chars[lookahead].1.is_whitespace() {
-                    lookahead += 1;
-                }
-                let has_open_paren = lookahead < len && chars[lookahead].1 == '(';
-                if has_open_paren && Self::is_aggregate_function_name(word) {
+        let mut scanner = TopLevelScanner::new(select_list);
+        while let Some(token) = scanner.next() {
+            if let ScanToken::Word { text, .. } = token {
+                if Self::is_aggregate_function_name(text)
+                    && scanner.peek_next_non_ws_byte() == Some(b'(')
+                {
                     return true;
                 }
-                i = end_i;
-                continue;
             }
-
-            i += 1;
         }
-
         false
     }
 
@@ -1152,126 +1149,16 @@ impl QueryExecutor {
         }
 
         let select_list = &sql[select_body_start..from_idx];
-        let chars: Vec<(usize, char)> = select_list.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let (_, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
+        let mut scanner = TopLevelScanner::new(select_list);
+        while let Some(token) = scanner.next() {
+            if let ScanToken::Word { text, .. } = token {
+                if text.eq_ignore_ascii_case("OVER")
+                    && scanner.peek_next_non_ws_byte() == Some(b'(')
+                {
+                    return true;
                 }
-                i += 1;
-                continue;
             }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                i += 1;
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                continue;
-            }
-
-            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
-                let start = chars[i].0;
-                let mut end_i = i + 1;
-                while end_i < len {
-                    let ch = chars[end_i].1;
-                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#' {
-                        end_i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let end = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    select_list.len()
-                };
-                let word = &select_list[start..end];
-                if word.eq_ignore_ascii_case("OVER") {
-                    let mut lookahead = end_i;
-                    while lookahead < len && chars[lookahead].1.is_whitespace() {
-                        lookahead += 1;
-                    }
-                    if lookahead < len && chars[lookahead].1 == '(' {
-                        return true;
-                    }
-                }
-                i = end_i;
-                continue;
-            }
-
-            i += 1;
         }
-
         false
     }
 
@@ -1467,155 +1354,12 @@ impl QueryExecutor {
             || Self::has_top_level_identifier_keyword(sql, "START")
     }
 
-    /// Like `find_top_level_keyword`, but additionally validates that the
-    /// character immediately after the matched word is not `_`, `$`, or `#`.
-    /// `find_top_level_keyword` splits on `is_ascii_alphanumeric()` only,
-    /// so `START_DATE` would match `START`.  This helper rejects such cases.
+    /// Check if the SQL contains a top-level identifier token matching `keyword`.
+    ///
+    /// `find_top_level_keyword` already uses full identifier-char boundaries
+    /// (`_`, `$`, `#`), so this is a simple presence check.
     fn has_top_level_identifier_keyword(sql: &str, keyword: &str) -> bool {
-        if keyword.contains('_') {
-            return Self::has_top_level_identifier_token(sql, keyword);
-        }
-        let Some(idx) = Self::find_top_level_keyword(sql, keyword) else {
-            return false;
-        };
-        let after = idx.saturating_add(keyword.len());
-        if after >= sql.len() {
-            return true;
-        }
-        !matches!(
-            sql.as_bytes().get(after),
-            Some(b'_') | Some(b'$') | Some(b'#')
-        )
-    }
-
-    /// Check if the effective SQL contains a top-level identifier token that
-    /// exactly matches `keyword` (supports underscores in keyword).
-    fn has_top_level_identifier_token(sql: &str, keyword: &str) -> bool {
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let len = chars.len();
-        let keyword_upper = keyword.to_ascii_uppercase();
-        let mut i = 0usize;
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                i += 1;
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                continue;
-            }
-
-            if depth == 0 && c.is_ascii_alphabetic() {
-                let start = byte_idx;
-                let mut end_i = i;
-                while end_i < len {
-                    let ch = chars[end_i].1;
-                    if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#') {
-                        end_i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let end_byte = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    sql.len()
-                };
-                if sql[start..end_byte].to_ascii_uppercase() == keyword_upper {
-                    return true;
-                }
-                i = end_i;
-                continue;
-            }
-
-            i += 1;
-        }
-
-        false
-    }
-
-    /// Like `find_top_level_keyword`, but validates identifier boundary.
-    #[allow(dead_code)]
-    fn find_top_level_identifier_keyword(sql: &str, keyword: &str) -> Option<usize> {
-        if Self::has_top_level_identifier_keyword(sql, keyword) {
-            Self::find_top_level_keyword(sql, keyword)
-        } else {
-            None
-        }
+        Self::find_top_level_keyword(sql, keyword).is_some()
     }
 
     /// Extract the ROWID expression for the first real (non-subquery) table
@@ -1923,127 +1667,21 @@ impl QueryExecutor {
     }
 
     fn select_clause_has_distinct_or_unique(sql: &str, select_idx: usize, from_idx: usize) -> bool {
-        let select_keyword_end = select_idx.saturating_add("SELECT".len());
-        if select_keyword_end >= from_idx || select_keyword_end >= sql.len() {
+        let start = select_idx.saturating_add("SELECT".len());
+        if start >= from_idx || start >= sql.len() || !sql.is_char_boundary(from_idx) {
             return false;
         }
-
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
-        while i < len && chars[i].0 < select_keyword_end {
-            i += 1;
-        }
-
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            if byte_idx >= from_idx {
-                break;
+        let slice = match sql.get(start..from_idx) {
+            Some(s) => s,
+            None => return false,
+        };
+        for token in TopLevelScanner::new(slice) {
+            if let ScanToken::Word { text, .. } = token {
+                return text.eq_ignore_ascii_case("DISTINCT")
+                    || text.eq_ignore_ascii_case("UNIQUE");
             }
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c.is_whitespace() {
-                i += 1;
-                continue;
-            }
-
-            if c.is_ascii_alphabetic() {
-                let start_byte = byte_idx;
-                let mut end_i = i;
-                while end_i < len && chars[end_i].0 < from_idx {
-                    let token_char = chars[end_i].1;
-                    if !token_char.is_ascii_alphanumeric() && token_char != '_' {
-                        break;
-                    }
-                    end_i += 1;
-                }
-                let end_byte = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    sql.len()
-                };
-                if !sql.is_char_boundary(start_byte) || !sql.is_char_boundary(end_byte) {
-                    return false;
-                }
-
-                let token_upper = sql[start_byte..end_byte].to_ascii_uppercase();
-                if token_upper == "DISTINCT" || token_upper == "UNIQUE" {
-                    return true;
-                }
-                return false;
-            }
-
             return false;
         }
-
         false
     }
 
@@ -2121,116 +1759,13 @@ impl QueryExecutor {
     }
 
     fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
-        let keyword_upper = keyword.to_ascii_uppercase();
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let len = chars.len();
-
-        let mut i = 0usize;
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let (_, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
+        for token in TopLevelScanner::new(sql) {
+            if let ScanToken::Word { text, start } = token {
+                if text.eq_ignore_ascii_case(keyword) {
+                    return Some(start);
                 }
-                i += 1;
-                continue;
             }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                i += 1;
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                continue;
-            }
-
-            if depth == 0 && c.is_ascii_alphabetic() {
-                let start_byte = chars[i].0;
-                let mut end_i = i;
-                while end_i < len && chars[end_i].1.is_ascii_alphanumeric() {
-                    end_i += 1;
-                }
-                let end_byte = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    sql.len()
-                };
-                if sql[start_byte..end_byte].to_ascii_uppercase() == keyword_upper {
-                    return Some(start_byte);
-                }
-                i = end_i;
-                continue;
-            }
-
-            i += 1;
         }
-
         None
     }
 
@@ -2352,88 +1887,14 @@ impl QueryExecutor {
         if Self::starts_with_relation_invocation(relation_head) {
             return false;
         }
-        let clause_upper = from_clause.to_ascii_uppercase();
-        if clause_upper.contains(" JOIN ") {
-            return false;
-        }
 
-        let mut chars = from_clause.char_indices().peekable();
-        let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while let Some((_, c)) = chars.next() {
-            let next = chars.peek().map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
+        for token in TopLevelScanner::new(from_clause) {
+            match token {
+                ScanToken::Symbol { byte: b',', .. } => return false,
+                ScanToken::Word { text, .. } if text.eq_ignore_ascii_case("JOIN") => {
+                    return false
                 }
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    chars.next(); // consume '/'
-                }
-                continue;
-            }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        chars.next(); // consume escaped quote
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                continue;
-            }
-
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        chars.next(); // consume escaped quote
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                chars.next(); // consume second '-'
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                chars.next(); // consume '*'
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                continue;
-            }
-
-            if c == '(' {
-                depth = depth.saturating_add(1);
-                continue;
-            }
-            if c == ')' {
-                depth = depth.saturating_sub(1);
-                continue;
-            }
-
-            if depth == 0 && c == ',' {
-                return false;
+                _ => {}
             }
         }
 
