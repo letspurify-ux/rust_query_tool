@@ -2420,8 +2420,9 @@ fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize
 }
 
 fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
-    let derived_end = skip_derived_relation_postfix_clauses(tokens, start);
-    if derived_end == start {
+    let relation_postfix_end = skip_relation_postfix_clauses(tokens, start);
+    let derived_end = skip_derived_relation_postfix_clauses(tokens, relation_postfix_end);
+    if derived_end == relation_postfix_end {
         return None;
     }
     let alias_start = skip_relation_postfix_clauses(tokens, derived_end);

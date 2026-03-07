@@ -2754,6 +2754,63 @@ fn subpartition_for_clause_before_alias_is_not_parsed_as_alias() {
 }
 
 #[test]
+fn partition_clause_before_pivot_still_collects_derived_alias() {
+    let ctx = analyze(
+        "SELECT p.| FROM sales PARTITION (p202401) PIVOT (SUM(amount) FOR quarter IN ('Q1' AS q1_amount)) p",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("p")),
+        "derived alias after PARTITION + PIVOT should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_clause_before_match_recognize_still_collects_derived_alias() {
+    let ctx = analyze(
+        "SELECT mr.| FROM sales PARTITION (p202401) MATCH_RECOGNIZE (PARTITION BY deptno ORDER BY amount PATTERN (a) DEFINE a AS amount > 0) mr",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("mr")),
+        "derived alias after PARTITION + MATCH_RECOGNIZE should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn partition_clause_before_model_still_collects_derived_alias() {
+    let ctx = analyze(
+        "SELECT m.| FROM sales PARTITION (p202401) MODEL DIMENSION BY (deptno) MEASURES (amount) RULES (amount[ANY] = amount[CV()]) m",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("m")),
+        "derived alias after PARTITION + MODEL should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn tablesample_keyword_is_not_parsed_as_table_alias() {
     let ctx = analyze("SELECT * FROM oqt_t_emp TABLESAMPLE (10) WHERE |");
     assert!(
