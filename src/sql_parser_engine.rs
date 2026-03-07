@@ -5789,6 +5789,77 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_exec_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("EXEC dbms_output.put_line('ok')");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "EXEC dbms_output.put_line('ok')".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlplus_describe_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("DESC emp");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec!["DESC emp".to_string(), "SELECT 1 FROM dual".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_exec_command_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("EXEC dbms_output.put_line('ok')");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[1].starts_with("EXEC dbms_output.put_line('ok')"),
+            "EXEC should become standalone statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_describe_command_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("DESC emp");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[1].starts_with("DESC emp"),
+            "DESC should become standalone statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
