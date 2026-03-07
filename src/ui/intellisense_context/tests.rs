@@ -3595,6 +3595,42 @@ fn system_versioning_for_application_time_contained_in_before_alias_is_not_parse
     assert_eq!(resolved, vec!["employees".to_string()]);
 }
 
+#[test]
+fn system_versioning_for_named_period_as_of_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR valid_time AS OF TIMESTAMP '2025-01-01 00:00:00' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("VALID_TIME")),
+        "FOR <period> clause period name must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
+#[test]
+fn system_versioning_for_named_period_between_before_alias_is_not_parsed_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM employees FOR business_time BETWEEN TIMESTAMP '2024-01-01 00:00:00' AND TIMESTAMP '2024-12-31 23:59:59' e WHERE e.|",
+    );
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("BUSINESS_TIME")),
+        "FOR <period> clause period name must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+    );
+
+    let resolved = resolve_qualifier_tables("e", &ctx.tables_in_scope);
+    assert_eq!(resolved, vec!["employees".to_string()]);
+}
+
 // ─── CTE inside subquery edge case ──────────────────────────────────────
 
 #[test]
