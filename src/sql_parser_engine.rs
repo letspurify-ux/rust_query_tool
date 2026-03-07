@@ -2209,6 +2209,20 @@ impl SqlParserEngine {
     where
         F: FnMut(&[char], usize, char, Option<char>),
     {
+        let can_fast_path_tool_command = self.state.is_idle()
+            && self.state.block_depth() == 0
+            && self.state.paren_depth == 0
+            && !self.state.in_with_plsql_declaration()
+            && self.current.trim().is_empty();
+        if can_fast_path_tool_command && sql_text::is_auto_terminated_tool_command(line) {
+            self.current.push_str(line);
+            self.current.push('\n');
+            self.push_current_statement();
+            self.reset_statement_local_state();
+            self.state.reset_create_state();
+            return;
+        }
+
         let mut on_symbol = on_symbol;
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
         scratch_chars.clear();
@@ -4845,6 +4859,32 @@ BEGIN"
             "SELECT should remain standalone after REMARK command split: {}",
             statements[2]
         );
+    }
+
+    #[test]
+    fn sqlplus_connect_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CONNECT scott/tiger");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "CONNECT scott/tiger".to_string());
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn sqlplus_start_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("START child.sql");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "START child.sql".to_string());
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
     }
 
     #[test]
