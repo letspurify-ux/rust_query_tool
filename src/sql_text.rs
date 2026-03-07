@@ -660,6 +660,21 @@ pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
 
 const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
 
+/// Top-level `WITH ...` clause keywords that indicate non-PL/SQL clause usage
+/// (e.g. `WITH READ ONLY`, `WITH CHECK OPTION`, `WITH ROWID`).
+const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
+    "READ",
+    "CHECK",
+    "CONSTRAINT",
+    "ROWID",
+    "OBJECT",
+    "PRIMARY",
+    "REDUCED",
+    "OIDS",
+    "LOCAL",
+    "CASCADED",
+];
+
 const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"];
 
 const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
@@ -917,6 +932,12 @@ pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
 /// Returns true when a keyword starts an Oracle top-level `WITH FUNCTION/PROCEDURE` declaration.
 pub(crate) fn is_with_plsql_declaration_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_PLSQL_DECLARATION_KEYWORDS)
+}
+
+/// Returns true when a top-level `WITH` token clearly belongs to a non-PL/SQL
+/// clause (for example `WITH READ ONLY` in view definitions).
+pub(crate) fn is_with_non_plsql_clause_keyword(word: &str) -> bool {
+    matches_keyword(word, WITH_NON_PLSQL_CLAUSE_KEYWORDS)
 }
 
 /// Returns true when a token can reasonably start a new top-level statement.
@@ -1188,6 +1209,27 @@ mod tests {
         assert!(is_statement_head_keyword("REVOKE"));
         assert!(is_statement_head_keyword("COMMIT"));
         assert!(is_statement_head_keyword("ROLLBACK"));
+    }
+
+    #[test]
+    fn with_non_plsql_clause_keyword_detects_common_oracle_clauses() {
+        for keyword in [
+            "READ",
+            "CHECK",
+            "ROWID",
+            "OBJECT",
+            "PRIMARY",
+            "REDUCED",
+            "CASCADED",
+            "CONSTRAINT",
+        ] {
+            assert!(
+                is_with_non_plsql_clause_keyword(keyword),
+                "{keyword} should be recognized as a non-PL/SQL WITH clause keyword"
+            );
+        }
+        assert!(!is_with_non_plsql_clause_keyword("FUNCTION"));
+        assert!(!is_with_non_plsql_clause_keyword("SELECT"));
     }
 
     #[test]
