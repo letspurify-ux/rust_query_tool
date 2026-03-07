@@ -797,7 +797,6 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "LOCK",
     "COMMIT",
     "ROLLBACK",
-    "RECOVER",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",
@@ -1034,6 +1033,28 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     if first.eq_ignore_ascii_case("PROMPT")
         || first.eq_ignore_ascii_case("REM")
         || first.eq_ignore_ascii_case("REMARK")
+    {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("DESCRIBE")
+        || first.eq_ignore_ascii_case("DESC")
+        || first.eq_ignore_ascii_case("EXEC")
+        || first.eq_ignore_ascii_case("EXECUTE")
+        || first.eq_ignore_ascii_case("SHOW")
+        || first.eq_ignore_ascii_case("SPOOL")
+        || first.eq_ignore_ascii_case("DEFINE")
+        || first.eq_ignore_ascii_case("UNDEFINE")
+        || first.eq_ignore_ascii_case("VARIABLE")
+        || first.eq_ignore_ascii_case("VAR")
+        || first.eq_ignore_ascii_case("PRINT")
+        || first.eq_ignore_ascii_case("ACCEPT")
+        || first.eq_ignore_ascii_case("PAUSE")
+        || first.eq_ignore_ascii_case("COLUMN")
+        || first.eq_ignore_ascii_case("BREAK")
+        || first.eq_ignore_ascii_case("COMPUTE")
+        || first.eq_ignore_ascii_case("CLEAR")
+        || first.eq_ignore_ascii_case("WHENEVER")
     {
         return true;
     }

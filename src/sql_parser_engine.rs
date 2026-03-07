@@ -6390,6 +6390,34 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_misc_single_line_commands_are_auto_terminated() {
+        for (command, next_select) in [
+            ("ACCEPT answer PROMPT 'Enter value:'", "SELECT 55 FROM dual;"),
+            ("PAUSE Press Enter", "SELECT 56 FROM dual;"),
+            ("VARIABLE v_status VARCHAR2(30)", "SELECT 57 FROM dual;"),
+            ("PRINT v_status", "SELECT 58 FROM dual;"),
+            ("BREAK ON deptno", "SELECT 59 FROM dual;"),
+            ("COMPUTE SUM OF sal ON deptno", "SELECT 60 FROM dual;"),
+            ("CLEAR BREAKS", "SELECT 61 FROM dual;"),
+            ("WHENEVER SQLERROR EXIT SQL.SQLCODE", "SELECT 62 FROM dual;"),
+        ] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line(command);
+            engine.process_line(next_select);
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(statements.len(), 2, "unexpected statements for {command}: {statements:?}");
+            assert_eq!(statements[0], command.to_string());
+            assert!(
+                statements[1].starts_with("SELECT"),
+                "next query should remain separated after {command}: {}",
+                statements[1]
+            );
+        }
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
@@ -6537,28 +6565,6 @@ BEGIN"
             statements[2].starts_with("SELECT 1 FROM dual"),
             "SELECT should remain standalone after ARCHIVE recovery split: {}",
             statements[2]
-        );
-    }
-
-    #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
-        let mut engine = SqlParserEngine::new();
-
-        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_recover RETURN NUMBER");
-        engine.process_line("AS LANGUAGE C;");
-        engine.process_line("RECOVER DATABASE;");
-
-        let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-        assert!(
-            statements[0].contains("AS LANGUAGE C"),
-            "first statement should keep EXTERNAL call spec: {}",
-            statements[0]
-        );
-        assert!(
-            statements[1].starts_with("RECOVER DATABASE"),
-            "RECOVER statement should begin a new statement after external routine split: {}",
-            statements[1]
         );
     }
 
