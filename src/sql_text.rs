@@ -797,7 +797,6 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "LOCK",
     "COMMIT",
     "ROLLBACK",
-    "RECOVER",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",

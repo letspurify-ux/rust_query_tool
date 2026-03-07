@@ -6484,7 +6484,7 @@ BEGIN"
 
 
     #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
+    fn external_language_clause_splits_before_recover_statement_head_with_following_select() {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE FUNCTION ext_recover_head RETURN NUMBER");

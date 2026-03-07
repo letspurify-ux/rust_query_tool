@@ -3206,6 +3206,8 @@ impl QueryExecutor {
             || trimmed.starts_with('@')
             || Self::is_start_script_command(trimmed)
             || Self::is_run_script_command(trimmed)
+            || upper == "RUN"
+            || upper == "R"
         {
             return Some(Self::parse_script_command(trimmed));
         }

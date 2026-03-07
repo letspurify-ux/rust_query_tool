@@ -10478,6 +10478,78 @@ SELECT 2 FROM dual;"
     }
 }
 
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_run_without_path_command() {
+    for run_command in ["RUN", "R"] {
+        let sql = format!(
+            "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+{run_command}
+SELECT 2 FROM dual;"
+        );
+
+        let items = QueryExecutor::split_script_items(&sql);
+
+        assert!(
+            matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+            "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+        );
+        assert!(
+            matches!(items.get(1), Some(ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error })) if raw == run_command && message.contains("requires a path") && *is_error),
+            "second item should classify {run_command} without path as unsupported run-script command: {items:?}"
+        );
+        assert!(
+            matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+            "third item should be trailing SELECT statement: {items:?}"
+        );
+    }
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_recovers_to_run_without_path_command() {
+    for run_command in ["RUN", "R"] {
+        let sql = format!(
+            "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+{run_command}
+SELECT 2 FROM dual;"
+        );
+
+        let items = QueryExecutor::split_format_items(&sql);
+        let stmts: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                FormatItem::Statement(stmt) => Some(stmt.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            stmts.first().is_some_and(|stmt| {
+                stmt.contains("WITH") && stmt.contains("FUNCTION f")
+            }),
+            "first formatted statement should keep only WITH FUNCTION declaration statement: {stmts:?}"
+        );
+        assert!(
+            matches!(items.get(1), Some(FormatItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error })) if raw == run_command && message.contains("requires a path") && *is_error),
+            "second item should classify {run_command} without path as unsupported run-script command: {items:?}"
+        );
+        assert!(
+            stmts
+                .get(1)
+                .is_some_and(|stmt| stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+            "second formatted statement should be trailing SELECT statement: {stmts:?}"
+        );
+    }
+}
+
 #[test]
 fn test_split_script_items_oracle_with_function_recovers_to_run_script_statement_head() {
     let sql = r#"WITH
