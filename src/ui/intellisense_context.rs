@@ -311,12 +311,18 @@ fn is_comment_on_target(tokens: &[SqlToken], idx: usize, last_word: Option<&str>
     false
 }
 
-fn is_comment_on_materialized_view_target(
+fn is_comment_on_qualified_view_target(
     tokens: &[SqlToken],
     idx: usize,
     last_word: Option<&str>,
 ) -> bool {
-    if !matches!(last_word, Some(prev) if prev.eq_ignore_ascii_case("MATERIALIZED")) {
+    let qualifier = match last_word {
+        Some(prev) if prev.eq_ignore_ascii_case("MATERIALIZED") => "MATERIALIZED",
+        Some(prev) if prev.eq_ignore_ascii_case("EDITIONING") => "EDITIONING",
+        _ => return false,
+    };
+
+    if idx == 0 {
         return false;
     }
 
@@ -333,7 +339,7 @@ fn is_comment_on_materialized_view_target(
 
     matches!(
         significant_words.as_slice(),
-        [first, second, third] if first == "MATERIALIZED" && second == "ON" && third == "COMMENT"
+        [first, second, third] if first == qualifier && second == "ON" && third == "COMMENT"
     )
 }
 fn is_create_on_table_target(tokens: &[SqlToken], idx: usize) -> bool {
@@ -1294,14 +1300,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                     "VIEW"
                         if is_comment_on_target(tokens, idx, last_word.as_deref())
-                            || is_comment_on_materialized_view_target(
+                            || is_comment_on_qualified_view_target(
                                 tokens,
                                 idx,
                                 last_word.as_deref(),
                             ) =>
                     {
-                        // `COMMENT ON VIEW ...` and `COMMENT ON MATERIALIZED VIEW ...`
-                        // use the same object-target position as COMMENT ON TABLE.
+                        // `COMMENT ON VIEW ...`, `COMMENT ON MATERIALIZED VIEW ...`,
+                        // and `COMMENT ON EDITIONING VIEW ...` use the same
+                        // object-target position as COMMENT ON TABLE.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
