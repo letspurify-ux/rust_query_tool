@@ -1613,6 +1613,20 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
     true
 }
 
+fn chars_starts_with_ascii_ci(chars: &[char], start: usize, pattern_upper_ascii: &str) -> bool {
+    let mut idx = start;
+    for pattern_ch in pattern_upper_ascii.chars() {
+        let Some(ch) = chars.get(idx).copied() else {
+            return false;
+        };
+        if !ch.eq_ignore_ascii_case(&pattern_ch) {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
 fn preview_identifier_upper(chars: &[char], start: usize) -> Option<String> {
     let first = chars.get(start).copied()?;
     if !sql_text::is_identifier_char(first) {
@@ -1753,8 +1767,8 @@ fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
             .is_none_or(|ch| ch.is_whitespace())
     };
 
-    chars_starts_with(chars, idx, "REM") && is_ascii_boundary(idx + 3)
-        || chars_starts_with(chars, idx, "REMARK") && is_ascii_boundary(idx + 6)
+    chars_starts_with_ascii_ci(chars, idx, "REM") && is_ascii_boundary(idx + 3)
+        || chars_starts_with_ascii_ci(chars, idx, "REMARK") && is_ascii_boundary(idx + 6)
 }
 
 // ---------------------------------------------------------------------------
@@ -5732,6 +5746,27 @@ BEGIN"
         assert!(
             statements[1].starts_with("/ REM rerun external\nSELECT 52 FROM dual"),
             "slash line with REM comment should start the next statement: {}",
+            statements[1]
+        );
+    }
+
+
+    #[test]
+    fn external_language_clause_splits_before_slash_line_with_lowercase_sqlplus_remark() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_slash_rem_lower RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("/ rem rerun external");
+        engine.process_line("SELECT 53 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("/ rem rerun external
+SELECT 53 FROM dual"),
+            "slash line with lowercase REM comment should start the next statement: {}",
             statements[1]
         );
     }
