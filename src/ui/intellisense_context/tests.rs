@@ -719,7 +719,6 @@ fn phase_for_update_of_skip_locked_is_not_column_context() {
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
 }
 
-
 #[test]
 fn phase_for_share_of_skip_is_not_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR SHARE OF empno SKIP |");
@@ -1232,6 +1231,32 @@ fn phase_delete_returning_bulk_collect_into_does_not_switch_to_table_context() {
     let ctx = analyze("DELETE FROM t WHERE a = 1 RETURNING a BULK COLLECT INTO |");
     assert_eq!(ctx.phase, SqlPhase::SetClause);
     assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_select_json_value_returning_clause_stays_column_context() {
+    let ctx = analyze("SELECT JSON_VALUE(payload, '$.id' RETURNING | NUMBER) FROM events e");
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EVENTS"),
+        "expected EVENTS table in scope, got {:?}",
+        names
+    );
+}
+
+#[test]
+fn phase_where_json_query_returning_clause_stays_where_context() {
+    let ctx = analyze("SELECT * FROM events e WHERE JSON_QUERY(e.payload, '$' RETURNING | VARCHAR2(4000)) IS NOT NULL");
+
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EVENTS"),
+        "expected EVENTS table in scope, got {:?}",
+        names
+    );
 }
 
 #[test]

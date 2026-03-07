@@ -676,6 +676,8 @@ fn begin_set_operator_operand_scope(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
     Unknown,
+    Insert,
+    Update,
     Delete,
     Merge,
     Rename,
@@ -1102,6 +1104,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
                         } else {
+                            depth_frames[depth].statement_kind = StatementKind::Insert;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.clear();
                         }
@@ -1408,10 +1411,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "RETURNING" => {
-                        // DML RETURNING lists target columns/expressions.
-                        depth_frames[depth].phase = SqlPhase::SetClause;
-                        depth_frames[depth].returning_clause_active = true;
-                        depth_frames[depth].locking_clause_active = false;
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        let is_dml_returning_context = matches!(
+                            current_statement_kind,
+                            StatementKind::Insert
+                                | StatementKind::Update
+                                | StatementKind::Delete
+                                | StatementKind::Merge
+                        );
+
+                        if is_dml_returning_context {
+                            // DML RETURNING lists target columns/expressions.
+                            depth_frames[depth].phase = SqlPhase::SetClause;
+                            depth_frames[depth].returning_clause_active = true;
+                            depth_frames[depth].locking_clause_active = false;
+                        }
                         relation_state.clear();
                     }
                     "UPDATE" => {
@@ -1454,7 +1471,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         } else {
                             depth_frames[depth].locking_clause_active = false;
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
-                            depth_frames[depth].statement_kind = StatementKind::Unknown;
+                            depth_frames[depth].statement_kind = StatementKind::Update;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
                             relation_state.expect_table();
                         }
