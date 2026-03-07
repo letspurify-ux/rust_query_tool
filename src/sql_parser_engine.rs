@@ -5660,6 +5660,50 @@ BEGIN"
     }
 
     #[test]
+    fn external_language_clause_splits_before_startup_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_startup RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("STARTUP;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("STARTUP"),
+            "STARTUP command should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_shutdown_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_shutdown RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("SHUTDOWN;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SHUTDOWN"),
+            "SHUTDOWN command should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn with_function_recovers_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
@@ -5715,6 +5759,96 @@ BEGIN"
         assert!(
             statements[2].starts_with("SELECT local_fn() FROM dual"),
             "SELECT statement should remain standalone after CREATE recovery split: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
+    fn with_function_recovers_before_startup_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("STARTUP;");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("STARTUP"),
+            "STARTUP command should start a new statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT statement should remain standalone after STARTUP recovery split: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
+    fn with_function_recovers_before_shutdown_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("SHUTDOWN;");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SHUTDOWN"),
+            "SHUTDOWN command should start a new statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT statement should remain standalone after SHUTDOWN recovery split: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
+    fn with_function_recovers_before_administer_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END local_fn;");
+        engine.process_line("ADMINISTER KEY MANAGEMENT SET KEY IDENTIFIED BY \"pwd\";");
+        engine.process_line("SELECT local_fn() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END local_fn"),
+            "first statement should keep WITH FUNCTION declaration: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("ADMINISTER KEY MANAGEMENT"),
+            "ADMINISTER statement should start a new statement after WITH FUNCTION recovery: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT local_fn() FROM dual"),
+            "SELECT statement should remain standalone after ADMINISTER recovery split: {}",
             statements[2]
         );
     }
