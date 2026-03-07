@@ -5013,6 +5013,24 @@ BEGIN"
     }
 
     #[test]
+    fn oracle_start_with_clause_is_not_misclassified_as_sqlplus_start_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT employee_id");
+        engine.process_line("FROM employees");
+        engine.process_line("START WITH manager_id IS NULL");
+        engine.process_line("CONNECT BY PRIOR employee_id = manager_id;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("START WITH manager_id IS NULL"),
+            "hierarchical START WITH clause should remain in the SELECT statement: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_trailing_block_comment_and_select() {
         let mut engine = SqlParserEngine::new();
 

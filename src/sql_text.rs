@@ -956,8 +956,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
 
     if first.eq_ignore_ascii_case("START") {
         let second = words.next();
-        let has_more_tokens = words.next().is_some();
-        return !(second.is_some_and(|word| word.eq_ignore_ascii_case("WITH")) && has_more_tokens);
+        return !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"));
     }
 
     if first.eq_ignore_ascii_case("RUN") {
@@ -1160,10 +1159,10 @@ mod tests {
     #[test]
     fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
         assert!(is_auto_terminated_tool_command("START child.sql"));
+        assert!(!is_auto_terminated_tool_command("START WITH"));
         assert!(!is_auto_terminated_tool_command(
             "START WITH parent_id IS NULL"
         ));
-        assert!(is_auto_terminated_tool_command("START with"));
     }
 
     #[test]
