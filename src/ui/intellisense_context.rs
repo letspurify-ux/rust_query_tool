@@ -1332,14 +1332,6 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .is_some_and(|frame| frame.locking_clause_active)
                             && !locking_of_clause_identifier_position(tokens, idx)
                         {
-                            let in_lock_target_list = matches!(
-                                previous_significant_token(tokens, idx),
-                                Some((_, SqlToken::Word(prev))) if prev.eq_ignore_ascii_case("OF")
-                            ) || matches!(
-                                previous_significant_token(tokens, idx),
-                                Some((_, SqlToken::Symbol(sym))) if sym == ","
-                            );
-
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
                             // modifiers, not expression/table contexts. Keep identifier
                             // suggestions for `OF wait` / `OF nowait` column names.
@@ -1355,8 +1347,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 || matches!(
                                     next_word_upper(tokens, idx + 1),
                                     Some((next, _)) if next == "LOCKED"
-                                ))
-                        {
+                                ));
+
+                        if locking_clause_active {
                             // Oracle `FOR UPDATE ... SKIP LOCKED` and in-progress `... SKIP`
                             // lock options close lock target list just like NOWAIT/WAIT.
                             // Keep `SKIP` as an identifier candidate for `OF <column list>`
@@ -1976,25 +1969,15 @@ fn next_word_upper(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
 }
 
 fn locking_of_clause_identifier_position(tokens: &[SqlToken], idx: usize) -> bool {
-    let Some((prev_word, _)) = prev_word_upper(tokens, idx) else {
+    let Some((prev_token, _)) = prev_non_comment_token(tokens, idx) else {
         return false;
     };
 
-    if prev_word == "OF" {
-        return true;
+    match prev_token {
+        SqlToken::Word(word) => word.eq_ignore_ascii_case("OF"),
+        SqlToken::Symbol(symbol) => matches!(symbol.as_str(), "," | "."),
+        _ => false,
     }
-
-    let mut cursor = idx;
-    while cursor > 0 {
-        cursor -= 1;
-        match &tokens[cursor] {
-            SqlToken::Comment(_) => continue,
-            SqlToken::Symbol(symbol) => return symbol == ",",
-            _ => return false,
-        }
-    }
-
-    false
 }
 
 fn prev_word_upper(tokens: &[SqlToken], before_idx: usize) -> Option<(String, usize)> {
