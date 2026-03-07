@@ -4113,9 +4113,12 @@ impl QueryExecutor {
             return tail.is_empty();
         }
 
-        // Hierarchical query clause "START WITH" must stay as SQL, not SQL*Plus START command.
-        let first_word = tail.split_whitespace().next().unwrap_or_default();
-        !first_word.eq_ignore_ascii_case("WITH")
+        // Hierarchical query clause "START WITH <expr>" must stay as SQL,
+        // but SQL*Plus still allows a script file literally named "with".
+        let mut words = tail.split_whitespace();
+        let first_word = words.next().unwrap_or_default();
+        let has_more_tokens = words.next().is_some();
+        !(first_word.eq_ignore_ascii_case("WITH") && has_more_tokens)
     }
 
     fn is_run_script_command(trimmed: &str) -> bool {
