@@ -1020,22 +1020,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
                 | "WRAP"
             )
         }
-        "SHOW" => {
-            let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
-                return false;
-            };
-            matches!(
-                second.to_ascii_uppercase().as_str(),
-                "ALL" | "APPINFO" | "AUTOCOMMIT" | "COLSEP" | "COPYCOMMIT"
-                | "DEFINE" | "DESCRIBE" | "ECHO" | "EDITFILE" | "ESCAPE"
-                | "FEEDBACK" | "HEADING" | "LINESIZE" | "LONG" | "LONGCHUNKSIZE"
-                | "NEWPAGE" | "NULL" | "NUMFORMAT" | "NUMWIDTH" | "PAGESIZE"
-                | "PAUSE" | "RELEASE" | "SERVEROUTPUT" | "SQLCODE" | "SQLCONTINUE"
-                | "SQLNUMBER" | "SQLPLUSCOMPATIBILITY" | "SQLPROMPT"
-                | "SQLTERMINATOR" | "SUFFIX" | "TERMOUT" | "TIMING" | "USER"
-                | "VERIFY" | "VERSION" | "WRAP"
-            )
-        }
+        "SHOW" => next_meaningful_word(trimmed, 1).is_some(),
         // PASSWORD abbreviations
         "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD" => true,
         // Simple auto-terminated keywords (no second-word check needed)
@@ -1286,6 +1271,8 @@ mod tests {
         assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT"));
         assert!(is_auto_terminated_tool_command("COLUMN ename FORMAT A20"));
         assert!(is_auto_terminated_tool_command("CLEAR COLUMNS"));
+        assert!(is_auto_terminated_tool_command("SHOW PARAMETER open_cursors"));
+        assert!(is_auto_terminated_tool_command("SHOW ERRORS"));
         assert!(is_auto_terminated_tool_command("PASSWO scott"));
         assert!(is_auto_terminated_tool_command("PASSWOR scott"));
         assert!(is_auto_terminated_tool_command("PASSWORD scott"));
