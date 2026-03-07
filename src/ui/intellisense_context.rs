@@ -1181,17 +1181,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
-                    "OVERWRITE"
-                        if matches!(last_word.as_deref(), Some("INSERT")) =>
-                    {
+                    "OVERWRITE" if matches!(last_word.as_deref(), Some("INSERT")) => {
                         // Hive/Spark-style `INSERT OVERWRITE TABLE ...` keeps
                         // target relation context after OVERWRITE.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
-                    "DIRECTORY"
-                        if matches!(last_word.as_deref(), Some("OVERWRITE")) =>
-                    {
+                    "DIRECTORY" if matches!(last_word.as_deref(), Some("OVERWRITE")) => {
                         // `INSERT OVERWRITE DIRECTORY ...` targets a filesystem
                         // location rather than a table relation.
                         depth_frames[depth].phase = SqlPhase::Initial;
@@ -1345,13 +1341,37 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
                         {
-                            // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
-                            // just like NOWAIT/WAIT. Keep `SKIP` as an identifier candidate
-                            // inside `OF <column list>` unless the next keyword is LOCKED.
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
-                            relation_state.clear();
+                            let prev_word = prev_word_upper(tokens, idx).map(|(word, _)| word);
+                            let mut prev_idx = idx;
+                            let mut prev_is_comma = false;
+                            while prev_idx > 0 {
+                                prev_idx -= 1;
+                                match &tokens[prev_idx] {
+                                    SqlToken::Comment(_) => continue,
+                                    SqlToken::Symbol(symbol) if symbol == "," => {
+                                        prev_is_comma = true;
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                            }
+
+                            let treat_as_lock_modifier = matches!(
+                                prev_word.as_deref(),
+                                Some(prev) if prev != "OF"
+                            ) && !prev_is_comma;
+
+                            if treat_as_lock_modifier
+                                || matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
+                            {
+                                // Oracle `FOR UPDATE ... SKIP LOCKED` (and a trailing `SKIP`
+                                // entered after at least one lock target) closes the lock target
+                                // list. Keep `SKIP` as identifier context for `OF skip` and
+                                // comma-separated column lists like `OF empno, skip`.
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                                relation_state.clear();
+                            }
                         }
                     }
                     "LOCKED" => {
@@ -1424,8 +1444,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             is_mysql_on_duplicate_key_update(tokens, idx);
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
-                        let is_locking_update_keyword =
-                            matches!(last_word.as_deref(), Some("FOR"));
+                        let is_locking_update_keyword = matches!(last_word.as_deref(), Some("FOR"));
                         if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
