@@ -2619,12 +2619,14 @@ fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
     // Also consume optional arithmetic/interval suffixes often used in Oracle
     // flashback clauses, e.g.:
     //   AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '1' HOUR
+    //   AS OF SCN 100 * 2
+    //   VERSIONS BETWEEN SCN 1 * 2 AND SCN 3 * 4
     loop {
         let operator_idx = skip_comment_tokens(tokens, idx);
         let Some(SqlToken::Symbol(op)) = tokens.get(operator_idx) else {
             break;
         };
-        if op != "+" && op != "-" {
+        if op != "+" && op != "-" && op != "*" && op != "/" && op != "||" {
             break;
         }
 
