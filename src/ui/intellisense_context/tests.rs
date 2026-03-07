@@ -2404,6 +2404,103 @@ fn natural_join() {
 }
 
 #[test]
+fn natural_left_outer_join_keeps_both_relations_in_scope() {
+    let ctx = analyze("SELECT d.| FROM emp e NATURAL LEFT OUTER JOIN dept d");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn natural_right_join_keeps_both_relations_in_scope() {
+    let ctx = analyze("SELECT e.| FROM emp e NATURAL RIGHT JOIN dept d");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn natural_full_outer_join_keeps_both_relations_in_scope() {
+    let ctx = analyze("SELECT d.| FROM emp e NATURAL FULL OUTER JOIN dept d");
+    let names = table_names(&ctx);
+    assert!(names.contains(&"EMP".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
+}
+
+#[test]
+fn partitioned_outer_join_does_not_treat_partition_keyword_as_alias() {
+    let ctx = analyze(
+        "SELECT * FROM sales s PARTITION BY (s.region_id) RIGHT OUTER JOIN targets t ON s.region_id = t.region_id WHERE t.|",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(aliases.iter().all(|alias| alias != "PARTITION"));
+    assert!(aliases.iter().any(|alias| alias == "S"), "aliases: {:?}", aliases);
+    assert!(aliases.iter().any(|alias| alias == "T"), "aliases: {:?}", aliases);
+}
+
+#[test]
+fn table_function_alias_column_list_keeps_alias_visible_in_where_clause() {
+    let ctx = analyze("SELECT * FROM TABLE(get_rows()) r(id, val) WHERE r.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
+}
+
+#[test]
+fn table_function_alias_column_list_before_join_keeps_following_join_relation_visible() {
+    let ctx = analyze(
+        "SELECT * FROM TABLE(get_rows()) r(id, val) JOIN dept d ON d.id = r.id WHERE d.|",
+    );
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"GET_ROWS".to_string()), "tables: {:?}", names);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
+    assert!(aliases.iter().any(|alias| alias == "D"), "aliases: {:?}", aliases);
+    assert!(
+        aliases.iter().all(|alias| alias != "ID" && alias != "VAL"),
+        "alias column-list identifiers must not leak into relation aliases: {:?}",
+        aliases
+    );
+}
+
+#[test]
+fn table_function_alias_column_list_before_comma_keeps_following_relation_visible() {
+    let ctx = analyze("SELECT * FROM TABLE(get_rows()) r(id, val), dept d WHERE d.|");
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+
+    let names = table_names(&ctx);
+    assert!(names.contains(&"GET_ROWS".to_string()), "tables: {:?}", names);
+    assert!(names.contains(&"DEPT".to_string()), "tables: {:?}", names);
+
+    let aliases: Vec<String> = ctx
+        .tables_in_scope
+        .iter()
+        .filter_map(|table| table.alias.as_ref().map(|alias| alias.to_ascii_uppercase()))
+        .collect();
+    assert!(aliases.iter().any(|alias| alias == "R"), "aliases: {:?}", aliases);
+    assert!(aliases.iter().any(|alias| alias == "D"), "aliases: {:?}", aliases);
+}
+
+#[test]
 fn lateral_subquery_can_see_outer_table_scope() {
     let ctx = analyze("SELECT * FROM t1 a, LATERAL (SELECT a.| FROM t2 b) l");
     let names = table_names(&ctx);
