@@ -2119,10 +2119,11 @@ impl SqlParserEngine {
                     && self.state.token.is_empty()
                 {
                     if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
-                        if candidate_upper == "BEGIN" {
-                            self.state.pending_implicit_external_top_level_split = false;
-                        } else if sql_text::is_with_main_query_keyword(&candidate_upper)
-                            || sql_text::is_statement_head_keyword(&candidate_upper)
+                        let should_split_on_begin = candidate_upper == "BEGIN"
+                            && self.state.create_plsql_kind == CreatePlsqlKind::Function;
+                        if (sql_text::is_with_main_query_keyword(&candidate_upper)
+                            || sql_text::is_statement_head_keyword(&candidate_upper))
+                            && (candidate_upper != "BEGIN" || should_split_on_begin)
                         {
                             self.push_current_statement();
                             self.reset_statement_local_state();
@@ -4604,6 +4605,60 @@ BEGIN"
             statements[0].contains("WITH cte AS"),
             "CTE WITH should be treated as a valid main query head: {}",
             statements[0]
+        );
+    }
+
+    #[test]
+    fn with_function_followed_by_cte_name_then_select_splits_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("  cte AS (SELECT f() AS v FROM dual)");
+        engine.process_line("SELECT v FROM cte;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("cte AS (SELECT f() AS v FROM dual)"),
+            "CTE factoring clause should stay with WITH FUNCTION statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SELECT 2 FROM dual"),
+            "trailing SELECT should be split into a new statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_target_function_splits_before_following_begin_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn RETURN NUMBER");
+        engine.process_line("AS LANGUAGE JAVA;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("/");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE JAVA"),
+            "external call-spec function should remain in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("BEGIN"),
+            "anonymous block should be split into a second statement: {}",
+            statements[1]
         );
     }
 
