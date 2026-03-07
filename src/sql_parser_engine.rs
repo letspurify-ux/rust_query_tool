@@ -2089,9 +2089,9 @@ impl SqlParserEngine {
                 continue;
             }
 
-            // nq'[...]'
+            // nq'[...]'/uq'[...]'
             if self.state.token.is_empty()
-                && (c == 'n' || c == 'N')
+                && matches!(c, 'n' | 'N' | 'u' | 'U')
                 && (next == Some('q') || next == Some('Q'))
                 && i + 2 < len
                 && chars[i + 2] == '\''
@@ -4157,6 +4157,21 @@ mod tests {
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_uq_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_uqquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE uq'[C]' NAME 'ext_lang_uqquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE uq'[C]' NAME 'ext_lang_uqquoted'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
@@ -6239,6 +6254,22 @@ BEGIN"
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn simple_trigger_call_body_without_as_is_splits_before_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_call_only");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("CALL pkg_trg.fire();");
+        engine.process_line("SELECT 42 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("CALL pkg_trg.fire()"));
+        assert_eq!(statements[1], "SELECT 42 FROM dual".to_string());
     }
 
     #[test]
