@@ -753,6 +753,24 @@ impl SplitState {
         })
     }
 
+    fn should_split_begin_after_implicit_external_semicolon(&self, token_upper: &str) -> bool {
+        if token_upper != "BEGIN"
+            || self.block_depth() != 1
+            || self.paren_depth != 0
+            || !self.pending_implicit_external_top_level_split
+        {
+            return false;
+        }
+
+        if !matches!(self.create_plsql_kind, CreatePlsqlKind::Function) {
+            return false;
+        }
+
+        self.active_routine_frame().is_some_and(|frame| {
+            frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
+        })
+    }
+
     fn pop_case_block(&mut self) {
         if self.top_is_case() {
             let _ = self.block_stack.pop();
@@ -2164,7 +2182,12 @@ impl SqlParserEngine {
                     && self.state.token.is_empty()
                 {
                     if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
-                        if candidate_upper == "BEGIN"
+                        if self
+                            .state
+                            .should_split_begin_after_implicit_external_semicolon(&candidate_upper)
+                        {
+                            self.split_current_and_reset_external_boundary();
+                        } else if candidate_upper == "BEGIN"
                             && self.state.pending_implicit_external_top_level_split
                         {
                             self.state.pending_implicit_external_top_level_split = false;
@@ -5319,6 +5342,42 @@ BEGIN"
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
         assert!(statements[2].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn explicit_external_language_clause_splits_before_following_begin_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_begin_explicit RETURN NUMBER");
+        engine.process_line("AS EXTERNAL LANGUAGE C;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 39 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS EXTERNAL LANGUAGE C"));
+        assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
+        assert!(statements[2].starts_with("SELECT 39 FROM dual"));
+    }
+
+    #[test]
+    fn implicit_external_literal_target_clause_splits_before_following_begin_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_begin_literal RETURN NUMBER");
+        engine.process_line("AS LANGUAGE 'C';");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 40 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE 'C'"));
+        assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
+        assert!(statements[2].starts_with("SELECT 40 FROM dual"));
     }
 
     #[test]
