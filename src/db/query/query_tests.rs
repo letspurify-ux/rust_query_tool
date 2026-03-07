@@ -430,6 +430,42 @@ fn test_multiple_selects() {
 }
 
 #[test]
+fn test_is_select_statement_values_is_select() {
+    let sql = "VALUES (1, 'A')";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "top-level VALUES should be treated as SELECT-like query"
+    );
+}
+
+#[test]
+fn test_is_select_statement_table_is_select() {
+    let sql = "TABLE employees";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "top-level TABLE should be treated as SELECT-like query"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_values_is_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) VALUES ((SELECT id FROM t))";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... VALUES should be treated as SELECT-like query"
+    );
+}
+
+#[test]
+fn test_is_select_statement_with_clause_table_is_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) TABLE t";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... TABLE should be treated as SELECT-like query"
+    );
+}
+
+#[test]
 fn test_is_select_statement_with_clause_insert_is_not_select() {
     let sql = "WITH t AS (SELECT 1 AS id FROM dual) INSERT INTO t2(id) SELECT id FROM t";
     assert!(
