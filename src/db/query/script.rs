@@ -621,6 +621,9 @@ impl QueryExecutor {
         let with_prefix_len: usize;
         if leading == Some("WITH") {
             if let Some(main_select_idx) = Self::find_main_select_after_with(sql) {
+                if Self::is_parenthesized_select_start(sql, main_select_idx) {
+                    return sql.to_string();
+                }
                 effective_sql = &sql[main_select_idx..];
                 with_prefix_len = main_select_idx;
             } else {
@@ -699,6 +702,9 @@ impl QueryExecutor {
         let with_prefix_len: usize;
         if leading == Some("WITH") {
             if let Some(main_select_idx) = Self::find_main_select_after_with(rewritten_sql) {
+                if Self::is_parenthesized_select_start(rewritten_sql, main_select_idx) {
+                    return rewritten_sql.to_string();
+                }
                 effective_sql = &rewritten_sql[main_select_idx..];
                 with_prefix_len = main_select_idx;
             } else {
@@ -1280,6 +1286,8 @@ impl QueryExecutor {
         let mut in_double_quote = false;
         let mut in_line_comment = false;
         let mut in_block_comment = false;
+        let mut top_level_closed_paren_recently = false;
+        let mut parenthesized_main_query_depth: Option<usize> = None;
 
         // Skip past the WITH keyword
         while i < len {
@@ -1374,17 +1382,37 @@ impl QueryExecutor {
             }
 
             if c == '(' {
+                if depth == 0
+                    && top_level_closed_paren_recently
+                    && parenthesized_main_query_depth.is_none()
+                {
+                    parenthesized_main_query_depth = Some(1);
+                }
                 depth = depth.saturating_add(1);
                 i += 1;
                 continue;
             }
             if c == ')' {
+                if depth == 1 {
+                    top_level_closed_paren_recently = true;
+                }
                 depth = depth.saturating_sub(1);
+                if parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth < wrapper_depth)
+                {
+                    parenthesized_main_query_depth = None;
+                }
                 i += 1;
                 continue;
             }
 
-            if depth == 0 && c.is_ascii_alphabetic() {
+            if !c.is_whitespace() {
+                top_level_closed_paren_recently = false;
+            }
+
+            let token_depth_matches_main_query =
+                parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth == wrapper_depth);
+
+            if (depth == 0 || token_depth_matches_main_query) && c.is_ascii_alphabetic() {
                 let start = byte_idx;
                 let mut end_i = i;
                 while end_i < len
@@ -1409,6 +1437,20 @@ impl QueryExecutor {
         }
 
         None
+    }
+
+    fn is_parenthesized_select_start(sql: &str, select_idx: usize) -> bool {
+        if !sql.is_char_boundary(select_idx) {
+            return false;
+        }
+        let prefix = &sql[..select_idx];
+        for ch in prefix.chars().rev() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            return ch == '(';
+        }
+        false
     }
 
     /// Check if the effective SQL has a top-level set operator (UNION, INTERSECT, MINUS, EXCEPT).
@@ -2485,6 +2527,8 @@ impl QueryExecutor {
         let mut with_plsql_waiting_main_query = false;
         let mut with_plsql_block_depth = 0usize;
         let mut with_plsql_pending_end = false;
+        let mut top_level_closed_paren_recently = false;
+        let mut parenthesized_main_query_depth: Option<usize> = None;
 
         let resolve_with_plsql_pending_end = |pending_end: &mut bool, block_depth: &mut usize| {
             if *pending_end {
@@ -2600,13 +2644,26 @@ impl QueryExecutor {
             }
 
             if c == '(' {
+                if depth == 0
+                    && (with_plsql_waiting_main_query || top_level_closed_paren_recently)
+                    && parenthesized_main_query_depth.is_none()
+                {
+                    parenthesized_main_query_depth = Some(1);
+                }
                 depth += 1;
                 i += 1;
                 continue;
             }
 
             if c == ')' {
+                if depth == 1 {
+                    top_level_closed_paren_recently = true;
+                }
                 depth = depth.saturating_sub(1);
+                if parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth < wrapper_depth)
+                {
+                    parenthesized_main_query_depth = None;
+                }
                 i += 1;
                 continue;
             }
@@ -2624,7 +2681,14 @@ impl QueryExecutor {
                 continue;
             }
 
-            if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
+            if !c.is_whitespace() {
+                top_level_closed_paren_recently = false;
+            }
+
+            let token_depth_matches_main_query =
+                parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth == wrapper_depth);
+
+            if (depth == 0 || token_depth_matches_main_query) && (c.is_ascii_alphabetic() || c == '_') {
                 let start = i;
                 i += 1;
                 while i < len

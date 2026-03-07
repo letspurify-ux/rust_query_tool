@@ -466,6 +466,15 @@ fn test_is_select_statement_with_clause_select_is_select() {
 }
 
 #[test]
+fn test_is_select_statement_with_parenthesized_main_select_is_select() {
+    let sql = "WITH t AS (SELECT 1 AS id FROM dual) (SELECT id FROM t)";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "WITH ... (SELECT ...) should be treated as SELECT"
+    );
+}
+
+#[test]
 fn test_is_select_statement_with_clause_merge_is_not_select() {
     let sql = "WITH src AS (SELECT 1 AS id FROM dual) MERGE INTO t2 d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id";
     assert!(
@@ -775,6 +784,13 @@ fn test_maybe_inject_rowid_for_editing_with_multiple_ctes() {
         rewritten,
         "WITH cte1 AS (SELECT 1 AS x FROM DUAL), cte2 AS (SELECT 2 AS y FROM DUAL) SELECT e.ROWID, ENAME FROM EMP e WHERE e.DEPTNO = 10"
     );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_with_parenthesized_main_select() {
+    let sql = "WITH t AS (SELECT EMPNO, ENAME FROM EMP) (SELECT ENAME FROM EMP)";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
 }
 
 #[test]
