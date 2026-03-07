@@ -6390,6 +6390,40 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_archive_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("ARCHIVE LOG LIST");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "ARCHIVE LOG LIST".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlplus_recover_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("RECOVER DATABASE");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "RECOVER DATABASE".to_string(),
+                "SELECT 1 FROM dual".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
@@ -6541,7 +6575,7 @@ BEGIN"
     }
 
     #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
+    fn external_language_clause_splits_before_recover_database_statement_head() {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_recover RETURN NUMBER");
