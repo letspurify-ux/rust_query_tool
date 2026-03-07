@@ -753,6 +753,20 @@ impl SplitState {
         })
     }
 
+    fn in_implicit_external_top_level_context(&self) -> bool {
+        if self.block_depth() != 1 || self.paren_depth != 0 {
+            return false;
+        }
+
+        self.active_routine_frame().is_some_and(|frame| {
+            matches!(
+                frame.external_clause_state,
+                ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::AwaitingLanguageTargetImplicit
+            )
+        })
+    }
+
     fn pop_case_block(&mut self) {
         if self.top_is_case() {
             let _ = self.block_stack.pop();
@@ -1689,6 +1703,29 @@ fn is_line_leading_open_paren_marker(chars: &[char], marker_idx: usize) -> bool 
     true
 }
 
+fn is_line_leading_plsql_label_marker(chars: &[char], marker_idx: usize) -> bool {
+    if chars.get(marker_idx).copied() != Some('<') || chars.get(marker_idx + 1).copied() != Some('<') {
+        return false;
+    }
+
+    let mut lookbehind = marker_idx;
+    while lookbehind > 0 {
+        let prev_idx = lookbehind - 1;
+        let Some(prev) = chars.get(prev_idx).copied() else {
+            break;
+        };
+        if prev == '\n' {
+            break;
+        }
+        if !prev.is_whitespace() {
+            return false;
+        }
+        lookbehind = prev_idx;
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -2219,14 +2256,21 @@ impl SqlParserEngine {
             }
 
             if self.state.pending_implicit_external_top_level_split
-                && self.state.block_depth() == 1
+                && self.state.block_depth() <= 1
                 && self.state.paren_depth == 0
                 && self.state.token.is_empty()
                 && ((c == '@' && is_line_leading_run_script_marker(chars, i))
                     || (c == '!' && is_line_leading_bang_host_marker(chars, i))
-                    || (c == '(' && is_line_leading_open_paren_marker(chars, i)))
+                    || (c == '(' && is_line_leading_open_paren_marker(chars, i))
+                    || (c == '<' && is_line_leading_plsql_label_marker(chars, i)))
             {
                 self.split_current_statement();
+            } else if self.state.in_implicit_external_top_level_context()
+                && self.state.token.is_empty()
+                && ((c == '(' && is_line_leading_open_paren_marker(chars, i))
+                    || (c == '<' && is_line_leading_plsql_label_marker(chars, i)))
+            {
+                self.split_current_and_reset_external_boundary();
             }
 
             self.state.flush_token();
@@ -5281,6 +5325,44 @@ BEGIN"
         assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
+        assert!(statements[2].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn implicit_external_language_clause_splits_before_following_parenthesized_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_paren RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C");
+        engine.process_line("(SELECT 1 FROM dual);");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(statements[1].starts_with("(SELECT 1 FROM dual)"));
+        assert!(statements[2].starts_with("SELECT 2 FROM dual"));
+    }
+
+    #[test]
+    fn implicit_external_language_clause_splits_before_following_plsql_label_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_label RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C");
+        engine.process_line("<<blk>>");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("<<blk>>\nBEGIN\n  NULL;\nEND"),
+            "label block should remain in a single statement: {statements:?}"
+        );
         assert!(statements[2].starts_with("SELECT 1 FROM dual"));
     }
 
