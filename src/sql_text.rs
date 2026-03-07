@@ -797,7 +797,6 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "LOCK",
     "COMMIT",
     "ROLLBACK",
-    "RECOVER",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",
@@ -1015,6 +1014,10 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("STARTUP") || first.eq_ignore_ascii_case("SHUTDOWN") {
+        return true;
+    }
+
+    if first.eq_ignore_ascii_case("ARCHIVE") || first.eq_ignore_ascii_case("RECOVER") {
         return true;
     }
 
@@ -1400,6 +1403,8 @@ mod tests {
         assert!(is_auto_terminated_tool_command("QUIT"));
         assert!(is_auto_terminated_tool_command("STARTUP"));
         assert!(is_auto_terminated_tool_command("SHUTDOWN IMMEDIATE"));
+        assert!(is_auto_terminated_tool_command("ARCHIVE LOG LIST"));
+        assert!(is_auto_terminated_tool_command("RECOVER DATABASE"));
         assert!(is_auto_terminated_tool_command("SPOOL out.log"));
         assert!(is_auto_terminated_tool_command("DESCRIBE emp"));
         assert!(is_auto_terminated_tool_command("DESC emp"));
