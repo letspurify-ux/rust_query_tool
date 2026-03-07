@@ -244,7 +244,7 @@ impl RoutineFrame {
         self.external_clause_state = ExternalClauseState::Confirmed;
     }
 
-    fn observe_external_clause_token(&mut self, token_upper: &str) {
+    fn observe_external_clause_token(&mut self, token_upper: &str, allow_implicit_language: bool) {
         if matches!(
             self.external_clause_state,
             ExternalClauseState::AwaitingLanguageTargetFromExternal
@@ -318,12 +318,13 @@ impl RoutineFrame {
         }
 
         if token_upper == "LANGUAGE" {
-            self.external_clause_state =
-                if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-                    ExternalClauseState::AwaitingLanguageTargetFromExternal
-                } else {
-                    ExternalClauseState::AwaitingLanguageTargetImplicit
-                };
+            if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
+                self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetFromExternal;
+            } else if allow_implicit_language {
+                self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetImplicit;
+            } else {
+                self.external_clause_state = ExternalClauseState::None;
+            }
             return;
         }
 
@@ -984,8 +985,12 @@ impl SplitState {
             return;
         }
 
+        let allow_implicit_language = self.block_depth() > 1
+            || (self.block_depth() == 1
+                && matches!(self.create_plsql_kind, CreatePlsqlKind::Function));
+
         if let Some(frame) = self.active_routine_frame_mut() {
-            frame.observe_external_clause_token(upper);
+            frame.observe_external_clause_token(upper, allow_implicit_language);
         }
     }
 
@@ -7091,5 +7096,24 @@ BEGIN"
         assert!(statements[0].contains("AS LANGUAGE 'C' NAME 'f';"));
         assert!(statements[0].contains("END pkg_ext_quote"));
         assert_eq!(statements[1], "SELECT 44 FROM dual".to_string());
+    }
+
+    #[test]
+    fn type_body_member_external_call_spec_does_not_split_before_type_end() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE BODY t_ext_member AS");
+        engine.process_line("  MAP MEMBER FUNCTION f RETURN NUMBER");
+        engine.process_line("  IS LANGUAGE C NAME 'f';");
+        engine.process_line("END;");
+        engine.process_line("SELECT 45 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("CREATE OR REPLACE TYPE BODY t_ext_member AS"));
+        assert!(statements[0].contains("MAP MEMBER FUNCTION f RETURN NUMBER"));
+        assert!(statements[0].contains("IS LANGUAGE C NAME 'f';"));
+        assert!(statements[0].contains("END"));
+        assert_eq!(statements[1], "SELECT 45 FROM dual".to_string());
     }
 }
