@@ -89,6 +89,19 @@ impl<'a> TopLevelScanner<'a> {
         }
     }
 
+    fn skip_q_quoted(&mut self, delimiter: u8, prefix_len: usize) {
+        self.pos += prefix_len;
+        let end_delimiter = sql_text::q_quote_closing_byte(delimiter);
+        while self.pos + 1 < self.bytes.len() {
+            if self.bytes[self.pos] == end_delimiter && self.bytes[self.pos + 1] == b'\'' {
+                self.pos += 2;
+                return;
+            }
+            self.pos += 1;
+        }
+        self.pos = self.bytes.len();
+    }
+
     fn skip_line_comment(&mut self) {
         self.pos += 2;
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
@@ -115,6 +128,30 @@ impl<'a> Iterator for TopLevelScanner<'a> {
     fn next(&mut self) -> Option<ScanToken<'a>> {
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
+
+            if (b == b'n' || b == b'N' || b == b'u' || b == b'U')
+                && self
+                    .bytes
+                    .get(self.pos + 1)
+                    .is_some_and(|&next_b| next_b == b'q' || next_b == b'Q')
+                && self.bytes.get(self.pos + 2) == Some(&b'\'')
+            {
+                if let Some(&delimiter) = self.bytes.get(self.pos + 3) {
+                    if QueryExecutor::is_valid_q_quote_delimiter(delimiter as char) {
+                        self.skip_q_quoted(delimiter, 4);
+                        continue;
+                    }
+                }
+            }
+
+            if (b == b'q' || b == b'Q') && self.bytes.get(self.pos + 1) == Some(&b'\'') {
+                if let Some(&delimiter) = self.bytes.get(self.pos + 2) {
+                    if QueryExecutor::is_valid_q_quote_delimiter(delimiter as char) {
+                        self.skip_q_quoted(delimiter, 3);
+                        continue;
+                    }
+                }
+            }
 
             if b == b'-' && self.bytes.get(self.pos + 1) == Some(&b'-') {
                 self.skip_line_comment();
