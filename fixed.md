@@ -1737,3 +1737,30 @@
 - `cargo test -q oracle_conditional_compilation_flag_does_not_enter_dollar_quote_mode -- --nocapture` 통과
 - `cargo test -q language_clause_with_empty_dollar_quoted_target_still_marks_external_routine_split -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-07 Oracle 공통 파서 엔진 누락 구문 보완 (`LANGUAGE '...'/"..."` 식별자 리터럴 오탐)
+
+### [중] 루틴 선언부의 `language 'C';` / `language "C";`를 외부 루틴 call spec으로 오인식해 조기 분리하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE PROCEDURE ... IS language 'C'; BEGIN ... END; SELECT ...;`
+  - 위 형태에서 선언부 식별자 `language` 뒤 문자열/quoted identifier가 오면 `AS LANGUAGE 'C'` call spec으로 잘못 확정되어 statement가 조기 종료될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 외부 루틴 상태 머신이 `LANGUAGE` 이후 리터럴(`'...'`, `N'...'`, `q'...'`, `"..."`)을 암시적 언어 타깃으로 즉시 수용했는데,
+  - 이 로직이 top-level call spec 문맥뿐 아니라 중첩 루틴 선언부(`block_depth > 1`)에도 동일 적용되어 오탐이 발생했습니다.
+- **수정**:
+  - `observe_external_clause_literal_target`에 `allow_implicit_target` 플래그를 도입해, 암시적 리터럴 타깃 승격을 문맥별로 제어하도록 변경했습니다.
+  - `SplitState::allow_implicit_external_literal_target`를 추가해 **top-level CREATE FUNCTION/PROCEDURE 헤더(`block_depth == 1`)에서만** 암시적 리터럴 타깃을 허용했습니다.
+  - 중첩 선언부에서는 `LANGUAGE` 뒤 리터럴이 더 이상 external call spec 정책을 활성화하지 않도록 일괄 보정했습니다.
+
+### [유사 케이스] 리터럴 종류별 일괄 검토
+- 기존 회귀 케이스(`LANGUAGE 'C'`, `N'C'`, `q'[C]'`, `nq'[C]'`, `$$C$$`)가 top-level call spec에서는 계속 정상 split되는지 함께 확인했습니다.
+- 동일 패턴의 quoted identifier(`LANGUAGE "C";`) 선언부 오탐도 함께 재현/검증해 동일 경로에서 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `language_followed_by_single_quoted_identifier_literal_does_not_force_external_split`
+- `language_followed_by_double_quoted_identifier_literal_does_not_force_external_split`
+
+### [검증]
+- `cargo test -q language_clause_with_single_quoted_target_without_external_keyword_marks_external_routine_split` 통과
+- `cargo test -q language_followed_by_` 통과
+- `cargo test -q` 전체 통과

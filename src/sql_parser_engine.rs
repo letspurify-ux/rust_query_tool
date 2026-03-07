@@ -344,7 +344,7 @@ impl RoutineFrame {
         }
     }
 
-    fn observe_external_clause_literal_target(&mut self) {
+    fn observe_external_clause_literal_target(&mut self, allow_implicit_target: bool) {
         let from_external = match self.external_clause_state {
             ExternalClauseState::AwaitingLanguageTargetFromExternal => true,
             ExternalClauseState::AwaitingLanguageTargetImplicit => false,
@@ -354,7 +354,7 @@ impl RoutineFrame {
         self.external_clause_state = ExternalClauseState::None;
         if from_external {
             self.mark_external_clause();
-        } else {
+        } else if allow_implicit_target {
             self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
         }
     }
@@ -1295,7 +1295,7 @@ impl SplitState {
         }
     }
 
-    fn observe_external_clause_literal_target(&mut self) {
+    fn observe_external_clause_literal_target(&mut self, allow_implicit_target: bool) {
         let should_track = self.block_depth() > 1
             || matches!(
                 self.create_plsql_kind,
@@ -1307,8 +1307,16 @@ impl SplitState {
         }
 
         if let Some(frame) = self.active_routine_frame_mut() {
-            frame.observe_external_clause_literal_target();
+            frame.observe_external_clause_literal_target(allow_implicit_target);
         }
+    }
+
+    fn allow_implicit_external_literal_target(&self) -> bool {
+        self.block_depth() == 1
+            && matches!(
+                self.create_plsql_kind,
+                CreatePlsqlKind::Procedure | CreatePlsqlKind::Function
+            )
     }
 
     fn observe_external_clause_symbol(&mut self, ch: char) {
@@ -1917,7 +1925,9 @@ impl SqlParserEngine {
                         continue;
                     }
                     self.state.flush_token();
-                    self.state.observe_external_clause_literal_target();
+                    let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                    self.state
+                        .observe_external_clause_literal_target(allow_implicit_target);
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);
                     self.current.push(chars[i + 1]);
@@ -1938,7 +1948,9 @@ impl SqlParserEngine {
                         continue;
                     }
                     self.state.flush_token();
-                    self.state.observe_external_clause_literal_target();
+                    let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                    self.state
+                        .observe_external_clause_literal_target(allow_implicit_target);
                     self.state.start_q_quote(delimiter);
                     self.current.push(c);
                     self.current.push('\'');
@@ -1951,7 +1963,9 @@ impl SqlParserEngine {
             // n'...'
             if self.state.token.is_empty() && (c == 'n' || c == 'N') && next == Some('\'') {
                 self.state.flush_token();
-                self.state.observe_external_clause_literal_target();
+                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                self.state
+                    .observe_external_clause_literal_target(allow_implicit_target);
                 self.state.lex_mode = LexMode::SingleQuote;
                 self.current.push(c);
                 self.current.push('\'');
@@ -1968,7 +1982,7 @@ impl SqlParserEngine {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
                     self.state.flush_token();
-                    self.state.observe_external_clause_literal_target();
+                    self.state.observe_external_clause_literal_target(true);
                     self.state.lex_mode = LexMode::DollarQuote { tag };
                     if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
                         for quote_ch in tag.chars() {
@@ -1982,7 +1996,9 @@ impl SqlParserEngine {
 
             if c == '\'' {
                 self.state.flush_token();
-                self.state.observe_external_clause_literal_target();
+                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                self.state
+                    .observe_external_clause_literal_target(allow_implicit_target);
                 self.state.lex_mode = LexMode::SingleQuote;
                 self.current.push(c);
                 i += 1;
@@ -1991,7 +2007,9 @@ impl SqlParserEngine {
 
             if c == '"' {
                 self.state.flush_token();
-                self.state.observe_external_clause_literal_target();
+                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                self.state
+                    .observe_external_clause_literal_target(allow_implicit_target);
                 self.state
                     .consume_trigger_alias_subject_on_quoted_identifier();
                 self.state.lex_mode = LexMode::DoubleQuote;
@@ -3331,6 +3349,44 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_assign IS"));
         assert!(statements[0].contains("language := 'C';"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_followed_by_single_quoted_identifier_literal_does_not_force_external_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_language_literal IS");
+        engine.process_line("  language 'C';");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_language_literal IS"));
+        assert!(statements[0].contains("language 'C';"));
+        assert!(statements[0].contains("END"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_followed_by_double_quoted_identifier_literal_does_not_force_external_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE proc_language_qident IS");
+        engine.process_line("  language \"C\";");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_language_qident IS"));
+        assert!(statements[0].contains("language \"C\";"));
+        assert!(statements[0].contains("END"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
