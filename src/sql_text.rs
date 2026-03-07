@@ -775,6 +775,7 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "DISASSOCIATE",
     "GRANT",
     "REVOKE",
+    "ADMINISTER",
 ];
 
 #[inline]
@@ -1170,6 +1171,7 @@ mod tests {
             "RENAME",
             "GRANT",
             "REVOKE",
+            "ADMINISTER",
             "COMMIT",
             "ROLLBACK",
             "SAVEPOINT",
