@@ -872,6 +872,37 @@ fn test_maybe_inject_rowid_for_editing_skips_connect_by() {
     assert_eq!(rewritten, sql);
 }
 
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_ignores_q_quote_fake_from_keyword() {
+    let sql = "SELECT q'[FROM not_a_clause]' AS txt, ENAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, q'[FROM not_a_clause]' AS txt, ENAME FROM EMP e"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_ignores_nq_quote_fake_join_keyword() {
+    let sql = "SELECT nq'[JOIN fake table]' AS txt, ENAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, nq'[JOIN fake table]' AS txt, ENAME FROM EMP e"
+    );
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_ignores_q_quote_fake_over_keyword() {
+    let sql = "SELECT q'[OVER (PARTITION BY DEPTNO)]' AS expr, ENAME FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, q'[OVER (PARTITION BY DEPTNO)]' AS expr, ENAME FROM EMP e"
+    );
+}
+
 #[test]
 fn test_maybe_inject_rowid_for_editing_skips_analytic_over_clause() {
     let sql = "SELECT ENAME, ROW_NUMBER() OVER (PARTITION BY DEPTNO ORDER BY SAL DESC) RN FROM EMP";
