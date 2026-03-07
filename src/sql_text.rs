@@ -1117,6 +1117,10 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     }
 
     if first.eq_ignore_ascii_case("SPOOL")
+        || first.eq_ignore_ascii_case("DESCRIBE")
+        || first.eq_ignore_ascii_case("DESC")
+        || first.eq_ignore_ascii_case("EXEC")
+        || first.eq_ignore_ascii_case("EXECUTE")
         || first.eq_ignore_ascii_case("DEFINE")
         || first.eq_ignore_ascii_case("UNDEFINE")
         || first.eq_ignore_ascii_case("VARIABLE")
@@ -1289,6 +1293,10 @@ mod tests {
         assert!(is_auto_terminated_tool_command("EXIT"));
         assert!(is_auto_terminated_tool_command("QUIT"));
         assert!(is_auto_terminated_tool_command("SPOOL out.log"));
+        assert!(is_auto_terminated_tool_command("DESCRIBE emp"));
+        assert!(is_auto_terminated_tool_command("DESC emp"));
+        assert!(is_auto_terminated_tool_command("EXEC dbms_output.put_line('x')"));
+        assert!(is_auto_terminated_tool_command("EXECUTE dbms_output.put_line('x')"));
         assert!(is_auto_terminated_tool_command("DEFINE v = 1"));
         assert!(is_auto_terminated_tool_command("UNDEFINE v"));
         assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT"));
