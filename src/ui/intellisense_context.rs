@@ -1496,6 +1496,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         depth_frames[depth].phase = SqlPhase::OrderByClause;
                         relation_state.clear();
                     }
+                    "REJECT" | "CASCADE" | "RESTRICT" | "PURGE" | "REUSE" | "STORAGE" => {
+                        if matches!(current_phase, SqlPhase::IntoClause)
+                            && !relation_state.is_expect_table()
+                        {
+                            // Post-target modifiers in DML/DDL clauses (e.g.
+                            // `LOG ERRORS ... REJECT`, `DROP ... CASCADE`,
+                            // `TRUNCATE ... REUSE STORAGE`) should not remain
+                            // in table-target completion context.
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                        }
+                        relation_state.clear();
+                    }
                     "SET" => {
                         let hierarchical_clause_active = depth_frames
                             .get(depth)

@@ -1315,6 +1315,22 @@ fn phase_merge_log_errors_into_is_table_context() {
 }
 
 #[test]
+fn phase_merge_log_errors_reject_limit_clause_is_not_table_context() {
+    let ctx = analyze(
+        "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val LOG ERRORS INTO err$_target REJECT | LIMIT UNLIMITED",
+    );
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_truncate_table_reuse_storage_clause_is_not_table_context() {
+    let ctx = analyze("TRUNCATE TABLE employees REUSE STORAGE |");
+    assert_eq!(ctx.phase, SqlPhase::Initial);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn merge_log_errors_into_does_not_capture_reject_keyword_as_alias() {
     let ctx = analyze(
         "MERGE INTO target t USING source s ON (t.id = s.id) \
