@@ -531,6 +531,23 @@ fn is_post_query_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     matches!(first_keyword.as_str(), "JSON" | "XML" | "BROWSE")
 }
 
+fn has_active_locking_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
+    let mut scan_idx = idx;
+    while scan_idx > 0 {
+        scan_idx -= 1;
+        match tokens.get(scan_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(SqlToken::Symbol(sym)) if sym == ";" => return false,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FOR") => {
+                return is_locking_for_clause(tokens, scan_idx + 1);
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1323,6 +1340,34 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             // relation-target contexts.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                         }
+                        relation_state.clear();
+                    }
+                    "WAIT" | "NOWAIT"
+                        if matches!(current_phase, SqlPhase::SetClause)
+                            && has_active_locking_for_clause(tokens, idx) =>
+                    {
+                        // `FOR UPDATE OF ... WAIT/NOWAIT` closes lock target list.
+                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        relation_state.clear();
+                    }
+                    "SKIP"
+                        if matches!(current_phase, SqlPhase::SetClause)
+                            && has_active_locking_for_clause(tokens, idx)
+                            && matches!(
+                                next_word_upper(tokens, idx + 1),
+                                Some((next_keyword, _)) if next_keyword == "LOCKED"
+                            ) =>
+                    {
+                        // `FOR UPDATE OF ... SKIP LOCKED` closes lock target list.
+                        depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        relation_state.clear();
+                    }
+                    "LOCKED"
+                        if matches!(current_phase, SqlPhase::SetClause)
+                            && matches!(last_word.as_deref(), Some("SKIP"))
+                            && has_active_locking_for_clause(tokens, idx) =>
+                    {
+                        depth_frames[depth].phase = SqlPhase::OrderByClause;
                         relation_state.clear();
                     }
                     "WINDOW" => {
