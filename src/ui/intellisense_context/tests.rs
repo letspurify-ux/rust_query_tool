@@ -4029,6 +4029,37 @@ fn match_recognize_pattern_variables_extracted_with_spaced_keywords() {
 }
 
 #[test]
+fn match_recognize_subset_variables_are_extracted() {
+    let tokens = tokenize(
+        "SELECT * FROM oqt_t_emp \
+         MATCH_RECOGNIZE (\
+            PARTITION BY deptno \
+            ORDER BY hiredate \
+            PATTERN (a b+) \
+            SUBSET up = (a, b) \
+            DEFINE b AS b.sal > PREV(b.sal)\
+         )",
+    );
+    let vars = extract_match_recognize_pattern_variables(&tokens);
+    assert_eq!(vars, vec!["a", "b", "up"]);
+}
+
+#[test]
+fn match_recognize_multiple_subset_variables_are_extracted() {
+    let tokens = tokenize(
+        "SELECT * FROM oqt_t_emp \
+         MATCH_RECOGNIZE (\
+            ORDER BY hiredate \
+            PATTERN (a b c) \
+            SUBSET grp1 = (a, b), grp2 = (c) \
+            DEFINE b AS b.sal > PREV(b.sal)\
+         )",
+    );
+    let vars = extract_match_recognize_pattern_variables(&tokens);
+    assert_eq!(vars, vec!["a", "b", "c", "grp1", "grp2"]);
+}
+
+#[test]
 fn match_recognize_keyword_is_not_parsed_as_table_alias() {
     let ctx = analyze("SELECT * FROM oqt_t_emp MATCH_RECOGNIZE (PATTERN (a)) WHERE |");
     assert!(

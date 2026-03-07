@@ -3135,8 +3135,9 @@ pub fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String
     model_info.measure_columns
 }
 
-/// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)`.
-/// Example: `PATTERN (a b+)` -> `["a", "b"]`.
+/// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)` and
+/// subset variables from `SUBSET ...`.
+/// Example: `PATTERN (a b+) SUBSET u = (a, b)` -> `["a", "b", "u"]`.
 pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
     let match_idx = find_top_level_word_index(tokens, "MATCH_RECOGNIZE")
         .or_else(|| find_top_level_keyword_pair_index(tokens, "MATCH", "RECOGNIZE"));
@@ -3209,8 +3210,59 @@ pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<Str
         }
     }
 
+    if let Some(subset_idx) = clause_tokens.iter().enumerate().find_map(|(idx, token)| {
+        if !is_top_level_depth(&token_depths, idx) {
+            return None;
+        }
+
+        match token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("SUBSET") => Some(idx),
+            _ => None,
+        }
+    }) {
+        let mut idx = next_non_comment_index(clause_tokens, subset_idx.saturating_add(1));
+        while idx < clause_tokens.len() {
+            if let Some(SqlToken::Word(word)) = clause_tokens.get(idx) {
+                let upper = word.to_ascii_uppercase();
+                if is_match_recognize_clause_boundary_keyword(&upper) {
+                    break;
+                }
+
+                let assign_idx = next_non_comment_index(clause_tokens, idx.saturating_add(1));
+                if is_identifier_word_token(word)
+                    && matches!(clause_tokens.get(assign_idx), Some(SqlToken::Symbol(sym)) if sym == "=")
+                {
+                    variables.push(strip_identifier_quotes(word));
+
+                    let rhs_idx = next_non_comment_index(clause_tokens, assign_idx + 1);
+                    idx = if matches!(clause_tokens.get(rhs_idx), Some(SqlToken::Symbol(sym)) if sym == "(")
+                    {
+                        extract_parenthesized_range(clause_tokens, rhs_idx)
+                            .map(|(_, next_idx)| next_idx)
+                            .unwrap_or(rhs_idx.saturating_add(1))
+                    } else {
+                        rhs_idx.saturating_add(1)
+                    };
+                } else {
+                    idx = idx.saturating_add(1);
+                }
+            } else {
+                idx = idx.saturating_add(1);
+            }
+
+            idx = next_non_comment_index(clause_tokens, idx);
+            if matches!(clause_tokens.get(idx), Some(SqlToken::Symbol(sym)) if sym == ",") {
+                idx = next_non_comment_index(clause_tokens, idx + 1);
+            }
+        }
+    }
+
     dedup_columns_case_insensitive(&mut variables);
     variables
+}
+
+fn is_match_recognize_clause_boundary_keyword(word: &str) -> bool {
+    matches!(word, "MEASURES" | "PATTERN" | "DEFINE" | "AFTER")
 }
 
 fn find_top_level_keyword_pair_index(
