@@ -5065,6 +5065,50 @@ BEGIN"
     }
 
     #[test]
+    fn external_language_clause_splits_before_create_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_create RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("CREATE TABLE t_after_ext (id NUMBER);");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("CREATE TABLE t_after_ext"),
+            "CREATE statement should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_alter_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_alter RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("ALTER SESSION SET optimizer_mode = ALL_ROWS;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep EXTERNAL call spec: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("ALTER SESSION SET optimizer_mode = ALL_ROWS"),
+            "ALTER statement should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn with_function_recovers_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
