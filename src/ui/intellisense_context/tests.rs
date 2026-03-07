@@ -5058,6 +5058,35 @@ fn extract_match_recognize_generated_columns_from_measures_and_pattern() {
 }
 
 #[test]
+fn extract_match_recognize_generated_columns_accepts_measures_alias_without_as() {
+    let tokens = tokenize(
+        "SELECT * FROM emp MATCH_RECOGNIZE ( \
+            MEASURES FIRST(ename) start_name, LAST(ename) end_name \
+            PATTERN (a b+) \
+            DEFINE b AS b.sal > PREV(b.sal) \
+        )",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert_eq!(cols, vec!["start_name", "end_name", "a", "b"]);
+}
+
+#[test]
+fn extract_match_recognize_generated_columns_keeps_pattern_variables_with_subset_after_after_match_skip() {
+    let tokens = tokenize(
+        "SELECT * FROM emp MATCH_RECOGNIZE ( \
+            PATTERN (a b c) \
+            AFTER MATCH SKIP TO LAST b \
+            SUBSET grp1 = (a, b), grp2 = (c) \
+            DEFINE b AS b.sal > PREV(b.sal), c AS c.sal >= b.sal \
+        )",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert_eq!(cols, vec!["a", "b", "c", "grp1", "grp2"]);
+}
+
+#[test]
 fn infer_source_columns_uses_match_recognize_generated_columns_when_select_list_is_star() {
     let tokens = tokenize(
         "SELECT * FROM ( \
