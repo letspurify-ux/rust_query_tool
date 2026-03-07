@@ -1331,10 +1331,21 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
                         {
+                            let in_lock_target_list = matches!(
+                                previous_significant_token(tokens, idx),
+                                Some((_, SqlToken::Word(prev))) if prev.eq_ignore_ascii_case("OF")
+                            ) || matches!(
+                                previous_significant_token(tokens, idx),
+                                Some((_, SqlToken::Symbol(sym))) if sym == ","
+                            );
+
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
-                            // modifiers, not expression/table contexts.
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
-                            relation_state.clear();
+                            // modifiers, not expression/table contexts. Keep WAIT/NOWAIT as
+                            // identifier candidates when entered as lock-target names.
+                            if !in_lock_target_list {
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                                relation_state.clear();
+                            }
                         }
                     }
                     "SKIP" => {
@@ -1978,6 +1989,19 @@ fn next_word_upper(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
                 return Some((word.to_ascii_uppercase(), current_idx));
             }
             _ => return None,
+        }
+    }
+    None
+}
+
+fn previous_significant_token(tokens: &[SqlToken], before_idx: usize) -> Option<(usize, &SqlToken)> {
+    let mut current_idx = before_idx;
+    while current_idx > 0 {
+        current_idx -= 1;
+        match tokens.get(current_idx) {
+            Some(SqlToken::Comment(_)) => continue,
+            Some(token) => return Some((current_idx, token)),
+            None => return None,
         }
     }
     None
