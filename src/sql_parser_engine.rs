@@ -3163,6 +3163,36 @@ mod tests {
             assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
         }
     }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_password_command_abbreviations() {
+        for password_command in ["PASSWO app_user", "PASSWOR app_user", "PASSWORD app_user"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("WITH");
+            engine.process_line("  FUNCTION f RETURN NUMBER IS");
+            engine.process_line("  BEGIN");
+            engine.process_line("    RETURN 1;");
+            engine.process_line("  END;");
+            engine.process_line(password_command);
+            engine.process_line("SELECT 2 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+
+            assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+            assert!(
+                statements[0].starts_with(
+                    "WITH
+  FUNCTION f RETURN NUMBER IS"
+                ),
+                "first statement should keep only WITH declaration: {}",
+                statements[0]
+            );
+            assert_eq!(statements[1], password_command.to_string());
+            assert_eq!(statements[2], "SELECT 2 FROM dual".to_string());
+        }
+    }
+
     #[test]
     fn create_view_as_with_function_keeps_statement_open_until_main_select_terminator() {
         let mut engine = SqlParserEngine::new();

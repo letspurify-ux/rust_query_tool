@@ -798,6 +798,14 @@ fn matches_keyword(keyword: &str, candidates: &[&str]) -> bool {
 }
 
 #[inline]
+fn is_password_command_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD"
+    )
+}
+
+#[inline]
 pub(crate) fn is_identifier_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#'
 }
@@ -925,7 +933,7 @@ pub(crate) fn is_with_plsql_declaration_keyword(word: &str) -> bool {
 /// `WITH FUNCTION/PROCEDURE` declaration mode but encountered another
 /// statement head instead of a main query keyword.
 pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
-    matches_keyword(word, STATEMENT_HEAD_KEYWORDS)
+    matches_keyword(word, STATEMENT_HEAD_KEYWORDS) || is_password_command_keyword(word)
 }
 
 pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
@@ -970,7 +978,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
             .is_some_and(|second| second.eq_ignore_ascii_case("BY"));
     }
 
-    if first.eq_ignore_ascii_case("PASSWORD") || first.eq_ignore_ascii_case("PASSW") {
+    if is_password_command_keyword(first) {
         return true;
     }
 
@@ -1294,6 +1302,17 @@ mod tests {
         assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT"));
         assert!(is_auto_terminated_tool_command("COLUMN ename FORMAT A20"));
         assert!(is_auto_terminated_tool_command("CLEAR COLUMNS"));
+        assert!(is_auto_terminated_tool_command("PASSWO scott"));
+        assert!(is_auto_terminated_tool_command("PASSWOR scott"));
+        assert!(is_auto_terminated_tool_command("PASSWORD scott"));
+    }
+
+    #[test]
+    fn statement_head_keyword_detects_password_abbreviations() {
+        assert!(is_statement_head_keyword("PASSW"));
+        assert!(is_statement_head_keyword("PASSWO"));
+        assert!(is_statement_head_keyword("PASSWOR"));
+        assert!(is_statement_head_keyword("PASSWORD"));
     }
 
     #[test]
