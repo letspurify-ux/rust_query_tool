@@ -1345,13 +1345,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(
-                                next_word_upper(tokens, idx + 1),
-                                Some((next_keyword, _)) if next_keyword == "LOCKED"
-                            )
                         {
                             // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
-                            // just like NOWAIT/WAIT.
+                            // just like NOWAIT/WAIT. As soon as SKIP appears, stop treating
+                            // the clause as `OF <column list>` context so completion does not
+                            // keep suggesting target columns while users finish typing LOCKED.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
