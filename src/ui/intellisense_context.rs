@@ -1330,6 +1330,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
+                            && !locking_of_clause_identifier_position(tokens, idx)
                         {
                             let in_lock_target_list = matches!(
                                 previous_significant_token(tokens, idx),
@@ -1340,33 +1341,21 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             );
 
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
-                            // modifiers, not expression/table contexts. Keep WAIT/NOWAIT as
-                            // identifier candidates when entered as lock-target names.
-                            if !in_lock_target_list {
-                                depth_frames[depth].phase = SqlPhase::OrderByClause;
-                                relation_state.clear();
-                            }
+                            // modifiers, not expression/table contexts. Keep identifier
+                            // suggestions for `OF wait` / `OF nowait` column names.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            relation_state.clear();
                         }
                     }
                     "SKIP" => {
                         let locking_clause_active = depth_frames
                             .get(depth)
-                            .is_some_and(|frame| frame.locking_clause_active);
-                        let starts_skip_locked_suffix = matches!(
-                            next_word_upper(tokens, idx + 1),
-                            Some((next, _)) if next == "LOCKED"
-                        );
-                        let follows_of_column_reference = matches!(
-                            last_word.as_deref(),
-                            Some("OF") | None
-                        );
-
-                        if locking_clause_active
-                            && (starts_skip_locked_suffix || !follows_of_column_reference)
+                            .is_some_and(|frame| frame.locking_clause_active)
+                            && !locking_of_clause_identifier_position(tokens, idx)
                         {
-                            // Oracle `FOR UPDATE ... SKIP LOCKED` and in-progress
-                            // `... OF <col> SKIP` both indicate the lock-option suffix,
-                            // not another lock-target column.
+                            // Treat `SKIP` after at least one target column as the start of
+                            // trailing lock options (`SKIP LOCKED`), even when `LOCKED` has
+                            // not been typed yet.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
@@ -1980,17 +1969,26 @@ fn next_word_upper(tokens: &[SqlToken], idx: usize) -> Option<(String, usize)> {
     None
 }
 
-fn previous_significant_token(tokens: &[SqlToken], before_idx: usize) -> Option<(usize, &SqlToken)> {
-    let mut current_idx = before_idx;
-    while current_idx > 0 {
-        current_idx -= 1;
-        match tokens.get(current_idx) {
-            Some(SqlToken::Comment(_)) => continue,
-            Some(token) => return Some((current_idx, token)),
-            None => return None,
+fn locking_of_clause_identifier_position(tokens: &[SqlToken], idx: usize) -> bool {
+    let Some((prev_word, _)) = prev_word_upper(tokens, idx) else {
+        return false;
+    };
+
+    if prev_word == "OF" {
+        return true;
+    }
+
+    let mut cursor = idx;
+    while cursor > 0 {
+        cursor -= 1;
+        match &tokens[cursor] {
+            SqlToken::Comment(_) => continue,
+            SqlToken::Symbol(symbol) => return symbol == ",",
+            _ => return false,
         }
     }
-    None
+
+    false
 }
 
 fn prev_word_upper(tokens: &[SqlToken], before_idx: usize) -> Option<(String, usize)> {
