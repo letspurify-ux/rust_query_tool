@@ -1504,7 +1504,7 @@ fn preview_identifier_upper(chars: &[char], start: usize) -> Option<String> {
 
 #[inline]
 fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-    !delimiter.is_whitespace()
+    !delimiter.is_whitespace() && delimiter != '\''
 }
 
 #[inline]
@@ -3401,6 +3401,19 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn apostrophe_cannot_start_q_quote_delimiter_and_does_not_swallow_semicolon_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT q'' FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SELECT q'' FROM dual".to_string());
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
     }
 
     #[test]
