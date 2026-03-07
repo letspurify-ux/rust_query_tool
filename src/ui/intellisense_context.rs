@@ -263,8 +263,7 @@ fn is_merge_action_context(
     last_word: Option<&str>,
 ) -> bool {
     matches!(statement_kind, StatementKind::Merge)
-        && (matches!(current_phase, SqlPhase::JoinCondition)
-            || matches!(last_word, Some("THEN")))
+        && (matches!(current_phase, SqlPhase::JoinCondition) || matches!(last_word, Some("THEN")))
 }
 
 fn is_merge_delete_where_action(
@@ -1259,13 +1258,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
                         );
-                        let should_expect_merge_target = matches!(current_phase, SqlPhase::MergeTarget);
-                        let should_expect_set_clause_target = matches!(current_phase, SqlPhase::SetClause)
-                            && matches!(
-                                current_statement_kind,
-                                StatementKind::Insert | StatementKind::Update | StatementKind::Delete
-                            )
-                            && !in_returning_clause;
+                        let should_expect_merge_target =
+                            matches!(current_phase, SqlPhase::MergeTarget);
+                        let should_expect_set_clause_target =
+                            matches!(current_phase, SqlPhase::SetClause)
+                                && matches!(
+                                    current_statement_kind,
+                                    StatementKind::Insert
+                                        | StatementKind::Update
+                                        | StatementKind::Delete
+                                )
+                                && !in_returning_clause;
                         let is_log_errors_target = matches!(
                             current_statement_kind,
                             StatementKind::Insert
@@ -3694,15 +3697,41 @@ fn find_top_level_keyword_pair_index(
         if !word.eq_ignore_ascii_case(first) {
             continue;
         }
-        let Some((next_word, _)) = next_word_upper(tokens, idx + 1) else {
-            continue;
-        };
-        if next_word.eq_ignore_ascii_case(second) {
+        if top_level_next_word_is(tokens, idx.saturating_add(1), second) {
             return Some(idx);
         }
     }
 
     None
+}
+
+fn top_level_next_word_is(tokens: &[SqlToken], start_idx: usize, keyword: &str) -> bool {
+    let mut idx = start_idx;
+    let mut paren_state = ParenDepthState::default();
+
+    while idx < tokens.len() {
+        match tokens.get(idx) {
+            Some(SqlToken::Comment(_)) => {
+                idx += 1;
+                continue;
+            }
+            Some(token) => {
+                apply_paren_token(&mut paren_state, token);
+                if paren_state.depth() != 0 {
+                    idx += 1;
+                    continue;
+                }
+
+                if let SqlToken::Word(word) = token {
+                    return word.eq_ignore_ascii_case(keyword);
+                }
+                return false;
+            }
+            None => break,
+        }
+    }
+
+    false
 }
 
 fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) -> Vec<String> {
