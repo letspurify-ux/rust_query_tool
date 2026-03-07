@@ -1709,3 +1709,31 @@
 - `cargo test -q external_language_without_target_but_clause_keywords_still_splits -- --nocapture` 통과
 - `cargo test -q package_nested_external_without_language_target_closes_on_semicolon -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+## 2026-03-07 Oracle 공통 파서 엔진 누락 구문 보완 (`$$PLSQL_*` 조건부 컴파일 플래그 vs dollar-quote)
+
+### [중] Oracle 조건부 컴파일 플래그(`$$PLSQL_UNIT` 등)를 dollar-quoted 문자열 시작으로 오인식하던 문제 수정
+- **증상**:
+  - `BEGIN ... IF $$PLSQL_UNIT IS NOT NULL THEN ... END IF; END; SELECT ...;` 형태에서
+  - 파서가 `$$`를 dollar-quote 시작으로 잘못 해석해 이후 토큰을 문자열로 삼켜 statement 분리가 깨질 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 dollar-quote 진입 조건이 `$$` 패턴을 우선적으로 허용하면서,
+  - Oracle 조건부 컴파일 플래그(`$$` + 식별자)와 Postgres-style dollar quote를 구분하지 못했습니다.
+- **수정**:
+  - `looks_like_oracle_conditional_compilation_flag` 헬퍼를 추가해 `$$<identifier>` 패턴을 감지합니다.
+  - 일반 SQL/PLSQL 문맥에서는 해당 패턴에서 dollar-quote 모드로 진입하지 않도록 차단했습니다.
+  - 동시에 외부 루틴 call spec의 `AS LANGUAGE $$C$$ ...` 케이스는 유지해야 하므로,
+  - `SplitState::awaiting_external_language_target` 문맥에서는 기존 dollar-quote 처리를 허용하도록 예외를 명시했습니다.
+
+### [유사 케이스] 외부 루틴 `AS LANGUAGE $$C$$ ...` 회귀 방지 일괄 점검
+- `$$` prefix를 blanket 차단하면 기존 외부 루틴 분리가 깨질 수 있어,
+- 언어 타깃 대기 상태에서만 예외 허용하도록 조건을 분리해 유사 회귀를 함께 차단했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `oracle_conditional_compilation_flag_does_not_enter_dollar_quote_mode`
+- `language_clause_with_empty_dollar_quoted_target_still_marks_external_routine_split`
+
+### [검증]
+- `cargo test -q oracle_conditional_compilation_flag_does_not_enter_dollar_quote_mode -- --nocapture` 통과
+- `cargo test -q language_clause_with_empty_dollar_quoted_target_still_marks_external_routine_split -- --nocapture` 통과
+- `cargo test` 전체 통과
