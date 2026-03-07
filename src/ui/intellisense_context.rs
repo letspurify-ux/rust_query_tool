@@ -2914,6 +2914,7 @@ fn consume_flashback_operand(tokens: &[SqlToken], start: usize) -> usize {
             }
         }
         Some(SqlToken::String(_)) => skip_comment_tokens(tokens, idx + 1),
+        Some(SqlToken::Symbol(sym)) if sym == "?" => skip_comment_tokens(tokens, idx + 1),
         Some(SqlToken::Symbol(sym)) if sym == ":" => {
             // Bind variable form `:b1`
             let bind_name_idx = skip_comment_tokens(tokens, idx + 1);

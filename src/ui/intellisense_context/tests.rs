@@ -3846,6 +3846,32 @@ fn flashback_as_of_scn_signed_bound_keeps_alias_visible() {
 }
 
 #[test]
+fn flashback_as_of_scn_positional_bind_keeps_alias_visible() {
+    let ctx = analyze("SELECT * FROM employees AS OF SCN ? e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SCN")),
+        "AS OF SCN positional bind must not be captured as alias: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following AS OF SCN positional bind should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn flashback_versions_between_scn_signed_bounds_keep_alias_visible() {
     let ctx =
         analyze("SELECT * FROM employees VERSIONS BETWEEN SCN -1 AND SCN +2 e WHERE e.|");
@@ -3865,6 +3891,32 @@ fn flashback_versions_between_scn_signed_bounds_keep_alias_visible() {
             .iter()
             .any(|table| table.alias.as_deref() == Some("e")),
         "alias following VERSIONS BETWEEN SCN signed bounds should be collected: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn flashback_versions_between_scn_positional_bind_bounds_keep_alias_visible() {
+    let ctx = analyze("SELECT * FROM employees VERSIONS BETWEEN SCN ? AND SCN ? e WHERE e.|");
+
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .all(|table| table.alias.as_deref() != Some("SCN")),
+        "VERSIONS SCN positional bind tokens must not be captured as aliases: {:?}",
+        ctx.tables_in_scope
+            .iter()
+            .map(|table| (&table.name, &table.alias))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.alias.as_deref() == Some("e")),
+        "alias following VERSIONS BETWEEN SCN positional binds should be collected: {:?}",
         ctx.tables_in_scope
             .iter()
             .map(|table| (&table.name, &table.alias))
