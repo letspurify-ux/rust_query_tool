@@ -679,6 +679,27 @@ fn phase_for_update_of_identifier_named_skip_stays_column_context() {
 }
 
 #[test]
+fn phase_for_update_of_identifier_named_skip_after_comma_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno, skip |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_update_of_identifier_named_wait_after_comma_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno, wait |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_update_of_identifier_named_nowait_after_comma_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno, nowait |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_for_update_of_skip_locked_is_not_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno SKIP LOCKED |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
