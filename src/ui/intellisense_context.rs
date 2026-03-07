@@ -617,6 +617,7 @@ struct ParserDepthFrame {
     paren_func: Option<String>,
     function_from_state: FunctionFromState,
     returning_clause_active: bool,
+    locking_clause_active: bool,
 }
 
 fn reset_relation_lookbehind(
@@ -735,6 +736,7 @@ impl Default for ParserDepthFrame {
             paren_func: None,
             function_from_state: FunctionFromState::NotApplicable,
             returning_clause_active: false,
+            locking_clause_active: false,
         }
     }
 }
@@ -823,6 +825,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     frame.function_from_state =
                         FunctionFromState::from_function_name(frame.paren_func.as_deref());
                     frame.returning_clause_active = false;
+                    frame.locking_clause_active = false;
                 }
 
                 let scope_id = next_scope_id;
@@ -1302,6 +1305,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "FOR" => {
                         if is_locking_for_clause(tokens, idx + 1) {
+                            depth_frames[depth].locking_clause_active = true;
                             // Locking clauses (`FOR UPDATE [OF ...]`, `FOR SHARE [OF ...]`,
                             // `FOR NO KEY UPDATE [OF ...]`, `FOR KEY SHARE [OF ...]`)
                             // can accept column references after `OF`.
@@ -1324,6 +1328,42 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                         }
                         relation_state.clear();
+                    }
+                    "WAIT" | "NOWAIT" => {
+                        if depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.locking_clause_active)
+                        {
+                            // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
+                            // modifiers, not expression/table contexts.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            relation_state.clear();
+                        }
+                    }
+                    "SKIP" => {
+                        if depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.locking_clause_active)
+                            && matches!(
+                                next_word_upper(tokens, idx + 1),
+                                Some((next_keyword, _)) if next_keyword == "LOCKED"
+                            )
+                        {
+                            // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
+                            // just like NOWAIT/WAIT.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            relation_state.clear();
+                        }
+                    }
+                    "LOCKED" => {
+                        if depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.locking_clause_active)
+                            && matches!(last_word.as_deref(), Some("SKIP"))
+                        {
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            relation_state.clear();
+                        }
                     }
                     "WINDOW" => {
                         // Treat SQL-standard WINDOW clause expressions as column context.
@@ -1367,6 +1407,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // DML RETURNING lists target columns/expressions.
                         depth_frames[depth].phase = SqlPhase::SetClause;
                         depth_frames[depth].returning_clause_active = true;
+                        depth_frames[depth].locking_clause_active = false;
                         relation_state.clear();
                     }
                     "UPDATE" => {
@@ -1384,7 +1425,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             is_mysql_on_duplicate_key_update(tokens, idx);
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
-                        if matches!(last_word.as_deref(), Some("FOR")) {
+                        let is_locking_update_keyword =
+                            matches!(last_word.as_deref(), Some("FOR"));
+                        if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
                                 depth_frames[depth].phase = SqlPhase::SetClause;
@@ -1396,14 +1439,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             || is_mysql_conflict_update
                             || is_postgres_conflict_update
                         {
+                            depth_frames[depth].locking_clause_active = false;
                             // `... ON DUPLICATE KEY UPDATE ...` and
                             // `... ON CONFLICT ... DO UPDATE ...` use UPDATE as an action keyword.
                             depth_frames[depth].phase = SqlPhase::SetClause;
                             relation_state.clear();
                         } else if is_expression_context {
+                            depth_frames[depth].locking_clause_active = false;
                             // Inside expressions, UPDATE can be a valid identifier/token.
                             relation_state.clear();
                         } else {
+                            depth_frames[depth].locking_clause_active = false;
                             depth_frames[depth].phase = SqlPhase::UpdateTarget;
                             depth_frames[depth].statement_kind = StatementKind::Unknown;
                             mark_query_scope(depth, &mut depth_frames, &mut query_depth);
@@ -1412,6 +1458,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "DELETE" => {
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].locking_clause_active = false;
                         let current_statement_kind = depth_frames
                             .get(depth)
                             .map(|frame| frame.statement_kind)
@@ -1438,6 +1485,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "MERGE" => {
                         depth_frames[depth].returning_clause_active = false;
+                        depth_frames[depth].locking_clause_active = false;
                         depth_frames[depth].phase = SqlPhase::MergeTarget;
                         depth_frames[depth].statement_kind = StatementKind::Merge;
                         mark_query_scope(depth, &mut depth_frames, &mut query_depth);
