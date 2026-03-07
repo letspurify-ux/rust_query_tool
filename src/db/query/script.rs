@@ -602,7 +602,7 @@ impl QueryExecutor {
 
     pub fn is_select_statement(sql: &str) -> bool {
         match Self::leading_keyword(sql).as_deref() {
-            Some("SELECT") => true,
+            Some("SELECT") | Some("VALUES") | Some("TABLE") => true,
             Some("WITH") => Self::with_clause_starts_with_select(sql),
             _ => false,
         }
@@ -2688,7 +2688,9 @@ impl QueryExecutor {
             let token_depth_matches_main_query =
                 parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth == wrapper_depth);
 
-            if (depth == 0 || token_depth_matches_main_query) && (c.is_ascii_alphabetic() || c == '_') {
+            if (depth == 0 || token_depth_matches_main_query)
+                && (c.is_ascii_alphabetic() || c == '_')
+            {
                 let start = i;
                 i += 1;
                 while i < len
@@ -2735,7 +2737,8 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE") {
+                if token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
+                {
                     in_with_plsql_declaration = true;
                     with_plsql_waiting_main_query = false;
                     with_plsql_block_depth = 0;
@@ -2744,7 +2747,10 @@ impl QueryExecutor {
                 }
 
                 if with_plsql_waiting_main_query {
-                    if token.eq_ignore_ascii_case("SELECT") {
+                    if token.eq_ignore_ascii_case("SELECT")
+                        || token.eq_ignore_ascii_case("VALUES")
+                        || token.eq_ignore_ascii_case("TABLE")
+                    {
                         return true;
                     }
 
@@ -2752,8 +2758,6 @@ impl QueryExecutor {
                         || token.eq_ignore_ascii_case("UPDATE")
                         || token.eq_ignore_ascii_case("DELETE")
                         || token.eq_ignore_ascii_case("MERGE")
-                        || token.eq_ignore_ascii_case("VALUES")
-                        || token.eq_ignore_ascii_case("TABLE")
                     {
                         return false;
                     }
@@ -2765,15 +2769,16 @@ impl QueryExecutor {
                     }
                 }
 
-                if token.eq_ignore_ascii_case("SELECT") {
+                if token.eq_ignore_ascii_case("SELECT")
+                    || token.eq_ignore_ascii_case("VALUES")
+                    || token.eq_ignore_ascii_case("TABLE")
+                {
                     return true;
                 }
                 if token.eq_ignore_ascii_case("INSERT")
                     || token.eq_ignore_ascii_case("UPDATE")
                     || token.eq_ignore_ascii_case("DELETE")
                     || token.eq_ignore_ascii_case("MERGE")
-                    || token.eq_ignore_ascii_case("VALUES")
-                    || token.eq_ignore_ascii_case("TABLE")
                 {
                     return false;
                 }
