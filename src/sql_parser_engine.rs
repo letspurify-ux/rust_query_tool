@@ -3566,6 +3566,23 @@ mod tests {
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
+
+    #[test]
+    fn package_spec_procedure_language_clause_without_external_keyword_does_not_split_mid_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE pkg_spec_lang AS");
+        engine.process_line("  PROCEDURE p IS LANGUAGE C;");
+        engine.process_line("END pkg_spec_lang;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("PROCEDURE p IS LANGUAGE C;"));
+        assert!(statements[0].contains("END pkg_spec_lang"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
     #[test]
     fn name_language_library_identifiers_do_not_activate_external_clause_policy() {
         let mut engine = SqlParserEngine::new();
@@ -3771,6 +3788,102 @@ mod tests {
                 statements[1]
             );
         }
+    }
+
+    #[test]
+    fn nested_language_identifier_targets_in_package_body_do_not_close_nested_routine() {
+        for target in ["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_language_ident AS");
+            engine.process_line("  PROCEDURE p IS");
+            engine.process_line(&format!("    language {target};"));
+            engine.process_line("  BEGIN");
+            engine.process_line("    NULL;");
+            engine.process_line("  END p;");
+            engine.process_line("END pkg_language_ident;");
+            engine.process_line("SELECT 1 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(
+                statements.len(),
+                2,
+                "unexpected statements for nested target {target}: {statements:?}"
+            );
+            assert!(
+                statements[0].contains(&format!("language {target};")),
+                "package body should keep nested language declaration for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END p;"),
+                "package body should keep nested procedure END for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END pkg_language_ident"),
+                "package body should close normally for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].starts_with("SELECT 1 FROM dual"),
+                "trailing SELECT should split for {target}: {}",
+                statements[1]
+            );
+        }
+    }
+
+
+    #[test]
+    fn package_body_nested_language_identifier_declaration_keeps_following_nested_subprograms() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_language_chain AS");
+        engine.process_line("  PROCEDURE p1 IS");
+        engine.process_line("    language c;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END p1;");
+        engine.process_line("  PROCEDURE p2 IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END p2;");
+        engine.process_line("END pkg_language_chain;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("PROCEDURE p1 IS"));
+        assert!(statements[0].contains("language c;"));
+        assert!(statements[0].contains("END p1;"));
+        assert!(statements[0].contains("PROCEDURE p2 IS"));
+        assert!(statements[0].contains("END p2;"));
+        assert!(statements[0].contains("END pkg_language_chain"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+
+    #[test]
+    fn nested_language_identifier_declaration_with_following_local_variable_keeps_routine_structure() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_language_locals AS");
+        engine.process_line("  PROCEDURE p IS");
+        engine.process_line("    language c;");
+        engine.process_line("    n NUMBER := 1;");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END p;");
+        engine.process_line("END pkg_language_locals;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("language c;"));
+        assert!(statements[0].contains("n NUMBER := 1;"));
+        assert!(statements[0].contains("END p;"));
+        assert!(statements[0].contains("END pkg_language_locals"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
     #[test]
@@ -6111,6 +6224,64 @@ BEGIN"
             statements[1].starts_with("SHUTDOWN"),
             "SHUTDOWN command should begin a new statement after external routine split: {}",
             statements[1]
+        );
+    }
+
+
+    #[test]
+    fn external_language_clause_splits_before_recover_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_recover_head RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("RECOVER DATABASE;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep external routine: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("RECOVER DATABASE"),
+            "RECOVER should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 1 FROM dual"),
+            "SELECT should remain standalone after RECOVER recovery split: {}",
+            statements[2]
+        );
+    }
+
+
+    #[test]
+    fn external_language_clause_splits_before_archive_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_archive_head RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("ARCHIVE LOG LIST;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C"),
+            "first statement should keep external routine: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("ARCHIVE LOG LIST"),
+            "ARCHIVE command should begin a new statement after external routine split: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 1 FROM dual"),
+            "SELECT should remain standalone after ARCHIVE recovery split: {}",
+            statements[2]
         );
     }
 
