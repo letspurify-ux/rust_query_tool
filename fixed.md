@@ -1790,3 +1790,31 @@
 - `cargo test -q external_language_clause_splits_before_parenthesized_query_statement_head -- --nocapture` 통과
 - `cargo test -q oracle_with_function_recovers_to_ -- --nocapture` 통과
 - `cargo test` 전체 통과
+
+
+## 2026-03-07 Oracle 공통 파서 엔진 누락 구문 보완 (`EXTERNAL call spec` 슬래시 종료)
+
+### [중] `AS LANGUAGE ... NAME ...` / `AS MLE MODULE ...`에서 세미콜론 없이 `/` 종료 시 문장 분리가 누락되던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE FUNCTION ... AS LANGUAGE C NAME 'x'`
+  - `CREATE OR REPLACE FUNCTION ... AS MLE MODULE ...`
+  - 위 구문이 세미콜론 없이 `/`로 종료되면, 후속 `SELECT`가 같은 statement로 합쳐질 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`는 `pending_implicit_external_top_level_split` 상태에서만 slash marker(`/`) 선분리를 수행했고,
+  - `NAME`/`MODULE`로 이미 외부 루틴이 확정된 `ForceSplit` 경로(`should_split_on_semicolon`)는 slash 선분리 조건에 포함하지 않았습니다.
+- **수정**:
+  - slash marker 처리 분기에 `should_split_on_semicolon()` 기반 조건을 추가해,
+  - 세미콜론 없이도 외부 루틴 call spec 경계를 slash line에서 안정적으로 분리하도록 보정했습니다.
+
+### [유사 케이스] 동일 계열 구문 일괄 검증
+- `AS LANGUAGE C NAME '...'`
+- `AS MLE MODULE ... SIGNATURE ...`
+- 두 형태 모두 slash 종료에서 후속 문장이 분리되는지 테스트로 보강했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `external_language_name_clause_without_semicolon_splits_on_slash_terminator`
+- `mle_module_clause_without_semicolon_splits_on_slash_terminator`
+
+### [검증]
+- `cargo test slash_terminator -- --nocapture` 통과
+- `cargo test -- --test-threads=1` 통과

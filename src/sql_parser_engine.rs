@@ -2292,14 +2292,24 @@ impl SqlParserEngine {
                 self.state.reset_create_state();
             }
 
-            if self.state.pending_implicit_external_top_level_split
-                && self.state.block_depth() == 1
-                && self.state.paren_depth == 0
-                && self.state.token.is_empty()
-                && ((c == '@' && is_line_leading_run_script_marker(chars, i))
-                    || (c == '!' && is_line_leading_bang_host_marker(chars, i))
-                    || (c == '/' && is_line_leading_slash_marker(chars, i))
-                    || (c == '(' && is_line_leading_open_paren_marker(chars, i)))
+            let should_split_pending_implicit_external =
+                self.state.pending_implicit_external_top_level_split
+                    && self.state.block_depth() == 1
+                    && self.state.paren_depth == 0;
+            let should_split_forced_external_on_slash =
+                self.state.block_depth() == 1
+                    && self.state.paren_depth == 0
+                    && self.state.should_split_on_semicolon();
+
+            if self.state.token.is_empty()
+                && ((should_split_pending_implicit_external
+                    && ((c == '@' && is_line_leading_run_script_marker(chars, i))
+                        || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                        || (c == '/' && is_line_leading_slash_marker(chars, i))
+                        || (c == '(' && is_line_leading_open_paren_marker(chars, i))))
+                    || (should_split_forced_external_on_slash
+                        && c == '/'
+                        && is_line_leading_slash_marker(chars, i)))
             {
                 self.split_current_statement();
             }
@@ -4058,6 +4068,85 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE $lang$C$lang$ NAME 'ext_lang_dollar'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn mle_module_clause_without_external_keyword_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_mle RETURN NUMBER");
+        engine.process_line("AS MLE MODULE ext_mod SIGNATURE 'run(number)';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle RETURN NUMBER"));
+        assert!(statements[0].contains("AS MLE MODULE ext_mod SIGNATURE 'run(number)'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn mle_language_target_with_module_clause_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_lang RETURN NUMBER");
+        engine.process_line("AS LANGUAGE JAVASCRIPT MLE MODULE ext_mod SIGNATURE 'run(number)';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_lang RETURN NUMBER")
+        );
+        assert!(
+            statements[0]
+                .contains("AS LANGUAGE JAVASCRIPT MLE MODULE ext_mod SIGNATURE 'run(number)'")
+        );
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn external_language_name_clause_without_semicolon_splits_on_slash_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_name_slash RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C NAME 'ext_name_slash'");
+        engine.process_line("/");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_name_slash RETURN NUMBER")
+        );
+        assert!(statements[0].contains("AS LANGUAGE C NAME 'ext_name_slash'"));
+        assert!(
+            statements[1].starts_with("/\nSELECT 1 FROM dual"),
+            "slash marker line should start the next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn mle_module_clause_without_semicolon_splits_on_slash_terminator() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_slash RETURN NUMBER");
+        engine.process_line("AS MLE MODULE ext_mod SIGNATURE 'run(number)'");
+        engine.process_line("/");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_slash RETURN NUMBER")
+        );
+        assert!(statements[0].contains("AS MLE MODULE ext_mod SIGNATURE 'run(number)'"));
+        assert!(
+            statements[1].starts_with("/\nSELECT 1 FROM dual"),
+            "slash marker line should start the next statement: {}",
+            statements[1]
+        );
     }
 
     #[test]
