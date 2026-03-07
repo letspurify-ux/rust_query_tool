@@ -1839,6 +1839,7 @@ impl QueryExecutor {
                 collector.state.is_idle(),
                 collector.state.in_create_plsql(),
                 collector.state.can_terminate_on_slash(),
+                collector.state.pending_end == crate::sql_parser_engine::PendingEnd::End,
                 collector.current_is_empty(),
                 collector.state.is_trigger(),
                 Self::line_starts_new_statement_keyword_for_bounds(trimmed),
@@ -1959,6 +1960,8 @@ impl QueryExecutor {
                 || word.eq_ignore_ascii_case("DELETE")
                 || word.eq_ignore_ascii_case("MERGE")
                 || word.eq_ignore_ascii_case("WITH")
+                || word.eq_ignore_ascii_case("VALUES")
+                || word.eq_ignore_ascii_case("TABLE")
         })
     }
 
@@ -1984,13 +1987,14 @@ impl QueryExecutor {
         is_idle: bool,
         in_create_plsql: bool,
         at_create_boundary: bool,
+        has_pending_end: bool,
         current_is_empty: bool,
         is_trigger: bool,
         starts_new_statement_head: bool,
     ) -> bool {
         is_idle
             && in_create_plsql
-            && at_create_boundary
+            && (at_create_boundary || has_pending_end)
             && !current_is_empty
             && !is_trigger
             && starts_new_statement_head

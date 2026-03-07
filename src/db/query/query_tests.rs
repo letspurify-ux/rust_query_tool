@@ -144,6 +144,54 @@ fn test_statement_bounds_at_cursor_keeps_multiline_alter_session_set_clause() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_recovers_incomplete_create_before_values_statement() {
+    let sql = "CREATE OR REPLACE FUNCTION f RETURN NUMBER IS
+BEGIN
+  RETURN 1;
+END
+VALUES (42);
+SELECT 2 FROM dual;";
+    let cursor = sql.find("VALUES (42)").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected VALUES statement bounds after incomplete CREATE recovery");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("VALUES (42)"),
+        "cursor on VALUES should resolve VALUES statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("CREATE OR REPLACE FUNCTION"),
+        "incomplete CREATE should not be merged into VALUES statement: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_recovers_incomplete_create_before_table_statement() {
+    let sql = "CREATE OR REPLACE FUNCTION f RETURN NUMBER IS
+BEGIN
+  RETURN 1;
+END
+TABLE t_parser_recover;
+SELECT 2 FROM dual;";
+    let cursor = sql.find("TABLE t_parser_recover").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected TABLE statement bounds after incomplete CREATE recovery");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("TABLE t_parser_recover"),
+        "cursor on TABLE should resolve TABLE statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("CREATE OR REPLACE FUNCTION"),
+        "incomplete CREATE should not be merged into TABLE statement: {statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_create_java_source_ignores_body_semicolon_until_slash() {
     let sql = r#"CREATE OR REPLACE AND COMPILE JAVA SOURCE NAMED "DemoClass" AS
 public class DemoClass {
@@ -8470,6 +8518,65 @@ SELECT 2 FROM dual;";
     assert!(
         stmts[1].starts_with("LOCK TABLE t_parser_recover IN EXCLUSIVE MODE"),
         "second statement should start at LOCK TABLE after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+
+#[test]
+fn test_split_script_items_incomplete_create_function_recovers_to_values_statement_head() {
+    let sql = "CREATE OR REPLACE FUNCTION f RETURN NUMBER IS
+BEGIN
+  RETURN 1;
+END
+VALUES (42);
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover incomplete CREATE FUNCTION when VALUES starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve incomplete CREATE FUNCTION body: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("VALUES (42)"),
+        "second statement should start at VALUES after recovery: {}",
+        stmts[1]
+    );
+    assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_incomplete_create_function_recovers_to_table_statement_head() {
+    let sql = "CREATE OR REPLACE FUNCTION f RETURN NUMBER IS
+BEGIN
+  RETURN 1;
+END
+TABLE t_parser_recover;
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        3,
+        "parser should recover incomplete CREATE FUNCTION when TABLE starts a new statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("CREATE OR REPLACE FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve incomplete CREATE FUNCTION body: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("TABLE t_parser_recover"),
+        "second statement should start at TABLE after recovery: {}",
         stmts[1]
     );
     assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
