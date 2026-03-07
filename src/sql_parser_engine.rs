@@ -1516,6 +1516,13 @@ impl SplitState {
             return;
         }
 
+        if self.with_clause_state == WithClauseState::PendingClause
+            && sql_text::is_with_non_plsql_clause_keyword(upper)
+        {
+            self.with_clause_state = WithClauseState::None;
+            return;
+        }
+
         // Standard CTE shape (`WITH name AS (...)`) means this is not a
         // top-level PL/SQL declaration prefix. But Oracle allows
         // `WITH FUNCTION/PROCEDURE ... AS`, so keep declaration mode once
@@ -4964,6 +4971,78 @@ BEGIN"
             "CTE WITH should be treated as a valid main query head: {}",
             statements[0]
         );
+    }
+
+    #[test]
+    fn non_plsql_with_clause_resets_pending_with_declaration_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE VIEW v_read_only AS");
+        engine.process_line("SELECT * FROM dual WITH READ ONLY;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH READ ONLY"),
+            "first statement should preserve trailing WITH READ ONLY clause: {}",
+            statements[0]
+        );
+        assert_eq!(
+            engine.state.with_clause_state,
+            WithClauseState::None,
+            "non-PL/SQL WITH clauses should not leave declaration tracking armed"
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn non_plsql_with_check_option_clause_resets_pending_with_declaration_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE VIEW v_checked AS");
+        engine.process_line("SELECT * FROM dual WITH CHECK OPTION;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH CHECK OPTION"),
+            "first statement should preserve WITH CHECK OPTION clause: {}",
+            statements[0]
+        );
+        assert_eq!(
+            engine.state.with_clause_state,
+            WithClauseState::None,
+            "WITH CHECK OPTION should not leave declaration tracking armed"
+        );
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn non_plsql_with_rowid_clause_resets_pending_with_declaration_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE VIEW v_rowid AS");
+        engine.process_line("SELECT rowid rid, t.* FROM t WITH ROWID;");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH ROWID"),
+            "first statement should preserve WITH ROWID clause: {}",
+            statements[0]
+        );
+        assert_eq!(
+            engine.state.with_clause_state,
+            WithClauseState::None,
+            "WITH ROWID should not leave declaration tracking armed"
+        );
+        assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
     }
 
     #[test]
