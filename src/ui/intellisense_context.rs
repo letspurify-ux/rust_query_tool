@@ -2744,8 +2744,13 @@ fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<us
 fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
     let mut idx = skip_comment_tokens(tokens, start);
 
-    if matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SCN") || word.eq_ignore_ascii_case("TIMESTAMP"))
-    {
+    if matches!(
+        tokens.get(idx),
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("SCN")
+                || word.eq_ignore_ascii_case("TIMESTAMP")
+                || word.eq_ignore_ascii_case("SNAPSHOT")
+    ) {
         idx = skip_comment_tokens(tokens, idx + 1);
     }
 
