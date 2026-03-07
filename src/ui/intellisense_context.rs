@@ -3506,7 +3506,10 @@ fn extract_match_recognize_clause_tokens(tokens: &[SqlToken]) -> Option<&[SqlTok
 }
 
 fn is_match_recognize_clause_boundary_keyword(word: &str) -> bool {
-    matches!(word, "MEASURES" | "PATTERN" | "DEFINE" | "AFTER")
+    matches!(
+        word,
+        "MEASURES" | "PATTERN" | "DEFINE" | "AFTER" | "SUBSET" | "ONE" | "ALL" | "WITH"
+    )
 }
 
 fn find_top_level_keyword_pair_index(
@@ -4203,6 +4206,22 @@ fn parse_model_measure_output_column(item_tokens: &[&SqlToken]) -> Option<String
             _ => {}
         }
         idx += 1;
+    }
+
+    if meaningful.len() >= 2 {
+        let alias_idx = meaningful.len().saturating_sub(1);
+        if let Some(SqlToken::Word(alias)) = meaningful.get(alias_idx).copied() {
+            let upper = alias.to_ascii_uppercase();
+            if is_identifier_word_token(alias)
+                && !sql_text::is_oracle_sql_keyword(&upper)
+                && !is_match_recognize_clause_boundary_keyword(&upper)
+            {
+                let previous = meaningful[alias_idx.saturating_sub(1)];
+                if !matches!(previous, SqlToken::Symbol(sym) if sym == ".") {
+                    return Some(strip_identifier_quotes(alias));
+                }
+            }
+        }
     }
 
     parse_simple_identifier_path_output_column(&meaningful)
