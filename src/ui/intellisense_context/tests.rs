@@ -4525,6 +4525,55 @@ fn merge_when_matched_delete_where_is_column_context() {
 }
 
 #[test]
+fn merge_update_then_delete_where_stays_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN MATCHED THEN UPDATE SET t.val = s.val DELETE WHERE |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn merge_insert_where_clause_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val) WHERE |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_merge_insert_log_errors_into_is_table_context() {
+    let ctx = analyze(
+        "MERGE INTO tgt t USING src s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val) LOG ERRORS INTO |",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_merge_insert_log_errors_reject_limit_then_returning_is_set_clause() {
+    let ctx = analyze(
+        "MERGE INTO tgt t USING src s ON (t.id = s.id) \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val) \
+         LOG ERRORS INTO err$_target REJECT LIMIT UNLIMITED RETURNING |",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+    assert!(!ctx.phase.is_table_context());
+}
+
+
+#[test]
 fn from_match_recognize_clause_preserves_match_keyword_for_phase_detection() {
     let ctx = analyze("SELECT * FROM sales MATCH RECOGNIZE (PARTITION BY |)");
     assert_eq!(ctx.phase, SqlPhase::MatchRecognizeClause);
@@ -4649,6 +4698,19 @@ fn merge_when_not_matched_by_source_update_set_is_column_context() {
     assert_eq!(ctx.phase, SqlPhase::SetClause);
     assert!(ctx.phase.is_column_context());
 }
+
+#[test]
+fn merge_when_not_matched_by_source_update_where_is_column_context() {
+    let ctx = analyze(
+        "MERGE INTO target t USING source s ON (t.id = s.id) \
+         WHEN NOT MATCHED BY SOURCE THEN UPDATE SET t.val = 1 WHERE |",
+    );
+
+    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.phase, SqlPhase::WhereClause);
+    assert!(ctx.phase.is_column_context());
+}
+
 
 #[test]
 fn insert_first_else_into_is_table_context() {
