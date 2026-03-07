@@ -1181,17 +1181,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
-                    "OVERWRITE"
-                        if matches!(last_word.as_deref(), Some("INSERT")) =>
-                    {
+                    "OVERWRITE" if matches!(last_word.as_deref(), Some("INSERT")) => {
                         // Hive/Spark-style `INSERT OVERWRITE TABLE ...` keeps
                         // target relation context after OVERWRITE.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
-                    "DIRECTORY"
-                        if matches!(last_word.as_deref(), Some("OVERWRITE")) =>
-                    {
+                    "DIRECTORY" if matches!(last_word.as_deref(), Some("OVERWRITE")) => {
                         // `INSERT OVERWRITE DIRECTORY ...` targets a filesystem
                         // location rather than a table relation.
                         depth_frames[depth].phase = SqlPhase::Initial;
@@ -1345,13 +1341,23 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
                         {
-                            // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
-                            // just like NOWAIT/WAIT. Keep `SKIP` as an identifier candidate
-                            // inside `OF <column list>` unless the next keyword is LOCKED.
-                            depth_frames[depth].phase = SqlPhase::OrderByClause;
-                            relation_state.clear();
+                            let next_is_locked = matches!(
+                                next_word_upper(tokens, idx + 1),
+                                Some((next, _)) if next == "LOCKED"
+                            );
+                            let prev_idx = prev_non_comment_index(tokens, idx);
+                            let follows_of_item_separator = matches!(
+                                tokens.get(prev_idx),
+                                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF")
+                            ) || matches!(tokens.get(prev_idx), Some(SqlToken::Symbol(sym)) if sym == ",");
+
+                            if next_is_locked || !follows_of_item_separator {
+                                // `SKIP` begins `SKIP LOCKED` after at least one OF-target item,
+                                // but can still be an identifier right after `OF` or `,`.
+                                depth_frames[depth].phase = SqlPhase::OrderByClause;
+                                relation_state.clear();
+                            }
                         }
                     }
                     "LOCKED" => {
@@ -1424,8 +1430,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             is_mysql_on_duplicate_key_update(tokens, idx);
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
-                        let is_locking_update_keyword =
-                            matches!(last_word.as_deref(), Some("FOR"));
+                        let is_locking_update_keyword = matches!(last_word.as_deref(), Some("FOR"));
                         if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
@@ -4143,6 +4148,17 @@ fn next_non_comment_index(tokens: &[SqlToken], start: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+fn prev_non_comment_index(tokens: &[SqlToken], before_idx: usize) -> usize {
+    let mut idx = before_idx;
+    while idx > 0 {
+        idx -= 1;
+        if !matches!(tokens[idx], SqlToken::Comment(_)) {
+            return idx;
+        }
+    }
+    before_idx
 }
 
 fn dedup_columns_case_insensitive(columns: &mut Vec<String>) {
