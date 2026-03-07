@@ -711,15 +711,6 @@ const TABLE_FUNCTION_ITEM_LEADING_KEYWORDS: &[&str] = &[
 ];
 
 const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "TRUNCATE",
-    "RENAME",
-    "GRANT",
-    "REVOKE",
-    "COMMIT",
-    "ROLLBACK",
     "DECLARE",
     "BEGIN",
     "WITH",
@@ -1054,6 +1045,7 @@ pub(crate) fn is_table_function_item_leading_keyword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn oracle_sql_keyword_lookup_uses_uppercase_tokens() {
@@ -1072,6 +1064,14 @@ mod tests {
         assert!(is_statement_head_keyword("REVOKE"));
         assert!(is_statement_head_keyword("COMMIT"));
         assert!(is_statement_head_keyword("ROLLBACK"));
+    }
+
+    #[test]
+    fn statement_head_keywords_do_not_contain_duplicates() {
+        let mut seen = HashSet::new();
+        for keyword in STATEMENT_HEAD_KEYWORDS {
+            assert!(seen.insert(*keyword), "duplicate statement head keyword: {keyword}");
+        }
     }
 
     #[test]
