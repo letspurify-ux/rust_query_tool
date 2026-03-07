@@ -2416,7 +2416,7 @@ fn parse_relation_alias_at(
 /// Parse an optional alias after a table name.
 fn parse_alias_deep(tokens: &[SqlToken], start: usize) -> (Option<String>, usize) {
     let start = skip_relation_postfix_clauses(tokens, start);
-    parse_relation_alias_at(tokens, start, false)
+    parse_relation_alias_at(tokens, start, true)
 }
 
 fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize) -> Option<String> {
@@ -2425,7 +2425,7 @@ fn parse_alias_after_derived_relation_clauses(tokens: &[SqlToken], start: usize)
         return None;
     }
     let alias_start = skip_relation_postfix_clauses(tokens, derived_end);
-    parse_relation_alias_at(tokens, alias_start, false).0
+    parse_relation_alias_at(tokens, alias_start, true).0
 }
 
 fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
