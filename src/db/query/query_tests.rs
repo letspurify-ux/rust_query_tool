@@ -2293,6 +2293,97 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_create_external_function_language_binary_single_quoted_target_without_external_keyword_splits(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_bquoted RETURN NUMBER
+AS LANGUAGE B'C' NAME 'ext_lang_bquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE B'...' without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_bquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE B'C' NAME 'ext_lang_bquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_binary_single_quoted_target_without_external_keyword_splits(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_bquoted RETURN NUMBER
+AS LANGUAGE B'C' NAME 'ext_lang_bquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE B'...' function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_bquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE B'C' NAME 'ext_lang_bquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_create_external_function_language_hex_single_quoted_target_without_external_keyword_splits() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER
+AS LANGUAGE X'C' NAME 'ext_lang_xquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "LANGUAGE X'...' without EXTERNAL keyword should split before trailing SELECT, got: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE X'C' NAME 'ext_lang_xquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_external_language_hex_single_quoted_target_without_external_keyword_splits(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER
+AS LANGUAGE X'C' NAME 'ext_lang_xquoted';
+SELECT 1 FROM dual;"#;
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep LANGUAGE X'...' function together and split trailing SELECT: {:?}",
+        stmts
+    );
+    assert!(stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER"));
+    assert!(stmts[0].contains("AS LANGUAGE X'C' NAME 'ext_lang_xquoted'"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_create_function() {
     let sql = r#"CREATE FUNCTION add_nums(a NUMBER, b NUMBER) RETURN NUMBER IS
 BEGIN
