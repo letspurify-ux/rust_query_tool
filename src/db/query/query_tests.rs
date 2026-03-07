@@ -11106,3 +11106,55 @@ fn test_split_script_items_create_sharing_wrapped_procedure_keeps_body_until_sla
         stmts[1]
     );
 }
+
+#[test]
+fn test_split_script_items_non_ascii_q_quote_delimiter_recovers_and_splits_trailing_statement() {
+    let sql = "SELECT q'가x' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "non-ASCII q-quote delimiter should be treated as invalid and not swallow trailing statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("SELECT q'가x' FROM dual"),
+        "first statement should preserve original malformed q-quote text: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second statement should remain split: {}",
+        stmts[1]
+    );
+}
+
+#[test]
+fn test_split_format_items_non_ascii_q_quote_delimiter_recovers_and_splits_trailing_statement() {
+    let sql = "SELECT q'가x' FROM dual;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should recover from non-ASCII q-quote delimiter and split trailing statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("SELECT q'가x' FROM dual"),
+        "first formatted statement should preserve malformed q-quote text: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[1].starts_with("SELECT 2 FROM dual"),
+        "second formatted statement should remain split: {}",
+        stmts[1]
+    );
+}
