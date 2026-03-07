@@ -666,6 +666,12 @@ fn phase_for_update_of_nowait_is_not_column_context() {
 }
 
 #[test]
+fn phase_for_update_of_skip_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno SKIP |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
 fn phase_for_update_of_skip_locked_is_not_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno SKIP LOCKED |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
