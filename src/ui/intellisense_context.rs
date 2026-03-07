@@ -709,6 +709,7 @@ enum StatementKind {
     Delete,
     Merge,
     Rename,
+    Lock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1157,18 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.expect_table();
                         }
                     }
+                    "LOCK" => {
+                        let is_expression_context = current_phase.is_column_context()
+                            || matches!(current_phase, SqlPhase::ValuesClause);
+                        if is_expression_context {
+                            // Inside expressions, LOCK can be a valid identifier/token.
+                            relation_state.clear();
+                        } else {
+                            depth_frames[depth].statement_kind = StatementKind::Lock;
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            relation_state.clear();
+                        }
+                    }
                     "WITH"
                         if should_enter_with_clause(current_phase, depth, last_word.as_deref()) =>
                     {
@@ -1236,6 +1249,20 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
+                    "IN" => {
+                        let current_statement_kind = depth_frames
+                            .get(depth)
+                            .map(|frame| frame.statement_kind)
+                            .unwrap_or(StatementKind::Unknown);
+                        if matches!(current_statement_kind, StatementKind::Lock)
+                            && matches!(current_phase, SqlPhase::IntoClause)
+                        {
+                            // Oracle `LOCK TABLE ... IN <lock_mode> MODE` switches from
+                            // table target to lock-mode keywords.
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                        }
+                        relation_state.clear();
+                    }
                     "OVERWRITE" if matches!(last_word.as_deref(), Some("INSERT")) => {
                         // Hive/Spark-style `INSERT OVERWRITE TABLE ...` keeps
                         // target relation context after OVERWRITE.
@@ -1276,6 +1303,9 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         // `FLASHBACK TABLE ...`, `COMMENT ON TABLE ...`,
                         // `CREATE [GLOBAL TEMPORARY] TABLE ...`)
                         // should provide table-name completion.
+                        if matches!(last_word.as_deref(), Some("LOCK")) {
+                            depth_frames[depth].statement_kind = StatementKind::Lock;
+                        }
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
@@ -3091,7 +3121,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
     is_join_keyword(word)
         || is_table_stop_keyword(word)
         || matches!(word, "SEARCH" | "CYCLE")
-        || matches!(word, "ON" | "SELECT" | "FROM" | "INTO")
+        || matches!(word, "ON" | "SELECT" | "FROM" | "INTO" | "IN")
 }
 
 /// Collect top-level tables visible within a standalone statement.
