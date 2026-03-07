@@ -1165,162 +1165,136 @@ impl QueryExecutor {
     /// Find the byte index of the main (final) SELECT keyword after a WITH clause.
     /// This skips over all CTE definitions to find the top-level SELECT that follows.
     fn find_main_select_after_with(sql: &str) -> Option<usize> {
-        let chars: Vec<(usize, char)> = sql.char_indices().collect();
-        let len = chars.len();
-        let mut i = 0usize;
+        let bytes = sql.as_bytes();
+        let len = bytes.len();
+        let mut pos = 0usize;
+
+        // Skip past the WITH keyword
+        while pos < len {
+            let b = bytes[pos];
+            if b.is_ascii_alphabetic() {
+                let start = pos;
+                pos += 1;
+                while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+                    pos += 1;
+                }
+                if sql.get(start..pos).is_some_and(|w| w.eq_ignore_ascii_case("WITH")) {
+                    break;
+                }
+                continue;
+            }
+            pos += 1;
+        }
+
+        // Scan for top-level SELECT at depth 0
         let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
         let mut top_level_closed_paren_recently = false;
         let mut parenthesized_main_query_depth: Option<usize> = None;
 
-        // Skip past the WITH keyword
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            if c.is_ascii_alphabetic() {
-                let start = byte_idx;
-                let mut end_i = i;
-                while end_i < len
-                    && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_')
-                {
-                    end_i += 1;
-                }
-                let end_byte = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    sql.len()
-                };
-                let word = &sql[start..end_byte];
-                if word.eq_ignore_ascii_case("WITH") {
-                    i = end_i;
-                    break;
-                }
-                i = end_i;
-                continue;
-            }
-            i += 1;
-        }
+        while pos < len {
+            let b = bytes[pos];
 
-        // Now scan for top-level SELECT at depth 0
-        while i < len {
-            let (byte_idx, c) = chars[i];
-            let next = chars.get(i + 1).map(|(_, ch)| *ch);
-
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
+            // Line comment
+            if b == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+                pos += 2;
+                while pos < len && bytes[pos] != b'\n' {
+                    pos += 1;
                 }
-                i += 1;
                 continue;
             }
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
+            // Block comment
+            if b == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < len {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
                     }
-                    in_single_quote = false;
+                    pos += 1;
                 }
-                i += 1;
                 continue;
             }
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
+            // Single-quoted string
+            if b == b'\'' {
+                pos += 1;
+                while pos < len {
+                    if bytes[pos] == b'\'' {
+                        pos += 1;
+                        if pos < len && bytes[pos] == b'\'' {
+                            pos += 1;
+                            continue;
+                        }
+                        break;
                     }
-                    in_double_quote = false;
+                    pos += 1;
                 }
-                i += 1;
+                continue;
+            }
+            // Double-quoted identifier
+            if b == b'"' {
+                pos += 1;
+                while pos < len {
+                    if bytes[pos] == b'"' {
+                        pos += 1;
+                        if pos < len && bytes[pos] == b'"' {
+                            pos += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    pos += 1;
+                }
                 continue;
             }
 
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
+            if b == b'(' {
                 if depth == 0
                     && top_level_closed_paren_recently
                     && parenthesized_main_query_depth.is_none()
                 {
                     parenthesized_main_query_depth = Some(1);
                 }
-                depth = depth.saturating_add(1);
-                i += 1;
+                depth += 1;
+                pos += 1;
                 continue;
             }
-            if c == ')' {
+            if b == b')' {
                 if depth == 1 {
                     top_level_closed_paren_recently = true;
                 }
                 depth = depth.saturating_sub(1);
-                if parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth < wrapper_depth)
-                {
+                if parenthesized_main_query_depth.is_some_and(|wd| depth < wd) {
                     parenthesized_main_query_depth = None;
                 }
-                i += 1;
+                pos += 1;
                 continue;
             }
 
-            if !c.is_whitespace() {
+            if b.is_ascii_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            if !b.is_ascii_whitespace() {
                 top_level_closed_paren_recently = false;
             }
 
-            let token_depth_matches_main_query =
-                parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth == wrapper_depth);
+            let at_query_depth = depth == 0
+                || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
 
-            if (depth == 0 || token_depth_matches_main_query) && c.is_ascii_alphabetic() {
-                let start = byte_idx;
-                let mut end_i = i;
-                while end_i < len
-                    && (chars[end_i].1.is_ascii_alphanumeric() || chars[end_i].1 == '_')
-                {
-                    end_i += 1;
+            if at_query_depth && b.is_ascii_alphabetic() {
+                let start = pos;
+                pos += 1;
+                while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+                    pos += 1;
                 }
-                let end_byte = if end_i < len {
-                    chars[end_i].0
-                } else {
-                    sql.len()
-                };
-                let word = &sql[start..end_byte];
-                if word.eq_ignore_ascii_case("SELECT") {
+                if sql.get(start..pos).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
                     return Some(start);
                 }
-                i = end_i;
                 continue;
             }
 
-            i += 1;
+            pos += 1;
         }
 
         None
@@ -1612,52 +1586,39 @@ impl QueryExecutor {
     }
 
     fn find_leading_wildcard_in_select_list(select_body: &str) -> Option<(usize, usize)> {
-        let mut chars = select_body.char_indices().peekable();
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
+        let bytes = select_body.as_bytes();
+        let mut pos = 0usize;
 
-        while let Some((byte_idx, c)) = chars.next() {
-            let next = chars.peek().map(|(_, ch)| *ch);
+        while pos < bytes.len() {
+            let b = bytes[pos];
 
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
+            if b == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+                pos += 2;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
                 }
                 continue;
             }
 
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    chars.next(); // consume '/'
+            if b == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < bytes.len() {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
                 }
                 continue;
             }
 
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                chars.next(); // consume second '-'
+            if b.is_ascii_whitespace() {
+                pos += 1;
                 continue;
             }
 
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                chars.next(); // consume '*'
-                continue;
-            }
-
-            if c.is_whitespace() {
-                continue;
-            }
-
-            if c == '*' {
-                let wildcard_end = byte_idx.saturating_add(c.len_utf8());
-                if select_body.is_char_boundary(byte_idx)
-                    && select_body.is_char_boundary(wildcard_end)
-                {
-                    return Some((byte_idx, wildcard_end));
-                }
-                return None;
+            if b == b'*' {
+                return Some((pos, pos + 1));
             }
 
             return None;
@@ -1702,19 +1663,10 @@ impl QueryExecutor {
     }
 
     fn skip_ascii_whitespace(sql: &str, mut idx: usize) -> usize {
-        while idx < sql.len() {
-            let Some(slice) = sql.get(idx..) else {
-                break;
-            };
-            let Some((_, ch)) = slice.char_indices().next() else {
-                break;
-            };
-            if !ch.is_whitespace() {
-                break;
-            }
-            idx = idx.saturating_add(ch.len_utf8());
+        let bytes = sql.as_bytes();
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
         }
-
         idx
     }
 
@@ -1933,178 +1885,194 @@ impl QueryExecutor {
 
     fn starts_with_relation_invocation(text: &str) -> bool {
         let trimmed = text.trim_start();
-        if trimmed.is_empty() {
+        let bytes = trimmed.as_bytes();
+        if bytes.is_empty() {
             return false;
         }
 
-        let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
-        let len = chars.len();
-        if chars.first().is_some_and(|(_, ch)| *ch == '(') {
+        if bytes[0] == b'(' {
             return true;
         }
 
         let mut pos = 0usize;
-        if Self::parse_identifier_at(&chars, trimmed, &mut pos).is_none() {
+
+        // Skip first identifier (plain or quoted)
+        if !Self::skip_identifier_bytes(bytes, &mut pos) {
             return false;
         }
 
+        // Skip optional schema qualifiers: .ident.ident...
         loop {
-            while pos < len && chars[pos].1.is_whitespace() {
+            let save = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
                 pos += 1;
             }
-            if pos >= len || chars[pos].1 != '.' {
+            if pos >= bytes.len() || bytes[pos] != b'.' {
+                pos = save;
                 break;
             }
-            pos += 1;
-            while pos < len && chars[pos].1.is_whitespace() {
+            pos += 1; // skip dot
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
                 pos += 1;
             }
-            if Self::parse_identifier_at(&chars, trimmed, &mut pos).is_none() {
+            if !Self::skip_identifier_bytes(bytes, &mut pos) {
                 return false;
             }
         }
 
-        while pos < len && chars[pos].1.is_whitespace() {
+        // Skip trailing whitespace
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
             pos += 1;
         }
 
-        pos < len && chars[pos].1 == '('
+        pos < bytes.len() && bytes[pos] == b'('
+    }
+
+    /// Skip an identifier (plain or double-quoted) at `pos` in byte slice.
+    /// Returns true if an identifier was found and skipped.
+    fn skip_identifier_bytes(bytes: &[u8], pos: &mut usize) -> bool {
+        if *pos >= bytes.len() {
+            return false;
+        }
+        if bytes[*pos] == b'"' {
+            *pos += 1;
+            while *pos < bytes.len() {
+                if bytes[*pos] == b'"' {
+                    *pos += 1;
+                    if *pos < bytes.len() && bytes[*pos] == b'"' {
+                        *pos += 1; // escaped quote
+                        continue;
+                    }
+                    return true;
+                }
+                *pos += 1;
+            }
+            return true; // unterminated
+        }
+        if sql_text::is_identifier_start_byte(bytes[*pos]) {
+            *pos += 1;
+            while *pos < bytes.len() && sql_text::is_identifier_byte(bytes[*pos]) {
+                *pos += 1;
+            }
+            return true;
+        }
+        false
     }
 
     fn with_clause_starts_with_select(sql: &str) -> bool {
         let stripped = Self::strip_leading_comments(sql);
-        let chars: Vec<char> = stripped.chars().collect();
-        let len = chars.len();
+        let bytes = stripped.as_bytes();
+        let len = bytes.len();
+        let mut pos = 0usize;
 
-        let mut i = 0usize;
         let mut depth = 0usize;
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut in_q_quote = false;
-        let mut q_quote_end: Option<char> = None;
         let mut in_with_plsql_declaration = false;
         let mut with_plsql_waiting_main_query = false;
         let mut with_plsql_block_depth = 0usize;
         let mut with_plsql_pending_end = false;
         let mut top_level_closed_paren_recently = false;
         let mut parenthesized_main_query_depth: Option<usize> = None;
+        let mut q_quote_end_byte: Option<u8> = None;
 
-        let resolve_with_plsql_pending_end = |pending_end: &mut bool, block_depth: &mut usize| {
-            if *pending_end {
-                *block_depth = block_depth.saturating_sub(1);
-                *pending_end = false;
+        let resolve_pending = |pending: &mut bool, bd: &mut usize| {
+            if *pending {
+                *bd = bd.saturating_sub(1);
+                *pending = false;
             }
         };
 
-        while i < len {
-            let c = chars[i];
-            let next = chars.get(i + 1).copied();
+        while pos < len {
+            let b = bytes[pos];
 
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if in_block_comment {
-                if c == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    i += 2;
+            // Q-quote mode
+            if let Some(end_b) = q_quote_end_byte {
+                if b == end_b && bytes.get(pos + 1) == Some(&b'\'') {
+                    q_quote_end_byte = None;
+                    pos += 2;
                     continue;
                 }
-                i += 1;
+                pos += 1;
                 continue;
             }
 
-            if in_q_quote {
-                if Some(c) == q_quote_end && next == Some('\'') {
-                    in_q_quote = false;
-                    q_quote_end = None;
-                    i += 2;
-                    continue;
+            // Line comment
+            if b == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+                pos += 2;
+                while pos < len && bytes[pos] != b'\n' {
+                    pos += 1;
                 }
-                i += 1;
                 continue;
             }
-
-            if in_single_quote {
-                if c == '\'' {
-                    if next == Some('\'') {
-                        i += 2;
-                        continue;
+            // Block comment
+            if b == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                pos += 2;
+                while pos + 1 < len {
+                    if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                        pos += 2;
+                        break;
                     }
-                    in_single_quote = false;
+                    pos += 1;
                 }
-                i += 1;
                 continue;
             }
 
-            if in_double_quote {
-                if c == '"' {
-                    if next == Some('"') {
-                        i += 2;
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            if c == '-' && next == Some('-') {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if c == '/' && next == Some('*') {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-
-            if (c == 'n' || c == 'N')
-                && matches!(next, Some('q') | Some('Q'))
-                && chars.get(i + 2) == Some(&'\'')
+            // NQ'...' or Q'...' (q-quoted strings)
+            if (b == b'n' || b == b'N')
+                && bytes.get(pos + 1).is_some_and(|&c| c == b'q' || c == b'Q')
+                && bytes.get(pos + 2) == Some(&b'\'')
             {
-                if let Some(&delimiter) = chars.get(i + 3) {
-                    if Self::is_valid_q_quote_delimiter(delimiter) {
-                        in_q_quote = true;
-                        q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                        i += 4;
+                if let Some(&delim) = bytes.get(pos + 3) {
+                    if !delim.is_ascii_whitespace() && delim != b'\'' {
+                        q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
+                        pos += 4;
+                        continue;
+                    }
+                }
+            }
+            if (b == b'q' || b == b'Q') && bytes.get(pos + 1) == Some(&b'\'') {
+                if let Some(&delim) = bytes.get(pos + 2) {
+                    if !delim.is_ascii_whitespace() && delim != b'\'' {
+                        q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
+                        pos += 3;
                         continue;
                     }
                 }
             }
 
-            if (c == 'q' || c == 'Q') && next == Some('\'') {
-                if let Some(&delimiter) = chars.get(i + 2) {
-                    if Self::is_valid_q_quote_delimiter(delimiter) {
-                        in_q_quote = true;
-                        q_quote_end = Some(sql_text::q_quote_closing(delimiter));
-                        i += 3;
-                        continue;
+            // Single-quoted string
+            if b == b'\'' {
+                pos += 1;
+                while pos < len {
+                    if bytes[pos] == b'\'' {
+                        pos += 1;
+                        if pos < len && bytes[pos] == b'\'' {
+                            pos += 1;
+                            continue;
+                        }
+                        break;
                     }
+                    pos += 1;
                 }
+                continue;
             }
-
-            if c == '\'' {
-                in_single_quote = true;
-                i += 1;
+            // Double-quoted identifier
+            if b == b'"' {
+                pos += 1;
+                while pos < len {
+                    if bytes[pos] == b'"' {
+                        pos += 1;
+                        if pos < len && bytes[pos] == b'"' {
+                            pos += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    pos += 1;
+                }
                 continue;
             }
 
-            if c == '"' {
-                in_double_quote = true;
-                i += 1;
-                continue;
-            }
-
-            if c == '(' {
+            if b == b'(' {
                 if depth == 0
                     && (with_plsql_waiting_main_query || top_level_closed_paren_recently)
                     && parenthesized_main_query_depth.is_none()
@@ -2112,57 +2080,49 @@ impl QueryExecutor {
                     parenthesized_main_query_depth = Some(1);
                 }
                 depth += 1;
-                i += 1;
+                pos += 1;
                 continue;
             }
-
-            if c == ')' {
+            if b == b')' {
                 if depth == 1 {
                     top_level_closed_paren_recently = true;
                 }
                 depth = depth.saturating_sub(1);
-                if parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth < wrapper_depth)
-                {
+                if parenthesized_main_query_depth.is_some_and(|wd| depth < wd) {
                     parenthesized_main_query_depth = None;
                 }
-                i += 1;
+                pos += 1;
                 continue;
             }
-
-            if c == ';' {
-                resolve_with_plsql_pending_end(
-                    &mut with_plsql_pending_end,
-                    &mut with_plsql_block_depth,
-                );
+            if b == b';' {
+                resolve_pending(&mut with_plsql_pending_end, &mut with_plsql_block_depth);
                 if in_with_plsql_declaration && with_plsql_block_depth == 0 {
                     in_with_plsql_declaration = false;
                     with_plsql_waiting_main_query = true;
                 }
-                i += 1;
+                pos += 1;
                 continue;
             }
 
-            if !c.is_whitespace() {
-                top_level_closed_paren_recently = false;
+            if b.is_ascii_whitespace() {
+                pos += 1;
+                continue;
             }
 
-            let token_depth_matches_main_query =
-                parenthesized_main_query_depth.is_some_and(|wrapper_depth| depth == wrapper_depth);
+            top_level_closed_paren_recently = false;
 
-            if (depth == 0 || token_depth_matches_main_query)
-                && (c.is_ascii_alphabetic() || c == '_')
-            {
-                let start = i;
-                i += 1;
-                while i < len
-                    && (chars[i].is_ascii_alphanumeric()
-                        || chars[i] == '_'
-                        || chars[i] == '$'
-                        || chars[i] == '#')
-                {
-                    i += 1;
+            let at_query_depth = depth == 0
+                || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
+
+            if at_query_depth && sql_text::is_identifier_start_byte(b) {
+                let start = pos;
+                pos += 1;
+                while pos < len && sql_text::is_identifier_byte(bytes[pos]) {
+                    pos += 1;
                 }
-                let token: String = chars[start..i].iter().collect();
+                let Some(token) = stripped.get(start..pos) else {
+                    continue;
+                };
 
                 if in_with_plsql_declaration {
                     if token.eq_ignore_ascii_case("BEGIN")
@@ -2171,34 +2131,26 @@ impl QueryExecutor {
                         || token.eq_ignore_ascii_case("IF")
                         || token.eq_ignore_ascii_case("LOOP")
                     {
-                        resolve_with_plsql_pending_end(
-                            &mut with_plsql_pending_end,
-                            &mut with_plsql_block_depth,
-                        );
+                        resolve_pending(&mut with_plsql_pending_end, &mut with_plsql_block_depth);
                         with_plsql_block_depth += 1;
                         continue;
                     }
-
                     if token.eq_ignore_ascii_case("END") {
                         with_plsql_pending_end = true;
                         continue;
                     }
-
                     if with_plsql_pending_end
                         && !(token.eq_ignore_ascii_case("CASE")
                             || token.eq_ignore_ascii_case("IF")
                             || token.eq_ignore_ascii_case("LOOP"))
                     {
-                        resolve_with_plsql_pending_end(
-                            &mut with_plsql_pending_end,
-                            &mut with_plsql_block_depth,
-                        );
+                        resolve_pending(&mut with_plsql_pending_end, &mut with_plsql_block_depth);
                     }
-
                     continue;
                 }
 
-                if token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
+                if token.eq_ignore_ascii_case("FUNCTION")
+                    || token.eq_ignore_ascii_case("PROCEDURE")
                 {
                     in_with_plsql_declaration = true;
                     with_plsql_waiting_main_query = false;
@@ -2214,7 +2166,6 @@ impl QueryExecutor {
                     {
                         return true;
                     }
-
                     if token.eq_ignore_ascii_case("INSERT")
                         || token.eq_ignore_ascii_case("UPDATE")
                         || token.eq_ignore_ascii_case("DELETE")
@@ -2222,9 +2173,8 @@ impl QueryExecutor {
                     {
                         return false;
                     }
-
-                    if sql_text::is_statement_head_keyword(&token)
-                        && !sql_text::is_with_main_query_keyword(&token)
+                    if sql_text::is_statement_head_keyword(token)
+                        && !sql_text::is_with_main_query_keyword(token)
                     {
                         return false;
                     }
@@ -2246,7 +2196,7 @@ impl QueryExecutor {
                 continue;
             }
 
-            i += 1;
+            pos += 1;
         }
 
         false
