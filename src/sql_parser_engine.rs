@@ -5511,6 +5511,51 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_show_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SHOW USER");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec!["SHOW USER".to_string(), "SELECT 1 FROM dual".to_string()]
+        );
+    }
+
+    #[test]
+    fn sqlplus_desc_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("DESC emp");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec!["DESC emp".to_string(), "SELECT 1 FROM dual".to_string()]
+        );
+    }
+
+    #[test]
+    fn sqlplus_describe_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("DESCRIBE scott.emp");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "DESCRIBE scott.emp".to_string(),
+                "SELECT 1 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
