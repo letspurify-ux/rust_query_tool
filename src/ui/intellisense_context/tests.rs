@@ -4910,6 +4910,45 @@ fn extract_oracle_model_generated_columns_from_measures_clause() {
 }
 
 #[test]
+fn extract_match_recognize_generated_columns_from_measures_and_pattern() {
+    let tokens = tokenize(
+        "SELECT * FROM emp MATCH_RECOGNIZE ( \
+            MEASURES FIRST(ename) AS start_name, LAST(ename) AS end_name \
+            PATTERN (a b+) \
+            DEFINE b AS b.sal > PREV(b.sal) \
+        )",
+    );
+
+    let cols = extract_match_recognize_generated_columns(&tokens);
+    assert_eq!(cols, vec!["start_name", "end_name", "a", "b"]);
+}
+
+#[test]
+fn infer_source_columns_uses_match_recognize_generated_columns_when_select_list_is_star() {
+    let tokens = tokenize(
+        "SELECT * FROM ( \
+            SELECT * FROM emp MATCH_RECOGNIZE ( \
+                MEASURES FIRST(ename) AS start_name, LAST(ename) AS end_name \
+                PATTERN (a b+) \
+                DEFINE b AS b.sal > PREV(b.sal) \
+            ) mr \
+        ) q",
+    );
+
+    let cols = infer_source_columns_before_clause(&tokens, tokens.len());
+    assert!(
+        cols.iter().any(|col| col.eq_ignore_ascii_case("start_name")),
+        "expected MATCH_RECOGNIZE MEASURES alias to be inferred, got: {:?}",
+        cols
+    );
+    assert!(
+        cols.iter().any(|col| col.eq_ignore_ascii_case("end_name")),
+        "expected MATCH_RECOGNIZE MEASURES alias to be inferred, got: {:?}",
+        cols
+    );
+}
+
+#[test]
 fn extract_oracle_unpivot_projection_with_nested_pivot_source() {
     let tokens = tokenize(
         "SELECT * FROM ( \

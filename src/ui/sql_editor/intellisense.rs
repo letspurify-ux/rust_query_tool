@@ -2878,6 +2878,11 @@ impl SqlEditorWidget {
                 deep_ctx.statement_tokens.as_ref(),
             ),
         );
+        derived_columns.extend(
+            intellisense_context::extract_match_recognize_generated_columns(
+                deep_ctx.statement_tokens.as_ref(),
+            ),
+        );
 
         if matches!(
             deep_ctx.phase,
@@ -6036,6 +6041,41 @@ MATCH_RECOGNIZE (
                 .iter()
                 .any(|c| c.eq_ignore_ascii_case("sum_plus_100")),
             "expected sum_plus_100 in merged suggestions, got: {:?}",
+            merged
+        );
+    }
+
+    #[test]
+    fn merge_derived_columns_includes_match_recognize_measures_aliases() {
+        let tokens = SqlEditorWidget::tokenize_sql(
+            "SELECT * \
+             FROM emp \
+             MATCH_RECOGNIZE ( \
+               MEASURES FIRST(ename) AS start_name, LAST(ename) AS end_name \
+               PATTERN (a b+) \
+               DEFINE b AS b.sal > PREV(b.sal) \
+             ) mr",
+        );
+
+        let derived_columns = intellisense_context::extract_match_recognize_generated_columns(&tokens);
+        let merged = SqlEditorWidget::merge_suggestions_with_derived_columns(
+            vec!["empno".to_string()],
+            "",
+            derived_columns,
+        );
+
+        assert!(
+            merged
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("start_name")),
+            "expected start_name in merged suggestions, got: {:?}",
+            merged
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("end_name")),
+            "expected end_name in merged suggestions, got: {:?}",
             merged
         );
     }

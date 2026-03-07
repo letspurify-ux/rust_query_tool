@@ -3209,35 +3209,77 @@ pub fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String
     model_info.measure_columns
 }
 
+/// Extract MATCH_RECOGNIZE-generated columns from a query token stream.
+/// This includes MEASURES aliases and PATTERN/SUBSET variables.
+pub fn extract_match_recognize_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let mut columns = extract_match_recognize_measure_columns(tokens);
+    columns.extend(extract_match_recognize_pattern_variables(tokens));
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
+fn extract_match_recognize_measure_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let Some(clause_tokens) = extract_match_recognize_clause_tokens(tokens) else {
+        return Vec::new();
+    };
+    let token_depths = paren_depths(clause_tokens);
+
+    let mut measures_idx = None;
+    for (idx, token) in clause_tokens.iter().enumerate() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = token {
+            if word.eq_ignore_ascii_case("MEASURES") {
+                measures_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let Some(measures_idx) = measures_idx else {
+        return Vec::new();
+    };
+
+    let measures_start = next_non_comment_index(clause_tokens, measures_idx.saturating_add(1));
+    if measures_start >= clause_tokens.len() {
+        return Vec::new();
+    }
+
+    let mut measures_end = clause_tokens.len();
+    for idx in measures_start..clause_tokens.len() {
+        if !is_top_level_depth(&token_depths, idx) {
+            continue;
+        }
+        if let SqlToken::Word(word) = &clause_tokens[idx] {
+            let upper = word.to_ascii_uppercase();
+            if is_match_recognize_clause_boundary_keyword(&upper) {
+                measures_end = idx;
+                break;
+            }
+        }
+    }
+
+    let mut columns = Vec::new();
+    for item_tokens in
+        split_top_level_symbol_groups(&clause_tokens[measures_start..measures_end], ",")
+    {
+        if let Some(column) = parse_model_measure_output_column(&item_tokens) {
+            columns.push(column);
+        }
+    }
+
+    dedup_columns_case_insensitive(&mut columns);
+    columns
+}
+
 /// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)` and
 /// subset variables from `SUBSET ...`.
 /// Example: `PATTERN (a b+) SUBSET u = (a, b)` -> `["a", "b", "u"]`.
 pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
-    let match_idx = find_top_level_word_index(tokens, "MATCH_RECOGNIZE")
-        .or_else(|| find_top_level_keyword_pair_index(tokens, "MATCH", "RECOGNIZE"));
-    let Some(match_idx) = match_idx else {
+    let Some(clause_tokens) = extract_match_recognize_clause_tokens(tokens) else {
         return Vec::new();
     };
-
-    let mut clause_start_idx = match_idx.saturating_add(1);
-    if let Some((next_keyword, next_idx)) = next_word_upper(tokens, clause_start_idx) {
-        if next_keyword == "RECOGNIZE" {
-            clause_start_idx = next_idx.saturating_add(1);
-        }
-    }
-
-    let clause_open_idx = next_non_comment_index(tokens, clause_start_idx);
-    let Some(SqlToken::Symbol(sym)) = tokens.get(clause_open_idx) else {
-        return Vec::new();
-    };
-    if sym != "(" {
-        return Vec::new();
-    }
-
-    let Some((clause_range, _)) = extract_parenthesized_range(tokens, clause_open_idx) else {
-        return Vec::new();
-    };
-    let clause_tokens = token_range_slice(tokens, clause_range);
     let token_depths = paren_depths(clause_tokens);
 
     let mut pattern_idx = None;
@@ -3335,6 +3377,29 @@ pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<Str
     variables
 }
 
+fn extract_match_recognize_clause_tokens(tokens: &[SqlToken]) -> Option<&[SqlToken]> {
+    let match_idx = find_top_level_word_index(tokens, "MATCH_RECOGNIZE")
+        .or_else(|| find_top_level_keyword_pair_index(tokens, "MATCH", "RECOGNIZE"))?;
+
+    let mut clause_start_idx = match_idx.saturating_add(1);
+    if let Some((next_keyword, next_idx)) = next_word_upper(tokens, clause_start_idx) {
+        if next_keyword == "RECOGNIZE" {
+            clause_start_idx = next_idx.saturating_add(1);
+        }
+    }
+
+    let clause_open_idx = next_non_comment_index(tokens, clause_start_idx);
+    let SqlToken::Symbol(sym) = tokens.get(clause_open_idx)? else {
+        return None;
+    };
+    if sym != "(" {
+        return None;
+    }
+
+    let (clause_range, _) = extract_parenthesized_range(tokens, clause_open_idx)?;
+    Some(token_range_slice(tokens, clause_range))
+}
+
 fn is_match_recognize_clause_boundary_keyword(word: &str) -> bool {
     matches!(word, "MEASURES" | "PATTERN" | "DEFINE" | "AFTER")
 }
@@ -3393,6 +3458,12 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
         if columns.is_empty() {
             columns = extract_oracle_pivot_unpivot_projection_columns(body_tokens);
         }
+        if columns.is_empty() {
+            columns = extract_oracle_model_generated_columns(body_tokens);
+        }
+        if columns.is_empty() {
+            columns = extract_match_recognize_generated_columns(body_tokens);
+        }
         dedup_columns_case_insensitive(&mut columns);
         return columns;
     }
@@ -3400,6 +3471,15 @@ fn infer_source_columns_before_clause(tokens: &[SqlToken], clause_idx: usize) ->
     let mut columns = extract_select_list_columns(tokens);
     if columns.is_empty() {
         columns = extract_table_function_columns(tokens);
+    }
+    if columns.is_empty() {
+        columns = extract_oracle_pivot_unpivot_projection_columns(tokens);
+    }
+    if columns.is_empty() {
+        columns = extract_oracle_model_generated_columns(tokens);
+    }
+    if columns.is_empty() {
+        columns = extract_match_recognize_generated_columns(tokens);
     }
     dedup_columns_case_insensitive(&mut columns);
     columns
