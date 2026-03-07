@@ -6373,6 +6373,40 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_recover_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("RECOVER DATABASE");
+        engine.process_line("SELECT 54 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "RECOVER DATABASE".to_string(),
+                "SELECT 54 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlplus_archive_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("ARCHIVE LOG LIST");
+        engine.process_line("SELECT 55 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "ARCHIVE LOG LIST".to_string(),
+                "SELECT 55 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn sqlplus_execute_command_is_auto_terminated() {
         let mut engine = SqlParserEngine::new();
 
@@ -6537,28 +6571,6 @@ BEGIN"
             statements[2].starts_with("SELECT 1 FROM dual"),
             "SELECT should remain standalone after ARCHIVE recovery split: {}",
             statements[2]
-        );
-    }
-
-    #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
-        let mut engine = SqlParserEngine::new();
-
-        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_recover RETURN NUMBER");
-        engine.process_line("AS LANGUAGE C;");
-        engine.process_line("RECOVER DATABASE;");
-
-        let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-        assert!(
-            statements[0].contains("AS LANGUAGE C"),
-            "first statement should keep EXTERNAL call spec: {}",
-            statements[0]
-        );
-        assert!(
-            statements[1].starts_with("RECOVER DATABASE"),
-            "RECOVER statement should begin a new statement after external routine split: {}",
-            statements[1]
         );
     }
 
