@@ -1250,6 +1250,36 @@ fn phase_merge_returning_into_is_not_table_context() {
 }
 
 #[test]
+fn phase_insert_log_errors_into_is_table_context() {
+    let ctx = analyze("INSERT INTO employees(id) VALUES (1) LOG ERRORS INTO |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_update_log_errors_into_is_table_context() {
+    let ctx = analyze("UPDATE employees SET salary = salary + 1 LOG ERRORS INTO |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_delete_log_errors_into_is_table_context() {
+    let ctx = analyze("DELETE FROM employees WHERE salary > 0 LOG ERRORS INTO |");
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
+fn phase_merge_log_errors_into_is_table_context() {
+    let ctx = analyze(
+        "MERGE INTO tgt t USING src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.val = s.val LOG ERRORS INTO |",
+    );
+    assert_eq!(ctx.phase, SqlPhase::IntoClause);
+    assert!(ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_select_json_value_returning_clause_stays_column_context() {
     let ctx = analyze("SELECT JSON_VALUE(payload, '$.id' RETURNING | NUMBER) FROM events e");
 
