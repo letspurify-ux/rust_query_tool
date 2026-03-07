@@ -1017,6 +1017,13 @@ fn phase_lock_table_is_table_context() {
 }
 
 #[test]
+fn phase_lock_table_in_clause_is_not_table_context() {
+    let ctx = analyze("LOCK TABLE emp IN |");
+    assert_ne!(ctx.phase, SqlPhase::IntoClause);
+    assert!(!ctx.phase.is_table_context());
+}
+
+#[test]
 fn phase_drop_table_is_table_context() {
     let ctx = analyze("DROP TABLE |");
     assert_eq!(ctx.phase, SqlPhase::IntoClause);
@@ -6029,6 +6036,21 @@ fn grammar_hierarchical_cycle_set_alias_does_not_switch_to_set_clause() {
     let ctx = analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr CYCLE empno SET | TO 'Y' DEFAULT 'N'");
     assert_eq!(ctx.phase, SqlPhase::ConnectByClause);
     assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn grammar_hierarchical_order_siblings_by_keeps_order_by_context() {
+    let ctx = analyze("SELECT * FROM emp CONNECT BY PRIOR empno = mgr ORDER SIBLINGS BY |");
+
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+    assert!(ctx.phase.is_column_context());
+
+    let names = table_names(&ctx);
+    assert!(
+        names.iter().any(|name| name == "EMP"),
+        "expected EMP table to remain in scope, got {:?}",
+        names
+    );
 }
 
 #[test]
