@@ -257,6 +257,16 @@ fn is_from_lateral_table_function(name: &str) -> bool {
     matches!(name, "JSON_TABLE" | "XMLTABLE" | "UNNEST" | "TABLE")
 }
 
+fn is_merge_action_context(
+    statement_kind: StatementKind,
+    current_phase: SqlPhase,
+    last_word: Option<&str>,
+) -> bool {
+    matches!(statement_kind, StatementKind::Merge)
+        && (matches!(current_phase, SqlPhase::JoinCondition)
+            || matches!(last_word, Some("THEN")))
+}
+
 fn relation_function_name_hint(table_name: &str) -> Option<String> {
     table_name
         .split('@')
@@ -1121,9 +1131,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .unwrap_or(StatementKind::Unknown);
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
-                        let is_merge_action_keyword =
-                            matches!(current_statement_kind, StatementKind::Merge)
-                                && matches!(current_phase, SqlPhase::JoinCondition);
+                        let is_merge_action_keyword = is_merge_action_context(
+                            current_statement_kind,
+                            current_phase,
+                            last_word.as_deref(),
+                        );
                         if is_expression_context {
                             // Inside expressions, INSERT can be a valid identifier/token.
                             relation_state.clear();
@@ -1514,9 +1526,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .unwrap_or(StatementKind::Unknown);
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
-                        let is_merge_action_keyword =
-                            matches!(current_statement_kind, StatementKind::Merge)
-                                && matches!(current_phase, SqlPhase::JoinCondition);
+                        let is_merge_action_keyword = is_merge_action_context(
+                            current_statement_kind,
+                            current_phase,
+                            last_word.as_deref(),
+                        );
                         let is_mysql_conflict_update =
                             is_mysql_on_duplicate_key_update(tokens, idx);
                         let is_postgres_conflict_update =
@@ -1560,9 +1574,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .unwrap_or(StatementKind::Unknown);
                         let is_expression_context = current_phase.is_column_context()
                             || matches!(current_phase, SqlPhase::ValuesClause);
-                        let is_merge_action_keyword =
-                            matches!(current_statement_kind, StatementKind::Merge)
-                                && matches!(current_phase, SqlPhase::JoinCondition);
+                        let is_merge_action_keyword = is_merge_action_context(
+                            current_statement_kind,
+                            current_phase,
+                            last_word.as_deref(),
+                        );
                         if is_expression_context {
                             // Inside expressions, DELETE can be a valid identifier/token.
                             relation_state.clear();
