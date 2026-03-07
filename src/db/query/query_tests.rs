@@ -2339,7 +2339,8 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
-fn test_create_external_function_language_hex_single_quoted_target_without_external_keyword_splits() {
+fn test_create_external_function_language_hex_single_quoted_target_without_external_keyword_splits()
+{
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER
 AS LANGUAGE X'C' NAME 'ext_lang_xquoted';
 SELECT 1 FROM dual;"#;
@@ -4548,6 +4549,40 @@ CONNECT BY level <= 20;"#;
         tool_commands.is_empty(),
         "Should have no tool commands, got: {:?}",
         tool_commands
+    );
+}
+
+#[test]
+fn test_start_with_single_token_path_parsed_as_start_command() {
+    let items = QueryExecutor::split_script_items(
+        "START with
+SELECT 1 FROM dual;",
+    );
+
+    assert!(
+        matches!(items.first(), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "with" && !relative_to_caller),
+        "first item should parse START with as run-script command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 1 FROM dual")),
+        "second item should keep trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_start_with_single_token_path_parsed_as_start_command() {
+    let items = QueryExecutor::split_format_items(
+        "START with
+SELECT 1 FROM dual;",
+    );
+
+    assert!(
+        matches!(items.first(), Some(FormatItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "with" && !relative_to_caller),
+        "first item should parse START with as run-script command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(FormatItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 1 FROM dual")),
+        "second item should keep trailing SELECT statement: {items:?}"
     );
 }
 
@@ -8613,7 +8648,6 @@ SELECT 2 FROM dual;";
     );
     assert!(stmts[2].starts_with("SELECT 2 FROM dual"));
 }
-
 
 #[test]
 fn test_split_script_items_incomplete_create_function_recovers_to_values_statement_head() {
