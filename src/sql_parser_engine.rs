@@ -2325,11 +2325,17 @@ impl SqlParserEngine {
     where
         F: FnMut(&[char], usize, char, Option<char>),
     {
-        let can_fast_path_tool_command = self.state.is_idle()
+        let line_started_with_empty_current = self.current.trim().is_empty();
+        let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
+            && self.state.with_clause_waiting_main_query()
+            && self.state.block_depth() == 0
+            && self.state.paren_depth == 0;
+        let line_starts_at_statement_boundary = self.state.is_idle()
             && self.state.block_depth() == 0
             && self.state.paren_depth == 0
             && !self.state.in_with_plsql_declaration()
-            && self.current.trim().is_empty();
+            && line_started_with_empty_current;
+        let can_fast_path_tool_command = line_starts_at_statement_boundary;
         if can_fast_path_tool_command && sql_text::is_auto_terminated_tool_command(line) {
             self.current.push_str(line);
             self.current.push('\n');
@@ -2346,10 +2352,10 @@ impl SqlParserEngine {
         scratch_chars.push('\n');
         self.process_chars_with_observer(&scratch_chars, &mut on_symbol);
 
-        if self.state.is_idle()
+        if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
+            && self.state.is_idle()
             && self.state.block_depth() == 0
             && self.state.paren_depth == 0
-            && !self.state.in_with_plsql_declaration()
             && sql_text::is_auto_terminated_tool_command(line)
         {
             self.push_current_statement();
@@ -5229,6 +5235,23 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert_eq!(statements[0], "START child.sql".to_string());
         assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn oracle_select_identifier_prompt_is_not_misclassified_as_sqlplus_prompt_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT");
+        engine.process_line("  PROMPT");
+        engine.process_line("FROM tool_words;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PROMPT"),
+            "column identifier should remain in SELECT statement: {}",
+            statements[0]
+        );
     }
 
     #[test]
