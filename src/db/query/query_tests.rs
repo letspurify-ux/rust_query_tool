@@ -9093,6 +9093,86 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_sql_macro_table_keeps_single_statement() {
+    let sql = "WITH
+  FUNCTION f(p_owner VARCHAR2)
+    RETURN VARCHAR2 SQL_MACRO(TABLE)
+  IS
+  BEGIN
+    RETURN 'SELECT owner FROM all_objects WHERE owner = p_owner';
+  END;
+SELECT * FROM f('SYS');
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION SQL_MACRO(TABLE) declaration should stay attached to its main SELECT statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f(p_owner VARCHAR2)"),
+        "first statement should preserve WITH FUNCTION SQL macro declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("RETURN VARCHAR2 SQL_MACRO(TABLE)"),
+        "first statement should keep SQL_MACRO(TABLE) signature inside declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT * FROM f('SYS')"),
+        "first statement should include main SELECT after declaration: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_sql_macro_table_keeps_single_statement() {
+    let sql = "WITH
+  FUNCTION f(p_owner VARCHAR2)
+    RETURN VARCHAR2 SQL_MACRO(TABLE)
+  IS
+  BEGIN
+    RETURN 'SELECT owner FROM all_objects WHERE owner = p_owner';
+  END;
+SELECT * FROM f('SYS');
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split_format_items should keep WITH FUNCTION SQL_MACRO(TABLE) declaration attached to main SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH\n  FUNCTION f(p_owner VARCHAR2)"),
+        "first formatted statement should preserve WITH FUNCTION SQL macro declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("RETURN VARCHAR2 SQL_MACRO(TABLE)"),
+        "first formatted statement should keep SQL_MACRO(TABLE) signature inside declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT * FROM f('SYS')"),
+        "first formatted statement should include main SELECT after declaration: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_create_type_opaque_keeps_single_statement() {
     let sql = "CREATE OR REPLACE TYPE t_opaque AS OPAQUE (
   STORAGE RAW(16)
