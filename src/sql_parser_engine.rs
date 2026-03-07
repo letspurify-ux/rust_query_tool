@@ -359,7 +359,7 @@ impl RoutineFrame {
         }
     }
 
-    fn observe_external_clause_symbol(&mut self, ch: char) {
+    fn observe_external_clause_symbol(&mut self, ch: char, next: Option<char>) {
         if !matches!(
             self.external_clause_state,
             ExternalClauseState::AwaitingLanguageTargetFromExternal
@@ -372,13 +372,12 @@ impl RoutineFrame {
             return;
         }
 
-        if matches!(
+        let is_canceling_symbol = matches!(
             ch,
-            ':' | '='
+            ':'
+                | '='
                 | '+'
-                | '-'
                 | '*'
-                | '/'
                 | '%'
                 | '<'
                 | '>'
@@ -391,7 +390,10 @@ impl RoutineFrame {
                 | ']'
                 | '{'
                 | '}'
-        ) {
+        ) || (ch == '-' && next != Some('-'))
+            || (ch == '/' && next != Some('*'));
+
+        if is_canceling_symbol {
             self.external_clause_state = ExternalClauseState::None;
         }
     }
@@ -1321,9 +1323,9 @@ impl SplitState {
             )
     }
 
-    fn observe_external_clause_symbol(&mut self, ch: char) {
+    fn observe_external_clause_symbol(&mut self, ch: char, next: Option<char>) {
         if let Some(frame) = self.active_routine_frame_mut() {
-            frame.observe_external_clause_symbol(ch);
+            frame.observe_external_clause_symbol(ch, next);
         }
     }
 
@@ -2182,7 +2184,7 @@ impl SqlParserEngine {
 
             self.state.flush_token();
             self.state.track_with_main_query_symbol(c);
-            self.state.observe_external_clause_symbol(c);
+            self.state.observe_external_clause_symbol(c, next);
             on_symbol(chars, i, c, next);
             let symbol_role = SymbolRole::from_char(c, next);
 
@@ -3452,6 +3454,7 @@ mod tests {
         engine.process_line("  language java;");
         engine.process_line("  language javascript;");
         engine.process_line("  language python;");
+        engine.process_line("  language mle;");
         engine.process_line("  marker NUMBER := 1;");
         engine.process_line("BEGIN");
         engine.process_line("  NULL;");
@@ -3465,6 +3468,7 @@ mod tests {
         assert!(statements[0].contains("language java;"));
         assert!(statements[0].contains("language javascript;"));
         assert!(statements[0].contains("language python;"));
+        assert!(statements[0].contains("language mle;"));
         assert!(statements[0].contains("marker NUMBER := 1;"));
         assert!(statements[0].contains("END"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
@@ -3485,6 +3489,43 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_assign IS"));
         assert!(statements[0].contains("language := 'C';"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_followed_by_line_comment_does_not_cancel_external_clause_detection() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_comment RETURN NUMBER");
+        engine.process_line("AS LANGUAGE -- keep parsing as external call spec");
+        engine.process_line("C;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_comment RETURN NUMBER")
+        );
+        assert!(statements[0].contains("AS LANGUAGE -- keep parsing as external call spec"));
+        assert!(statements[0].contains("C;"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_followed_by_block_comment_does_not_cancel_external_clause_detection() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_block_comment RETURN NUMBER");
+        engine.process_line("AS LANGUAGE /* keep parsing as external call spec */");
+        engine.process_line("C;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0]
+            .starts_with("CREATE OR REPLACE FUNCTION ext_lang_block_comment RETURN NUMBER"));
+        assert!(statements[0].contains("AS LANGUAGE /* keep parsing as external call spec */"));
+        assert!(statements[0].contains("C;"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
