@@ -2843,6 +2843,7 @@ fn skip_flashback_bound_expression(tokens: &[SqlToken], start: usize) -> usize {
         Some(SqlToken::Word(word))
             if word.eq_ignore_ascii_case("SCN")
                 || word.eq_ignore_ascii_case("TIMESTAMP")
+                || word.eq_ignore_ascii_case("DATE")
                 || word.eq_ignore_ascii_case("SNAPSHOT")
     ) {
         idx = skip_comment_tokens(tokens, idx + 1);
