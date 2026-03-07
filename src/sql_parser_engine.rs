@@ -4014,6 +4014,63 @@ BEGIN"
     }
 
     #[test]
+    fn end_if_with_label_closes_block_and_splits_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  IF 1 = 1 THEN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END IF done_flag;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END IF done_flag;"),
+            "first statement should include END IF label: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn end_loop_with_label_closes_block_and_splits_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  LOOP");
+        engine.process_line("    EXIT;");
+        engine.process_line("  END LOOP loop_done;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("END LOOP loop_done;"));
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn end_case_with_label_closes_block_and_splits_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  CASE");
+        engine.process_line("    WHEN 1 = 1 THEN NULL;");
+        engine.process_line("  END CASE case_done;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("END CASE case_done;"));
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+    #[test]
     fn trigger_referencing_alias_with_quoted_identifier_does_not_block_body_as_split() {
         let mut engine = SqlParserEngine::new();
 
