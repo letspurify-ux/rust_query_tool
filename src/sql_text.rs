@@ -1001,6 +1001,124 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
+    if first.eq_ignore_ascii_case("SET") {
+        let Some(second) = words.next() else {
+            return false;
+        };
+        return matches_keyword(
+            second,
+            &[
+                "APPINFO",
+                "ARRAYSIZE",
+                "AUTOCOMMIT",
+                "AUTOPRINT",
+                "AUTORECOVERY",
+                "AUTOTRACE",
+                "BLOCKTERMINATOR",
+                "CMDSEP",
+                "COLINVISIBLE",
+                "COLSEP",
+                "CONCAT",
+                "COPYCOMMIT",
+                "COPYTYPECHECK",
+                "DEFINE",
+                "DESCRIBE",
+                "ECHO",
+                "EDITFILE",
+                "EMBEDDED",
+                "ESCAPE",
+                "FEEDBACK",
+                "FLAGGER",
+                "FLUSH",
+                "HEADING",
+                "HEADSEP",
+                "INSTANCE",
+                "LINESIZE",
+                "LOBOFFSET",
+                "LONG",
+                "LONGCHUNKSIZE",
+                "MARKUP",
+                "NEWPAGE",
+                "NULL",
+                "NUMFORMAT",
+                "NUMWIDTH",
+                "PAGESIZE",
+                "PAUSE",
+                "RECSEP",
+                "RECSEPCHAR",
+                "ROWLIMIT",
+                "SERVEROUTPUT",
+                "SHIFTINOUT",
+                "SHOWMODE",
+                "SQLBLANKLINES",
+                "SQLCASE",
+                "SQLCONTINUE",
+                "SQLFORMAT",
+                "SQLNUMBER",
+                "SQLPLUSCOMPATIBILITY",
+                "SQLPREFIX",
+                "SQLPROMPT",
+                "SQLTERMINATOR",
+                "SUFFIX",
+                "TAB",
+                "TERMOUT",
+                "TIMING",
+                "TRIMOUT",
+                "TRIMSPOOL",
+                "UNDERLINE",
+                "VERIFY",
+                "WRAP",
+            ],
+        );
+    }
+
+    if first.eq_ignore_ascii_case("SHOW") {
+        let Some(second) = words.next() else {
+            return false;
+        };
+        return matches_keyword(
+            second,
+            &[
+                "ALL",
+                "APPINFO",
+                "AUTOCOMMIT",
+                "COLSEP",
+                "COPYCOMMIT",
+                "DEFINE",
+                "DESCRIBE",
+                "ECHO",
+                "EDITFILE",
+                "ESCAPE",
+                "FEEDBACK",
+                "HEADING",
+                "LINESIZE",
+                "LONG",
+                "LONGCHUNKSIZE",
+                "NEWPAGE",
+                "NULL",
+                "NUMFORMAT",
+                "NUMWIDTH",
+                "PAGESIZE",
+                "PAUSE",
+                "RELEASE",
+                "SERVEROUTPUT",
+                "SQLCODE",
+                "SQLCONTINUE",
+                "SQLNUMBER",
+                "SQLPLUSCOMPATIBILITY",
+                "SQLPROMPT",
+                "SQLTERMINATOR",
+                "SUFFIX",
+                "TERMOUT",
+                "TIMING",
+                "USER",
+                "VERIFY",
+                "VERSION",
+                "WRAP",
+            ],
+        );
+    }
+
     if first.eq_ignore_ascii_case("SPOOL")
         || first.eq_ignore_ascii_case("DEFINE")
         || first.eq_ignore_ascii_case("UNDEFINE")

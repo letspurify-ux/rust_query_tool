@@ -3615,6 +3615,43 @@ mod tests {
     }
 
     #[test]
+    fn nested_language_identifier_targets_do_not_force_external_split() {
+        for target in ["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE PROCEDURE proc_language_ident IS");
+            engine.process_line(&format!("  language {target};"));
+            engine.process_line("BEGIN");
+            engine.process_line("  NULL;");
+            engine.process_line("END;");
+            engine.process_line("SELECT 1 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(statements.len(), 2, "unexpected statements for {target}: {statements:?}");
+            assert!(
+                statements[0].starts_with("CREATE OR REPLACE PROCEDURE proc_language_ident IS"),
+                "first statement should keep procedure body for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains(&format!("language {target};")),
+                "first statement should keep language declaration for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END"),
+                "first statement should contain END for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].starts_with("SELECT 1 FROM dual"),
+                "second statement should remain standalone for {target}: {}",
+                statements[1]
+            );
+        }
+    }
+
+    #[test]
     fn language_comparison_operator_cancels_implicit_external_detection() {
         let mut engine = SqlParserEngine::new();
 
@@ -5507,6 +5544,37 @@ BEGIN"
         assert_eq!(
             statements,
             vec!["SPOOL out.log".to_string(), "SELECT 1 FROM dual".to_string()]
+        );
+    }
+
+    #[test]
+    fn sqlplus_set_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SET SERVEROUTPUT ON");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "SET SERVEROUTPUT ON".to_string(),
+                "SELECT 1 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlplus_show_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SHOW USER");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec!["SHOW USER".to_string(), "SELECT 1 FROM dual".to_string()]
         );
     }
 
