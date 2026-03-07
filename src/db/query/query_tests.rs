@@ -4729,6 +4729,75 @@ ORDER SIBLINGS BY node_id;"#;
     );
 }
 
+
+#[test]
+fn test_start_with_clause_with_inline_comment_not_parsed_as_start_tool_command() {
+    let sql = r#"SELECT
+  employee_id,
+  manager_id
+FROM employees
+START /*tree root*/ WITH manager_id IS NULL
+CONNECT BY PRIOR employee_id = manager_id;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(statements.len(), 1, "Should be 1 statement, got: {statements:?}");
+    assert!(
+        statements[0].contains("START /*tree root*/ WITH manager_id IS NULL"),
+        "Statement should retain hierarchical START WITH clause, got: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "START WITH clause with inline comment must not become tool command: {tool_commands:?}"
+    );
+}
+
+#[test]
+fn test_connect_by_clause_with_inline_comment_not_parsed_as_connect_tool_command() {
+    let sql = r#"SELECT
+  employee_id,
+  manager_id
+FROM employees
+START WITH manager_id IS NULL
+CONNECT /*hierarchical*/ BY PRIOR employee_id = manager_id;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(statements.len(), 1, "Should be 1 statement, got: {statements:?}");
+    assert!(
+        statements[0].contains("CONNECT /*hierarchical*/ BY PRIOR employee_id = manager_id"),
+        "Statement should retain hierarchical CONNECT BY clause, got: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "CONNECT BY clause with inline comment must not become tool command: {tool_commands:?}"
+    );
+}
+
 #[test]
 fn test_print_prefix_word_not_parsed_as_print_tool_command() {
     let sql = "SELECT printable_col FROM dual;";

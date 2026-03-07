@@ -2706,11 +2706,7 @@ impl QueryExecutor {
             return Some(ToolCommand::Quit);
         }
 
-        if (upper == "CONNECT"
-            || (upper.starts_with("CONNECT ") && !upper.starts_with("CONNECT BY")))
-            || upper == "CONN"
-            || upper.starts_with("CONN ")
-        {
+        if Self::is_connect_command(trimmed) {
             return Some(Self::parse_connect_command(trimmed));
         }
 
@@ -3673,36 +3669,88 @@ impl QueryExecutor {
     }
 
     fn is_start_script_command(trimmed: &str) -> bool {
-        if trimmed.len() < 5 {
+        let Some(first_word) = Self::next_meaningful_word(trimmed, 0) else {
+            return false;
+        };
+        if !first_word.eq_ignore_ascii_case("START") {
             return false;
         }
-        let head = match trimmed.get(0..5) {
-            Some(head) => head,
-            None => return false,
+        let Some(second_word) = Self::next_meaningful_word(trimmed, 1) else {
+            return true;
         };
-        if !head.eq_ignore_ascii_case("START") {
-            return false;
-        }
-        let tail = match trimmed.get(5..) {
-            Some(tail) => tail,
-            None => return false,
-        };
-        if tail.is_empty()
-            || !tail
-                .chars()
-                .next()
-                .map(|ch| ch.is_whitespace())
-                .unwrap_or(false)
-        {
-            return tail.is_empty();
+
+        if !second_word.eq_ignore_ascii_case("WITH") {
+            return true;
         }
 
         // Hierarchical query clause "START WITH <expr>" must stay as SQL,
         // but SQL*Plus still allows a script file literally named "with".
-        let mut words = tail.split_whitespace();
-        let first_word = words.next().unwrap_or_default();
-        let has_more_tokens = words.next().is_some();
-        !(first_word.eq_ignore_ascii_case("WITH") && has_more_tokens)
+        Self::next_meaningful_word(trimmed, 2).is_none()
+    }
+
+    fn is_connect_command(trimmed: &str) -> bool {
+        let Some(first_word) = Self::next_meaningful_word(trimmed, 0) else {
+            return false;
+        };
+
+        if first_word.eq_ignore_ascii_case("CONN") {
+            return true;
+        }
+
+        if !first_word.eq_ignore_ascii_case("CONNECT") {
+            return false;
+        }
+
+        !Self::next_meaningful_word(trimmed, 1)
+            .is_some_and(|second_word| second_word.eq_ignore_ascii_case("BY"))
+    }
+
+    fn next_meaningful_word(line: &str, skip_words: usize) -> Option<&str> {
+        let mut idx = 0usize;
+        let mut seen_words = 0usize;
+
+        while idx < line.len() {
+            let ch = line[idx..].chars().next()?;
+            let ch_len = ch.len_utf8();
+
+            if ch.is_whitespace() {
+                idx += ch_len;
+                continue;
+            }
+
+            if line[idx..].starts_with("--") {
+                return None;
+            }
+
+            if line[idx..].starts_with("/*") {
+                let comment_start = idx + 2;
+                let comment_tail = &line[comment_start..];
+                let comment_len = comment_tail.find("*/")?;
+                idx = comment_start + comment_len + 2;
+                continue;
+            }
+
+            let mut end = idx;
+            while end < line.len() {
+                let word_ch = line[end..].chars().next()?;
+                if word_ch.is_whitespace()
+                    || line[end..].starts_with("/*")
+                    || line[end..].starts_with("--")
+                {
+                    break;
+                }
+                end += word_ch.len_utf8();
+            }
+
+            if seen_words == skip_words {
+                return line.get(idx..end);
+            }
+
+            seen_words += 1;
+            idx = end;
+        }
+
+        None
     }
 
     fn is_run_script_command(trimmed: &str) -> bool {
