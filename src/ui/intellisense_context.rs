@@ -263,8 +263,7 @@ fn is_merge_action_context(
     last_word: Option<&str>,
 ) -> bool {
     matches!(statement_kind, StatementKind::Merge)
-        && (matches!(current_phase, SqlPhase::JoinCondition)
-            || matches!(last_word, Some("THEN")))
+        && (matches!(current_phase, SqlPhase::JoinCondition) || matches!(last_word, Some("THEN")))
 }
 
 fn relation_function_name_hint(table_name: &str) -> Option<String> {
@@ -1248,13 +1247,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             current_phase,
                             SqlPhase::SelectList | SqlPhase::Initial | SqlPhase::ValuesClause
                         );
-                        let should_expect_merge_target = matches!(current_phase, SqlPhase::MergeTarget);
-                        let should_expect_set_clause_target = matches!(current_phase, SqlPhase::SetClause)
-                            && matches!(
-                                current_statement_kind,
-                                StatementKind::Insert | StatementKind::Update | StatementKind::Delete
-                            )
-                            && !in_returning_clause;
+                        let should_expect_merge_target =
+                            matches!(current_phase, SqlPhase::MergeTarget);
+                        let should_expect_set_clause_target =
+                            matches!(current_phase, SqlPhase::SetClause)
+                                && matches!(
+                                    current_statement_kind,
+                                    StatementKind::Insert
+                                        | StatementKind::Update
+                                        | StatementKind::Delete
+                                )
+                                && !in_returning_clause;
                         let is_log_errors_target = matches!(
                             current_statement_kind,
                             StatementKind::Insert
@@ -1263,7 +1266,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 | StatementKind::Merge
                         ) && is_log_errors_into_clause(tokens, idx);
 
-                        if should_expect_table_target
+                        if in_returning_clause {
+                            // Oracle DML `RETURNING ... INTO` consumes bind/host targets,
+                            // not relation names or column expressions.
+                            depth_frames[depth].phase = SqlPhase::Initial;
+                            relation_state.clear();
+                        } else if should_expect_table_target
                             || should_expect_merge_target
                             || should_expect_set_clause_target
                             || is_log_errors_target

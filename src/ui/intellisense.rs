@@ -1467,6 +1467,20 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn detect_sql_context_returning_into_bind_target_is_general_context() {
+        let sql_with_cursor = "INSERT INTO t (a) VALUES (1) RETURNING a INTO |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::General);
+    }
+
+    #[test]
     fn detect_sql_context_join_using_clause_is_column_name() {
         let sql_with_cursor = "SELECT * FROM employees e JOIN departments d USING (|)";
         let cursor = sql_with_cursor
