@@ -2658,12 +2658,18 @@ fn skip_relation_temporal_clause(tokens: &[SqlToken], start: usize) -> Option<us
     }
 
     idx = skip_comment_tokens(tokens, idx + 1);
-    if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("SYSTEM_TIME") || word.eq_ignore_ascii_case("APPLICATION_TIME"))
-    {
-        return None;
-    }
+    let period_name_idx = match tokens.get(idx) {
+        Some(SqlToken::Word(word))
+            if word.eq_ignore_ascii_case("SYSTEM_TIME")
+                || word.eq_ignore_ascii_case("APPLICATION_TIME")
+                || is_identifier_word_token(word) =>
+        {
+            idx
+        }
+        _ => return None,
+    };
 
-    idx = skip_comment_tokens(tokens, idx + 1);
+    idx = skip_comment_tokens(tokens, period_name_idx + 1);
     let keyword = match tokens.get(idx) {
         Some(SqlToken::Word(word)) => word.to_ascii_uppercase(),
         _ => return None,
