@@ -1642,25 +1642,6 @@ fn chars_starts_with_ascii_case_insensitive(chars: &[char], start: usize, patter
     true
 }
 
-fn preview_identifier_upper(chars: &[char], start: usize) -> Option<String> {
-    let first = chars.get(start).copied()?;
-    if !sql_text::is_identifier_char(first) {
-        return None;
-    }
-
-    let mut idx = start;
-    let mut token = String::new();
-    while let Some(ch) = chars.get(idx).copied() {
-        if !sql_text::is_identifier_char(ch) {
-            break;
-        }
-        token.push(ch);
-        idx += 1;
-    }
-    token.make_ascii_uppercase();
-    Some(token)
-}
-
 #[inline]
 fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
     !delimiter.is_whitespace() && delimiter != '\''
@@ -1792,6 +1773,7 @@ pub(crate) struct SqlParserEngine {
     current: String,
     statements: Vec<String>,
     scratch_chars: Vec<char>,
+    preview_identifier_upper_buf: String,
 }
 
 impl SqlParserEngine {
@@ -1801,6 +1783,7 @@ impl SqlParserEngine {
             current: String::new(),
             statements: Vec::new(),
             scratch_chars: Vec::new(),
+            preview_identifier_upper_buf: String::new(),
         }
     }
 
@@ -1883,6 +1866,89 @@ impl SqlParserEngine {
     fn split_current_and_reset_external_boundary(&mut self) {
         self.split_current_statement();
         self.state.block_stack.clear();
+    }
+
+    fn with_preview_identifier_upper<R, F>(
+        &mut self,
+        chars: &[char],
+        start: usize,
+        f: F,
+    ) -> Option<R>
+    where
+        F: FnOnce(&str, &mut Self) -> R,
+    {
+        let mut upper_buf = std::mem::take(&mut self.preview_identifier_upper_buf);
+        upper_buf.clear();
+
+        let first = chars.get(start).copied()?;
+        if !sql_text::is_identifier_char(first) {
+            self.preview_identifier_upper_buf = upper_buf;
+            return None;
+        }
+
+        let mut idx = start;
+        while let Some(ch) = chars.get(idx).copied() {
+            if !sql_text::is_identifier_char(ch) {
+                break;
+            }
+            upper_buf.push(ch);
+            idx += 1;
+        }
+        upper_buf.make_ascii_uppercase();
+
+        let result = f(upper_buf.as_str(), self);
+        self.preview_identifier_upper_buf = upper_buf;
+        Some(result)
+    }
+
+    fn handle_identifier_start_candidate(&mut self, chars: &[char], i: usize) {
+        let should_preview = self.state.token.is_empty()
+            && ((self.state.block_depth() == 1 && self.state.paren_depth == 0)
+                || (self.state.in_with_plsql_declaration()
+                    && self.state.with_clause_waiting_main_query()
+                    && self.state.block_depth() == 0
+                    && self.state.paren_depth == 0));
+
+        if !should_preview {
+            return;
+        }
+
+        let _ = self.with_preview_identifier_upper(chars, i, |candidate_upper, this| {
+            if this.state.block_depth() == 1 && this.state.paren_depth == 0 {
+                if this
+                    .state
+                    .should_split_begin_after_implicit_external_semicolon(candidate_upper)
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if candidate_upper == "BEGIN"
+                    && this.state.pending_implicit_external_top_level_split
+                {
+                    this.state.pending_implicit_external_top_level_split = false;
+                } else if this.state.pending_implicit_external_top_level_split
+                    && (sql_text::is_with_main_query_keyword(candidate_upper)
+                        || sql_text::is_statement_head_keyword(candidate_upper))
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if this
+                    .state
+                    .should_split_before_implicit_external_begin_block(candidate_upper)
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if this.state.pending_implicit_external_top_level_split {
+                    this.state.pending_implicit_external_top_level_split = false;
+                }
+            }
+
+            if this.state.in_with_plsql_declaration()
+                && this.state.with_clause_waiting_main_query()
+                && this.state.block_depth() == 0
+                && this.state.paren_depth == 0
+                && sql_text::is_statement_head_keyword(candidate_upper)
+                && !sql_text::is_with_main_query_keyword(candidate_upper)
+            {
+                this.split_current_statement();
+            }
+        });
     }
 
     pub(crate) fn starts_with_alter_session(&self) -> bool {
@@ -2253,51 +2319,7 @@ impl SqlParserEngine {
             }
 
             if sql_text::is_identifier_char(c) {
-                if self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
-                    && self.state.token.is_empty()
-                {
-                    if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
-                        if self
-                            .state
-                            .should_split_begin_after_implicit_external_semicolon(&candidate_upper)
-                        {
-                            self.split_current_and_reset_external_boundary();
-                        } else if candidate_upper == "BEGIN"
-                            && self.state.pending_implicit_external_top_level_split
-                        {
-                            self.state.pending_implicit_external_top_level_split = false;
-                        } else if self.state.pending_implicit_external_top_level_split
-                            && (sql_text::is_with_main_query_keyword(&candidate_upper)
-                                || sql_text::is_statement_head_keyword(&candidate_upper))
-                        {
-                            self.split_current_and_reset_external_boundary();
-                        } else if self
-                            .state
-                            .should_split_before_implicit_external_begin_block(&candidate_upper)
-                        {
-                            self.split_current_and_reset_external_boundary();
-                        } else if self.state.pending_implicit_external_top_level_split {
-                            self.state.pending_implicit_external_top_level_split = false;
-                        }
-                    }
-                }
-
-                if self.state.in_with_plsql_declaration()
-                    && self.state.with_clause_waiting_main_query()
-                    && self.state.block_depth() == 0
-                    && self.state.paren_depth == 0
-                {
-                    if let Some(candidate_upper) = preview_identifier_upper(chars, i) {
-                        if sql_text::is_statement_head_keyword(&candidate_upper)
-                            && !sql_text::is_with_main_query_keyword(&candidate_upper)
-                        {
-                            self.push_current_statement();
-                            self.reset_statement_local_state();
-                            self.state.reset_create_state();
-                        }
-                    }
-                }
+                self.handle_identifier_start_candidate(chars, i);
                 if self.state.token.is_empty() {
                     self.state.token_prefixed_with_dollar = i > 0 && chars[i - 1] == '$';
                 }
