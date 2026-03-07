@@ -1596,6 +1596,35 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn detect_sql_context_insert_first_else_into_clause_is_table_name() {
+        let sql_with_cursor =
+            "INSERT FIRST WHEN score >= 90 THEN INTO top_rank (id) VALUES (1) ELSE INTO | (id) VALUES (2) SELECT 1 score FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::TableName);
+    }
+
+    #[test]
+    fn detect_sql_context_outer_apply_rhs_is_table_name() {
+        let sql_with_cursor = "SELECT * FROM t1 OUTER APPLY |";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("expected cursor marker in SQL");
+        let sql = format!(
+            "{}{}",
+            &sql_with_cursor[..cursor],
+            &sql_with_cursor[cursor + 1..]
+        );
+        assert_eq!(detect_sql_context(&sql, cursor), SqlContext::TableName);
+    }
+
+    #[test]
     fn get_suggestions_excludes_exact_prefix_match() {
         let mut data = IntellisenseData::new();
         data.tables = vec!["AB".to_string(), "ABC_TABLE".to_string()];
