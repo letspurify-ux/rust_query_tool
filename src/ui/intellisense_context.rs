@@ -1349,40 +1349,26 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "SKIP" => {
-                        if depth_frames
+                        let locking_clause_active = depth_frames
                             .get(depth)
-                            .is_some_and(|frame| frame.locking_clause_active)
+                            .is_some_and(|frame| frame.locking_clause_active);
+                        let starts_skip_locked_suffix = matches!(
+                            next_word_upper(tokens, idx + 1),
+                            Some((next, _)) if next == "LOCKED"
+                        );
+                        let follows_of_column_reference = matches!(
+                            last_word.as_deref(),
+                            Some("OF") | None
+                        );
+
+                        if locking_clause_active
+                            && (starts_skip_locked_suffix || !follows_of_column_reference)
                         {
-                            let prev_word = prev_word_upper(tokens, idx).map(|(word, _)| word);
-                            let mut prev_idx = idx;
-                            let mut prev_is_comma = false;
-                            while prev_idx > 0 {
-                                prev_idx -= 1;
-                                match &tokens[prev_idx] {
-                                    SqlToken::Comment(_) => continue,
-                                    SqlToken::Symbol(symbol) if symbol == "," => {
-                                        prev_is_comma = true;
-                                        break;
-                                    }
-                                    _ => break,
-                                }
-                            }
-
-                            let treat_as_lock_modifier = matches!(
-                                prev_word.as_deref(),
-                                Some(prev) if prev != "OF"
-                            ) && !prev_is_comma;
-
-                            if treat_as_lock_modifier
-                                || matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
-                            {
-                                // Oracle `FOR UPDATE ... SKIP LOCKED` (and a trailing `SKIP`
-                                // entered after at least one lock target) closes the lock target
-                                // list. Keep `SKIP` as identifier context for `OF skip` and
-                                // comma-separated column lists like `OF empno, skip`.
-                                depth_frames[depth].phase = SqlPhase::OrderByClause;
-                                relation_state.clear();
-                            }
+                            // Oracle `FOR UPDATE ... SKIP LOCKED` and in-progress
+                            // `... OF <col> SKIP` both indicate the lock-option suffix,
+                            // not another lock-target column.
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                            relation_state.clear();
                         }
                     }
                     "LOCKED" => {

@@ -692,6 +692,20 @@ fn phase_for_update_of_skip_locked_is_not_column_context() {
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
 }
 
+
+#[test]
+fn phase_for_share_of_skip_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR SHARE OF empno SKIP |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
+fn phase_for_share_of_identifier_named_skip_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR SHARE OF skip |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
 #[test]
 fn phase_for_read_only_clause_is_not_table_context() {
     let ctx = analyze("SELECT * FROM emp FOR READ ONLY |");
