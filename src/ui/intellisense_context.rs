@@ -618,6 +618,7 @@ struct ParserDepthFrame {
     function_from_state: FunctionFromState,
     returning_clause_active: bool,
     locking_clause_active: bool,
+    hierarchical_clause_active: bool,
 }
 
 fn reset_relation_lookbehind(
@@ -740,6 +741,7 @@ impl Default for ParserDepthFrame {
             function_from_state: FunctionFromState::NotApplicable,
             returning_clause_active: false,
             locking_clause_active: false,
+            hierarchical_clause_active: false,
         }
     }
 }
@@ -829,6 +831,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         FunctionFromState::from_function_name(frame.paren_func.as_deref());
                     frame.returning_clause_active = false;
                     frame.locking_clause_active = false;
+                    frame.hierarchical_clause_active = false;
                 }
 
                 let scope_id = next_scope_id;
@@ -1389,7 +1392,15 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "SET" => {
-                        if matches!(
+                        let hierarchical_clause_active = depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.hierarchical_clause_active);
+                        if hierarchical_clause_active {
+                            // Oracle hierarchical query SEARCH/CYCLE clauses use
+                            // `... SET <ordering_or_cycle_col>` where SET is not
+                            // DML assignment syntax.
+                            depth_frames[depth].phase = SqlPhase::ConnectByClause;
+                        } else if matches!(
                             current_phase,
                             SqlPhase::WithClause | SqlPhase::OrderByClause
                         ) && matches!(cte_state, CteState::Inactive)
@@ -1402,11 +1413,26 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                         relation_state.clear();
                     }
+                    "BY" => {
+                        let hierarchical_clause_active = depth_frames
+                            .get(depth)
+                            .is_some_and(|frame| frame.hierarchical_clause_active);
+                        if hierarchical_clause_active {
+                            depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        }
+                        relation_state.clear();
+                    }
                     "SEARCH" | "CYCLE" => {
                         if matches!(current_phase, SqlPhase::WithClause) {
                             // Oracle recursive CTE clauses (`SEARCH ... BY ...`,
                             // `CYCLE ... SET ...`) expect column expressions.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
+                        } else if matches!(current_phase, SqlPhase::ConnectByClause) {
+                            // Oracle hierarchical query clauses (`... SEARCH ...`,
+                            // `... CYCLE ...`) appear after CONNECT BY and should
+                            // keep expression-column semantics.
+                            depth_frames[depth].phase = SqlPhase::ConnectByClause;
+                            depth_frames[depth].hierarchical_clause_active = true;
                         }
                         relation_state.clear();
                     }
@@ -1581,6 +1607,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     }
                     "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => {
                         depth_frames[depth].phase = SqlPhase::Initial;
+                        depth_frames[depth].hierarchical_clause_active = false;
                         relation_state.clear();
                         begin_set_operator_operand_scope(
                             &mut scope_stack,
