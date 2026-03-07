@@ -2481,6 +2481,17 @@ impl QueryExecutor {
         let mut in_block_comment = false;
         let mut in_q_quote = false;
         let mut q_quote_end: Option<char> = None;
+        let mut in_with_plsql_declaration = false;
+        let mut with_plsql_waiting_main_query = false;
+        let mut with_plsql_block_depth = 0usize;
+        let mut with_plsql_pending_end = false;
+
+        let resolve_with_plsql_pending_end = |pending_end: &mut bool, block_depth: &mut usize| {
+            if *pending_end {
+                *block_depth = block_depth.saturating_sub(1);
+                *pending_end = false;
+            }
+        };
 
         while i < len {
             let c = chars[i];
@@ -2600,6 +2611,19 @@ impl QueryExecutor {
                 continue;
             }
 
+            if c == ';' {
+                resolve_with_plsql_pending_end(
+                    &mut with_plsql_pending_end,
+                    &mut with_plsql_block_depth,
+                );
+                if in_with_plsql_declaration && with_plsql_block_depth == 0 {
+                    in_with_plsql_declaration = false;
+                    with_plsql_waiting_main_query = true;
+                }
+                i += 1;
+                continue;
+            }
+
             if depth == 0 && (c.is_ascii_alphabetic() || c == '_') {
                 let start = i;
                 i += 1;
@@ -2612,6 +2636,71 @@ impl QueryExecutor {
                     i += 1;
                 }
                 let token: String = chars[start..i].iter().collect();
+
+                if in_with_plsql_declaration {
+                    if token.eq_ignore_ascii_case("BEGIN")
+                        || token.eq_ignore_ascii_case("DECLARE")
+                        || token.eq_ignore_ascii_case("CASE")
+                        || token.eq_ignore_ascii_case("IF")
+                        || token.eq_ignore_ascii_case("LOOP")
+                    {
+                        resolve_with_plsql_pending_end(
+                            &mut with_plsql_pending_end,
+                            &mut with_plsql_block_depth,
+                        );
+                        with_plsql_block_depth += 1;
+                        continue;
+                    }
+
+                    if token.eq_ignore_ascii_case("END") {
+                        with_plsql_pending_end = true;
+                        continue;
+                    }
+
+                    if with_plsql_pending_end
+                        && !(token.eq_ignore_ascii_case("CASE")
+                            || token.eq_ignore_ascii_case("IF")
+                            || token.eq_ignore_ascii_case("LOOP"))
+                    {
+                        resolve_with_plsql_pending_end(
+                            &mut with_plsql_pending_end,
+                            &mut with_plsql_block_depth,
+                        );
+                    }
+
+                    continue;
+                }
+
+                if token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE") {
+                    in_with_plsql_declaration = true;
+                    with_plsql_waiting_main_query = false;
+                    with_plsql_block_depth = 0;
+                    with_plsql_pending_end = false;
+                    continue;
+                }
+
+                if with_plsql_waiting_main_query {
+                    if token.eq_ignore_ascii_case("SELECT") {
+                        return true;
+                    }
+
+                    if token.eq_ignore_ascii_case("INSERT")
+                        || token.eq_ignore_ascii_case("UPDATE")
+                        || token.eq_ignore_ascii_case("DELETE")
+                        || token.eq_ignore_ascii_case("MERGE")
+                        || token.eq_ignore_ascii_case("VALUES")
+                        || token.eq_ignore_ascii_case("TABLE")
+                    {
+                        return false;
+                    }
+
+                    if sql_text::is_statement_head_keyword(&token)
+                        && !sql_text::is_with_main_query_keyword(&token)
+                    {
+                        return false;
+                    }
+                }
+
                 if token.eq_ignore_ascii_case("SELECT") {
                     return true;
                 }
@@ -2619,6 +2708,8 @@ impl QueryExecutor {
                     || token.eq_ignore_ascii_case("UPDATE")
                     || token.eq_ignore_ascii_case("DELETE")
                     || token.eq_ignore_ascii_case("MERGE")
+                    || token.eq_ignore_ascii_case("VALUES")
+                    || token.eq_ignore_ascii_case("TABLE")
                 {
                     return false;
                 }
@@ -4239,6 +4330,51 @@ mod tests {
         assert_eq!(
             QueryExecutor::strip_extra_trailing_semicolons("SELECT 'WEEKEND REPORT' FROM dual;;"),
             "SELECT 'WEEKEND REPORT' FROM dual"
+        );
+    }
+
+    #[test]
+    fn with_function_select_is_recognized_as_select_statement() {
+        let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+SELECT f() FROM dual";
+
+        assert!(
+            QueryExecutor::is_select_statement(sql),
+            "WITH FUNCTION ... SELECT should be treated as SELECT"
+        );
+    }
+
+    #[test]
+    fn with_procedure_select_is_recognized_as_select_statement() {
+        let sql = "WITH
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END;
+SELECT 1 FROM dual";
+
+        assert!(
+            QueryExecutor::is_select_statement(sql),
+            "WITH PROCEDURE ... SELECT should be treated as SELECT"
+        );
+    }
+
+    #[test]
+    fn with_function_followed_by_new_statement_head_is_not_select_statement() {
+        let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
+
+        assert!(
+            !QueryExecutor::is_select_statement(sql),
+            "WITH FUNCTION followed by non-query statement head should not be SELECT"
         );
     }
 }
