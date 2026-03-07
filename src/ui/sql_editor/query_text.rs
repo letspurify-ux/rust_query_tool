@@ -119,8 +119,6 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
         }
     };
 
-    let bytes = sql.as_bytes();
-
     while let Some((idx, c)) = iter.next() {
         let next = iter.peek().map(|(_, ch)| *ch);
 
@@ -305,58 +303,52 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         pending_newline = false;
 
-        if current.is_empty()
-            && (c == 'n' || c == 'N')
-            && (next == Some('q') || next == Some('Q'))
-            && bytes.get(idx + 2) == Some(&b'\'')
-            && bytes.get(idx + 3).is_some()
-        {
-            // SAFETY: idx+3 is a valid byte position and q-quote delimiters
-            // are always single-byte characters in Oracle syntax.
-            let del_byte = bytes[idx + 3];
-            let delimiter = del_byte as char;
-            let Some(next_char) = next else {
-                continue;
-            };
-            flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            current_start = idx;
-            current.push(c);
-            current.push(next_char);
-            current.push('\'');
-            current.push(delimiter);
-            scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(
-                scan_state.q_quote_end(),
-                Some(sql_text::q_quote_closing(delimiter))
-            );
-            iter.next();
-            iter.next();
-            iter.next();
-            continue;
+        if current.is_empty() && (c == 'n' || c == 'N') {
+            let mut lookahead = iter.clone();
+            if let (Some((_, q_ch)), Some((_, quote_ch)), Some((_, delimiter))) =
+                (lookahead.next(), lookahead.next(), lookahead.next())
+            {
+                if (q_ch == 'q' || q_ch == 'Q') && quote_ch == '\'' {
+                    flush_word(&mut current, &mut current_start, idx, &mut tokens);
+                    current_start = idx;
+                    current.push(c);
+                    current.push(q_ch);
+                    current.push('\'');
+                    current.push(delimiter);
+                    scan_state.start_q_quote(delimiter);
+                    debug_assert_eq!(
+                        scan_state.q_quote_end(),
+                        Some(sql_text::q_quote_closing(delimiter))
+                    );
+                    iter.next();
+                    iter.next();
+                    iter.next();
+                    continue;
+                }
+            }
         }
 
-        if current.is_empty()
-            && (c == 'q' || c == 'Q')
-            && next == Some('\'')
-            && bytes.get(idx + 2).is_some()
-        {
-            // SAFETY: idx+2 is a valid byte position and q-quote delimiters
-            // are always single-byte characters in Oracle syntax.
-            let del_byte = bytes[idx + 2];
-            let delimiter = del_byte as char;
-            flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            current_start = idx;
-            current.push(c);
-            current.push('\'');
-            current.push(delimiter);
-            scan_state.start_q_quote(delimiter);
-            debug_assert_eq!(
-                scan_state.q_quote_end(),
-                Some(sql_text::q_quote_closing(delimiter))
-            );
-            iter.next();
-            iter.next();
-            continue;
+        if current.is_empty() && (c == 'q' || c == 'Q') {
+            let mut lookahead = iter.clone();
+            if let (Some((_, quote_ch)), Some((_, delimiter))) =
+                (lookahead.next(), lookahead.next())
+            {
+                if quote_ch == '\'' {
+                    flush_word(&mut current, &mut current_start, idx, &mut tokens);
+                    current_start = idx;
+                    current.push(c);
+                    current.push('\'');
+                    current.push(delimiter);
+                    scan_state.start_q_quote(delimiter);
+                    debug_assert_eq!(
+                        scan_state.q_quote_end(),
+                        Some(sql_text::q_quote_closing(delimiter))
+                    );
+                    iter.next();
+                    iter.next();
+                    continue;
+                }
+            }
         }
 
         if c == '\'' {
@@ -780,7 +772,7 @@ mod tests {
     use super::{
         can_execute_while_disconnected, clamp_cursor_to_char_boundary,
         has_connection_bootstrap_command, statement_at_cursor, statement_bounds_in_text,
-        tokenize_sql, DollarQuoteState, PendingTailTokenKind,
+        tokenize_sql, tokenize_sql_spanned, DollarQuoteState, PendingTailTokenKind,
     };
     use crate::db::SplitState;
     use crate::sql_text;
@@ -1229,5 +1221,41 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "$proc$BEGIN (x); END$proc$")));
+    }
+
+    #[test]
+    fn tokenize_sql_spanned_supports_unicode_q_quote_delimiter() {
+        let sql = "SELECT q'가한글가' AS txt FROM dual";
+        let string_token =
+            tokenize_sql_spanned(sql)
+                .into_iter()
+                .find_map(|span| match span.token {
+                    SqlToken::String(value) => Some((value, span.start, span.end)),
+                    _ => None,
+                });
+
+        assert_eq!(
+            string_token,
+            Some(("q'가한글가'".to_string(), 7, 20)),
+            "unicode q-quote delimiter should stay in one string token"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_spanned_supports_unicode_nq_quote_delimiter() {
+        let sql = "SELECT nq'가문자열가' AS txt FROM dual";
+        let string_token =
+            tokenize_sql_spanned(sql)
+                .into_iter()
+                .find_map(|span| match span.token {
+                    SqlToken::String(value) => Some((value, span.start, span.end)),
+                    _ => None,
+                });
+
+        assert_eq!(
+            string_token,
+            Some(("nq'가문자열가'".to_string(), 7, 24)),
+            "unicode nq-quote delimiter should stay in one string token"
+        );
     }
 }
