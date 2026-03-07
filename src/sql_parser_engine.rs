@@ -2327,10 +2327,9 @@ impl SqlParserEngine {
                 self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
                     && self.state.paren_depth == 0;
-            let should_split_forced_external_on_slash =
-                self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
-                    && self.state.should_split_on_semicolon();
+            let should_split_forced_external_on_slash = self.state.block_depth() == 1
+                && self.state.paren_depth == 0
+                && self.state.should_split_on_semicolon();
 
             if self.state.token.is_empty()
                 && ((should_split_pending_implicit_external
@@ -3654,9 +3653,9 @@ mod tests {
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
-
     #[test]
-    fn package_spec_procedure_language_clause_without_external_keyword_does_not_split_mid_statement() {
+    fn package_spec_procedure_language_clause_without_external_keyword_does_not_split_mid_statement(
+    ) {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE PACKAGE pkg_spec_lang AS");
@@ -3925,7 +3924,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn package_body_nested_language_identifier_declaration_keeps_following_nested_subprograms() {
         let mut engine = SqlParserEngine::new();
@@ -3954,9 +3952,9 @@ mod tests {
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
-
     #[test]
-    fn nested_language_identifier_declaration_with_following_local_variable_keeps_routine_structure() {
+    fn nested_language_identifier_declaration_with_following_local_variable_keeps_routine_structure(
+    ) {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_language_locals AS");
@@ -4290,13 +4288,9 @@ mod tests {
 
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-        assert!(
-            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_lang RETURN NUMBER")
-        );
-        assert!(
-            statements[0]
-                .contains("AS LANGUAGE JAVASCRIPT MLE MODULE ext_mod SIGNATURE 'run(number)'")
-        );
+        assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_lang RETURN NUMBER"));
+        assert!(statements[0]
+            .contains("AS LANGUAGE JAVASCRIPT MLE MODULE ext_mod SIGNATURE 'run(number)'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
@@ -4333,9 +4327,7 @@ mod tests {
 
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-        assert!(
-            statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_slash RETURN NUMBER")
-        );
+        assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_slash RETURN NUMBER"));
         assert!(statements[0].contains("AS MLE MODULE ext_mod SIGNATURE 'run(number)'"));
         assert!(
             statements[1].starts_with("/\nSELECT 1 FROM dual"),
@@ -5799,7 +5791,8 @@ BEGIN"
     }
 
     #[test]
-    fn oracle_start_with_clause_with_inline_comment_is_not_misclassified_as_sqlplus_start_command() {
+    fn oracle_start_with_clause_with_inline_comment_is_not_misclassified_as_sqlplus_start_command()
+    {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("SELECT employee_id");
@@ -5817,7 +5810,8 @@ BEGIN"
     }
 
     #[test]
-    fn oracle_connect_by_clause_with_inline_comment_is_not_misclassified_as_sqlplus_connect_command() {
+    fn oracle_connect_by_clause_with_inline_comment_is_not_misclassified_as_sqlplus_connect_command(
+    ) {
         let mut engine = SqlParserEngine::new();
 
         engine.process_line("SELECT employee_id");
@@ -6390,6 +6384,40 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_recover_command_is_auto_terminated_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("RECOVER DATABASE");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "RECOVER DATABASE".to_string(),
+                "SELECT 1 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlplus_archive_command_is_auto_terminated_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("ARCHIVE LOG LIST");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec![
+                "ARCHIVE LOG LIST".to_string(),
+                "SELECT 1 FROM dual".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
@@ -6482,7 +6510,6 @@ BEGIN"
         );
     }
 
-
     #[test]
     fn external_language_clause_splits_before_recover_statement_head() {
         let mut engine = SqlParserEngine::new();
@@ -6511,7 +6538,6 @@ BEGIN"
         );
     }
 
-
     #[test]
     fn external_language_clause_splits_before_archive_statement_head() {
         let mut engine = SqlParserEngine::new();
@@ -6537,28 +6563,6 @@ BEGIN"
             statements[2].starts_with("SELECT 1 FROM dual"),
             "SELECT should remain standalone after ARCHIVE recovery split: {}",
             statements[2]
-        );
-    }
-
-    #[test]
-    fn external_language_clause_splits_before_recover_statement_head() {
-        let mut engine = SqlParserEngine::new();
-
-        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_next_recover RETURN NUMBER");
-        engine.process_line("AS LANGUAGE C;");
-        engine.process_line("RECOVER DATABASE;");
-
-        let statements = engine.finalize_and_take_statements();
-        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-        assert!(
-            statements[0].contains("AS LANGUAGE C"),
-            "first statement should keep EXTERNAL call spec: {}",
-            statements[0]
-        );
-        assert!(
-            statements[1].starts_with("RECOVER DATABASE"),
-            "RECOVER statement should begin a new statement after external routine split: {}",
-            statements[1]
         );
     }
 
