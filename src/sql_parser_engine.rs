@@ -1704,6 +1704,36 @@ fn is_line_leading_open_paren_marker(chars: &[char], marker_idx: usize) -> bool 
     true
 }
 
+fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
+    if chars.get(marker_idx) != Some(&'/') {
+        return false;
+    }
+
+    if chars
+        .iter()
+        .take(marker_idx)
+        .any(|ch| !ch.is_whitespace())
+    {
+        return false;
+    }
+
+    let mut idx = marker_idx + 1;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '\n' {
+            return true;
+        }
+
+        if !ch.is_whitespace() {
+            return false;
+        }
+
+        idx += 1;
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -2231,7 +2261,8 @@ impl SqlParserEngine {
                 && self.state.paren_depth == 0
                 && self.state.token.is_empty()
                 && ((c == '@' && is_line_leading_run_script_marker(chars, i))
-                    || (c == '!' && is_line_leading_bang_host_marker(chars, i)))
+                    || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                    || (c == '/' && is_line_leading_slash_marker(chars, i)))
             {
                 self.push_current_statement();
                 self.reset_statement_local_state();
@@ -2244,6 +2275,7 @@ impl SqlParserEngine {
                 && self.state.token.is_empty()
                 && ((c == '@' && is_line_leading_run_script_marker(chars, i))
                     || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                    || (c == '/' && is_line_leading_slash_marker(chars, i))
                     || (c == '(' && is_line_leading_open_paren_marker(chars, i)))
             {
                 self.split_current_statement();
@@ -5504,6 +5536,25 @@ BEGIN"
     }
 
     #[test]
+    fn external_language_clause_splits_before_sqlplus_slash_terminator_line() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_slash RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("/");
+        engine.process_line("SELECT 51 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("/\nSELECT 51 FROM dual"),
+            "slash marker line should start the next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_prompt_command() {
         let mut engine = SqlParserEngine::new();
 
@@ -5669,6 +5720,27 @@ BEGIN"
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
         assert!(statements[1].starts_with("@child.sql"));
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_sqlplus_slash_terminator_line() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("/");
+        engine.process_line("SELECT 52 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("END"));
+        assert!(
+            statements[1].starts_with("/\nSELECT 52 FROM dual"),
+            "slash marker line should start the next statement: {}",
+            statements[1]
+        );
     }
 
     #[test]
