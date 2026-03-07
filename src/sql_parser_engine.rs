@@ -781,6 +781,16 @@ impl SplitState {
         self.create_plsql_kind == CreatePlsqlKind::Wrapped
     }
 
+    fn awaiting_external_language_target(&self) -> bool {
+        self.routine_is_stack.last().is_some_and(|frame| {
+            matches!(
+                frame.external_clause_state,
+                ExternalClauseState::AwaitingLanguageTargetFromExternal
+                    | ExternalClauseState::AwaitingLanguageTargetImplicit
+            )
+        })
+    }
+
     fn keep_semicolons_inside_create_body(&self) -> bool {
         self.in_java_source_create() || self.in_wrapped_create()
     }
@@ -1485,6 +1495,18 @@ fn parse_dollar_quote_tag(chars: &[char], start: usize) -> Option<String> {
     None
 }
 
+#[inline]
+fn looks_like_oracle_conditional_compilation_flag(chars: &[char], start: usize) -> bool {
+    if chars.get(start).copied() != Some('$') || chars.get(start + 1).copied() != Some('$') {
+        return false;
+    }
+
+    chars
+        .get(start + 2)
+        .copied()
+        .is_some_and(sql_text::is_identifier_char)
+}
+
 fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
     let mut idx = start;
     for pattern_ch in pattern.chars() {
@@ -1918,7 +1940,11 @@ impl SqlParserEngine {
             }
 
             // $$tag$$
-            if self.state.token.is_empty() && c == '$' {
+            if self.state.token.is_empty()
+                && c == '$'
+                && (!looks_like_oracle_conditional_compilation_flag(chars, i)
+                    || self.state.awaiting_external_language_target())
+            {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
                     self.state.flush_token();
@@ -3430,6 +3456,23 @@ mod tests {
     }
 
     #[test]
+    fn oracle_conditional_compilation_flag_does_not_enter_dollar_quote_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  IF $$PLSQL_UNIT IS NOT NULL THEN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END IF;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 11 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("IF $$PLSQL_UNIT IS NOT NULL THEN"));
+        assert!(statements[1].starts_with("SELECT 11 FROM dual"));
+    }
+
+    #[test]
     fn language_clause_with_dollar_quoted_target_without_external_keyword_marks_external_routine_split(
     ) {
         let mut engine = SqlParserEngine::new();
@@ -3442,6 +3485,20 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE $lang$C$lang$ NAME 'ext_lang_dollar'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_empty_dollar_quoted_target_still_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_dollar_empty RETURN NUMBER");
+        engine.process_line("AS LANGUAGE $$C$$ NAME 'ext_lang_dollar_empty';");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE $$C$$ NAME 'ext_lang_dollar_empty'"));
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
     }
 
     #[test]
