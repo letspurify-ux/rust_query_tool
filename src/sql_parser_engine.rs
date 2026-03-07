@@ -1985,6 +1985,22 @@ impl SqlParserEngine {
                 continue;
             }
 
+            // b'...'/x'...'
+            if self.state.token.is_empty()
+                && matches!(c, 'b' | 'B' | 'x' | 'X')
+                && next == Some('\'')
+            {
+                self.state.flush_token();
+                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                self.state
+                    .observe_external_clause_literal_target(allow_implicit_target);
+                self.state.lex_mode = LexMode::SingleQuote;
+                self.current.push(c);
+                self.current.push('\'');
+                i += 2;
+                continue;
+            }
+
             // u'...'
             if self.state.token.is_empty() && (c == 'u' || c == 'U') && next == Some('\'') {
                 self.state.flush_token();
@@ -3612,6 +3628,36 @@ mod tests {
         let statements = engine.finalize_and_take_statements();
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE nq'[C]' NAME 'ext_lang_nqquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_binary_single_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_bquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE B'C' NAME 'ext_lang_bquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE B'C' NAME 'ext_lang_bquoted'"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_hex_single_quoted_target_without_external_keyword_marks_external_routine_split(
+    ) {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_xquoted RETURN NUMBER");
+        engine.process_line("AS LANGUAGE X'C' NAME 'ext_lang_xquoted';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE X'C' NAME 'ext_lang_xquoted'"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
 
