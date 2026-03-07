@@ -1342,14 +1342,24 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "SKIP" => {
-                        if depth_frames
+                        let locking_clause_active = depth_frames
                             .get(depth)
-                            .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
+                            .is_some_and(|frame| frame.locking_clause_active);
+                        let starts_skip_locked_suffix = matches!(
+                            next_word_upper(tokens, idx + 1),
+                            Some((next, _)) if next == "LOCKED"
+                        );
+                        let follows_of_column_reference = matches!(
+                            last_word.as_deref(),
+                            Some("OF") | None
+                        );
+
+                        if locking_clause_active
+                            && (starts_skip_locked_suffix || !follows_of_column_reference)
                         {
-                            // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
-                            // just like NOWAIT/WAIT. Keep `SKIP` as an identifier candidate
-                            // inside `OF <column list>` unless the next keyword is LOCKED.
+                            // Oracle `FOR UPDATE ... SKIP LOCKED` and in-progress
+                            // `... OF <col> SKIP` both indicate the lock-option suffix,
+                            // not another lock-target column.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }
