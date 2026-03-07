@@ -1178,7 +1178,10 @@ impl QueryExecutor {
                 while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
                     pos += 1;
                 }
-                if sql.get(start..pos).is_some_and(|w| w.eq_ignore_ascii_case("WITH")) {
+                if sql
+                    .get(start..pos)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("WITH"))
+                {
                     break;
                 }
                 continue;
@@ -1279,8 +1282,8 @@ impl QueryExecutor {
                 top_level_closed_paren_recently = false;
             }
 
-            let at_query_depth = depth == 0
-                || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
+            let at_query_depth =
+                depth == 0 || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
 
             if at_query_depth && b.is_ascii_alphabetic() {
                 let start = pos;
@@ -1288,7 +1291,10 @@ impl QueryExecutor {
                 while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
                     pos += 1;
                 }
-                if sql.get(start..pos).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+                if sql
+                    .get(start..pos)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("SELECT"))
+                {
                     return Some(start);
                 }
                 continue;
@@ -1843,9 +1849,7 @@ impl QueryExecutor {
         for token in TopLevelScanner::new(from_clause) {
             match token {
                 ScanToken::Symbol { byte: b',', .. } => return false,
-                ScanToken::Word { text, .. } if text.eq_ignore_ascii_case("JOIN") => {
-                    return false
-                }
+                ScanToken::Word { text, .. } if text.eq_ignore_ascii_case("JOIN") => return false,
                 _ => {}
             }
         }
@@ -2111,8 +2115,8 @@ impl QueryExecutor {
 
             top_level_closed_paren_recently = false;
 
-            let at_query_depth = depth == 0
-                || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
+            let at_query_depth =
+                depth == 0 || parenthesized_main_query_depth.is_some_and(|wd| depth == wd);
 
             if at_query_depth && sql_text::is_identifier_start_byte(b) {
                 let start = pos;
@@ -2149,8 +2153,7 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if token.eq_ignore_ascii_case("FUNCTION")
-                    || token.eq_ignore_ascii_case("PROCEDURE")
+                if token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
                 {
                     in_with_plsql_declaration = true;
                     with_plsql_waiting_main_query = false;
@@ -2597,6 +2600,18 @@ impl QueryExecutor {
             return Some(ToolCommand::Unsupported {
                 raw: trimmed.to_string(),
                 message: "HOST command is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
+        if Self::is_word_command(&upper, "STARTUP")
+            || Self::is_word_command(&upper, "SHUTDOWN")
+            || Self::is_word_command(&upper, "ARCHIVE")
+            || Self::is_word_command(&upper, "RECOVER")
+        {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "SQL*Plus admin command is not supported in this client.".to_string(),
                 is_error: true,
             });
         }
