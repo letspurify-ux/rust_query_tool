@@ -5832,6 +5832,34 @@ BEGIN"
         );
     }
 
+
+    #[test]
+    fn sqlplus_startup_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("STARTUP");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "STARTUP".to_string());
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn sqlplus_shutdown_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SHUTDOWN IMMEDIATE");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SHUTDOWN IMMEDIATE".to_string());
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
     #[test]
     fn external_language_clause_splits_before_shutdown_statement_head() {
         let mut engine = SqlParserEngine::new();
