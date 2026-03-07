@@ -1633,6 +1633,29 @@ fn is_line_leading_bang_host_marker(chars: &[char], marker_idx: usize) -> bool {
     true
 }
 
+fn is_line_leading_open_paren_marker(chars: &[char], marker_idx: usize) -> bool {
+    if chars.get(marker_idx).copied() != Some('(') {
+        return false;
+    }
+
+    let mut lookbehind = marker_idx;
+    while lookbehind > 0 {
+        let prev_idx = lookbehind - 1;
+        let Some(prev) = chars.get(prev_idx).copied() else {
+            break;
+        };
+        if prev == '\n' {
+            break;
+        }
+        if !prev.is_whitespace() {
+            return false;
+        }
+        lookbehind = prev_idx;
+    }
+
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -2149,7 +2172,8 @@ impl SqlParserEngine {
                 && self.state.paren_depth == 0
                 && self.state.token.is_empty()
                 && ((c == '@' && is_line_leading_run_script_marker(chars, i))
-                    || (c == '!' && is_line_leading_bang_host_marker(chars, i)))
+                    || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                    || (c == '(' && is_line_leading_open_paren_marker(chars, i)))
             {
                 self.push_current_statement();
                 self.reset_statement_local_state();
@@ -3766,6 +3790,22 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE $$C$$ NAME 'ext_lang_dollar_empty'"));
         assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_parenthesized_query_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_paren RETURN NUMBER");
+        engine.process_line("AS LANGUAGE U'C';");
+        engine.process_line("(SELECT ext_lang_paren() AS v FROM dual)");
+        engine.process_line("UNION ALL");
+        engine.process_line("SELECT 2 AS v FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE U'C'"));
+        assert!(statements[1].starts_with("(SELECT ext_lang_paren() AS v FROM dual)"));
     }
 
     #[test]
