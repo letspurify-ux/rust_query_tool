@@ -5013,6 +5013,45 @@ BEGIN"
     }
 
     #[test]
+    fn sqlplus_spool_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SPOOL output.log");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SPOOL output.log".to_string());
+        assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
+    }
+
+    #[test]
+    fn sqlplus_show_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SHOW ERRORS");
+        engine.process_line("SELECT 4 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SHOW ERRORS".to_string());
+        assert_eq!(statements[1], "SELECT 4 FROM dual".to_string());
+    }
+
+    #[test]
+    fn sqlplus_whenever_command_keeps_following_statement_separate_without_semicolon() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WHENEVER SQLERROR EXIT SQL.SQLCODE");
+        engine.process_line("SELECT 5 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "WHENEVER SQLERROR EXIT SQL.SQLCODE".to_string());
+        assert_eq!(statements[1], "SELECT 5 FROM dual".to_string());
+    }
+
+    #[test]
     fn external_language_clause_splits_before_trailing_block_comment_and_select() {
         let mut engine = SqlParserEngine::new();
 

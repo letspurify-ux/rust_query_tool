@@ -1002,6 +1002,13 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         return true;
     }
 
+    if first.eq_ignore_ascii_case("SPOOL")
+        || first.eq_ignore_ascii_case("SHOW")
+        || first.eq_ignore_ascii_case("WHENEVER")
+    {
+        return true;
+    }
+
     false
 }
 
@@ -1148,6 +1155,9 @@ mod tests {
         assert!(is_auto_terminated_tool_command("! ls"));
         assert!(is_auto_terminated_tool_command("EXIT"));
         assert!(is_auto_terminated_tool_command("QUIT"));
+        assert!(is_auto_terminated_tool_command("SPOOL run.log"));
+        assert!(is_auto_terminated_tool_command("SHOW ERRORS"));
+        assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT SQL.SQLCODE"));
     }
 
     #[test]
