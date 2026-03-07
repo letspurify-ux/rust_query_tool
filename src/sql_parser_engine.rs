@@ -5430,6 +5430,87 @@ BEGIN"
     }
 
     #[test]
+    fn trigger_referencing_alias_with_when_clause_splits_before_next_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_ref_alias");
+        engine.process_line("BEFORE INSERT ON t");
+        engine.process_line("REFERENCING NEW AS n");
+        engine.process_line("FOR EACH ROW");
+        engine.process_line("WHEN (n.id IS NULL)");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn package_spec_with_subprogram_declarations_keeps_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE pkg_tmp IS");
+        engine.process_line("  FUNCTION f RETURN NUMBER;");
+        engine.process_line("  PROCEDURE p;");
+        engine.process_line("END pkg_tmp;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("FUNCTION f RETURN NUMBER;"));
+        assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn with_function_followed_by_lock_statement_recovers() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("LOCK TABLE emp IN EXCLUSIVE MODE;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[1].starts_with("LOCK TABLE emp IN EXCLUSIVE MODE"));
+    }
+
+    #[test]
+    fn with_function_followed_by_run_script_marker_recovers() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("@child.sql");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[1].starts_with("@child.sql"));
+    }
+
+    #[test]
+    fn sqlplus_spool_command_is_auto_terminated() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SPOOL out.log");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(
+            statements,
+            vec!["SPOOL out.log".to_string(), "SELECT 1 FROM dual".to_string()]
+        );
+    }
+
+    #[test]
     fn external_language_clause_splits_before_alter_statement_head() {
         let mut engine = SqlParserEngine::new();
 
