@@ -7222,6 +7222,56 @@ fn test_parse_ddl_object_type_create_trigger() {
 }
 
 #[test]
+fn test_parse_ddl_object_type_create_noforce_trigger() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE NOFORCE TRIGGER MY_TRIG BEFORE INSERT ON MY_TABLE BEGIN NULL; END;"
+        ),
+        "Trigger"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_forward_crossedition_trigger() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE FORWARD CROSSEDITION TRIGGER MY_TRIG BEFORE INSERT ON MY_TABLE BEGIN NULL; END;"
+        ),
+        "Trigger"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_reverse_crossedition_trigger() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE REVERSE CROSSEDITION TRIGGER MY_TRIG BEFORE INSERT ON MY_TABLE BEGIN NULL; END;"
+        ),
+        "Trigger"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_sharing_data_package() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE SHARING=DATA PACKAGE MY_PKG AS PROCEDURE P; END MY_PKG;"
+        ),
+        "Package"
+    );
+}
+
+#[test]
+fn test_parse_ddl_object_type_create_sharing_equals_metadata_package() {
+    assert_eq!(
+        QueryExecutor::parse_ddl_object_type(
+            "CREATE OR REPLACE SHARING = METADATA PACKAGE MY_PKG AS PROCEDURE P; END MY_PKG;"
+        ),
+        "Package"
+    );
+}
+
+#[test]
 fn test_parse_ddl_object_type_create_sequence() {
     assert_eq!(
         QueryExecutor::parse_ddl_object_type("CREATE SEQUENCE MY_SEQ START WITH 1"),
