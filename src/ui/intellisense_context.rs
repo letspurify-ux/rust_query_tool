@@ -1181,17 +1181,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             relation_state.clear();
                         }
                     }
-                    "OVERWRITE"
-                        if matches!(last_word.as_deref(), Some("INSERT")) =>
-                    {
+                    "OVERWRITE" if matches!(last_word.as_deref(), Some("INSERT")) => {
                         // Hive/Spark-style `INSERT OVERWRITE TABLE ...` keeps
                         // target relation context after OVERWRITE.
                         depth_frames[depth].phase = SqlPhase::IntoClause;
                         relation_state.expect_table();
                     }
-                    "DIRECTORY"
-                        if matches!(last_word.as_deref(), Some("OVERWRITE")) =>
-                    {
+                    "DIRECTORY" if matches!(last_word.as_deref(), Some("OVERWRITE")) => {
                         // `INSERT OVERWRITE DIRECTORY ...` targets a filesystem
                         // location rather than a table relation.
                         depth_frames[depth].phase = SqlPhase::Initial;
@@ -1357,31 +1353,33 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
                         {
-                            let follows_skip_locked =
-                                matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED");
-                            let prev_word = prev_word_upper(tokens, idx);
-                            let previous_token_is_word_target =
-                                matches!(prev_word.as_ref(), Some((prev, _)) if prev != "OF");
-                            let previous_token_is_column_separator = (0..idx)
-                                .rev()
-                                .find_map(|lookback| match tokens.get(lookback) {
-                                    Some(SqlToken::Comment(_)) => None,
-                                    Some(SqlToken::Symbol(sym)) if sym == "," || sym == "." => {
-                                        Some(true)
+                            let prev_word = prev_word_upper(tokens, idx).map(|(word, _)| word);
+                            let mut prev_idx = idx;
+                            let mut prev_is_comma = false;
+                            while prev_idx > 0 {
+                                prev_idx -= 1;
+                                match &tokens[prev_idx] {
+                                    SqlToken::Comment(_) => continue,
+                                    SqlToken::Symbol(symbol) if symbol == "," => {
+                                        prev_is_comma = true;
+                                        break;
                                     }
-                                    Some(_) => Some(false),
-                                    None => Some(false),
-                                })
-                                .unwrap_or(false);
+                                    _ => break,
+                                }
+                            }
 
-                            if follows_skip_locked
-                                || (previous_token_is_word_target
-                                    && !previous_token_is_column_separator)
+                            let treat_as_lock_modifier = matches!(
+                                prev_word.as_deref(),
+                                Some(prev) if prev != "OF"
+                            ) && !prev_is_comma;
+
+                            if treat_as_lock_modifier
+                                || matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
                             {
-                                // Oracle lock modifiers (`SKIP [LOCKED]`) start right after
-                                // the final `OF` column expression and should end column
-                                // completion. Keep `SKIP` as an identifier candidate for
-                                // `OF skip` and qualified forms like `OF t.skip`.
+                                // Oracle `FOR UPDATE ... SKIP LOCKED` (and a trailing `SKIP`
+                                // entered after at least one lock target) closes the lock target
+                                // list. Keep `SKIP` as identifier context for `OF skip` and
+                                // comma-separated column lists like `OF empno, skip`.
                                 depth_frames[depth].phase = SqlPhase::OrderByClause;
                                 relation_state.clear();
                             }
@@ -1457,8 +1455,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             is_mysql_on_duplicate_key_update(tokens, idx);
                         let is_postgres_conflict_update =
                             is_postgres_on_conflict_do_update(tokens, idx);
-                        let is_locking_update_keyword =
-                            matches!(last_word.as_deref(), Some("FOR"));
+                        let is_locking_update_keyword = matches!(last_word.as_deref(), Some("FOR"));
                         if is_locking_update_keyword {
                             // `FOR UPDATE OF ...` lock clause inside SELECT statements.
                             if locking_for_clause_has_of_target(tokens, idx) {
