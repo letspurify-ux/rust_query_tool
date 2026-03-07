@@ -1332,6 +1332,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             .is_some_and(|frame| frame.locking_clause_active)
                             && !locking_of_clause_identifier_position(tokens, idx)
                         {
+                            let in_lock_target_list = matches!(
+                                previous_significant_token(tokens, idx),
+                                Some((_, SqlToken::Word(prev))) if prev.eq_ignore_ascii_case("OF")
+                            ) || matches!(
+                                previous_significant_token(tokens, idx),
+                                Some((_, SqlToken::Symbol(sym))) if sym == ","
+                            );
+
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
                             // modifiers, not expression/table contexts. Keep identifier
                             // suggestions for `OF wait` / `OF nowait` column names.
@@ -1340,7 +1348,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         }
                     }
                     "SKIP" => {
-                        if depth_frames
+                        let locking_clause_active = depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
                             && !locking_of_clause_identifier_position(tokens, idx)
