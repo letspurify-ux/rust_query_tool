@@ -317,6 +317,15 @@ impl RoutineFrame {
             return;
         }
 
+        if matches!(token_upper, "ROW" | "TABLE" | "POLYMORPHIC")
+            && self.external_clause_state == ExternalClauseState::SawUsingClauseSubject
+        {
+            // Oracle polymorphic table functions allow qualifiers between
+            // `PIPELINED` and `USING` (e.g. `PIPELINED TABLE POLYMORPHIC USING`).
+            // Keep the USING-clause subject armed across those keywords.
+            return;
+        }
+
         if token_upper == "LANGUAGE" {
             self.external_clause_state =
                 if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
@@ -5580,6 +5589,50 @@ BEGIN"
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS PIPELINED USING ext_pipe_impl"));
         assert!(statements[1].starts_with("SELECT 12 FROM dual"));
+    }
+
+    #[test]
+    fn pipelined_table_polymorphic_using_clause_marks_external_routine_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_pipe_poly RETURN sys.odcinumberlist");
+        engine.process_line("AS PIPELINED TABLE POLYMORPHIC USING ext_pipe_impl;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS PIPELINED TABLE POLYMORPHIC USING ext_pipe_impl"),
+            "pipelined table polymorphic call spec should stay in first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SELECT 12 FROM dual"),
+            "SELECT should be split into next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn nested_pipelined_table_polymorphic_using_clause_keeps_package_statement_intact() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_ext_poly AS");
+        engine.process_line("  FUNCTION f RETURN sys.odcinumberlist");
+        engine.process_line("  AS PIPELINED TABLE POLYMORPHIC USING ext_pipe_impl;");
+        engine.process_line("END pkg_ext_poly;");
+        engine.process_line("SELECT 44 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("CREATE OR REPLACE PACKAGE BODY pkg_ext_poly AS"));
+        assert!(
+            statements[0].contains("AS PIPELINED TABLE POLYMORPHIC USING ext_pipe_impl;"),
+            "nested polymorphic call spec should stay inside package body: {}",
+            statements[0]
+        );
+        assert!(statements[0].contains("END pkg_ext_poly"));
+        assert_eq!(statements[1], "SELECT 44 FROM dual".to_string());
     }
 
     #[test]
