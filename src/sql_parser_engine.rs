@@ -1476,6 +1476,16 @@ impl SplitState {
         }
 
         if sql_text::is_with_main_query_keyword(upper) {
+            // `TABLE` can appear inside a WITH FUNCTION declaration signature,
+            // e.g. `RETURN VARCHAR2 SQL_MACRO(TABLE)`. Only switch out of
+            // declaration mode once the declaration has been closed by `;`
+            // and we are explicitly awaiting the main query.
+            if self.with_clause_state
+                == WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration)
+            {
+                return;
+            }
+
             self.with_clause_state = WithClauseState::None;
             return;
         }
