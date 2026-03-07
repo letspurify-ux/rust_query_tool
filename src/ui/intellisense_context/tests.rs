@@ -544,9 +544,10 @@ fn sqlite_indexed_by_postfix_keeps_alias_after_clause() {
     let ctx = analyze("SELECT o.| FROM orders INDEXED BY idx_orders_date o");
 
     assert!(
-        ctx.tables_in_scope.iter().any(
-            |table| table.name.eq_ignore_ascii_case("ORDERS") && table.alias.as_deref() == Some("o")
-        ),
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDERS")
+                && table.alias.as_deref() == Some("o")),
         "INDEXED BY postfix should not block alias parsing: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -560,9 +561,10 @@ fn sqlite_not_indexed_postfix_keeps_alias_after_clause() {
     let ctx = analyze("SELECT o.| FROM orders NOT INDEXED o");
 
     assert!(
-        ctx.tables_in_scope.iter().any(
-            |table| table.name.eq_ignore_ascii_case("ORDERS") && table.alias.as_deref() == Some("o")
-        ),
+        ctx.tables_in_scope
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case("ORDERS")
+                && table.alias.as_deref() == Some("o")),
         "NOT INDEXED postfix should not block alias parsing: {:?}",
         ctx.tables_in_scope
             .iter()
@@ -570,7 +572,6 @@ fn sqlite_not_indexed_postfix_keeps_alias_after_clause() {
             .collect::<Vec<_>>()
     );
 }
-
 
 #[test]
 fn unnest_argument_scope_can_resolve_left_relation_columns() {
@@ -702,6 +703,20 @@ fn phase_for_update_of_identifier_then_skip_transitions_to_non_column_context() 
 fn phase_for_update_of_skip_locked_is_not_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno SKIP LOCKED |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+
+#[test]
+fn phase_for_share_of_skip_is_not_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR SHARE OF empno SKIP |");
+    assert_eq!(ctx.phase, SqlPhase::OrderByClause);
+}
+
+#[test]
+fn phase_for_share_of_identifier_named_skip_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR SHARE OF skip |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
 }
 
 #[test]
@@ -3270,7 +3285,8 @@ fn flashback_as_of_scn_multiplicative_expression_keeps_alias_visible() {
 
 #[test]
 fn flashback_versions_between_scn_multiplicative_bounds_keep_alias_visible() {
-    let ctx = analyze("SELECT * FROM employees VERSIONS BETWEEN SCN 1 * 2 AND SCN 3 * 4 e WHERE e.|");
+    let ctx =
+        analyze("SELECT * FROM employees VERSIONS BETWEEN SCN 1 * 2 AND SCN 3 * 4 e WHERE e.|");
 
     assert!(
         ctx.tables_in_scope
@@ -4964,7 +4980,8 @@ fn infer_source_columns_uses_match_recognize_generated_columns_when_select_list_
 
     let cols = infer_source_columns_before_clause(&tokens, tokens.len());
     assert!(
-        cols.iter().any(|col| col.eq_ignore_ascii_case("start_name")),
+        cols.iter()
+            .any(|col| col.eq_ignore_ascii_case("start_name")),
         "expected MATCH_RECOGNIZE MEASURES alias to be inferred, got: {:?}",
         cols
     );
