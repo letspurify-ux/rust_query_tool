@@ -531,6 +531,19 @@ fn is_post_query_for_clause(tokens: &[SqlToken], start_idx: usize) -> bool {
     matches!(first_keyword.as_str(), "JSON" | "XML" | "BROWSE")
 }
 
+fn is_locking_option_keyword(tokens: &[SqlToken], keyword_idx: usize) -> bool {
+    let Some((prev_word, _)) = prev_word_upper(tokens, keyword_idx) else {
+        return false;
+    };
+
+    // `FOR UPDATE OF <identifier>` keeps column-list context even when
+    // identifiers match lock option keywords (`WAIT`, `NOWAIT`, `SKIP`).
+    // Treat as lock option only when it does not directly follow
+    // OF/comma-separated identifier boundaries.
+    prev_word != "OF"
+        && !matches!(tokens.get(keyword_idx.saturating_sub(1)), Some(SqlToken::Symbol(sym)) if sym == ",")
+}
+
 fn is_query_expression_start(tokens: &[SqlToken], start_idx: usize) -> bool {
     let mut idx = skip_comment_tokens(tokens, start_idx);
 
@@ -1334,6 +1347,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
+                            && is_locking_option_keyword(tokens, idx)
                         {
                             // Oracle lock options after `FOR UPDATE [OF ...]` are trailing
                             // modifiers, not expression/table contexts.
@@ -1345,11 +1359,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         if depth_frames
                             .get(depth)
                             .is_some_and(|frame| frame.locking_clause_active)
-                            && matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED")
+                            && (is_locking_option_keyword(tokens, idx)
+                                || matches!(next_word_upper(tokens, idx + 1), Some((next, _)) if next == "LOCKED"))
                         {
                             // Oracle `FOR UPDATE ... SKIP LOCKED` closes lock target list
                             // just like NOWAIT/WAIT. Keep `SKIP` as an identifier candidate
-                            // inside `OF <column list>` unless the next keyword is LOCKED.
+                            // when it starts/continues `OF <column list>`.
                             depth_frames[depth].phase = SqlPhase::OrderByClause;
                             relation_state.clear();
                         }

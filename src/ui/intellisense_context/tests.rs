@@ -666,6 +666,20 @@ fn phase_for_update_of_nowait_is_not_column_context() {
 }
 
 #[test]
+fn phase_for_update_of_identifier_named_wait_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF wait |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
+fn phase_for_update_of_identifier_named_nowait_stays_column_context() {
+    let ctx = analyze("SELECT * FROM emp FOR UPDATE OF nowait |");
+    assert_eq!(ctx.phase, SqlPhase::SetClause);
+    assert!(ctx.phase.is_column_context());
+}
+
+#[test]
 fn phase_for_update_of_skip_is_not_column_context() {
     let ctx = analyze("SELECT * FROM emp FOR UPDATE OF empno SKIP |");
     assert_eq!(ctx.phase, SqlPhase::OrderByClause);
