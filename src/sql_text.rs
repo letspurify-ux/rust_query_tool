@@ -797,7 +797,6 @@ const STATEMENT_HEAD_KEYWORDS: &[&str] = &[
     "LOCK",
     "COMMIT",
     "ROLLBACK",
-    "RECOVER",
     "AUDIT",
     "NOAUDIT",
     "ASSOCIATE",
@@ -964,6 +963,10 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return false;
+    }
+
+    if trimmed.starts_with('!') {
+        return true;
     }
 
     if trimmed.starts_with("@@") || trimmed.starts_with('@') {
@@ -1208,7 +1211,10 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
         let mut end = idx;
         while end < line.len() {
             let word_ch = line[end..].chars().next()?;
-            if word_ch.is_whitespace() || line[end..].starts_with("/*") || line[end..].starts_with("--") {
+            if word_ch.is_whitespace()
+                || line[end..].starts_with("/*")
+                || line[end..].starts_with("--")
+            {
                 break;
             }
             end += word_ch.len_utf8();
@@ -1304,7 +1310,10 @@ mod tests {
     fn statement_head_keywords_do_not_contain_duplicates() {
         let mut seen = HashSet::new();
         for keyword in STATEMENT_HEAD_KEYWORDS {
-            assert!(seen.insert(*keyword), "duplicate statement head keyword: {keyword}");
+            assert!(
+                seen.insert(*keyword),
+                "duplicate statement head keyword: {keyword}"
+            );
         }
     }
 
@@ -1396,6 +1405,8 @@ mod tests {
         assert!(is_auto_terminated_tool_command("REMARK comment"));
         assert!(is_auto_terminated_tool_command("HOST ls"));
         assert!(is_auto_terminated_tool_command("! ls"));
+        assert!(is_auto_terminated_tool_command("!ls"));
+        assert!(is_auto_terminated_tool_command("   !echo ok"));
         assert!(is_auto_terminated_tool_command("EXIT"));
         assert!(is_auto_terminated_tool_command("QUIT"));
         assert!(is_auto_terminated_tool_command("STARTUP"));
@@ -1403,8 +1414,12 @@ mod tests {
         assert!(is_auto_terminated_tool_command("SPOOL out.log"));
         assert!(is_auto_terminated_tool_command("DESCRIBE emp"));
         assert!(is_auto_terminated_tool_command("DESC emp"));
-        assert!(is_auto_terminated_tool_command("EXEC dbms_output.put_line('x')"));
-        assert!(is_auto_terminated_tool_command("EXECUTE dbms_output.put_line('x')"));
+        assert!(is_auto_terminated_tool_command(
+            "EXEC dbms_output.put_line('x')"
+        ));
+        assert!(is_auto_terminated_tool_command(
+            "EXECUTE dbms_output.put_line('x')"
+        ));
         assert!(is_auto_terminated_tool_command("DEFINE v = 1"));
         assert!(is_auto_terminated_tool_command("UNDEFINE v"));
         assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT"));
@@ -1413,6 +1428,12 @@ mod tests {
         assert!(is_auto_terminated_tool_command("PASSWO scott"));
         assert!(is_auto_terminated_tool_command("PASSWOR scott"));
         assert!(is_auto_terminated_tool_command("PASSWORD scott"));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_detects_bang_host_without_whitespace() {
+        assert!(is_auto_terminated_tool_command("!uname -a"));
+        assert!(is_auto_terminated_tool_command("!pwd"));
     }
 
     #[test]
