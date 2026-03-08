@@ -2194,7 +2194,10 @@ impl SqlParserEngine {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
                     self.state.flush_token();
-                    self.state.observe_external_clause_literal_target(true);
+                    let allow_implicit_target =
+                        self.state.allow_implicit_external_literal_target();
+                    self.state
+                        .observe_external_clause_literal_target(allow_implicit_target);
                     // Push tag chars to current before moving tag into lex_mode.
                     for k in 0..tag_len {
                         self.current.push(chars[i + k]);
@@ -3815,6 +3818,92 @@ mod tests {
             assert!(
                 statements[1].starts_with("SELECT 1 FROM dual"),
                 "second statement should remain standalone for {target}: {}",
+                statements[1]
+            );
+        }
+    }
+
+    #[test]
+    fn nested_language_dollar_quoted_targets_do_not_force_external_split() {
+        for target in ["$$C$$", "$lang$JAVA$lang$", "$lang$PYTHON$lang$"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE PROCEDURE proc_language_dollar_ident IS");
+            engine.process_line(&format!("  language {target};"));
+            engine.process_line("BEGIN");
+            engine.process_line("  NULL;");
+            engine.process_line("END;");
+            engine.process_line("SELECT 1 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(
+                statements.len(),
+                2,
+                "unexpected statements for {target}: {statements:?}"
+            );
+            assert!(
+                statements[0].starts_with(
+                    "CREATE OR REPLACE PROCEDURE proc_language_dollar_ident IS"
+                ),
+                "first statement should keep procedure body for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains(&format!("language {target};")),
+                "first statement should keep language declaration for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END"),
+                "first statement should contain END for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].starts_with("SELECT 1 FROM dual"),
+                "second statement should remain standalone for {target}: {}",
+                statements[1]
+            );
+        }
+    }
+
+    #[test]
+    fn nested_language_dollar_quoted_targets_in_package_body_do_not_close_nested_routine() {
+        for target in ["$$C$$", "$lang$JAVASCRIPT$lang$", "$lang$JAVA$lang$"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_language_dollar_ident AS");
+            engine.process_line("  PROCEDURE p IS");
+            engine.process_line(&format!("    language {target};"));
+            engine.process_line("  BEGIN");
+            engine.process_line("    NULL;");
+            engine.process_line("  END p;");
+            engine.process_line("END pkg_language_dollar_ident;");
+            engine.process_line("SELECT 1 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(
+                statements.len(),
+                2,
+                "unexpected statements for nested target {target}: {statements:?}"
+            );
+            assert!(
+                statements[0].contains(&format!("language {target};")),
+                "package body should keep nested language declaration for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END p;"),
+                "package body should keep nested procedure END for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[0].contains("END pkg_language_dollar_ident"),
+                "package body should close normally for {target}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].starts_with("SELECT 1 FROM dual"),
+                "trailing SELECT should split for {target}: {}",
                 statements[1]
             );
         }
