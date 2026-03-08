@@ -6270,6 +6270,33 @@ BY PRIOR employee_id = manager_id"),
     }
 
     #[test]
+    fn non_cte_with_delegate_option_does_not_leak_into_following_comment_on_function() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("GRANT READ ON DIRECTORY app_dir TO app_user WITH DELEGATE OPTION;");
+        engine.process_line("COMMENT ON FUNCTION app_user.f IS 'ok';");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("GRANT READ ON DIRECTORY app_dir TO app_user WITH DELEGATE OPTION"),
+            "first statement should remain the GRANT statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("COMMENT ON FUNCTION app_user.f IS 'ok'"),
+            "second statement should remain a standalone COMMENT ON FUNCTION statement: {}",
+            statements[1]
+        );
+        assert!(
+            statements[2].starts_with("SELECT 1 FROM dual"),
+            "third statement should remain a standalone SELECT statement: {}",
+            statements[2]
+        );
+    }
+
+    #[test]
     fn non_plsql_grant_with_clause_exits_pending_with_mode_without_semicolon() {
         let mut state = SplitState::default();
 
@@ -6286,6 +6313,24 @@ BY PRIOR employee_id = manager_id"),
             state.with_clause_state,
             WithClauseState::None,
             "WITH GRANT OPTION should immediately exit WITH FUNCTION/PROCEDURE tracking"
+        );
+    }
+
+    #[test]
+    fn non_plsql_grant_with_delegate_option_exits_pending_with_mode_without_semicolon() {
+        let mut state = SplitState::default();
+
+        state.track_top_level_with_plsql("GRANT", true);
+        state.track_top_level_with_plsql("APP_ROLE", false);
+        state.track_top_level_with_plsql("TO", false);
+        state.track_top_level_with_plsql("APP_USER", false);
+        state.track_top_level_with_plsql("WITH", false);
+        state.track_top_level_with_plsql("DELEGATE", false);
+
+        assert_eq!(
+            state.with_clause_state,
+            WithClauseState::None,
+            "WITH DELEGATE OPTION should immediately exit WITH FUNCTION/PROCEDURE tracking"
         );
     }
 

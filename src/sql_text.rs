@@ -681,6 +681,7 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     // WITH FUNCTION/PROCEDURE declaration tracking.
     "GRANT",
     "ADMIN",
+    "DELEGATE",
     "HIERARCHY",
 ];
 
@@ -1212,6 +1213,7 @@ mod tests {
             "CONSTRAINT",
             "GRANT",
             "ADMIN",
+            "DELEGATE",
             "HIERARCHY",
         ] {
             assert!(
