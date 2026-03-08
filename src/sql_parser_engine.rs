@@ -5633,6 +5633,52 @@ BEGIN"
     }
 
     #[test]
+    fn materialized_view_log_with_sequence_resets_pending_with_declaration_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE MATERIALIZED VIEW LOG ON mv_test WITH SEQUENCE;");
+        engine.process_line("SELECT 9 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH SEQUENCE"),
+            "first statement should preserve WITH SEQUENCE clause: {}",
+            statements[0]
+        );
+        assert_eq!(
+            engine.state.with_clause_state,
+            WithClauseState::None,
+            "WITH SEQUENCE should not leave declaration tracking armed"
+        );
+        assert_eq!(statements[1], "SELECT 9 FROM dual".to_string());
+    }
+
+    #[test]
+    fn materialized_view_log_with_commit_scn_resets_pending_with_declaration_mode() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE MATERIALIZED VIEW LOG ON mv_test WITH COMMIT SCN;");
+        engine.process_line("SELECT 10 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("WITH COMMIT SCN"),
+            "first statement should preserve WITH COMMIT SCN clause: {}",
+            statements[0]
+        );
+        assert_eq!(
+            engine.state.with_clause_state,
+            WithClauseState::None,
+            "WITH COMMIT SCN should not leave declaration tracking armed"
+        );
+        assert_eq!(statements[1], "SELECT 10 FROM dual".to_string());
+    }
+
+    #[test]
     fn with_clause_multiple_plsql_declarations_keep_main_query_attached() {
         let mut engine = SqlParserEngine::new();
 
