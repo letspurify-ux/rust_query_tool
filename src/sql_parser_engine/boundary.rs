@@ -558,7 +558,7 @@ impl SymbolRole {
 
         let is_pending_end_separator = matches!(
             ch,
-            ',' | ')' | ']' | '}' | '+' | '*' | '%' | '=' | '<' | '>' | '|'
+            ',' | ']' | '}' | '+' | '*' | '%' | '=' | '<' | '>' | '|'
         ) || (ch == '-' && next != Some('-'))
             || (ch == '/' && next != Some('*'));
 

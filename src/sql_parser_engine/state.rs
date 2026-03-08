@@ -78,8 +78,7 @@ impl SplitState {
                 frame.external_clause_state,
                 ExternalClauseState::SawImplicitLanguageTarget
                     | ExternalClauseState::AwaitingLanguageTargetImplicit
-            ) && (sql_text::is_with_main_query_keyword(token_upper)
-                || sql_text::is_statement_head_keyword(token_upper))
+            )
         })
     }
 
@@ -770,7 +769,7 @@ impl SplitState {
             self.block_stack.truncate(pos);
             true
         } else {
-            self.pop_block_of_kind(BlockKind::TimingPoint)
+            false
         }
     }
 
