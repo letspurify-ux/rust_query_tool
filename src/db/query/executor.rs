@@ -1917,6 +1917,33 @@ impl QueryExecutor {
         trimmed.eq_ignore_ascii_case("SET") || Self::starts_with_ignore_ascii_case(trimmed, "SET ")
     }
 
+    pub(crate) fn is_sql_set_statement_line(trimmed: &str) -> bool {
+        if !Self::is_set_clause_line(trimmed) {
+            return false;
+        }
+
+        let mut parts = trimmed
+            .trim_end_matches(';')
+            .split_whitespace()
+            .map(|part| part.trim_matches(|ch: char| ch == ',' || ch == ';'));
+
+        let Some(first) = parts.next() else {
+            return false;
+        };
+        if !first.eq_ignore_ascii_case("SET") {
+            return false;
+        }
+
+        let Some(second) = parts.next() else {
+            return false;
+        };
+
+        second.eq_ignore_ascii_case("TRANSACTION")
+            || second.eq_ignore_ascii_case("ROLE")
+            || second.eq_ignore_ascii_case("CONSTRAINT")
+            || second.eq_ignore_ascii_case("CONSTRAINTS")
+    }
+
     pub(crate) fn should_force_terminate_on_blank_line(
         sqlblanklines_enabled: bool,
         trimmed: &str,
@@ -2004,6 +2031,10 @@ impl QueryExecutor {
 
     fn line_might_be_tool_command_for_bounds(trimmed: &str) -> bool {
         if trimmed.is_empty() {
+            return false;
+        }
+
+        if Self::is_sql_set_statement_line(trimmed) {
             return false;
         }
 
