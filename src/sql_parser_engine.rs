@@ -2351,7 +2351,23 @@ impl SqlParserEngine {
                 self.state.reset_create_state();
             }
 
-            self.state.flush_token();
+            let has_timing_point_label_end = c == ';'
+                && self.state.pending_end == PendingEnd::End
+                && self.state.allow_timing_point_end_suffix()
+                && matches!(
+                    self.state.token.as_str(),
+                    token if token.eq_ignore_ascii_case("BEFORE")
+                        || token.eq_ignore_ascii_case("AFTER")
+                        || token.eq_ignore_ascii_case("INSTEAD")
+                );
+
+            if has_timing_point_label_end {
+                self.state.pending_end = PendingEnd::None;
+                self.state.token.clear();
+                self.state.token_prefixed_with_dollar = false;
+            } else {
+                self.state.flush_token();
+            }
             self.state.track_with_main_query_symbol(c);
             self.state.observe_external_clause_symbol(c, next);
             on_symbol(chars, i, c, next);
@@ -5344,6 +5360,102 @@ BEGIN"
             statements[0]
         );
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn compound_trigger_nested_labeled_block_named_before_does_not_close_timing_point() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_label_before");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  BEFORE STATEMENT IS");
+        engine.process_line("    <<before>>");
+        engine.process_line("    BEGIN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END before;");
+        engine.process_line("  END BEFORE STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END before"),
+            "labeled nested block should stay inside trigger body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END BEFORE STATEMENT"),
+            "timing-point close should remain attached to compound trigger: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_nested_labeled_block_named_after_does_not_close_timing_point() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_label_after");
+        engine.process_line("FOR INSERT ON t");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  AFTER STATEMENT IS");
+        engine.process_line("    <<after>>");
+        engine.process_line("    BEGIN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END after;");
+        engine.process_line("  END AFTER STATEMENT;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END after"),
+            "labeled nested block should stay inside trigger body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END AFTER STATEMENT"),
+            "timing-point close should remain attached to compound trigger: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn compound_trigger_nested_labeled_block_named_instead_does_not_close_timing_point() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TRIGGER trg_label_instead");
+        engine.process_line("INSTEAD OF INSERT ON v_orders");
+        engine.process_line("COMPOUND TRIGGER");
+        engine.process_line("  INSTEAD OF EACH ROW IS");
+        engine.process_line("    <<instead>>");
+        engine.process_line("    BEGIN");
+        engine.process_line("      NULL;");
+        engine.process_line("    END instead;");
+        engine.process_line("  END INSTEAD OF EACH ROW;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END instead"),
+            "labeled nested block should stay inside trigger body: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END INSTEAD OF EACH ROW"),
+            "timing-point close should remain attached to compound trigger: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
 
     #[test]
