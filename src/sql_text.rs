@@ -665,6 +665,9 @@ const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
 const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     "READ",
     "CHECK",
+    "NO",
+    "DATA",
+    "TIES",
     "CONSTRAINT",
     "ROWID",
     "OBJECT",
@@ -1198,6 +1201,9 @@ mod tests {
         for keyword in [
             "READ",
             "CHECK",
+            "NO",
+            "DATA",
+            "TIES",
             "ROWID",
             "OBJECT",
             "PRIMARY",
