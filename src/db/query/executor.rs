@@ -1962,7 +1962,11 @@ impl QueryExecutor {
         };
 
         let rest = rest.trim_start();
-        rest.starts_with("--") || rest.starts_with("/*")
+        if rest.starts_with("/*") {
+            return true;
+        }
+
+        sql_text::is_sqlplus_comment_line(rest)
     }
 
     pub(crate) fn should_force_terminate_lone_semicolon(
