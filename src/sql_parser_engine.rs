@@ -1834,6 +1834,7 @@ impl SqlParserEngine {
         self.state.pending_do = PendingDo::None;
         self.state.if_state = IfState::None;
         self.state.paren_depth = 0;
+        self.state.with_clause_state = WithClauseState::None;
     }
 
     fn push_current_statement(&mut self) {
@@ -5615,6 +5616,65 @@ BEGIN"
                 statements[0].contains("WITH FUNCTION f RETURN NUMBER IS"),
                 "first statement should include WITH FUNCTION declaration for {head}: {}",
                 statements[0]
+            );
+        }
+    }
+
+    #[test]
+    fn with_function_recovery_splits_before_non_main_query_statement_heads() {
+        let cases = [
+            (
+                "CREATE TABLE",
+                vec![
+                    "CREATE TABLE wf_recovery_t (id NUMBER);",
+                    "SELECT 42 FROM dual;",
+                ],
+            ),
+            (
+                "ALTER SESSION",
+                vec![
+                    "ALTER SESSION SET NLS_DATE_FORMAT = ''YYYY-MM-DD'';",
+                    "SELECT 43 FROM dual;",
+                ],
+            ),
+            (
+                "AUDIT",
+                vec!["AUDIT SESSION;", "SELECT 44 FROM dual;"],
+            ),
+        ];
+
+        for (head, lines) in cases {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+            engine.process_line("BEGIN");
+            engine.process_line("  RETURN 1;");
+            engine.process_line("END;");
+
+            for line in lines {
+                engine.process_line(line);
+            }
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(
+                statements.len(),
+                3,
+                "{head} should be parsed as a standalone statement after WITH FUNCTION recovery: {statements:?}"
+            );
+            assert!(
+                statements[0].contains("WITH FUNCTION f RETURN NUMBER IS"),
+                "first statement should remain the completed WITH FUNCTION declaration for {head}: {}",
+                statements[0]
+            );
+            assert!(
+                statements[1].starts_with(head),
+                "second statement should start with {head}: {}",
+                statements[1]
+            );
+            assert!(
+                statements[2].starts_with("SELECT"),
+                "third statement should preserve trailing SELECT after {head}: {}",
+                statements[2]
             );
         }
     }
