@@ -2953,6 +2953,55 @@ SELECT 1 FROM DUAL;"#;
 }
 
 #[test]
+fn test_slash_terminator_with_sqlplus_rem_comment() {
+    let sql = r#"CREATE PROCEDURE test_proc AS
+BEGIN
+  NULL;
+END
+/ REM execute block
+SELECT 1 FROM DUAL;"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "slash terminator with REM comment should split, got: {:?}",
+        stmts
+    );
+}
+
+#[test]
+fn test_split_format_items_slash_terminator_with_sqlplus_remark_comment() {
+    let sql = r#"CREATE PROCEDURE test_proc AS
+BEGIN
+  NULL;
+END
+/ remark execute block
+SELECT 1 FROM DUAL;"#;
+    let items = QueryExecutor::split_format_items(sql);
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "split_format_items should split slash+REMARK terminator, got: {:?}",
+        statements
+    );
+    assert_eq!(slash_count, 1, "slash delimiter should be preserved once");
+}
+
+#[test]
 fn test_split_format_items_slash_terminator_after_end_without_semicolon() {
     let sql = r#"CREATE PROCEDURE test_proc AS
 BEGIN
