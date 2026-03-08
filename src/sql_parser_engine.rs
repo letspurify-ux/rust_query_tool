@@ -1365,8 +1365,7 @@ impl SplitState {
     }
 
     fn finalize_external_clause_on_semicolon(&mut self) {
-        let allow_implicit_target_split = !(self.block_depth() == 1
-            && matches!(self.create_plsql_kind, CreatePlsqlKind::Procedure));
+        let allow_implicit_target_split = true;
 
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.finalize_external_clause_on_semicolon(allow_implicit_target_split);
@@ -6755,6 +6754,27 @@ BEGIN"
             "SHUTDOWN command should begin a new statement after external routine split: {}",
             statements[1]
         );
+    }
+
+    #[test]
+    fn procedure_with_implicit_language_target_splits_before_following_statement() {
+        for target in ["C", "JAVASCRIPT", "MLE"] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE PROCEDURE ext_proc_implicit");
+            engine.process_line(&format!("AS LANGUAGE {target};"));
+            engine.process_line("SELECT 1 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+
+            assert_eq!(statements.len(), 2, "unexpected statements for {target}: {statements:?}");
+            assert!(
+                statements[0].contains(&format!("AS LANGUAGE {target};")),
+                "first statement should keep implicit language target clause for {target}: {}",
+                statements[0]
+            );
+            assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+        }
     }
 
     #[test]
