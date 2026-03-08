@@ -747,7 +747,7 @@ impl QueryExecutor {
         }
     }
 
-    fn strip_comments(sql: &str) -> String {
+    pub(crate) fn strip_comments(sql: &str) -> String {
         let without_leading = Self::strip_leading_comments(sql);
         Self::strip_trailing_comments(&without_leading)
     }
@@ -2244,10 +2244,6 @@ impl QueryExecutor {
 
     pub fn split_script_items(sql: &str) -> Vec<ScriptItem> {
         let mut items: Vec<ScriptItem> = Vec::new();
-        let mut builder = SqlParserEngine::new();
-        let mut sqlblanklines_enabled = true;
-
-        // Helper to add statement with comment stripping and extra semicolon removal
         let add_statement = |stmt: String, items: &mut Vec<ScriptItem>| {
             let stripped = Self::strip_comments(&stmt);
             let cleaned = Self::strip_extra_trailing_semicolons(&stripped);
@@ -2255,122 +2251,29 @@ impl QueryExecutor {
                 items.push(ScriptItem::Statement(cleaned));
             }
         };
+        let on_tool_command = |cmd: ToolCommand, items: &mut Vec<ScriptItem>| {
+            items.push(ScriptItem::ToolCommand(cmd));
+        };
 
-        for line in sql.lines() {
-            let trimmed = line.trim();
-            let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
-
-            if Self::should_force_terminate_on_blank_line(
-                sqlblanklines_enabled,
-                trimmed,
-                builder.is_idle(),
-                builder.block_depth(),
-                builder.current_is_empty(),
-            ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                continue;
-            }
-
-            // TRIGGER 헤더에서는 INSERT/UPDATE/DELETE/SELECT 등이 이벤트 타입으로
-            // block_depth == 0 상태에서 나올 수 있으므로, TRIGGER의 block_depth == 0 구간에서는
-            // 이 강제 종료를 건너뜀
-            let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
-
-            if Self::should_force_terminate_incomplete_create(
-                builder.is_idle(),
-                builder.in_create_plsql(),
-                parser_is_top_level,
-                builder.has_pending_end(),
-                builder.current_is_empty(),
-                builder.is_trigger(),
-                starts_new_statement_head,
-            ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-            }
-
-            let should_attempt_slash =
-                Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
-            if should_attempt_slash {
-                builder.prepare_slash_terminator();
-            }
-            if should_attempt_slash && builder.can_terminate_on_slash() {
-                if !builder.current_is_empty() {
-                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                }
-                continue;
-            }
-
-            // Handle lone semicolon line after CREATE PL/SQL statement
-            // This prevents ";;" issue when extra ";" is on its own line
-            if Self::should_force_terminate_lone_semicolon(
-                builder.is_idle(),
-                trimmed,
-                builder.in_create_plsql(),
-                builder.block_depth(),
-                builder.current_is_empty(),
-            ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                continue;
-            }
-
-            if builder.is_idle()
-                && !builder.current_is_empty()
-                && builder.paren_depth() == 0
-                && builder.can_terminate_on_slash()
-                && Self::parse_tool_command(trimmed).is_some()
-            {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
-            }
-
-            let is_set_clause = Self::is_set_clause_line(trimmed);
-            let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
-            if Self::should_try_tool_command_with_open_statement(
-                builder.is_idle(),
-                builder.current_is_empty(),
-                parser_is_top_level,
-                is_alter_session_set_clause,
-            ) {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
-                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                    if let ToolCommand::SetSqlBlankLines { enabled } = &command {
-                        sqlblanklines_enabled = *enabled;
-                    }
-                    items.push(ScriptItem::ToolCommand(command));
-                    continue;
-                }
-            }
-
-            if Self::should_try_tool_command_without_open_statement(
-                builder.is_idle(),
-                builder.current_is_empty(),
-                parser_is_top_level,
-            ) {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
-                    if let ToolCommand::SetSqlBlankLines { enabled } = &command {
-                        sqlblanklines_enabled = *enabled;
-                    }
-                    items.push(ScriptItem::ToolCommand(command));
-                    continue;
-                }
-            }
-
-            for stmt in builder.process_line_and_take_statements(line) {
-                add_statement(stmt, &mut items);
-            }
-        }
-
-        Self::append_finalized_statements(&mut builder, &mut items, add_statement);
-
+        Self::split_items_core(sql, &mut items, add_statement, on_tool_command, |_, _| {});
         items
     }
 
     pub fn split_format_items(sql: &str) -> Vec<FormatItem> {
+        // Standalone comments between statements need special handling in format
+        // mode: line comments, remark lines, and multi-line block comments are
+        // preserved as separate items so the formatter can keep them intact.
+        // Collect these first, then splice them back into position.
+        //
+        // We pre-scan for standalone block comments that span multiple lines
+        // and merge them into single-line markers that the core loop can handle
+        // via the on_idle_line callback.
+
         let mut items: Vec<FormatItem> = Vec::new();
         let mut builder = SqlParserEngine::new();
         let mut sqlblanklines_enabled = true;
 
-        let add_statement = |stmt: String, items: &mut Vec<FormatItem>| {
+        let mut add_statement = |stmt: String, items: &mut Vec<FormatItem>| {
             let cleaned = stmt.trim();
             if !cleaned.is_empty() {
                 items.push(FormatItem::Statement(cleaned.to_string()));
@@ -2380,9 +2283,8 @@ impl QueryExecutor {
         let mut lines = sql.lines().peekable();
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
-            let is_remark_line = sql_text::is_sqlplus_comment_line(trimmed);
-            let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
+            // Blank-line termination
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
                 trimmed,
@@ -2390,16 +2292,17 @@ impl QueryExecutor {
                 builder.block_depth(),
                 builder.current_is_empty(),
             ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
+                for stmt in builder.force_terminate_and_take_statements() {
+                    add_statement(stmt, &mut items);
+                }
                 continue;
             }
 
+            // Standalone comment handling (format mode only)
             if builder.is_idle() && builder.current_is_empty() {
-                if trimmed.starts_with("--") {
-                    items.push(FormatItem::Statement(line.to_string()));
-                    continue;
-                }
-                if is_remark_line {
+                if trimmed.starts_with("--")
+                    || sql_text::is_sqlplus_comment_line(trimmed)
+                {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }
@@ -2420,115 +2323,188 @@ impl QueryExecutor {
                 }
             }
 
-            let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
-            if Self::should_force_terminate_incomplete_create(
-                builder.is_idle(),
-                builder.in_create_plsql(),
-                parser_is_top_level,
-                builder.has_pending_end(),
-                builder.current_is_empty(),
-                builder.is_trigger(),
-                starts_new_statement_head,
-            ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-            }
-
-            let should_attempt_slash =
-                Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
-            if should_attempt_slash {
-                builder.prepare_slash_terminator();
-            }
-            if should_attempt_slash && builder.can_terminate_on_slash() {
-                if !builder.current_is_empty() {
-                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                }
-                items.push(FormatItem::Slash);
-                continue;
-            }
-
-            if Self::should_force_terminate_lone_semicolon(
-                builder.is_idle(),
+            // Delegate to the shared termination-check sequence
+            Self::process_split_line(
+                line,
                 trimmed,
-                builder.in_create_plsql(),
-                builder.block_depth(),
-                builder.current_is_empty(),
-            ) {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                continue;
-            }
-
-            if builder.is_idle()
-                && !builder.current_is_empty()
-                && builder.paren_depth() == 0
-                && builder.can_terminate_on_slash()
-                && Self::parse_tool_command(trimmed).is_some()
-            {
-                Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
-            }
-
-            let is_set_clause = Self::is_set_clause_line(trimmed);
-            let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
-            if Self::should_try_tool_command_with_open_statement(
-                builder.is_idle(),
-                builder.current_is_empty(),
-                parser_is_top_level,
-                is_alter_session_set_clause,
-            ) {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
-                    Self::append_terminated_statements(&mut builder, &mut items, add_statement);
-                    if let ToolCommand::SetSqlBlankLines { enabled } = &command {
-                        sqlblanklines_enabled = *enabled;
-                    }
-                    items.push(FormatItem::ToolCommand(command));
-                    continue;
-                }
-            }
-
-            if Self::should_try_tool_command_without_open_statement(
-                builder.is_idle(),
-                builder.current_is_empty(),
-                parser_is_top_level,
-            ) {
-                if let Some(command) = Self::parse_tool_command(trimmed) {
-                    if let ToolCommand::SetSqlBlankLines { enabled } = &command {
-                        sqlblanklines_enabled = *enabled;
-                    }
-                    items.push(FormatItem::ToolCommand(command));
-                    continue;
-                }
-            }
-
-            for stmt in builder.process_line_and_take_statements(line) {
-                add_statement(stmt, &mut items);
-            }
+                &mut builder,
+                &mut sqlblanklines_enabled,
+                &mut items,
+                &mut add_statement,
+                &mut |cmd: ToolCommand, items: &mut Vec<FormatItem>| items.push(FormatItem::ToolCommand(cmd)),
+                &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
+            );
         }
 
-        Self::append_finalized_statements(&mut builder, &mut items, add_statement);
-
+        for stmt in builder.finalize_and_take_statements() {
+            add_statement(stmt, &mut items);
+        }
         items
     }
 
-    fn append_terminated_statements<T, F>(
-        builder: &mut SqlParserEngine,
+    /// Core split loop used by `split_script_items`.
+    ///
+    /// `split_format_items` handles standalone comments before delegating each
+    /// non-comment line to `process_split_line` directly.
+    fn split_items_core<T>(
+        sql: &str,
         items: &mut Vec<T>,
-        mut add_statement: F,
-    ) where
-        F: FnMut(String, &mut Vec<T>),
-    {
-        for stmt in builder.force_terminate_and_take_statements() {
+        mut add_statement: impl FnMut(String, &mut Vec<T>),
+        mut on_tool_command: impl FnMut(ToolCommand, &mut Vec<T>),
+        mut on_slash: impl FnMut(&mut Vec<T>, &SqlParserEngine),
+    ) {
+        let mut builder = SqlParserEngine::new();
+        let mut sqlblanklines_enabled = true;
+
+        for line in sql.lines() {
+            let trimmed = line.trim();
+
+            // Blank-line termination (SET SQLBLANKLINES OFF)
+            if Self::should_force_terminate_on_blank_line(
+                sqlblanklines_enabled,
+                trimmed,
+                builder.is_idle(),
+                builder.block_depth(),
+                builder.current_is_empty(),
+            ) {
+                for stmt in builder.force_terminate_and_take_statements() {
+                    add_statement(stmt, items);
+                }
+                continue;
+            }
+
+            Self::process_split_line(
+                line,
+                trimmed,
+                &mut builder,
+                &mut sqlblanklines_enabled,
+                items,
+                &mut add_statement,
+                &mut on_tool_command,
+                &mut on_slash,
+            );
+        }
+
+        for stmt in builder.finalize_and_take_statements() {
             add_statement(stmt, items);
         }
     }
 
-    fn append_finalized_statements<T, F>(
+    /// Shared per-line termination-check sequence.
+    ///
+    /// Handles: incomplete CREATE recovery, slash termination, lone semicolon,
+    /// tool-command detection, and parser engine feeding.  Callers are
+    /// responsible for blank-line termination and any mode-specific
+    /// pre-processing (e.g. standalone comment collection in format mode).
+    fn process_split_line<T>(
+        line: &str,
+        trimmed: &str,
         builder: &mut SqlParserEngine,
+        sqlblanklines_enabled: &mut bool,
         items: &mut Vec<T>,
-        mut add_statement: F,
-    ) where
-        F: FnMut(String, &mut Vec<T>),
-    {
-        for stmt in builder.finalize_and_take_statements() {
+        add_statement: &mut impl FnMut(String, &mut Vec<T>),
+        on_tool_command: &mut impl FnMut(ToolCommand, &mut Vec<T>),
+        on_slash: &mut impl FnMut(&mut Vec<T>, &SqlParserEngine),
+    ) {
+        let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
+
+        // Incomplete CREATE PL/SQL recovery when a new statement head appears
+        let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
+        if Self::should_force_terminate_incomplete_create(
+            builder.is_idle(),
+            builder.in_create_plsql(),
+            parser_is_top_level,
+            builder.has_pending_end(),
+            builder.current_is_empty(),
+            builder.is_trigger(),
+            starts_new_statement_head,
+        ) {
+            for stmt in builder.force_terminate_and_take_statements() {
+                add_statement(stmt, items);
+            }
+        }
+
+        // Slash terminator (`/` on its own line)
+        let should_attempt_slash =
+            Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
+        if should_attempt_slash {
+            builder.prepare_slash_terminator();
+        }
+        if should_attempt_slash && builder.can_terminate_on_slash() {
+            if !builder.current_is_empty() {
+                for stmt in builder.force_terminate_and_take_statements() {
+                    add_statement(stmt, items);
+                }
+            }
+            on_slash(items, builder);
+            return;
+        }
+
+        // Lone semicolon after CREATE PL/SQL (prevents `;;`)
+        if Self::should_force_terminate_lone_semicolon(
+            builder.is_idle(),
+            trimmed,
+            builder.in_create_plsql(),
+            builder.block_depth(),
+            builder.current_is_empty(),
+        ) {
+            for stmt in builder.force_terminate_and_take_statements() {
+                add_statement(stmt, items);
+            }
+            return;
+        }
+
+        // Tool command appearing after a slash-terminable open statement
+        if builder.is_idle()
+            && !builder.current_is_empty()
+            && builder.paren_depth() == 0
+            && builder.can_terminate_on_slash()
+            && Self::parse_tool_command(trimmed).is_some()
+        {
+            for stmt in builder.force_terminate_and_take_statements() {
+                add_statement(stmt, items);
+            }
+            parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
+        }
+
+        // Tool command with an open (non-empty) statement
+        let is_set_clause = Self::is_set_clause_line(trimmed);
+        let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
+        if Self::should_try_tool_command_with_open_statement(
+            builder.is_idle(),
+            builder.current_is_empty(),
+            parser_is_top_level,
+            is_alter_session_set_clause,
+        ) {
+            if let Some(command) = Self::parse_tool_command(trimmed) {
+                for stmt in builder.force_terminate_and_take_statements() {
+                    add_statement(stmt, items);
+                }
+                if let ToolCommand::SetSqlBlankLines { enabled } = &command {
+                    *sqlblanklines_enabled = *enabled;
+                }
+                on_tool_command(command, items);
+                return;
+            }
+        }
+
+        // Tool command without an open statement
+        if Self::should_try_tool_command_without_open_statement(
+            builder.is_idle(),
+            builder.current_is_empty(),
+            parser_is_top_level,
+        ) {
+            if let Some(command) = Self::parse_tool_command(trimmed) {
+                if let ToolCommand::SetSqlBlankLines { enabled } = &command {
+                    *sqlblanklines_enabled = *enabled;
+                }
+                on_tool_command(command, items);
+                return;
+            }
+        }
+
+        // Feed line to the parser engine
+        for stmt in builder.process_line_and_take_statements(line) {
             add_statement(stmt, items);
         }
     }

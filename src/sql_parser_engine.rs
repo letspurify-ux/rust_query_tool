@@ -262,7 +262,7 @@ impl RoutineFrame {
                 return;
             }
 
-            if from_external && token_upper.chars().all(sql_text::is_identifier_char) {
+            if from_external && token_upper.bytes().all(sql_text::is_identifier_byte) {
                 self.mark_external_clause();
                 return;
             }
@@ -1469,48 +1469,30 @@ impl SplitState {
 
         if self.create_state == CreateState::AwaitingObjectType {
             match upper {
-                "OR" => {
-                    return;
-                }
-                "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE" => {
-                    return;
-                }
-                "IF" | "NOT" | "EXISTS" => {
-                    return;
-                }
-                "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING" | "FORWARD"
-                | "REVERSE" | "CROSSEDITION" => {
-                    return;
-                }
+                // Modifiers that appear between CREATE and the object type keyword
+                "OR" | "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE"
+                | "IF" | "NOT" | "EXISTS"
+                | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING"
+                | "FORWARD" | "REVERSE" | "CROSSEDITION"
+                | "SHARING" | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
+
+                // TYPE BODY member modifiers — only skip when inside type body
                 "MEMBER" | "STATIC" | "CONSTRUCTOR" | "MAP" | "ORDER" | "FINAL"
-                | "INSTANTIABLE" | "OVERRIDING" => {
-                    if self.create_plsql_kind == CreatePlsqlKind::TypeBody {
-                        return;
-                    }
-                }
-                "SHARING" | "METADATA" | "DATA" | "EXTENDED" | "NONE" => {
-                    return;
-                }
+                | "INSTANTIABLE" | "OVERRIDING"
+                    if self.create_plsql_kind == CreatePlsqlKind::TypeBody => return,
+
                 "JAVA" => {
                     self.create_state = CreateState::AwaitingJavaTarget;
                     return;
                 }
-                "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TYPE" | "TRIGGER" => {
-                    self.create_plsql_kind = match upper {
-                        "PROCEDURE" => CreatePlsqlKind::Procedure,
-                        "FUNCTION" => CreatePlsqlKind::Function,
-                        "PACKAGE" => CreatePlsqlKind::Package,
-                        "TYPE" => CreatePlsqlKind::TypeSpecAwaitingBody,
-                        "TRIGGER" => CreatePlsqlKind::Trigger(TriggerKind::Simple),
-                        _ => CreatePlsqlKind::None,
-                    };
-                    self.create_state = CreateState::None;
-                    return;
-                }
-                _ => {
-                    self.create_state = CreateState::None;
-                }
+                "PROCEDURE" => { self.create_plsql_kind = CreatePlsqlKind::Procedure; }
+                "FUNCTION"  => { self.create_plsql_kind = CreatePlsqlKind::Function; }
+                "PACKAGE"   => { self.create_plsql_kind = CreatePlsqlKind::Package; }
+                "TYPE"      => { self.create_plsql_kind = CreatePlsqlKind::TypeSpecAwaitingBody; }
+                "TRIGGER"   => { self.create_plsql_kind = CreatePlsqlKind::Trigger(TriggerKind::Simple); }
+                _ => {}
             }
+            self.create_state = CreateState::None;
         }
 
         if upper == "CREATE" {
@@ -1690,54 +1672,11 @@ fn is_external_language_target(token_upper: &str) -> bool {
     sql_text::is_external_language_target_keyword(token_upper)
 }
 
-fn is_line_leading_run_script_marker(chars: &[char], marker_idx: usize) -> bool {
-    if chars.get(marker_idx).copied() != Some('@') {
-        return false;
-    }
-
-    let mut lookbehind = marker_idx;
-    while lookbehind > 0 {
-        let prev_idx = lookbehind - 1;
-        let Some(prev) = chars.get(prev_idx).copied() else {
-            break;
-        };
-        if prev == '\n' {
-            break;
-        }
-        if !prev.is_whitespace() {
-            return false;
-        }
-        lookbehind = prev_idx;
-    }
-
-    true
-}
-
-fn is_line_leading_bang_host_marker(chars: &[char], marker_idx: usize) -> bool {
-    if chars.get(marker_idx).copied() != Some('!') {
-        return false;
-    }
-
-    let mut lookbehind = marker_idx;
-    while lookbehind > 0 {
-        let prev_idx = lookbehind - 1;
-        let Some(prev) = chars.get(prev_idx).copied() else {
-            break;
-        };
-        if prev == '\n' {
-            break;
-        }
-        if !prev.is_whitespace() {
-            return false;
-        }
-        lookbehind = prev_idx;
-    }
-
-    true
-}
-
-fn is_line_leading_open_paren_marker(chars: &[char], marker_idx: usize) -> bool {
-    if chars.get(marker_idx).copied() != Some('(') {
+/// Check if `chars[marker_idx]` is the first non-whitespace character on its
+/// line, i.e. only whitespace (or start-of-input) precedes it since the last
+/// newline.  The expected character must match `expected`.
+fn is_line_leading_char(chars: &[char], marker_idx: usize, expected: char) -> bool {
+    if chars.get(marker_idx).copied() != Some(expected) {
         return false;
     }
 
@@ -1760,25 +1699,13 @@ fn is_line_leading_open_paren_marker(chars: &[char], marker_idx: usize) -> bool 
 }
 
 fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
-    if chars.get(marker_idx) != Some(&'/') {
+    if !is_line_leading_char(chars, marker_idx, '/') {
         return false;
     }
 
-    if chars.iter().take(marker_idx).any(|ch| !ch.is_whitespace()) {
-        return false;
-    }
-
+    // After `/`, only whitespace, newline, line comment, or REM/REMARK is allowed.
     let mut idx = marker_idx + 1;
-    while idx < chars.len() {
-        let ch = chars[idx];
-        if ch == '\n' {
-            return true;
-        }
-
-        if !ch.is_whitespace() {
-            break;
-        }
-
+    while idx < chars.len() && chars[idx] != '\n' && chars[idx].is_whitespace() {
         idx += 1;
     }
 
@@ -2081,30 +2008,18 @@ impl SqlParserEngine {
                     i += 1;
                     continue;
                 }
-                LexMode::DollarQuote { .. } => {
-                    // Need to extract tag to check for closing.
-                    // We reborrow via a match to satisfy the borrow checker.
-                    let tag_matches = if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
-                        c == '$' && chars_starts_with(chars, i, tag)
-                    } else {
-                        false
-                    };
-                    if tag_matches {
-                        let tag_len = if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
-                            let tl = tag.len();
-                            for quote_ch in tag.chars() {
-                                self.current.push(quote_ch);
-                            }
-                            tl
-                        } else {
-                            0
-                        };
+                LexMode::DollarQuote { tag } => {
+                    if c == '$' && chars_starts_with(chars, i, tag) {
+                        let tag_len = tag.len();
+                        for k in 0..tag_len {
+                            self.current.push(chars[i + k]);
+                        }
                         self.state.lex_mode = LexMode::Idle;
                         i += tag_len;
-                        continue;
+                    } else {
+                        self.current.push(c);
+                        i += 1;
                     }
-                    self.current.push(c);
-                    i += 1;
                     continue;
                 }
                 LexMode::SingleQuote => {
@@ -2191,116 +2106,72 @@ impl SqlParserEngine {
                 continue;
             }
 
-            // nq'[...]'/uq'[...]'
-            if self.state.token.is_empty()
-                && matches!(c, 'n' | 'N' | 'u' | 'U')
-                && (next == Some('q') || next == Some('Q'))
-                && i + 2 < len
-                && chars[i + 2] == '\''
-            {
-                if let Some(&delimiter) = chars.get(i + 3) {
-                    if !is_valid_q_quote_delimiter(delimiter) {
-                        // Oracle q-quote delimiters cannot be whitespace.
-                        // Fall back to regular token/quote parsing.
-                        self.current.push(c);
-                        self.state.token.push(c);
-                        i += 1;
+            // Q-quote literals: q'[...]' and nq'[...]'/uq'[...]'
+            // Detect the start position of the q/Q character and the delimiter.
+            if self.state.token.is_empty() {
+                let (q_prefix_len, q_idx) =
+                    if matches!(c, 'n' | 'N' | 'u' | 'U')
+                        && matches!(next, Some('q' | 'Q'))
+                        && i + 2 < len
+                        && chars[i + 2] == '\''
+                    {
+                        (4, i + 3) // nq'D or uq'D
+                    } else if matches!(c, 'q' | 'Q') && next == Some('\'') {
+                        (3, i + 2) // q'D
+                    } else {
+                        (0, 0)
+                    };
+
+                if q_prefix_len > 0 {
+                    if let Some(&delimiter) = chars.get(q_idx) {
+                        if !is_valid_q_quote_delimiter(delimiter) {
+                            self.current.push(c);
+                            self.state.token.push(c);
+                            i += 1;
+                            continue;
+                        }
+                        self.state.flush_token();
+                        let allow_implicit_target =
+                            self.state.allow_implicit_external_literal_target();
+                        self.state
+                            .observe_external_clause_literal_target(allow_implicit_target);
+                        self.state.start_q_quote(delimiter);
+                        for k in 0..q_prefix_len {
+                            self.current.push(chars[i + k]);
+                        }
+                        i += q_prefix_len;
                         continue;
                     }
-                    self.state.flush_token();
-                    let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                    self.state
-                        .observe_external_clause_literal_target(allow_implicit_target);
-                    self.state.start_q_quote(delimiter);
-                    self.current.push(c);
-                    self.current.push(chars[i + 1]);
-                    self.current.push('\'');
-                    self.current.push(delimiter);
-                    i += 4;
-                    continue;
                 }
             }
 
-            // q'[...]'
-            if self.state.token.is_empty() && (c == 'q' || c == 'Q') && next == Some('\'') {
-                if let Some(delimiter) = next2 {
-                    if !is_valid_q_quote_delimiter(delimiter) {
-                        self.current.push(c);
-                        self.state.token.push(c);
-                        i += 1;
-                        continue;
-                    }
+            // Prefixed string literals: n'...', b'...', x'...', u'...', u&'...'
+            if self.state.token.is_empty()
+                && matches!(c, 'n' | 'N' | 'b' | 'B' | 'x' | 'X' | 'u' | 'U')
+            {
+                // u&'...' (3-char prefix)
+                let (is_prefixed_quote, prefix_len) =
+                    if (c == 'u' || c == 'U') && next == Some('&') && next2 == Some('\'') {
+                        (true, 3)
+                    } else if next == Some('\'') {
+                        (true, 2)
+                    } else {
+                        (false, 0)
+                    };
+
+                if is_prefixed_quote {
                     self.state.flush_token();
-                    let allow_implicit_target = self.state.allow_implicit_external_literal_target();
+                    let allow_implicit_target =
+                        self.state.allow_implicit_external_literal_target();
                     self.state
                         .observe_external_clause_literal_target(allow_implicit_target);
-                    self.state.start_q_quote(delimiter);
-                    self.current.push(c);
-                    self.current.push('\'');
-                    self.current.push(delimiter);
-                    i += 3;
+                    self.state.lex_mode = LexMode::SingleQuote;
+                    for k in 0..prefix_len {
+                        self.current.push(chars[i + k]);
+                    }
+                    i += prefix_len;
                     continue;
                 }
-            }
-
-            // n'...'
-            if self.state.token.is_empty() && (c == 'n' || c == 'N') && next == Some('\'') {
-                self.state.flush_token();
-                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                self.state
-                    .observe_external_clause_literal_target(allow_implicit_target);
-                self.state.lex_mode = LexMode::SingleQuote;
-                self.current.push(c);
-                self.current.push('\'');
-                i += 2;
-                continue;
-            }
-
-            // b'...'/x'...'
-            if self.state.token.is_empty()
-                && matches!(c, 'b' | 'B' | 'x' | 'X')
-                && next == Some('\'')
-            {
-                self.state.flush_token();
-                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                self.state
-                    .observe_external_clause_literal_target(allow_implicit_target);
-                self.state.lex_mode = LexMode::SingleQuote;
-                self.current.push(c);
-                self.current.push('\'');
-                i += 2;
-                continue;
-            }
-
-            // u'...'
-            if self.state.token.is_empty() && (c == 'u' || c == 'U') && next == Some('\'') {
-                self.state.flush_token();
-                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                self.state
-                    .observe_external_clause_literal_target(allow_implicit_target);
-                self.state.lex_mode = LexMode::SingleQuote;
-                self.current.push(c);
-                self.current.push('\'');
-                i += 2;
-                continue;
-            }
-
-            // u&'...'
-            if self.state.token.is_empty()
-                && (c == 'u' || c == 'U')
-                && next == Some('&')
-                && next2 == Some('\'')
-            {
-                self.state.flush_token();
-                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                self.state
-                    .observe_external_clause_literal_target(allow_implicit_target);
-                self.state.lex_mode = LexMode::SingleQuote;
-                self.current.push(c);
-                self.current.push('&');
-                self.current.push('\'');
-                i += 3;
-                continue;
             }
 
             // $$tag$$
@@ -2313,12 +2184,11 @@ impl SqlParserEngine {
                     let tag_len = tag.len();
                     self.state.flush_token();
                     self.state.observe_external_clause_literal_target(true);
-                    self.state.lex_mode = LexMode::DollarQuote { tag };
-                    if let LexMode::DollarQuote { tag } = &self.state.lex_mode {
-                        for quote_ch in tag.chars() {
-                            self.current.push(quote_ch);
-                        }
+                    // Push tag chars to current before moving tag into lex_mode.
+                    for k in 0..tag_len {
+                        self.current.push(chars[i + k]);
                     }
+                    self.state.lex_mode = LexMode::DollarQuote { tag };
                     i += tag_len;
                     continue;
                 }
@@ -2372,8 +2242,8 @@ impl SqlParserEngine {
                 && self.state.block_depth() == 0
                 && self.state.paren_depth == 0
                 && self.state.token.is_empty()
-                && ((c == '@' && is_line_leading_run_script_marker(chars, i))
-                    || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                && ((c == '@' && is_line_leading_char(chars, i, '@'))
+                    || (c == '!' && is_line_leading_char(chars, i, '!'))
                     || (c == '/' && is_line_leading_slash_marker(chars, i)))
             {
                 self.push_current_statement();
@@ -2391,10 +2261,10 @@ impl SqlParserEngine {
 
             if self.state.token.is_empty()
                 && ((should_split_pending_implicit_external
-                    && ((c == '@' && is_line_leading_run_script_marker(chars, i))
-                        || (c == '!' && is_line_leading_bang_host_marker(chars, i))
+                    && ((c == '@' && is_line_leading_char(chars, i, '@'))
+                        || (c == '!' && is_line_leading_char(chars, i, '!'))
                         || (c == '/' && is_line_leading_slash_marker(chars, i))
-                        || (c == '(' && is_line_leading_open_paren_marker(chars, i))))
+                        || (c == '(' && is_line_leading_char(chars, i, '('))))
                     || (should_split_forced_external_on_slash
                         && c == '/'
                         && is_line_leading_slash_marker(chars, i)))

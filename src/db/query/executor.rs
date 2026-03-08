@@ -53,100 +53,51 @@ impl QueryExecutor {
         }
     }
 
-    fn tokenized_upper(sql: &str) -> Vec<String> {
-        let mut normalized = String::with_capacity(sql.len());
-        let mut chars = sql.chars().peekable();
-        let mut in_single_quote = false;
-        let mut in_double_quote = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while let Some(ch) = chars.next() {
-            let next = chars.peek().copied();
-
-            if in_line_comment {
-                if ch == '\n' {
-                    in_line_comment = false;
-                    normalized.push(' ');
-                }
-                continue;
+    /// Check if the SQL (after stripping comments and trailing semicolons)
+    /// matches a single keyword optionally followed by WORK.
+    fn is_plain_keyword(sql: &str, keyword: &str) -> bool {
+        let stripped = Self::strip_leading_comments(sql);
+        // Remove trailing block comments, line comments, and semicolons.
+        // Inline `-- comment` on the same line needs special handling since
+        // strip_trailing_comments only removes whole-line trailing comments.
+        let trimmed = stripped.trim().trim_end_matches(';').trim();
+        // Find first `--` outside quotes to strip inline line comment
+        let effective = if let Some(pos) = trimmed.find("--") {
+            trimmed[..pos].trim()
+        } else {
+            trimmed
+        };
+        // Strip trailing block comments (e.g. `COMMIT /* ... */`)
+        let effective = if effective.ends_with("*/") {
+            if let Some(start) = effective.rfind("/*") {
+                effective[..start].trim()
+            } else {
+                effective
             }
-
-            if in_block_comment {
-                if ch == '*' && next == Some('/') {
-                    in_block_comment = false;
-                    normalized.push(' ');
-                    let _ = chars.next();
-                    continue;
-                }
-                continue;
-            }
-
-            if in_single_quote {
-                if ch == '\'' {
-                    if next == Some('\'') {
-                        let _ = chars.next();
-                        continue;
-                    }
-                    in_single_quote = false;
-                }
-                continue;
-            }
-
-            if in_double_quote {
-                if ch == '"' {
-                    if next == Some('"') {
-                        let _ = chars.next();
-                        continue;
-                    }
-                    in_double_quote = false;
-                }
-                continue;
-            }
-
-            if ch == '-' && next == Some('-') {
-                in_line_comment = true;
-                let _ = chars.next();
-                continue;
-            }
-
-            if ch == '/' && next == Some('*') {
-                in_block_comment = true;
-                let _ = chars.next();
-                continue;
-            }
-
-            if ch == '\'' {
-                in_single_quote = true;
-                continue;
-            }
-
-            if ch == '"' {
-                in_double_quote = true;
-                continue;
-            }
-
-            normalized.push(ch);
+        } else {
+            effective
+        };
+        let effective = effective.trim_end_matches(';').trim();
+        let mut words = effective.split_whitespace();
+        let first = match words.next() {
+            Some(w) => w,
+            None => return false,
+        };
+        if !first.eq_ignore_ascii_case(keyword) {
+            return false;
         }
-
-        normalized
-            .trim()
-            .trim_end_matches(';')
-            .split_whitespace()
-            .map(|token| token.to_uppercase())
-            .collect()
+        match words.next() {
+            None => true,
+            Some(second) => second.eq_ignore_ascii_case("WORK") && words.next().is_none(),
+        }
     }
 
     pub(crate) fn is_plain_commit(sql: &str) -> bool {
-        let tokens = Self::tokenized_upper(sql);
-        matches!(tokens.as_slice(), [first] if first == "COMMIT")
-            || matches!(tokens.as_slice(), [first, second] if first == "COMMIT" && second == "WORK")
+        Self::is_plain_keyword(sql, "COMMIT")
     }
 
     pub(crate) fn is_plain_rollback(sql: &str) -> bool {
-        let tokens = Self::tokenized_upper(sql);
-        matches!(tokens.as_slice(), [first] if first == "ROLLBACK")
-            || matches!(tokens.as_slice(), [first, second] if first == "ROLLBACK" && second == "WORK")
+        Self::is_plain_keyword(sql, "ROLLBACK")
     }
 
     fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
