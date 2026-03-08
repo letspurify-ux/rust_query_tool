@@ -719,6 +719,8 @@ pub(crate) struct SplitState {
     // -- Reusable buffer --
     token_upper_buf: String,
     pending_implicit_external_top_level_split: bool,
+    last_token_was_as: bool,
+    with_search_cycle_set_expected: bool,
 }
 
 impl SplitState {
@@ -967,6 +969,7 @@ impl SplitState {
 
         // Return the uppercase buffer so its capacity is reused.
         let _ = upper;
+        self.last_token_was_as = upper == "AS";
         self.token_upper_buf = upper_buf;
         self.token.clear();
         self.token_prefixed_with_dollar = false;
@@ -1542,16 +1545,33 @@ impl SplitState {
             return;
         }
 
+        let at_top_level = self.block_depth() == 0 && self.paren_depth == 0;
+
+        if at_top_level
+            && self.with_clause_waiting_main_query()
+            && matches!(upper, "SEARCH" | "CYCLE")
+        {
+            self.with_search_cycle_set_expected = true;
+            return;
+        }
+
+        if at_top_level && self.with_search_cycle_set_expected && upper == "SET" {
+            self.with_search_cycle_set_expected = false;
+            return;
+        }
+
         if sql_text::is_with_plsql_declaration_keyword(upper) {
             self.with_clause_state =
                 WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration);
             return;
         }
 
-        if self.with_clause_state == WithClauseState::PendingClause
+        if at_top_level
+            && self.with_clause_state == WithClauseState::PendingClause
             && sql_text::is_with_non_plsql_clause_keyword(upper)
         {
             self.with_clause_state = WithClauseState::None;
+            self.with_search_cycle_set_expected = false;
             return;
         }
 
@@ -1559,8 +1579,9 @@ impl SplitState {
         // top-level PL/SQL declaration prefix. But Oracle allows
         // `WITH FUNCTION/PROCEDURE ... AS`, so keep declaration mode once
         // a PL/SQL declaration keyword has already been seen.
-        if upper == "AS" && self.with_clause_state == WithClauseState::PendingClause {
+        if at_top_level && upper == "AS" && self.with_clause_state == WithClauseState::PendingClause {
             self.with_clause_state = WithClauseState::None;
+            self.with_search_cycle_set_expected = false;
             return;
         }
 
@@ -1575,7 +1596,12 @@ impl SplitState {
                 return;
             }
 
+            if !at_top_level {
+                return;
+            }
+
             self.with_clause_state = WithClauseState::None;
+            self.with_search_cycle_set_expected = false;
             return;
         }
     }
@@ -1588,7 +1614,7 @@ impl SplitState {
             return;
         }
 
-        if ch == '(' {
+        if ch == '(' && !self.last_token_was_as {
             self.with_clause_state = WithClauseState::None;
         }
     }
@@ -1789,6 +1815,8 @@ impl SqlParserEngine {
         self.state.pending_do = PendingDo::None;
         self.state.if_state = IfState::None;
         self.state.paren_depth = 0;
+        self.state.last_token_was_as = false;
+        self.state.with_search_cycle_set_expected = false;
     }
 
     fn push_current_statement(&mut self) {
@@ -1910,6 +1938,7 @@ impl SqlParserEngine {
                 && this.state.paren_depth == 0
                 && sql_text::is_statement_head_keyword(candidate_upper)
                 && !sql_text::is_with_main_query_keyword(candidate_upper)
+                && !(candidate_upper == "SET" && this.state.with_search_cycle_set_expected)
             {
                 this.split_current_statement();
             }
@@ -3597,6 +3626,108 @@ mod tests {
         assert!(statements[0].contains("END pkg_spec_lang"));
         assert!(statements[1].starts_with("SELECT 1 FROM dual"));
     }
+
+    #[test]
+    fn type_body_external_member_with_parameters_clause_keeps_statement_intact() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE BODY t_ext_params AS");
+        engine.process_line("  MAP MEMBER FUNCTION f RETURN NUMBER");
+        engine.process_line("  IS LANGUAGE C NAME 'f' PARAMETERS (CONTEXT, RETURN INDICATOR SHORT);");
+        engine.process_line("END;");
+        engine.process_line("SELECT 47 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("PARAMETERS (CONTEXT, RETURN INDICATOR SHORT);"));
+        assert_eq!(statements[1], "SELECT 47 FROM dual".to_string());
+    }
+
+    #[test]
+    fn create_type_spec_object_keeps_following_statement_separate() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE TYPE t_obj AS OBJECT (");
+        engine.process_line("  id NUMBER");
+        engine.process_line(");");
+        engine.process_line("SELECT 46 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("CREATE OR REPLACE TYPE t_obj AS OBJECT"));
+        assert!(statements[0].contains("id NUMBER"));
+        assert_eq!(statements[1], "SELECT 46 FROM dual".to_string());
+    }
+
+
+    #[test]
+    fn with_function_then_cte_search_clause_keeps_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("q AS (");
+        engine.process_line("  SELECT level AS n FROM dual CONNECT BY level <= 3");
+        engine.process_line(")");
+        engine.process_line("SEARCH DEPTH FIRST BY n SET ord");
+        engine.process_line("SELECT n FROM q;");
+        engine.process_line("SELECT 48 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("WITH FUNCTION local_fn RETURN NUMBER IS"));
+        assert!(statements[0].contains("SEARCH DEPTH FIRST BY n SET ord"));
+        assert!(statements[0].contains("SELECT n FROM q"));
+        assert_eq!(statements[1], "SELECT 48 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_function_then_cte_cycle_clause_keeps_single_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN NUMBER IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN 1;");
+        engine.process_line("END;");
+        engine.process_line("q(n) AS (");
+        engine.process_line("  SELECT 1 FROM dual");
+        engine.process_line("  UNION ALL");
+        engine.process_line("  SELECT n + 1 FROM q WHERE n < 3");
+        engine.process_line(")");
+        engine.process_line("CYCLE n SET is_cycle TO 'Y' DEFAULT 'N'");
+        engine.process_line("SELECT n FROM q;");
+        engine.process_line("SELECT 49 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("WITH FUNCTION local_fn RETURN NUMBER IS"));
+        assert!(statements[0].contains("CYCLE n SET is_cycle TO 'Y' DEFAULT 'N'"));
+        assert!(statements[0].contains("SELECT n FROM q"));
+        assert_eq!(statements[1], "SELECT 49 FROM dual".to_string());
+    }
+
+    #[test]
+    fn with_function_cte_table_expression_then_statement_head_recovers_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH FUNCTION local_fn RETURN sys.odcinumberlist IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  RETURN sys.odcinumberlist(1, 2, 3);");
+        engine.process_line("END;");
+        engine.process_line("q AS (");
+        engine.process_line("  SELECT column_value AS n FROM TABLE(local_fn())");
+        engine.process_line(")");
+        engine.process_line("ALTER SESSION SET optimizer_mode = ALL_ROWS;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].starts_with("WITH FUNCTION local_fn RETURN sys.odcinumberlist IS"));
+        assert!(statements[0].contains("SELECT column_value AS n FROM TABLE(local_fn())"));
+        assert!(statements[1].starts_with("ALTER SESSION SET optimizer_mode = ALL_ROWS"));
+    }
+
 
     #[test]
     fn name_language_library_identifiers_do_not_activate_external_clause_policy() {
