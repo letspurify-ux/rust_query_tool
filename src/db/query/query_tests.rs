@@ -10744,6 +10744,54 @@ SELECT 2 FROM dual;"
 }
 
 #[test]
+fn test_parse_tool_command_classifies_unhandled_sqlplus_set_options_as_unsupported() {
+    for set_command in [
+        "SET SQLFORMAT CSV",
+        "SET APPINFO 'SPACE Query'",
+        "SET TERMOUT OFF",
+    ] {
+        let parsed = QueryExecutor::parse_tool_command(set_command);
+        assert!(
+            matches!(&parsed, Some(ToolCommand::Unsupported { raw, message, is_error }) if raw == set_command && message.contains("SET command") && *is_error),
+            "{set_command} should be classified as unsupported SET command: {parsed:?}"
+        );
+    }
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_sqlplus_set_options() {
+    for set_command in [
+        "SET SQLFORMAT CSV",
+        "SET APPINFO 'SPACE Query'",
+        "SET TERMOUT OFF",
+    ] {
+        let sql = format!(
+            "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+{set_command}
+SELECT 2 FROM dual;"
+        );
+        let items = QueryExecutor::split_script_items(&sql);
+
+        assert!(
+            matches!(&items[0], ScriptItem::Statement(stmt) if stmt.contains("FUNCTION f RETURN NUMBER IS") && !stmt.contains(set_command)),
+            "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+        );
+        assert!(
+            matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == set_command && message.contains("SET command") && *is_error),
+            "second item should classify {set_command} as unsupported SQL*Plus SET command without leaking into SQL statement: {items:?}"
+        );
+        assert!(
+            matches!(&items[2], ScriptItem::Statement(stmt) if stmt.starts_with("SELECT 2 FROM dual")),
+            "third item should be trailing SELECT statement: {items:?}"
+        );
+    }
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_sqlplus_admin_commands() {
     for admin_command in [
         "STARTUP",

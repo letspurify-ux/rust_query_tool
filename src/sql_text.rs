@@ -695,6 +695,69 @@ const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
+const SQLPLUS_SET_OPTION_KEYWORDS: &[&str] = &[
+    "APPINFO",
+    "ARRAYSIZE",
+    "AUTOCOMMIT",
+    "AUTOPRINT",
+    "AUTORECOVERY",
+    "AUTOTRACE",
+    "BLOCKTERMINATOR",
+    "CMDSEP",
+    "COLINVISIBLE",
+    "COLSEP",
+    "CONCAT",
+    "COPYCOMMIT",
+    "COPYTYPECHECK",
+    "DEFINE",
+    "DESCRIBE",
+    "ECHO",
+    "EDITFILE",
+    "EMBEDDED",
+    "ESCAPE",
+    "FEEDBACK",
+    "FLAGGER",
+    "FLUSH",
+    "HEADING",
+    "HEADSEP",
+    "INSTANCE",
+    "LINESIZE",
+    "LOBOFFSET",
+    "LONG",
+    "LONGCHUNKSIZE",
+    "MARKUP",
+    "NEWPAGE",
+    "NULL",
+    "NUMFORMAT",
+    "NUMWIDTH",
+    "PAGESIZE",
+    "PAUSE",
+    "RECSEP",
+    "RECSEPCHAR",
+    "ROWLIMIT",
+    "SERVEROUTPUT",
+    "SHIFTINOUT",
+    "SHOWMODE",
+    "SQLBLANKLINES",
+    "SQLCASE",
+    "SQLCONTINUE",
+    "SQLFORMAT",
+    "SQLNUMBER",
+    "SQLPLUSCOMPATIBILITY",
+    "SQLPREFIX",
+    "SQLPROMPT",
+    "SQLTERMINATOR",
+    "SUFFIX",
+    "TAB",
+    "TERMOUT",
+    "TIMING",
+    "TRIMOUT",
+    "TRIMSPOOL",
+    "UNDERLINE",
+    "VERIFY",
+    "WRAP",
+];
+
 pub(crate) const FORMAT_COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
     "CONSTRAINT",
     "NOT",
@@ -973,6 +1036,11 @@ pub(crate) fn is_statement_head_keyword(word: &str) -> bool {
     STATEMENT_HEAD_KEYWORDS_SET.contains(upper.as_str()) || is_password_command_keyword(word)
 }
 
+/// Returns true when `word` is a SQL*Plus `SET` option keyword.
+pub(crate) fn is_sqlplus_set_option_keyword(word: &str) -> bool {
+    matches_keyword(word, SQLPLUS_SET_OPTION_KEYWORDS)
+}
+
 pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -1006,69 +1074,7 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
             let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
                 return false;
             };
-            matches!(
-                second.to_ascii_uppercase().as_str(),
-                "APPINFO"
-                    | "ARRAYSIZE"
-                    | "AUTOCOMMIT"
-                    | "AUTOPRINT"
-                    | "AUTORECOVERY"
-                    | "AUTOTRACE"
-                    | "BLOCKTERMINATOR"
-                    | "CMDSEP"
-                    | "COLINVISIBLE"
-                    | "COLSEP"
-                    | "CONCAT"
-                    | "COPYCOMMIT"
-                    | "COPYTYPECHECK"
-                    | "DEFINE"
-                    | "DESCRIBE"
-                    | "ECHO"
-                    | "EDITFILE"
-                    | "EMBEDDED"
-                    | "ESCAPE"
-                    | "FEEDBACK"
-                    | "FLAGGER"
-                    | "FLUSH"
-                    | "HEADING"
-                    | "HEADSEP"
-                    | "INSTANCE"
-                    | "LINESIZE"
-                    | "LOBOFFSET"
-                    | "LONG"
-                    | "LONGCHUNKSIZE"
-                    | "MARKUP"
-                    | "NEWPAGE"
-                    | "NULL"
-                    | "NUMFORMAT"
-                    | "NUMWIDTH"
-                    | "PAGESIZE"
-                    | "PAUSE"
-                    | "RECSEP"
-                    | "RECSEPCHAR"
-                    | "ROWLIMIT"
-                    | "SERVEROUTPUT"
-                    | "SHIFTINOUT"
-                    | "SHOWMODE"
-                    | "SQLBLANKLINES"
-                    | "SQLCASE"
-                    | "SQLCONTINUE"
-                    | "SQLFORMAT"
-                    | "SQLNUMBER"
-                    | "SQLPLUSCOMPATIBILITY"
-                    | "SQLPREFIX"
-                    | "SQLPROMPT"
-                    | "SQLTERMINATOR"
-                    | "SUFFIX"
-                    | "TAB"
-                    | "TERMOUT"
-                    | "TIMING"
-                    | "TRIMOUT"
-                    | "TRIMSPOOL"
-                    | "UNDERLINE"
-                    | "VERIFY"
-                    | "WRAP"
-            )
+            is_sqlplus_set_option_keyword(second)
         }
         "SHOW" => next_meaningful_word(trimmed, 1).is_some(),
         // PASSWORD abbreviations
@@ -1354,6 +1360,14 @@ mod tests {
         assert!(is_statement_head_keyword("PASSWO"));
         assert!(is_statement_head_keyword("PASSWOR"));
         assert!(is_statement_head_keyword("PASSWORD"));
+    }
+
+    #[test]
+    fn sqlplus_set_option_keyword_detects_supported_set_subcommands() {
+        assert!(is_sqlplus_set_option_keyword("SQLFORMAT"));
+        assert!(is_sqlplus_set_option_keyword("APPINFO"));
+        assert!(is_sqlplus_set_option_keyword("TERMOUT"));
+        assert!(!is_sqlplus_set_option_keyword("UNKNOWN"));
     }
 
     #[test]

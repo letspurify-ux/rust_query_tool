@@ -2712,6 +2712,14 @@ impl QueryExecutor {
             return Some(Self::parse_null_command(trimmed));
         }
 
+        if Self::is_sqlplus_set_command(upper.as_str()) {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "SQL*Plus SET command is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
         if trimmed.starts_with("@@")
             || trimmed.starts_with('@')
             || Self::is_start_script_command(trimmed)
@@ -3601,6 +3609,27 @@ impl QueryExecutor {
             message: format!("{command_name} supports only ON or OFF."),
             is_error: true,
         }
+    }
+
+    fn is_sqlplus_set_command(upper_line: &str) -> bool {
+        if !upper_line.starts_with("SET") {
+            return false;
+        }
+
+        let mut parts = upper_line.split_whitespace();
+        let Some(first) = parts.next() else {
+            return false;
+        };
+
+        if first != "SET" {
+            return false;
+        }
+
+        let Some(second) = parts.next() else {
+            return false;
+        };
+
+        sql_text::is_sqlplus_set_option_keyword(second)
     }
 
     fn parse_set_number_command<F>(
