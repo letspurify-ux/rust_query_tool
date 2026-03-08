@@ -300,7 +300,10 @@ impl RoutineFrame {
             return;
         }
 
-        if matches!(token_upper, "MODULE" | "SIGNATURE") {
+        if matches!(
+            token_upper,
+            "MODULE" | "SIGNATURE" | "ENV" | "ENVIRONMENT"
+        ) {
             if matches!(
                 self.external_clause_state,
                 ExternalClauseState::SawMleKeyword | ExternalClauseState::Confirmed
@@ -4713,6 +4716,24 @@ BEGIN"
             statements[0]
         );
         assert!(statements[1].starts_with("SELECT 10 FROM dual"));
+    }
+
+    #[test]
+    fn language_clause_with_mle_environment_without_external_keyword_still_splits() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_env RETURN NUMBER");
+        engine.process_line("AS MLE ENV ext_env_impl;");
+        engine.process_line("SELECT 12 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS MLE ENV ext_env_impl"),
+            "first statement should keep MLE ENV clause tokens: {}",
+            statements[0]
+        );
+        assert!(statements[1].starts_with("SELECT 12 FROM dual"));
     }
 
     #[test]
