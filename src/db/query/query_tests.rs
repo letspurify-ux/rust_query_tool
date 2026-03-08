@@ -102,6 +102,25 @@ fn test_statement_bounds_at_cursor_splits_around_tool_command_line() {
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_splits_around_run_buffer_command_line() {
+    let sql = "SELECT 1 FROM dual;\nRUN\nSELECT 2 FROM dual;";
+    let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds after RUN command line");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT 2 FROM dual"),
+        "expected final SELECT statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("RUN"),
+        "RUN command line must not leak into SQL statement bounds: {statement}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_splits_after_with_function_and_run_script_command() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\n@child.sql\nSELECT 2 FROM dual;";
     let cursor = sql.rfind("2 FROM dual").unwrap_or(sql.len());
@@ -11063,6 +11082,58 @@ SELECT 2 FROM dual;"#;
             .get(1)
             .is_some_and(|stmt| stmt.trim_start().starts_with("SELECT 2 FROM dual")),
         "second formatted statement should be trailing SELECT statement: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_run_buffer_command() {
+    let sql = r#"WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+RUN
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == "RUN" && message.contains("without script path") && *is_error),
+        "second item should classify RUN without path as unsupported run-buffer command: {items:?}"
+    );
+    assert!(
+        matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_recovers_to_r_buffer_command() {
+    let sql = r#"WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+R
+SELECT 2 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(items.first(), Some(ScriptItem::Statement(stmt)) if stmt.contains("WITH") && stmt.contains("FUNCTION f")),
+        "first item should keep only WITH FUNCTION declaration statement: {items:?}"
+    );
+    assert!(
+        matches!(&items[1], ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, message, is_error }) if raw == "R" && message.contains("without script path") && *is_error),
+        "second item should classify R without path as unsupported run-buffer alias: {items:?}"
+    );
+    assert!(
+        matches!(items.get(2), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 2 FROM dual")),
+        "third item should be trailing SELECT statement: {items:?}"
     );
 }
 

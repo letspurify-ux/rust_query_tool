@@ -2720,6 +2720,14 @@ impl QueryExecutor {
             return Some(Self::parse_script_command(trimmed));
         }
 
+        if upper == "RUN" || upper == "R" {
+            return Some(ToolCommand::Unsupported {
+                raw: trimmed.to_string(),
+                message: "RUN without script path is not supported in this client.".to_string(),
+                is_error: true,
+            });
+        }
+
         if upper.starts_with("WHENEVER SQLERROR") {
             return Some(Self::parse_whenever_sqlerror_command(trimmed));
         }
