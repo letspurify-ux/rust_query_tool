@@ -320,6 +320,12 @@ impl RoutineFrame {
             return;
         }
 
+        if self.external_clause_state == ExternalClauseState::SawUsingClauseSubject
+            && matches!(token_upper, "ROW" | "SCALAR" | "TABLE" | "POLYMORPHIC")
+        {
+            return;
+        }
+
         if token_upper == "LANGUAGE" {
             if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
                 self.external_clause_state =
@@ -7474,6 +7480,46 @@ BY PRIOR employee_id = manager_id"),
             "trailing SELECT should split after slash terminator: {}",
             statements[1]
         );
+    }
+
+    #[test]
+    fn package_body_polymorphic_pipelined_using_clause_closes_nested_routine() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_poly AS");
+        engine.process_line("  FUNCTION stream_rows RETURN row_tab_t");
+        engine.process_line("  IS PIPELINED ROW POLYMORPHIC USING stream_rows_impl;");
+        engine.process_line("END pkg_poly;");
+        engine.process_line("SELECT 41 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PIPELINED ROW POLYMORPHIC USING stream_rows_impl"),
+            "polymorphic PIPELINED USING call spec should remain in package body: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 41 FROM dual".to_string());
+    }
+
+    #[test]
+    fn package_body_table_polymorphic_pipelined_using_clause_closes_nested_routine() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_poly_table AS");
+        engine.process_line("  FUNCTION stream_rows RETURN row_tab_t");
+        engine.process_line("  IS PIPELINED TABLE POLYMORPHIC USING stream_rows_impl;");
+        engine.process_line("END pkg_poly_table;");
+        engine.process_line("SELECT 42 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("PIPELINED TABLE POLYMORPHIC USING stream_rows_impl"),
+            "table polymorphic PIPELINED USING call spec should remain in package body: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 42 FROM dual".to_string());
     }
 
     #[test]
