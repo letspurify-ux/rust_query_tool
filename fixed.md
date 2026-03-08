@@ -1849,3 +1849,28 @@
 - `cargo test -q sqlplus_set_tool_command -- --nocapture`
 - `cargo test -q recursive_search_cycle_set_clauses_not_tool_commands`
 - `cargo test`
+
+## 2026-03-08 Oracle 공통 파서 엔진 누락 문법 보완 (`AS LANGUAGE C` 뒤 일반 statement head 분리)
+
+### [중] `EXTERNAL` 키워드 없는 call spec에서 `BEGIN` 외 일반 statement head(`SELECT` 등)를 새 문장으로 분리하지 못하던 문제 수정
+- **증상**:
+  - `CREATE OR REPLACE FUNCTION ... AS LANGUAGE C` 다음 줄에 `SELECT ...;`가 올 때,
+  - `SELECT`가 같은 CREATE 문에 붙어 버려 statement split이 누락될 수 있었습니다.
+- **원인**:
+  - `src/sql_parser_engine.rs`의 implicit external 경계 분리 로직이 사실상 `BEGIN` 케이스 중심으로만 동작했고,
+  - `AS LANGUAGE <target>` 뒤 `SELECT/ALTER/CREATE/...` 같은 일반 statement head를 별도 분리 대상으로 보지 않았습니다.
+- **수정**:
+  - `should_split_before_implicit_external_statement_head`를 추가해,
+  - top-level routine depth에서 implicit external 상태(`SawImplicitLanguageTarget`/`AwaitingLanguageTargetImplicit`)일 때
+  - 외부 clause 키워드(`WITH`, `NAME`, `LIBRARY` 등)를 제외한 statement head를 만나면 즉시 split 하도록 보강했습니다.
+
+### [유사 케이스] 기존 `WITH CONTEXT`/`NAME`/`LIBRARY` call-spec 절 회귀 방지
+- 새 분리 조건에서 `sql_text::is_external_language_clause_keyword(...)`를 제외 처리하여,
+- `AS LANGUAGE C WITH CONTEXT`, `... NAME 'x'`, `... LIBRARY ...` 형태가 중간 분리되지 않도록 함께 보정했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `sql_parser_engine::tests::external_language_target_without_semicolon_splits_before_following_statement_head`
+
+### [검증]
+- `cargo test -q external_language_target_without_semicolon_splits_before_following_statement_head -- --nocapture` 통과
+- `cargo test -q -- --test-threads=1` 통과
