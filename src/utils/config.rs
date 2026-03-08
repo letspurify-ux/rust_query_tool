@@ -13,6 +13,7 @@ const APP_DIR_NAME: &str = "space_query";
 const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
+const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 50;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -55,7 +56,7 @@ impl AppConfig {
             editor_font_size: 14,
             result_font: "Helvetica".to_string(),
             result_font_size: 14,
-            result_cell_max_chars: crate::ui::constants::RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT,
+            result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             max_rows: 1000,
             auto_commit: false,
         }

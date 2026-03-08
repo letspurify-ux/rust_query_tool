@@ -310,6 +310,12 @@ struct QueryEditBackupState {
     sort_state: Option<ColumnSortState>,
 }
 
+struct EditModePreparation {
+    table_name: String,
+    rowid_col: usize,
+    editable_columns: Vec<(usize, String)>,
+}
+
 #[derive(Clone)]
 struct ActiveInlineEdit {
     row: usize,
@@ -785,9 +791,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len() as i32;
-        self.table.set_rows(row_count);
+        self.set_table_rows_for_current_font(row_count);
         self.table.set_cols(col_count);
-        self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
@@ -1013,8 +1018,6 @@ impl ResultTableWidget {
     fn apply_table_metrics_for_current_font(&mut self) {
         let font_size = self.font_settings.size();
         self.table
-            .set_row_height_all(Self::row_height_for_font(font_size));
-        self.table
             .set_col_header_height(Self::header_height_for_font(font_size));
     }
 
@@ -1024,6 +1027,52 @@ impl ResultTableWidget {
 
     fn header_height_for_font(size: u32) -> i32 {
         (size as i32 + TABLE_CELL_PADDING * 2 + 6).max(TABLE_COL_HEADER_HEIGHT)
+    }
+
+    fn set_table_rows_for_current_font(&mut self, row_count: i32) {
+        let next_row_count = row_count.max(0);
+        let current_rows = self.table.rows().max(0);
+        if current_rows == next_row_count {
+            return;
+        }
+        if next_row_count == 0 {
+            self.table.set_rows(0);
+            return;
+        }
+
+        let desired_height = Self::row_height_for_font(self.font_settings.size());
+        if next_row_count < current_rows {
+            self.table.set_rows(next_row_count);
+            return;
+        }
+
+        if current_rows == 0 {
+            self.table.set_rows(1);
+            if self.table.row_height(0) != desired_height {
+                self.table.set_row_height(0, desired_height);
+            }
+            if next_row_count != 1 {
+                self.table.set_rows(next_row_count);
+            }
+            return;
+        }
+
+        let template_row = current_rows.saturating_sub(1);
+        if self.table.row_height(template_row) == desired_height {
+            self.table.set_rows(next_row_count);
+            return;
+        }
+
+        // Existing rows keep their current height. Seed exactly one newly added
+        // row with the new font metrics so later growth inherits the new height.
+        let seed_row = current_rows;
+        self.table.set_rows(seed_row.saturating_add(1));
+        if self.table.row_height(seed_row) != desired_height {
+            self.table.set_row_height(seed_row, desired_height);
+        }
+        if next_row_count != seed_row.saturating_add(1) {
+            self.table.set_rows(next_row_count);
+        }
     }
 
     fn min_col_width_for_font(size: u32) -> i32 {
@@ -4163,6 +4212,71 @@ impl ResultTableWidget {
         Self::find_rowid_column_index(headers).is_some()
     }
 
+    fn prepare_edit_mode(
+        headers: &[String],
+        source_sql: &str,
+    ) -> Result<EditModePreparation, String> {
+        if !Self::can_show_rowid_edit_actions(headers, source_sql) {
+            return Err("Current result set does not support ROWID-based editing.".to_string());
+        }
+
+        let table_name = Self::resolve_target_table(source_sql)?;
+        let rowid_col = Self::find_rowid_column_index(headers)
+            .ok_or_else(|| "Editing requires a ROWID column in the result set.".to_string())?;
+        let editable_columns: Vec<(usize, String)> = headers
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != rowid_col)
+            .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
+            .collect();
+        if editable_columns.is_empty() {
+            return Err("No editable columns were detected in this result set.".to_string());
+        }
+
+        Ok(EditModePreparation {
+            table_name,
+            rowid_col,
+            editable_columns,
+        })
+    }
+
+    fn build_existing_edit_rows(
+        full_data_snapshot: &[Vec<String>],
+        rowid_col: usize,
+    ) -> Result<(HashMap<String, Vec<String>>, Vec<String>, Vec<EditRowState>), String> {
+        let mut original_rows_by_rowid = HashMap::new();
+        let mut original_row_order = Vec::with_capacity(full_data_snapshot.len());
+        let mut row_states = Vec::with_capacity(full_data_snapshot.len());
+
+        for (row_idx, row) in full_data_snapshot.iter().enumerate() {
+            let rowid = row
+                .get(rowid_col)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Row {} cannot be edited because ROWID is missing or empty.",
+                        row_idx + 1
+                    )
+                })?;
+            if original_rows_by_rowid.contains_key(&rowid) {
+                return Err(format!(
+                    "Edit mode requires unique ROWID values (duplicate: {}).",
+                    rowid
+                ));
+            }
+            original_rows_by_rowid.insert(rowid.clone(), row.clone());
+            original_row_order.push(rowid.clone());
+            row_states.push(EditRowState::Existing {
+                rowid,
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            });
+        }
+
+        Ok((original_rows_by_rowid, original_row_order, row_states))
+    }
+
     pub fn is_save_pending(&self) -> bool {
         *self
             .pending_save_request
@@ -4199,48 +4313,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !Self::can_show_rowid_edit_actions(&headers_snapshot, &source_sql_text) {
-            return false;
-        }
-        let Some(rowid_col) = Self::find_rowid_column_index(&headers_snapshot) else {
-            return false;
-        };
-        let source_sql_text = self
-            .source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if Self::resolve_target_table(&source_sql_text).is_err() {
-            return false;
-        }
-        let editable_columns: Vec<(usize, String)> = headers_snapshot
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx != rowid_col)
-            .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
-            .collect();
-        if editable_columns.is_empty() {
-            return false;
-        }
-
-        let rows = self
-            .full_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut seen = HashSet::new();
-        for row in rows.iter() {
-            let Some(rowid) = row
-                .get(rowid_col)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-            else {
-                return false;
-            };
-            if !seen.insert(rowid.to_string()) {
-                return false;
-            }
-        }
-        true
+        Self::prepare_edit_mode(&headers_snapshot, &source_sql_text).is_ok()
     }
 
     pub fn begin_edit_mode(&mut self) -> Result<String, String> {
@@ -4269,19 +4342,11 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let table_name = Self::resolve_target_table(&source_sql_text)?;
-        let rowid_col = Self::find_rowid_column_index(&headers_snapshot)
-            .ok_or_else(|| "Editing requires a ROWID column in the result set.".to_string())?;
-
-        let editable_columns: Vec<(usize, String)> = headers_snapshot
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx != rowid_col)
-            .filter_map(|(idx, name)| Self::editable_column_identifier(name).map(|id| (idx, id)))
-            .collect();
-        if editable_columns.is_empty() {
-            return Err("No editable columns were detected in this result set.".to_string());
-        }
+        let EditModePreparation {
+            table_name,
+            rowid_col,
+            editable_columns,
+        } = Self::prepare_edit_mode(&headers_snapshot, &source_sql_text)?;
 
         let current_null_text = self.current_null_text();
         let full_data_snapshot = self
@@ -4289,34 +4354,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let mut original_rows_by_rowid = HashMap::new();
-        let mut original_row_order = Vec::with_capacity(full_data_snapshot.len());
-        let mut row_states = Vec::with_capacity(full_data_snapshot.len());
-        for (row_idx, row) in full_data_snapshot.iter().enumerate() {
-            let rowid = row
-                .get(rowid_col)
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "Row {} cannot be edited because ROWID is missing or empty.",
-                        row_idx + 1
-                    )
-                })?;
-            if original_rows_by_rowid.contains_key(&rowid) {
-                return Err(format!(
-                    "Edit mode requires unique ROWID values (duplicate: {}).",
-                    rowid
-                ));
-            }
-            original_rows_by_rowid.insert(rowid.clone(), row.clone());
-            original_row_order.push(rowid.clone());
-            row_states.push(EditRowState::Existing {
-                rowid,
-                explicit_null_cols: HashSet::new(),
-                dirty_cols: HashSet::new(),
-            });
-        }
+        let (original_rows_by_rowid, original_row_order, row_states) =
+            Self::build_existing_edit_rows(&full_data_snapshot, rowid_col)?;
 
         *self
             .pending_save_request
@@ -4412,8 +4451,7 @@ impl ResultTableWidget {
             new_row_index
         };
 
-        self.table.set_rows((new_row_index + 1) as i32);
-        self.apply_table_metrics_for_current_font();
+        self.set_table_rows_for_current_font((new_row_index + 1) as i32);
         self.table.set_row_position(new_row_index as i32);
         self.sync_table_viewport_state();
 
@@ -4489,13 +4527,12 @@ impl ResultTableWidget {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .len();
-                self.table.set_rows(new_len as i32);
+                self.set_table_rows_for_current_font(new_len as i32);
                 if new_len > 0 {
                     let row = (new_row_index).min(new_len.saturating_sub(1)) as i32;
                     let col = self.table.get_selection().1.max(0);
                     self.table.set_selection(row, col, row, col);
                 }
-                self.apply_table_metrics_for_current_font();
                 self.table.redraw();
                 return Ok("Cancelled row insertion and removed staged row.".to_string());
             }
@@ -4572,8 +4609,7 @@ impl ResultTableWidget {
             return Err("No selected rows were available to delete.".to_string());
         }
 
-        self.table.set_rows(new_len as i32);
-        self.apply_table_metrics_for_current_font();
+        self.set_table_rows_for_current_font(new_len as i32);
         if new_len > 0 {
             let row = row_start.min(new_len.saturating_sub(1)) as i32;
             let col = self.table.get_selection().1.max(0);
@@ -4864,8 +4900,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len();
-        self.table.set_rows(new_len as i32);
-        self.apply_table_metrics_for_current_font();
+        self.set_table_rows_for_current_font(new_len as i32);
         self.recalculate_widths_for_current_font();
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
@@ -5594,9 +5629,8 @@ impl ResultTableWidget {
                 .max_cell_display_chars
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.table.set_rows(1);
+            self.set_table_rows_for_current_font(1);
             self.table.set_cols(1);
-            self.apply_table_metrics_for_current_font();
             let message_width =
                 Self::estimate_display_width(&result.message, font_size, max_cell_display_chars)
                     .clamp(200, 1200);
@@ -5624,7 +5658,6 @@ impl ResultTableWidget {
             if self.table.cols() < col_count {
                 self.table.set_cols(col_count);
             }
-            self.apply_table_metrics_for_current_font();
             *self
                 .headers
                 .lock()
@@ -5640,9 +5673,8 @@ impl ResultTableWidget {
         let col_count = col_names.len() as i32;
 
         // Update table dimensions — no internal CellMatrix to rebuild
-        self.table.set_rows(row_count);
+        self.set_table_rows_for_current_font(row_count);
         self.table.set_cols(col_count);
-        self.apply_table_metrics_for_current_font();
 
         let font_size = self.font_settings.size();
         let max_cell_display_chars = *self
@@ -5772,9 +5804,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = initial_widths.clone();
 
-        self.table.set_rows(0);
+        self.set_table_rows_for_current_font(0);
         self.table.set_cols(col_count);
-        self.apply_table_metrics_for_current_font();
 
         for (i, _name) in headers.iter().enumerate() {
             self.table.set_col_width(i as i32, initial_widths[i]);
@@ -5899,7 +5930,7 @@ impl ResultTableWidget {
             .extend(rows_to_add);
 
         // Just update row count — draw_cell reads from full_data on demand
-        self.table.set_rows(new_total);
+        self.set_table_rows_for_current_font(new_total);
 
         mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         self.table.redraw();
@@ -6309,7 +6340,7 @@ impl ResultTableWidget {
         self.apply_table_metrics_for_current_font();
         self.recalculate_widths_for_current_font();
         // Force FLTK to recalculate the table's internal layout after
-        // row height / column width changes from the new font metrics.
+        // header height / column width changes from the new font metrics.
         let (x, y, w, h) = (
             self.table.x(),
             self.table.y(),
@@ -6413,6 +6444,7 @@ impl ResultTableWidget {
 #[cfg(test)]
 mod row_edit_sql_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn sql_literal_from_input_handles_null_numbers_and_expr() {
@@ -9170,6 +9202,69 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 .as_slice(),
             &[vec!["7369".to_string(), "SMITH".to_string()]]
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn streamed_rows_keep_font_height_without_post_render_metric_pass() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["EMPNO".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(vec![
+            vec!["7369".to_string()],
+            vec!["7499".to_string()],
+            vec!["7521".to_string()],
+        ]);
+        widget.finish_streaming();
+
+        let expected_height = ResultTableWidget::row_height_for_font(widget.font_settings.size());
+        assert_eq!(widget.table.row_height(0), expected_height);
+        assert_eq!(widget.table.row_height(2), expected_height);
+
+        let result = QueryResult::new_select_streamed(
+            "SELECT EMPNO FROM EMP",
+            vec![crate::db::ColumnInfo {
+                name: "EMPNO".to_string(),
+                data_type: "NUMBER".to_string(),
+            }],
+            3,
+            Duration::from_millis(1),
+        );
+        widget.display_result(&result);
+
+        assert_eq!(widget.table.row_height(0), expected_height);
+        assert_eq!(widget.table.row_height(2), expected_height);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "FLTK widget tests require the process main thread on macOS"
+    )]
+    fn font_change_does_not_retouch_existing_rows_but_updates_new_rows() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["EMPNO".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(vec![vec!["7369".to_string()]]);
+
+        let original_size = widget.font_settings.size();
+        let original_height = ResultTableWidget::row_height_for_font(original_size);
+        assert_eq!(widget.table.row_height(0), original_height);
+
+        let updated_size = original_size.saturating_add(4);
+        widget.apply_font_settings(widget.font_settings.profile(), updated_size);
+
+        assert_eq!(widget.table.row_height(0), original_height);
+
+        widget.append_rows(vec![vec!["7499".to_string()], vec!["7521".to_string()]]);
+
+        let updated_height = ResultTableWidget::row_height_for_font(updated_size);
+        assert_eq!(widget.table.row_height(0), original_height);
+        assert_eq!(widget.table.row_height(1), updated_height);
+        assert_eq!(widget.table.row_height(2), updated_height);
     }
 
     #[test]

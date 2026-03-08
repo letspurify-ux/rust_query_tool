@@ -1405,7 +1405,9 @@ mod tests {
 
     #[test]
     fn auto_terminated_tool_command_ignores_leading_line_comment_before_set() {
-        assert!(!is_auto_terminated_tool_command("-- comment\nSET TERMOUT ON"));
+        assert!(!is_auto_terminated_tool_command(
+            "-- comment\nSET TERMOUT ON"
+        ));
     }
 
     #[test]

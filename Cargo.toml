@@ -9,6 +9,7 @@ build = "build.rs"
 [[bin]]
 name = "space_query"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }

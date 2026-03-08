@@ -8743,8 +8743,10 @@ SELECT 2 FROM dual;";
         "WITH FUNCTION declaration must stay attached to main CALL statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  FUNCTION f RETURN NUMBER IS"),
+        stmts[0].starts_with(
+            "WITH
+  FUNCTION f RETURN NUMBER IS"
+        ),
         "first statement should preserve WITH FUNCTION declaration: {}",
         stmts[0]
     );
@@ -8777,7 +8779,8 @@ fn test_split_script_items_oracle_with_procedure_without_semicolon_uses_slash_te
 }
 
 #[test]
-fn test_split_script_items_oracle_with_function_without_semicolon_recovers_to_create_statement_head() {
+fn test_split_script_items_oracle_with_function_without_semicolon_recovers_to_create_statement_head(
+) {
     let sql = "WITH
   FUNCTION f RETURN NUMBER IS
   BEGIN
@@ -8794,8 +8797,10 @@ SELECT 2 FROM dual;";
         "parser should recover WITH FUNCTION declaration mode without END semicolon when CREATE starts a new statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  FUNCTION f RETURN NUMBER IS"),
+        stmts[0].starts_with(
+            "WITH
+  FUNCTION f RETURN NUMBER IS"
+        ),
         "first statement should preserve WITH FUNCTION declaration block: {}",
         stmts[0]
     );
@@ -8808,7 +8813,8 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
-fn test_split_script_items_oracle_with_procedure_without_semicolon_recovers_to_alter_statement_head() {
+fn test_split_script_items_oracle_with_procedure_without_semicolon_recovers_to_alter_statement_head(
+) {
     let sql = "WITH
   PROCEDURE p IS
   BEGIN
@@ -8825,8 +8831,10 @@ SELECT 2 FROM dual;";
         "parser should recover WITH PROCEDURE declaration mode without END semicolon when ALTER starts a new statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("WITH
-  PROCEDURE p IS"),
+        stmts[0].starts_with(
+            "WITH
+  PROCEDURE p IS"
+        ),
         "first statement should preserve WITH PROCEDURE declaration block: {}",
         stmts[0]
     );
@@ -11593,7 +11601,8 @@ fn test_split_format_items_oracle_with_function_keeps_slash_block_comment_with_m
 }
 
 #[test]
-fn test_split_script_items_external_language_clause_splits_before_parenthesized_query_statement_head() {
+fn test_split_script_items_external_language_clause_splits_before_parenthesized_query_statement_head(
+) {
     let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_paren RETURN NUMBER
 AS LANGUAGE C;
 (SELECT 2 FROM dual);"#;

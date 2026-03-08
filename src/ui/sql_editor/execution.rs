@@ -2963,7 +2963,7 @@ impl SqlEditorWidget {
     }
 
     /// 토크나이저는 공통 로직(`query_text`)로 위임합니다.
-    pub fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
+    pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
         super::query_text::tokenize_sql(sql)
     }
 

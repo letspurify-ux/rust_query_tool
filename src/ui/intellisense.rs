@@ -1645,7 +1645,6 @@ mod intellisense_tests {
         assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
     }
 
-
     #[test]
     fn detect_sql_context_second_cte_explicit_column_list_is_column_name() {
         let sql_with_cursor =
@@ -1660,7 +1659,6 @@ mod intellisense_tests {
         );
         assert_eq!(detect_sql_context(&sql, cursor), SqlContext::ColumnName);
     }
-
 
     #[test]
     fn get_suggestions_excludes_exact_prefix_match() {

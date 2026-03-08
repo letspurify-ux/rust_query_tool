@@ -2,21 +2,9 @@
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
-#![allow(
-    clippy::arc_with_non_send_sync,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
 
-mod app;
-mod db;
-mod sql_parser_engine;
-mod sql_text;
-mod ui;
-mod utils;
-
-use app::App;
-use utils::logging;
+use space_query::app::App;
+use space_query::utils::logging;
 
 fn main() {
     let previous_panic_hook = std::panic::take_hook();

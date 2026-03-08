@@ -4689,7 +4689,6 @@ fn phase_merge_insert_log_errors_reject_limit_then_returning_is_set_clause() {
     assert!(!ctx.phase.is_table_context());
 }
 
-
 #[test]
 fn from_match_recognize_clause_preserves_match_keyword_for_phase_detection() {
     let ctx = analyze("SELECT * FROM sales MATCH RECOGNIZE (PARTITION BY |)");
@@ -4803,8 +4802,16 @@ fn merge_when_matched_update_set_delete_where_keeps_source_table_in_scope() {
     assert_eq!(ctx.depth, 0);
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     let names = table_names(&ctx);
-    assert!(names.iter().any(|name| name == "TARGET"), "tables: {:?}", names);
-    assert!(names.iter().any(|name| name == "SOURCE"), "tables: {:?}", names);
+    assert!(
+        names.iter().any(|name| name == "TARGET"),
+        "tables: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|name| name == "SOURCE"),
+        "tables: {:?}",
+        names
+    );
 }
 
 #[test]
@@ -4853,7 +4860,6 @@ fn merge_when_not_matched_by_source_update_where_is_column_context() {
     assert_eq!(ctx.phase, SqlPhase::WhereClause);
     assert!(ctx.phase.is_column_context());
 }
-
 
 #[test]
 fn insert_first_else_into_is_table_context() {

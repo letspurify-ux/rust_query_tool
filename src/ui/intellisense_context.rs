@@ -119,7 +119,7 @@ impl TokenRange {
 #[allow(dead_code)]
 pub struct CursorContext {
     /// Full token stream for the normalized statement.
-    pub statement_tokens: Arc<[SqlToken]>,
+    pub(crate) statement_tokens: Arc<[SqlToken]>,
     /// Number of tokens located before/at cursor in `statement_tokens`.
     pub cursor_token_len: usize,
     /// Current SQL phase at cursor position
@@ -200,7 +200,7 @@ impl RelationParseState {
 ///
 /// `full_statement` is the complete statement token stream.
 /// `cursor_token_len` is the count of tokens before/at cursor.
-pub fn analyze_cursor_context(
+pub(crate) fn analyze_cursor_context(
     full_statement: &[SqlToken],
     cursor_token_len: usize,
 ) -> CursorContext {
@@ -1958,7 +1958,7 @@ fn filter_scope_entries(
     TableAnalysis { tables, subqueries }
 }
 
-pub fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
+pub(crate) fn token_range_slice(tokens: &[SqlToken], range: TokenRange) -> &[SqlToken] {
     let start = range.start.min(tokens.len());
     let end = range.end.min(tokens.len());
     if start >= end {
@@ -3227,7 +3227,7 @@ fn is_relation_alias_breaker(word: &str) -> bool {
 
 /// Collect top-level tables visible within a standalone statement.
 /// This avoids full cursor-phase analysis when only table scope is needed.
-pub fn collect_tables_in_statement(tokens: &[SqlToken]) -> Vec<ScopedTableRef> {
+pub(crate) fn collect_tables_in_statement(tokens: &[SqlToken]) -> Vec<ScopedTableRef> {
     collect_tables_deep(tokens, &[0], tokens.len()).tables
 }
 
@@ -3331,7 +3331,7 @@ pub fn resolve_all_scope_tables(tables_in_scope: &[ScopedTableRef]) -> Vec<Strin
 /// Extract projected column names from a SELECT statement's token stream.
 /// Returns column names/aliases in the order they appear in the SELECT list.
 /// Items that cannot be resolved (e.g., `*`, expressions without aliases) are omitted.
-pub fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
     let mut columns = Vec::new();
     let select_list_tokens = extract_select_list_tokens(tokens);
     for item_tokens in split_top_level_symbol_groups(select_list_tokens, ",") {
@@ -3345,7 +3345,7 @@ pub fn extract_select_list_columns(tokens: &[SqlToken]) -> Vec<String> {
 
 /// Resolve source table names referenced by wildcard items (`*`, `t.*`) in a
 /// SELECT list. Returned names are deduplicated in appearance order.
-pub fn extract_select_list_wildcard_tables(
+pub(crate) fn extract_select_list_wildcard_tables(
     tokens: &[SqlToken],
     tables_in_scope: &[ScopedTableRef],
 ) -> Vec<String> {
@@ -3362,7 +3362,7 @@ pub fn extract_select_list_wildcard_tables(
 /// Extract column names from table-function `COLUMNS` clauses such as
 /// `XMLTABLE(... COLUMNS col1 NUMBER PATH '...', col2 VARCHAR2(30) PATH '...')`.
 /// Returns discovered column names in appearance order.
-pub fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
     let token_depths = paren_depths(tokens);
     for (idx, token) in tokens.iter().enumerate() {
         if !is_top_level_depth(&token_depths, idx) {
@@ -3384,7 +3384,7 @@ pub fn extract_table_function_columns(tokens: &[SqlToken]) -> Vec<String> {
 }
 
 /// Extract qualifiers from incomplete select-list items like `alias.`.
-pub fn extract_select_list_leading_qualifiers(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_select_list_leading_qualifiers(tokens: &[SqlToken]) -> Vec<String> {
     let mut qualifiers = Vec::new();
     let mut seen = HashSet::new();
     let select_list_tokens = extract_select_list_tokens(tokens);
@@ -3425,7 +3425,7 @@ struct ModelClauseColumns {
 /// Extract Oracle PIVOT/UNPIVOT-projected columns from a query token stream.
 /// This is primarily used when the SELECT list contains `*` and normal
 /// select-list extraction cannot determine output columns.
-pub fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
     let pivot = parse_top_level_pivot_clause(tokens);
     let unpivot = parse_top_level_unpivot_clause(tokens);
     if pivot.is_none() && unpivot.is_none() {
@@ -3462,7 +3462,7 @@ pub fn extract_oracle_pivot_unpivot_projection_columns(tokens: &[SqlToken]) -> V
 }
 
 /// Extract Oracle UNPIVOT-introduced columns (measure + FOR target).
-pub fn extract_oracle_unpivot_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_oracle_unpivot_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
     let Some(unpivot_info) = parse_top_level_unpivot_clause(tokens) else {
         return Vec::new();
     };
@@ -3474,7 +3474,7 @@ pub fn extract_oracle_unpivot_generated_columns(tokens: &[SqlToken]) -> Vec<Stri
 }
 
 /// Extract Oracle MODEL-introduced measure columns from `MEASURES (...)`.
-pub fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
     let Some(model_info) = parse_top_level_model_clause(tokens) else {
         return Vec::new();
     };
@@ -3483,7 +3483,7 @@ pub fn extract_oracle_model_generated_columns(tokens: &[SqlToken]) -> Vec<String
 
 /// Extract MATCH_RECOGNIZE-generated columns from a query token stream.
 /// This includes MEASURES aliases and PATTERN/SUBSET variables.
-pub fn extract_match_recognize_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_match_recognize_generated_columns(tokens: &[SqlToken]) -> Vec<String> {
     let mut columns = extract_match_recognize_measure_columns(tokens);
     columns.extend(extract_match_recognize_pattern_variables(tokens));
     dedup_columns_case_insensitive(&mut columns);
@@ -3548,7 +3548,7 @@ fn extract_match_recognize_measure_columns(tokens: &[SqlToken]) -> Vec<String> {
 /// Extract MATCH_RECOGNIZE pattern variables from `PATTERN (...)` and
 /// subset variables from `SUBSET ...`.
 /// Example: `PATTERN (a b+) SUBSET u = (a, b)` -> `["a", "b", "u"]`.
-pub fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
+pub(crate) fn extract_match_recognize_pattern_variables(tokens: &[SqlToken]) -> Vec<String> {
     let Some(clause_tokens) = extract_match_recognize_clause_tokens(tokens) else {
         return Vec::new();
     };

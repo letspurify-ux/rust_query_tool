@@ -1,0 +1,969 @@
+impl SqlEditorWidget {
+    pub fn setup_intellisense(&mut self) {
+        let buffer = self.buffer.clone();
+        let mut editor = self.editor.clone();
+        let intellisense_data = self.intellisense_data.clone();
+        let intellisense_popup = self.intellisense_popup.clone();
+        let connection = self.connection.clone();
+        let column_sender = self.column_sender.clone();
+        let enter_keyup_suppression = Arc::new(Mutex::new(EnterKeyupSuppression::None));
+        let navigation_keyup_state = Arc::new(Mutex::new(NavigationKeyupState::Idle));
+        let intellisense_runtime = self.intellisense_runtime.clone();
+
+        // Setup callback for inserting selected text
+        let mut buffer_for_insert = buffer.clone();
+        let mut editor_for_insert = editor.clone();
+        let intellisense_runtime_for_insert = intellisense_runtime.clone();
+        let intellisense_data_for_insert = intellisense_data.clone();
+        let column_sender_for_insert = column_sender.clone();
+        let connection_for_insert = connection.clone();
+        {
+            let mut popup = intellisense_popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            popup.set_selected_callback(move |selected| {
+                let (cursor_pos, cursor_pos_usize) =
+                    Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
+                let context_text = Self::normalize_intellisense_context_text(
+                    &Self::context_before_cursor(&buffer_for_insert, cursor_pos),
+                );
+                let context = detect_sql_context(&context_text, context_text.len());
+                if matches!(context, SqlContext::TableName) {
+                    let should_prefetch = {
+                        let data = intellisense_data_for_insert
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        data.is_known_relation(&selected)
+                    };
+                    if should_prefetch {
+                        Self::request_table_columns(
+                            &selected,
+                            &intellisense_data_for_insert,
+                            &column_sender_for_insert,
+                            &connection_for_insert,
+                        );
+                    }
+                }
+                let range = intellisense_runtime_for_insert.completion_range();
+                let (start, end) = if let Some(range) = range {
+                    (range.start(), range.end())
+                } else {
+                    let (word, start, _end) = Self::word_at_cursor(&buffer_for_insert, cursor_pos);
+                    if word.is_empty() {
+                        (cursor_pos_usize, cursor_pos_usize)
+                    } else {
+                        (start, cursor_pos_usize)
+                    }
+                };
+
+                if start != end {
+                    buffer_for_insert.replace(start as i32, end as i32, &selected);
+                    editor_for_insert.set_insert_position((start + selected.len()) as i32);
+                } else {
+                    buffer_for_insert.insert(cursor_pos, &selected);
+                    editor_for_insert
+                        .set_insert_position((cursor_pos_usize + selected.len()) as i32);
+                }
+                Self::finalize_completion_after_selection(
+                    &intellisense_runtime_for_insert,
+                );
+            });
+        }
+
+        // Handle keyboard events for triggering intellisense and syntax highlighting
+        let mut buffer_for_handle = buffer;
+        let intellisense_data_for_handle = intellisense_data;
+        let intellisense_popup_for_handle = intellisense_popup;
+        let column_sender_for_handle = column_sender;
+        let connection_for_handle = connection;
+        let enter_keyup_suppression_for_handle = enter_keyup_suppression;
+        let navigation_keyup_state_for_handle = navigation_keyup_state;
+        let intellisense_runtime_for_handle = intellisense_runtime;
+        let mut widget_for_shortcuts = self.clone();
+        let find_callback_for_handle = self.find_callback.clone();
+        let replace_callback_for_handle = self.replace_callback.clone();
+        let file_drop_callback_for_handle = self.file_drop_callback.clone();
+        let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
+
+        editor.handle(move |ed, ev| {
+            let schedule_viewport_refresh = |widget: &SqlEditorWidget| {
+                let widget = widget.clone();
+                app::add_timeout3(0.0, move |_| {
+                    widget.refresh_highlighting();
+                });
+            };
+            match ev {
+                Event::MouseWheel => {
+                    schedule_viewport_refresh(&widget_for_shortcuts);
+                    false
+                }
+                Event::Released => {
+                    schedule_viewport_refresh(&widget_for_shortcuts);
+                    false
+                }
+                Event::DndEnter | Event::DndDrag => {
+                    *dnd_drop_state_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        DndDropState::AwaitingPaste;
+                    true
+                }
+                Event::DndLeave => {
+                    *dnd_drop_state_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = DndDropState::Idle;
+                    true
+                }
+                Event::DndRelease => {
+                    *dnd_drop_state_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        DndDropState::AwaitingPaste;
+                    true
+                }
+                Event::Push => {
+                    let state = fltk::app::event_state();
+                    let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
+                        || state.contains(fltk::enums::Shortcut::Command);
+                    if ctrl_or_cmd && fltk::app::event_button() == 1 {
+                        let pos = ed.xy_to_position(
+                            fltk::app::event_x(),
+                            fltk::app::event_y(),
+                            PositionType::Cursor,
+                        );
+                        if pos >= 0 {
+                            let (pos, _) = Self::cursor_position(&buffer_for_handle, pos);
+                            if let Some((_, start, end)) =
+                                Self::identifier_at_position(&buffer_for_handle, pos)
+                            {
+                                buffer_for_handle.select(start, end);
+                                ed.set_insert_position(end);
+                            } else {
+                                buffer_for_handle.unselect();
+                                ed.set_insert_position(pos);
+                            }
+                            ed.show_insert_position();
+                            widget_for_shortcuts.quick_describe_at_cursor();
+                            return true;
+                        }
+                    }
+                    false
+                }
+                Event::KeyDown => {
+                    let key = fltk::app::event_key();
+                    let original_key = fltk::app::event_original_key();
+                    let shortcut_key = Self::shortcut_key_for_layout(key, original_key);
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
+                    let state = fltk::app::event_state();
+                    let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
+                        || state.contains(fltk::enums::Shortcut::Command);
+                    let shift = state.contains(fltk::enums::Shortcut::Shift);
+                    let alt = state.contains(fltk::enums::Shortcut::Alt);
+
+                    if ctrl_or_cmd && shift && matches!(key, Key::Up | Key::Down) {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                        }
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &intellisense_runtime_for_handle,
+                        );
+                        let direction = if key == Key::Up { -1 } else { 1 };
+                        widget_for_shortcuts.select_block_in_direction(direction);
+                        return true;
+                    }
+
+                    if alt && matches!(key, Key::Up | Key::Down) {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                        }
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &intellisense_runtime_for_handle,
+                        );
+                        let direction = if key == Key::Up { 1 } else { -1 };
+                        widget_for_shortcuts.navigate_history(direction);
+                        return true;
+                    }
+
+                    if shortcut_key == Key::Escape {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                        }
+                        return Self::cancel_intellisense_on_escape_keydown(
+                            popup_visible,
+                            &intellisense_runtime_for_handle,
+                        );
+                    }
+
+                    if popup_visible {
+                        match shortcut_key {
+                            Key::Up => {
+                                // Navigate popup up, consume event
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_prev();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
+                            Key::Down => {
+                                // Navigate popup down, consume event
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_next();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
+                            Key::PageUp => {
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_prev_page();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
+                            Key::PageDown => {
+                                let pos = ed.insert_position();
+                                *navigation_keyup_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    NavigationKeyupState::RestoreCursor { anchor: pos };
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .select_next_page();
+                                ed.set_insert_position(pos);
+                                ed.show_insert_position();
+
+                                return true;
+                            }
+                            Key::Enter | Key::KPEnter | Key::Tab => {
+                                // Insert selected suggestion, consume event
+                                let selected = intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .get_selected();
+                                let has_selected = selected.is_some();
+                                if let Some(selected) = selected {
+                                    let (cursor_pos, cursor_pos_usize) =
+                                        Self::editor_cursor_position(ed, &buffer_for_handle);
+                                    let range = intellisense_runtime_for_handle.completion_range();
+                                    let (start, end) = if let Some(range) = range {
+                                        (range.start(), range.end())
+                                    } else {
+                                        let (word, start, _end) =
+                                            Self::word_at_cursor(&buffer_for_handle, cursor_pos);
+                                        if word.is_empty() {
+                                            (cursor_pos_usize, cursor_pos_usize)
+                                        } else {
+                                            (start, cursor_pos_usize)
+                                        }
+                                    };
+
+                                    if start != end {
+                                        buffer_for_handle.replace(
+                                            start as i32,
+                                            end as i32,
+                                            &selected,
+                                        );
+                                        ed.set_insert_position((start + selected.len()) as i32);
+                                    } else {
+                                        buffer_for_handle.insert(cursor_pos, &selected);
+                                        ed.set_insert_position(
+                                            (cursor_pos_usize + selected.len()) as i32,
+                                        );
+                                    }
+                                    Self::finalize_completion_after_selection(
+                                        &intellisense_runtime_for_handle,
+                                    );
+
+                                    // Update syntax highlighting after insertion
+                                    widget_for_shortcuts.refresh_highlighting();
+                                }
+                                if matches!(key, Key::Enter | Key::KPEnter) {
+                                    *enter_keyup_suppression_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        EnterKeyupSuppression::PopupConfirm;
+                                }
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                intellisense_runtime_for_handle.clear_pending_intellisense();
+                                return Self::should_consume_popup_confirm_key(key, has_selected);
+                            }
+                            _ => {
+                                // Let other keys pass through to editor
+                            }
+                        }
+                    }
+
+                    if !ed.active() || (!ed.has_focus() && !popup_visible) {
+                        return false;
+                    }
+                    // KeyDown fires BEFORE the character is inserted into the buffer.
+                    // Handle navigation and selection keys here to consume them
+                    // before they affect the editor.
+
+                    // Handle basic editing shortcuts
+                    let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
+                        || state.contains(fltk::enums::Shortcut::Command);
+                    let shift = state.contains(fltk::enums::Shortcut::Shift);
+
+                    if ctrl_or_cmd {
+                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'f') {
+                            widget_for_shortcuts.format_selected_sql();
+                            return true;
+                        }
+
+                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'z') {
+                            widget_for_shortcuts.redo();
+                            return true;
+                        }
+
+                        match shortcut_key {
+                            k if Self::matches_alpha_shortcut(k, 'z') => {
+                                widget_for_shortcuts.undo();
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'y') => {
+                                widget_for_shortcuts.redo();
+                                return true;
+                            }
+                            k if k == Key::from_char(' ') => {
+                                // Ctrl+Space - Trigger intellisense
+                                Self::invalidate_manual_trigger_debounce_state(
+                                    &intellisense_runtime_for_handle,
+                                );
+                                Self::trigger_intellisense(
+                                    ed,
+                                    &buffer_for_handle,
+                                    &intellisense_data_for_handle,
+                                    &intellisense_popup_for_handle,
+                                    &column_sender_for_handle,
+                                    &connection_for_handle,
+                                    &intellisense_runtime_for_handle,
+                                );
+                                return true;
+                            }
+                            Key::Enter | Key::KPEnter => {
+                                if matches!(
+                                    *enter_keyup_suppression_for_handle
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                    EnterKeyupSuppression::CtrlEnterExecute
+                                ) {
+                                    return true;
+                                }
+                                *enter_keyup_suppression_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    EnterKeyupSuppression::CtrlEnterExecute;
+                                widget_for_shortcuts.execute_statement_at_cursor();
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'f') => {
+                                Self::invoke_void_callback(&find_callback_for_handle);
+                                return true;
+                            }
+                            k if k == Key::from_char('/') || k == Key::from_char('?') => {
+                                widget_for_shortcuts.toggle_comment();
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'u') => {
+                                widget_for_shortcuts.convert_selection_case(true);
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'l') => {
+                                widget_for_shortcuts.convert_selection_case(false);
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'h') => {
+                                Self::invoke_void_callback(&replace_callback_for_handle);
+                                return true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // F4 - Quick Describe (handle on KeyDown for immediate response)
+                    if key == Key::F4 {
+                        widget_for_shortcuts.quick_describe_at_cursor();
+                        return true;
+                    }
+
+                    if key == Key::F3 {
+                        let mut editor_for_find = ed.clone();
+                        if !FindReplaceDialog::find_next_from_session(
+                            &mut editor_for_find,
+                            &mut buffer_for_handle,
+                        ) && !FindReplaceDialog::has_search_text()
+                        {
+                            Self::invoke_void_callback(&find_callback_for_handle);
+                        }
+                        return true;
+                    }
+
+                    if key == Key::F5 {
+                        widget_for_shortcuts.execute_current();
+                        return true;
+                    }
+
+                    if key == Key::F9 {
+                        widget_for_shortcuts.execute_statement_at_cursor();
+                        return true;
+                    }
+
+                    if key == Key::F6 {
+                        widget_for_shortcuts.explain_current();
+                        return true;
+                    }
+
+                    if key == Key::F7 {
+                        widget_for_shortcuts.commit();
+                        return true;
+                    }
+
+                    if key == Key::F8 {
+                        widget_for_shortcuts.rollback();
+                        return true;
+                    }
+
+                    false
+                }
+                Event::KeyUp => {
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
+                    if !ed.active() || (!ed.has_focus() && !popup_visible) {
+                        return false;
+                    }
+                    // KeyUp fires AFTER the character is inserted into the buffer.
+                    // Filter/show intellisense here.
+                    let key = fltk::app::event_key();
+                    let original_key = fltk::app::event_original_key();
+                    let event_text = fltk::app::event_text();
+                    let state = fltk::app::event_state();
+                    let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
+                        || state.contains(fltk::enums::Shortcut::Command);
+                    let alt = state.contains(fltk::enums::Shortcut::Alt);
+                    let shift = state.contains(fltk::enums::Shortcut::Shift);
+
+                    // Ctrl/Cmd+Space is handled on KeyDown for manual intellisense trigger.
+                    // Ignore the matching KeyUp so the popup is not immediately dismissed.
+                    if Self::should_ignore_keyup_after_manual_trigger(
+                        key,
+                        original_key,
+                        ctrl_or_cmd,
+                    ) {
+                        return true;
+                    }
+
+                    // Keep KeyUp lightweight by using raw offsets (no full-buffer clones).
+                    let cursor_pos = ed.insert_position();
+                    let char_before_cursor =
+                        Self::char_before_cursor(&buffer_for_handle, cursor_pos);
+                    let typed_char = Self::typed_char_from_key_event(
+                        &event_text,
+                        key,
+                        shift,
+                        char_before_cursor,
+                    );
+                    if Self::is_modifier_key(key) {
+                        return false;
+                    }
+
+                    if event_text.is_empty()
+                        && typed_char.is_none()
+                        && !ctrl_or_cmd
+                        && !alt
+                        && !matches!(
+                            key,
+                            Key::BackSpace
+                                | Key::Delete
+                                | Key::Left
+                                | Key::Right
+                                | Key::Up
+                                | Key::Down
+                                | Key::Home
+                                | Key::End
+                                | Key::PageUp
+                                | Key::PageDown
+                                | Key::Enter
+                                | Key::KPEnter
+                                | Key::Tab
+                                | Key::Escape
+                        )
+                    {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                            Self::invalidate_keyup_debounce_with_parse_generation(
+                                &intellisense_runtime_for_handle,
+                                true,
+                            );
+                        }
+                        return false;
+                    }
+
+                    if matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
+                        let mut nav_state = navigation_keyup_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let NavigationKeyupState::RestoreCursor { anchor } = *nav_state {
+                            ed.set_insert_position(anchor);
+                            ed.show_insert_position();
+                            *nav_state = NavigationKeyupState::Idle;
+                            return true;
+                        }
+                    }
+
+                    if matches!(key, Key::Enter | Key::KPEnter)
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::PopupConfirm
+                        )
+                    {
+                        *enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::None;
+                        return true;
+                    }
+                    if matches!(key, Key::Enter | Key::KPEnter)
+                        && matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::CtrlEnterExecute
+                        )
+                    {
+                        *enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::None;
+                        return true;
+                    }
+
+                    // Navigation keys - hide popup and let editor handle cursor movement
+                    if matches!(
+                        key,
+                        Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown
+                    ) {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                        }
+                        Self::invalidate_keyup_debounce_with_parse_generation(
+                            &intellisense_runtime_for_handle,
+                            true,
+                        );
+                        widget_for_shortcuts.refresh_highlighting();
+                        return false;
+                    }
+
+                    // Skip if these keys (already handled in KeyDown)
+                    if popup_visible
+                        && matches!(
+                            key,
+                            Key::Up
+                                | Key::Down
+                                | Key::PageUp
+                                | Key::PageDown
+                                | Key::Escape
+                                | Key::Enter
+                                | Key::KPEnter
+                                | Key::Tab
+                        )
+                    {
+                        return true;
+                    }
+
+                    // Handle typing - update intellisense filter
+                    let (word, word_start, _) =
+                        Self::word_at_cursor(&buffer_for_handle, cursor_pos);
+                    let buffer_len = buffer_for_handle.length();
+
+                    let fast_path_applied = if popup_visible {
+                        Self::try_fast_path_intellisense_filter(
+                            ed,
+                            &buffer_for_handle,
+                            &intellisense_popup_for_handle,
+                            &intellisense_runtime_for_handle,
+                            cursor_pos,
+                            key,
+                            typed_char,
+                        )
+                    } else {
+                        false
+                    };
+
+                    if fast_path_applied {
+                        intellisense_runtime_for_handle.clear_pending_intellisense();
+                        Self::invalidate_keyup_debounce_with_parse_generation(
+                            &intellisense_runtime_for_handle,
+                            true,
+                        );
+                    } else if key == Key::BackSpace || key == Key::Delete {
+                        // After backspace/delete, re-evaluate (debounced)
+                        if Self::has_min_intellisense_prefix(&word) {
+                            Self::schedule_keyup_intellisense_debounce(
+                                &intellisense_runtime_for_handle,
+                                cursor_pos,
+                                buffer_len,
+                                ed,
+                                &buffer_for_handle,
+                                &intellisense_data_for_handle,
+                                &intellisense_popup_for_handle,
+                                &column_sender_for_handle,
+                                &connection_for_handle,
+                            );
+                        } else {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                            Self::invalidate_keyup_debounce_with_parse_generation(
+                                &intellisense_runtime_for_handle,
+                                true,
+                            );
+                        }
+                    } else if let Some(ch) = typed_char {
+                        if Self::should_force_full_analysis(ch) {
+                            let qualifier =
+                                Self::qualifier_before_word(&buffer_for_handle, word_start);
+                            if Self::should_auto_trigger_intellisense_for_forced_char(
+                                &word,
+                                qualifier.as_deref(),
+                            ) {
+                                Self::schedule_keyup_intellisense_debounce(
+                                    &intellisense_runtime_for_handle,
+                                    cursor_pos,
+                                    buffer_len,
+                                    ed,
+                                    &buffer_for_handle,
+                                    &intellisense_data_for_handle,
+                                    &intellisense_popup_for_handle,
+                                    &column_sender_for_handle,
+                                    &connection_for_handle,
+                                );
+                            } else {
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                intellisense_runtime_for_handle.clear_ui_tracking();
+                                Self::invalidate_keyup_debounce_with_parse_generation(
+                                    &intellisense_runtime_for_handle,
+                                    true,
+                                );
+                            }
+                        } else if sql_text::is_identifier_char(ch) {
+                            // Alphanumeric typed - show/update popup if word is long enough
+                            if Self::has_min_intellisense_prefix(&word) {
+                                Self::schedule_keyup_intellisense_debounce(
+                                    &intellisense_runtime_for_handle,
+                                    cursor_pos,
+                                    buffer_len,
+                                    ed,
+                                    &buffer_for_handle,
+                                    &intellisense_data_for_handle,
+                                    &intellisense_popup_for_handle,
+                                    &column_sender_for_handle,
+                                    &connection_for_handle,
+                                );
+                            } else {
+                                intellisense_popup_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .hide();
+                                intellisense_runtime_for_handle.clear_ui_tracking();
+                                Self::invalidate_keyup_debounce_with_parse_generation(
+                                    &intellisense_runtime_for_handle,
+                                    true,
+                                );
+                            }
+                        } else {
+                            // Non-identifier character (space, punctuation, etc.)
+                            // Close popup - user is done with this word
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                            intellisense_runtime_for_handle.clear_ui_tracking();
+                            Self::invalidate_keyup_debounce_with_parse_generation(
+                                &intellisense_runtime_for_handle,
+                                true,
+                            );
+                        }
+                    }
+
+                    if Self::has_min_intellisense_prefix(&word) {
+                        Self::maybe_prefetch_columns_for_word(
+                            &word,
+                            &intellisense_data_for_handle,
+                            &column_sender_for_handle,
+                            &connection_for_handle,
+                        );
+                    }
+                    if matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
+                        widget_for_shortcuts.refresh_highlighting();
+                    }
+                    false
+                }
+                Event::Unfocus => {
+                    let unfocus_x = fltk::app::event_x_root();
+                    let unfocus_y = fltk::app::event_y_root();
+                    if matches!(
+                        intellisense_runtime_for_handle.popup_transition_state(),
+                        IntellisensePopupTransitionState::Showing
+                    ) {
+                        Self::schedule_deferred_unfocus_popup_hide(
+                            ed.clone(),
+                            intellisense_popup_for_handle.clone(),
+                            intellisense_runtime_for_handle.clone(),
+                            unfocus_x,
+                            unfocus_y,
+                            INTELLISENSE_DEFERRED_HIDE_RETRIES,
+                        );
+                        return false;
+                    }
+                    let should_hide_and_clear = {
+                        let mut popup = intellisense_popup_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let popup_visible = popup.is_visible();
+                        let pointer_inside_popup =
+                            popup_visible && popup.contains_point(unfocus_x, unfocus_y);
+                        if Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
+                            popup.hide();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_hide_and_clear {
+                        Self::clear_intellisense_state_for_external_hide(
+                            &intellisense_runtime_for_handle,
+                        );
+                    }
+                    false
+                }
+                Event::Shortcut => {
+                    let key = fltk::app::event_key();
+                    let popup_visible = intellisense_popup_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_visible();
+                    let state = fltk::app::event_state();
+                    let ctrl_or_cmd = state.contains(fltk::enums::Shortcut::Ctrl)
+                        || state.contains(fltk::enums::Shortcut::Command);
+
+                    // If intellisense is visible, consume Enter/Tab to prevent them from reaching other handlers
+                    if popup_visible
+                        && matches!(
+                            key,
+                            Key::Up
+                                | Key::Down
+                                | Key::PageUp
+                                | Key::PageDown
+                                | Key::Enter
+                                | Key::KPEnter
+                                | Key::Tab
+                        )
+                    {
+                        return true;
+                    }
+
+                    if ctrl_or_cmd && matches!(key, Key::Enter | Key::KPEnter) {
+                        if matches!(
+                            *enter_keyup_suppression_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            EnterKeyupSuppression::CtrlEnterExecute
+                        ) {
+                            return true;
+                        }
+                        *enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            EnterKeyupSuppression::CtrlEnterExecute;
+                        widget_for_shortcuts.execute_statement_at_cursor();
+                        return true;
+                    }
+
+                    false
+                }
+                Event::Paste => {
+                    let from_drop = {
+                        let mut drop_state = dnd_drop_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let was_drop = matches!(*drop_state, DndDropState::AwaitingPaste);
+                        *drop_state = DndDropState::Idle;
+                        was_drop
+                    };
+                    if !from_drop {
+                        return false;
+                    }
+
+                    let event_text = app::event_text();
+                    if let Some(path) = Self::extract_dropped_file_path(&event_text) {
+                        if Self::invoke_file_drop_callback(&file_drop_callback_for_handle, path) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        });
+    }
+
+    fn extract_dropped_file_path(raw: &str) -> Option<PathBuf> {
+        for token in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if token.starts_with('#') {
+                continue;
+            }
+            let Some(path) = Self::parse_dropped_file_token(token) else {
+                continue;
+            };
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    fn parse_dropped_file_token(token: &str) -> Option<PathBuf> {
+        let cleaned = token.trim_matches('\0').trim();
+        let cleaned = cleaned
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                cleaned
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(cleaned)
+            .trim();
+        if cleaned.is_empty() {
+            return None;
+        }
+
+        let path_str = if let Some(rest) = Self::strip_prefix_ignore_ascii_case(cleaned, "file://")
+        {
+            let mut uri_path = rest.trim();
+            if let Some(after_localhost) =
+                Self::strip_prefix_ignore_ascii_case(uri_path, "localhost")
+            {
+                uri_path = after_localhost;
+            }
+            #[cfg(windows)]
+            {
+                let bytes = uri_path.as_bytes();
+                if bytes.len() >= 3
+                    && bytes[0] == b'/'
+                    && bytes[1].is_ascii_alphabetic()
+                    && bytes[2] == b':'
+                {
+                    uri_path = &uri_path[1..];
+                }
+            }
+            Self::decode_uri_percent(uri_path)
+        } else {
+            cleaned.to_string()
+        };
+
+        if path_str.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(path_str))
+    }
+
+    fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+        let value_bytes = value.as_bytes();
+        let prefix_bytes = prefix.as_bytes();
+        if value_bytes.len() < prefix_bytes.len() {
+            return None;
+        }
+        if value_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes) {
+            return value.get(prefix_bytes.len()..);
+        }
+        None
+    }
+
+    fn decode_uri_percent(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex_value = |b: u8| -> Option<u8> {
+                    match b {
+                        b'0'..=b'9' => Some(b - b'0'),
+                        b'a'..=b'f' => Some(b - b'a' + 10),
+                        b'A'..=b'F' => Some(b - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+                {
+                    out.push((high << 4) | low);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8(out)
+            .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
+    }
+
+
+}

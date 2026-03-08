@@ -1,0 +1,153 @@
+use fltk::{
+    app,
+    draw::set_cursor,
+    enums::{Cursor, Event, Key},
+    prelude::*,
+    text::{PositionType, TextBuffer, TextEditor},
+};
+use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use oracle::Connection;
+
+use crate::db::{
+    ObjectBrowser, ProcedureArgument, SequenceInfo, SharedConnection, TableColumnDetail,
+};
+use crate::sql_text;
+use crate::ui::intellisense::{
+    detect_sql_context, get_word_at_cursor, IntellisenseData, IntellisensePopup, SqlContext,
+};
+use crate::ui::intellisense_context;
+use crate::ui::FindReplaceDialog;
+
+use super::*;
+
+const MAX_MERGED_SUGGESTIONS: usize = 50;
+const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
+const COLUMN_LOAD_WORKER_COUNT: usize = 4;
+const INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS: f64 = 0.01;
+const INTELLISENSE_DEFERRED_HIDE_RETRIES: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationKeyupState {
+    Idle,
+    RestoreCursor { anchor: i32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterKeyupSuppression {
+    None,
+    PopupConfirm,
+    CtrlEnterExecute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DndDropState {
+    Idle,
+    AwaitingPaste,
+}
+
+#[derive(Clone)]
+struct IntellisenseTriggerSnapshot {
+    request_generation: u64,
+    cursor_pos: i32,
+    cursor_pos_usize: usize,
+    prefix: String,
+    word_start: usize,
+    qualifier: Option<String>,
+    statement_text: String,
+    cursor_in_statement: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NormalizedIntellisenseContext {
+    text: String,
+    cursor_byte: usize,
+}
+
+#[derive(Clone)]
+struct ColumnLoadTask {
+    table_key: String,
+    connection: SharedConnection,
+    sender: mpsc::Sender<ColumnLoadUpdate>,
+}
+
+enum ColumnLoadWorkerMessage {
+    Task(ColumnLoadTask),
+    Shutdown,
+}
+
+struct ColumnLoadWorkerPool {
+    worker_senders: Vec<mpsc::Sender<ColumnLoadWorkerMessage>>,
+    worker_handles: Mutex<Vec<JoinHandle<()>>>,
+    next_worker: AtomicUsize,
+}
+
+impl ColumnLoadWorkerPool {
+    fn enqueue(&self, task: ColumnLoadTask) -> Result<(), ColumnLoadTask> {
+        if self.worker_senders.is_empty() {
+            return Err(task);
+        }
+        let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_senders.len();
+        let task_for_err = task.clone();
+        self.worker_senders[index]
+            .send(ColumnLoadWorkerMessage::Task(task))
+            .map_err(|_| task_for_err)
+    }
+
+    fn shutdown(&self) {
+        for sender in &self.worker_senders {
+            let _ = sender.send(ColumnLoadWorkerMessage::Shutdown);
+        }
+
+        let handles = {
+            let mut guard = match self.worker_handles.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+
+        for handle in handles {
+            if let Err(err) = handle.join() {
+                crate::utils::logging::log_error(
+                    "sql_editor::intellisense::column_loader",
+                    &format!("column worker join failed: {:?}", err),
+                );
+            }
+        }
+    }
+}
+
+static COLUMN_LOAD_WORKER_POOL: OnceLock<ColumnLoadWorkerPool> = OnceLock::new();
+
+impl SqlEditorWidget {
+    const COLUMN_LOAD_LOCK_RETRY_ATTEMPTS: usize = 5;
+    const COLUMN_LOAD_LOCK_RETRY_DELAY_MS: u64 = 60;
+    const INTELLISENSE_POPUP_WIDTH: i32 = 320;
+    const INTELLISENSE_POPUP_Y_OFFSET: i32 = 20;
+}
+
+include!("helpers.rs");
+include!("runtime.rs");
+include!("completion.rs");
+include!("context.rs");
+include!("popup.rs");
+
+#[cfg(test)]
+mod intellisense_regression_tests {
+    use super::*;
+    use crate::db::create_shared_connection;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    include!("tests.rs");
+}
