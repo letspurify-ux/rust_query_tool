@@ -721,7 +721,7 @@ impl QueryExecutor {
                     i -= 1;
                     if i > 0 && bytes[i - 1] == b'/' && bytes[i] == b'*' {
                         depth -= 1;
-                        if depth < 0 {
+                        if depth == 0 {
                             found_start = Some(i - 1);
                             break;
                         }

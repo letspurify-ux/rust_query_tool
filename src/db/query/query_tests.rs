@@ -2976,6 +2976,39 @@ SELECT 1 FROM DUAL;
 }
 
 #[test]
+fn test_strip_comments_removes_trailing_block_comment_same_line() {
+    // Trailing block comment inline with SQL should be stripped.
+    let sql = "SELECT 1 FROM dual /* trailing note */";
+    let stripped = QueryExecutor::strip_comments(sql);
+    assert_eq!(
+        stripped, "SELECT 1 FROM dual",
+        "Trailing inline block comment should be stripped, got: {stripped:?}"
+    );
+}
+
+#[test]
+fn test_strip_comments_removes_trailing_block_comment_own_line() {
+    // Trailing block comment on its own line (after newline) should be stripped.
+    let sql = "SELECT 1 FROM dual\n/* trailing note */";
+    let stripped = QueryExecutor::strip_comments(sql);
+    assert_eq!(
+        stripped, "SELECT 1 FROM dual",
+        "Trailing whole-line block comment should be stripped, got: {stripped:?}"
+    );
+}
+
+#[test]
+fn test_strip_comments_removes_multiple_trailing_block_comments() {
+    // Multiple sequential trailing block comments should all be stripped.
+    let sql = "SELECT 1 FROM dual /* note1 */ /* note2 */";
+    let stripped = QueryExecutor::strip_comments(sql);
+    assert_eq!(
+        stripped, "SELECT 1 FROM dual",
+        "Multiple trailing block comments should be stripped, got: {stripped:?}"
+    );
+}
+
+#[test]
 fn test_procedure_with_loop() {
     let sql = r#"CREATE PROCEDURE test_proc AS
 BEGIN
