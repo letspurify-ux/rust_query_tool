@@ -5920,6 +5920,46 @@ BEGIN"
     }
 
     #[test]
+    fn bare_start_line_is_not_misclassified_as_sqlplus_start_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT employee_id");
+        engine.process_line("FROM employees");
+        engine.process_line("START");
+        engine.process_line("WITH manager_id IS NULL");
+        engine.process_line("CONNECT BY PRIOR employee_id = manager_id;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("START
+WITH manager_id IS NULL"),
+            "multi-line START WITH clause should remain in the SELECT statement: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
+    fn bare_connect_line_is_not_misclassified_as_sqlplus_connect_command() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT employee_id");
+        engine.process_line("FROM employees");
+        engine.process_line("START WITH manager_id IS NULL");
+        engine.process_line("CONNECT");
+        engine.process_line("BY PRIOR employee_id = manager_id;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("CONNECT
+BY PRIOR employee_id = manager_id"),
+            "multi-line CONNECT BY clause should remain in the SELECT statement: {}",
+            statements[0]
+        );
+    }
+
+    #[test]
     fn oracle_select_identifier_prompt_is_not_misclassified_as_sqlplus_prompt_command() {
         let mut engine = SqlParserEngine::new();
 
