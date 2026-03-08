@@ -1064,12 +1064,12 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         // Keywords requiring second-word disambiguation
         "START" => {
             let second = next_meaningful_word(trimmed, 1).map(|(word, _)| word);
-            !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+            second.is_some_and(|word| !word.eq_ignore_ascii_case("WITH"))
         }
         "R" => next_meaningful_word(trimmed, 1).is_none(),
-        "CONNECT" => !next_meaningful_word(trimmed, 1)
+        "CONNECT" => next_meaningful_word(trimmed, 1)
             .map(|(word, _)| word)
-            .is_some_and(|second| second.eq_ignore_ascii_case("BY")),
+            .is_some_and(|second| !second.eq_ignore_ascii_case("BY")),
         "SET" => {
             let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
                 return false;
@@ -1400,6 +1400,14 @@ mod tests {
         assert!(!is_auto_terminated_tool_command(
             "START WITH parent_id IS NULL"
         ));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_requires_arguments_for_start_and_connect() {
+        assert!(!is_auto_terminated_tool_command("START"));
+        assert!(!is_auto_terminated_tool_command("CONNECT"));
+        assert!(is_auto_terminated_tool_command("START script.sql"));
+        assert!(is_auto_terminated_tool_command("CONNECT scott/tiger"));
     }
 
     #[test]
