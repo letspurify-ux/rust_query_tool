@@ -11401,19 +11401,19 @@ fn test_split_script_items_create_sharing_wrapped_procedure_keeps_body_until_sla
 }
 
 #[test]
-fn test_split_script_items_non_ascii_q_quote_delimiter_recovers_and_splits_trailing_statement() {
-    let sql = "SELECT q'가x' FROM dual;\nSELECT 2 FROM dual;";
+fn test_split_script_items_non_ascii_q_quote_delimiter_splits_trailing_statement() {
+    let sql = "SELECT q'가x가' FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
 
     assert_eq!(
         stmts.len(),
         2,
-        "non-ASCII q-quote delimiter should be treated as invalid and not swallow trailing statement: {stmts:?}"
+        "non-ASCII q-quote delimiter should keep q-quote balanced and split trailing statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("SELECT q'가x' FROM dual"),
-        "first statement should preserve original malformed q-quote text: {}",
+        stmts[0].starts_with("SELECT q'가x가' FROM dual"),
+        "first statement should preserve non-ASCII q-quote text: {}",
         stmts[0]
     );
     assert!(
@@ -11424,8 +11424,8 @@ fn test_split_script_items_non_ascii_q_quote_delimiter_recovers_and_splits_trail
 }
 
 #[test]
-fn test_split_format_items_non_ascii_q_quote_delimiter_recovers_and_splits_trailing_statement() {
-    let sql = "SELECT q'가x' FROM dual;\nSELECT 2 FROM dual;";
+fn test_split_format_items_non_ascii_q_quote_delimiter_splits_trailing_statement() {
+    let sql = "SELECT q'가x가' FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);
     let stmts: Vec<&str> = items
         .iter()
@@ -11438,11 +11438,11 @@ fn test_split_format_items_non_ascii_q_quote_delimiter_recovers_and_splits_trail
     assert_eq!(
         stmts.len(),
         2,
-        "split_format_items should recover from non-ASCII q-quote delimiter and split trailing statement: {stmts:?}"
+        "split_format_items should keep non-ASCII q-quote delimiter balanced and split trailing statement: {stmts:?}"
     );
     assert!(
-        stmts[0].starts_with("SELECT q'가x' FROM dual"),
-        "first formatted statement should preserve malformed q-quote text: {}",
+        stmts[0].starts_with("SELECT q'가x가' FROM dual"),
+        "first formatted statement should preserve non-ASCII q-quote text: {}",
         stmts[0]
     );
     assert!(

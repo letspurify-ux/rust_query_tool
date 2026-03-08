@@ -1687,7 +1687,7 @@ fn chars_starts_with_ascii_case_insensitive(chars: &[char], start: usize, patter
 
 #[inline]
 fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-    delimiter.is_ascii() && !delimiter.is_ascii_whitespace() && delimiter != '\''
+    !delimiter.is_whitespace() && delimiter != '\''
 }
 
 #[inline]
@@ -4268,6 +4268,32 @@ mod tests {
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert_eq!(statements[0], "SELECT q'' FROM dual".to_string());
         assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn non_ascii_q_quote_delimiter_is_treated_as_q_quote_and_preserves_semicolon_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT q'가문자열가' FROM dual;");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SELECT q'가문자열가' FROM dual".to_string());
+        assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+    }
+
+    #[test]
+    fn non_ascii_nq_quote_delimiter_is_treated_as_q_quote_and_preserves_semicolon_split() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("SELECT nq'가문자열가' FROM dual;");
+        engine.process_line("SELECT 3 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert_eq!(statements[0], "SELECT nq'가문자열가' FROM dual".to_string());
+        assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
     }
 
     #[test]
