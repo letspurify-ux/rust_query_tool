@@ -1792,6 +1792,38 @@ fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
         return true;
     }
 
+    if chars[idx] == '/' && chars.get(idx + 1).copied() == Some('*') {
+        let mut scan_idx = idx + 2;
+        let mut found_comment_end = false;
+
+        while scan_idx < chars.len() {
+            if chars[scan_idx] == '*' && chars.get(scan_idx + 1).copied() == Some('/') {
+                scan_idx += 2;
+                found_comment_end = true;
+                break;
+            }
+
+            if chars[scan_idx] == '\n' {
+                break;
+            }
+
+            scan_idx += 1;
+        }
+
+        if !found_comment_end {
+            return false;
+        }
+
+        while scan_idx < chars.len() && chars[scan_idx] != '\n' {
+            if !chars[scan_idx].is_whitespace() {
+                return false;
+            }
+            scan_idx += 1;
+        }
+
+        return true;
+    }
+
     let is_ascii_boundary = |offset: usize| {
         chars
             .get(offset)
@@ -6710,6 +6742,35 @@ BY PRIOR employee_id = manager_id"),
         assert!(
             statements[1].starts_with("@@child_script.sql"),
             "double run-script marker should start the next statement after external routine split: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn with_function_waiting_main_query_recovers_on_slash_line_with_block_comment() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("WITH");
+        engine.process_line("  FUNCTION f RETURN NUMBER IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    RETURN 1;");
+        engine.process_line("  END;");
+        engine.process_line("/ /* rerun statement */");
+        engine.process_line("SELECT f() FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("WITH
+  FUNCTION f RETURN NUMBER IS"),
+            "WITH FUNCTION declaration should remain the first statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("/ /* rerun statement */
+SELECT f() FROM dual"),
+            "slash terminator with block comment should start the next statement: {}",
             statements[1]
         );
     }
