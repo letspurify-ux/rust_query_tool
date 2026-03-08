@@ -303,7 +303,7 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
 
         pending_newline = false;
 
-        if current.is_empty() && (c == 'n' || c == 'N') {
+        if current.is_empty() && matches!(c, 'n' | 'N' | 'u' | 'U') {
             let mut lookahead = iter.clone();
             if let (Some((_, q_ch)), Some((_, quote_ch)), Some((_, delimiter))) =
                 (lookahead.next(), lookahead.next(), lookahead.next())
@@ -997,7 +997,7 @@ mod tests {
 
             pending_newline = false;
 
-            if (c == 'n' || c == 'N')
+            if matches!(c, 'n' | 'N' | 'u' | 'U')
                 && (next == Some('q') || next == Some('Q'))
                 && i + 2 < chars.len()
                 && chars[i + 2] == '\''
@@ -1256,6 +1256,32 @@ mod tests {
             string_token,
             Some(("nq'가문자열가'".to_string(), 7, 24)),
             "unicode nq-quote delimiter should stay in one string token"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_treats_uq_quote_literal_as_string() {
+        let tokens = tokenize_sql("SELECT uq'[문자열;유지]' AS txt FROM dual");
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, SqlToken::String(s) if s == "uq'[문자열;유지]'")));
+    }
+
+    #[test]
+    fn tokenize_sql_spanned_supports_unicode_uq_quote_delimiter() {
+        let sql = "SELECT uq'가문자열가' AS txt FROM dual";
+        let string_token =
+            tokenize_sql_spanned(sql)
+                .into_iter()
+                .find_map(|span| match span.token {
+                    SqlToken::String(value) => Some((value, span.start, span.end)),
+                    _ => None,
+                });
+
+        assert_eq!(
+            string_token,
+            Some(("uq'가문자열가'".to_string(), 7, 24)),
+            "unicode uq-quote delimiter should stay in one string token"
         );
     }
 }
