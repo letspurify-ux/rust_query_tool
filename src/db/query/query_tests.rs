@@ -8707,6 +8707,37 @@ fn test_split_script_items_oracle_with_function_keeps_single_statement_until_mai
 }
 
 #[test]
+fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_call() {
+    let sql = "WITH
+  FUNCTION f RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END;
+CALL consume_fn(f());
+SELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION declaration must stay attached to main CALL statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].starts_with("WITH
+  FUNCTION f RETURN NUMBER IS"),
+        "first statement should preserve WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("CALL consume_fn(f())"),
+        "first statement should include main CALL body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_procedure_without_semicolon_uses_slash_terminator() {
     let sql = "WITH PROCEDURE p IS\nBEGIN\n  NULL;\nEND\n/\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
