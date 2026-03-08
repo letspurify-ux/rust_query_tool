@@ -1679,7 +1679,7 @@ impl QueryExecutor {
             Some(s) => s,
             None => return false,
         };
-        for token in TopLevelScanner::new(slice) {
+        if let Some(token) = TopLevelScanner::new(slice).next() {
             if let ScanToken::Word { text, .. } = token {
                 return text.eq_ignore_ascii_case("DISTINCT")
                     || text.eq_ignore_ascii_case("UNIQUE");

@@ -20,6 +20,7 @@ impl SqlEditorWidget {
         let cursor_token_len = cursor_token_len.min(tokens.len());
         let mut state = InsertParseState::Idle;
         let mut depth = 0usize;
+        let mut multitable_insert = false;
 
         for token in &tokens[..cursor_token_len] {
             match token {
@@ -28,6 +29,16 @@ impl SqlEditorWidget {
                     if word.eq_ignore_ascii_case("INSERT") {
                         state = InsertParseState::AfterInsert;
                         depth = 0;
+                        multitable_insert = false;
+                        continue;
+                    }
+
+                    if depth == 0
+                        && matches!(state, InsertParseState::AfterInsert)
+                        && (word.eq_ignore_ascii_case("ALL")
+                            || word.eq_ignore_ascii_case("FIRST"))
+                    {
+                        multitable_insert = true;
                         continue;
                     }
 
@@ -36,6 +47,13 @@ impl SqlEditorWidget {
                             InsertParseState::AfterInto
                         }
                         InsertParseState::AfterInto => InsertParseState::AfterTarget,
+                        InsertParseState::InValuesOrSelectBody
+                            if depth == 0
+                                && multitable_insert
+                                && word.eq_ignore_ascii_case("INTO") =>
+                        {
+                            InsertParseState::AfterInto
+                        }
                         InsertParseState::AfterTarget | InsertParseState::AfterColumnList
                             if starts_insert_body(word) =>
                         {

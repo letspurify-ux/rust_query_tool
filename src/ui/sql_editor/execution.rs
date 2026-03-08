@@ -75,6 +75,14 @@ struct ResolvedScriptInclude {
     items: Vec<ScriptItem>,
 }
 
+#[derive(Debug, Clone)]
+enum PrintNamedData {
+    Scalar(Option<String>),
+    Cursor(CursorResult),
+    CursorEmpty,
+    Missing,
+}
+
 #[derive(Clone, Copy)]
 struct ExecutionStartupPolicy {
     has_connect_command: bool,
@@ -3400,36 +3408,15 @@ impl SqlEditorWidget {
 
                                     if let Some(name) = name {
                                         let key = SessionState::normalize_name(&name);
-                                        enum PrintNamedData {
-                                            Scalar(Option<String>),
-                                            Cursor(CursorResult),
-                                            CursorEmpty,
-                                            Missing,
-                                        }
-
                                         let named_data = {
-                                            let mut guard = match session.lock() {
+                                            let guard = match session.lock() {
                                                 Ok(guard) => guard,
                                                 Err(poisoned) => {
                                                     eprintln!("Warning: session state lock was poisoned; recovering.");
                                                     poisoned.into_inner()
                                                 }
                                             };
-                                            match guard.binds.get_mut(&key) {
-                                                Some(bind) => match &mut bind.value {
-                                                    BindValue::Scalar(value) => {
-                                                        PrintNamedData::Scalar(value.clone())
-                                                    }
-                                                    BindValue::Cursor(cursor) => {
-                                                        if let Some(cursor_result) = cursor.take() {
-                                                            PrintNamedData::Cursor(cursor_result)
-                                                        } else {
-                                                            PrintNamedData::CursorEmpty
-                                                        }
-                                                    }
-                                                },
-                                                None => PrintNamedData::Missing,
-                                            }
+                                            SqlEditorWidget::clone_print_named_data(&guard, &key)
                                         };
 
                                         match named_data {
@@ -3504,7 +3491,7 @@ impl SqlEditorWidget {
                                         }
                                     } else {
                                         let (summary_rows, cursor_results) = {
-                                            let mut guard = match session.lock() {
+                                            let guard = match session.lock() {
                                                 Ok(guard) => guard,
                                                 Err(poisoned) => {
                                                     eprintln!("Warning: session state lock was poisoned; recovering.");
@@ -3515,45 +3502,10 @@ impl SqlEditorWidget {
                                             if guard.binds.is_empty() {
                                                 (Vec::new(), Vec::new())
                                             } else {
-                                                let mut summary_rows: Vec<Vec<String>> = Vec::new();
-                                                let mut cursor_results: Vec<(
-                                                    String,
-                                                    CursorResult,
-                                                )> = Vec::new();
-
-                                                for (bind_name, bind) in &mut guard.binds {
-                                                    let value_display = match &mut bind.value {
-                                                        BindValue::Scalar(value) => value
-                                                            .clone()
-                                                            .unwrap_or_else(|| null_text.clone()),
-                                                        BindValue::Cursor(cursor) => {
-                                                            if let Some(cursor_result) =
-                                                                cursor.take()
-                                                            {
-                                                                let row_count =
-                                                                    cursor_result.rows.len();
-                                                                cursor_results.push((
-                                                                    bind_name.clone(),
-                                                                    cursor_result,
-                                                                ));
-                                                                format!(
-                                                                    "REFCURSOR ({} rows)",
-                                                                    row_count
-                                                                )
-                                                            } else {
-                                                                "REFCURSOR (empty)".to_string()
-                                                            }
-                                                        }
-                                                    };
-
-                                                    summary_rows.push(vec![
-                                                        bind_name.clone(),
-                                                        bind.data_type.display(),
-                                                        value_display,
-                                                    ]);
-                                                }
-
-                                                (summary_rows, cursor_results)
+                                                SqlEditorWidget::collect_print_all_data(
+                                                    &guard,
+                                                    &null_text,
+                                                )
                                             }
                                         };
 
@@ -6138,6 +6090,10 @@ impl SqlEditorWidget {
 
                                     match cursor_result {
                                         Ok((mut query_result, was_cancelled)) => {
+                                            let cursor_column_names =
+                                                SqlEditorWidget::cursor_result_column_names(
+                                                    &query_result.columns,
+                                                );
                                             if cursor_timed_out {
                                                 query_result.message =
                                                     SqlEditorWidget::timeout_message(query_timeout);
@@ -6163,12 +6119,6 @@ impl SqlEditorWidget {
                                             if !feedback_enabled {
                                                 query_result.message.clear();
                                             }
-
-                                            let column_names: Vec<String> = query_result
-                                                .columns
-                                                .iter()
-                                                .map(|c| c.name.clone())
-                                                .collect();
 
                                             // Spool output before sending to avoid
                                             // cloning the message string a second time.
@@ -6198,7 +6148,7 @@ impl SqlEditorWidget {
                                             if let Some(bind) = guard.binds.get_mut(&cursor_name) {
                                                 bind.value =
                                                     BindValue::Cursor(Some(CursorResult {
-                                                        columns: column_names,
+                                                        columns: cursor_column_names,
                                                         rows: cursor_rows,
                                                     }));
                                             }
@@ -7392,6 +7342,51 @@ impl SqlEditorWidget {
         }
     }
 
+    fn clone_print_named_data(session: &SessionState, key: &str) -> PrintNamedData {
+        match session.binds.get(key) {
+            Some(bind) => match &bind.value {
+                BindValue::Scalar(value) => PrintNamedData::Scalar(value.clone()),
+                BindValue::Cursor(Some(cursor_result)) => {
+                    PrintNamedData::Cursor(cursor_result.clone())
+                }
+                BindValue::Cursor(None) => PrintNamedData::CursorEmpty,
+            },
+            None => PrintNamedData::Missing,
+        }
+    }
+
+    fn collect_print_all_data(
+        session: &SessionState,
+        null_text: &str,
+    ) -> (Vec<Vec<String>>, Vec<(String, CursorResult)>) {
+        let mut summary_rows = Vec::new();
+        let mut cursor_results = Vec::new();
+
+        for (bind_name, bind) in &session.binds {
+            let value_display = match &bind.value {
+                BindValue::Scalar(value) => value.clone().unwrap_or_else(|| null_text.to_string()),
+                BindValue::Cursor(Some(cursor_result)) => {
+                    let row_count = cursor_result.rows.len();
+                    cursor_results.push((bind_name.clone(), cursor_result.clone()));
+                    format!("REFCURSOR ({} rows)", row_count)
+                }
+                BindValue::Cursor(None) => "REFCURSOR (empty)".to_string(),
+            };
+
+            summary_rows.push(vec![
+                bind_name.clone(),
+                bind.data_type.display(),
+                value_display,
+            ]);
+        }
+
+        (summary_rows, cursor_results)
+    }
+
+    fn cursor_result_column_names(columns: &[ColumnInfo]) -> Vec<String> {
+        columns.iter().map(|column| column.name.clone()).collect()
+    }
+
     fn has_spool_target(session: &Arc<Mutex<SessionState>>) -> bool {
         match session.lock() {
             Ok(guard) => guard.spool_path.is_some(),
@@ -7687,6 +7682,25 @@ impl SqlEditorWidget {
         app::awake();
     }
 
+    fn flush_buffered_result_rows(
+        sender: &mpsc::Sender<QueryProgress>,
+        session: &Arc<Mutex<SessionState>>,
+        index: usize,
+        buffered_display_rows: &mut Vec<Vec<String>>,
+        buffered_raw_rows: &mut Vec<Vec<String>>,
+    ) {
+        if buffered_display_rows.is_empty() {
+            buffered_raw_rows.clear();
+            return;
+        }
+
+        let rows = std::mem::take(buffered_display_rows);
+        let raw_rows = std::mem::take(buffered_raw_rows);
+        SqlEditorWidget::append_spool_rows(session, &raw_rows);
+        let _ = sender.send(QueryProgress::Rows { index, rows });
+        app::awake();
+    }
+
     fn emit_select_result(
         sender: &mpsc::Sender<QueryProgress>,
         session: &Arc<Mutex<SessionState>>,
@@ -7713,21 +7727,38 @@ impl SqlEditorWidget {
         }
 
         let mut row_count = 0usize;
+        let mut buffered_display_rows: Vec<Vec<String>> = Vec::new();
+        let mut buffered_raw_rows: Vec<Vec<String>> = Vec::new();
+        let mut last_flush = Instant::now();
+        let mut has_flushed_rows = false;
         if !rows.is_empty() {
-            for row_chunk in rows.chunks(PROGRESS_ROWS_MAX_BATCH) {
-                let display_chunk: Vec<Vec<String>> = row_chunk
-                    .iter()
-                    .map(|row| SqlEditorWidget::display_row_values(row, &null_text))
-                    .collect();
-                row_count += display_chunk.len();
-
-                let _ = sender.send(QueryProgress::Rows {
-                    index,
-                    rows: display_chunk,
-                });
-                app::awake();
-                SqlEditorWidget::append_spool_rows(session, row_chunk);
+            for row in rows {
+                row_count += 1;
+                buffered_display_rows.push(SqlEditorWidget::display_row_values(&row, &null_text));
+                buffered_raw_rows.push(row);
+                if SqlEditorWidget::should_flush_progress_rows(
+                    last_flush,
+                    buffered_display_rows.len(),
+                    has_flushed_rows,
+                ) {
+                    SqlEditorWidget::flush_buffered_result_rows(
+                        sender,
+                        session,
+                        index,
+                        &mut buffered_display_rows,
+                        &mut buffered_raw_rows,
+                    );
+                    last_flush = Instant::now();
+                    has_flushed_rows = true;
+                }
             }
+            SqlEditorWidget::flush_buffered_result_rows(
+                sender,
+                session,
+                index,
+                &mut buffered_display_rows,
+                &mut buffered_raw_rows,
+            );
         }
         let column_info: Vec<ColumnInfo> = column_names
             .iter()
@@ -8557,7 +8588,9 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_regression_tests {
-    use super::{QueryProgress, ScriptItem, SqlEditorWidget};
+    use super::{
+        QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH,
+    };
     use crate::db::SessionState;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -9069,6 +9102,102 @@ END oqt_mega_pkg;"#;
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected QueryProgress::Rows"),
+        }
+    }
+
+    #[test]
+    fn flush_buffered_result_rows_emits_display_rows() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let mut buffered_display_rows = vec![vec!["(null)".to_string()], vec!["2".to_string()]];
+        let mut buffered_raw_rows = vec![vec!["".to_string()], vec!["2".to_string()]];
+
+        SqlEditorWidget::flush_buffered_result_rows(
+            &sender,
+            &session,
+            9,
+            &mut buffered_display_rows,
+            &mut buffered_raw_rows,
+        );
+
+        assert!(buffered_display_rows.is_empty());
+        assert!(buffered_raw_rows.is_empty());
+        let message = receiver
+            .try_recv()
+            .unwrap_or_else(|err| panic!("expected result rows progress message: {err}"));
+        match message {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(index, 9);
+                assert_eq!(rows, vec![vec!["(null)".to_string()], vec!["2".to_string()]]);
+            }
+            _ => panic!("expected QueryProgress::Rows"),
+        }
+    }
+
+    #[test]
+    fn emit_select_result_uses_streaming_sized_initial_batch() {
+        let (sender, receiver) = mpsc::channel();
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let rows = (0..101)
+            .map(|index| vec![format!("value_{index}")])
+            .collect::<Vec<Vec<String>>>();
+
+        SqlEditorWidget::emit_select_result(
+            &sender,
+            &session,
+            "LOCAL",
+            4,
+            "select * from dual",
+            vec!["COL1".to_string()],
+            rows,
+            true,
+            true,
+        );
+
+        let messages = receiver.try_iter().collect::<Vec<QueryProgress>>();
+        assert_eq!(messages.len(), 5);
+        match &messages[0] {
+            QueryProgress::StatementStart { index } => assert_eq!(*index, 4),
+            _ => panic!("expected QueryProgress::StatementStart"),
+        }
+        match &messages[1] {
+            QueryProgress::SelectStart {
+                index,
+                columns,
+                null_text: _,
+            } => {
+                assert_eq!(*index, 4);
+                assert_eq!(columns, &vec!["COL1".to_string()]);
+            }
+            _ => panic!("expected QueryProgress::SelectStart"),
+        }
+        match &messages[2] {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(*index, 4);
+                assert_eq!(rows.len(), PROGRESS_ROWS_INITIAL_BATCH);
+            }
+            _ => panic!("expected initial QueryProgress::Rows"),
+        }
+        match &messages[3] {
+            QueryProgress::Rows { index, rows } => {
+                assert_eq!(*index, 4);
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("expected trailing QueryProgress::Rows"),
+        }
+        match &messages[4] {
+            QueryProgress::StatementFinished {
+                index,
+                result,
+                connection_name,
+                timed_out,
+            } => {
+                assert_eq!(*index, 4);
+                assert_eq!(connection_name, "LOCAL");
+                assert!(!timed_out);
+                assert_eq!(result.row_count, 101);
+            }
+            _ => panic!("expected QueryProgress::StatementFinished"),
         }
     }
 
@@ -9673,6 +9802,103 @@ mod disconnected_precheck_gate_tests {
 
         assert!(!policy.has_connect_command);
         assert!(policy.requires_connected_session);
+    }
+}
+
+#[cfg(test)]
+mod print_bind_state_tests {
+    use super::{PrintNamedData, SqlEditorWidget};
+    use crate::db::{BindDataType, BindValue, BindVar, ColumnInfo, CursorResult, SessionState};
+
+    #[test]
+    fn clone_print_named_data_preserves_refcursor_in_session() {
+        let mut session = SessionState::default();
+        session.binds.insert(
+            "V_RC".to_string(),
+            BindVar {
+                data_type: BindDataType::RefCursor,
+                value: BindValue::Cursor(Some(CursorResult {
+                    columns: vec!["EMPNO".to_string()],
+                    rows: vec![vec!["7369".to_string()]],
+                })),
+            },
+        );
+
+        let named = SqlEditorWidget::clone_print_named_data(&session, "V_RC");
+
+        match named {
+            PrintNamedData::Cursor(cursor) => {
+                assert_eq!(cursor.columns, vec!["EMPNO".to_string()]);
+                assert_eq!(cursor.rows, vec![vec!["7369".to_string()]]);
+            }
+            _ => panic!("expected cursor print data"),
+        }
+
+        match session.binds.get("V_RC").map(|bind| &bind.value) {
+            Some(BindValue::Cursor(Some(cursor))) => {
+                assert_eq!(cursor.columns, vec!["EMPNO".to_string()]);
+                assert_eq!(cursor.rows, vec![vec!["7369".to_string()]]);
+            }
+            _ => panic!("expected refcursor to remain in session after PRINT clone"),
+        }
+    }
+
+    #[test]
+    fn collect_print_all_data_preserves_cursor_results() {
+        let mut session = SessionState::default();
+        session.binds.insert(
+            "V_RC".to_string(),
+            BindVar {
+                data_type: BindDataType::RefCursor,
+                value: BindValue::Cursor(Some(CursorResult {
+                    columns: vec!["ENAME".to_string()],
+                    rows: vec![vec!["SMITH".to_string()]],
+                })),
+            },
+        );
+
+        let (summary_rows, cursor_results) = SqlEditorWidget::collect_print_all_data(&session, "");
+
+        assert_eq!(summary_rows.len(), 1);
+        assert_eq!(
+            summary_rows[0],
+            vec![
+                "V_RC".to_string(),
+                BindDataType::RefCursor.display(),
+                "REFCURSOR (1 rows)".to_string(),
+            ]
+        );
+        assert_eq!(cursor_results.len(), 1);
+        assert_eq!(cursor_results[0].0, "V_RC".to_string());
+        assert_eq!(cursor_results[0].1.columns, vec!["ENAME".to_string()]);
+        assert_eq!(cursor_results[0].1.rows, vec![vec!["SMITH".to_string()]]);
+
+        match session.binds.get("V_RC").map(|bind| &bind.value) {
+            Some(BindValue::Cursor(Some(cursor))) => {
+                assert_eq!(cursor.columns, vec!["ENAME".to_string()]);
+                assert_eq!(cursor.rows, vec![vec!["SMITH".to_string()]]);
+            }
+            _ => panic!("expected refcursor to remain in session after PRINT ALL snapshot"),
+        }
+    }
+
+    #[test]
+    fn cursor_result_column_names_preserve_raw_headers_for_later_print() {
+        let columns = vec![
+            ColumnInfo {
+                name: "EMPNO".to_string(),
+                data_type: "Number".to_string(),
+            },
+            ColumnInfo {
+                name: "ENAME".to_string(),
+                data_type: "Varchar2".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            SqlEditorWidget::cursor_result_column_names(&columns),
+            vec!["EMPNO".to_string(), "ENAME".to_string()]
+        );
     }
 }
 

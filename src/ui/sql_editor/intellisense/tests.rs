@@ -1467,6 +1467,60 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
     }
 
     #[test]
+    fn classify_intellisense_context_treats_insert_all_second_column_list_as_column_context() {
+        let sql_with_cursor =
+            "INSERT ALL INTO emp_a (id) VALUES (1) INTO emp_b (|) VALUES (2) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(SqlEditorWidget::is_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
+    fn classify_intellisense_context_treats_insert_first_second_column_list_as_column_context() {
+        let sql_with_cursor = "INSERT FIRST WHEN 1 = 1 THEN INTO emp_a (id) VALUES (1) \
+             WHEN 2 = 2 THEN INTO emp_b (|) VALUES (2) SELECT 1 FROM dual";
+        let cursor = sql_with_cursor
+            .find('|')
+            .expect("cursor marker should exist");
+        let sql = sql_with_cursor.replace('|', "");
+
+        let token_spans = super::query_text::tokenize_sql_spanned(&sql);
+        let split_idx = token_spans.partition_point(|span| span.end <= cursor);
+        let full_tokens: Vec<SqlToken> = token_spans.into_iter().map(|span| span.token).collect();
+        let deep_ctx = intellisense_context::analyze_cursor_context(&full_tokens, split_idx);
+
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::IntoClause);
+        assert!(SqlEditorWidget::is_insert_column_list_context(
+            deep_ctx.statement_tokens.as_ref(),
+            deep_ctx.cursor_token_len
+        ));
+
+        let context = SqlEditorWidget::classify_intellisense_context(
+            &deep_ctx,
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        assert_eq!(context, SqlContext::ColumnName);
+    }
+
+    #[test]
     fn insert_column_list_context_ignores_parentheses_after_select_body_starts() {
         let sql_with_cursor =
             "INSERT INTO audit_emp (emp_id) SELECT * FROM (SELECT | FROM oqt_t_emp) src";

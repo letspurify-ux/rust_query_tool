@@ -244,7 +244,7 @@ impl SplitState {
             return LineBoundaryAction::None;
         }
 
-        let first_word = line.trim_start().split_whitespace().next();
+        let first_word = line.split_whitespace().next();
         if first_word.is_some_and(|word| word.eq_ignore_ascii_case("BEGIN")) {
             return LineBoundaryAction::None;
         }
@@ -1152,7 +1152,6 @@ impl SplitState {
             }
 
             self.with_clause_state = WithClauseState::None;
-            return;
         }
     }
 

@@ -2659,14 +2659,11 @@ fn skip_relation_postfix_clauses(tokens: &[SqlToken], start: usize) -> usize {
                         open_idx = skip_comment_tokens(tokens, open_idx + 1);
                     }
                 } else if upper == "SAMPLE"
-                    && matches!(tokens.get(open_idx), Some(SqlToken::Word(next)) if next.eq_ignore_ascii_case("BLOCK"))
-                {
-                    open_idx = skip_comment_tokens(tokens, open_idx + 1);
-                } else if upper == "SAMPLE"
                     && matches!(
                         tokens.get(open_idx),
                         Some(SqlToken::Word(next))
-                            if next.eq_ignore_ascii_case("BERNOULLI")
+                            if next.eq_ignore_ascii_case("BLOCK")
+                                || next.eq_ignore_ascii_case("BERNOULLI")
                                 || next.eq_ignore_ascii_case("SYSTEM")
                     )
                 {
@@ -3519,11 +3516,11 @@ fn extract_match_recognize_measure_columns(tokens: &[SqlToken]) -> Vec<String> {
     }
 
     let mut measures_end = clause_tokens.len();
-    for idx in measures_start..clause_tokens.len() {
+    for (idx, token) in clause_tokens.iter().enumerate().skip(measures_start) {
         if !is_top_level_depth(&token_depths, idx) {
             continue;
         }
-        if let SqlToken::Word(word) = &clause_tokens[idx] {
+        if let SqlToken::Word(word) = token {
             let upper = word.to_ascii_uppercase();
             if is_match_recognize_clause_boundary_keyword(&upper) {
                 measures_end = idx;

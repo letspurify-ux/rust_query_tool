@@ -3364,6 +3364,43 @@ fn with_function_supports_all_oracle_main_query_heads() {
 }
 
 #[test]
+fn with_function_followed_by_multitable_insert_all_stays_single_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END;");
+    engine.process_line("INSERT ALL");
+    engine.process_line("  INTO t_result(v) VALUES (f())");
+    engine.process_line("  INTO t_audit(v) VALUES (f() + 1)");
+    engine.process_line("SELECT f() FROM dual;");
+    engine.process_line("SELECT 10 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(
+        statements.len(),
+        2,
+        "multitable INSERT ALL main query should stay attached to WITH FUNCTION: {statements:?}"
+    );
+    assert!(
+        statements[0].contains("INSERT ALL"),
+        "first statement should keep INSERT ALL body attached: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("SELECT f() FROM dual"),
+        "first statement should include INSERT ALL driving SELECT: {}",
+        statements[0]
+    );
+    assert!(
+        statements[1].starts_with("SELECT 10 FROM dual"),
+        "second statement should preserve trailing SELECT: {}",
+        statements[1]
+    );
+}
+
+#[test]
 fn with_function_recovery_splits_before_non_main_query_statement_heads() {
     let cases = [
         (
