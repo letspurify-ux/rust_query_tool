@@ -334,6 +334,25 @@ fn test_statement_bounds_at_cursor_slash_after_end_without_semicolon_returns_pre
 }
 
 #[test]
+fn test_statement_bounds_at_cursor_incomplete_create_recovers_before_rename_statement_head() {
+    let sql = "CREATE OR REPLACE PROCEDURE proc_recover AS\nBEGIN\n  NULL;\nEND\nRENAME t_parser_recover TO t_parser_recover_new;\nSELECT 2 FROM dual;";
+    let cursor = sql.find("RENAME").unwrap_or(0);
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected recovered RENAME statement bounds after incomplete CREATE");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.starts_with("RENAME t_parser_recover TO t_parser_recover_new"),
+        "cursor on trailing RENAME should resolve only recovered statement: {statement}"
+    );
+    assert!(
+        !statement.contains("CREATE OR REPLACE PROCEDURE"),
+        "recovered statement must not include preceding CREATE text: {statement}"
+    );
+}
+
+#[test]
 fn test_normalize_sql_for_execute_trims_trailing_semicolon_for_select() {
     let normalized = QueryExecutor::normalize_sql_for_execute("  SELECT 1 FROM dual;   ");
     assert_eq!(normalized, "SELECT 1 FROM dual");
@@ -11530,22 +11549,22 @@ fn test_split_script_items_oracle_with_function_without_semicolon_uses_slash_ter
 }
 
 #[test]
-fn test_split_script_items_oracle_with_function_uses_slash_terminator_with_line_comment() {
+fn test_split_script_items_oracle_with_function_keeps_slash_line_comment_with_main_query() {
     let sql = "WITH FUNCTION f RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND\n/ -- sqlplus terminator\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
     let stmts = get_statements(&items);
 
     assert_eq!(
         stmts.len(),
-        2,
-        "expected WITH FUNCTION and SELECT split when slash has trailing comment, got: {stmts:?}"
+        1,
+        "expected WITH FUNCTION main query to keep slash-comment line attached, got: {stmts:?}"
     );
     assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
-    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+    assert!(stmts[0].contains("/ -- sqlplus terminator\nSELECT 2 FROM dual"));
 }
 
 #[test]
-fn test_split_format_items_oracle_with_function_uses_slash_terminator_with_block_comment() {
+fn test_split_format_items_oracle_with_function_keeps_slash_block_comment_with_main_query() {
     let sql = "WITH FUNCTION f RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND\n/ /* sqlplus terminator */\nSELECT 3 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);
     let stmts: Vec<&str> = items
@@ -11555,14 +11574,57 @@ fn test_split_format_items_oracle_with_function_uses_slash_terminator_with_block
             _ => None,
         })
         .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(
+        stmts.len(),
+        1,
+        "expected WITH FUNCTION main query to keep slash block comment attached, got: {stmts:?}"
+    );
+    assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
+    assert_eq!(
+        slash_count, 0,
+        "slash+block-comment line should stay in the next statement, got: {items:?}"
+    );
+    assert!(stmts[0].contains("/ /* sqlplus terminator */\nSELECT 3 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_external_language_clause_splits_before_parenthesized_query_statement_head() {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_paren RETURN NUMBER
+AS LANGUAGE C;
+(SELECT 2 FROM dual);"#;
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
 
     assert_eq!(
         stmts.len(),
         2,
-        "expected WITH FUNCTION and SELECT split when slash has trailing block comment, got: {stmts:?}"
+        "expected LANGUAGE call spec and parenthesized query split, got: {stmts:?}"
     );
-    assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
-    assert!(stmts[1].starts_with("SELECT 3 FROM dual"));
+    assert!(stmts[0].contains("AS LANGUAGE C"));
+    assert!(stmts[1].starts_with("(SELECT 2 FROM dual)"));
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_external_language_clause_splits_before_parenthesized_query_statement_head(
+) {
+    let sql = r#"CREATE OR REPLACE FUNCTION ext_lang_paren RETURN NUMBER
+AS LANGUAGE C;
+(SELECT 2 FROM dual);"#;
+    let cursor = sql.rfind("SELECT 2").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(sql, cursor)
+        .expect("expected statement bounds for parenthesized trailing query");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("(SELECT 2 FROM dual)"),
+        "cursor on trailing parenthesized query should resolve only that statement: {statement}"
+    );
 }
 
 #[test]

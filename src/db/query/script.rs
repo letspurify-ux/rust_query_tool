@@ -1,5 +1,5 @@
 use crate::db::session::{BindDataType, ComputeMode};
-use crate::sql_parser_engine::SqlParserEngine;
+use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
 use crate::sql_text;
 
 use super::{FormatItem, QueryExecutor, ScriptItem, ToolCommand};
@@ -2408,36 +2408,33 @@ impl QueryExecutor {
     ) {
         let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
-        // Incomplete CREATE PL/SQL recovery when a new statement head appears
-        let starts_new_statement_head = Self::line_starts_statement_head_keyword(trimmed);
-        if Self::should_force_terminate_incomplete_create(
-            builder.is_idle(),
-            builder.in_create_plsql(),
-            parser_is_top_level,
-            builder.has_pending_end(),
-            builder.current_is_empty(),
-            builder.is_trigger(),
-            starts_new_statement_head,
-        ) {
-            for stmt in builder.force_terminate_and_take_statements() {
-                add_statement(stmt, items);
-            }
-        }
-
-        // Slash terminator (`/` on its own line)
-        let should_attempt_slash =
-            Self::should_attempt_slash_terminator(builder.is_idle(), trimmed);
-        if should_attempt_slash {
-            builder.prepare_slash_terminator();
-        }
-        if should_attempt_slash && builder.can_terminate_on_slash() {
-            if !builder.current_is_empty() {
-                for stmt in builder.force_terminate_and_take_statements() {
-                    add_statement(stmt, items);
+        builder.state.prepare_splitter_line_boundary(line);
+        match builder
+            .state
+            .splitter_line_boundary_action_for_line(line, builder.current_is_empty())
+        {
+            LineBoundaryAction::None => {}
+            LineBoundaryAction::SplitBeforeLine => {
+                if !builder.current_is_empty() {
+                    for stmt in builder.force_terminate_and_take_statements() {
+                        add_statement(stmt, items);
+                    }
                 }
+                parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
             }
-            on_slash(items, builder);
-            return;
+            LineBoundaryAction::SplitAndConsumeLine => {
+                if !builder.current_is_empty() {
+                    for stmt in builder.force_terminate_and_take_statements() {
+                        add_statement(stmt, items);
+                    }
+                }
+                on_slash(items, builder);
+                return;
+            }
+            LineBoundaryAction::ConsumeLine => {
+                on_slash(items, builder);
+                return;
+            }
         }
 
         // Lone semicolon after CREATE PL/SQL (prevents `;;`)

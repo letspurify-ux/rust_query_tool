@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::db::session::{BindDataType, BindValue, CompiledObject, SessionState};
+use crate::sql_parser_engine::LineBoundaryAction;
 use crate::sql_text;
 use crate::utils::logging;
 
@@ -1463,14 +1464,6 @@ impl QueryExecutor {
                 self.push_current_span(sql)
             }
 
-            fn prepare_slash_terminator(&mut self) {
-                use crate::sql_parser_engine::PendingEnd;
-
-                if self.state.pending_end == PendingEnd::End && self.state.is_idle() {
-                    self.state.resolve_pending_end_on_terminator();
-                }
-            }
-
             fn consume_next_char(
                 iter: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
                 base_offset: usize,
@@ -1783,37 +1776,36 @@ impl QueryExecutor {
                 continue;
             }
 
-            if Self::should_force_terminate_incomplete_create(
-                collector.state.is_idle(),
-                collector.state.in_create_plsql(),
-                collector.state.can_terminate_on_slash(),
-                collector.state.pending_end == crate::sql_parser_engine::PendingEnd::End,
-                collector.current_is_empty(),
-                collector.state.is_trigger(),
-                Self::line_starts_new_statement_keyword_for_bounds(trimmed),
-            ) {
-                if let Some(span) = collector.force_terminate(sql) {
-                    if !on_span(span) {
-                        return;
-                    }
-                }
-            }
-
-            if Self::should_attempt_slash_terminator(collector.state.is_idle(), trimmed) {
-                collector.prepare_slash_terminator();
-            }
-            if Self::should_attempt_slash_terminator(collector.state.is_idle(), trimmed)
-                && collector.state.can_terminate_on_slash()
+            collector.state.prepare_splitter_line_boundary(line);
+            match collector
+                .state
+                .splitter_line_boundary_action_for_line(line, collector.current_is_empty())
             {
-                if !collector.current_is_empty() {
-                    if let Some(span) = collector.force_terminate(sql) {
-                        if !on_span(span) {
-                            return;
+                LineBoundaryAction::None => {}
+                LineBoundaryAction::SplitBeforeLine => {
+                    if !collector.current_is_empty() {
+                        if let Some(span) = collector.force_terminate(sql) {
+                            if !on_span(span) {
+                                return;
+                            }
                         }
                     }
                 }
-                line_start = next_line_start;
-                continue;
+                LineBoundaryAction::SplitAndConsumeLine => {
+                    if !collector.current_is_empty() {
+                        if let Some(span) = collector.force_terminate(sql) {
+                            if !on_span(span) {
+                                return;
+                            }
+                        }
+                    }
+                    line_start = next_line_start;
+                    continue;
+                }
+                LineBoundaryAction::ConsumeLine => {
+                    line_start = next_line_start;
+                    continue;
+                }
             }
 
             if Self::should_force_terminate_lone_semicolon(
@@ -1887,32 +1879,6 @@ impl QueryExecutor {
         trimmed.split_whitespace().next()
     }
 
-    pub(crate) fn line_starts_statement_head_keyword(trimmed: &str) -> bool {
-        Self::line_first_word(trimmed).is_some_and(sql_text::is_statement_head_keyword)
-    }
-
-    fn line_starts_new_statement_keyword_for_bounds(trimmed: &str) -> bool {
-        Self::line_first_word(trimmed).is_some_and(|word| {
-            word.eq_ignore_ascii_case("CREATE")
-                || word.eq_ignore_ascii_case("ALTER")
-                || word.eq_ignore_ascii_case("DROP")
-                || word.eq_ignore_ascii_case("TRUNCATE")
-                || word.eq_ignore_ascii_case("GRANT")
-                || word.eq_ignore_ascii_case("REVOKE")
-                || word.eq_ignore_ascii_case("COMMIT")
-                || word.eq_ignore_ascii_case("ROLLBACK")
-                || word.eq_ignore_ascii_case("SAVEPOINT")
-                || word.eq_ignore_ascii_case("SELECT")
-                || word.eq_ignore_ascii_case("INSERT")
-                || word.eq_ignore_ascii_case("UPDATE")
-                || word.eq_ignore_ascii_case("DELETE")
-                || word.eq_ignore_ascii_case("MERGE")
-                || word.eq_ignore_ascii_case("WITH")
-                || word.eq_ignore_ascii_case("VALUES")
-                || word.eq_ignore_ascii_case("TABLE")
-        })
-    }
-
     pub(crate) fn is_set_clause_line(trimmed: &str) -> bool {
         trimmed.eq_ignore_ascii_case("SET") || Self::starts_with_ignore_ascii_case(trimmed, "SET ")
     }
@@ -1956,44 +1922,6 @@ impl QueryExecutor {
             && is_idle
             && block_depth == 0
             && !current_is_empty
-    }
-
-    pub(crate) fn should_force_terminate_incomplete_create(
-        is_idle: bool,
-        in_create_plsql: bool,
-        at_create_boundary: bool,
-        has_pending_end: bool,
-        current_is_empty: bool,
-        is_trigger: bool,
-        starts_new_statement_head: bool,
-    ) -> bool {
-        is_idle
-            && in_create_plsql
-            && (at_create_boundary || has_pending_end)
-            && !current_is_empty
-            && !is_trigger
-            && starts_new_statement_head
-    }
-
-    pub(crate) fn should_attempt_slash_terminator(is_idle: bool, trimmed: &str) -> bool {
-        if !is_idle {
-            return false;
-        }
-
-        if trimmed == "/" {
-            return true;
-        }
-
-        let Some(rest) = trimmed.strip_prefix('/') else {
-            return false;
-        };
-
-        let rest = rest.trim_start();
-        if rest.starts_with("/*") {
-            return true;
-        }
-
-        sql_text::is_sqlplus_comment_line(rest)
     }
 
     pub(crate) fn should_force_terminate_lone_semicolon(
