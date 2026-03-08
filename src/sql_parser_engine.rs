@@ -2319,6 +2319,10 @@ impl SqlParserEngine {
                 self.state.reset_create_state();
             }
 
+            let slash_statement_delimiter =
+                c == '/' && self.state.token.is_empty() && is_line_leading_slash_marker(chars, i);
+            let mut consumed_slash_statement_delimiter = false;
+
             let should_split_pending_implicit_external =
                 self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
@@ -2331,24 +2335,31 @@ impl SqlParserEngine {
                 && ((should_split_pending_implicit_external
                     && ((c == '@' && is_line_leading_char(chars, i, '@'))
                         || (c == '!' && is_line_leading_char(chars, i, '!'))
-                        || (c == '/' && is_line_leading_slash_marker(chars, i))
+                        || slash_statement_delimiter
                         || (c == '(' && is_line_leading_char(chars, i, '('))))
                     || (should_split_forced_external_on_slash
-                        && c == '/'
-                        && is_line_leading_slash_marker(chars, i)))
+                        && slash_statement_delimiter))
             {
                 self.split_current_statement();
+                consumed_slash_statement_delimiter = slash_statement_delimiter;
             }
 
             if self.state.in_create_plsql()
                 && self.state.block_depth() == 0
                 && self.state.paren_depth == 0
                 && self.state.token.is_empty()
-                && c == '/'
-                && is_line_leading_slash_marker(chars, i)
+                && slash_statement_delimiter
             {
                 self.split_current_statement();
                 self.state.reset_create_state();
+                consumed_slash_statement_delimiter = true;
+            }
+
+            if consumed_slash_statement_delimiter {
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
             }
 
             let has_timing_point_label_end = c == ';'
@@ -4449,8 +4460,8 @@ mod tests {
         );
         assert!(statements[0].contains("AS LANGUAGE C NAME 'ext_name_slash'"));
         assert!(
-            statements[1].starts_with("/\nSELECT 1 FROM dual"),
-            "slash marker line should start the next statement: {}",
+            statements[1].starts_with("SELECT 1 FROM dual"),
+            "slash delimiter line should not leak into next statement: {}",
             statements[1]
         );
     }
@@ -4469,8 +4480,8 @@ mod tests {
         assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_mle_slash RETURN NUMBER"));
         assert!(statements[0].contains("AS MLE MODULE ext_mod SIGNATURE 'run(number)'"));
         assert!(
-            statements[1].starts_with("/\nSELECT 1 FROM dual"),
-            "slash marker line should start the next statement: {}",
+            statements[1].starts_with("SELECT 1 FROM dual"),
+            "slash delimiter line should not leak into next statement: {}",
             statements[1]
         );
     }
@@ -5970,6 +5981,53 @@ BEGIN"
     }
 
     #[test]
+    fn case_expression_followed_by_for_update_keeps_same_statement() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("BEGIN");
+        engine.process_line("  SELECT CASE WHEN status = 'READY' THEN id ELSE 0 END");
+        engine.process_line("    INTO v_id");
+        engine.process_line("    FROM jobs");
+        engine.process_line("    FOR UPDATE SKIP LOCKED;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("END\n    INTO v_id\n    FROM jobs\n    FOR UPDATE SKIP LOCKED;\nEND"),
+            "FOR UPDATE clause should remain in the same PL/SQL block after CASE END: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn external_language_parameters_without_semicolon_splits_on_slash() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_params RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C PARAMETERS (CONTEXT)");
+        engine.process_line("/");
+        engine.process_line("SELECT 2 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("AS LANGUAGE C PARAMETERS (CONTEXT)"),
+            "call specification should stay in routine statement: {}",
+            statements[0]
+        );
+        assert!(
+            statements[1].starts_with("SELECT 2 FROM dual"),
+            "trailing query should remain standalone after slash delimiter: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
     fn aggregate_using_clause_without_external_keyword_marks_external_routine_split() {
         let mut engine = SqlParserEngine::new();
 
@@ -6667,8 +6725,8 @@ BY PRIOR employee_id = manager_id"),
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(
-            statements[1].starts_with("/ REM rerun external\nSELECT 52 FROM dual"),
-            "slash line with REM comment should start the next statement: {}",
+            statements[1].starts_with("SELECT 52 FROM dual"),
+            "slash delimiter line should not leak into next statement: {}",
             statements[1]
         );
     }
@@ -6686,8 +6744,8 @@ BY PRIOR employee_id = manager_id"),
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(
-            statements[1].starts_with("/ remark rerun external\nSELECT 152 FROM dual"),
-            "slash line with lowercase remark should start the next statement: {}",
+            statements[1].starts_with("SELECT 152 FROM dual"),
+            "slash delimiter line should not leak into next statement: {}",
             statements[1]
         );
     }
@@ -6732,8 +6790,8 @@ BY PRIOR employee_id = manager_id"),
         assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(
-            statements[1].starts_with("/\nSELECT 51 FROM dual"),
-            "slash marker line should start the next statement: {}",
+            statements[1].starts_with("SELECT 51 FROM dual"),
+            "slash delimiter line should not leak into next statement: {}",
             statements[1]
         );
     }
