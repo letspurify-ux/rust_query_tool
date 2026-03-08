@@ -1506,7 +1506,7 @@ impl SplitState {
                 "OR" | "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE"
                 | "IF" | "NOT" | "EXISTS" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING"
                 | "NONEDITIONING" | "FORWARD" | "REVERSE" | "CROSSEDITION" | "SHARING"
-                | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
+                | "METADATA" | "DATA" | "EXTENDED" | "NONE" | "DEBUG" => return,
 
                 // TYPE BODY member modifiers — only skip when inside type body
                 "MEMBER" | "STATIC" | "CONSTRUCTOR" | "MAP" | "ORDER" | "FINAL"
@@ -2713,6 +2713,22 @@ mod tests {
     }
 
     #[test]
+    fn create_state_accepts_debug_modifier_before_procedure() {
+        let mut state = SplitState::default();
+
+        state.track_create_plsql("CREATE");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("DEBUG");
+        assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+        state.track_create_plsql("PROCEDURE");
+
+        assert!(state.in_create_plsql());
+        assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Procedure);
+    }
+
+    #[test]
     fn create_type_body_member_modifier_is_not_treated_as_new_create_target() {
         let mut state = SplitState {
             create_plsql_kind: CreatePlsqlKind::TypeBody,
@@ -3424,6 +3440,32 @@ mod tests {
         assert_eq!(
             statements[0],
             "CREATE OR REPLACE NONEDITIONABLE PACKAGE BODY pkg_ext AS\n  FUNCTION ext_call RETURN NUMBER IS\n  EXTERNAL LIBRARY extlib LANGUAGE C;\nEND pkg_ext".to_string()
+        );
+        assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+    }
+
+    #[test]
+    fn create_debug_procedure_splits_before_trailing_select() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE DEBUG PROCEDURE dbg_proc AS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 1 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "expected debug procedure + select split");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE DEBUG PROCEDURE dbg_proc AS"),
+            "first statement should preserve DEBUG procedure header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("END"),
+            "first statement should preserve procedure body terminator: {}",
+            statements[0]
         );
         assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
     }
