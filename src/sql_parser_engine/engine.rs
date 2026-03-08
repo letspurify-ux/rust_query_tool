@@ -236,15 +236,25 @@ impl SqlParserEngine {
                 if this
                     .state
                     .should_split_begin_after_implicit_external_semicolon(candidate_upper)
-                    || (this.state.pending_implicit_external_top_level_split
-                        && (sql_text::is_with_main_query_keyword(candidate_upper)
-                            || sql_text::is_statement_head_keyword(candidate_upper)))
-                    || this
-                        .state
-                        .should_split_before_implicit_external_begin_block(candidate_upper)
-                    || this
-                        .state
-                        .should_split_before_implicit_external_statement_head(candidate_upper)
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if candidate_upper == "BEGIN"
+                    && this.state.pending_implicit_external_top_level_split
+                {
+                    this.state.pending_implicit_external_top_level_split = false;
+                } else if this.state.pending_implicit_external_top_level_split
+                    && (sql_text::is_with_main_query_keyword(candidate_upper)
+                        || sql_text::is_statement_head_keyword(candidate_upper))
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if this
+                    .state
+                    .should_split_before_implicit_external_begin_block(candidate_upper)
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if this
+                    .state
+                    .should_split_before_implicit_external_statement_head(candidate_upper)
                 {
                     this.split_current_and_reset_external_boundary();
                 } else if this.state.pending_implicit_external_top_level_split {
