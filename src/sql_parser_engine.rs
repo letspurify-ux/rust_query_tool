@@ -319,7 +319,8 @@ impl RoutineFrame {
 
         if token_upper == "LANGUAGE" {
             if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
-                self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetFromExternal;
+                self.external_clause_state =
+                    ExternalClauseState::AwaitingLanguageTargetFromExternal;
             } else if allow_implicit_language {
                 self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetImplicit;
             } else {
@@ -1471,25 +1472,37 @@ impl SplitState {
             match upper {
                 // Modifiers that appear between CREATE and the object type keyword
                 "OR" | "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE"
-                | "IF" | "NOT" | "EXISTS"
-                | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING" | "NONEDITIONING"
-                | "FORWARD" | "REVERSE" | "CROSSEDITION"
-                | "SHARING" | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
+                | "IF" | "NOT" | "EXISTS" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING"
+                | "NONEDITIONING" | "FORWARD" | "REVERSE" | "CROSSEDITION" | "SHARING"
+                | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
 
                 // TYPE BODY member modifiers — only skip when inside type body
                 "MEMBER" | "STATIC" | "CONSTRUCTOR" | "MAP" | "ORDER" | "FINAL"
                 | "INSTANTIABLE" | "OVERRIDING"
-                    if self.create_plsql_kind == CreatePlsqlKind::TypeBody => return,
+                    if self.create_plsql_kind == CreatePlsqlKind::TypeBody =>
+                {
+                    return
+                }
 
                 "JAVA" => {
                     self.create_state = CreateState::AwaitingJavaTarget;
                     return;
                 }
-                "PROCEDURE" => { self.create_plsql_kind = CreatePlsqlKind::Procedure; }
-                "FUNCTION"  => { self.create_plsql_kind = CreatePlsqlKind::Function; }
-                "PACKAGE"   => { self.create_plsql_kind = CreatePlsqlKind::Package; }
-                "TYPE"      => { self.create_plsql_kind = CreatePlsqlKind::TypeSpecAwaitingBody; }
-                "TRIGGER"   => { self.create_plsql_kind = CreatePlsqlKind::Trigger(TriggerKind::Simple); }
+                "PROCEDURE" => {
+                    self.create_plsql_kind = CreatePlsqlKind::Procedure;
+                }
+                "FUNCTION" => {
+                    self.create_plsql_kind = CreatePlsqlKind::Function;
+                }
+                "PACKAGE" => {
+                    self.create_plsql_kind = CreatePlsqlKind::Package;
+                }
+                "TYPE" => {
+                    self.create_plsql_kind = CreatePlsqlKind::TypeSpecAwaitingBody;
+                }
+                "TRIGGER" => {
+                    self.create_plsql_kind = CreatePlsqlKind::Trigger(TriggerKind::Simple);
+                }
                 _ => {}
             }
             self.create_state = CreateState::None;
@@ -2109,18 +2122,17 @@ impl SqlParserEngine {
             // Q-quote literals: q'[...]' and nq'[...]'/uq'[...]'
             // Detect the start position of the q/Q character and the delimiter.
             if self.state.token.is_empty() {
-                let (q_prefix_len, q_idx) =
-                    if matches!(c, 'n' | 'N' | 'u' | 'U')
-                        && matches!(next, Some('q' | 'Q'))
-                        && i + 2 < len
-                        && chars[i + 2] == '\''
-                    {
-                        (4, i + 3) // nq'D or uq'D
-                    } else if matches!(c, 'q' | 'Q') && next == Some('\'') {
-                        (3, i + 2) // q'D
-                    } else {
-                        (0, 0)
-                    };
+                let (q_prefix_len, q_idx) = if matches!(c, 'n' | 'N' | 'u' | 'U')
+                    && matches!(next, Some('q' | 'Q'))
+                    && i + 2 < len
+                    && chars[i + 2] == '\''
+                {
+                    (4, i + 3) // nq'D or uq'D
+                } else if matches!(c, 'q' | 'Q') && next == Some('\'') {
+                    (3, i + 2) // q'D
+                } else {
+                    (0, 0)
+                };
 
                 if q_prefix_len > 0 {
                     if let Some(&delimiter) = chars.get(q_idx) {
@@ -2161,8 +2173,7 @@ impl SqlParserEngine {
 
                 if is_prefixed_quote {
                     self.state.flush_token();
-                    let allow_implicit_target =
-                        self.state.allow_implicit_external_literal_target();
+                    let allow_implicit_target = self.state.allow_implicit_external_literal_target();
                     self.state
                         .observe_external_clause_literal_target(allow_implicit_target);
                     self.state.lex_mode = LexMode::SingleQuote;
@@ -5331,6 +5342,69 @@ BEGIN"
     }
 
     #[test]
+    fn with_function_supports_all_oracle_main_query_heads() {
+        let cases = [
+            (
+                "SELECT",
+                vec!["SELECT f() FROM dual;", "SELECT 2 FROM dual;"],
+            ),
+            (
+                "INSERT",
+                vec![
+                    "INSERT INTO t_result(v) VALUES (f());",
+                    "SELECT 3 FROM dual;",
+                ],
+            ),
+            (
+                "UPDATE",
+                vec!["UPDATE t_result SET v = f();", "SELECT 4 FROM dual;"],
+            ),
+            (
+                "DELETE",
+                vec!["DELETE FROM t_result WHERE v = f();", "SELECT 5 FROM dual;"],
+            ),
+            (
+                "MERGE",
+                vec![
+                    "MERGE INTO t_result d USING (SELECT f() AS v FROM dual) s ON (d.v = s.v)",
+                    "WHEN MATCHED THEN UPDATE SET d.v = s.v",
+                    "WHEN NOT MATCHED THEN INSERT (v) VALUES (s.v);",
+                    "SELECT 6 FROM dual;",
+                ],
+            ),
+            ("VALUES", vec!["VALUES (f());", "SELECT 7 FROM dual;"]),
+            (
+                "TABLE",
+                vec!["TABLE(sys.odcinumberlist(f()));", "SELECT 8 FROM dual;"],
+            ),
+        ];
+
+        for (head, body_lines) in cases {
+            let mut engine = SqlParserEngine::new();
+            engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+            engine.process_line("BEGIN");
+            engine.process_line("  RETURN 1;");
+            engine.process_line("END;");
+
+            for line in body_lines {
+                engine.process_line(line);
+            }
+
+            let statements = engine.finalize_and_take_statements();
+            assert_eq!(
+                statements.len(),
+                2,
+                "{head} main query head should keep WITH FUNCTION block attached: {statements:?}"
+            );
+            assert!(
+                statements[0].contains("WITH FUNCTION f RETURN NUMBER IS"),
+                "first statement should include WITH FUNCTION declaration for {head}: {}",
+                statements[0]
+            );
+        }
+    }
+
+    #[test]
     fn compound_trigger_instead_of_each_row_section_splits_on_outer_end() {
         let mut engine = SqlParserEngine::new();
 
@@ -5877,6 +5951,26 @@ BEGIN"
             statements[2].starts_with("SELECT 1 FROM dual"),
             "third statement should remain a standalone SELECT statement: {}",
             statements[2]
+        );
+    }
+
+    #[test]
+    fn non_plsql_grant_with_clause_exits_pending_with_mode_without_semicolon() {
+        let mut state = SplitState::default();
+
+        state.track_top_level_with_plsql("GRANT", true);
+        state.track_top_level_with_plsql("SELECT", false);
+        state.track_top_level_with_plsql("ON", false);
+        state.track_top_level_with_plsql("DUAL", false);
+        state.track_top_level_with_plsql("TO", false);
+        state.track_top_level_with_plsql("APP_USER", false);
+        state.track_top_level_with_plsql("WITH", false);
+        state.track_top_level_with_plsql("GRANT", false);
+
+        assert_eq!(
+            state.with_clause_state,
+            WithClauseState::None,
+            "WITH GRANT OPTION should immediately exit WITH FUNCTION/PROCEDURE tracking"
         );
     }
 
