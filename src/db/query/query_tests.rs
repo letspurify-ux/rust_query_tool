@@ -872,7 +872,6 @@ fn test_maybe_inject_rowid_for_editing_skips_connect_by() {
     assert_eq!(rewritten, sql);
 }
 
-
 #[test]
 fn test_maybe_inject_rowid_for_editing_ignores_q_quote_fake_from_keyword() {
     let sql = "SELECT q'[FROM not_a_clause]' AS txt, ENAME FROM EMP e";
@@ -9890,6 +9889,78 @@ fn test_split_script_items_oracle_parenthesized_with_function_cte_splits_normall
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_set_transaction_is_not_sqlplus_set_tool_command() {
+    let sql = "SET TRANSACTION READ ONLY;
+SELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec![
+            "SET TRANSACTION READ ONLY".to_string(),
+            "SELECT 2 FROM dual".to_string()
+        ],
+        "SET TRANSACTION should be parsed as SQL statement, not SQL*Plus SET tool command: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| !matches!(item, ScriptItem::ToolCommand(_))),
+        "SET TRANSACTION must not produce tool command items: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_set_role_is_not_sqlplus_set_tool_command() {
+    let sql = "SET ROLE app_role;
+SELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec![
+            "SET ROLE app_role".to_string(),
+            "SELECT 2 FROM dual".to_string()
+        ],
+        "SET ROLE should be parsed as SQL statement, not SQL*Plus SET tool command: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| !matches!(item, ScriptItem::ToolCommand(_))),
+        "SET ROLE must not produce tool command items: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_set_constraints_is_not_sqlplus_set_tool_command() {
+    let sql = "SET CONSTRAINTS ALL DEFERRED;
+SELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts,
+        vec![
+            "SET CONSTRAINTS ALL DEFERRED".to_string(),
+            "SELECT 2 FROM dual".to_string()
+        ],
+        "SET CONSTRAINTS should be parsed as SQL statement, not SQL*Plus SET tool command: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| !matches!(item, ScriptItem::ToolCommand(_))),
+        "SET CONSTRAINTS must not produce tool command items: {items:?}"
+    );
 }
 
 #[test]

@@ -1818,3 +1818,34 @@
 ### [검증]
 - `cargo test slash_terminator -- --nocapture` 통과
 - `cargo test -- --test-threads=1` 통과
+
+## 2026-03-08 Oracle 공통 파서 엔진 누락 문법 보완 (`SET TRANSACTION` / `SET ROLE` / `SET CONSTRAINT[S]`)
+
+### [중] SQL `SET ...` 문을 SQL*Plus `SET` 도구 명령으로 오인식하던 문제 수정
+- **증상**:
+  - 스크립트 분해에서 아래 SQL 문이 `ToolCommand::Set*`으로 잘못 분류되어 SQL statement로 실행되지 않을 수 있었습니다.
+    - `SET TRANSACTION READ ONLY;`
+    - `SET ROLE app_role;`
+    - `SET CONSTRAINTS ALL DEFERRED;`
+- **원인**:
+  - `src/db/query/script.rs`의 도구 명령 분기(`parse_tool_command`)가 top-level `SET` 라인을 우선 잡아버려,
+  - Oracle DML/트랜잭션 SQL 문법(`SET TRANSACTION/ROLE/CONSTRAINT[S]`)과 SQL*Plus 환경 명령(`SET ECHO`, `SET SQLBLANKLINES` 등)을 구분하지 못했습니다.
+- **수정**:
+  - `src/db/query/executor.rs`에 `is_sql_set_statement_line`를 추가해 SQL `SET` 문 헤드(`TRANSACTION`, `ROLE`, `CONSTRAINT`, `CONSTRAINTS`)를 명시 식별하도록 보강했습니다.
+  - 동일 가드를 `line_might_be_tool_command_for_bounds`와 `process_split_line`의 tool-command 분기 양쪽에 적용해,
+    - statement bounds 계산 경로
+    - script split 경로
+    에서 모두 SQL `SET` 문이 tool command로 오인식되지 않도록 일괄 보정했습니다.
+
+### [유사 케이스] 동일 계열 `SET` 키워드 오인식 경로 일괄 점검
+- 기존 회귀 케이스 `WITH ... SEARCH/CYCLE ... SET ...`와 충돌 없이 유지되는지 함께 재검증했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `test_split_script_items_set_transaction_is_not_sqlplus_set_tool_command`
+- `test_split_script_items_set_role_is_not_sqlplus_set_tool_command`
+- `test_split_script_items_set_constraints_is_not_sqlplus_set_tool_command`
+
+### [검증]
+- `cargo test -q sqlplus_set_tool_command -- --nocapture`
+- `cargo test -q recursive_search_cycle_set_clauses_not_tool_commands`
+- `cargo test`

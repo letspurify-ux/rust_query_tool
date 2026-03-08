@@ -2300,9 +2300,7 @@ impl QueryExecutor {
 
             // Standalone comment handling (format mode only)
             if builder.is_idle() && builder.current_is_empty() {
-                if trimmed.starts_with("--")
-                    || sql_text::is_sqlplus_comment_line(trimmed)
-                {
+                if trimmed.starts_with("--") || sql_text::is_sqlplus_comment_line(trimmed) {
                     items.push(FormatItem::Statement(line.to_string()));
                     continue;
                 }
@@ -2331,7 +2329,9 @@ impl QueryExecutor {
                 &mut sqlblanklines_enabled,
                 &mut items,
                 &mut add_statement,
-                &mut |cmd: ToolCommand, items: &mut Vec<FormatItem>| items.push(FormatItem::ToolCommand(cmd)),
+                &mut |cmd: ToolCommand, items: &mut Vec<FormatItem>| {
+                    items.push(FormatItem::ToolCommand(cmd))
+                },
                 &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
             );
         }
@@ -2470,11 +2470,12 @@ impl QueryExecutor {
         // Tool command with an open (non-empty) statement
         let is_set_clause = Self::is_set_clause_line(trimmed);
         let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
+        let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
         if Self::should_try_tool_command_with_open_statement(
             builder.is_idle(),
             builder.current_is_empty(),
             parser_is_top_level,
-            is_alter_session_set_clause,
+            is_alter_session_set_clause || is_sql_set_statement,
         ) {
             if let Some(command) = Self::parse_tool_command(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {
@@ -2493,7 +2494,8 @@ impl QueryExecutor {
             builder.is_idle(),
             builder.current_is_empty(),
             parser_is_top_level,
-        ) {
+        ) && !is_sql_set_statement
+        {
             if let Some(command) = Self::parse_tool_command(trimmed) {
                 if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                     *sqlblanklines_enabled = *enabled;
@@ -2734,10 +2736,7 @@ impl QueryExecutor {
             return Some(ToolCommand::Quit);
         }
 
-        if Self::is_connect_command(trimmed)
-            || upper == "CONN"
-            || upper.starts_with("CONN ")
-        {
+        if Self::is_connect_command(trimmed) || upper == "CONN" || upper.starts_with("CONN ") {
             return Some(Self::parse_connect_command(trimmed));
         }
 
@@ -3728,8 +3727,7 @@ impl QueryExecutor {
             return false;
         }
 
-        !Self::next_meaningful_word(trimmed, 1)
-            .is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+        !Self::next_meaningful_word(trimmed, 1).is_some_and(|word| word.eq_ignore_ascii_case("BY"))
     }
 
     fn next_meaningful_word(line: &str, skip_words: usize) -> Option<&str> {
@@ -3944,7 +3942,10 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
     #[test]
     fn parse_tool_command_connect_by_with_inline_comment_is_not_connect_command() {
         assert!(
-            QueryExecutor::parse_tool_command("CONNECT /*hierarchical*/ BY PRIOR employee_id = manager_id").is_none(),
+            QueryExecutor::parse_tool_command(
+                "CONNECT /*hierarchical*/ BY PRIOR employee_id = manager_id"
+            )
+            .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
         );
     }
