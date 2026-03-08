@@ -5913,6 +5913,10 @@ BEGIN"
                 "TABLE",
                 vec!["TABLE(sys.odcinumberlist(f()));", "SELECT 8 FROM dual;"],
             ),
+            (
+                "CALL",
+                vec!["CALL consume_fn(f());", "SELECT 9 FROM dual;"],
+            ),
         ];
 
         for (head, body_lines) in cases {

@@ -651,11 +651,11 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_SQL_KEYWORDS.iter().copied().collect());
 
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] = &[
-    "WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE",
+    "WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES", "TABLE",
 ];
 
 pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "WITH", "TABLE",
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES", "WITH", "TABLE",
 ];
 
 const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
