@@ -671,6 +671,7 @@ enum CreatePlsqlKind {
     Procedure,
     Function,
     Package,
+    PackageBody,
     TypeSpecAwaitingBody,
     TypeSpec,
     TypeBody,
@@ -722,6 +723,8 @@ pub(crate) struct SplitState {
     timing_point_state: TimingPointState,
     saw_compound_keyword: bool,
     saw_trigger_alias_subject: bool,
+    package_body_name: Option<String>,
+    awaiting_package_body_name: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
@@ -823,7 +826,7 @@ impl SplitState {
             return;
         }
 
-        self.resolve_plain_end();
+        self.resolve_plain_end("");
         if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
             && !self.in_with_plsql_declaration()
@@ -919,7 +922,7 @@ impl SplitState {
     fn needs_nested_begin_tracking(&self) -> bool {
         matches!(
             self.create_plsql_kind,
-            CreatePlsqlKind::Package | CreatePlsqlKind::TypeBody
+            CreatePlsqlKind::PackageBody | CreatePlsqlKind::TypeBody
         )
     }
 
@@ -995,7 +998,7 @@ impl SplitState {
 
         if !token_prefixed_with_dollar {
             self.handle_if_state_on_token(upper);
-            self.handle_pending_end_on_token(end_token_role.suffix());
+            self.handle_pending_end_on_token(upper, end_token_role.suffix());
             self.handle_block_openers(upper, end_token_role);
         }
 
@@ -1052,7 +1055,7 @@ impl SplitState {
     }
 
     /// Sub-handler: resolve pending END based on the following keyword.
-    fn handle_pending_end_on_token(&mut self, suffix: Option<PendingEndSuffix>) {
+    fn handle_pending_end_on_token(&mut self, token_upper: &str, suffix: Option<PendingEndSuffix>) {
         if self.pending_end != PendingEnd::End {
             return;
         }
@@ -1061,7 +1064,7 @@ impl SplitState {
             suffix.apply_to_state(self);
         } else {
             // Plain END – CASE expression or PL/SQL block
-            self.resolve_plain_end();
+            self.resolve_plain_end(token_upper);
         }
 
         self.pending_end = PendingEnd::None;
@@ -1298,8 +1301,20 @@ impl SplitState {
 
     /// Plain END (not END CASE/IF/LOOP/WHILE/REPEAT/timing).
     /// If top is Case, treat as CASE expression end. Otherwise pop a PL/SQL block.
-    fn resolve_plain_end(&mut self) {
+    fn resolve_plain_end(&mut self, token_upper: &str) {
+        let top = self.block_stack.last().copied();
         let _ = self.block_stack.pop();
+
+        if top == Some(BlockKind::Begin)
+            && self.block_stack.last() == Some(&BlockKind::AsIs)
+            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self
+                .package_body_name
+                .as_deref()
+                .is_some_and(|name| name == token_upper)
+        {
+            let _ = self.block_stack.pop();
+        }
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
@@ -1443,6 +1458,8 @@ impl SplitState {
     pub(crate) fn reset_create_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
+        self.package_body_name = None;
+        self.awaiting_package_body_name = false;
         self.as_is_follow_state = AsIsFollowState::None;
         self.begin_state = BeginState::None;
         self.as_is_state = AsIsState::None;
@@ -1482,6 +1499,27 @@ impl SplitState {
         }
 
         if self.in_create_plsql() {
+            if self.block_depth() == 0
+                && self.create_plsql_kind == CreatePlsqlKind::Package
+                && upper == "BODY"
+            {
+                self.create_plsql_kind = CreatePlsqlKind::PackageBody;
+                self.package_body_name = None;
+                self.awaiting_package_body_name = true;
+                return;
+            }
+
+            if self.block_depth() == 0
+                && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+                && self.awaiting_package_body_name
+            {
+                if matches!(upper, "AS" | "IS") {
+                    self.awaiting_package_body_name = false;
+                } else {
+                    self.package_body_name = Some(upper.to_string());
+                }
+            }
+
             if self.block_depth() == 0 && upper == "WRAPPED" {
                 self.create_plsql_kind = CreatePlsqlKind::Wrapped;
                 self.create_state = CreateState::None;
@@ -2953,7 +2991,7 @@ mod tests {
             ..SplitState::default()
         };
 
-        state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
+        state.handle_pending_end_on_token("AFTER", Some(PendingEndSuffix::TimingPoint));
 
         assert_eq!(state.pending_end, PendingEnd::None);
         assert_eq!(state.timing_point_state, TimingPointState::None);
@@ -3518,6 +3556,57 @@ mod tests {
     }
 
     #[test]
+    fn package_body_initialization_begin_end_closes_outer_as_is_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_init AS");
+        engine.process_line("  PROCEDURE p IS");
+        engine.process_line("  BEGIN");
+        engine.process_line("    NULL;");
+        engine.process_line("  END p;");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END pkg_init;");
+        engine.process_line("SELECT 42 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].starts_with("CREATE OR REPLACE PACKAGE BODY pkg_init AS"),
+            "first statement should keep package body header: {}",
+            statements[0]
+        );
+        assert!(
+            statements[0].contains("BEGIN\n  NULL;\nEND pkg_init"),
+            "first statement should preserve package initialization block: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 42 FROM dual".to_string());
+    }
+
+    #[test]
+    fn package_body_initialization_begin_end_closes_outer_is_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_init_is IS");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END pkg_init_is;");
+        engine.process_line("SELECT 77 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(
+            statements[0].contains("BEGIN\n  NULL;\nEND pkg_init_is"),
+            "first statement should preserve package body IS initialization block: {}",
+            statements[0]
+        );
+        assert_eq!(statements[1], "SELECT 77 FROM dual".to_string());
+    }
+
+    #[test]
     fn compound_trigger_with_each_row_timing_point_splits_on_outer_end() {
         let mut engine = SqlParserEngine::new();
 
@@ -3623,7 +3712,7 @@ mod tests {
         assert_eq!(state.timing_point_state, TimingPointState::None);
 
         state.pending_end = PendingEnd::End;
-        state.handle_pending_end_on_token(Some(PendingEndSuffix::TimingPoint));
+        state.handle_pending_end_on_token("AFTER", Some(PendingEndSuffix::TimingPoint));
 
         assert!(state.block_stack.is_empty());
         assert_eq!(state.pending_end, PendingEnd::None);
