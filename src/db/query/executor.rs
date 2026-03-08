@@ -2078,6 +2078,8 @@ impl QueryExecutor {
             || first.eq_ignore_ascii_case("DISCONNECT")
             || first.eq_ignore_ascii_case("DISC")
             || first.eq_ignore_ascii_case("START")
+            || first.eq_ignore_ascii_case("RUN")
+            || first.eq_ignore_ascii_case("R")
             || first.eq_ignore_ascii_case("TIMING")
             || first.eq_ignore_ascii_case("TTITLE")
             || first.eq_ignore_ascii_case("BTITLE")
