@@ -760,6 +760,26 @@ impl SplitState {
         })
     }
 
+    fn should_split_before_implicit_external_statement_head(&self, token_upper: &str) -> bool {
+        if self.block_depth() != 1 || self.paren_depth != 0 {
+            return false;
+        }
+
+        if !sql_text::is_statement_head_keyword(token_upper)
+            || sql_text::is_external_language_clause_keyword(token_upper)
+        {
+            return false;
+        }
+
+        self.active_routine_frame().is_some_and(|frame| {
+            matches!(
+                frame.external_clause_state,
+                ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::AwaitingLanguageTargetImplicit
+            )
+        })
+    }
+
     fn should_split_begin_after_implicit_external_semicolon(&self, token_upper: &str) -> bool {
         if token_upper != "BEGIN"
             || self.block_depth() != 1
@@ -1919,6 +1939,11 @@ impl SqlParserEngine {
                 } else if this
                     .state
                     .should_split_before_implicit_external_begin_block(candidate_upper)
+                {
+                    this.split_current_and_reset_external_boundary();
+                } else if this
+                    .state
+                    .should_split_before_implicit_external_statement_head(candidate_upper)
                 {
                     this.split_current_and_reset_external_boundary();
                 } else if this.state.pending_implicit_external_top_level_split {
@@ -7295,5 +7320,23 @@ BEGIN"
         assert!(statements[0].contains("IS LANGUAGE C NAME 'f';"));
         assert!(statements[0].contains("END"));
         assert_eq!(statements[1], "SELECT 45 FROM dual".to_string());
+    }
+
+    #[test]
+    fn external_language_target_without_semicolon_splits_before_following_statement_head() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_plain_lang RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C");
+        engine.process_line("SELECT 46 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("SELECT 46 FROM dual"),
+            "SELECT should begin a new statement after implicit external call spec: {}",
+            statements[1]
+        );
     }
 }
