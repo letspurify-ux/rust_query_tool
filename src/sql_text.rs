@@ -673,6 +673,12 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     "OIDS",
     "LOCAL",
     "CASCADED",
+    // GRANT/REVOKE option clauses (e.g. WITH GRANT OPTION, WITH ADMIN OPTION,
+    // WITH HIERARCHY OPTION) are non-PL/SQL and should immediately exit
+    // WITH FUNCTION/PROCEDURE declaration tracking.
+    "GRANT",
+    "ADMIN",
+    "HIERARCHY",
 ];
 
 const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"];
@@ -993,45 +999,88 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
             !second.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
         }
         "R" => next_meaningful_word(trimmed, 1).is_none(),
-        "CONNECT" => {
-            !next_meaningful_word(trimmed, 1)
-                .map(|(word, _)| word)
-                .is_some_and(|second| second.eq_ignore_ascii_case("BY"))
-        }
+        "CONNECT" => !next_meaningful_word(trimmed, 1)
+            .map(|(word, _)| word)
+            .is_some_and(|second| second.eq_ignore_ascii_case("BY")),
         "SET" => {
             let Some(second) = next_meaningful_word(trimmed, 1).map(|(word, _)| word) else {
                 return false;
             };
             matches!(
                 second.to_ascii_uppercase().as_str(),
-                "APPINFO" | "ARRAYSIZE" | "AUTOCOMMIT" | "AUTOPRINT"
-                | "AUTORECOVERY" | "AUTOTRACE" | "BLOCKTERMINATOR" | "CMDSEP"
-                | "COLINVISIBLE" | "COLSEP" | "CONCAT" | "COPYCOMMIT"
-                | "COPYTYPECHECK" | "DEFINE" | "DESCRIBE" | "ECHO" | "EDITFILE"
-                | "EMBEDDED" | "ESCAPE" | "FEEDBACK" | "FLAGGER" | "FLUSH"
-                | "HEADING" | "HEADSEP" | "INSTANCE" | "LINESIZE" | "LOBOFFSET"
-                | "LONG" | "LONGCHUNKSIZE" | "MARKUP" | "NEWPAGE" | "NULL"
-                | "NUMFORMAT" | "NUMWIDTH" | "PAGESIZE" | "PAUSE" | "RECSEP"
-                | "RECSEPCHAR" | "ROWLIMIT" | "SERVEROUTPUT" | "SHIFTINOUT"
-                | "SHOWMODE" | "SQLBLANKLINES" | "SQLCASE" | "SQLCONTINUE"
-                | "SQLFORMAT" | "SQLNUMBER" | "SQLPLUSCOMPATIBILITY" | "SQLPREFIX"
-                | "SQLPROMPT" | "SQLTERMINATOR" | "SUFFIX" | "TAB" | "TERMOUT"
-                | "TIMING" | "TRIMOUT" | "TRIMSPOOL" | "UNDERLINE" | "VERIFY"
-                | "WRAP"
+                "APPINFO"
+                    | "ARRAYSIZE"
+                    | "AUTOCOMMIT"
+                    | "AUTOPRINT"
+                    | "AUTORECOVERY"
+                    | "AUTOTRACE"
+                    | "BLOCKTERMINATOR"
+                    | "CMDSEP"
+                    | "COLINVISIBLE"
+                    | "COLSEP"
+                    | "CONCAT"
+                    | "COPYCOMMIT"
+                    | "COPYTYPECHECK"
+                    | "DEFINE"
+                    | "DESCRIBE"
+                    | "ECHO"
+                    | "EDITFILE"
+                    | "EMBEDDED"
+                    | "ESCAPE"
+                    | "FEEDBACK"
+                    | "FLAGGER"
+                    | "FLUSH"
+                    | "HEADING"
+                    | "HEADSEP"
+                    | "INSTANCE"
+                    | "LINESIZE"
+                    | "LOBOFFSET"
+                    | "LONG"
+                    | "LONGCHUNKSIZE"
+                    | "MARKUP"
+                    | "NEWPAGE"
+                    | "NULL"
+                    | "NUMFORMAT"
+                    | "NUMWIDTH"
+                    | "PAGESIZE"
+                    | "PAUSE"
+                    | "RECSEP"
+                    | "RECSEPCHAR"
+                    | "ROWLIMIT"
+                    | "SERVEROUTPUT"
+                    | "SHIFTINOUT"
+                    | "SHOWMODE"
+                    | "SQLBLANKLINES"
+                    | "SQLCASE"
+                    | "SQLCONTINUE"
+                    | "SQLFORMAT"
+                    | "SQLNUMBER"
+                    | "SQLPLUSCOMPATIBILITY"
+                    | "SQLPREFIX"
+                    | "SQLPROMPT"
+                    | "SQLTERMINATOR"
+                    | "SUFFIX"
+                    | "TAB"
+                    | "TERMOUT"
+                    | "TIMING"
+                    | "TRIMOUT"
+                    | "TRIMSPOOL"
+                    | "UNDERLINE"
+                    | "VERIFY"
+                    | "WRAP"
             )
         }
         "SHOW" => next_meaningful_word(trimmed, 1).is_some(),
         // PASSWORD abbreviations
         "PASSW" | "PASSWO" | "PASSWOR" | "PASSWORD" => true,
         // Simple auto-terminated keywords (no second-word check needed)
-        "DISC" | "DISCONNECT" | "CONN" | "RUN" | "EXIT" | "QUIT"
-        | "STARTUP" | "SHUTDOWN" | "RECOVER" | "ARCHIVE" | "HOST"
-        | "TIMING" | "TTITLE" | "BTITLE" | "REPHEADER" | "REPFOOTER"
-        | "PROMPT" | "REM" | "REMARK"
-        | "SPOOL" | "STORE" | "GET" | "SAVE" | "DESCRIBE" | "DESC"
-        | "EXEC" | "EXECUTE" | "DEFINE" | "UNDEFINE" | "VARIABLE" | "VAR"
-        | "PRINT" | "ACCEPT" | "PAUSE" | "WHENEVER" | "COLUMN" | "BREAK"
-        | "CLEAR" | "COMPUTE" => true,
+        "DISC" | "DISCONNECT" | "CONN" | "RUN" | "EXIT" | "QUIT" | "STARTUP" | "SHUTDOWN"
+        | "RECOVER" | "ARCHIVE" | "HOST" | "TIMING" | "TTITLE" | "BTITLE" | "REPHEADER"
+        | "REPFOOTER" | "PROMPT" | "REM" | "REMARK" | "SPOOL" | "STORE" | "GET" | "SAVE"
+        | "DESCRIBE" | "DESC" | "EXEC" | "EXECUTE" | "DEFINE" | "UNDEFINE" | "VARIABLE" | "VAR"
+        | "PRINT" | "ACCEPT" | "PAUSE" | "WHENEVER" | "COLUMN" | "BREAK" | "CLEAR" | "COMPUTE" => {
+            true
+        }
         _ => false,
     }
 }
@@ -1064,7 +1113,10 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
         let mut end = idx;
         while end < line.len() {
             let word_ch = line[end..].chars().next()?;
-            if word_ch.is_whitespace() || line[end..].starts_with("/*") || line[end..].starts_with("--") {
+            if word_ch.is_whitespace()
+                || line[end..].starts_with("/*")
+                || line[end..].starts_with("--")
+            {
                 break;
             }
             end += word_ch.len_utf8();
@@ -1146,6 +1198,9 @@ mod tests {
             "REDUCED",
             "CASCADED",
             "CONSTRAINT",
+            "GRANT",
+            "ADMIN",
+            "HIERARCHY",
         ] {
             assert!(
                 is_with_non_plsql_clause_keyword(keyword),
@@ -1160,7 +1215,10 @@ mod tests {
     fn statement_head_keywords_do_not_contain_duplicates() {
         let mut seen = HashSet::new();
         for keyword in STATEMENT_HEAD_KEYWORDS {
-            assert!(seen.insert(*keyword), "duplicate statement head keyword: {keyword}");
+            assert!(
+                seen.insert(*keyword),
+                "duplicate statement head keyword: {keyword}"
+            );
         }
     }
 
@@ -1264,14 +1322,20 @@ mod tests {
         assert!(is_auto_terminated_tool_command("SAVE script.sql"));
         assert!(is_auto_terminated_tool_command("DESCRIBE emp"));
         assert!(is_auto_terminated_tool_command("DESC emp"));
-        assert!(is_auto_terminated_tool_command("EXEC dbms_output.put_line('x')"));
-        assert!(is_auto_terminated_tool_command("EXECUTE dbms_output.put_line('x')"));
+        assert!(is_auto_terminated_tool_command(
+            "EXEC dbms_output.put_line('x')"
+        ));
+        assert!(is_auto_terminated_tool_command(
+            "EXECUTE dbms_output.put_line('x')"
+        ));
         assert!(is_auto_terminated_tool_command("DEFINE v = 1"));
         assert!(is_auto_terminated_tool_command("UNDEFINE v"));
         assert!(is_auto_terminated_tool_command("WHENEVER SQLERROR EXIT"));
         assert!(is_auto_terminated_tool_command("COLUMN ename FORMAT A20"));
         assert!(is_auto_terminated_tool_command("CLEAR COLUMNS"));
-        assert!(is_auto_terminated_tool_command("SHOW PARAMETER open_cursors"));
+        assert!(is_auto_terminated_tool_command(
+            "SHOW PARAMETER open_cursors"
+        ));
         assert!(is_auto_terminated_tool_command("SHOW ERRORS"));
         assert!(is_auto_terminated_tool_command("PASSWO scott"));
         assert!(is_auto_terminated_tool_command("PASSWOR scott"));
@@ -1307,8 +1371,12 @@ mod tests {
 
     #[test]
     fn auto_terminated_tool_command_set_with_block_comment_is_detected() {
-        assert!(is_auto_terminated_tool_command("SET /*sqlplus*/ TERMOUT ON"));
-        assert!(is_auto_terminated_tool_command("SET /*a*/ /*b*/ PAGESIZE 100"));
+        assert!(is_auto_terminated_tool_command(
+            "SET /*sqlplus*/ TERMOUT ON"
+        ));
+        assert!(is_auto_terminated_tool_command(
+            "SET /*a*/ /*b*/ PAGESIZE 100"
+        ));
     }
     #[test]
     fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
