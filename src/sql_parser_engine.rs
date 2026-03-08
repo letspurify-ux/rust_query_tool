@@ -1883,7 +1883,6 @@ impl SqlParserEngine {
         let should_preview = self.state.token.is_empty()
             && ((self.state.block_depth() == 1 && self.state.paren_depth == 0)
                 || (self.state.in_with_plsql_declaration()
-                    && self.state.with_clause_waiting_main_query()
                     && self.state.block_depth() == 0
                     && self.state.paren_depth == 0));
 
@@ -1918,13 +1917,30 @@ impl SqlParserEngine {
             }
 
             if this.state.in_with_plsql_declaration()
-                && this.state.with_clause_waiting_main_query()
-                && this.state.block_depth() == 0
                 && this.state.paren_depth == 0
                 && sql_text::is_statement_head_keyword(candidate_upper)
-                && !sql_text::is_with_main_query_keyword(candidate_upper)
             {
-                this.split_current_statement();
+                let should_recover_with_clause = if this.state.with_clause_waiting_main_query() {
+                    !sql_text::is_with_main_query_keyword(candidate_upper)
+                } else if matches!(
+                    this.state.with_clause_state,
+                    WithClauseState::InPlsqlDeclaration(WithDeclarationState::CollectingDeclaration)
+                ) {
+                    !sql_text::is_with_main_query_keyword(candidate_upper)
+                        && !sql_text::is_with_plsql_declaration_keyword(candidate_upper)
+                        && !matches!(candidate_upper, "BEGIN" | "DECLARE")
+                } else {
+                    false
+                };
+
+                if should_recover_with_clause {
+                    if this.state.pending_end == PendingEnd::End {
+                        this.state.resolve_pending_end_on_separator();
+                    }
+                    if this.state.block_depth() == 0 {
+                        this.split_current_statement();
+                    }
+                }
             }
         });
     }
