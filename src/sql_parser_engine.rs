@@ -5420,6 +5420,35 @@ BEGIN"
     }
 
     #[test]
+    fn non_plsql_with_clause_variants_reset_pending_with_declaration_mode() {
+        for (suffix, marker) in [
+            ("WITH NO DATA", "NO DATA"),
+            ("WITH TIES", "TIES"),
+        ] {
+            let mut engine = SqlParserEngine::new();
+
+            engine.process_line("CREATE OR REPLACE VIEW v_non_plsql_clause AS");
+            engine.process_line(&format!("SELECT 1 AS v FROM dual {suffix};"));
+            engine.process_line("SELECT 4 FROM dual;");
+
+            let statements = engine.finalize_and_take_statements();
+
+            assert_eq!(statements.len(), 2, "unexpected statements for {suffix}: {statements:?}");
+            assert!(
+                statements[0].contains(marker),
+                "first statement should preserve trailing {marker} clause: {}",
+                statements[0]
+            );
+            assert_eq!(
+                engine.state.with_clause_state,
+                WithClauseState::None,
+                "{marker} should not leave declaration tracking armed"
+            );
+            assert_eq!(statements[1], "SELECT 4 FROM dual".to_string());
+        }
+    }
+
+    #[test]
     fn with_clause_multiple_plsql_declarations_keep_main_query_attached() {
         let mut engine = SqlParserEngine::new();
 
