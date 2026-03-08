@@ -1748,15 +1748,39 @@ fn is_line_leading_slash_marker(chars: &[char], marker_idx: usize) -> bool {
         return false;
     }
 
-    // After `/`, only whitespace, newline, line comment, or REM/REMARK is allowed.
+    // After `/`, only whitespace, newline, block/line comment, or REM/REMARK is allowed.
     let mut idx = marker_idx + 1;
-    while idx < chars.len() && chars[idx] != '\n' && chars[idx].is_whitespace() {
-        idx += 1;
+    loop {
+        while idx < chars.len() && chars[idx] != '\n' && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+
+        if idx >= chars.len() || chars[idx] == '\n' {
+            return true;
+        }
+
+        if chars[idx] == '/' && chars.get(idx + 1).copied() == Some('*') {
+            let mut lookahead = idx + 2;
+            let mut closed = false;
+            while lookahead + 1 < chars.len() {
+                if chars[lookahead] == '*' && chars[lookahead + 1] == '/' {
+                    idx = lookahead + 2;
+                    closed = true;
+                    break;
+                }
+                lookahead += 1;
+            }
+
+            if !closed {
+                return false;
+            }
+
+            continue;
+        }
+
+        break;
     }
 
-    if idx >= chars.len() || chars[idx] == '\n' {
-        return true;
-    }
 
     if chars[idx] == '-' && chars.get(idx + 1).copied() == Some('-') {
         return true;
@@ -6576,6 +6600,25 @@ BY PRIOR employee_id = manager_id"),
         assert!(
             statements[1].starts_with("/\nSELECT 51 FROM dual"),
             "slash marker line should start the next statement: {}",
+            statements[1]
+        );
+    }
+
+    #[test]
+    fn external_language_clause_splits_before_slash_line_with_block_comment() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE FUNCTION ext_fn_slash_block RETURN NUMBER");
+        engine.process_line("AS LANGUAGE C;");
+        engine.process_line("/ /* rerun external */");
+        engine.process_line("SELECT 251 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(
+            statements[1].starts_with("/ /* rerun external */\nSELECT 251 FROM dual"),
+            "slash line with block comment should start the next statement: {}",
             statements[1]
         );
     }

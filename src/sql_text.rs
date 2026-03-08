@@ -1100,23 +1100,22 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
     let mut seen_words = 0usize;
 
     while idx < line.len() {
-        let ch = line[idx..].chars().next()?;
-        let ch_len = ch.len_utf8();
-
-        if ch.is_whitespace() {
-            idx += ch_len;
-            continue;
-        }
-
         if line[idx..].starts_with("--") {
             return None;
         }
 
         if line[idx..].starts_with("/*") {
-            let comment_start = idx + 2;
-            let comment_tail = &line[comment_start..];
-            let comment_len = comment_tail.find("*/")?;
-            idx = comment_start + comment_len + 2;
+            let block_start = idx + 2;
+            let block_end = line[block_start..].find("*/")?;
+            idx = block_start + block_end + 2;
+            continue;
+        }
+
+        let ch = line[idx..].chars().next()?;
+        let ch_len = ch.len_utf8();
+
+        if ch.is_whitespace() {
+            idx += ch_len;
             continue;
         }
 
@@ -1400,6 +1399,22 @@ mod tests {
             "SET /*a*/ /*b*/ PAGESIZE 100"
         ));
     }
+
+    #[test]
+    fn auto_terminated_tool_command_ignores_leading_line_comment_before_set() {
+        assert!(!is_auto_terminated_tool_command("-- comment\nSET TERMOUT ON"));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_ignores_comment_only_block_comment_line() {
+        assert!(!is_auto_terminated_tool_command("/* comment */"));
+    }
+
+    #[test]
+    fn auto_terminated_tool_command_ignores_unterminated_block_comment() {
+        assert!(!is_auto_terminated_tool_command("SET /* unterminated"));
+    }
+
     #[test]
     fn auto_terminated_tool_command_ignores_start_with_sql_clause() {
         assert!(is_auto_terminated_tool_command("START child.sql"));
