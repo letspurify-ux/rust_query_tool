@@ -404,7 +404,7 @@ impl RoutineFrame {
         }
     }
 
-    fn finalize_external_clause_on_semicolon(&mut self) {
+    fn finalize_external_clause_on_semicolon(&mut self, allow_implicit_target_split: bool) {
         match self.external_clause_state {
             ExternalClauseState::SawExternalKeyword
             | ExternalClauseState::AwaitingLanguageTargetFromExternal => {
@@ -412,7 +412,11 @@ impl RoutineFrame {
             }
             ExternalClauseState::SawImplicitLanguageTarget
             | ExternalClauseState::AwaitingLanguageTargetImplicit => {
-                self.mark_implicit_language_target_on_semicolon();
+                if allow_implicit_target_split {
+                    self.mark_implicit_language_target_on_semicolon();
+                } else {
+                    self.external_clause_state = ExternalClauseState::None;
+                }
             }
             _ => {}
         }
@@ -990,7 +994,10 @@ impl SplitState {
 
         let allow_implicit_language = self.block_depth() > 1
             || (self.block_depth() == 1
-                && matches!(self.create_plsql_kind, CreatePlsqlKind::Function));
+                && matches!(
+                    self.create_plsql_kind,
+                    CreatePlsqlKind::Function | CreatePlsqlKind::Procedure
+                ));
 
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.observe_external_clause_token(upper, allow_implicit_language);
@@ -1358,8 +1365,11 @@ impl SplitState {
     }
 
     fn finalize_external_clause_on_semicolon(&mut self) {
+        let allow_implicit_target_split = !(self.block_depth() == 1
+            && matches!(self.create_plsql_kind, CreatePlsqlKind::Procedure));
+
         if let Some(frame) = self.active_routine_frame_mut() {
-            frame.finalize_external_clause_on_semicolon();
+            frame.finalize_external_clause_on_semicolon(allow_implicit_target_split);
             if frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
                 && frame.block_depth == 1
             {
@@ -6095,6 +6105,42 @@ BEGIN"
         assert!(statements[0].contains("AS LANGUAGE C"));
         assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
         assert!(statements[2].starts_with("SELECT 1 FROM dual"));
+    }
+
+    #[test]
+    fn implicit_external_language_clause_on_procedure_splits_before_following_begin_block() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE ext_proc_begin");
+        engine.process_line("AS LANGUAGE C");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 101 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 3, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE C"));
+        assert!(statements[1].starts_with("BEGIN\n  NULL;\nEND"));
+        assert!(statements[2].starts_with("SELECT 101 FROM dual"));
+    }
+
+    #[test]
+    fn implicit_external_literal_target_clause_on_procedure_with_semicolon_keeps_block_together() {
+        let mut engine = SqlParserEngine::new();
+
+        engine.process_line("CREATE OR REPLACE PROCEDURE ext_proc_begin_literal");
+        engine.process_line("AS LANGUAGE 'C';");
+        engine.process_line("BEGIN");
+        engine.process_line("  NULL;");
+        engine.process_line("END;");
+        engine.process_line("SELECT 102 FROM dual;");
+
+        let statements = engine.finalize_and_take_statements();
+        assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+        assert!(statements[0].contains("AS LANGUAGE 'C'"));
+        assert!(statements[0].contains("BEGIN\n  NULL;\nEND"));
+        assert!(statements[1].starts_with("SELECT 102 FROM dual"));
     }
 
     #[test]
