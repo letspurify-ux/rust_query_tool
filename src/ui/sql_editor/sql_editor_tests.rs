@@ -338,6 +338,20 @@ fn format_sql_keeps_if_and_begin_aligned_in_nested_package_body_blocks() {
 }
 
 #[test]
+fn format_sql_keeps_loop_and_named_end_aligned_in_nested_package_body_blocks() {
+    let input = "create package body pkg as procedure procname is begin begin null; end; loop null; end loop; end procname; end pkg;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "    BEGIN\n        BEGIN\n            NULL;\n        END;\n        LOOP\n            NULL;\n        END LOOP;\n    END procname;"
+        ),
+        "nested BEGIN/LOOP indentation should stay at the same procedure depth, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_oracle_labels() {
     // Test <<loop_label>> preservation
     let input = "<<outer_loop>>\nFOR i IN 1..10 LOOP\n<<inner_loop>>\nFOR j IN 1..5 LOOP\nNULL;\nEND LOOP inner_loop;\nEND LOOP outer_loop;";
