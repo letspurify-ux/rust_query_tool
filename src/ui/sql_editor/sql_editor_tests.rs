@@ -2210,6 +2210,54 @@ END;"#;
 }
 
 #[test]
+fn format_sql_paren_case_start_with_inline_comment_keeps_case_indented() {
+    let input = r#"BEGIN
+v_num := ( -- keep this comment
+CASE
+WHEN 1 = 1 THEN
+1
+ELSE
+0
+END
+);
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("v_num := ( -- keep this comment\n        CASE\n            WHEN 1 = 1 THEN"),
+        "CASE block after parenthesis+comment should stay indented as expression depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("END\n        );"),
+        "closing parenthesis should remain aligned with expression depth, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_case_start_with_inline_comment_keeps_case_indented() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT ( -- inline comment
+CASE
+WHEN score > 10 THEN 'HIGH'
+ELSE 'LOW'
+END
+) AS bucket
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("( -- inline comment\n            CASE\n                WHEN score > 10 THEN 'HIGH'"),
+        "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("END\n            ) AS bucket"),
+        "CASE END and close paren should stay aligned in OPEN FOR expression, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE
