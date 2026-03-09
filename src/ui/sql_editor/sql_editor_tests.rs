@@ -1206,6 +1206,27 @@ END;"#;
     assert_eq!(formatted, expected);
 }
 
+
+
+#[test]
+fn format_sql_keeps_second_cte_depth_after_extra_closing_paren() {
+    let input = r#"WITH c1 AS (
+SELECT 1
+)
+)
+, c2 AS (
+SELECT 2
+)
+SELECT 3;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("c2 AS (
+    SELECT 2"),
+        "second CTE body should keep depth indentation, got:
+{formatted}"
+    );
+}
 #[test]
 fn format_sql_select_case_inside_sum_is_indented() {
     let input = r#"SELECT grp,

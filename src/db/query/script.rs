@@ -938,11 +938,8 @@ impl QueryExecutor {
                         subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     } else if closed_kind == Some(SubqueryParenKind::Pending) {
                         pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                    } else if closed_kind.is_none() {
-                        // Malformed SQL recovery path: keep depth accounting monotonic.
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     }
-                    if with_cte_depth > 0 {
+                    if with_cte_depth > 0 && with_cte_paren > 0 {
                         with_cte_paren -= 1;
                     }
                 }
@@ -4331,6 +4328,26 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
             )
             .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
+        );
+    }
+
+
+    #[test]
+    fn line_block_depths_keeps_with_cte_depth_after_extra_closing_paren() {
+        let sql = "WITH c1 AS (
+SELECT 1
+)
+)
+, c2 AS (
+SELECT 2
+)
+SELECT 3";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths.len(), 8, "each SQL line should produce one depth entry");
+        assert!(
+            depths.get(5).copied().unwrap_or(0) > 0,
+            "second CTE body should remain nested despite malformed extra ')', depths={depths:?}"
         );
     }
 }
