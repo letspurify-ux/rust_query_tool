@@ -2426,7 +2426,17 @@ impl SqlEditorWidget {
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SET");
-                let max_extra = if is_dml_clause_line { 1 } else { 2 };
+                let is_depth_strict_clause = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "JOIN")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ON")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "AND")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OR");
+                let max_extra = if is_depth_strict_clause {
+                    0
+                } else if is_dml_clause_line {
+                    if parser_depth >= 2 { 0 } else { 1 }
+                } else {
+                    2
+                };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth
@@ -9062,6 +9072,51 @@ END;"#;
         assert!(
             formatted.contains("ELSE\n            0\n        END CASE);"),
             "END CASE terminator should stay aligned with CASE header in parenthesized expression, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn nested_exists_join_clauses_follow_parser_depth() {
+        let sql = r#"BEGIN
+  SELECT e.empno
+  INTO v_empno
+  FROM emp e
+  WHERE EXISTS (
+    SELECT 1
+    FROM dept d
+      JOIN loc l
+        ON l.deptno = d.deptno
+    WHERE d.deptno = e.deptno
+      AND EXISTS (
+        SELECT 1
+        FROM bonus b
+        WHERE b.empno = e.empno
+      )
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    WHERE EXISTS (
+        SELECT 1
+        FROM dept d
+        JOIN loc l"),
+            "nested subquery should stay aligned to parser depth, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        WHERE d.deptno = e.deptno
+        AND EXISTS ("),
+            "nested condition clauses should not gain extra depth drift, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("            WHERE b.empno = e.empno"),
+            "inner EXISTS WHERE should follow parser depth, got:
+{}",
             formatted
         );
     }
