@@ -2363,13 +2363,35 @@ impl SqlEditorWidget {
                 let prev_upper = prev.to_ascii_uppercase();
                 Self::starts_with_plain_end(&prev_upper)
             });
-            let next_significant_line_trimmed = lines.iter().skip(idx + 1).find_map(|next| {
+            let mut next_significant_line_trimmed: Option<&str> = None;
+            let mut in_peek_block_comment = false;
+            for next in lines.iter().skip(idx + 1) {
                 let next_trimmed = next.trim_start();
                 if next_trimmed.is_empty() || Self::is_sqlplus_comment_line(next_trimmed) {
-                    return None;
+                    continue;
                 }
-                Some(next_trimmed)
-            });
+
+                if in_peek_block_comment {
+                    if next_trimmed.contains("*/") {
+                        in_peek_block_comment = false;
+                    }
+                    continue;
+                }
+
+                if next_trimmed.starts_with("/*") {
+                    if !next_trimmed.contains("*/") {
+                        in_peek_block_comment = true;
+                    }
+                    continue;
+                }
+
+                if next_trimmed == "*/" {
+                    continue;
+                }
+
+                next_significant_line_trimmed = Some(next_trimmed);
+                break;
+            }
             let next_line_is_named_plain_end = next_significant_line_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)

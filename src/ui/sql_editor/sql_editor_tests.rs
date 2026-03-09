@@ -1269,6 +1269,72 @@ END demo_pkg;
 }
 
 #[test]
+fn format_sql_keeps_end_if_depth_before_named_end_when_multiline_block_comment_in_between() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+PROCEDURE p IS
+BEGIN
+IF 1 = 1 THEN
+NULL;
+END IF;
+/* keep pending
+end label scope */
+END p;
+END demo_pkg;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "CREATE OR REPLACE PACKAGE BODY demo_pkg AS",
+        "    PROCEDURE p IS",
+        "    BEGIN",
+        "        IF 1 = 1 THEN",
+        "            NULL;",
+        "        END IF;",
+        "        /* keep pending",
+        "end label scope */",
+        "    END p;",
+        "END demo_pkg;",
+        "/",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_keeps_end_if_depth_before_named_end_when_sqlplus_comment_and_block_comment_in_between() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+PROCEDURE p IS
+BEGIN
+IF 1 = 1 THEN
+NULL;
+END IF;
+-- keep pending end label scope
+/* still in same scope */
+END p;
+END demo_pkg;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "CREATE OR REPLACE PACKAGE BODY demo_pkg AS",
+        "    PROCEDURE p IS",
+        "    BEGIN",
+        "        IF 1 = 1 THEN",
+        "            NULL;",
+        "        END IF;",
+        "        -- keep pending end label scope",
+        "        /* still in same scope */",
+        "    END p;",
+        "END demo_pkg;",
+        "/",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
 fn format_sql_select_case_inside_sum_is_indented() {
     let input = r#"SELECT grp,
 COUNT (*) AS cnt,
