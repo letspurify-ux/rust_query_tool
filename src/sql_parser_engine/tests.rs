@@ -5931,6 +5931,33 @@ fn package_body_nested_routine_end_name_with_if_else_exception_keeps_package_dep
 }
 
 #[test]
+fn package_body_end_with_qualified_label_still_closes_outer_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_label_qualified AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  ELSE");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END owner.pkg_label_qualified;");
+    engine.process_line("SELECT 103 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.pkg_label_qualified"),
+        "qualified package end label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 103 FROM dual".to_string());
+}
+
+#[test]
 fn oracle_external_language_without_semicolon_splits_before_following_statement_head() {
     let mut engine = SqlParserEngine::new();
 

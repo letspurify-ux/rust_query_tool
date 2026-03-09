@@ -318,6 +318,21 @@ impl SplitState {
             && self.block_stack.get(self.block_stack.len().saturating_sub(2)) == Some(&BlockKind::AsIs)
     }
 
+    fn package_body_end_label_matches(&self, token_upper: &str) -> bool {
+        let Some(package_name) = self.package_body_name.as_deref() else {
+            return false;
+        };
+
+        if package_name == token_upper {
+            return true;
+        }
+
+        token_upper
+            .rsplit('.')
+            .next()
+            .is_some_and(|segment| segment == package_name)
+    }
+
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
@@ -846,10 +861,7 @@ impl SplitState {
                     if as_is_depth > 1 {
                         true
                     } else {
-                        let matches_named_end = self
-                            .package_body_name
-                            .as_deref()
-                            .is_some_and(|name| name == token_upper);
+                        let matches_named_end = self.package_body_end_label_matches(token_upper);
                         let unlabeled_end = token_upper.is_empty();
                         matches_named_end || unlabeled_end
                     }
@@ -878,10 +890,7 @@ impl SplitState {
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
             && self.block_depth() <= 2
         {
-            let matches_named_end = self
-                .package_body_name
-                .as_deref()
-                .is_some_and(|name| name == token_upper);
+            let matches_named_end = self.package_body_end_label_matches(token_upper);
             let unlabeled_end = token_upper.is_empty();
             return matches_named_end || unlabeled_end;
         }
