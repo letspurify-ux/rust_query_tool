@@ -1770,7 +1770,7 @@ impl SqlEditorWidget {
 
                     if create_table_paren_expected
                         && upper == "AS"
-                        && (next_word_is("SELECT") || next_word_is("WITH"))
+                        && (next_word_is("SELECT") || next_word_is("WITH") || next_word_is("VALUES"))
                     {
                         create_table_paren_expected = false;
                     }
@@ -2089,7 +2089,8 @@ impl SqlEditorWidget {
                                 || next_word_is("INSERT")
                                 || next_word_is("UPDATE")
                                 || next_word_is("DELETE")
-                                || next_word_is("MERGE");
+                                || next_word_is("MERGE")
+                                || next_word_is("VALUES");
                             if needs_space {
                                 out.push(' ');
                             }
@@ -9845,6 +9846,50 @@ FROM DUAL"
             "Compound trigger AFTER timing qualifier should be preserved, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn formats_values_subquery_with_nested_depth() {
+        let sql = "SELECT 1 FROM dual WHERE EXISTS (VALUES (1));";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT 1",
+            "FROM DUAL",
+            "WHERE EXISTS (",
+            "        VALUES (1)",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_deeply_nested_subqueries_with_consistent_depth() {
+        let sql = "SELECT outer_col FROM outer_t o WHERE EXISTS (SELECT 1 FROM (SELECT inner_col FROM inner_t i WHERE i.id IN (SELECT id FROM leaf_t WHERE status = 'Y')) nested_q WHERE nested_q.inner_col = o.outer_col);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT outer_col",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        SELECT 1",
+            "        FROM (",
+            "                SELECT inner_col",
+            "                FROM inner_t i",
+            "                WHERE i.id IN (",
+            "                        SELECT id",
+            "                        FROM leaf_t",
+            "                        WHERE status = 'Y'",
+            "                    )",
+            "            ) nested_q",
+            "        WHERE nested_q.inner_col = o.outer_col",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
     }
 }
 
