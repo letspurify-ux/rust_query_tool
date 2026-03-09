@@ -8757,6 +8757,81 @@ END pkg_depth_comment; -- package end"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_quoted_end_label_does_not_trigger_end_suffix_dedent() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_q AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END "IF";
+END pkg_depth_q;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let proc_header_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE p1 IS"))
+        .expect("expected PROCEDURE header line");
+    let end_proc_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END \"IF\""))
+        .expect("expected quoted END label line");
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END pkg_depth_q"))
+        .expect("expected package END line");
+
+    assert_eq!(
+        depths[end_proc_idx], depths[proc_header_idx],
+        "quoted END labels (END \"IF\") must align with subprogram header depth (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "package END should still dedent to top-level after quoted END label (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_with_is_if_else_exception_and_named_end_stays_single_statement() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_mix IS
+  PROCEDURE p1 AS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    ELSE
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p1;
+END pkg_depth_mix;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "package body should remain single statement across IS/AS, IF/ELSE, EXCEPTION, named END: {stmts:?}"
+    );
+    assert!(stmts[0].contains("END IF;"));
+    assert!(stmts[0].contains("EXCEPTION"));
+    assert!(stmts[0].contains("END p1;"));
+    assert!(stmts[0].contains("END pkg_depth_mix"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);
