@@ -824,6 +824,15 @@ impl SplitState {
         let top = self.block_stack.last().copied();
         let _ = self.block_stack.pop();
 
+        if top == Some(BlockKind::Declare)
+            && self.block_stack.last() == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins > 0
+        {
+            let _ = self.block_stack.pop();
+            self.pending_subprogram_begins -= 1;
+            return;
+        }
+
         if top == Some(BlockKind::Begin)
             && self.block_stack.last() == Some(&BlockKind::AsIs)
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
