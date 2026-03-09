@@ -443,7 +443,9 @@ impl RoutineFrame {
     fn finalize_external_clause_on_semicolon(&mut self, allow_implicit_target_split: bool) {
         match self.external_clause_state {
             ExternalClauseState::SawExternalKeyword
-            | ExternalClauseState::AwaitingLanguageTargetFromExternal => {
+            | ExternalClauseState::AwaitingLanguageTargetFromExternal
+            | ExternalClauseState::SawUsingClauseSubject
+            | ExternalClauseState::SawMleKeyword => {
                 self.mark_external_clause();
             }
             ExternalClauseState::SawImplicitLanguageTarget
