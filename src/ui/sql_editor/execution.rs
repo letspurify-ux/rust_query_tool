@@ -364,6 +364,21 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(rest, "FOR")
     }
 
+    fn starts_with_plain_end_terminator(trimmed_upper: &str) -> bool {
+        if !crate::sql_text::starts_with_keyword_token(trimmed_upper, "END") {
+            return false;
+        }
+
+        if trimmed_upper == "END" {
+            return true;
+        }
+
+        let Some(rest) = trimmed_upper.strip_prefix("END") else {
+            return false;
+        };
+        matches!(rest.trim_start(), "" | ";")
+    }
+
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
         sanitized.clear_password();
@@ -2365,7 +2380,8 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let force_end_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper);
+            let force_end_depth = Self::starts_with_plain_end_terminator(&trimmed_upper)
+                || Self::starts_with_end_suffix_terminator(&trimmed_upper);
             // Only force parser depth for dedent-oriented control lines.
             // Block starters (IF/FOR/WHILE/CASE/BEGIN/DECLARE/LOOP...) should keep
             // an already-deeper indent from the first formatting pass.
@@ -8849,6 +8865,13 @@ END if_owner;"#;
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
+    }
+
+    #[test]
+    fn starts_with_plain_end_terminator_handles_named_end_labels() {
+        assert!(SqlEditorWidget::starts_with_plain_end_terminator("END"));
+        assert!(SqlEditorWidget::starts_with_plain_end_terminator("END;"));
+        assert!(!SqlEditorWidget::starts_with_plain_end_terminator("END pkg_demo;"));
     }
 
     #[test]
