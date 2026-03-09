@@ -1986,6 +1986,27 @@ END;"#;
 }
 
 #[test]
+fn format_sql_paren_case_end_with_comment_does_not_leak_depth_to_next_line() {
+    let input = r#"BEGIN
+v_num := (
+CASE
+WHEN 1 = 1 THEN
+1
+ELSE
+0
+END -- close case
+);
+v_next := 2;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("END -- close case\n    );\n    v_next := 2;"),
+        "parenthesized CASE depth should be closed before the next statement, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE
