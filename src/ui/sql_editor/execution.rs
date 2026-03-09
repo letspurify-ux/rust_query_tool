@@ -2293,10 +2293,8 @@ impl SqlEditorWidget {
                 let parser_depth = depth + extra_indent;
                 let effective_depth = if in_dml_statement {
                     parser_depth.max(existing_indent)
-                } else if existing_indent > parser_depth.saturating_add(3) {
-                    parser_depth
                 } else {
-                    parser_depth.max(existing_indent)
+                    parser_depth
                 };
                 out.push_str(&" ".repeat(effective_depth * 4));
                 out.push_str(trimmed);
