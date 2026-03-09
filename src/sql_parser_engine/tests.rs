@@ -1173,6 +1173,65 @@ fn package_body_initialization_begin_end_closes_outer_is_block() {
 }
 
 #[test]
+fn package_body_init_end_if_label_does_not_capture_outer_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_nested_end_if AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF done_flag;");
+    engine.process_line("END pkg_nested_end_if;");
+    engine.process_line("SELECT 88 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END IF done_flag;"),
+        "first statement should keep nested END IF label: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END pkg_nested_end_if"),
+        "first statement should close package body at outer END label: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 88 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_init_end_exception_identifier_does_not_capture_outer_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_nested_exception AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  EXCEPTION");
+    engine.process_line("    WHEN OTHERS THEN");
+    engine.process_line("      NULL;");
+    engine.process_line("  END inner_block;");
+    engine.process_line("END pkg_nested_exception;");
+    engine.process_line("SELECT 89 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END inner_block;"),
+        "first statement should keep nested END label: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END pkg_nested_exception"),
+        "first statement should close package body at outer END label: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 89 FROM dual".to_string());
+}
+
+#[test]
 fn compound_trigger_with_each_row_timing_point_splits_on_outer_end() {
     let mut engine = SqlParserEngine::new();
 

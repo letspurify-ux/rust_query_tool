@@ -313,6 +313,7 @@ impl SplitState {
 
     fn package_body_init_end_context(&self) -> bool {
         self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.block_depth() == 2
             && self.block_stack.last() == Some(&BlockKind::Begin)
             && self.block_stack.get(self.block_stack.len().saturating_sub(2)) == Some(&BlockKind::AsIs)
     }
