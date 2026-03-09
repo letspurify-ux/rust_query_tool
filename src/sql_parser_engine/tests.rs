@@ -5779,3 +5779,31 @@ fn malformed_implicit_language_clause_keyword_without_target_splits_before_next_
     assert!(statements[0].contains("AS LANGUAGE PARAMETERS ('x')"));
     assert_eq!(statements[1], "SELECT 52 FROM dual".to_string());
 }
+
+#[test]
+fn malformed_mle_clause_without_module_or_signature_still_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_missing_target RETURN NUMBER");
+    engine.process_line("AS MLE;");
+    engine.process_line("SELECT 53 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS MLE"));
+    assert_eq!(statements[1], "SELECT 53 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_using_clause_without_target_still_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_using_missing_target RETURN NUMBER");
+    engine.process_line("AS AGGREGATE USING;");
+    engine.process_line("SELECT 54 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS AGGREGATE USING"));
+    assert_eq!(statements[1], "SELECT 54 FROM dual".to_string());
+}
