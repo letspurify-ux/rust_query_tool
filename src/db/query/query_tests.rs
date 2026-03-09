@@ -12851,3 +12851,33 @@ END pkg_mix;"#;
         "package body AS function split END IF + split END name depth mismatch: {depths:?}"
     );
 }
+
+#[test]
+fn test_line_block_depths_package_body_nested_exception_handlers_keep_outer_handler_depth() {
+    // Outer EXCEPTION handler contains nested BEGIN..EXCEPTION block.
+    // After inner END, the outer WHEN handler body depth must remain active.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_nested_ex AS
+  FUNCTION f_nested RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  EXCEPTION
+    WHEN OTHERS THEN
+      BEGIN
+        NULL;
+      EXCEPTION
+        WHEN ZERO_DIVIDE THEN
+          NULL;
+      END;
+      RETURN -1;
+  END f_nested;
+END pkg_nested_ex;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    // pkg AS(0) fn IS(1) BEGIN(1) RETURN(2) EXCEPTION(1) WHEN(2) BEGIN(3) NULL(4)
+    // EXCEPTION(3) WHEN(3) NULL(4) END;(2) RETURN(2) END fn(0) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 2, 3, 4, 3, 3, 4, 2, 2, 0, 0];
+    assert_eq!(
+        depths, expected,
+        "nested exception handlers should preserve outer handler depth: {depths:?}"
+    );
+}

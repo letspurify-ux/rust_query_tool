@@ -639,8 +639,7 @@ impl QueryExecutor {
         let mut with_cte_depth = 0usize;
         let mut with_cte_paren = 0isize;
         let mut pending_with = false;
-        let mut exception_depth_stack: Vec<usize> = Vec::new();
-        let mut exception_handler_body = false;
+        let mut exception_depth_stack: Vec<(usize, bool)> = Vec::new();
         let mut case_branch_stack: Vec<bool> = Vec::new();
 
         for line in sql.lines() {
@@ -738,7 +737,7 @@ impl QueryExecutor {
             });
             let exception_end_line = exception_depth_stack
                 .last()
-                .is_some_and(|depth| *depth == builder.block_depth())
+                .is_some_and(|(depth, _)| builder.block_depth() <= *depth)
                 && leading_is("END")
                 && !end_has_suffix;
 
@@ -844,8 +843,13 @@ impl QueryExecutor {
                 0
             };
 
-            let exception_handler_component =
-                if exception_handler_body && !leading_is("WHEN") && !exception_end_line {
+            let has_active_exception_handler = exception_depth_stack
+                .iter()
+                .any(|(_, in_handler_body)| *in_handler_body);
+            let exception_handler_component = if has_active_exception_handler
+                && !leading_is("WHEN")
+                && !exception_end_line
+            {
                     1
                 } else {
                     0
@@ -882,17 +886,18 @@ impl QueryExecutor {
             }
 
             if leading_is("EXCEPTION") {
-                exception_depth_stack.push(builder.block_depth());
-                exception_handler_body = false;
+                exception_depth_stack.push((builder.block_depth(), false));
             } else if !exception_depth_stack.is_empty() && leading_is("WHEN") {
-                exception_handler_body = true;
-            } else if exception_depth_stack
-                .last()
-                .is_some_and(|depth| *depth == builder.block_depth())
-                && leading_is("END")
-            {
-                exception_depth_stack.pop();
-                exception_handler_body = false;
+                if let Some((_, in_handler_body)) = exception_depth_stack.last_mut() {
+                    *in_handler_body = true;
+                }
+            } else if leading_is("END") {
+                while exception_depth_stack
+                    .last()
+                    .is_some_and(|(depth, _)| builder.block_depth() <= *depth)
+                {
+                    exception_depth_stack.pop();
+                }
             }
             if at_case_header_level {
                 if leading_is_any(&["WHEN", "ELSE"]) {
