@@ -389,6 +389,81 @@ impl QueryExecutor {
             })
         }
 
+        fn parse_identifier_chain(line: &str) -> Option<String> {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            if i >= bytes.len() {
+                return None;
+            }
+
+            let mut segments: Vec<String> = Vec::new();
+
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() || bytes[i] == b';' {
+                    break;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                    break;
+                }
+
+                if bytes[i] == b'"' {
+                    i += 1;
+                    let mut segment = String::new();
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                segment.push('"');
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        segment.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    if segment.is_empty() {
+                        break;
+                    }
+                    segment.make_ascii_uppercase();
+                    segments.push(segment);
+                } else {
+                    if !sql_text::is_identifier_start_byte(bytes[i]) {
+                        break;
+                    }
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    segments.push(line[start..i].to_ascii_uppercase());
+                }
+
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+
+            if segments.is_empty() {
+                None
+            } else {
+                Some(segments.join("."))
+            }
+        }
+
         #[derive(Default)]
         struct EndSuffixOrLabel {
             upper: String,
@@ -627,8 +702,8 @@ impl QueryExecutor {
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 } else if builder.state.pending_end == PendingEnd::End {
-                    let label_upper = leading_word
-                        .map(|word| word.to_ascii_uppercase())
+                    let label_upper = parse_identifier_chain(line)
+                        .or_else(|| leading_word.map(|word| word.to_ascii_uppercase()))
                         .unwrap_or_default();
                     if builder
                         .state
