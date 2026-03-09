@@ -1329,7 +1329,7 @@ impl SqlEditorWidget {
                         let mut end_tail: Vec<String> = Vec::new();
                         if let Some(qualifier) = end_qualifier.as_deref() {
                             match qualifier {
-                                "LOOP" | "IF" | "CASE" | "REPEAT" => {
+                                "LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE" => {
                                     end_tail.push(qualifier.to_string());
                                 }
                                 "BEFORE" | "AFTER" => {
@@ -1375,7 +1375,7 @@ impl SqlEditorWidget {
                         }
                         let is_qualified_end = matches!(
                             end_tail.first().map(String::as_str),
-                            Some("LOOP" | "IF" | "CASE" | "REPEAT")
+                            Some("LOOP" | "IF" | "CASE" | "REPEAT" | "FOR" | "WHILE")
                         );
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
 
@@ -8898,14 +8898,33 @@ END if_owner;"#;
     }
 
     #[test]
+    fn format_statement_preserves_end_for_and_end_while_suffixes() {
+        let for_sql = "BEGIN\n  FOR i IN 1..3 LOOP\n    NULL;\n  END FOR;\nEND;";
+        let for_formatted = SqlEditorWidget::format_sql_basic(for_sql);
+        assert!(
+            for_formatted.contains("END FOR;"),
+            "END FOR suffix should be preserved as a single terminator line, got:\n{}",
+            for_formatted
+        );
+
+        let while_sql = "BEGIN\n  WHILE i < 3 LOOP\n    i := i + 1;\n  END WHILE;\nEND;";
+        let while_formatted = SqlEditorWidget::format_sql_basic(while_sql);
+        assert!(
+            while_formatted.contains("END WHILE;"),
+            "END WHILE suffix should be preserved as a single terminator line, got:\n{}",
+            while_formatted
+        );
+    }
+
+    #[test]
     fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END CASE"));
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END REPEAT"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FOR"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END WHILE"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END FOR"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END WHILE"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
     }
@@ -8914,8 +8933,8 @@ END if_owner;"#;
     fn starts_with_plain_end_excludes_qualified_end_suffixes() {
         assert!(SqlEditorWidget::starts_with_plain_end("END"));
         assert!(SqlEditorWidget::starts_with_plain_end("END pkg;"));
-        assert!(SqlEditorWidget::starts_with_plain_end("END FOR"));
-        assert!(SqlEditorWidget::starts_with_plain_end("END WHILE"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END FOR"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END WHILE"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END IF;"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END LOOP"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END CASE"));

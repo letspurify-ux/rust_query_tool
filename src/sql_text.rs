@@ -644,7 +644,8 @@ pub(crate) const FORMAT_CONDITION_KEYWORDS: &[&str] = &["ON", "AND", "OR", "WHEN
 pub(crate) const FORMAT_BLOCK_START_KEYWORDS: &[&str] = &["DECLARE", "IF", "REPEAT"];
 
 /// Supported qualifiers for `END ...` in formatter block indentation logic.
-pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] = &["LOOP", "IF", "CASE", "REPEAT"];
+pub(crate) const FORMAT_BLOCK_END_QUALIFIER_KEYWORDS: &[&str] =
+    &["LOOP", "IF", "CASE", "REPEAT", "FOR", "WHILE"];
 
 /// Shared SQL keyword lookup set for lexer/highlighting and IntelliSense checks.
 pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
