@@ -6555,6 +6555,65 @@ SELECT 1 FROM dual;"#;
     );
 }
 
+
+#[test]
+fn test_line_block_depths_package_body_with_nested_end_labels_and_exception() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY test_pkg AS
+  FUNCTION f1 RETURN NUMBER IS
+    v NUMBER := 0;
+  BEGIN
+    IF v = 0 THEN
+      v := 1;
+    ELSE
+      v := 2;
+    END IF;
+    RETURN v;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN -1;
+  END f1;
+BEGIN
+  NULL;
+END test_pkg;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(depths.len(), 17, "unexpected depth vector: {depths:?}");
+    assert!(depths[5] > depths[4], "IF body should indent (depths: {depths:?})");
+    assert_eq!(depths[6], depths[4], "ELSE should pre-dedent to IF depth (depths: {depths:?})");
+    assert_eq!(depths[8], depths[4], "END IF should return to IF depth (depths: {depths:?})");
+    assert!(
+        depths[11] > depths[10],
+        "EXCEPTION handler WHEN should indent under EXCEPTION (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[16],
+        0,
+        "named package-body END should close both BEGIN and AS/IS scopes (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_with_subprogram_end_name_on_next_line() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY test_pkg AS
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END
+  p;
+END test_pkg;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(depths.len(), 7, "unexpected depth vector: {depths:?}");
+    assert_eq!(depths[4], depths[5], "split END / name suffix should keep depth stable (depths: {depths:?})");
+    assert_eq!(
+        depths[6],
+        0,
+        "final END <package_name> should fully close package-body scope (depths: {depths:?})"
+    );
+}
+
 #[test]
 fn test_line_block_depths_increase_for_if_and_case() {
     let sql = r#"BEGIN

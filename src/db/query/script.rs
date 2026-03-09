@@ -388,6 +388,76 @@ impl QueryExecutor {
                 )
             })
         }
+
+        fn parse_end_label_upper(line: &str) -> Option<String> {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i + 3 > bytes.len() || !bytes[i..i + 3].eq_ignore_ascii_case(b"END") {
+                return None;
+            }
+            i += 3;
+
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                    return None;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            if i >= bytes.len() {
+                return Some(String::new());
+            }
+
+            if bytes[i] == b';' {
+                return Some(String::new());
+            }
+
+            if bytes[i] == b'"' {
+                let mut out = String::new();
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            out.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                out.make_ascii_uppercase();
+                return Some(out);
+            }
+
+            if !sql_text::is_identifier_start_byte(bytes[i]) {
+                return Some(String::new());
+            }
+            let start = i;
+            i += 1;
+            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+            Some(line[start..i].to_ascii_uppercase())
+        }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
 
         let mut builder = SqlParserEngine::new();
@@ -480,17 +550,41 @@ impl QueryExecutor {
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
                 && leading_is("END");
+            let end_label_upper = if leading_is("END") {
+                parse_end_label_upper(line)
+            } else {
+                None
+            };
+
             let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
                 builder.block_depth().saturating_sub(1)
             } else {
                 builder.block_depth()
             };
+
+            if leading_is("END")
+                && builder
+                    .state
+                    .plain_end_closes_parent_scope(end_label_upper.as_deref().unwrap_or_default())
+            {
+                block_depth_component = block_depth_component.saturating_sub(1);
+            }
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && is_end_suffix_keyword(leading_word)
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
+                } else if builder.state.pending_end == PendingEnd::End {
+                    let label_upper = leading_word
+                        .map(|word| word.to_ascii_uppercase())
+                        .unwrap_or_default();
+                    if builder
+                        .state
+                        .plain_end_closes_parent_scope(label_upper.as_str())
+                    {
+                        block_depth_component = block_depth_component.saturating_sub(1);
+                    }
                 }
             }
 
