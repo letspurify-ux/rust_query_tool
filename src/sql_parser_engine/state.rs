@@ -782,12 +782,16 @@ impl SplitState {
         if top == Some(BlockKind::Begin)
             && self.block_stack.last() == Some(&BlockKind::AsIs)
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
-            && self
+        {
+            let matches_named_end = self
                 .package_body_name
                 .as_deref()
-                .is_some_and(|name| name == token_upper)
-        {
-            let _ = self.block_stack.pop();
+                .is_some_and(|name| name == token_upper);
+            let unlabeled_end = token_upper.is_empty();
+
+            if matches_named_end || unlabeled_end {
+                let _ = self.block_stack.pop();
+            }
         }
     }
 
