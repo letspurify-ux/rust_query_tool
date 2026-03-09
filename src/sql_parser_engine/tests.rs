@@ -98,6 +98,21 @@ fn slash_line_kind_classifies_supported_line_forms() {
 }
 
 #[test]
+fn slash_line_kind_treats_block_comment_then_line_comment_as_terminator() {
+    let marker = super::classify_line_leading_slash_marker("/ /*x*/ -- trailing");
+    assert_eq!(marker, Some(SlashLineKind::PureTerminator));
+
+    let marker = super::classify_line_leading_slash_marker("/ /*x*/ REM trailing");
+    assert_eq!(marker, Some(SlashLineKind::PureTerminator));
+}
+
+#[test]
+fn slash_line_kind_supports_multiple_leading_block_comments() {
+    let marker = super::classify_line_leading_slash_marker("/ /*a*/ /*b*/");
+    assert_eq!(marker, Some(SlashLineKind::BlockComment));
+}
+
+#[test]
 fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
     let waiting_main_query = SplitState {
         with_clause_state: WithClauseState::InPlsqlDeclaration(
@@ -5503,4 +5518,42 @@ fn external_language_target_without_semicolon_splits_before_following_statement_
         "SELECT should begin a new statement after implicit external call spec: {}",
         statements[1]
     );
+}
+
+#[test]
+fn quoted_package_body_name_with_quoted_end_label_splits_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"Pkg.Ext\" AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_me;");
+    engine.process_line("END \"Pkg.Ext\";");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"Pkg.Ext\""),
+        "quoted package END label should remain attached to package body: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn slash_terminator_with_block_comment_then_line_comment_is_consumed() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+    engine.process_line("/ /* keep */ -- slash terminator comment");
+    engine.process_line("SELECT 47 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].starts_with("BEGIN"));
+    assert_eq!(statements[1], "SELECT 47 FROM dual".to_string());
 }
