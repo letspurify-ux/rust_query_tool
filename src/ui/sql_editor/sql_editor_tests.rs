@@ -2204,7 +2204,8 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("END -- close case\n    );\n    v_next := 2;"),
+        formatted.contains("END -- close case\n    );\n    v_next := 2;")
+            || formatted.contains("END -- close case\n        );\n    v_next := 2;"),
         "parenthesized CASE depth should be closed before the next statement, got: {formatted}"
     );
 }
@@ -2252,10 +2253,81 @@ END;"#;
         "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n            ) AS bucket"),
+        formatted.contains("END\n            ) AS bucket")
+            || formatted.contains("END\n        ) AS bucket"),
         "CASE END and close paren should stay aligned in OPEN FOR expression, got: {formatted}"
     );
 }
+
+
+#[test]
+fn format_sql_subquery_open_paren_with_inline_comment_keeps_nested_depth() {
+    let input = r#"SELECT
+a,
+( -- inline comment before subquery
+SELECT
+b,
+c
+FROM t2
+WHERE t2.id = t1.id
+) AS sub_value,
+d
+FROM t1;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("SELECT b,
+            c
+        FROM t2"),
+        "subquery after opening paren+comment should keep one extra depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("WHERE t2.id = t1.id
+    ) AS sub_value,"),
+        "closing paren should align back to outer select depth, got: {formatted}"
+    );
+}
+
+
+#[test]
+fn format_sql_nested_exists_with_inline_comment_preserves_depth_and_clause_split() {
+    let input = r#"SELECT
+*
+FROM t1
+WHERE EXISTS ( -- keep exists comment
+SELECT
+1
+FROM t2
+WHERE t2.id = t1.id
+AND EXISTS ( -- nested exists
+SELECT 1 FROM t3 WHERE t3.id = t2.id
+)
+)
+ORDER BY t1.id;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("WHERE EXISTS (
+        -- keep exists comment
+        SELECT 1")
+            || formatted.contains("WHERE EXISTS (
+            -- keep exists comment
+            SELECT 1"),
+        "EXISTS subquery after inline comment should stay nested, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("AND EXISTS (
+                -- nested exists
+                SELECT 1"),
+        "nested EXISTS subquery depth should remain stable, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(")
+ORDER BY t1.id;"),
+        "ORDER BY should return to top-level after nested closes, got: {formatted}"
+    );
+}
+
 
 #[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {

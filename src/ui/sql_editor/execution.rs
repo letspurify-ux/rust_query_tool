@@ -2147,9 +2147,18 @@ impl SqlEditorWidget {
                             let restore_clause = paren_clause_restore_stack.pop().unwrap_or(None);
                             let was_column_list = column_list_stack.pop().unwrap_or(false);
                             let indent_increase = paren_indent_increase_stack.pop().unwrap_or(0);
+                            let previous_non_comment_word = tokens[..idx].iter().rev().find_map(|t| {
+                                match t {
+                                    SqlToken::Comment(_) => None,
+                                    SqlToken::Word(word) => Some(word.as_str()),
+                                    _ => Some(""),
+                                }
+                            });
                             let close_case_paren_on_newline = !was_subquery
                                 && !was_column_list
-                                && suppress_comma_break_depth > 0
+                                && (suppress_comma_break_depth > 0
+                                    || previous_non_comment_word
+                                        .is_some_and(|word| word.eq_ignore_ascii_case("END")))
                                 && out.trim_end().ends_with("END");
                             if was_subquery || was_column_list {
                                 if indent_level > 0 && indent_increase > 0 {
@@ -2169,10 +2178,18 @@ impl SqlEditorWidget {
                                     suppress_comma_break_depth.saturating_sub(1);
                             }
                             if close_case_paren_on_newline {
+                                let close_paren_extra = if matches!(
+                                    open_cursor_state,
+                                    OpenCursorFormatState::InSelect { .. }
+                                ) {
+                                    2
+                                } else {
+                                    1
+                                };
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
-                                    1,
+                                    close_paren_extra,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -2290,7 +2307,12 @@ impl SqlEditorWidget {
                 let existing_indent = leading_spaces / 4;
                 let extra_indent = if into_list_active { 1 } else { 0 };
                 let parser_depth = depth + extra_indent;
-                let effective_depth = if in_dml_statement {
+                let previous_line_ends_with_open_paren = last_code_line_trimmed
+                    .as_deref()
+                    .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
+                let effective_depth = if in_dml_statement && previous_line_ends_with_open_paren {
+                    parser_depth
+                } else if in_dml_statement {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
                 } else {
                     parser_depth
@@ -2327,11 +2349,13 @@ impl SqlEditorWidget {
             } else {
                 0
             };
+            let starts_with_close_paren = trimmed.starts_with(')');
             let paren_case_extra_indent = if in_paren_case_expression
                 && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+                    || starts_with_close_paren)
             {
                 1
             } else {
@@ -2391,7 +2415,6 @@ impl SqlEditorWidget {
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
             let parser_depth = depth + extra_indent + paren_case_extra_indent;
-            let starts_with_close_paren = trimmed.starts_with(')');
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement && starts_with_close_paren {
@@ -2412,6 +2435,14 @@ impl SqlEditorWidget {
             if in_paren_case_expression
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
             {
+                let next_is_close_paren = next_significant_line_trimmed
+                    .is_some_and(|next| next.trim_start().starts_with(')'));
+                if !next_is_close_paren {
+                    paren_case_expression_depth =
+                        paren_case_expression_depth.saturating_sub(1);
+                }
+            }
+            if starts_with_close_paren && paren_case_expression_depth > 0 {
                 paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
             }
 
