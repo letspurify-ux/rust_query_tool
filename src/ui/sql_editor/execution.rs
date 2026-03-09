@@ -604,7 +604,9 @@ impl SqlEditorWidget {
 
         for span in spans.iter().rev() {
             match &span.token {
-                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => {
+                SqlToken::Comment(comment_text)
+                    if comment_text.trim_start().starts_with("--") =>
+                {
                     if trailing_line_comment_span.is_none() {
                         trailing_line_comment_span = Some((span.start, span.end));
                     }
@@ -630,6 +632,15 @@ impl SqlEditorWidget {
 
         let (comment_start, comment_end) = trailing_line_comment_span?;
         if !has_non_comment_token_before_trailing_comment || comment_end == comment_start {
+            return None;
+        }
+
+        let line_prefix_start = trimmed[..comment_start]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let line_prefix = trimmed.get(line_prefix_start..comment_start)?;
+        if line_prefix.trim().is_empty() {
             return None;
         }
 
@@ -9593,6 +9604,37 @@ FROM DUAL"
             preserved.ends_with("; COMMENT SEMICOLON"),
             "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
             preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_indented_comment() {
+        let source = "SELECT 1 FROM dual\n  -- trailing note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Inserted semicolon before an indented trailing comment should be removed, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("-- trailing note"),
+            "Indented trailing comment should be preserved, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_comment_only_line_semicolon_when_indented() {
+        let source = "  -- existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved,
+            "-- existing; comment semicolon",
+            "Semicolon inside comment-only selection should remain untouched even with indentation"
         );
     }
 
