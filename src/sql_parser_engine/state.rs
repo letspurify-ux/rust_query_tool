@@ -849,6 +849,32 @@ impl SplitState {
         }
     }
 
+    pub(crate) fn plain_end_closes_parent_scope(&self, token_upper: &str) -> bool {
+        let top = self.block_stack.last().copied();
+
+        if top == Some(BlockKind::Declare)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins > 0
+        {
+            return true;
+        }
+
+        if top == Some(BlockKind::Begin)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.block_depth() <= 2
+        {
+            let matches_named_end = self
+                .package_body_name
+                .as_deref()
+                .is_some_and(|name| name == token_upper);
+            let unlabeled_end = token_upper.is_empty();
+            return matches_named_end || unlabeled_end;
+        }
+
+        false
+    }
+
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
         self.resolve_pending_end_with_policy(EndResolutionPolicy::KeepCreateState);
     }
