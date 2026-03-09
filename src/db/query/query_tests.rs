@@ -2828,6 +2828,39 @@ END test_pkg;"#;
 }
 
 #[test]
+fn test_package_body_subprogram_declare_end_label_depth() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY test_pkg AS
+  FUNCTION f1 RETURN NUMBER IS
+    v_temp NUMBER := 0;
+  BEGIN
+    DECLARE
+      v_inner NUMBER := 1;
+    BEGIN
+      IF v_inner = 1 THEN
+        v_temp := v_inner;
+      END IF;
+    END;
+    RETURN v_temp;
+  END f1;
+END test_pkg;
+
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(
+        stmts.len(),
+        2,
+        "package body with DECLARE/END IF/named END should split only at final END: {:?}",
+        stmts
+    );
+    assert!(stmts[0].contains("END IF;"));
+    assert!(stmts[0].contains("END f1;"));
+    assert!(stmts[0].contains("END test_pkg"));
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_package_followed_by_select() {
     let sql = r#"CREATE PACKAGE test_pkg AS
   PROCEDURE proc1;
