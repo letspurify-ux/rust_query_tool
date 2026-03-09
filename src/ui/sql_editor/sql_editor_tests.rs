@@ -1985,6 +1985,66 @@ END;"#;
     );
 }
 
+
+#[test]
+fn format_sql_nested_paren_case_expression_tracks_depth() {
+    let input = r#"BEGIN
+v_kind := (
+CASE
+WHEN score > 90 THEN
+CASE
+WHEN score > 95 THEN
+'A+'
+ELSE
+'A'
+END
+ELSE
+'B'
+END);
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("WHEN score > 90 THEN
+                CASE
+                    WHEN score > 95 THEN"),
+        "Nested CASE inside parenthesized CASE expression should increase depth, got: {}",
+        formatted
+    );
+    assert!(
+        formatted.contains("'A'
+                END
+            ELSE"),
+        "Inner END should align with nested CASE depth before outer ELSE, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_inline_case_in_parenthesized_expression_gets_extra_indent() {
+    let input = r#"BEGIN
+v_code := (
+CASE status
+WHEN 'A' THEN
+1
+ELSE
+0
+END);
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("v_code := (\n        CASE status\n            WHEN 'A' THEN"),
+        "Inline CASE in parenthesized expression should keep extra depth, got: {}",
+        formatted
+    );
+    assert!(
+        formatted.contains("0\n        END\n        );"),
+        "END of inline parenthesized CASE should align with CASE depth, got: {}",
+        formatted
+    );
+}
+
 #[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"

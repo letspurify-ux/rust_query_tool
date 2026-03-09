@@ -2305,9 +2305,13 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(|prev| prev.ends_with('('));
+            let starts_case_keyword =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let starts_paren_case_expression =
-                !in_dml_statement && trimmed_upper == "CASE" && previous_line_ends_with_open_paren;
+                !in_dml_statement && starts_case_keyword && previous_line_ends_with_open_paren;
             if starts_paren_case_expression {
+                paren_case_expression_depth += 1;
+            } else if !in_dml_statement && paren_case_expression_depth > 0 && starts_case_keyword {
                 paren_case_expression_depth += 1;
             }
             let in_paren_case_expression = !in_dml_statement && paren_case_expression_depth > 0;
@@ -2350,10 +2354,10 @@ impl SqlEditorWidget {
                 0
             };
             let paren_case_extra_indent = if in_paren_case_expression
-                && (trimmed_upper == "CASE"
+                && (starts_case_keyword
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
-                    || trimmed_upper == "END")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
             {
                 1
             } else {
@@ -2400,7 +2404,9 @@ impl SqlEditorWidget {
             out.push_str(&" ".repeat(effective_depth * 4));
             out.push_str(trimmed);
 
-            if in_paren_case_expression && trimmed_upper == "END" {
+            if in_paren_case_expression
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+            {
                 paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
             }
 
