@@ -432,6 +432,7 @@ impl SqlParserEngine {
                         }
                         self.state.lex_mode = LexMode::Idle;
                         if let Some(identifier_upper) = self.state.finish_quoted_identifier() {
+                            self.state.observe_external_clause_quoted_identifier_target();
                             self.state
                                 .resolve_pending_end_on_separator_with_token(&identifier_upper);
                         } else if self.state.pending_end == PendingEnd::End {
@@ -599,9 +600,6 @@ impl SqlParserEngine {
 
             if c == '"' {
                 self.state.flush_token();
-                let allow_implicit_target = self.state.allow_implicit_external_literal_target();
-                self.state
-                    .observe_external_clause_literal_target(allow_implicit_target);
                 self.state
                     .consume_trigger_alias_subject_on_quoted_identifier();
                 self.state.begin_quoted_identifier();
