@@ -2258,6 +2258,27 @@ END;"#;
 }
 
 #[test]
+fn format_sql_open_cursor_nested_paren_case_closing_parens_stay_aligned() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT (( -- keep comment
+CASE
+WHEN score > 10 THEN 1
+ELSE 0
+END
+)) AS score_flag
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("END
+            )) AS score_flag"),
+        "nested paren CASE in OPEN FOR should keep closing parens aligned with CASE depth, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE
