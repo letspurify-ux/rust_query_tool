@@ -6121,3 +6121,42 @@ fn malformed_using_clause_without_target_still_splits_before_next_statement() {
     assert!(statements[0].contains("AS AGGREGATE USING"));
     assert_eq!(statements[1], "SELECT 54 FROM dual".to_string());
 }
+
+#[test]
+fn package_body_named_if_handles_nested_if_and_init_end_if_correctly() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY if AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  ELSE");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF;");
+    engine.process_line("END IF;");
+    engine.process_line("SELECT 55 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END IF;\nEND IF"));
+    assert_eq!(statements[1], "SELECT 55 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_init_exception_block_with_keyword_label_keeps_depth_balanced() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY exception AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END exception;");
+    engine.process_line("SELECT 56 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("EXCEPTION\n  WHEN OTHERS THEN"));
+    assert_eq!(statements[1], "SELECT 56 FROM dual".to_string());
+}
