@@ -8988,6 +8988,80 @@ SELECT 1 FROM dual;"#;
     );
     assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
 }
+
+#[test]
+fn test_line_block_depths_package_body_end_if_with_leading_block_comment_keeps_if_scope() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_comment_end_if AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    /* close if */ END IF;
+    NULL;
+  END p1;
+END pkg_comment_end_if;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF line");
+    let end_if_idx = lines
+        .iter()
+        .position(|line| line.contains("END IF;"))
+        .expect("expected END IF line");
+    let null_after_end_if_idx = end_if_idx + 1;
+    assert!(
+        lines
+            .get(null_after_end_if_idx)
+            .is_some_and(|line| line.trim_start() == "NULL;"),
+        "expected NULL line immediately after END IF"
+    );
+
+    assert_eq!(
+        depths[end_if_idx], depths[if_idx],
+        "END IF with leading block comment should align with IF depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[null_after_end_if_idx],
+        depths[if_idx],
+        "line after END IF should remain at procedure depth, not dedent past IF (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_end_name_with_leading_block_comment_dedents_to_top() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_comment_end_name AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+/* package tail */ END pkg_comment_end_name;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.contains("END pkg_comment_end_name"))
+        .expect("expected package END line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package END with leading block comment should dedent to top-level (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "following statement should stay top-level after commented named END (depths: {depths:?})"
+    );
+}
 #[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";

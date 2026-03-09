@@ -473,9 +473,26 @@ impl QueryExecutor {
         fn parse_end_suffix_or_label(line: &str) -> Option<EndSuffixOrLabel> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                break;
             }
+
             if i + 3 > bytes.len() || !bytes[i..i + 3].eq_ignore_ascii_case(b"END") {
                 return None;
             }
