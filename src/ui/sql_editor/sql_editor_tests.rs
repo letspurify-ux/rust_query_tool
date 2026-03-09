@@ -2258,6 +2258,36 @@ END;"#;
 }
 
 #[test]
+fn format_sql_open_cursor_nested_paren_case_with_comment_closing_paren_alignment() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT ( -- lvl1
+CASE
+WHEN score > 10 THEN
+CASE
+WHEN flag = 'Y' THEN 1
+ELSE 0
+END
+ELSE 0
+END -- lvl1 end
+) AS bucket
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let normalized = formatted.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("END -- lvl1 end ) AS bucket"),
+        "outer CASE close paren should align with CASE depth in OPEN FOR expression, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("WHEN flag = 'Y' THEN 1"),
+        "inner CASE branch should stay nested in OPEN FOR expression, got: {formatted}"
+    );
+}
+
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE

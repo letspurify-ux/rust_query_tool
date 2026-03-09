@@ -2242,6 +2242,7 @@ impl SqlEditorWidget {
         let mut in_dml_statement = false;
         let mut in_block_comment = false;
         let mut paren_case_expression_depth = 0usize;
+        let mut pending_paren_case_close = false;
         let mut last_code_line_trimmed: Option<String> = None;
         let lines: Vec<&str> = formatted.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
@@ -2304,13 +2305,12 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
-            let starts_paren_case_expression = !in_dml_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+            let starts_paren_case_expression = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                 && previous_line_ends_with_open_paren;
             if starts_paren_case_expression {
                 paren_case_expression_depth += 1;
             }
-            let in_paren_case_expression = !in_dml_statement && paren_case_expression_depth > 0;
+            let in_paren_case_expression = paren_case_expression_depth > 0;
             let starts_dml = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
@@ -2327,13 +2327,20 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let paren_case_extra_indent = if in_paren_case_expression
-                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
-                    || trimmed_upper.starts_with("WHEN ")
-                    || trimmed_upper.starts_with("ELSE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
+            let is_paren_case_branch_line = trimmed_upper.starts_with("WHEN ")
+                || trimmed_upper.starts_with("ELSE")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END");
+            let paren_case_extra_indent = if (in_paren_case_expression
+                && (((!in_dml_statement)
+                    && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE"))
+                    || is_paren_case_branch_line))
+                || (trimmed.starts_with(")") && pending_paren_case_close)
             {
-                1
+                if in_dml_statement && is_paren_case_branch_line {
+                    2
+                } else {
+                    1
+                }
             } else {
                 0
             };
@@ -2341,6 +2348,11 @@ impl SqlEditorWidget {
                 last_code_line_trimmed.as_deref().is_some_and(|prev| {
                     let prev_upper = prev.to_ascii_uppercase();
                     Self::starts_with_plain_end(&prev_upper)
+                });
+            let previous_line_is_case_end =
+                last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    let prev_upper = prev.to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&prev_upper, "END")
                 });
             let mut next_significant_line_trimmed: Option<&str> = None;
             let mut in_peek_block_comment = false;
@@ -2390,9 +2402,22 @@ impl SqlEditorWidget {
 
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
-            let parser_depth = depth + extra_indent + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
+            let parser_depth_raw = depth
+                + extra_indent
+                + paren_case_extra_indent
+                + usize::from(in_dml_statement && starts_with_close_paren && previous_line_is_case_end);
+            let parser_depth = if starts_with_close_paren && pending_paren_case_close && !in_dml_statement {
+                parser_depth_raw.saturating_sub(1)
+            } else {
+                parser_depth_raw
+            };
+            let dml_paren_case_aligned_line = in_dml_statement
+                && in_paren_case_expression
+                && !crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let effective_depth = if force_block_depth {
+                parser_depth
+            } else if dml_paren_case_aligned_line {
                 parser_depth
             } else if in_dml_statement && starts_with_close_paren {
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
@@ -2412,7 +2437,10 @@ impl SqlEditorWidget {
             if in_paren_case_expression
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
             {
+                pending_paren_case_close = true;
+            } else if starts_with_close_paren && pending_paren_case_close {
                 paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
+                pending_paren_case_close = false;
             }
 
             if starts_into_ender {
