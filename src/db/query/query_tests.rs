@@ -12679,6 +12679,65 @@ END;"#;
     assert_eq!(depths, expected, "sequential END IF + END LOOP depth tracking mismatch: {depths:?}");
 }
 
+
+#[test]
+fn test_line_block_depths_package_body_nested_exception_blocks() {
+    // Nested block inside exception handler with its own EXCEPTION section.
+    // Outer handler indentation must remain active after the inner END.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_nested_ex AS
+  PROCEDURE p_nested IS
+  BEGIN
+    NULL;
+  EXCEPTION
+    WHEN OTHERS THEN
+      BEGIN
+        NULL;
+      EXCEPTION
+        WHEN OTHERS THEN
+          NULL;
+      END;
+      NULL;
+  END p_nested;
+END pkg_nested_ex;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    // pkg AS(0) proc IS(1) BEGIN(1) NULL(2) EXCEPTION(1) WHEN(2)
+    // inner BEGIN(3) NULL(4) inner EXCEPTION(3) inner WHEN(3) NULL(4) inner END(2)
+    // outer handler NULL(2) END p_nested(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 2, 3, 4, 3, 3, 4, 2, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "package body nested exception blocks depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_standalone_nested_exception_blocks() {
+    // Same nested exception pattern in standalone routine to cover non-package path.
+    let sql = r#"CREATE OR REPLACE PROCEDURE p_nested_ex IS
+BEGIN
+  NULL;
+EXCEPTION
+  WHEN OTHERS THEN
+    BEGIN
+      NULL;
+    EXCEPTION
+      WHEN OTHERS THEN
+        NULL;
+    END;
+    NULL;
+END p_nested_ex;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    // create IS(0) BEGIN(0) NULL(1) EXCEPTION(0) WHEN(1)
+    // inner BEGIN(2) NULL(3) inner EXCEPTION(2) inner WHEN(2) NULL(3) inner END(1)
+    // outer handler NULL(1) END name(1)
+    let expected = vec![0, 0, 1, 0, 1, 2, 3, 2, 2, 3, 1, 1, 1];
+    assert_eq!(
+        depths, expected,
+        "standalone nested exception blocks depth mismatch: {depths:?}"
+    );
+}
 #[test]
 fn test_line_block_depths_package_body_exception_with_split_end_name() {
     // Package body function with EXCEPTION handler and split END / name on next line.
