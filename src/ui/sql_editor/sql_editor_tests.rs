@@ -831,6 +831,32 @@ END;"#;
 }
 
 #[test]
+fn format_sql_select_into_does_not_leak_extra_depth_to_next_statement() {
+    let input = r#"BEGIN
+SELECT col
+INTO
+v_col;
+IF 1 = 1 THEN
+NULL;
+END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    SELECT col",
+        "    INTO v_col;",
+        "    IF 1 = 1 THEN",
+        "        NULL;",
+        "    END IF;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
 fn format_sql_where_exists_and_not_exists_layout_regression() {
     let input = "SELECT * FROM asdf WHERE EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.sku LIKE 'SKU-%') AND NOT EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.qty <= 0);";
 
