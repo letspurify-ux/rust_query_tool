@@ -893,7 +893,7 @@ impl QueryExecutor {
                 0
             };
 
-            let with_cte_component = if with_cte_depth > 0 {
+            let with_cte_component = if with_cte_depth > 0 && query_paren_component == 0 {
                 let starts_main_select =
                     leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
                 if starts_main_select {

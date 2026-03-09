@@ -2417,6 +2417,8 @@ impl SqlEditorWidget {
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement {
+                let starts_with_cte =
+                    crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH");
                 let is_dml_clause_line = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
@@ -2425,9 +2427,14 @@ impl SqlEditorWidget {
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "HAVING")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SET");
-                let max_extra = if is_dml_clause_line { 1 } else { 2 };
-                existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SET")
+                    || starts_with_cte;
+                if starts_with_cte {
+                    parser_depth
+                } else {
+                    let max_extra = if is_dml_clause_line { 1 } else { 2 };
+                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
+                }
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth
             } else {

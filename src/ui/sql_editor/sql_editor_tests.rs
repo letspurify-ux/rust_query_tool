@@ -1763,6 +1763,31 @@ ORDER BY d.deptno;"#;
 }
 
 #[test]
+fn format_sql_nested_with_and_exists_subqueries_keep_depth_consistent() {
+    let input = "SELECT a.id, (SELECT MAX(x.score) FROM (WITH ranked AS (SELECT t.id, t.score, ROW_NUMBER() OVER (PARTITION BY t.grp ORDER BY t.score DESC) AS rn FROM score_table t WHERE t.grp = a.grp) SELECT r.score FROM ranked r WHERE r.rn <= 3) x) AS top_score FROM account a WHERE EXISTS (SELECT 1 FROM (SELECT o.account_id FROM orders o WHERE o.status = 'OPEN' UNION ALL SELECT o2.account_id FROM orders o2 WHERE o2.status = 'PENDING') open_orders WHERE open_orders.account_id = a.id);";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("FROM (
+                WITH ranked AS ("),
+        "Nested WITH in deep FROM-subquery context should keep stable depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("WHERE EXISTS (
+        SELECT 1
+        FROM (
+                SELECT o.account_id"),
+        "Nested EXISTS/FROM subquery indentation should stay stable in complex nesting, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(") x
+    ) AS top_score
+FROM ACCOUNT a"),
+        "Closing subquery depth should return to parent SELECT depth, got: {formatted}"
+    );
+}
+#[test]
 fn format_sql_cte_comment_layout_is_idempotent() {
     let input = r#"WITH e AS (
     SELECT
