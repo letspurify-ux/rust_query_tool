@@ -603,7 +603,10 @@ impl SplitState {
         }
 
         if let Some(suffix) = suffix {
-            suffix.apply_to_state(self);
+            let resolved_by_suffix = suffix.apply_to_state(self);
+            if !resolved_by_suffix {
+                self.resolve_plain_end(token_upper);
+            }
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
             return;

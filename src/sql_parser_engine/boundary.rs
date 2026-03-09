@@ -127,34 +127,34 @@ impl PendingEndSuffix {
         }
     }
 
-    fn apply_to_state(self, state: &mut SplitState) {
-        match self {
+    fn apply_to_state(self, state: &mut SplitState) -> bool {
+        let popped = match self {
             Self::Case => {
-                state.pop_case_block();
+                state.pop_case_block()
             }
             Self::If => {
-                state.pop_top_matching_block(&[BlockKind::If]);
+                state.pop_top_matching_block(&[BlockKind::If])
             }
             Self::Loop => {
-                state.pop_top_matching_block(&[BlockKind::Loop]);
+                state.pop_top_matching_block(&[BlockKind::Loop])
             }
             Self::While => {
-                state.pop_top_matching_block(&[BlockKind::While, BlockKind::Loop]);
+                state.pop_top_matching_block(&[BlockKind::While, BlockKind::Loop])
             }
             Self::Repeat => {
-                state.pop_top_matching_block(&[BlockKind::Repeat]);
+                state.pop_top_matching_block(&[BlockKind::Repeat])
             }
             Self::For => {
-                state.pop_top_matching_block(&[BlockKind::For, BlockKind::Loop]);
+                state.pop_top_matching_block(&[BlockKind::For, BlockKind::Loop])
             }
-            Self::TimingPoint => {
-                state.pop_timing_point_block();
-            }
-        }
+            Self::TimingPoint => state.pop_timing_point_block(),
+        };
 
         if self == Self::TimingPoint {
             state.timing_point_state = TimingPointState::None;
         }
+
+        popped
     }
 }
 
