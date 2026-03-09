@@ -613,7 +613,14 @@ impl SplitState {
         }
 
         if let Some(suffix) = suffix {
-            let _ = suffix.apply_to_state(self);
+            let parsed_suffix_closed_block = suffix.apply_to_state(self);
+            let treat_suffix_as_label = !parsed_suffix_closed_block
+                && self.pending_end_suffix_token_should_be_treated_as_label(token_upper);
+            if treat_suffix_as_label {
+                if !self.top_is_case() {
+                    self.resolve_plain_end(token_upper);
+                }
+            }
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
             self.skip_next_end_label_token = true;
@@ -626,6 +633,28 @@ impl SplitState {
         self.pending_end_label_token = None;
         self.skip_next_end_label_token = true;
         true
+    }
+
+    fn pending_end_suffix_token_should_be_treated_as_label(&self, token_upper: &str) -> bool {
+        if token_upper.is_empty() {
+            return false;
+        }
+
+        let top = self.block_stack.last().copied();
+
+        if top == Some(BlockKind::Begin)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+        {
+            return true;
+        }
+
+        if top == Some(BlockKind::AsIs) && self.create_plsql_kind == CreatePlsqlKind::PackageBody {
+            return true;
+        }
+
+        top == Some(BlockKind::Declare)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins > 0
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).

@@ -6273,3 +6273,37 @@ fn package_body_init_exception_block_with_keyword_label_keeps_depth_balanced() {
     assert!(statements[0].contains("EXCEPTION\n  WHEN OTHERS THEN"));
     assert_eq!(statements[1], "SELECT 56 FROM dual".to_string());
 }
+
+#[test]
+fn package_body_name_end_if_closes_outer_as_is_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY if AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_me;");
+    engine.process_line("END IF;");
+    assert_eq!(
+        engine.block_depth(),
+        0,
+        "END IF label for package body should close outer AS/IS depth"
+    );
+}
+
+#[test]
+fn package_body_name_end_exception_closes_outer_as_is_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY exception AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_me;");
+    engine.process_line("END EXCEPTION;");
+    assert_eq!(
+        engine.block_depth(),
+        0,
+        "END EXCEPTION label for package body should close outer AS/IS depth"
+    );
+}
