@@ -5958,6 +5958,59 @@ fn package_body_end_with_qualified_label_still_closes_outer_depth() {
 }
 
 #[test]
+fn package_body_end_with_three_part_qualified_label_closes_outer_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_label_tripart AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  ELSE");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END db.owner.pkg_label_tripart;");
+    engine.process_line("SELECT 104 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END db.owner.pkg_label_tripart"),
+        "three-part qualified package end label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 104 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_nested_routine_end_with_qualified_name_keeps_single_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_nested_q AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    IF 1 = 1 THEN");
+    engine.process_line("      NULL;");
+    engine.process_line("    ELSE");
+    engine.process_line("      NULL;");
+    engine.process_line("    END IF;");
+    engine.process_line("  EXCEPTION");
+    engine.process_line("    WHEN OTHERS THEN");
+    engine.process_line("      NULL;");
+    engine.process_line("  END owner.run_me;");
+    engine.process_line("END pkg_nested_q;");
+    engine.process_line("SELECT 105 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END owner.run_me"));
+    assert!(statements[0].contains("END pkg_nested_q"));
+    assert_eq!(statements[1], "SELECT 105 FROM dual".to_string());
+}
+
+#[test]
 fn oracle_external_language_without_semicolon_splits_before_following_statement_head() {
     let mut engine = SqlParserEngine::new();
 

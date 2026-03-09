@@ -333,6 +333,25 @@ impl SplitState {
             .is_some_and(|segment| segment == package_name)
     }
 
+    fn push_pending_end_label_segment(&mut self, token_upper: &str) {
+        if token_upper.is_empty() {
+            return;
+        }
+
+        match self.pending_end_label_token.as_mut() {
+            Some(label) if !label.is_empty() => {
+                label.push('.');
+                label.push_str(token_upper);
+            }
+            Some(label) => {
+                label.push_str(token_upper);
+            }
+            None => {
+                self.pending_end_label_token = Some(token_upper.to_string());
+            }
+        }
+    }
+
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
@@ -582,7 +601,7 @@ impl SplitState {
         }
 
         if self.package_body_init_end_context() {
-            self.pending_end_label_token = Some(token_upper.to_string());
+            self.push_pending_end_label_segment(token_upper);
             return;
         }
 
@@ -908,7 +927,7 @@ impl SplitState {
         }
 
         if self.package_body_init_end_context() {
-            self.pending_end_label_token = Some(token_upper.to_string());
+            self.push_pending_end_label_segment(token_upper);
             return;
         }
 
