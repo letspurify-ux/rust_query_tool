@@ -9121,6 +9121,109 @@ SELECT 1 FROM dual;"#;
     assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
 }
 
+
+#[test]
+fn test_line_block_depths_package_body_schema_qualified_end_starting_with_end_suffix_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+END IF_OWNER.IF_PKG;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END IF_OWNER.IF_PKG"))
+        .expect("expected END IF_OWNER.IF_PKG line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "schema-qualified package END should stay at top-level even when owner starts with IF (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "depth should fully reset after schema-qualified package END with IF-prefixed owner (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_split_schema_qualified_end_label_continuation() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF x THEN
+      NULL;
+    END IF;
+  END p1;
+END
+IF_OWNER.IF_PKG;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let end_line_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END")
+        .expect("expected split END line");
+    let label_line_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF_OWNER.IF_PKG"))
+        .expect("expected schema-qualified END label continuation line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[end_line_idx], 0,
+        "split package END line should pre-dedent to top-level (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[label_line_idx], 0,
+        "schema-qualified END label continuation should remain at top-level (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "depth should be reset after split schema-qualified package END (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_schema_qualified_end_starting_with_end_suffix_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+END IF_OWNER.IF_PKG;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "schema-qualified package END with IF-prefixed owner should not swallow trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].to_ascii_uppercase().contains("END IF_OWNER.IF_PKG"),
+        "first statement should preserve schema-qualified package END: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+}
+
 #[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";

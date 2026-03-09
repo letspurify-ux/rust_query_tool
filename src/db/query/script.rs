@@ -494,6 +494,7 @@ impl QueryExecutor {
             upper: String,
             quoted_label: bool,
             leading_unquoted_segment: Option<String>,
+            segment_count: usize,
         }
 
         fn parse_end_suffix_or_label(line: &str) -> Option<EndSuffixOrLabel> {
@@ -605,6 +606,7 @@ impl QueryExecutor {
                 upper: segments.join("."),
                 quoted_label,
                 leading_unquoted_segment,
+                segment_count: segments.len(),
             })
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
@@ -634,8 +636,11 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let pending_end_label_continuation =
-                leading_identifier_chain.is_some() && !is_non_label_control_keyword(leading_word);
+            let pending_end_label_continuation = leading_identifier_chain.as_ref().is_some_and(
+                |identifier_chain| {
+                    identifier_chain.contains('.') || !is_non_label_control_keyword(leading_word)
+                },
+            );
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -710,6 +715,7 @@ impl QueryExecutor {
             };
             let end_has_suffix = end_suffix_or_label.as_ref().is_some_and(|tail| {
                 !tail.quoted_label
+                    && tail.segment_count == 1
                     && is_end_suffix_keyword(tail.leading_unquoted_segment.as_deref())
             });
             let exception_end_line = exception_depth_stack
