@@ -2341,7 +2341,14 @@ impl SqlEditorWidget {
                 let leading_spaces = line.len().saturating_sub(trimmed.len());
                 let existing_indent = leading_spaces / 4;
                 let extra_indent = if into_list_active { 1 } else { 0 };
-                let effective_depth = (depth + extra_indent).max(existing_indent);
+                let parser_depth = depth + extra_indent;
+                let effective_depth = if in_dml_statement {
+                    parser_depth.max(existing_indent)
+                } else if existing_indent > parser_depth.saturating_add(3) {
+                    parser_depth
+                } else {
+                    parser_depth.max(existing_indent)
+                };
                 out.push_str(&" ".repeat(effective_depth * 4));
                 out.push_str(trimmed);
                 continue;
@@ -2433,10 +2440,13 @@ impl SqlEditorWidget {
 
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
+            let parser_depth = depth + extra_indent + paren_case_extra_indent;
             let effective_depth = if force_block_depth {
-                depth + extra_indent + paren_case_extra_indent
+                parser_depth
+            } else if !in_dml_statement && existing_indent > parser_depth.saturating_add(3) {
+                parser_depth
             } else {
-                (depth + extra_indent + paren_case_extra_indent).max(existing_indent)
+                parser_depth.max(existing_indent)
             };
             out.push_str(&" ".repeat(effective_depth * 4));
             out.push_str(trimmed);

@@ -1161,6 +1161,51 @@ END;"#;
     assert_eq!(formatted, expected);
 }
 
+
+#[test]
+fn format_sql_plsql_depth_overrides_manual_overindent_for_code_lines() {
+    let input = r#"BEGIN
+                    IF 1 = 1 THEN
+                                NULL;
+                    END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    IF 1 = 1 THEN",
+        "        NULL;",
+        "    END IF;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_plsql_depth_overrides_manual_overindent_for_comment_lines() {
+    let input = r#"BEGIN
+                    IF 1 = 1 THEN
+                                -- deeply indented comment
+                                NULL;
+                    END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    IF 1 = 1 THEN",
+        "        -- deeply indented comment",
+        "        NULL;",
+        "    END IF;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
 #[test]
 fn format_sql_select_case_inside_sum_is_indented() {
     let input = r#"SELECT grp,
