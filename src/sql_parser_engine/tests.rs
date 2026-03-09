@@ -5469,6 +5469,26 @@ fn nested_external_function_with_quoted_language_target_closes_subprogram_block(
 }
 
 #[test]
+fn quoted_package_body_name_with_initializer_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"Pkg$Ext\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"Pkg$Ext\";");
+    engine.process_line("SELECT 55 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"Pkg$Ext\""),
+        "quoted package body terminator should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 55 FROM dual".to_string());
+}
+
+#[test]
 fn type_body_member_external_call_spec_does_not_split_before_type_end() {
     let mut engine = SqlParserEngine::new();
 
