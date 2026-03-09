@@ -49,6 +49,7 @@ pub(crate) struct SplitState {
     quoted_identifier_buf: String,
     pending_implicit_external_top_level_split: bool,
     pending_end_label_token: Option<String>,
+    skip_next_end_label_token: bool,
 }
 
 impl SplitState {
@@ -530,9 +531,18 @@ impl SplitState {
         };
 
         if !token_prefixed_with_dollar {
-            self.handle_if_state_on_token(upper);
-            self.handle_pending_end_on_token(upper, end_token_role.suffix());
-            self.handle_block_openers(upper, end_token_role);
+            if self.skip_next_end_label_token && self.pending_end == PendingEnd::None {
+                // Optional END label token after END <suffix>; keep consuming until
+                // line end or semicolon so keyword labels don't open new blocks.
+            } else {
+                self.handle_if_state_on_token(upper);
+                let consume_as_end_label =
+                    self.handle_pending_end_on_token(upper, end_token_role.suffix());
+
+                if !consume_as_end_label {
+                    self.handle_block_openers(upper, end_token_role);
+                }
+            }
         }
 
         // Return the uppercase buffer so its capacity is reused.
@@ -588,9 +598,9 @@ impl SplitState {
     }
 
     /// Sub-handler: resolve pending END based on the following keyword.
-    fn handle_pending_end_on_token(&mut self, token_upper: &str, suffix: Option<PendingEndSuffix>) {
+    fn handle_pending_end_on_token(&mut self, token_upper: &str, suffix: Option<PendingEndSuffix>) -> bool {
         if self.pending_end != PendingEnd::End {
-            return;
+            return false;
         }
 
         // Package body initialization blocks may close with `END <package_name>` where
@@ -599,20 +609,23 @@ impl SplitState {
         // not as END-suffix keywords.
         if self.package_body_init_end_context() {
             self.push_pending_end_label_segment(token_upper);
-            return;
+            return true;
         }
 
         if let Some(suffix) = suffix {
             let _ = suffix.apply_to_state(self);
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
-            return;
+            self.skip_next_end_label_token = true;
+            return true;
         }
 
         // Plain END – CASE expression or PL/SQL block
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
         self.pending_end_label_token = None;
+        self.skip_next_end_label_token = true;
+        true
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
@@ -1090,6 +1103,7 @@ impl SplitState {
     fn reset_statement_boundary_state(&mut self) {
         self.pending_end = PendingEnd::None;
         self.pending_end_label_token = None;
+        self.skip_next_end_label_token = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.paren_depth = 0;
@@ -1132,6 +1146,10 @@ impl SplitState {
         self.token.clear();
         self.quoted_identifier_buf.clear();
         self.block_stack.clear();
+    }
+
+    pub(crate) fn clear_skip_next_end_label_token(&mut self) {
+        self.skip_next_end_label_token = false;
     }
 
     pub(crate) fn begin_quoted_identifier(&mut self) {
