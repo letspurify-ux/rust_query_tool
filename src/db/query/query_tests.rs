@@ -8834,6 +8834,77 @@ END pkg_depth_comment; -- package end"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_named_if_does_not_consume_end_if_suffix() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if AS
+  PROCEDURE p IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    ELSE
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p;
+END if;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let package_header_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("CREATE OR REPLACE PACKAGE BODY if AS"))
+        .expect("expected package header");
+    let end_package_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END if"))
+        .expect("expected END if");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected SELECT line");
+
+    assert_eq!(
+        depths[end_package_idx], depths[package_header_idx],
+        "END <package_name> where name is IF should close package scope, not END IF suffix (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "statement after package body named IF should return to top-level depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_name_matching_end_if_keeps_statement_boundary() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if AS
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END p;
+END if;
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "END <package_name> where name is IF must terminate package body block before next statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("END if"),
+        "first statement should contain package END label, got: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn test_line_block_depths_package_body_quoted_end_label_does_not_trigger_end_suffix_dedent() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_q AS
   PROCEDURE p1 IS

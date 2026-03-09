@@ -571,9 +571,12 @@ impl QueryExecutor {
             // causing incorrect indentation for ELSE/WHEN that follow.
             {
                 use crate::sql_parser_engine::PendingEnd;
+                let can_consume_pending_end = leading_word
+                    .map(|word| word.to_ascii_uppercase())
+                    .is_some_and(|word| builder.state.pending_end_can_consume_token(&word));
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !is_end_suffix_keyword(leading_word)
+                    && !can_consume_pending_end
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -622,17 +625,14 @@ impl QueryExecutor {
             }
             {
                 use crate::sql_parser_engine::PendingEnd;
-                if builder.state.pending_end == PendingEnd::End
-                    && is_end_suffix_keyword(leading_word)
-                {
-                    block_depth_component = block_depth_component.saturating_sub(1);
-                } else if builder.state.pending_end == PendingEnd::End {
+                if builder.state.pending_end == PendingEnd::End {
                     let label_upper = leading_word
                         .map(|word| word.to_ascii_uppercase())
                         .unwrap_or_default();
-                    if builder
-                        .state
-                        .plain_end_closes_parent_scope(label_upper.as_str())
+                    if builder.state.pending_end_can_consume_token(&label_upper)
+                        || builder
+                            .state
+                            .plain_end_closes_parent_scope(label_upper.as_str())
                     {
                         block_depth_component = block_depth_component.saturating_sub(1);
                     }

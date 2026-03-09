@@ -603,7 +603,11 @@ impl SplitState {
         }
 
         if let Some(suffix) = suffix {
-            suffix.apply_to_state(self);
+            if self.pending_end_suffix_matches_scope(suffix) {
+                suffix.apply_to_state(self);
+            } else {
+                self.resolve_plain_end(token_upper);
+            }
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
             return;
@@ -613,6 +617,36 @@ impl SplitState {
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
         self.pending_end_label_token = None;
+    }
+
+    fn pending_end_suffix_matches_scope(&self, suffix: PendingEndSuffix) -> bool {
+        match suffix {
+            PendingEndSuffix::Case => self.block_stack.last() == Some(&BlockKind::Case),
+            PendingEndSuffix::If => self.block_stack.last() == Some(&BlockKind::If),
+            PendingEndSuffix::Loop => self.block_stack.last() == Some(&BlockKind::Loop),
+            PendingEndSuffix::While => self
+                .block_stack
+                .last()
+                .is_some_and(|kind| matches!(kind, BlockKind::While | BlockKind::Loop)),
+            PendingEndSuffix::Repeat => self.block_stack.last() == Some(&BlockKind::Repeat),
+            PendingEndSuffix::For => self
+                .block_stack
+                .last()
+                .is_some_and(|kind| matches!(kind, BlockKind::For | BlockKind::Loop)),
+            PendingEndSuffix::TimingPoint => self
+                .block_stack
+                .iter()
+                .any(|kind| *kind == BlockKind::TimingPoint),
+        }
+    }
+
+    pub(crate) fn pending_end_can_consume_token(&self, token_upper: &str) -> bool {
+        if self.pending_end != PendingEnd::End || self.package_body_init_end_context() {
+            return false;
+        }
+
+        PendingEndSuffix::parse(token_upper, self.allow_timing_point_end_suffix())
+            .is_some_and(|suffix| self.pending_end_suffix_matches_scope(suffix))
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
