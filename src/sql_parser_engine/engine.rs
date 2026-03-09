@@ -646,6 +646,7 @@ impl SqlParserEngine {
                 self.state.flush_token();
             }
             self.state.track_with_main_query_symbol(c);
+            self.state.track_create_plsql_symbol(c);
             self.state.observe_external_clause_symbol(c, next);
             on_symbol(chars, i, c, next);
             let symbol_role = SymbolRole::from_char(c, next);

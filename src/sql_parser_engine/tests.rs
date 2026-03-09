@@ -417,7 +417,6 @@ fn package_body_init_section_with_quoted_end_label_splits_before_following_state
     assert!(statements[1].starts_with("SELECT 100 FROM dual"));
 }
 
-
 #[test]
 fn package_body_init_end_with_keyword_label_is_treated_as_label_not_suffix() {
     let mut engine = SqlParserEngine::new();
@@ -459,6 +458,47 @@ fn package_body_init_end_with_qualified_keyword_label_is_treated_as_label() {
     );
     assert_eq!(statements[1], "SELECT 8 FROM dual".to_string());
 }
+
+#[test]
+fn package_body_with_qualified_name_uses_last_segment_for_end_label_matching() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY owner.if AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END owner.if;");
+    engine.process_line("SELECT 108 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END owner.if"));
+    assert_eq!(statements[1], "SELECT 108 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_with_three_part_name_uses_last_segment_for_end_label_matching() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY db.owner.exception IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END db.owner.exception;");
+    engine.process_line("SELECT 109 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END db.owner.exception"));
+    assert_eq!(statements[1], "SELECT 109 FROM dual".to_string());
+}
+
 #[test]
 fn package_body_end_with_schema_qualified_label_splits_following_statement() {
     let mut engine = SqlParserEngine::new();
@@ -5958,7 +5998,6 @@ fn quoted_package_body_name_with_quoted_end_label_splits_following_statement() {
     assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
 }
 
-
 #[test]
 fn package_body_nested_routine_named_end_updates_depth_after_end_label() {
     let mut engine = SqlParserEngine::new();
@@ -5975,7 +6014,11 @@ fn package_body_nested_routine_named_end_updates_depth_after_end_label() {
     engine.process_line("    END IF;");
     assert_eq!(engine.block_depth(), 2);
     engine.process_line("  END run_me;");
-    assert_eq!(engine.block_depth(), 1, "END <name> should close nested routine depth");
+    assert_eq!(
+        engine.block_depth(),
+        1,
+        "END <name> should close nested routine depth"
+    );
 }
 
 #[test]
