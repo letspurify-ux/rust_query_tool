@@ -308,6 +308,77 @@ fn create_type_body_member_function_splits_before_trailing_select() {
 }
 
 #[test]
+fn quoted_package_body_name_allows_split_before_trailing_select() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"PkgBody\" AS");
+    engine.process_line("  PROCEDURE p IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END p;");
+    engine.process_line("END \"PkgBody\";");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE PACKAGE BODY \"PkgBody\" AS"),
+        "first statement should preserve quoted package body text: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn schema_qualified_package_body_name_allows_split_before_trailing_select() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY app.pkg_ext AS");
+    engine.process_line("  PROCEDURE p IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END p;");
+    engine.process_line("END pkg_ext;");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE PACKAGE BODY app.pkg_ext AS"),
+        "first statement should preserve schema-qualified package body text: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn schema_qualified_package_body_with_init_block_splits_after_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY app.pkg_ext AS");
+    engine.process_line("  PROCEDURE p IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END p;");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END pkg_ext;");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END pkg_ext"),
+        "first statement should include package body END label: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
 fn declare_begin_state_machine_tracks_pending_begin() {
     let mut state = SplitState::default();
 
