@@ -2414,8 +2414,11 @@ impl SqlEditorWidget {
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
             let parser_depth = depth + extra_indent + paren_case_extra_indent;
+            let starts_with_close_paren = trimmed.starts_with(')');
             let effective_depth = if force_block_depth {
                 parser_depth
+            } else if in_dml_statement && starts_with_close_paren {
+                existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
             } else if in_dml_statement {
                 let is_dml_clause_line = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
@@ -8755,6 +8758,42 @@ END;";
         assert_eq!(
             preserved.trim_end(),
             "SELECT a.topic,\n    a.TOPIC\nFROM help a\nWHERE a.SEQ IN (\n        SELECT seq\n        FROM help\n    ) b"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_subqueries_keep_progressive_depth_indentation() {
+        let source = r#"BEGIN
+  SELECT col1
+  INTO v_col
+  FROM t1
+  WHERE EXISTS (
+    SELECT 1
+    FROM t2
+    WHERE t2.id IN (
+      SELECT t3.id
+      FROM t3
+      WHERE t3.flag = 'Y'
+    )
+  );
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE EXISTS (\n            SELECT 1"),
+            "first nested subquery should stay indented under EXISTS, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("WHERE t2.id IN (\n                SELECT t3.id"),
+            "second nested subquery should stay indented under IN, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("WHERE t3.flag = 'Y'\n            )"),
+            "closing parenthesis should dedent one level from deepest query body, got:\n{}",
+            formatted
         );
     }
 
