@@ -414,7 +414,12 @@ impl QueryExecutor {
             })
         }
 
-        fn parse_identifier_chain(line: &str) -> Option<String> {
+        struct IdentifierChain {
+            upper: String,
+            is_line_tail: bool,
+        }
+
+        fn parse_identifier_chain(line: &str) -> Option<IdentifierChain> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
 
@@ -494,7 +499,16 @@ impl QueryExecutor {
             if segments.is_empty() {
                 None
             } else {
-                Some(segments.join("."))
+                let chain_end = i;
+                let rest = line.get(chain_end..).unwrap_or_default().trim_start();
+                let is_line_tail = rest.is_empty()
+                    || rest.starts_with(';')
+                    || rest.starts_with("--")
+                    || rest.starts_with("/*");
+                Some(IdentifierChain {
+                    upper: segments.join("."),
+                    is_line_tail,
+                })
             }
         }
 
@@ -517,27 +531,25 @@ impl QueryExecutor {
             }
             i += 3;
 
-            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| {
-                loop {
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-                        return i;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        i += 2;
-                        while i + 1 < bytes.len() {
-                            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                                i += 2;
-                                break;
-                            }
-                            i += 1;
-                        }
-                        continue;
-                    }
+            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                     return i;
                 }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                return i;
             };
 
             i = skip_ws_and_inline_comments(bytes, i);
@@ -654,11 +666,17 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let pending_end_label_continuation = leading_identifier_chain.as_ref().is_some_and(
-                |identifier_chain| {
-                    identifier_chain.contains('.') || !is_non_label_control_keyword(leading_word)
-                },
-            );
+            let pending_end_label_continuation =
+                leading_identifier_chain
+                    .as_ref()
+                    .is_some_and(|identifier_chain| {
+                        if !identifier_chain.is_line_tail {
+                            return false;
+                        }
+
+                        identifier_chain.upper.contains('.')
+                            || !is_non_label_control_keyword(leading_word)
+                    });
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -750,13 +768,11 @@ impl QueryExecutor {
 
             if leading_is("END")
                 && !end_has_suffix
-                && builder
-                    .state
-                    .plain_end_closes_parent_scope(
-                        end_suffix_or_label
-                            .as_ref()
-                            .map_or("", |tail| tail.upper.as_str()),
-                    )
+                && builder.state.plain_end_closes_parent_scope(
+                    end_suffix_or_label
+                        .as_ref()
+                        .map_or("", |tail| tail.upper.as_str()),
+                )
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -769,14 +785,21 @@ impl QueryExecutor {
                 } else if builder.state.pending_end == PendingEnd::End
                     && pending_end_label_continuation
                 {
-                    let label_upper = leading_identifier_chain.clone().unwrap_or_default();
-                    let pop_count = builder.state.plain_end_scope_pop_count(label_upper.as_str());
+                    let label_upper = leading_identifier_chain
+                        .as_ref()
+                        .map_or_else(String::new, |identifier_chain| {
+                            identifier_chain.upper.clone()
+                        });
+                    let pop_count = builder
+                        .state
+                        .plain_end_scope_pop_count(label_upper.as_str());
                     if pop_count > 0 {
                         block_depth_component = block_depth_component.saturating_sub(pop_count);
                     }
                 } else if builder.state.pending_end == PendingEnd::End {
                     let label_upper = leading_identifier_chain
-                        .clone()
+                        .as_ref()
+                        .map(|identifier_chain| identifier_chain.upper.clone())
                         .or_else(|| leading_word.map(|word| word.to_ascii_uppercase()))
                         .unwrap_or_default();
                     if builder
@@ -841,8 +864,10 @@ impl QueryExecutor {
                 0
             };
 
-            let in_exception_handler_body =
-                exception_handler_body_stack.last().copied().unwrap_or(false);
+            let in_exception_handler_body = exception_handler_body_stack
+                .last()
+                .copied()
+                .unwrap_or(false);
             let exception_handler_component =
                 if in_exception_handler_body && !leading_is("WHEN") && !exception_end_line {
                     1
