@@ -361,6 +361,18 @@ impl RoutineFrame {
         }
     }
 
+    fn observe_external_clause_quoted_identifier_target(&mut self) {
+        match self.external_clause_state {
+            ExternalClauseState::AwaitingLanguageTargetFromExternal => {
+                self.mark_external_clause();
+            }
+            ExternalClauseState::AwaitingLanguageTargetImplicit => {
+                self.external_clause_state = ExternalClauseState::None;
+            }
+            _ => {}
+        }
+    }
+
     fn observe_external_clause_literal_target(&mut self, allow_implicit_target: bool) {
         let from_external = match self.external_clause_state {
             ExternalClauseState::AwaitingLanguageTargetFromExternal => true,
@@ -386,6 +398,13 @@ impl RoutineFrame {
         }
 
         if ch.is_whitespace() {
+            return;
+        }
+
+        if self.external_clause_state == ExternalClauseState::AwaitingLanguageTargetImplicit
+            && matches!(ch, '"' | '`')
+        {
+            self.external_clause_state = ExternalClauseState::None;
             return;
         }
 

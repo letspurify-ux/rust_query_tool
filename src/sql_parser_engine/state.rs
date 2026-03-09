@@ -933,6 +933,22 @@ impl SplitState {
         }
     }
 
+    fn observe_external_clause_quoted_identifier_target(&mut self) {
+        let should_track = self.block_depth() > 1
+            || matches!(
+                self.create_plsql_kind,
+                CreatePlsqlKind::Procedure | CreatePlsqlKind::Function
+            );
+
+        if !should_track {
+            return;
+        }
+
+        if let Some(frame) = self.active_routine_frame_mut() {
+            frame.observe_external_clause_quoted_identifier_target();
+        }
+    }
+
     fn allow_implicit_external_literal_target(&self) -> bool {
         self.active_routine_frame().is_some_and(|frame| {
             frame.external_clause_state == ExternalClauseState::AwaitingLanguageTargetImplicit
