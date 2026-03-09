@@ -9049,6 +9049,100 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_named_if_with_nested_end_if_and_exception() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p1;
+BEGIN
+  NULL;
+END IF;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let nested_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected nested IF line");
+    let nested_end_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END IF;")
+        .expect("expected nested END IF line");
+    let exception_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("EXCEPTION"))
+        .expect("expected EXCEPTION line");
+    let init_end_if_idx = lines
+        .iter()
+        .rposition(|line| line.trim_start() == "END IF;")
+        .expect("expected package END IF line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[nested_end_if_idx], depths[nested_if_idx],
+        "nested END IF should align with nested IF depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[exception_idx],
+        depths[nested_if_idx].saturating_sub(1),
+        "EXCEPTION should dedent one level from nested IF body (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[init_end_if_idx], 0,
+        "package body END IF label should dedent to top-level (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "depth should reset after package END IF label (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_named_if_with_nested_end_if_and_exception() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p1;
+BEGIN
+  NULL;
+END IF;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "named package END IF must terminate package statement before SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].to_ascii_uppercase().contains("END IF"),
+        "first statement should preserve package END IF label: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);

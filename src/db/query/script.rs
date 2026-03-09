@@ -675,8 +675,14 @@ impl QueryExecutor {
             } else {
                 None
             };
+            let end_closes_parent_scope = end_suffix_or_label.as_ref().is_some_and(|tail| {
+                builder
+                    .state
+                    .plain_end_closes_parent_scope(tail.upper.as_str())
+            });
             let end_has_suffix = end_suffix_or_label.as_ref().is_some_and(|tail| {
                 !tail.quoted_label
+                    && !end_closes_parent_scope
                     && is_end_suffix_keyword(tail.leading_unquoted_segment.as_deref())
             });
             let exception_end_line = exception_depth_stack
@@ -705,11 +711,7 @@ impl QueryExecutor {
             }
             {
                 use crate::sql_parser_engine::PendingEnd;
-                if builder.state.pending_end == PendingEnd::End
-                    && is_end_suffix_keyword(leading_word)
-                {
-                    block_depth_component = block_depth_component.saturating_sub(1);
-                } else if builder.state.pending_end == PendingEnd::End {
+                if builder.state.pending_end == PendingEnd::End {
                     let label_upper = parse_identifier_chain(line)
                         .or_else(|| leading_word.map(|word| word.to_ascii_uppercase()))
                         .unwrap_or_default();
@@ -717,6 +719,8 @@ impl QueryExecutor {
                         .state
                         .plain_end_closes_parent_scope(label_upper.as_str())
                     {
+                        block_depth_component = block_depth_component.saturating_sub(1);
+                    } else if is_end_suffix_keyword(leading_word) {
                         block_depth_component = block_depth_component.saturating_sub(1);
                     }
                 }
