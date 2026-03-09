@@ -1233,6 +1233,55 @@ END;"#;
 }
 
 #[test]
+fn format_sql_plsql_depth_overrides_manual_overindent_for_dml_lines() {
+    let input = r#"BEGIN
+                    SELECT
+                                col1
+                            INTO
+                                            v_col1
+                                FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    SELECT col1",
+        "    INTO v_col1",
+        "    FROM DUAL;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_plsql_depth_overrides_manual_overindent_for_dml_comment_lines() {
+    let input = r#"BEGIN
+                    SELECT
+                                col1
+                            INTO
+                                            -- selected value comment
+                                            v_col1
+                                FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    SELECT col1",
+        "    INTO",
+        "        -- selected value comment",
+        "        v_col1",
+        "    FROM DUAL;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
 fn format_sql_keeps_end_if_depth_before_named_end_when_line_comment_in_between() {
     let input = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
 PROCEDURE p IS
