@@ -389,6 +389,31 @@ impl QueryExecutor {
             })
         }
 
+        fn is_non_label_control_keyword(leading_word: Option<&str>) -> bool {
+            leading_word.is_some_and(|word| {
+                matches!(
+                    word,
+                    _ if word.eq_ignore_ascii_case("END")
+                        || word.eq_ignore_ascii_case("CASE")
+                        || word.eq_ignore_ascii_case("IF")
+                        || word.eq_ignore_ascii_case("LOOP")
+                        || word.eq_ignore_ascii_case("WHILE")
+                        || word.eq_ignore_ascii_case("FOR")
+                        || word.eq_ignore_ascii_case("REPEAT")
+                        || word.eq_ignore_ascii_case("ELSE")
+                        || word.eq_ignore_ascii_case("ELSIF")
+                        || word.eq_ignore_ascii_case("ELSEIF")
+                        || word.eq_ignore_ascii_case("WHEN")
+                        || word.eq_ignore_ascii_case("EXCEPTION")
+                        || word.eq_ignore_ascii_case("BEGIN")
+                        || word.eq_ignore_ascii_case("DECLARE")
+                        || word.eq_ignore_ascii_case("THEN")
+                        || word.eq_ignore_ascii_case("IS")
+                        || word.eq_ignore_ascii_case("AS")
+                )
+            })
+        }
+
         fn parse_identifier_chain(line: &str) -> Option<String> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
@@ -604,6 +629,13 @@ impl QueryExecutor {
             } else {
                 None
             };
+            let leading_identifier_chain = if builder.is_idle() {
+                parse_identifier_chain(line)
+            } else {
+                None
+            };
+            let pending_end_label_continuation =
+                leading_identifier_chain.is_some() && !is_non_label_control_keyword(leading_word);
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -656,6 +688,7 @@ impl QueryExecutor {
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
                     && !is_end_suffix_keyword(leading_word)
+                    && !pending_end_label_continuation
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -709,8 +742,20 @@ impl QueryExecutor {
                     && is_end_suffix_keyword(leading_word)
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
+                } else if builder.state.pending_end == PendingEnd::End
+                    && pending_end_label_continuation
+                {
+                    block_depth_component = block_depth_component.saturating_sub(1);
+                    let label_upper = leading_identifier_chain.clone().unwrap_or_default();
+                    if builder
+                        .state
+                        .plain_end_closes_parent_scope(label_upper.as_str())
+                    {
+                        block_depth_component = block_depth_component.saturating_sub(1);
+                    }
                 } else if builder.state.pending_end == PendingEnd::End {
-                    let label_upper = parse_identifier_chain(line)
+                    let label_upper = leading_identifier_chain
+                        .clone()
                         .or_else(|| leading_word.map(|word| word.to_ascii_uppercase()))
                         .unwrap_or_default();
                     if builder

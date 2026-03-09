@@ -6662,6 +6662,79 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_keeps_pending_end_for_quoted_split_labels() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY "TEST_PKG" AS
+  FUNCTION f1 RETURN NUMBER IS
+  BEGIN
+    IF 1 = 1 THEN
+      RETURN 1;
+    ELSE
+      RETURN 2;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN -1;
+  END
+  "f1";
+BEGIN
+  NULL;
+END
+"TEST_PKG";"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    assert_eq!(depths.len(), 17, "unexpected depth vector: {depths:?}");
+    assert_eq!(
+        depths[12],
+        depths[11],
+        "split quoted subprogram END label should keep depth stable (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[16],
+        0,
+        "split quoted package END label should fully close package body scope (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_with_split_quoted_end_labels() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY "TEST_PKG" AS
+  FUNCTION f1 RETURN NUMBER IS
+  BEGIN
+    RETURN 1;
+  END
+  "f1";
+BEGIN
+  NULL;
+END
+"TEST_PKG";
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "split quoted END labels should keep package body and trailing SELECT separated: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("END\n  \"f1\";"),
+        "first statement should preserve split quoted subprogram END label"
+    );
+    assert!(
+        statements[0].contains("END") && statements[0].contains("\"TEST_PKG\""),
+        "first statement should preserve split quoted package END label: {:?}",
+        statements[0]
+    );
+    assert!(
+        statements[1].contains("SELECT 1 FROM dual"),
+        "second statement should contain trailing SELECT"
+    );
+}
+
+#[test]
 fn test_split_script_items_package_body_with_quoted_schema_qualified_end_name() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY "TEST_SCHEMA"."TEST_PKG" AS
   PROCEDURE p IS
