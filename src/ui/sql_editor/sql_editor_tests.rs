@@ -1161,7 +1161,6 @@ END;"#;
     assert_eq!(formatted, expected);
 }
 
-
 #[test]
 fn format_sql_plsql_depth_overrides_manual_overindent_for_code_lines() {
     let input = r#"BEGIN
@@ -1259,6 +1258,39 @@ END demo_pkg;
         "            NULL;",
         "        END IF;",
         "        /* keep pending end label scope */",
+        "    END p;",
+        "END demo_pkg;",
+        "/",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_keeps_end_if_depth_before_named_end_when_multiline_block_comment_in_between() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+PROCEDURE p IS
+BEGIN
+IF 1 = 1 THEN
+NULL;
+END IF;
+/* keep pending
+end label scope */
+END p;
+END demo_pkg;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "CREATE OR REPLACE PACKAGE BODY demo_pkg AS",
+        "    PROCEDURE p IS",
+        "    BEGIN",
+        "        IF 1 = 1 THEN",
+        "            NULL;",
+        "        END IF;",
+        "        /* keep pending",
+        "end label scope */",
         "    END p;",
         "END demo_pkg;",
         "/",
