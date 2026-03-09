@@ -313,6 +313,10 @@ impl QueryExecutor {
             None
         }
 
+        fn leading_close_paren_count(line: &str) -> usize {
+            line.trim_start().chars().take_while(|ch| *ch == ')').count()
+        }
+
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
             loop {
                 while idx < chars.len() && chars[idx].is_whitespace() {
@@ -822,12 +826,12 @@ impl QueryExecutor {
                 }
             }
 
-            let query_paren_component =
-                if line.trim_start().starts_with(')') && subquery_paren_depth > 0 {
-                    subquery_paren_depth.saturating_sub(1)
-                } else {
-                    subquery_paren_depth
-                };
+            let leading_close_parens = leading_close_paren_count(line);
+            let query_paren_component = if subquery_paren_depth > 0 {
+                subquery_paren_depth.saturating_sub(leading_close_parens)
+            } else {
+                0
+            };
 
             let with_cte_component = if with_cte_depth > 0 {
                 let starts_main_select =
@@ -4332,5 +4336,21 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
             .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
         );
+    }
+
+    #[test]
+    fn line_block_depths_dedents_all_leading_closing_parens_on_line() {
+        let sql = "SELECT *\nFROM (\nSELECT *\nFROM (\nSELECT 1 FROM dual\n))\nWHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 1, 1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn line_block_depths_saturates_when_leading_closing_parens_exceed_depth() {
+        let sql = "SELECT 1\nFROM dual\n)))\nSELECT 2\nFROM dual";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 0, 0, 0]);
     }
 }
