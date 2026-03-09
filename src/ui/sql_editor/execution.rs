@@ -600,39 +600,47 @@ impl SqlEditorWidget {
         let trimmed = &formatted[..trimmed_len];
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
-        let mut trailing_line_comment: Option<(usize, usize)> = None;
         let mut semicolon_span: Option<(usize, usize)> = None;
+        let mut trailing_line_comment_span: Option<(usize, usize)> = None;
+        let mut has_non_comment_token_before_trailing_comment = false;
 
         for span in spans.iter().rev() {
             match &span.token {
                 SqlToken::Comment(comment_text) if comment_text.starts_with("--") => {
-                    if trailing_line_comment.is_none() {
-                        trailing_line_comment = Some((span.start, span.end));
+                    if trailing_line_comment_span.is_none() {
+                        trailing_line_comment_span = Some((span.start, span.end));
                     }
+                    continue;
                 }
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == ";" => {
                     semicolon_span = Some((span.start, span.end));
                     break;
                 }
-                _ => break,
+                _ => {
+                    if trailing_line_comment_span.is_some() {
+                        has_non_comment_token_before_trailing_comment = true;
+                    }
+                    break;
+                }
             }
         }
 
-        if let Some(span) = semicolon_span {
-            return Some(span);
+        if semicolon_span.is_some() {
+            return semicolon_span;
         }
 
-        let (comment_start, comment_end) = trailing_line_comment?;
-        let comment_text = trimmed.get(comment_start..comment_end)?;
-        let comment_semicolon = comment_text.rfind(';')?;
+        let (comment_start, comment_end) = trailing_line_comment_span?;
+        if !has_non_comment_token_before_trailing_comment || comment_end == comment_start {
+            return None;
+        }
 
-        Some((
-            comment_start.saturating_add(comment_semicolon),
-            comment_start
-                .saturating_add(comment_semicolon)
-                .saturating_add(1),
-        ))
+        let comment_text = trimmed.get(comment_start..comment_end)?;
+        if !comment_text.ends_with(';') {
+            return None;
+        }
+
+        Some((comment_end - 1, comment_end))
     }
 
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
@@ -9552,6 +9560,32 @@ FROM DUAL"
         assert!(
             !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Statement terminator should stay absent, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_in_comment_only_selection() {
+        let source = "-- existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved,
+            "-- existing; comment semicolon",
+            "Semicolon inside comment-only selections should not be removed"
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_in_sqlplus_remark_comment() {
+        let source = "REM existing; comment semicolon";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            preserved.ends_with("; COMMENT SEMICOLON"),
+            "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
             preserved
         );
     }
