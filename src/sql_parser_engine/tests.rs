@@ -5706,3 +5706,31 @@ fn oracle_external_language_without_semicolon_splits_before_following_statement_
     assert!(statements[0].contains("AS EXTERNAL LANGUAGE C"));
     assert_eq!(statements[1], "SELECT 50 FROM dual".to_string());
 }
+
+#[test]
+fn malformed_external_clause_without_language_target_still_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_lang_target RETURN NUMBER");
+    engine.process_line("AS EXTERNAL;");
+    engine.process_line("SELECT 51 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS EXTERNAL"));
+    assert_eq!(statements[1], "SELECT 51 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_implicit_language_clause_keyword_without_target_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_implicit_target RETURN NUMBER");
+    engine.process_line("AS LANGUAGE PARAMETERS ('x')");
+    engine.process_line("SELECT 52 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE PARAMETERS ('x')"));
+    assert_eq!(statements[1], "SELECT 52 FROM dual".to_string());
+}
