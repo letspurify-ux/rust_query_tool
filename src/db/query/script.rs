@@ -314,7 +314,52 @@ impl QueryExecutor {
         }
 
         fn leading_close_paren_count(line: &str) -> usize {
-            line.trim_start().chars().take_while(|ch| *ch == ')').count()
+            let bytes = line.as_bytes();
+            let mut idx = 0usize;
+            let mut close_count = 0usize;
+
+            loop {
+                while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                    idx += 1;
+                }
+
+                if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+                    idx += 2;
+                    while idx + 1 < bytes.len() {
+                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                            idx += 2;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    continue;
+                }
+
+                if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
+                    return close_count;
+                }
+
+                if idx < bytes.len() && sql_text::is_identifier_start_byte(bytes[idx]) {
+                    let start = idx;
+                    idx += 1;
+                    while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
+                        idx += 1;
+                    }
+                    let token = &line[start..idx];
+                    if token.eq_ignore_ascii_case("REM") || token.eq_ignore_ascii_case("REMARK") {
+                        return close_count;
+                    }
+                    return close_count;
+                }
+
+                if idx < bytes.len() && bytes[idx] == b')' {
+                    close_count += 1;
+                    idx += 1;
+                    continue;
+                }
+
+                return close_count;
+            }
         }
 
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
@@ -4371,6 +4416,44 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
         assert_eq!(depths, vec![0, 0, 1, 1, 2, 0, 0]);
     }
 
+    #[test]
+    fn line_block_depths_dedents_with_leading_block_comment_before_closing_paren() {
+        let sql = "SELECT *
+FROM (
+SELECT 1 FROM dual
+/* close */ )
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn line_block_depths_dedents_with_leading_whitespace_and_comment_between_closing_parens() {
+        let sql = "SELECT *
+FROM (
+SELECT *
+FROM (
+SELECT 1 FROM dual
+) /* mid */ )
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 1, 1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn line_block_depths_dedents_stops_counting_at_leading_line_comment() {
+        let sql = "SELECT *
+FROM (
+SELECT 1 FROM dual
+-- )
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        assert_eq!(depths, vec![0, 0, 1, 1, 0, 0]);
+    }
     #[test]
     fn line_block_depths_saturates_when_leading_closing_parens_exceed_depth() {
         let sql = "SELECT 1\nFROM dual\n)))\nSELECT 2\nFROM dual";
