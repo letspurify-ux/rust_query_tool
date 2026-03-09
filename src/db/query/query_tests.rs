@@ -8390,6 +8390,69 @@ WHERE EXISTS (
 }
 
 #[test]
+fn test_line_block_depths_detects_subquery_after_multiline_block_comment_between_paren_and_select()
+{
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  /* comment starts
+     and continues without sql keywords
+     until this line */
+  SELECT 1
+  FROM dual
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let nested_select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected nested SELECT line");
+
+    assert!(
+        depths[nested_select_idx] > depths[where_idx],
+        "Multiline block comment between '(' and SELECT should preserve subquery depth"
+    );
+}
+
+#[test]
+fn test_line_block_depths_detects_with_subquery_after_multiline_block_comment_between_paren_and_with() {
+    let sql = r#"SELECT
+  col
+FROM t
+WHERE EXISTS (
+  /* comment starts
+     and continues without sql keywords
+     until this line */
+  WITH cte AS (
+    SELECT 1 AS n FROM dual
+  )
+  SELECT n FROM cte
+);"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let where_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHERE EXISTS"))
+        .expect("expected WHERE EXISTS line");
+    let with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WITH cte AS"))
+        .expect("expected nested WITH line");
+
+    assert!(
+        depths[with_idx] > depths[where_idx],
+        "Multiline block comment between '(' and WITH should preserve subquery depth"
+    );
+}
+
+#[test]
 fn test_line_block_depths_detects_subquery_after_rem_comment_between_paren_and_select() {
     let sql = r#"SELECT
   col
