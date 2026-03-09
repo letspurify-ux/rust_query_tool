@@ -343,6 +343,27 @@ impl OpenCursorFormatState {
 }
 
 impl SqlEditorWidget {
+    fn starts_with_end_suffix_terminator(trimmed_upper: &str) -> bool {
+        if !crate::sql_text::starts_with_keyword_token(trimmed_upper, "END") {
+            return false;
+        }
+
+        if trimmed_upper == "END" {
+            return true;
+        }
+
+        let Some(rest) = trimmed_upper.strip_prefix("END") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+
+        crate::sql_text::starts_with_keyword_token(rest, "IF")
+            || crate::sql_text::starts_with_keyword_token(rest, "LOOP")
+            || crate::sql_text::starts_with_keyword_token(rest, "CASE")
+            || crate::sql_text::starts_with_keyword_token(rest, "WHILE")
+            || crate::sql_text::starts_with_keyword_token(rest, "FOR")
+    }
+
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
         sanitized.clear_password();
@@ -2345,12 +2366,7 @@ impl SqlEditorWidget {
                 0
             };
             let is_trigger_for_each_row = trimmed_upper.starts_with("FOR EACH ROW");
-            let force_end_depth = trimmed_upper == "END"
-                || trimmed_upper.starts_with("END IF")
-                || trimmed_upper.starts_with("END LOOP")
-                || trimmed_upper.starts_with("END CASE")
-                || trimmed_upper.starts_with("END WHILE")
-                || trimmed_upper.starts_with("END FOR");
+            let force_end_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper);
             let force_block_depth = !in_dml_statement
                 && (trimmed_upper.starts_with("EXCEPTION")
                     || trimmed_upper.starts_with("WHEN ")
@@ -8793,6 +8809,51 @@ END oqt_mega_pkg;"#;
             formatted, formatted_again,
             "Formatting should be idempotent for nested CASE expressions"
         );
+    }
+
+
+    #[test]
+    fn package_body_named_end_with_if_prefix_is_not_treated_as_end_if_suffix() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY if_owner AS
+FUNCTION run_check RETURN NUMBER IS
+BEGIN
+  IF 1 = 1 THEN
+    RETURN 1;
+  END IF;
+END run_check;
+BEGIN
+  NULL;
+END if_owner;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let end_if_owner_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END if_owner;"));
+        assert!(
+            end_if_owner_line.is_some_and(|line| line.starts_with("    ")),
+            "Package named END label should stay at package-body depth, got:
+{}",
+            formatted
+        );
+
+        let end_if_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END IF;"));
+        assert!(
+            end_if_line.is_some_and(|line| line.starts_with("        ")),
+            "Nested END IF should remain more indented than END package label, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END"));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
     }
 
     #[test]
