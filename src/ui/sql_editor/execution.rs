@@ -777,7 +777,13 @@ impl SqlEditorWidget {
                     select_list_break_state.clear();
                 }
                 FormatItem::Verbatim(text) => {
-                    formatted.push_str(text);
+                    if let Some(command) = QueryExecutor::parse_tool_command(text)
+                        .filter(|cmd| matches!(cmd, ToolCommand::Prompt { .. }))
+                    {
+                        formatted.push_str(&Self::format_tool_command(&command));
+                    } else {
+                        formatted.push_str(text);
+                    }
                     select_list_break_state.clear();
                 }
                 FormatItem::Slash => {

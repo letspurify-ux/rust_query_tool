@@ -2800,7 +2800,7 @@ impl QueryExecutor {
     ) {
         let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
-        builder.state.prepare_splitter_line_boundary(line);
+        builder.prepare_splitter_line_boundary(line);
         match builder
             .state
             .splitter_line_boundary_action_for_line(line, builder.current_is_empty())

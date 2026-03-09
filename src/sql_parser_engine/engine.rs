@@ -93,6 +93,10 @@ pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLine
     }
 }
 
+pub(crate) fn line_starts_with_consumed_slash_terminator(line: &str) -> bool {
+    classify_line_leading_slash_marker(line).is_some_and(|kind| kind.consumes_as_terminator())
+}
+
 // ---------------------------------------------------------------------------
 // SqlParserEngine
 // ---------------------------------------------------------------------------
@@ -138,6 +142,13 @@ impl SqlParserEngine {
 
     pub(crate) fn can_terminate_on_slash(&self) -> bool {
         self.state.can_terminate_on_slash()
+    }
+
+    pub(crate) fn prepare_splitter_line_boundary(&mut self, line: &str) {
+        if self.is_idle() && line_starts_with_consumed_slash_terminator(line) {
+            self.state.flush_token();
+        }
+        self.state.prepare_splitter_line_boundary(line);
     }
 
     fn push_current_statement(&mut self) {

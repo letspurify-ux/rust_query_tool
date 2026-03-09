@@ -1577,6 +1577,8 @@ impl QueryExecutor {
                 continue;
             }
 
+            collector.builder.prepare_splitter_line_boundary(line);
+
             match collector
                 .builder
                 .state
