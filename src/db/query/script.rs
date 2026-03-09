@@ -272,15 +272,35 @@ impl QueryExecutor {
                 .any(|keyword| chars_word_eq_ignore_ascii_case(chars, start, end, keyword))
         }
 
-        fn leading_keyword_after_comments(line: &str) -> Option<&str> {
+        fn leading_keyword_after_comments<'a>(
+            line: &'a str,
+            in_block_comment: &mut bool,
+        ) -> Option<&'a str> {
             let trimmed = line.trim_start();
-            if sql_text::is_sqlplus_comment_line(trimmed) {
+            if !*in_block_comment && sql_text::is_sqlplus_comment_line(trimmed) {
                 return None;
             }
 
             let bytes = line.as_bytes();
             let mut i = 0usize;
             while i < bytes.len() {
+                if *in_block_comment {
+                    let mut closed = false;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            *in_block_comment = false;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return None;
+                    }
+                    continue;
+                }
+
                 let b = bytes[i];
                 if b.is_ascii_whitespace() {
                     i += 1;
@@ -291,13 +311,7 @@ impl QueryExecutor {
                 }
                 if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
                     i += 2;
-                    while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
+                    *in_block_comment = true;
                     continue;
                 }
                 if sql_text::is_identifier_byte(b) {
@@ -720,9 +734,11 @@ impl QueryExecutor {
         let mut exception_depth_stack: Vec<usize> = Vec::new();
         let mut exception_handler_body_stack: Vec<bool> = Vec::new();
         let mut case_branch_stack: Vec<bool> = Vec::new();
+        let mut in_leading_block_comment = false;
 
         for line in sql.lines() {
-            let leading_word = leading_keyword_after_comments(line);
+            let was_in_leading_block_comment = in_leading_block_comment;
+            let leading_word = leading_keyword_after_comments(line, &mut in_leading_block_comment);
             let leading_identifier_chain = parse_identifier_chain(line);
             let pending_end_label_continuation =
                 leading_identifier_chain
@@ -746,10 +762,13 @@ impl QueryExecutor {
             };
 
             let trimmed_start = line.trim_start();
+            let in_leading_block_comment_line = leading_word.is_none()
+                && (was_in_leading_block_comment || in_leading_block_comment);
             let is_comment_or_blank = trimmed_start.is_empty()
                 || sql_text::is_sqlplus_comment_line(trimmed_start)
                 || ((trimmed_start.starts_with("/*") || trimmed_start.starts_with("*/"))
-                    && leading_word.is_none());
+                    && leading_word.is_none())
+                || in_leading_block_comment_line;
 
             if pending_subquery_paren > 0 && !is_comment_or_blank {
                 // WITH is also a valid subquery head (e.g. `( WITH cte AS (...) SELECT ... )`).

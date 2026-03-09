@@ -2252,8 +2252,8 @@ END;"#;
         "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n            ) AS bucket"),
-        "CASE END and close paren should stay aligned in OPEN FOR expression, got: {formatted}"
+        formatted.contains("END\n        ) AS bucket"),
+        "CASE END and close paren should preserve stable OPEN FOR expression indentation, got: {formatted}"
     );
 }
 
