@@ -9095,6 +9095,30 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_split_named_end_starting_with_if_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg_split AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF v_flag THEN
+      NULL;
+    END
+    IF;
+  END
+  p1;
+END
+if_pkg_split;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 1, 0, 0, 0];
+
+    assert_eq!(
+        depths, expected,
+        "split END labels + IF-prefixed package END label depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_package_body_named_end_starting_with_end_suffix_keyword() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
   PROCEDURE p1 IS
@@ -12695,3 +12719,62 @@ END pkg;"#;
     );
 }
 
+#[test]
+fn test_line_block_depths_split_end_if_inside_exception_handler() {
+    let sql = r#"BEGIN
+  NULL;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF x THEN
+      NULL;
+    END
+    IF;
+END;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 0, 1, 2, 3, 2, 2, 0];
+
+    assert_eq!(
+        depths, expected,
+        "split END IF inside EXCEPTION handler depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_split_end_label_starting_with_if_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg_split2 AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+END
+IF_PKG_SPLIT2;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 2, 1, 0, 0, 0];
+
+    assert_eq!(
+        depths, expected,
+        "split package END label starting with IF should keep top-level depth: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_split_end_label_after_leading_block_comment() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_comment_label AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END
+  /* split label comment */ p1;
+END pkg_comment_label;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 1, 2, 1, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "split END label after leading block comment depth mismatch: {depths:?}"
+    );
+}
