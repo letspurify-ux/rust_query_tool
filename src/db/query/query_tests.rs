@@ -12386,3 +12386,312 @@ fn test_split_format_items_non_ascii_q_quote_delimiter_splits_trailing_statement
         stmts[1]
     );
 }
+
+// ── END / END IF / END name nested depth regression tests ──────────────────
+
+#[test]
+fn test_line_block_depths_nested_begin_inside_if() {
+    // BEGIN inside IF inside outer BEGIN
+    let sql = r#"BEGIN
+  IF x THEN
+    BEGIN
+      NULL;
+    END;
+  END IF;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) IF(1) inner-BEGIN(2) NULL(3) END;(2) END-IF(1) END(0)
+    let expected = vec![0, 1, 2, 3, 2, 1, 0];
+    assert_eq!(depths, expected, "BEGIN inside IF depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_loop_with_nested_if() {
+    // IF nested inside FOR...LOOP
+    let sql = r#"BEGIN
+  FOR i IN 1..5 LOOP
+    IF x THEN
+      NULL;
+    END IF;
+  END LOOP;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) FOR-LOOP(1) IF(2) NULL(3) END-IF(2) END-LOOP(1) END(0)
+    let expected = vec![0, 1, 2, 3, 2, 1, 0];
+    assert_eq!(depths, expected, "IF inside FOR LOOP depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_three_level_nested_if() {
+    // Triple-nested IF blocks
+    let sql = r#"BEGIN
+  IF a THEN
+    IF b THEN
+      IF c THEN
+        NULL;
+      END IF;
+    END IF;
+  END IF;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) IFa(1) IFb(2) IFc(3) NULL(4) END-IFc(3) END-IFb(2) END-IFa(1) END(0)
+    let expected = vec![0, 1, 2, 3, 4, 3, 2, 1, 0];
+    assert_eq!(depths, expected, "three-level nested IF depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_standalone_procedure_end_name() {
+    // CREATE PROCEDURE with END name (not a package body).
+    // BEGIN after IS is shown at the same depth as IS (pre-dedented by 1).
+    let sql = r#"CREATE OR REPLACE PROCEDURE my_proc IS
+BEGIN
+  IF x THEN
+    NULL;
+  END IF;
+END my_proc;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // CREATE IS(0) BEGIN(0) IF(1) NULL(2) END-IF(1) END name(0)
+    // Note: BEGIN after IS is at the same depth as IS due to pending_subprogram_begins pre-dedent.
+    let expected = vec![0, 0, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "standalone procedure END name depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_split_end_if_inside_package_procedure() {
+    // Package body procedure with split END / IF inside.
+    // BEGIN after IS is at the same depth as IS (pending_subprogram_begins pre-dedent).
+    // Package init NULL is one level deeper than the package init BEGIN.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF x THEN
+      NULL;
+    END
+    IF;
+  END p1;
+BEGIN
+  NULL;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) PROC IS(1) BEGIN(1) IF(2) NULL(3) END(2) IF;(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 1, 2, 0];
+    assert_eq!(depths, expected, "split END IF in package body procedure mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_if_elsif_else_nesting() {
+    // IF/ELSIF/ELSE chain inside BEGIN
+    let sql = r#"BEGIN
+  IF a THEN
+    NULL;
+  ELSIF b THEN
+    NULL;
+  ELSE
+    NULL;
+  END IF;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) IF(1) NULL(2) ELSIF(1) NULL(2) ELSE(1) NULL(2) END-IF(1) END(0)
+    let expected = vec![0, 1, 2, 1, 2, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "IF/ELSIF/ELSE depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_package_body_multiple_procs_end_names() {
+    // Package body with two procedures, each with END name.
+    // BEGIN after IS is at the same depth as IS.
+    // Package init body (NULL inside BEGIN...END pkg) is one level deeper.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+  PROCEDURE p2 IS
+  BEGIN
+    NULL;
+  END p2;
+BEGIN
+  NULL;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) p1 IS(1) BEGIN(1) NULL(2) END p1(1) p2 IS(1) BEGIN(1) NULL(2) END p2(1) BEGIN(1) NULL(2) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 0];
+    assert_eq!(depths, expected, "package body multiple procedures END name depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_end_name_split_across_lines_followed_by_end() {
+    // Split END / name in package body followed by package-level END.
+    // BEGIN after IS is at the same depth as IS.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END
+  p1;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) PROC IS(1) BEGIN(1) NULL(2) END(1) p1;(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 1, 0];
+    assert_eq!(depths, expected, "split END name followed by package END depth mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_loop_inside_if_with_end_name() {
+    // LOOP inside IF inside package body procedure with END name.
+    // BEGIN after IS is at the same depth as IS.
+    // Package init body is one level deeper than BEGIN.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF x THEN
+      FOR i IN 1..5 LOOP
+        NULL;
+      END LOOP;
+    END IF;
+  END p1;
+BEGIN
+  NULL;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) PROC IS(1) BEGIN(1) IF(2) FOR-LOOP(3) NULL(4) END-LOOP(3) END-IF(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 4, 3, 2, 1, 1, 2, 0];
+    assert_eq!(depths, expected, "LOOP inside IF inside package procedure END name mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_sequential_end_if_and_end_loop() {
+    // Sequential END IF and END LOOP at same nesting level
+    let sql = r#"BEGIN
+  IF a THEN
+    NULL;
+  END IF;
+  FOR i IN 1..3 LOOP
+    NULL;
+  END LOOP;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) IF(1) NULL(2) END-IF(1) FOR-LOOP(1) NULL(2) END-LOOP(1) END(0)
+    let expected = vec![0, 1, 2, 1, 1, 2, 1, 0];
+    assert_eq!(depths, expected, "sequential END IF + END LOOP depth tracking mismatch: {depths:?}");
+}
+
+#[test]
+fn test_line_block_depths_package_body_exception_with_split_end_name() {
+    // Package body function with EXCEPTION handler and split END / name on next line.
+    // Verifies that exception_depth_stack is correctly popped on the split END line,
+    // so the label line does not inherit exception handler indentation.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  FUNCTION f1 RETURN NUMBER IS
+  BEGIN
+    NULL;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN -1;
+  END
+  f1;
+BEGIN
+  NULL;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) FN IS(1) BEGIN(1) NULL(2) EXCEPTION(1) WHEN(2) RETURN(3) END(1) f1;(1) BEGIN(1) NULL(2) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 2, 3, 1, 1, 1, 2, 0];
+    assert_eq!(
+        depths, expected,
+        "package body function with exception handler + split END name depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_triple_nested_end_if_with_split() {
+    // Three-level nested IF where the innermost END IF is split across lines.
+    let sql = r#"BEGIN
+  IF a THEN
+    IF b THEN
+      IF c THEN
+        NULL;
+      END
+      IF;
+    END IF;
+  END IF;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) IFa(1) IFb(2) IFc(3) NULL(4) END(3) IF;(3) END-IFb(2) END-IFa(1) END(0)
+    let expected = vec![0, 1, 2, 3, 4, 3, 3, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "triple nested IF with split innermost END IF depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_end_if_then_end_loop_then_end() {
+    // Mixed END IF / END LOOP / plain END in sequence at different nesting levels
+    let sql = r#"BEGIN
+  FOR i IN 1..5 LOOP
+    IF x THEN
+      BEGIN
+        NULL;
+      END;
+    END IF;
+  END LOOP;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // BEGIN(0) FOR-LOOP(1) IF(2) BEGIN(3) NULL(4) END;(3) END-IF(2) END-LOOP(1) END(0)
+    let expected = vec![0, 1, 2, 3, 4, 3, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "END;/END IF/END LOOP nested sequence depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_standalone_procedure_with_exception() {
+    // Standalone procedure with IF and EXCEPTION handler, END name on same line.
+    // Verifies exception handler tracking is cleared by END proc_name.
+    let sql = r#"CREATE OR REPLACE PROCEDURE test_proc IS
+BEGIN
+  IF x = 1 THEN
+    NULL;
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END test_proc;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // CREATE IS(0) BEGIN(0) IF(1) NULL(2) END-IF(1) EXCEPTION(0) WHEN(1) NULL(2) END name(0)
+    let expected = vec![0, 0, 1, 2, 1, 0, 1, 2, 0];
+    assert_eq!(
+        depths, expected,
+        "standalone procedure with exception handler END name depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_nested_if_and_end_names_sequential() {
+    // Package body with two procedures: one with nested IF, one plain.
+    // Verifies depth resets correctly between procedures.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF x THEN
+      IF y THEN
+        NULL;
+      END IF;
+    END IF;
+  END p1;
+  PROCEDURE p2 IS
+  BEGIN
+    NULL;
+  END p2;
+END pkg;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    // AS(0) p1 IS(1) BEGIN(1) IFx(2) IFy(3) NULL(4) END-IFy(3) END-IFx(2) END p1(1)
+    // p2 IS(1) BEGIN(1) NULL(2) END p2(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 4, 3, 2, 1, 1, 1, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "package body with nested IF in p1 + plain p2 depth mismatch: {depths:?}"
+    );
+}
+
