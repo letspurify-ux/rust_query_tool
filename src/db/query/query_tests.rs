@@ -11169,6 +11169,73 @@ SELECT 2 FROM dual;"#;
 }
 
 #[test]
+fn test_split_script_items_run_script_command_strips_inline_comments_from_path() {
+    let sql = "@child.sql -- trailing comment
+SELECT 1 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+
+    assert!(
+        matches!(items.first(), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "first item should parse @ script path without trailing comment: {items:?}"
+    );
+    assert!(
+        matches!(items.get(1), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 1 FROM dual")),
+        "second item should keep trailing SELECT statement: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_run_script_variants_strip_inline_comments_from_path() {
+    let cases = [
+        ("@@child.sql /* keep */ -- trailing", "child.sql", true),
+        ("START child.sql /* keep */ -- trailing", "child.sql", false),
+        ("RUN child.sql /* keep */ -- trailing", "child.sql", false),
+        ("R child.sql -- trailing", "child.sql", false),
+    ];
+
+    for (command_line, expected_path, expected_relative) in cases {
+        let sql = format!("{command_line}\nSELECT 1 FROM dual;");
+        let items = QueryExecutor::split_script_items(sql.as_str());
+
+        assert!(
+            matches!(items.first(), Some(ScriptItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == expected_path && *relative_to_caller == expected_relative),
+            "first item should parse script command path without inline comment for {command_line}: {items:?}"
+        );
+        assert!(
+            matches!(items.get(1), Some(ScriptItem::Statement(stmt)) if stmt.trim_start().starts_with("SELECT 1 FROM dual")),
+            "second item should keep trailing SELECT statement for {command_line}: {items:?}"
+        );
+    }
+}
+
+#[test]
+fn test_split_format_items_run_script_command_strips_inline_comments_from_path() {
+    let sql = "START child.sql -- trailing comment
+SELECT 1 FROM dual;";
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        matches!(items.first(), Some(FormatItem::ToolCommand(ToolCommand::RunScript { path, relative_to_caller })) if path == "child.sql" && !relative_to_caller),
+        "first item should parse START script path without trailing comment: {items:?}"
+    );
+    assert!(
+        stmts
+            .first()
+            .is_some_and(|stmt| stmt.trim_start().starts_with("SELECT 1 FROM dual")),
+        "formatted statements should keep trailing SELECT statement: {stmts:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_recovers_to_r_keyword_statement_head() {
     let sql = r#"WITH
   FUNCTION f RETURN NUMBER IS

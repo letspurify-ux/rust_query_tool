@@ -3694,18 +3694,20 @@ impl QueryExecutor {
 
     fn parse_script_command(raw: &str) -> ToolCommand {
         let trimmed = raw.trim();
-        let run_path_storage;
         let (relative_to_caller, command_label, path) = if trimmed.starts_with("@@") {
-            (true, "@@", trimmed.trim_start_matches("@@").trim())
+            let remainder = trimmed.trim_start_matches("@@").trim();
+            (true, "@@", Self::extract_script_path(remainder))
         } else if trimmed.starts_with('@') {
-            (false, "@", trimmed.trim_start_matches('@').trim())
+            let remainder = trimmed.trim_start_matches('@').trim();
+            (false, "@", Self::extract_script_path(remainder))
         } else if Self::is_start_script_command(trimmed) {
-            (false, "START", trimmed.get(5..).unwrap_or_default().trim())
+            let start = Self::remainder_after_first_word(trimmed).unwrap_or(trimmed.len());
+            let remainder = trimmed.get(start..).unwrap_or_default().trim();
+            (false, "START", Self::extract_script_path(remainder))
         } else if Self::is_run_script_command(trimmed) {
-            let mut parts = trimmed.split_whitespace();
-            let _ = parts.next();
-            run_path_storage = parts.collect::<Vec<&str>>().join(" ");
-            (false, "RUN", run_path_storage.trim())
+            let start = Self::remainder_after_first_word(trimmed).unwrap_or(trimmed.len());
+            let remainder = trimmed.get(start..).unwrap_or_default().trim();
+            (false, "RUN", Self::extract_script_path(remainder))
         } else {
             (false, "@", "")
         };
@@ -3730,6 +3732,60 @@ impl QueryExecutor {
             path: cleaned,
             relative_to_caller,
         }
+    }
+
+    fn remainder_after_first_word(line: &str) -> Option<usize> {
+        let mut in_word = false;
+        for (idx, ch) in line.char_indices() {
+            if !in_word {
+                if ch.is_whitespace() {
+                    continue;
+                }
+                in_word = true;
+                continue;
+            }
+
+            if ch.is_whitespace() {
+                return Some(idx);
+            }
+        }
+
+        in_word.then_some(line.len())
+    }
+
+    fn extract_script_path(remainder: &str) -> &str {
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut idx = 0usize;
+
+        while idx < remainder.len() {
+            let tail = match remainder.get(idx..) {
+                Some(value) => value,
+                None => break,
+            };
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+
+            if !in_single_quote && !in_double_quote {
+                if tail.starts_with("--") {
+                    return remainder.get(..idx).unwrap_or_default().trim();
+                }
+                if tail.starts_with("/*") {
+                    return remainder.get(..idx).unwrap_or_default().trim();
+                }
+            }
+
+            if ch == '\'' && !in_double_quote {
+                in_single_quote = !in_single_quote;
+            } else if ch == '"' && !in_single_quote {
+                in_double_quote = !in_double_quote;
+            }
+
+            idx += ch.len_utf8();
+        }
+
+        remainder.trim()
     }
 
     fn is_start_script_command(trimmed: &str) -> bool {
