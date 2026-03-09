@@ -48,6 +48,7 @@ pub(crate) struct SplitState {
     token_upper_buf: String,
     quoted_identifier_buf: String,
     pending_implicit_external_top_level_split: bool,
+    pending_end_label_token: Option<String>,
 }
 
 impl SplitState {
@@ -291,12 +292,19 @@ impl SplitState {
         false
     }
 
+    fn package_body_init_end_context(&self) -> bool {
+        self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.block_stack.last() == Some(&BlockKind::Begin)
+            && self.block_stack.get(self.block_stack.len().saturating_sub(2)) == Some(&BlockKind::AsIs)
+    }
+
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
         }
 
-        self.resolve_plain_end("");
+        let pending_end_label = self.pending_end_label_token.clone().unwrap_or_default();
+        self.resolve_plain_end(&pending_end_label);
         if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
             && !self.in_with_plsql_declaration()
@@ -304,6 +312,7 @@ impl SplitState {
             self.reset_create_tracking_state();
         }
         self.pending_end = PendingEnd::None;
+        self.pending_end_label_token = None;
     }
 
     // -- Convenience accessors --------------------------------------------------
@@ -532,12 +541,20 @@ impl SplitState {
 
         if let Some(suffix) = suffix {
             suffix.apply_to_state(self);
-        } else {
-            // Plain END – CASE expression or PL/SQL block
-            self.resolve_plain_end(token_upper);
+            self.pending_end = PendingEnd::None;
+            self.pending_end_label_token = None;
+            return;
         }
 
+        if self.package_body_init_end_context() {
+            self.pending_end_label_token = Some(token_upper.to_string());
+            return;
+        }
+
+        // Plain END – CASE expression or PL/SQL block
+        self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
+        self.pending_end_label_token = None;
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
@@ -813,8 +830,14 @@ impl SplitState {
             return;
         }
 
+        if self.package_body_init_end_context() {
+            self.pending_end_label_token = Some(token_upper.to_string());
+            return;
+        }
+
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
+        self.pending_end_label_token = None;
     }
 
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
@@ -953,6 +976,7 @@ impl SplitState {
 
     fn reset_statement_boundary_state(&mut self) {
         self.pending_end = PendingEnd::None;
+        self.pending_end_label_token = None;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
         self.paren_depth = 0;

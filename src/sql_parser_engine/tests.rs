@@ -376,7 +376,6 @@ fn package_body_init_section_without_end_label_splits_before_following_statement
     assert!(statements[1].starts_with("SELECT 99 FROM dual"));
 }
 
-
 #[test]
 fn package_body_init_section_with_quoted_end_label_splits_before_following_statement() {
     let mut engine = SqlParserEngine::new();
@@ -401,6 +400,28 @@ fn package_body_init_section_with_quoted_end_label_splits_before_following_state
     );
     assert!(statements[1].starts_with("SELECT 100 FROM dual"));
 }
+
+#[test]
+fn package_body_end_with_schema_qualified_label_splits_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_qualified_label AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END owner.pkg_qualified_label;");
+    engine.process_line("SELECT 102 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.pkg_qualified_label"),
+        "qualified package body end label should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 102 FROM dual".to_string());
+}
+
 #[test]
 fn declare_begin_state_machine_tracks_pending_begin() {
     let mut state = SplitState::default();
