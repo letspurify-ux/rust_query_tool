@@ -443,17 +443,26 @@ impl QueryExecutor {
                     i += 1;
                     let mut segment = String::new();
                     while i < bytes.len() {
-                        if bytes[i] == b'"' {
-                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        let ch_opt = line.get(i..).and_then(|rest| rest.chars().next());
+                        let ch = match ch_opt {
+                            Some(ch) => ch,
+                            None => break,
+                        };
+
+                        if ch == '"' {
+                            let next_idx = i + ch.len_utf8();
+                            let next_ch = line.get(next_idx..).and_then(|rest| rest.chars().next());
+                            if next_ch == Some('"') {
                                 segment.push('"');
-                                i += 2;
+                                i = next_idx + '"'.len_utf8();
                                 continue;
                             }
-                            i += 1;
+                            i = next_idx;
                             break;
                         }
-                        segment.push(bytes[i] as char);
-                        i += 1;
+
+                        segment.push(ch);
+                        i += ch.len_utf8();
                     }
                     if segment.is_empty() {
                         break;
@@ -556,17 +565,26 @@ impl QueryExecutor {
                     i += 1;
                     let mut segment = String::new();
                     while i < bytes.len() {
-                        if bytes[i] == b'"' {
-                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        let ch_opt = line.get(i..).and_then(|rest| rest.chars().next());
+                        let ch = match ch_opt {
+                            Some(ch) => ch,
+                            None => break,
+                        };
+
+                        if ch == '"' {
+                            let next_idx = i + ch.len_utf8();
+                            let next_ch = line.get(next_idx..).and_then(|rest| rest.chars().next());
+                            if next_ch == Some('"') {
                                 segment.push('"');
-                                i += 2;
+                                i = next_idx + '"'.len_utf8();
                                 continue;
                             }
-                            i += 1;
+                            i = next_idx;
                             break;
                         }
-                        segment.push(bytes[i] as char);
-                        i += 1;
+
+                        segment.push(ch);
+                        i += ch.len_utf8();
                     }
                     if segment.is_empty() {
                         break;
