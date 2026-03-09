@@ -2399,7 +2399,11 @@ impl SqlEditorWidget {
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement && starts_with_close_paren {
-                existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                if previous_line_is_plain_end {
+                    parser_depth.saturating_add(2)
+                } else {
+                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                }
             } else if in_dml_statement {
                 let is_dml_clause_line = Self::is_dml_clause_starter(&trimmed_upper)
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
@@ -2447,6 +2451,7 @@ impl SqlEditorWidget {
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
         crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WITH")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
@@ -9976,6 +9981,232 @@ FROM DUAL"
             "                    )",
             "            ) nested_q",
             "        WHERE nested_q.inner_col = o.outer_col",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_nested_union_subquery_with_consistent_depth() {
+        let sql = "SELECT o.id FROM outer_t o WHERE EXISTS (SELECT 1 FROM (SELECT i.id FROM inner_a i WHERE i.flag = 'Y' UNION ALL SELECT j.id FROM inner_b j WHERE j.flag = 'N') merged WHERE merged.id = o.id);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT o.id",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        SELECT 1",
+            "        FROM (",
+            "                SELECT i.id",
+            "                FROM inner_a i",
+            "                WHERE i.flag = 'Y'",
+            "                UNION ALL",
+            "                SELECT j.id",
+            "                FROM inner_b j",
+            "                WHERE j.flag = 'N'",
+            "            ) merged",
+            "        WHERE merged.id = o.id",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn plsql_nested_with_subquery_keeps_cte_body_depth() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    WITH filt AS (
+      SELECT id
+      FROM inner_t
+      WHERE flag = 'Y'
+    )
+    SELECT id
+    FROM filt
+    WHERE filt.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WITH filt AS (
+                SELECT id
+                FROM inner_t
+                WHERE flag = 'Y'
+            )"),
+            "CTE body inside nested subquery should indent one level deeper than WITH header, got:
+{}",
+            formatted
+        );
+    }
+
+
+
+    #[test]
+    fn plsql_nested_union_subquery_keeps_consistent_depth() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    SELECT 1
+    FROM (
+      SELECT i.id
+      FROM inner_a i
+      WHERE i.flag = 'Y'
+      UNION ALL
+      SELECT j.id
+      FROM inner_b j
+      WHERE j.flag = 'N'
+    ) merged
+    WHERE merged.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("FROM (
+                SELECT i.id"),
+            "Nested subquery under FROM should increase depth, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("UNION ALL
+                SELECT j.id"),
+            "Set operator branch inside nested subquery should keep same nested depth, got:
+{}",
+            formatted
+        );
+    }
+
+
+    #[test]
+    fn plsql_nested_with_multiple_ctes_keeps_cte_depth_aligned() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+    WITH a AS (
+      SELECT id
+      FROM inner_t
+    ), b AS (
+      SELECT id
+      FROM a
+    )
+    SELECT id
+    FROM b
+    WHERE b.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "BEGIN",
+            "    SELECT o.id",
+            "    INTO v_id",
+            "    FROM outer_t o",
+            "    WHERE EXISTS (",
+            "            WITH a AS (",
+            "                SELECT id",
+            "                FROM inner_t",
+            "            ),",
+            "            b AS (",
+            "                SELECT id",
+            "                FROM a",
+            "            )",
+            "            SELECT id",
+            "            FROM b",
+            "            WHERE b.id = o.id",
+            "        );",
+            "END;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+
+    #[test]
+    fn plsql_nested_with_clause_resets_excess_manual_indent() {
+        let sql = r#"BEGIN
+  SELECT o.id
+  INTO v_id
+  FROM outer_t o
+  WHERE EXISTS (
+                    WITH filt AS (
+      SELECT id
+      FROM inner_t
+      WHERE flag = 'Y'
+    )
+    SELECT id
+    FROM filt
+    WHERE filt.id = o.id
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE EXISTS (
+            WITH filt AS ("),
+            "WITH clause should align to nested query depth instead of preserving excess manual indent, got:
+{}",
+            formatted
+        );
+    }
+
+
+    #[test]
+    fn plsql_nested_with_clause_does_not_keep_two_level_extra_indent() {
+        let sql = r#"BEGIN
+    SELECT o.id
+    INTO v_id
+    FROM outer_t o
+    WHERE EXISTS (
+                WITH filt AS (
+                    SELECT id
+                    FROM inner_t
+                    WHERE flag = 'Y'
+                )
+            SELECT id
+            FROM filt
+            WHERE filt.id = o.id
+        );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE EXISTS (
+            WITH filt AS ("),
+            "WITH clause should not keep two-level extra indent in nested DML depth, got:
+{}",
+            formatted
+        );
+    }
+    #[test]
+    fn formats_nested_with_subquery_with_consistent_depth() {
+        let sql = "SELECT o.id FROM outer_t o WHERE EXISTS (WITH filt AS (SELECT id FROM inner_t WHERE flag = 'Y') SELECT id FROM filt WHERE filt.id = o.id);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT o.id",
+            "FROM outer_t o",
+            "WHERE EXISTS (",
+            "        WITH filt AS (",
+            "            SELECT id",
+            "            FROM inner_t",
+            "            WHERE flag = 'Y'",
+            "        )",
+            "        SELECT id",
+            "        FROM filt",
+            "        WHERE filt.id = o.id",
             "    );",
         ]
         .join("\n");
