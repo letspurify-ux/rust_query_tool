@@ -1100,15 +1100,40 @@ impl QueryExecutor {
             return String::new();
         }
 
-        // Remove trailing semicolon if present (but keep for PL/SQL blocks)
-        if matches!(
-            Self::leading_keyword(sql_trimmed).as_deref(),
-            Some("BEGIN") | Some("DECLARE")
-        ) {
+        // Remove trailing semicolon if present (but keep for PL/SQL blocks
+        // and CREATE ... END; style definitions where END; is part of grammar).
+        if Self::should_preserve_trailing_semicolon_for_execute(sql_trimmed) {
             format!("{};", without_trailing_semicolons)
         } else {
             without_trailing_semicolons.to_string()
         }
+    }
+
+    fn should_preserve_trailing_semicolon_for_execute(sql: &str) -> bool {
+        if matches!(
+            Self::leading_keyword(sql).as_deref(),
+            Some("BEGIN") | Some("DECLARE")
+        ) {
+            return true;
+        }
+
+        let mut trailing_tokens = sql
+            .split_whitespace()
+            .rev()
+            .map(|token| token.trim_matches(|ch: char| !sql_text::is_identifier_char(ch)))
+            .filter(|token| !token.is_empty());
+
+        let Some(last_token) = trailing_tokens.next() else {
+            return false;
+        };
+
+        if last_token.eq_ignore_ascii_case("END") {
+            return true;
+        }
+
+        trailing_tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("END"))
     }
 
     fn strip_trailing_sqlplus_slash(sql: &str) -> &str {
