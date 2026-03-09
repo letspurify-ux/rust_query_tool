@@ -389,7 +389,13 @@ impl QueryExecutor {
             })
         }
 
-        fn parse_end_suffix_or_label_upper(line: &str) -> Option<String> {
+        #[derive(Default)]
+        struct EndSuffixOrLabel {
+            upper: String,
+            quoted_label: bool,
+        }
+
+        fn parse_end_suffix_or_label(line: &str) -> Option<EndSuffixOrLabel> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -422,11 +428,11 @@ impl QueryExecutor {
             }
 
             if i >= bytes.len() {
-                return Some(String::new());
+                return Some(EndSuffixOrLabel::default());
             }
 
             if bytes[i] == b';' {
-                return Some(String::new());
+                return Some(EndSuffixOrLabel::default());
             }
 
             if bytes[i] == b'"' {
@@ -445,18 +451,24 @@ impl QueryExecutor {
                     i += 1;
                 }
                 out.make_ascii_uppercase();
-                return Some(out);
+                return Some(EndSuffixOrLabel {
+                    upper: out,
+                    quoted_label: true,
+                });
             }
 
             if !sql_text::is_identifier_start_byte(bytes[i]) {
-                return Some(String::new());
+                return Some(EndSuffixOrLabel::default());
             }
             let start = i;
             i += 1;
             while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
                 i += 1;
             }
-            Some(line[start..i].to_ascii_uppercase())
+            Some(EndSuffixOrLabel {
+                upper: line[start..i].to_ascii_uppercase(),
+                quoted_label: false,
+            })
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
 
@@ -546,12 +558,14 @@ impl QueryExecutor {
             let innermost_case_depth = builder.state.innermost_case_depth();
             let at_case_header_level =
                 innermost_case_depth.is_some_and(|depth| depth + 1 == builder.block_depth());
-            let end_suffix_or_label_upper = if leading_is("END") {
-                parse_end_suffix_or_label_upper(line)
+            let end_suffix_or_label = if leading_is("END") {
+                parse_end_suffix_or_label(line)
             } else {
                 None
             };
-            let end_has_suffix = is_end_suffix_keyword(end_suffix_or_label_upper.as_deref());
+            let end_has_suffix = end_suffix_or_label
+                .as_ref()
+                .is_some_and(|tail| !tail.quoted_label && is_end_suffix_keyword(Some(&tail.upper)));
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
@@ -569,7 +583,9 @@ impl QueryExecutor {
                 && builder
                     .state
                     .plain_end_closes_parent_scope(
-                        end_suffix_or_label_upper.as_deref().unwrap_or_default(),
+                        end_suffix_or_label
+                            .as_ref()
+                            .map_or("", |tail| tail.upper.as_str()),
                     )
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
