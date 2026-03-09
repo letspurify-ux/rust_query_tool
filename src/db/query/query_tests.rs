@@ -8794,6 +8794,64 @@ END pkg_depth_q;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_end_if_with_label_keeps_if_depth() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_end_if_label AS
+BEGIN
+  IF 1 = 1 THEN
+    NULL;
+  END IF done_flag;
+END pkg_end_if_label;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF header");
+    let end_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END IF done_flag"))
+        .expect("expected END IF label");
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END pkg_end_if_label"))
+        .expect("expected package END");
+
+    assert_eq!(
+        depths[end_if_idx], depths[if_idx],
+        "END IF <label> should align with IF depth (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "package END should dedent to top-level after END IF <label> (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_qualified_quoted_end_label_closes_outer_scope() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY "Pkg.Ext" AS
+BEGIN
+  NULL;
+END owner."Pkg.Ext";"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END owner.\"Pkg.Ext\""))
+        .expect("expected qualified quoted package END");
+
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "qualified quoted package END should dedent to top-level (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
 fn test_split_script_items_package_body_with_is_if_else_exception_and_named_end_stays_single_statement() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_mix IS
   PROCEDURE p1 AS

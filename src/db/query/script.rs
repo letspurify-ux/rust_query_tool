@@ -435,39 +435,68 @@ impl QueryExecutor {
                 return Some(EndSuffixOrLabel::default());
             }
 
-            if bytes[i] == b'"' {
-                let mut out = String::new();
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            out.push('"');
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    out.push(bytes[i] as char);
+            let mut label_upper = String::new();
+            let mut saw_quoted_segment = false;
+            let mut saw_segment = false;
+
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                out.make_ascii_uppercase();
-                return Some(EndSuffixOrLabel {
-                    upper: out,
-                    quoted_label: true,
-                });
+
+                if i >= bytes.len() {
+                    break;
+                }
+
+                if bytes[i] == b'"' {
+                    saw_quoted_segment = true;
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                label_upper.push('"');
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            saw_segment = true;
+                            break;
+                        }
+                        label_upper.push((bytes[i] as char).to_ascii_uppercase());
+                        i += 1;
+                    }
+                } else if sql_text::is_identifier_start_byte(bytes[i]) {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    label_upper.push_str(&line[start..i].to_ascii_uppercase());
+                    saw_segment = true;
+                } else {
+                    break;
+                }
+
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+
+                if i < bytes.len() && bytes[i] == b'.' {
+                    label_upper.push('.');
+                    i += 1;
+                    continue;
+                }
+
+                break;
             }
 
-            if !sql_text::is_identifier_start_byte(bytes[i]) {
+            if !saw_segment {
                 return Some(EndSuffixOrLabel::default());
             }
-            let start = i;
-            i += 1;
-            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
-                i += 1;
-            }
+
             Some(EndSuffixOrLabel {
-                upper: line[start..i].to_ascii_uppercase(),
-                quoted_label: false,
+                upper: label_upper,
+                quoted_label: saw_quoted_segment,
             })
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;

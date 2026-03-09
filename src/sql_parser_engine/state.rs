@@ -327,10 +327,10 @@ impl SplitState {
             return true;
         }
 
-        token_upper
-            .rsplit('.')
-            .next()
-            .is_some_and(|segment| segment == package_name)
+        let mut qualified_suffix = String::with_capacity(package_name.len().saturating_add(1));
+        qualified_suffix.push('.');
+        qualified_suffix.push_str(package_name);
+        token_upper.ends_with(&qualified_suffix)
     }
 
     fn push_pending_end_label_segment(&mut self, token_upper: &str) {
