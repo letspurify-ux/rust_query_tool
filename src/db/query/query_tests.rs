@@ -8562,6 +8562,186 @@ fn test_line_block_depths_with_values_main_query_dedents_to_with_level() {
 }
 
 #[test]
+fn test_line_block_depths_nested_with_inside_outer_with_preserves_outer_depth() {
+    let sql = "WITH outer_cte AS (\n  WITH inner_cte AS (\n    SELECT 1 AS n FROM dual\n  )\n  SELECT n FROM inner_cte\n),\nouter_two AS (\n  SELECT n FROM outer_cte\n)\nSELECT * FROM outer_two;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let outer_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH OUTER_CTE")
+        })
+        .expect("expected outer WITH line");
+    let inner_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH INNER_CTE")
+        })
+        .expect("expected inner WITH line");
+    let inner_main_select_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT N FROM INNER_CTE")
+        })
+        .expect("expected inner main SELECT line");
+    let outer_two_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("OUTER_TWO AS (")
+        })
+        .expect("expected second CTE line");
+
+    assert!(
+        depths[inner_with_idx] > depths[outer_with_idx],
+        "nested WITH should be deeper than outer WITH (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[inner_main_select_idx], depths[inner_with_idx],
+        "inner main SELECT should align with nested WITH depth (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[outer_two_idx],
+        depths[outer_with_idx] + 1,
+        "after closing inner WITH, next outer CTE should stay in outer WITH CTE body depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_three_level_nested_with_keeps_outer_cte_depth() {
+    let sql = "WITH outer_cte AS (\n  WITH mid_cte AS (\n    WITH inner_cte AS (\n      SELECT 1 AS n FROM dual\n    )\n    SELECT n FROM inner_cte\n  )\n  SELECT n FROM mid_cte\n),\nouter_two AS (\n  SELECT n FROM outer_cte\n)\nSELECT * FROM outer_two;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let outer_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH OUTER_CTE")
+        })
+        .expect("expected outer WITH line");
+    let mid_with_idx = lines
+        .iter()
+        .position(|line| line.trim_start().to_uppercase().starts_with("WITH MID_CTE"))
+        .expect("expected middle WITH line");
+    let inner_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH INNER_CTE")
+        })
+        .expect("expected inner WITH line");
+    let outer_two_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("OUTER_TWO AS (")
+        })
+        .expect("expected second outer CTE line");
+    let outer_main_select_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT N FROM MID_CTE")
+        })
+        .expect("expected outer CTE main SELECT line");
+
+    assert!(
+        depths[mid_with_idx] > depths[outer_with_idx],
+        "mid WITH should be deeper than outer WITH (depths: {:?})",
+        depths
+    );
+    assert!(
+        depths[inner_with_idx] > depths[mid_with_idx],
+        "inner WITH should be deeper than mid WITH (depths: {:?})",
+        depths
+    );
+    assert!(
+        depths[outer_main_select_idx] > depths[outer_with_idx],
+        "outer CTE main SELECT should remain inside outer WITH depth (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[outer_two_idx],
+        depths[outer_with_idx] + 1,
+        "after nested WITH levels close, next outer CTE should stay in outer WITH CTE body depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_nested_with_in_second_outer_cte_preserves_outer_with_depth() {
+    let sql = "WITH outer_one AS (\n  SELECT 1 AS n FROM dual\n),\nouter_two AS (\n  WITH inner_cte AS (\n    SELECT 2 AS n FROM dual\n  )\n  SELECT n FROM inner_cte\n)\nSELECT * FROM outer_two;";
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let outer_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH OUTER_ONE")
+        })
+        .expect("expected outer WITH line");
+    let outer_two_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("OUTER_TWO AS (")
+        })
+        .expect("expected OUTER_TWO line");
+    let inner_with_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("WITH INNER_CTE")
+        })
+        .expect("expected inner WITH line");
+    let trailing_select_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start()
+                .to_uppercase()
+                .starts_with("SELECT * FROM OUTER_TWO")
+        })
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[outer_two_idx],
+        depths[outer_with_idx] + 1,
+        "second outer CTE should stay in outer WITH CTE body depth (depths: {:?})",
+        depths
+    );
+    assert!(
+        depths[inner_with_idx] > depths[outer_two_idx],
+        "nested WITH should be deeper than second outer CTE line (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[trailing_select_idx], depths[outer_with_idx],
+        "main SELECT should dedent back to outer WITH header depth (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
 fn test_line_block_depths_detects_values_subquery_head_after_open_paren() {
     let sql = "SELECT *\nFROM (\n  VALUES (1), (2)\n) AS t(n)\nWHERE n > 1;";
     let depths = QueryExecutor::line_block_depths(sql);
