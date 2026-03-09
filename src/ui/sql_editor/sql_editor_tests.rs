@@ -1708,30 +1708,39 @@ ORDER BY deptno,
 }
 
 #[test]
-fn format_sql_resets_paren_comma_suppression_after_top_level_semicolon() {
+fn format_sql_keeps_suppressed_comma_break_after_unbalanced_paren_semicolon() {
     let input = "SELECT func(a, b;\nSELECT c, d FROM dual";
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("SELECT\n    c,\n    d\nFROM DUAL;"),
-        "Comma wrapping should recover for next top-level statement after ';', got: {}",
+        formatted.contains("SELECT c, d\nFROM DUAL;"),
+        "Second statement should keep its original compact SELECT-line layout, got: {}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("SELECT\n    c,\n    d\nFROM DUAL;"),
+        "Invalid statement should not force SELECT-line break recovery pattern, got: {}",
         formatted
     );
 }
 
 #[test]
-fn format_sql_recovers_when_slash_appears_in_comment() {
-    let input = "SELECT 1 FROM dual;
--- /
-SELECT a, b FROM dual;";
+fn format_sql_slash_separator_does_not_force_next_statement_comma_wrapping() {
+    let input = "SELECT func(a, b;\n/\nSELECT c, d FROM dual";
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("SELECT a,\n    b\nFROM DUAL;"),
-        "Formatter should recover top-level statement splitting after comment slash, got: {}",
+        formatted.contains("SELECT c,\n    d\nFROM DUAL;"),
+        "Second statement should keep normal comma wrapping after slash separator, got: {}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("SELECT\n    c,\n    d\nFROM DUAL;"),
+        "Slash separator should not trigger forced SELECT-line break recovery pattern, got: {}",
         formatted
     );
 }
+
 #[test]
 fn format_sql_comment_parenthesis_does_not_affect_comma_newline() {
     let input = "SELECT a /* (comment) */, b FROM dual";
