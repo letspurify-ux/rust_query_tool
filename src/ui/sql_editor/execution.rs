@@ -353,11 +353,9 @@ impl SqlEditorWidget {
         };
         let rest = rest.trim_start();
 
-        crate::sql_text::starts_with_keyword_token(rest, "IF")
-            || crate::sql_text::starts_with_keyword_token(rest, "LOOP")
-            || crate::sql_text::starts_with_keyword_token(rest, "CASE")
-            || crate::sql_text::starts_with_keyword_token(rest, "WHILE")
-            || crate::sql_text::starts_with_keyword_token(rest, "FOR")
+        FORMAT_BLOCK_END_QUALIFIER_KEYWORDS
+            .iter()
+            .any(|keyword| crate::sql_text::starts_with_keyword_token(rest, keyword))
     }
 
     fn starts_with_plain_end(trimmed_upper: &str) -> bool {
@@ -8888,7 +8886,11 @@ END if_owner;"#;
     fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END CASE"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END REPEAT"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FOR"));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END WHILE"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
     }
@@ -8897,8 +8899,12 @@ END if_owner;"#;
     fn starts_with_plain_end_excludes_qualified_end_suffixes() {
         assert!(SqlEditorWidget::starts_with_plain_end("END"));
         assert!(SqlEditorWidget::starts_with_plain_end("END pkg;"));
+        assert!(SqlEditorWidget::starts_with_plain_end("END FOR"));
+        assert!(SqlEditorWidget::starts_with_plain_end("END WHILE"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END IF;"));
         assert!(!SqlEditorWidget::starts_with_plain_end("END LOOP"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END CASE"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END REPEAT"));
     }
 
     #[test]
