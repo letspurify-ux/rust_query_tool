@@ -258,12 +258,12 @@ impl SqlParserEngine {
                     this.split_current_and_reset_external_boundary();
                 } else if this
                     .state
-                    .should_split_before_implicit_external_begin_block(candidate_upper)
+                    .should_split_before_external_begin_block(candidate_upper)
                 {
                     this.split_current_and_reset_external_boundary();
                 } else if this
                     .state
-                    .should_split_before_implicit_external_statement_head(candidate_upper)
+                    .should_split_before_external_statement_head(candidate_upper)
                 {
                     this.split_current_and_reset_external_boundary();
                 } else if this.state.pending_implicit_external_top_level_split {
