@@ -358,7 +358,6 @@ impl SqlEditorWidget {
         rest.is_empty() || rest.starts_with(';')
     }
 
-
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
         sanitized.clear_password();
@@ -826,6 +825,14 @@ impl SqlEditorWidget {
         crate::sql_text::is_sqlplus_comment_line(statement)
     }
 
+    fn is_comment_or_blank_line(trimmed: &str) -> bool {
+        trimmed.is_empty()
+            || Self::is_sqlplus_comment_line(trimmed)
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || trimmed == "*/"
+    }
+
     fn is_create_trigger_statement(statement: &str) -> bool {
         let mut word_idx = 0usize;
         let mut has_trigger_in_prefix = false;
@@ -884,8 +891,7 @@ impl SqlEditorWidget {
             .split_whitespace()
             .next()
             .is_some_and(|first_word| {
-                first_word.eq_ignore_ascii_case("REM")
-                    || first_word.eq_ignore_ascii_case("REMARK")
+                first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK")
             })
     }
 
@@ -2359,13 +2365,14 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let previous_line_is_plain_end = last_code_line_trimmed.as_deref().is_some_and(|prev| {
-                let prev_upper = prev.to_ascii_uppercase();
-                Self::starts_with_plain_end(&prev_upper)
-            });
+            let previous_line_is_plain_end =
+                last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    let prev_upper = prev.to_ascii_uppercase();
+                    Self::starts_with_plain_end(&prev_upper)
+                });
             let next_significant_line_trimmed = lines.iter().skip(idx + 1).find_map(|next| {
                 let next_trimmed = next.trim_start();
-                if next_trimmed.is_empty() || Self::is_sqlplus_comment_line(next_trimmed) {
+                if Self::is_comment_or_blank_line(next_trimmed) {
                     return None;
                 }
                 Some(next_trimmed)
@@ -3534,8 +3541,7 @@ impl SqlEditorWidget {
                                                 (Vec::new(), Vec::new())
                                             } else {
                                                 SqlEditorWidget::collect_print_all_data(
-                                                    &guard,
-                                                    &null_text,
+                                                    &guard, &null_text,
                                                 )
                                             }
                                         };
@@ -8619,9 +8625,7 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_regression_tests {
-    use super::{
-        QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH,
-    };
+    use super::{QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH};
     use crate::db::SessionState;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -8821,7 +8825,6 @@ END oqt_mega_pkg;"#;
         );
     }
 
-
     #[test]
     fn package_body_named_end_with_if_prefix_is_not_treated_as_end_if_suffix() {
         let sql = r#"CREATE OR REPLACE PACKAGE BODY if_owner AS
@@ -8852,6 +8855,85 @@ END if_owner;"#;
         assert!(
             end_if_line.is_some_and(|line| line.starts_with("        ")),
             "Nested END IF should remain more indented than END package label, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_named_end_keeps_depth_across_multiline_block_comment() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+PROCEDURE p IS
+BEGIN
+  IF 1 = 1 THEN
+    NULL;
+  END IF;
+  /* keep pending end label scope
+     across multiline comment */
+END p;
+END demo_pkg;
+/"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let end_if_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END IF;"));
+        assert!(
+            end_if_line.is_some_and(|line| line.starts_with("        ")),
+            "END IF should keep nested depth before named END, got:\n{}",
+            formatted
+        );
+
+        let end_proc_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END p;"));
+        assert!(
+            end_proc_line.is_some_and(|line| line.starts_with("    ")),
+            "Procedure END label should keep procedure depth after multiline block comment, got:\n{}",
+            formatted
+        );
+
+        let end_pkg_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END demo_pkg;"));
+        assert!(
+            end_pkg_line.is_some_and(|line| !line.starts_with(' ')),
+            "Package END label should stay at top-level depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_named_end_keeps_depth_after_end_loop_with_multiline_block_comment() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
+PROCEDURE p IS
+BEGIN
+  FOR i IN 1..2 LOOP
+    NULL;
+  END LOOP;
+  /* keep pending end label scope
+     across multiline comment */
+END p;
+END demo_pkg;
+/"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let end_loop_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END LOOP;"));
+        assert!(
+            end_loop_line.is_some_and(|line| line.starts_with("        ")),
+            "END LOOP should keep loop depth before named END, got:
+{}",
+            formatted
+        );
+
+        let end_proc_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END p;"));
+        assert!(
+            end_proc_line.is_some_and(|line| line.starts_with("    ")),
+            "Procedure END label should keep procedure depth after multiline block comment, got:
 {}",
             formatted
         );
@@ -8934,15 +9016,31 @@ END;"#;
 
     #[test]
     fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END CASE"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END REPEAT"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF;"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END LOOP"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END CASE"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END REPEAT"
+        ));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END FOR"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END WHILE"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FOR"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END WHILE"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF_OWNER;"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FORWARD;"
+        ));
     }
 
     #[test]
@@ -9304,7 +9402,10 @@ END;"#;
         match message {
             QueryProgress::Rows { index, rows } => {
                 assert_eq!(index, 9);
-                assert_eq!(rows, vec![vec!["(null)".to_string()], vec!["2".to_string()]]);
+                assert_eq!(
+                    rows,
+                    vec![vec!["(null)".to_string()], vec!["2".to_string()]]
+                );
             }
             _ => panic!("expected QueryProgress::Rows"),
         }
@@ -9627,8 +9728,7 @@ FROM DUAL"
 
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
         assert_eq!(
-            preserved,
-            "-- existing; comment semicolon",
+            preserved, "-- existing; comment semicolon",
             "Semicolon inside comment-only selections should not be removed"
         );
     }
@@ -9661,7 +9761,11 @@ FROM DUAL"
 
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.contains("REM keep this exact comment"), "{}", formatted);
+        assert!(
+            formatted.contains("REM keep this exact comment"),
+            "{}",
+            formatted
+        );
         assert!(formatted.contains("REMARK Keep;This;Too"), "{}", formatted);
         assert!(formatted.contains("SELECT 1\nFROM DUAL;"), "{}", formatted);
     }
