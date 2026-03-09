@@ -2248,12 +2248,62 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("( -- inline comment\n            CASE\n                WHEN score > 10 THEN 'HIGH'"),
+        formatted.contains("( -- inline comment\n                CASE\n                    WHEN score > 10 THEN 'HIGH'"),
         "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
     );
     assert!(
         formatted.contains("END\n            ) AS bucket"),
         "CASE END and close paren should stay aligned in OPEN FOR expression, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_nested_subquery_case_start_with_inline_comment_keeps_case_depth() {
+    let input = r#"SELECT
+u.user_id,
+(SELECT -- score bucket
+CASE
+WHEN s.score >= 90 THEN 'A'
+WHEN s.score >= 80 THEN 'B'
+ELSE 'C'
+END
+FROM scores s
+WHERE s.user_id = u.user_id) AS score_bucket
+FROM users u;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("SELECT -- score bucket\n            CASE\n                WHEN s.score >= 90 THEN 'A'"),
+        "Nested subquery CASE should keep depth when SELECT line has inline comment, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("ELSE 'C'\n            END\n        FROM scores s"),
+        "CASE END should align with CASE header in nested subquery, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_nested_subquery_case_with_inline_comment_keeps_case_depth() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT
+(SELECT -- nested bucket
+CASE
+WHEN t.score > 0 THEN 'Y'
+ELSE 'N'
+END
+FROM dual) AS bucket
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("SELECT -- nested bucket\n                CASE\n                    WHEN t.score > 0 THEN 'Y'"),
+        "OPEN FOR nested subquery CASE should keep depth with inline comment, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("ELSE 'N'\n                END\n            FROM DUAL"),
+        "Nested CASE END should stay aligned inside OPEN FOR subquery, got: {formatted}"
     );
 }
 
