@@ -2411,6 +2411,9 @@ impl SqlEditorWidget {
                 into_list_active = true;
             }
             if trimmed.ends_with(';') {
+                into_list_active = false;
+            }
+            if trimmed.ends_with(';') {
                 in_dml_statement = false;
             }
             last_code_line_trimmed = Some(trimmed.to_string());
@@ -8909,6 +8912,50 @@ END;"#;
         assert!(
             !formatted.contains("        ELSIF v_col1 = 1 THEN"),
             "ELSIF should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_statement_after_returning_into_does_not_keep_extra_into_indent() {
+        let sql = r#"BEGIN
+  UPDATE emp
+  SET sal = sal + 1
+  RETURNING empno
+  INTO v_empno;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    NULL;"),
+            "line after RETURNING INTO should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        NULL;"),
+            "line after RETURNING INTO should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_statement_after_fetch_into_does_not_keep_extra_into_indent() {
+        let sql = r#"BEGIN
+  FETCH c1
+  INTO v_empno;
+  v_total := v_total + 1;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    v_total := v_total + 1;"),
+            "line after FETCH INTO should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        v_total := v_total + 1;"),
+            "line after FETCH INTO should not keep stale INTO-list extra indent, got:\n{}",
             formatted
         );
     }
