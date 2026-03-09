@@ -2304,7 +2304,7 @@ impl SqlEditorWidget {
             let trimmed_upper = trimmed.to_ascii_uppercase();
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
-                .is_some_and(|prev| prev.ends_with('('));
+                .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
             let starts_paren_case_expression = !in_dml_statement
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                 && previous_line_ends_with_open_paren;
@@ -2615,6 +2615,22 @@ impl SqlEditorWidget {
         }
 
         continuation_lines
+    }
+
+    fn line_ends_with_open_paren_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    let trailing_symbol = sym.trim_end();
+                    return trailing_symbol.ends_with('(');
+                }
+                _ => return false,
+            }
+        }
+
+        false
     }
 
     fn is_plsql_like_tokens(statement: &str, tokens: &[SqlToken]) -> bool {
