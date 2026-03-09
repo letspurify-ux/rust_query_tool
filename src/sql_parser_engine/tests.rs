@@ -5656,3 +5656,53 @@ fn slash_terminator_with_block_comment_then_line_comment_is_consumed() {
     assert!(statements[0].starts_with("BEGIN"));
     assert_eq!(statements[1], "SELECT 47 FROM dual".to_string());
 }
+
+#[test]
+fn oracle_external_name_identifier_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_name_ident RETURN NUMBER");
+    engine.process_line("AS EXTERNAL LANGUAGE C NAME ext_symbol;");
+    engine.process_line("SELECT 48 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS EXTERNAL LANGUAGE C NAME ext_symbol"),
+        "external call spec should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 48 FROM dual".to_string());
+}
+
+#[test]
+fn oracle_external_name_quoted_identifier_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_name_qident RETURN NUMBER");
+    engine.process_line("AS EXTERNAL LANGUAGE C NAME \"Ext$Sym\";");
+    engine.process_line("SELECT 49 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS EXTERNAL LANGUAGE C NAME \"Ext$Sym\""),
+        "quoted identifier target should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 49 FROM dual".to_string());
+}
+
+#[test]
+fn oracle_external_language_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_external_no_semi RETURN NUMBER");
+    engine.process_line("AS EXTERNAL LANGUAGE C");
+    engine.process_line("SELECT 50 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS EXTERNAL LANGUAGE C"));
+    assert_eq!(statements[1], "SELECT 50 FROM dual".to_string());
+}

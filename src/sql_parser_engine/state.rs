@@ -65,13 +65,17 @@ impl SplitState {
             .filter(|frame| frame.block_depth == current_depth)
     }
 
-    fn should_split_before_implicit_external_begin_block(&self, token_upper: &str) -> bool {
+    fn should_split_before_external_begin_block(&self, token_upper: &str) -> bool {
         if token_upper != "BEGIN" {
             return false;
         }
 
         if self.block_depth() != 1 || self.paren_depth != 0 {
             return false;
+        }
+
+        if self.should_split_on_semicolon() {
+            return true;
         }
 
         self.active_routine_frame().is_some_and(|frame| {
@@ -83,7 +87,7 @@ impl SplitState {
         })
     }
 
-    fn should_split_before_implicit_external_statement_head(&self, token_upper: &str) -> bool {
+    fn should_split_before_external_statement_head(&self, token_upper: &str) -> bool {
         if self.block_depth() != 1 || self.paren_depth != 0 {
             return false;
         }
@@ -92,6 +96,10 @@ impl SplitState {
             || sql_text::is_external_language_clause_keyword(token_upper)
         {
             return false;
+        }
+
+        if self.should_split_on_semicolon() {
+            return true;
         }
 
         self.active_routine_frame().is_some_and(|frame| {
