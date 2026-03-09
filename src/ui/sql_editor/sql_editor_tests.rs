@@ -1911,10 +1911,10 @@ fn format_sql_filtered_cte_with_window_function_exact_layout() {
     SELECT *
     FROM enriched
     WHERE (sal > (
-        SELECT AVG (sal)
-        FROM oqt_t_emp
-        WHERE deptno = enriched.deptno
-    ))
+            SELECT AVG (sal)
+            FROM oqt_t_emp
+            WHERE deptno = enriched.deptno
+        ))
         OR (job IN ('MANAGER', 'ANALYST')
             AND sal >= 2500)
 )
@@ -2252,8 +2252,8 @@ END;"#;
         "OPEN FOR nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n            ) AS bucket"),
-        "CASE END and close paren should stay aligned in OPEN FOR expression, got: {formatted}"
+        formatted.contains("END\n        ) AS bucket"),
+        "CASE END and close paren should stay in OPEN FOR expression depth context, got: {formatted}"
     );
 }
 

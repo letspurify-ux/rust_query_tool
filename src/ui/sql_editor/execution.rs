@@ -2109,13 +2109,12 @@ impl SqlEditorWidget {
                                         WithCteFormatState::InDefinitions { .. }
                                     ) && matches!(prev_word_upper.as_deref(), Some("AS"));
                                 let deep_subquery_indent =
-                                    matches!(current_clause.as_deref(), Some("SELECT" | "FROM"))
-                                        && !in_cte_as_subquery
-                                        || (matches!(current_clause.as_deref(), Some("WHERE"))
-                                            && matches!(
-                                                prev_word_upper.as_deref(),
-                                                Some("EXISTS" | "IN")
-                                            ));
+                                    (matches!(current_clause.as_deref(), Some("SELECT" | "FROM"))
+                                        && !in_cte_as_subquery)
+                                        || matches!(
+                                            current_clause.as_deref(),
+                                            Some("WHERE" | "HAVING")
+                                        );
                                 if is_subquery && deep_subquery_indent {
                                     2
                                 } else {
@@ -9970,6 +9969,53 @@ FROM DUAL"
         .join("\n");
 
         assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_where_scalar_subquery_with_nested_depth() {
+        let sql =
+            "SELECT * FROM orders o WHERE o.amount > (SELECT AVG(amount) FROM orders_archive oa WHERE oa.customer_id = o.customer_id);";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT *",
+            "FROM orders o",
+            "WHERE o.amount > (",
+            "        SELECT AVG (amount)",
+            "        FROM orders_archive oa",
+            "        WHERE oa.customer_id = o.customer_id",
+            "    );",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_having_scalar_subquery_with_nested_depth() {
+        let sql = "SELECT deptno, COUNT(*) cnt FROM emp GROUP BY deptno HAVING COUNT(*) > (SELECT AVG(team_cnt) FROM dept_summary ds WHERE ds.region = 'EAST');";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("HAVING COUNT (\n        *\n    ) > ("),
+            "HAVING scalar subquery should start on a new deep line, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        SELECT AVG (team_cnt)"),
+            "HAVING scalar subquery SELECT should keep nested depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        FROM dept_summary ds"),
+            "HAVING scalar subquery FROM should keep nested depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        WHERE ds.region = 'EAST'"),
+            "HAVING scalar subquery WHERE should keep nested depth, got:\n{}",
+            formatted
+        );
     }
 }
 
