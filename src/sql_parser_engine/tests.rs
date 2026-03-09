@@ -173,12 +173,28 @@ fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
 
     assert_eq!(
         forced_external.line_boundary_action(block_comment_marker, false),
-        LineBoundaryAction::SplitBeforeLine
+        LineBoundaryAction::SplitAndConsumeLine
     );
     assert_eq!(
         forced_external.line_boundary_action(pure_marker, false),
         LineBoundaryAction::SplitAndConsumeLine
     );
+}
+
+#[test]
+fn slash_terminator_with_block_comment_is_consumed_after_plsql_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+    engine.process_line("/ /* keep */");
+    engine.process_line("SELECT 53 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].starts_with("BEGIN"));
+    assert_eq!(statements[1], "SELECT 53 FROM dual".to_string());
 }
 
 #[test]
@@ -4593,8 +4609,8 @@ fn external_language_clause_splits_before_slash_line_with_block_comment() {
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS LANGUAGE C"));
     assert!(
-        statements[1].starts_with("/ /* rerun external */\nSELECT 251 FROM dual"),
-        "slash line with block comment should start the next statement: {}",
+        statements[1].starts_with("SELECT 251 FROM dual"),
+        "slash line with block comment should be consumed as terminator: {}",
         statements[1]
     );
 }

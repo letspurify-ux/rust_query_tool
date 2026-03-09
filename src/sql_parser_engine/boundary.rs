@@ -610,7 +610,10 @@ pub(crate) enum SlashLineKind {
 
 impl SlashLineKind {
     pub(crate) fn consumes_as_terminator(self) -> bool {
-        matches!(self, Self::PureTerminator | Self::SqlPlusRemark)
+        matches!(
+            self,
+            Self::PureTerminator | Self::BlockComment | Self::SqlPlusRemark
+        )
     }
 }
 
