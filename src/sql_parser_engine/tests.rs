@@ -308,6 +308,56 @@ fn create_type_body_member_function_splits_before_trailing_select() {
 }
 
 #[test]
+fn package_body_init_section_without_end_label_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_init_no_label AS");
+    engine.process_line("  PROCEDURE p IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END p;");
+    engine.process_line("BEGIN");
+    engine.process_line("  p;");
+    engine.process_line("END;");
+    engine.process_line("SELECT 99 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("BEGIN\n  p;\nEND"),
+        "package body initialization section should remain in first statement: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 99 FROM dual"));
+}
+
+
+#[test]
+fn package_body_init_section_with_quoted_end_label_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_init_quoted AS");
+    engine.process_line("  PROCEDURE p IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END p;");
+    engine.process_line("BEGIN");
+    engine.process_line("  p;");
+    engine.process_line("END \"pkg_init_quoted\";");
+    engine.process_line("SELECT 100 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"pkg_init_quoted\""),
+        "quoted package body END label should remain in first statement: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 100 FROM dual"));
+}
+#[test]
 fn declare_begin_state_machine_tracks_pending_begin() {
     let mut state = SplitState::default();
 
