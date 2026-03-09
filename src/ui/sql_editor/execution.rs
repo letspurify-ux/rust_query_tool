@@ -1195,6 +1195,11 @@ impl SqlEditorWidget {
         let mut statement_has_with_clause = false;
         let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
         let mut trigger_header_state = TriggerHeaderState::None;
+        let is_package_body_statement = {
+            let upper = statement.to_ascii_uppercase();
+            upper.contains("CREATE OR REPLACE PACKAGE BODY")
+                || upper.contains("CREATE PACKAGE BODY")
+        };
 
         let newline_with = |out: &mut String,
                             indent_level: usize,
@@ -1278,6 +1283,7 @@ impl SqlEditorWidget {
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
+                    let at_package_body_member_depth = is_package_body_statement && indent_level == 1;
                     if upper == "END" {
                         let end_qualifier = {
                             let mut qualifier = None;
@@ -1383,13 +1389,21 @@ impl SqlEditorWidget {
                                 }
                             }
                             if matches!(closed_block.as_deref(), Some("BEGIN" | "DECLARE"))
-                                && block_stack.last().is_some_and(|s| s == "PACKAGE_BODY")
+                                && (block_stack.last().is_some_and(|s| s == "PACKAGE_BODY")
+                                    || at_package_body_member_depth)
                             {
                                 pending_package_member_separator = true;
                             }
                         }
 
                         indent_level = indent_level.saturating_sub(1);
+                        if is_package_body_statement
+                            && !is_qualified_end
+                            && !case_expression_end
+                            && indent_level == 1
+                        {
+                            pending_package_member_separator = true;
+                        }
                         let end_extra =
                             if case_expression_end && (in_sql_case_clause || !in_plsql_block) {
                                 1
@@ -1534,7 +1548,8 @@ impl SqlEditorWidget {
                         }
                         create_pending = false;
                     } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
-                        && block_stack.iter().any(|s| s == "PACKAGE_BODY")
+                        && (block_stack.iter().any(|s| s == "PACKAGE_BODY")
+                            || at_package_body_member_depth)
                     {
                         if !at_line_start {
                             newline_with(

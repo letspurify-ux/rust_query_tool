@@ -63,10 +63,13 @@ enum PlainEndParentClosure {
 impl SplitState {
     fn plain_end_parent_closure(&self, token_upper: &str) -> PlainEndParentClosure {
         let top = self.block_stack.last().copied();
+        let closes_active_routine_declare = self
+            .active_routine_frame()
+            .is_some_and(|frame| frame.block_depth == self.block_depth());
 
         if top == Some(BlockKind::Declare)
             && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
-            && self.pending_subprogram_begins > 0
+            && closes_active_routine_declare
         {
             return PlainEndParentClosure::NestedSubprogramDeclaration;
         }
@@ -886,13 +889,13 @@ impl SplitState {
                 .routine_is_stack
                 .last()
                 .is_some_and(|frame| frame.block_depth == self.block_depth());
-            if self.begin_state == BeginState::AfterDeclare {
-                // DECLARE ... BEGIN – same block, don't push
-                self.begin_state = BeginState::None;
-            } else if begins_pending_routine_body {
+            if begins_pending_routine_body {
                 // AS/IS ... BEGIN – same block
                 let _ = self.routine_is_stack.pop();
                 self.pending_subprogram_begins = self.pending_subprogram_begins.saturating_sub(1);
+            } else if self.begin_state == BeginState::AfterDeclare {
+                // DECLARE ... BEGIN – same block, don't push
+                self.begin_state = BeginState::None;
             } else {
                 self.block_stack.push(BlockKind::Begin);
             }
@@ -973,10 +976,13 @@ impl SplitState {
 
     pub(crate) fn plain_end_closes_parent_scope(&self, token_upper: &str) -> bool {
         let top = self.block_stack.last().copied();
+        let closes_active_routine_declare = self
+            .active_routine_frame()
+            .is_some_and(|frame| frame.block_depth == self.block_depth());
 
         if top == Some(BlockKind::Declare)
             && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
-            && self.pending_subprogram_begins > 0
+            && closes_active_routine_declare
         {
             return true;
         }

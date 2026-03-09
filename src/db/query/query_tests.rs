@@ -13170,6 +13170,98 @@ END pkg_nested_ex;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_nested_labeled_declare_does_not_close_parent_routine() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+  PROCEDURE validate_and_process (p_root_id IN NUMBER, p_mode IN VARCHAR2 DEFAULT 'NORMAL') IS
+    PROCEDURE apply_one (p_pos IN PLS_INTEGER) IS
+      l_score NUMBER := 0;
+    BEGIN
+      <<inner_rules>>
+      DECLARE
+        l_counter PLS_INTEGER := 0;
+      BEGIN
+        NULL;
+      EXCEPTION
+        WHEN OTHERS THEN
+          AUDIT ('INNER_RULES', 'inner_rules failed');
+      END inner_rules;
+      CASE
+        WHEN l_score >= 150 THEN
+          NULL;
+        ELSE
+          NULL;
+      END CASE;
+    EXCEPTION
+      WHEN OTHERS THEN
+        RAISE;
+    END apply_one;
+  BEGIN
+    NULL;
+  END validate_and_process;
+
+  PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS
+    l_modes t_vc_aat;
+    l_snapshot CLOB;
+  BEGIN
+    NULL;
+  END run_extreme;
+END fmt_pkg_extreme;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let apply_one_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE apply_one"))
+        .expect("expected PROCEDURE apply_one line");
+    let end_inner_rules_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END inner_rules"))
+        .expect("expected END inner_rules line");
+    let case_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "CASE")
+        .expect("expected CASE line");
+    let exception_idx = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start() == "EXCEPTION")
+        .nth(1)
+        .map(|(idx, _)| idx)
+        .expect("expected apply_one EXCEPTION line");
+    let validate_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE validate_and_process"))
+        .expect("expected validate_and_process header line");
+    let run_extreme_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE run_extreme"))
+        .expect("expected run_extreme header line");
+    let run_extreme_decl_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "l_snapshot CLOB;")
+        .expect("expected run_extreme declaration line");
+
+    assert_eq!(
+        depths[end_inner_rules_idx], depths[case_idx],
+        "CASE after labeled inner DECLARE block should stay in the same parent routine depth: {depths:?}"
+    );
+    assert_eq!(
+        depths[exception_idx], depths[apply_one_idx],
+        "nested routine EXCEPTION should align with its PROCEDURE header depth: {depths:?}"
+    );
+    assert_eq!(
+        depths[validate_idx], depths[run_extreme_idx],
+        "package body member headers should keep the same depth after previous nested blocks: {depths:?}"
+    );
+    assert_eq!(
+        depths[run_extreme_decl_idx],
+        depths[run_extreme_idx].saturating_add(1),
+        "next package body member declarations should remain nested under the recovered member header: {depths:?}"
+    );
+}
+
+#[test]
 fn test_line_block_depths_standalone_nested_exception_blocks() {
     // Same nested exception pattern in standalone routine to cover non-package path.
     let sql = r#"CREATE OR REPLACE PROCEDURE p_nested_ex IS
@@ -13196,6 +13288,73 @@ END p_nested_ex;"#;
         "standalone nested exception blocks depth mismatch: {depths:?}"
     );
 }
+
+#[test]
+fn test_line_block_depths_anonymous_block_with_local_procedure_and_nested_exception_blocks() {
+    let sql = r#"DECLARE
+  v NUMBER := 0;
+  PROCEDURE bump(p IN OUT NUMBER) IS
+  BEGIN
+    p := p + 1;
+  END;
+BEGIN
+  <<blk1>>
+  DECLARE
+    a NUMBER := 0;
+  BEGIN
+    FOR i IN 1..3 LOOP
+      bump(a);
+
+      <<blk2>>
+      DECLARE
+        b NUMBER := 0;
+      BEGIN
+        WHILE b < 3 LOOP
+          b := b + 1;
+
+          BEGIN
+            IF (i = 2 AND b = 2) THEN
+              RAISE_APPLICATION_ERROR(-20002, 'forced nested error i=2 b=2');
+            END IF;
+
+            CASE
+              WHEN MOD(i+b,2)=0 THEN
+                v := v + 10;
+              ELSE
+                v := v + 1;
+            END CASE;
+
+          EXCEPTION
+            WHEN OTHERS THEN
+              DBMS_OUTPUT.PUT_LINE('[ANON] caught='||SQLERRM||' -> re-raise once');
+              IF i = 2 AND b = 2 THEN
+                RAISE;
+              END IF;
+          END;
+
+        END LOOP;
+      END blk2;
+
+    END LOOP;
+  END blk1;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('[ANON] top exception handled: '||SQLERRM);
+END;
+/"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![
+        0, 1, 1, 1, 2, 1, 0, 1, 1, 2, 1, 2, 3, 3, 3, 3, 4, 3, 4, 5, 5, 5, 6, 7, 6, 6, 6, 7, 8,
+        7, 8, 6, 6, 5, 6, 7, 7, 8, 7, 5, 5, 4, 3, 3, 2, 1, 1, 0, 1, 2, 0, 0,
+    ];
+    assert_eq!(
+        depths, expected,
+        "anonymous block with local procedure should keep nested BEGIN/EXCEPTION depths balanced: {depths:?}"
+    );
+}
+
 #[test]
 fn test_line_block_depths_package_body_exception_with_split_end_name() {
     // Package body function with EXCEPTION handler and split END / name on next line.

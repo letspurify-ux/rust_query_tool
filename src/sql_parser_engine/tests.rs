@@ -6148,6 +6148,38 @@ fn package_body_local_nested_subprograms_keep_member_and_initializer_depths() {
 }
 
 #[test]
+fn anonymous_declare_keeps_pending_begin_after_local_subprogram_body() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("DECLARE");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("  PROCEDURE bump IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  BEGIN");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "local subprogram body BEGIN should not consume the outer DECLARE ... BEGIN depth"
+    );
+    engine.process_line("    NULL;");
+    engine.process_line("  END;");
+    assert_eq!(engine.block_depth(), 1);
+    assert_eq!(
+        engine.state.pending_subprogram_begins, 0,
+        "local subprogram END should clear pending subprogram begin tracking"
+    );
+    engine.process_line("BEGIN");
+    assert_eq!(
+        engine.block_depth(),
+        1,
+        "outer anonymous block BEGIN should remain at DECLARE depth after local subprogram"
+    );
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+    assert_eq!(engine.block_depth(), 0);
+}
+
+#[test]
 fn package_body_torture_blocks_remain_single_statement_until_terminator() {
     let mut engine = SqlParserEngine::new();
 

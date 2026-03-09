@@ -3231,6 +3231,86 @@ SELECT audit_id,
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(formatted, formatted_again);
 }
+
+#[test]
+fn format_sql_fmt_pkg_extreme_package_body_keeps_member_recovery_after_nested_exception_sections() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+    PROCEDURE validate_and_process (p_root_id IN NUMBER, p_mode IN VARCHAR2 DEFAULT 'NORMAL') IS
+        PROCEDURE apply_one (p_pos IN PLS_INTEGER) IS
+            l_score NUMBER := 0;
+        BEGIN
+            <<inner_rules>>
+            DECLARE
+                l_counter PLS_INTEGER := 0;
+            BEGIN
+                NULL;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    AUDIT ('INNER_RULES', 'inner_rules failed');
+            END inner_rules;
+        CASE
+            WHEN l_score >= 150 THEN
+                NULL;
+            ELSE
+                NULL;
+        END CASE;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RAISE;
+        END apply_one;
+    BEGIN
+        BEGIN
+            EXECUTE IMMEDIATE q'[
+                SELECT COUNT(*)
+                  FROM fmtx_unit
+                 WHERE parent_id = :x
+            ]'
+            INTO l_count USING p_root_id;
+            AUDIT ('SUMMARY', 'root_id=' || p_root_id);
+    EXCEPTION
+        WHEN OTHERS THEN
+            AUDIT ('SUMMARY_ERR', 'summary failed for root_id=' || p_root_id);
+END;
+
+EXCEPTION
+    WHEN e_bad_mode THEN AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);
+
+RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);
+
+    WHEN OTHERS THEN AUDIT ('FATAL', 'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM);
+
+RAISE;
+
+END validate_and_process;
+
+PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS l_modes t_vc_aat;
+
+l_snapshot CLOB;
+
+BEGIN
+    NULL;
+END run_extreme;
+END fmt_pkg_extreme;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("END inner_rules;\n            CASE"),
+        "statement after labeled inner block should stay in the same procedure body depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "EXCEPTION\n        WHEN e_bad_mode THEN\n            AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);\n            RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);"
+        ),
+        "package member exception handlers should expand inline THEN bodies into the exception block, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "END validate_and_process;\n\n    PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS\n        l_modes t_vc_aat;\n        l_snapshot CLOB;"
+        ),
+        "formatter should recover package body member context before the next procedure declaration, got: {formatted}"
+    );
+}
 #[test]
 fn format_sql_declare_begin_pre_dedent() {
     let input = r#"DECLARE
