@@ -517,27 +517,25 @@ impl QueryExecutor {
             }
             i += 3;
 
-            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| {
-                loop {
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-                        return i;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        i += 2;
-                        while i + 1 < bytes.len() {
-                            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                                i += 2;
-                                break;
-                            }
-                            i += 1;
-                        }
-                        continue;
-                    }
+            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                     return i;
                 }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                return i;
             };
 
             i = skip_ws_and_inline_comments(bytes, i);
@@ -654,11 +652,13 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let pending_end_label_continuation = leading_identifier_chain.as_ref().is_some_and(
-                |identifier_chain| {
-                    identifier_chain.contains('.') || !is_non_label_control_keyword(leading_word)
-                },
-            );
+            let pending_end_label_continuation =
+                leading_identifier_chain
+                    .as_ref()
+                    .is_some_and(|identifier_chain| {
+                        identifier_chain.contains('.')
+                            || !is_non_label_control_keyword(leading_word)
+                    });
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -742,21 +742,47 @@ impl QueryExecutor {
                 && leading_is("END")
                 && !end_has_suffix;
 
-            let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
-                builder.block_depth().saturating_sub(1)
+            let package_scope_asis_count = builder
+                .state
+                .block_stack
+                .iter()
+                .filter(|kind| **kind == crate::sql_parser_engine::BlockKind::AsIs)
+                .count();
+            let in_package_subprogram_scope = package_scope_asis_count >= 2;
+
+            let package_member_exception_line = if leading_is("EXCEPTION") {
+                let asis_count = builder
+                    .state
+                    .block_stack
+                    .iter()
+                    .filter(|kind| **kind == crate::sql_parser_engine::BlockKind::AsIs)
+                    .count();
+                let begin_count = builder
+                    .state
+                    .block_stack
+                    .iter()
+                    .filter(|kind| **kind == crate::sql_parser_engine::BlockKind::Begin)
+                    .count();
+                asis_count >= 2 && begin_count == 1
             } else {
-                builder.block_depth()
+                false
             };
+
+            let mut block_depth_component =
+                if leading_word.is_some_and(should_pre_dedent) && !package_member_exception_line {
+                    builder.block_depth().saturating_sub(1)
+                } else {
+                    builder.block_depth()
+                };
 
             if leading_is("END")
                 && !end_has_suffix
-                && builder
-                    .state
-                    .plain_end_closes_parent_scope(
-                        end_suffix_or_label
-                            .as_ref()
-                            .map_or("", |tail| tail.upper.as_str()),
-                    )
+                && !in_package_subprogram_scope
+                && builder.state.plain_end_closes_parent_scope(
+                    end_suffix_or_label
+                        .as_ref()
+                        .map_or("", |tail| tail.upper.as_str()),
+                )
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -771,9 +797,10 @@ impl QueryExecutor {
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                     let label_upper = leading_identifier_chain.clone().unwrap_or_default();
-                    if builder
-                        .state
-                        .plain_end_closes_parent_scope(label_upper.as_str())
+                    if !in_package_subprogram_scope
+                        && builder
+                            .state
+                            .plain_end_closes_parent_scope(label_upper.as_str())
                     {
                         block_depth_component = block_depth_component.saturating_sub(1);
                     }
@@ -782,9 +809,10 @@ impl QueryExecutor {
                         .clone()
                         .or_else(|| leading_word.map(|word| word.to_ascii_uppercase()))
                         .unwrap_or_default();
-                    if builder
-                        .state
-                        .plain_end_closes_parent_scope(label_upper.as_str())
+                    if !in_package_subprogram_scope
+                        && builder
+                            .state
+                            .plain_end_closes_parent_scope(label_upper.as_str())
                     {
                         block_depth_component = block_depth_component.saturating_sub(1);
                     }

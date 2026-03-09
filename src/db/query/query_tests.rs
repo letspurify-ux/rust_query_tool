@@ -6555,7 +6555,6 @@ SELECT 1 FROM dual;"#;
     );
 }
 
-
 #[test]
 fn test_line_block_depths_package_body_with_nested_end_labels_and_exception() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY test_pkg AS
@@ -6579,16 +6578,24 @@ END test_pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
 
     assert_eq!(depths.len(), 17, "unexpected depth vector: {depths:?}");
-    assert!(depths[5] > depths[4], "IF body should indent (depths: {depths:?})");
-    assert_eq!(depths[6], depths[4], "ELSE should pre-dedent to IF depth (depths: {depths:?})");
-    assert_eq!(depths[8], depths[4], "END IF should return to IF depth (depths: {depths:?})");
+    assert!(
+        depths[5] > depths[4],
+        "IF body should indent (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[6], depths[4],
+        "ELSE should pre-dedent to IF depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[8], depths[4],
+        "END IF should return to IF depth (depths: {depths:?})"
+    );
     assert!(
         depths[11] > depths[10],
         "EXCEPTION handler WHEN should indent under EXCEPTION (depths: {depths:?})"
     );
     assert_eq!(
-        depths[16],
-        0,
+        depths[16], 0,
         "named package-body END should close both BEGIN and AS/IS scopes (depths: {depths:?})"
     );
 }
@@ -6606,10 +6613,12 @@ END test_pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
 
     assert_eq!(depths.len(), 7, "unexpected depth vector: {depths:?}");
-    assert_eq!(depths[4], depths[5], "split END / name suffix should keep depth stable (depths: {depths:?})");
     assert_eq!(
-        depths[6],
-        0,
+        depths[4], depths[5],
+        "split END / name suffix should keep depth stable (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[6], 0,
         "final END <package_name> should fully close package-body scope (depths: {depths:?})"
     );
 }
@@ -6685,13 +6694,11 @@ END
 
     assert_eq!(depths.len(), 17, "unexpected depth vector: {depths:?}");
     assert_eq!(
-        depths[12],
-        depths[11],
+        depths[12], depths[11],
         "split quoted subprogram END label should keep depth stable (depths: {depths:?})"
     );
     assert_eq!(
-        depths[16],
-        0,
+        depths[16], 0,
         "split quoted package END label should fully close package body scope (depths: {depths:?})"
     );
 }
@@ -8944,7 +8951,8 @@ END pkg_depth_q;"#;
 }
 
 #[test]
-fn test_split_script_items_package_body_with_is_if_else_exception_and_named_end_stays_single_statement() {
+fn test_split_script_items_package_body_with_is_if_else_exception_and_named_end_stays_single_statement(
+) {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_mix IS
   PROCEDURE p1 AS
   BEGIN
@@ -8981,7 +8989,6 @@ SELECT 1 FROM dual;"#;
     assert!(stmts[0].contains("END pkg_depth_mix"));
 }
 
-
 #[test]
 fn test_line_block_depths_package_body_end_name_on_next_line_after_nested_end_if() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split IS
@@ -9011,13 +9018,11 @@ SELECT 1 FROM dual;"#;
         .expect("expected split package END name line");
 
     assert_eq!(
-        depths[if_suffix_idx],
-        depths[end_if_idx],
+        depths[if_suffix_idx], depths[end_if_idx],
         "split END/IF should preserve the same dedented depth (depths: {depths:?})"
     );
     assert_eq!(
-        depths[package_name_suffix_idx],
-        0,
+        depths[package_name_suffix_idx], 0,
         "split named package END should dedent to top-level (depths: {depths:?})"
     );
 }
@@ -9050,16 +9055,22 @@ SELECT 1 FROM dual;"#;
         "split END labels in package body should not swallow trailing statement: {stmts:?}"
     );
     let first_upper = stmts[0].to_ascii_uppercase();
-    assert!(first_upper.contains("END
-    IF;"));
-    assert!(first_upper.contains("END
-  P1;"));
+    assert!(first_upper.contains(
+        "END
+    IF;"
+    ));
+    assert!(first_upper.contains(
+        "END
+  P1;"
+    ));
     assert!(
         first_upper.contains("END") && first_upper.contains("PKG_DEPTH_SPLIT2"),
         "first statement missing split package end label: {}",
         stmts[0]
     );
-    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+    assert!(stmts[1]
+        .to_ascii_uppercase()
+        .starts_with("SELECT 1 FROM DUAL"));
 }
 
 #[test]
@@ -9118,9 +9129,10 @@ SELECT 1 FROM dual;"#;
         "first statement should keep named package END: {}",
         stmts[0]
     );
-    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+    assert!(stmts[1]
+        .to_ascii_uppercase()
+        .starts_with("SELECT 1 FROM DUAL"));
 }
-
 
 #[test]
 fn test_line_block_depths_package_body_schema_qualified_end_starting_with_end_suffix_keyword() {
@@ -9217,11 +9229,15 @@ SELECT 1 FROM dual;"#;
         "schema-qualified package END with IF-prefixed owner should not swallow trailing SELECT: {stmts:?}"
     );
     assert!(
-        stmts[0].to_ascii_uppercase().contains("END IF_OWNER.IF_PKG"),
+        stmts[0]
+            .to_ascii_uppercase()
+            .contains("END IF_OWNER.IF_PKG"),
         "first statement should preserve schema-qualified package END: {}",
         stmts[0]
     );
-    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+    assert!(stmts[1]
+        .to_ascii_uppercase()
+        .starts_with("SELECT 1 FROM DUAL"));
 }
 
 #[test]
@@ -12505,7 +12521,10 @@ END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // BEGIN(0) IF(1) inner-BEGIN(2) NULL(3) END;(2) END-IF(1) END(0)
     let expected = vec![0, 1, 2, 3, 2, 1, 0];
-    assert_eq!(depths, expected, "BEGIN inside IF depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "BEGIN inside IF depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12521,7 +12540,10 @@ END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // BEGIN(0) FOR-LOOP(1) IF(2) NULL(3) END-IF(2) END-LOOP(1) END(0)
     let expected = vec![0, 1, 2, 3, 2, 1, 0];
-    assert_eq!(depths, expected, "IF inside FOR LOOP depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "IF inside FOR LOOP depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12539,7 +12561,10 @@ END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // BEGIN(0) IFa(1) IFb(2) IFc(3) NULL(4) END-IFc(3) END-IFb(2) END-IFa(1) END(0)
     let expected = vec![0, 1, 2, 3, 4, 3, 2, 1, 0];
-    assert_eq!(depths, expected, "three-level nested IF depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "three-level nested IF depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12556,7 +12581,10 @@ END my_proc;"#;
     // CREATE IS(0) BEGIN(0) IF(1) NULL(2) END-IF(1) END name(0)
     // Note: BEGIN after IS is at the same depth as IS due to pending_subprogram_begins pre-dedent.
     let expected = vec![0, 0, 1, 2, 1, 0];
-    assert_eq!(depths, expected, "standalone procedure END name depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "standalone procedure END name depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12578,7 +12606,10 @@ END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // AS(0) PROC IS(1) BEGIN(1) IF(2) NULL(3) END(2) IF;(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
     let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 1, 2, 0];
-    assert_eq!(depths, expected, "split END IF in package body procedure mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "split END IF in package body procedure mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12596,7 +12627,10 @@ END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // BEGIN(0) IF(1) NULL(2) ELSIF(1) NULL(2) ELSE(1) NULL(2) END-IF(1) END(0)
     let expected = vec![0, 1, 2, 1, 2, 1, 2, 1, 0];
-    assert_eq!(depths, expected, "IF/ELSIF/ELSE depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "IF/ELSIF/ELSE depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12619,7 +12653,10 @@ END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // AS(0) p1 IS(1) BEGIN(1) NULL(2) END p1(1) p2 IS(1) BEGIN(1) NULL(2) END p2(1) BEGIN(1) NULL(2) END pkg(0)
     let expected = vec![0, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 0];
-    assert_eq!(depths, expected, "package body multiple procedures END name depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "package body multiple procedures END name depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12636,7 +12673,10 @@ END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // AS(0) PROC IS(1) BEGIN(1) NULL(2) END(1) p1;(1) END pkg(0)
     let expected = vec![0, 1, 1, 2, 1, 1, 0];
-    assert_eq!(depths, expected, "split END name followed by package END depth mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "split END name followed by package END depth mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12659,7 +12699,10 @@ END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // AS(0) PROC IS(1) BEGIN(1) IF(2) FOR-LOOP(3) NULL(4) END-LOOP(3) END-IF(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
     let expected = vec![0, 1, 1, 2, 3, 4, 3, 2, 1, 1, 2, 0];
-    assert_eq!(depths, expected, "LOOP inside IF inside package procedure END name mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "LOOP inside IF inside package procedure END name mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12676,7 +12719,10 @@ END;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // BEGIN(0) IF(1) NULL(2) END-IF(1) FOR-LOOP(1) NULL(2) END-LOOP(1) END(0)
     let expected = vec![0, 1, 2, 1, 1, 2, 1, 0];
-    assert_eq!(depths, expected, "sequential END IF + END LOOP depth tracking mismatch: {depths:?}");
+    assert_eq!(
+        depths, expected,
+        "sequential END IF + END LOOP depth tracking mismatch: {depths:?}"
+    );
 }
 
 #[test]
@@ -12849,5 +12895,69 @@ END pkg_mix;"#;
     assert_eq!(
         depths, expected,
         "package body AS function split END IF + split END name depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_nested_exception_in_function_and_loop() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_nested AS
+  FUNCTION f1(p_n NUMBER) RETURN NUMBER IS
+    v NUMBER;
+  BEGIN
+    BEGIN
+      v := p_n + 1;
+    EXCEPTION
+      WHEN OTHERS THEN
+        v := -1;
+    END;
+    RETURN v;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN -2;
+  END f1;
+
+  PROCEDURE p1 IS
+  BEGIN
+    FOR rec IN (SELECT LEVEL lv FROM dual CONNECT BY LEVEL <= 2) LOOP
+      BEGIN
+        IF rec.lv = 2 THEN
+          NULL;
+        END IF;
+      EXCEPTION
+        WHEN OTHERS THEN
+          NULL;
+      END;
+    END LOOP;
+  END p1;
+END pkg_depth_nested;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let function_exception_idx = lines
+        .iter()
+        .position(|line| line.starts_with("  EXCEPTION"))
+        .expect("expected function EXCEPTION line");
+    let function_end_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END f1"))
+        .expect("expected END f1 line");
+    let function_when_idx = lines
+        .iter()
+        .position(|line| {
+            line.trim_start().starts_with("WHEN OTHERS THEN") && *line == "    WHEN OTHERS THEN"
+        })
+        .expect("expected function WHEN line");
+
+    assert_eq!(
+        depths[function_exception_idx], depths[function_end_idx],
+        "outer function EXCEPTION should align with END f1 depth: {:?}",
+        depths
+    );
+    assert_eq!(
+        depths[function_when_idx],
+        depths[function_exception_idx].saturating_add(1),
+        "outer function WHEN should be one level deeper than EXCEPTION: {:?}",
+        depths
     );
 }
