@@ -3503,6 +3503,48 @@ fn with_function_supports_all_oracle_main_query_heads() {
 }
 
 #[test]
+fn wrapped_create_splits_on_sqlplus_slash_terminator() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE wrapped_pkg wrapped");
+    engine.process_line("a000000");
+    engine.process_line("1");
+    engine.process_line("abcd");
+    engine.process_line("/");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE PACKAGE wrapped_pkg wrapped"),
+        "first statement should preserve wrapped DDL header: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn wrapped_create_recovers_on_following_statement_head_without_slash() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PROCEDURE wrapped_proc wrapped");
+    engine.process_line("a000000");
+    engine.process_line("abcd");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE PROCEDURE wrapped_proc wrapped"),
+        "first statement should preserve wrapped DDL header: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
 fn with_function_followed_by_multitable_insert_all_stays_single_statement() {
     let mut engine = SqlParserEngine::new();
 

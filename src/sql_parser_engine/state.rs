@@ -207,7 +207,26 @@ impl SplitState {
         line: &str,
         current_is_empty: bool,
     ) -> LineBoundaryAction {
-        self.line_boundary_action(classify_line_leading_marker(line), current_is_empty)
+        let action = self.line_boundary_action(classify_line_leading_marker(line), current_is_empty);
+        if action != LineBoundaryAction::None {
+            return action;
+        }
+
+        if self.is_idle()
+            && self.in_wrapped_create()
+            && !current_is_empty
+            && self.block_depth() == 0
+            && self.paren_depth == 0
+        {
+            let first_word = line.split_whitespace().next();
+            if first_word.is_some_and(sql_text::is_statement_head_keyword)
+                && !first_word.is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
+            {
+                return LineBoundaryAction::SplitBeforeLine;
+            }
+        }
+
+        LineBoundaryAction::None
     }
 
     pub(crate) fn splitter_line_boundary_action_for_line(
