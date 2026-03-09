@@ -2258,6 +2258,39 @@ END;"#;
 }
 
 #[test]
+fn format_sql_open_cursor_nested_paren_case_with_inline_comment_keeps_closing_depth() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT (
+CASE
+WHEN score > 10 THEN (
+CASE -- nested expression
+WHEN score > 20 THEN 'HIGH+'
+ELSE 'HIGH'
+END
+)
+ELSE 'LOW'
+END
+) AS bucket
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("END
+                )
+                ELSE 'LOW'"),
+        "inner CASE close-paren should stay aligned at nested depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("END
+            ) AS bucket"),
+        "outer CASE close-paren should stay aligned at OPEN FOR expression depth, got: {formatted}"
+    );
+}
+
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE
