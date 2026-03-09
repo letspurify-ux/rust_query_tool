@@ -324,6 +324,17 @@ fn format_sql_keeps_nested_begin_depth_inside_package_body_procedure() {
 }
 
 #[test]
+fn format_sql_keeps_if_depth_after_nested_end_in_package_body_procedure() {
+    let input = "create package body a as\nprocedure b is\nbegin\n  begin\n    null;\n  end;\n  if 1 = 1 then\n    null;\n  end if;\nend b;\nend a;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("        END;\n        IF 1 = 1 THEN"),
+        "IF should keep procedure-local depth after nested END;, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_preserves_oracle_labels() {
     // Test <<loop_label>> preservation
     let input = "<<outer_loop>>\nFOR i IN 1..10 LOOP\n<<inner_loop>>\nFOR j IN 1..5 LOOP\nNULL;\nEND LOOP inner_loop;\nEND LOOP outer_loop;";

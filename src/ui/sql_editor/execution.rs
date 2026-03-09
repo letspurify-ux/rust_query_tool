@@ -2375,7 +2375,6 @@ impl SqlEditorWidget {
                     || force_end_depth
                     || trimmed_upper.starts_with("BEGIN")
                     || trimmed_upper.starts_with("CASE")
-                    || trimmed_upper.starts_with("IF ")
                     || trimmed_upper.starts_with("LOOP")
                     || (trimmed_upper.starts_with("FOR ") && !is_trigger_for_each_row)
                     || trimmed_upper.starts_with("WHILE ")
