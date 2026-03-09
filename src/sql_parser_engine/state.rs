@@ -593,15 +593,19 @@ impl SplitState {
             return;
         }
 
+        // Package body initialization blocks may close with `END <package_name>` where
+        // `<package_name>` can itself be a keyword token (`IF`, `CASE`, ...). In that
+        // context we must treat following identifier tokens as an END label segment,
+        // not as END-suffix keywords.
+        if self.package_body_init_end_context() {
+            self.push_pending_end_label_segment(token_upper);
+            return;
+        }
+
         if let Some(suffix) = suffix {
             suffix.apply_to_state(self);
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
-            return;
-        }
-
-        if self.package_body_init_end_context() {
-            self.push_pending_end_label_segment(token_upper);
             return;
         }
 

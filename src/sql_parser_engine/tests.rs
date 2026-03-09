@@ -417,6 +417,48 @@ fn package_body_init_section_with_quoted_end_label_splits_before_following_state
     assert!(statements[1].starts_with("SELECT 100 FROM dual"));
 }
 
+
+#[test]
+fn package_body_init_end_with_keyword_label_is_treated_as_label_not_suffix() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY if AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END IF;");
+    engine.process_line("SELECT 7 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END IF"),
+        "package body END label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 7 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_init_end_with_qualified_keyword_label_is_treated_as_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY if AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END owner.if;");
+    engine.process_line("SELECT 8 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.if"),
+        "qualified package body END label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 8 FROM dual".to_string());
+}
 #[test]
 fn package_body_end_with_schema_qualified_label_splits_following_statement() {
     let mut engine = SqlParserEngine::new();
