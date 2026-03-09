@@ -1063,7 +1063,7 @@ fn format_sql_keeps_consecutive_sqlplus_comments_together() {
     let input = "REM first\nREMARK second\nSELECT 1 FROM dual;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
-    let expected = ["REM FIRST", "REMARK SECOND", "", "SELECT 1", "FROM DUAL;"].join("\n");
+    let expected = ["REM first", "REMARK second", "", "SELECT 1", "FROM DUAL;"].join("\n");
 
     assert_eq!(formatted, expected);
 }

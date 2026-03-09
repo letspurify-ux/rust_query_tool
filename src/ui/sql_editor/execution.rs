@@ -899,6 +899,17 @@ impl SqlEditorWidget {
             .any(|token| !matches!(token, SqlToken::Comment(_)))
     }
 
+    fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
+        statement
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .is_some_and(|first_word| {
+                first_word.eq_ignore_ascii_case("REM")
+                    || first_word.eq_ignore_ascii_case("REMARK")
+            })
+    }
+
     fn statement_ends_with_semicolon(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
         Self::statement_ends_with_semicolon_tokens(&tokens)
@@ -1162,6 +1173,10 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         select_list_break_state_on_start: SelectListBreakState,
     ) -> String {
+        if Self::is_sqlplus_remark_comment_statement(statement) {
+            return statement.trim().to_string();
+        }
+
         if let Some(formatted) = Self::format_create_table(statement) {
             return formatted;
         }
@@ -9589,11 +9604,31 @@ FROM DUAL"
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
-        assert!(
-            preserved.ends_with("; COMMENT SEMICOLON"),
+        assert_eq!(
+            preserved, source,
             "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
             preserved
         );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_remark_comment_text_case() {
+        let sql = "REMARK Keep MixedCase ; punctuation";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_rem_comments_between_statements() {
+        let sql = "REM keep this exact comment\nSELECT 1 FROM dual;\nREMARK Keep;This;Too";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.contains("REM keep this exact comment"), "{}", formatted);
+        assert!(formatted.contains("REMARK Keep;This;Too"), "{}", formatted);
+        assert!(formatted.contains("SELECT 1\nFROM DUAL;"), "{}", formatted);
     }
 
     #[test]
