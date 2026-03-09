@@ -2328,6 +2328,7 @@ impl SqlEditorWidget {
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXCEPTION")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSE")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHEN")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
@@ -2381,6 +2382,7 @@ impl SqlEditorWidget {
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
                     || trimmed_upper.starts_with("ELSIF")
+                    || trimmed_upper.starts_with("ELSEIF")
                     || trimmed_upper.starts_with("CASE")
                     || Self::starts_with_bare_end(&trimmed_upper)
                     || force_end_suffix_depth);
@@ -8851,6 +8853,62 @@ END if_owner;"#;
             end_if_line.is_some_and(|line| line.starts_with("        ")),
             "Nested END IF should remain more indented than END package label, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_else_if_clause_uses_block_depth_without_extra_into_indent() {
+        let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    SELECT col1,
+           col2
+      INTO v_col1,
+           v_col2
+      FROM dual;
+  ELSEIF v_col1 = 1 THEN
+      NULL;
+  END IF;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    ELSEIF v_col1 = 1 THEN"),
+            "ELSEIF should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        ELSEIF v_col1 = 1 THEN"),
+            "ELSEIF should not keep stale INTO-list extra indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_elseif_clause_uses_block_depth_without_extra_into_indent() {
+        let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    SELECT col1,
+           col2
+      INTO v_col1,
+           v_col2
+      FROM dual;
+  ELSIF v_col1 = 1 THEN
+      NULL;
+  END IF;
+  NULL;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("    ELSIF v_col1 = 1 THEN"),
+            "ELSIF should align to block depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("        ELSIF v_col1 = 1 THEN"),
+            "ELSIF should not keep stale INTO-list extra indent, got:\n{}",
             formatted
         );
     }
