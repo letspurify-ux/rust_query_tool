@@ -313,6 +313,73 @@ impl QueryExecutor {
             None
         }
 
+        fn parse_leading_identifier_chain_upper(line: &str) -> Option<String> {
+            fn parse_segment(line: &str, bytes: &[u8], i: &mut usize) -> Option<String> {
+                if *i >= bytes.len() {
+                    return None;
+                }
+
+                if bytes[*i] == b'"' {
+                    let mut out = String::new();
+                    *i += 1;
+                    while *i < bytes.len() {
+                        if bytes[*i] == b'"' {
+                            if *i + 1 < bytes.len() && bytes[*i + 1] == b'"' {
+                                out.push('"');
+                                *i += 2;
+                                continue;
+                            }
+                            *i += 1;
+                            break;
+                        }
+                        out.push(bytes[*i] as char);
+                        *i += 1;
+                    }
+                    out.make_ascii_uppercase();
+                    return Some(out);
+                }
+
+                if !sql_text::is_identifier_start_byte(bytes[*i]) {
+                    return None;
+                }
+
+                let start = *i;
+                *i += 1;
+                while *i < bytes.len() && sql_text::is_identifier_byte(bytes[*i]) {
+                    *i += 1;
+                }
+                Some(line[start..*i].to_ascii_uppercase())
+            }
+
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            let mut label = parse_segment(line, bytes, &mut i)?;
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() || bytes[i] != b'.' {
+                    break;
+                }
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+
+                let Some(segment) = parse_segment(line, bytes, &mut i) else {
+                    break;
+                };
+                label.push('.');
+                label.push_str(&segment);
+            }
+
+            Some(label)
+        }
+
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
             loop {
                 while idx < chars.len() && chars[idx].is_whitespace() {
@@ -429,34 +496,69 @@ impl QueryExecutor {
                 return Some(String::new());
             }
 
-            if bytes[i] == b'"' {
-                let mut out = String::new();
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            out.push('"');
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    out.push(bytes[i] as char);
-                    i += 1;
+            fn parse_identifier_segment_upper(line: &str, bytes: &[u8], i: &mut usize) -> Option<String> {
+                if *i >= bytes.len() {
+                    return None;
                 }
-                out.make_ascii_uppercase();
-                return Some(out);
+
+                if bytes[*i] == b'"' {
+                    let mut out = String::new();
+                    *i += 1;
+                    while *i < bytes.len() {
+                        if bytes[*i] == b'"' {
+                            if *i + 1 < bytes.len() && bytes[*i + 1] == b'"' {
+                                out.push('"');
+                                *i += 2;
+                                continue;
+                            }
+                            *i += 1;
+                            break;
+                        }
+                        out.push(bytes[*i] as char);
+                        *i += 1;
+                    }
+                    out.make_ascii_uppercase();
+                    return Some(out);
+                }
+
+                if !sql_text::is_identifier_start_byte(bytes[*i]) {
+                    return None;
+                }
+
+                let start = *i;
+                *i += 1;
+                while *i < bytes.len() && sql_text::is_identifier_byte(bytes[*i]) {
+                    *i += 1;
+                }
+                Some(line[start..*i].to_ascii_uppercase())
             }
 
-            if !sql_text::is_identifier_start_byte(bytes[i]) {
+            let mut label = String::new();
+            let Some(first_segment) = parse_identifier_segment_upper(line, bytes, &mut i) else {
                 return Some(String::new());
-            }
-            let start = i;
-            i += 1;
-            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+            };
+            label.push_str(&first_segment);
+
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() || bytes[i] != b'.' {
+                    break;
+                }
                 i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+
+                let Some(segment) = parse_identifier_segment_upper(line, bytes, &mut i) else {
+                    break;
+                };
+                label.push('.');
+                label.push_str(&segment);
             }
-            Some(line[start..i].to_ascii_uppercase())
+
+            Some(label)
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
 
@@ -533,7 +635,15 @@ impl QueryExecutor {
                     && !is_comment_or_blank
                     && !is_end_suffix_keyword(leading_word)
                 {
-                    builder.state.resolve_pending_end_on_separator();
+                    if let Some(word) = leading_word {
+                        let token_upper = parse_leading_identifier_chain_upper(line)
+                            .unwrap_or_else(|| word.to_ascii_uppercase());
+                        builder
+                            .state
+                            .resolve_pending_end_on_separator_with_token(&token_upper);
+                    } else {
+                        builder.state.resolve_pending_end_on_separator();
+                    }
                 }
             }
 

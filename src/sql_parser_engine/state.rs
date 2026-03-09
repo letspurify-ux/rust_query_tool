@@ -908,7 +908,13 @@ impl SplitState {
         }
 
         if self.package_body_init_end_context() {
-            self.pending_end_label_token = Some(token_upper.to_string());
+            if self.package_body_end_label_matches(token_upper) || token_upper.is_empty() {
+                self.resolve_plain_end(token_upper);
+                self.pending_end = PendingEnd::None;
+                self.pending_end_label_token = None;
+            } else {
+                self.pending_end_label_token = Some(token_upper.to_string());
+            }
             return;
         }
 

@@ -6949,6 +6949,70 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_split_end_if_with_label_like_next_line_keyword() {
+    let sql = r#"BEGIN
+  IF flag = 1 THEN
+    NULL;
+  END
+  IF;
+  NULL;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "split END/IF must resolve as END IF instead of treating IF as label (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_end_name_on_next_line_no_suffix_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_split_end AS
+BEGIN
+  NULL;
+END
+pkg_split_end;
+SELECT 1 FROM dual;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 0, 0, 0];
+    assert_eq!(
+        depths, expected,
+        "split named END in package body must close top-level scope before next statement (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_end_with_schema_qualified_name() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_schema_end AS
+BEGIN
+  NULL;
+END app_owner.pkg_schema_end;
+SELECT 1 FROM dual;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 0, 0];
+    assert_eq!(
+        depths, expected,
+        "schema-qualified END label should close package body and keep next statement top-level (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_end_with_split_schema_qualified_name() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_schema_split AS
+BEGIN
+  NULL;
+END
+app_owner.pkg_schema_split;
+SELECT 1 FROM dual;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 0, 0, 0];
+    assert_eq!(
+        depths, expected,
+        "split END + schema-qualified package label should resolve before next statement (depths: {depths:?})"
+    );
+}
+
+#[test]
 fn test_line_block_depths_preserve_pending_end_across_comment_line() {
     let sql = r#"BEGIN
   WHILE i < 5 LOOP
