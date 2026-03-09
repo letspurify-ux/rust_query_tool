@@ -2305,8 +2305,9 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(|prev| prev.ends_with('('));
-            let starts_paren_case_expression =
-                !in_dml_statement && trimmed_upper == "CASE" && previous_line_ends_with_open_paren;
+            let starts_paren_case_expression = !in_dml_statement
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                && previous_line_ends_with_open_paren;
             if starts_paren_case_expression {
                 paren_case_expression_depth += 1;
             }
@@ -2350,10 +2351,10 @@ impl SqlEditorWidget {
                 0
             };
             let paren_case_extra_indent = if in_paren_case_expression
-                && (trimmed_upper == "CASE"
+                && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
-                    || trimmed_upper == "END")
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END"))
             {
                 1
             } else {
@@ -2422,7 +2423,9 @@ impl SqlEditorWidget {
             out.push_str(&" ".repeat(effective_depth * 4));
             out.push_str(trimmed);
 
-            if in_paren_case_expression && trimmed_upper == "END" {
+            if in_paren_case_expression
+                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
+            {
                 paren_case_expression_depth = paren_case_expression_depth.saturating_sub(1);
             }
 
@@ -8998,6 +9001,54 @@ END;"#;
             while_formatted.contains("END WHILE;"),
             "END WHILE suffix should be preserved as a single terminator line, got:\n{}",
             while_formatted
+        );
+    }
+
+    #[test]
+    fn paren_case_expression_tracks_searched_case_headers() {
+        let sql = r#"BEGIN
+  v_val := (
+    CASE v_mode
+      WHEN 1 THEN 10
+      ELSE 0
+    END
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("(\n        CASE v_mode\n            WHEN 1 THEN"),
+            "CASE <expr> after '(' should get parenthesized CASE depth indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ELSE\n            0\n        END"),
+            "CASE <expr> END should keep CASE-block depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn paren_case_expression_tracks_end_case_terminator() {
+        let sql = r#"BEGIN
+  v_val := (
+    CASE
+      WHEN v_mode = 1 THEN 10
+      ELSE 0
+    END CASE
+  );
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("CASE\n            WHEN v_mode = 1 THEN"),
+            "Parenthesized CASE should still format branch depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("ELSE\n            0\n        END CASE);"),
+            "END CASE terminator should stay aligned with CASE header in parenthesized expression, got:\n{}",
+            formatted
         );
     }
 
