@@ -1,4 +1,6 @@
 use super::*;
+use std::fs;
+use std::path::PathBuf;
 
 /// Helper to extract statements from ScriptItems
 fn get_statements(items: &[ScriptItem]) -> Vec<&str> {
@@ -9,6 +11,13 @@ fn get_statements(items: &[ScriptItem]) -> Vec<&str> {
             _ => None,
         })
         .collect()
+}
+
+fn load_query_test_file(name: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test");
+    path.push(name);
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 #[test]
@@ -237,6 +246,69 @@ SELECT 2 FROM dual;"#;
     assert!(
         !statement.contains("SELECT 2 FROM dual"),
         "slash-delimited trailing statement must not be merged: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mega_torture_resolves_trigger_after_package_body() {
+    let sql = load_query_test_file("mega_torture.txt");
+    let cursor = sql
+        .find("CREATE OR REPLACE TRIGGER oqt_trg_test_bi")
+        .unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(&sql, cursor)
+        .expect("expected trigger statement bounds in mega_torture");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("CREATE OR REPLACE TRIGGER oqt_trg_test_bi"),
+        "cursor on trigger should resolve trigger statement, got: {statement}"
+    );
+    assert!(
+        !statement.contains("END oqt_mega_pkg;") && !statement.contains("SHOW ERRORS PACKAGE BODY"),
+        "trigger statement bounds must not include package body tail: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mega_torture_resolves_execute_block_after_trigger() {
+    let sql = load_query_test_file("mega_torture.txt");
+    let cursor = sql.find("oqt_mega_pkg.seed(30)").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(&sql, cursor)
+        .expect("expected execute block bounds in mega_torture");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("BEGIN"),
+        "cursor on package execution block should resolve BEGIN block, got: {statement}"
+    );
+    assert!(
+        statement.contains("oqt_mega_pkg.seed(30);"),
+        "execution block should contain the SEED call: {statement}"
+    );
+    assert!(
+        !statement.contains("CREATE OR REPLACE TRIGGER oqt_trg_test_bi"),
+        "execution block must not include prior trigger statement: {statement}"
+    );
+}
+
+#[test]
+fn test_statement_bounds_at_cursor_mega_torture_resolves_summary_query_after_print() {
+    let sql = load_query_test_file("mega_torture.txt");
+    let cursor = sql.find("SELECT grp,").unwrap_or(sql.len());
+
+    let bounds = QueryExecutor::statement_bounds_at_cursor(&sql, cursor)
+        .expect("expected summary query bounds in mega_torture");
+    let statement = &sql[bounds.0..bounds.1];
+
+    assert!(
+        statement.trim_start().starts_with("SELECT grp,"),
+        "cursor on summary query should resolve trailing SELECT, got: {statement}"
+    );
+    assert!(
+        !statement.contains("PRINT v_rc") && !statement.contains("BEGIN\n    oqt_mega_pkg.open_rc"),
+        "summary query must not include PRINT or prior BEGIN block: {statement}"
     );
 }
 
@@ -3993,6 +4065,85 @@ SHOW ERRORS"#;
     assert!(
         !stmts[0].contains("SHOW ERRORS"),
         "Package spec should NOT contain SHOW ERRORS - depth did not return to 0!"
+    );
+}
+
+#[test]
+fn test_split_format_items_package_body_then_show_errors_prompt_trigger_after_consecutive_case_ends() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
+  FUNCTION f_deep RETURN NUMBER IS
+    v NUMBER := 0;
+  BEGIN
+    v :=
+      CASE
+        WHEN 1 = 1 THEN
+          CASE
+            WHEN 2 = 2 THEN 100
+            ELSE 10
+          END
+        ELSE
+          CASE
+            WHEN 3 = 3 THEN 777
+            ELSE 0
+          END
+      END;
+    RETURN v;
+  END;
+
+  PROCEDURE run_torture IS
+  BEGIN
+    NULL;
+  END run_torture;
+END oqt_mega_pkg;
+/
+SHOW ERRORS PACKAGE BODY oqt_mega_pkg
+
+PROMPT [6] trigger
+
+CREATE OR REPLACE TRIGGER oqt_trg_test_bi
+BEGIN
+  NULL;
+END;
+/
+BEGIN
+  NULL;
+END;
+/"#;
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(stmts.len(), 3, "expected package, trigger, and block statements: {items:?}");
+    assert_eq!(slash_count, 3, "slash delimiters should be preserved around each block: {items:?}");
+    assert!(
+        matches!(&items[1], FormatItem::Slash),
+        "package body should terminate on its own slash before SHOW ERRORS: {items:?}"
+    );
+    assert!(
+        matches!(&items[2], FormatItem::ToolCommand(ToolCommand::ShowErrors { .. })),
+        "SHOW ERRORS PACKAGE BODY should be a standalone tool command: {items:?}"
+    );
+    assert!(
+        matches!(&items[3], FormatItem::ToolCommand(ToolCommand::Prompt { text }) if text == "[6] trigger"),
+        "PROMPT after SHOW ERRORS should remain a standalone tool command: {items:?}"
+    );
+    assert!(
+        stmts[0].contains("END oqt_mega_pkg")
+            && !stmts[0].contains("SHOW ERRORS")
+            && !stmts[0].contains("PROMPT [6]")
+            && !stmts[0].contains("CREATE OR REPLACE TRIGGER"),
+        "package body statement should not absorb following report/prompt/trigger lines: {}",
+        stmts[0]
     );
 }
 
@@ -13010,8 +13161,8 @@ END pkg_nested_ex;"#;
     let depths = QueryExecutor::line_block_depths(sql);
     // pkg AS(0) proc IS(1) BEGIN(1) NULL(2) EXCEPTION(1) WHEN(2)
     // inner BEGIN(3) NULL(4) inner EXCEPTION(3) inner WHEN(3) NULL(4) inner END(2)
-    // outer handler NULL(2) END p_nested(1) END pkg(0)
-    let expected = vec![0, 1, 1, 2, 1, 2, 3, 4, 3, 3, 4, 2, 2, 1, 0];
+    // outer handler NULL(3) END p_nested(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 2, 3, 4, 3, 3, 4, 2, 3, 1, 0];
     assert_eq!(
         depths, expected,
         "package body nested exception blocks depth mismatch: {depths:?}"

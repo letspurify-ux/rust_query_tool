@@ -5,13 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::db::session::{BindDataType, BindValue, CompiledObject, SessionState};
-use crate::sql_parser_engine::LineBoundaryAction;
+use crate::sql_parser_engine::{LineBoundaryAction, SqlParserEngine};
 use crate::sql_text;
 use crate::utils::logging;
 
-use super::{
-    ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem, SplitState, ToolCommand,
-};
+use super::{ColumnInfo, ProcedureArgument, QueryResult, ResolvedBind, ScriptItem, ToolCommand};
 
 pub struct QueryExecutor;
 
@@ -1411,364 +1409,145 @@ impl QueryExecutor {
     where
         F: FnMut((usize, usize)) -> bool,
     {
-        #[derive(Default)]
         struct StatementSpanCollector {
-            state: SplitState,
+            builder: SqlParserEngine,
             current_start: Option<usize>,
-            current_non_whitespace_start: Option<usize>,
-            current_non_whitespace_end: usize,
-            current_has_non_whitespace: bool,
-            leading_tokens: Vec<String>,
+            current_end: usize,
         }
 
         impl StatementSpanCollector {
             fn current_is_empty(&self) -> bool {
-                !self.current_has_non_whitespace
+                self.current_start.is_none()
             }
 
             fn starts_with_alter_session(&self) -> bool {
-                matches!(
-                    (self.leading_tokens.first(), self.leading_tokens.get(1)),
-                    (Some(first), Some(second)) if first == "ALTER" && second == "SESSION"
-                )
+                self.builder.starts_with_alter_session()
             }
 
-            fn record_char(&mut self, index: usize, ch: char) {
-                if self.current_start.is_none() {
-                    self.current_start = Some(index);
+            fn line_non_whitespace_start(line: &str, from: usize) -> Option<usize> {
+                if from > line.len() || !line.is_char_boundary(from) {
+                    return None;
                 }
-                let char_end = index + ch.len_utf8();
-                if !ch.is_whitespace() {
-                    if self.current_non_whitespace_start.is_none() {
-                        self.current_non_whitespace_start = Some(index);
-                    }
-                    self.current_non_whitespace_end = char_end;
-                    self.current_has_non_whitespace = true;
+                line[from..]
+                    .char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                    .map(|(idx, _)| from + idx)
+            }
+
+            fn char_index_to_byte_offset(line: &str, char_index: usize) -> usize {
+                if char_index == 0 {
+                    return 0;
                 }
+                line.char_indices()
+                    .nth(char_index)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or_else(|| line.len())
             }
 
-            fn flush_token(&mut self) {
-                if !self.state.token.is_empty() && self.leading_tokens.len() < 2 {
-                    self.leading_tokens
-                        .push(self.state.token.to_ascii_uppercase());
+            fn emit_current_span<F>(&mut self, sql: &str, on_span: &mut F) -> bool
+            where
+                F: FnMut((usize, usize)) -> bool,
+            {
+                let Some(start) = self.current_start.take() else {
+                    self.current_end = 0;
+                    return true;
+                };
+                let end = self.current_end.max(start);
+                self.current_end = 0;
+                if let Some(span) = QueryExecutor::trim_statement_span_for_bounds(sql, start, end) {
+                    return on_span(span);
                 }
-                self.state.flush_token();
+                true
             }
 
-            fn clear_current(&mut self) {
-                self.current_start = None;
-                self.current_non_whitespace_start = None;
-                self.current_non_whitespace_end = 0;
-                self.current_has_non_whitespace = false;
-                self.leading_tokens.clear();
-            }
-
-            fn push_current_span(&mut self, sql: &str) -> Option<(usize, usize)> {
-                if let Some(start) = self.current_non_whitespace_start {
-                    let end = self.current_non_whitespace_end;
-                    if end > start {
-                        let span = QueryExecutor::trim_statement_span_for_bounds(sql, start, end);
-                        self.clear_current();
-                        return span;
-                    }
+            fn force_terminate_current<F>(&mut self, sql: &str, on_span: &mut F) -> bool
+            where
+                F: FnMut((usize, usize)) -> bool,
+            {
+                let statements = self.builder.force_terminate_and_take_statements();
+                if statements.is_empty() {
+                    self.current_start = None;
+                    self.current_end = 0;
+                    return true;
                 }
-                self.clear_current();
-                None
+                self.emit_current_span(sql, on_span)
             }
 
-            fn force_terminate(&mut self, sql: &str) -> Option<(usize, usize)> {
-                self.flush_token();
-                self.state.force_reset_all();
-                self.push_current_span(sql)
-            }
-
-            fn finalize(&mut self, sql: &str) -> Option<(usize, usize)> {
-                self.flush_token();
-                self.state.resolve_pending_end_on_eof();
-                self.state.reset_create_state();
-                self.push_current_span(sql)
-            }
-
-            fn consume_next_char(
-                iter: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-                base_offset: usize,
-            ) -> Option<(usize, char)> {
-                iter.next()
-                    .map(|(relative, ch)| (base_offset + relative, ch))
-            }
-
-            fn peek_n_char(
-                iter: &std::iter::Peekable<std::str::CharIndices<'_>>,
-                n: usize,
-            ) -> Option<char> {
-                let mut lookahead = iter.clone();
-                for _ in 0..n {
-                    lookahead.next()?;
+            fn finalize_current<F>(&mut self, sql: &str, on_span: &mut F) -> bool
+            where
+                F: FnMut((usize, usize)) -> bool,
+            {
+                let statements = self.builder.finalize_and_take_statements();
+                if statements.is_empty() {
+                    self.current_start = None;
+                    self.current_end = 0;
+                    return true;
                 }
-                lookahead.next().map(|(_, ch)| ch)
+                self.emit_current_span(sql, on_span)
             }
 
-            fn process_segment<F>(
+            fn process_line<F>(
                 &mut self,
                 sql: &str,
-                start: usize,
-                end: usize,
+                line: &str,
+                line_start: usize,
+                next_line_start: usize,
                 on_span: &mut F,
             ) -> bool
             where
                 F: FnMut((usize, usize)) -> bool,
             {
-                use crate::sql_parser_engine::LexMode;
+                let mut boundary_offsets = Vec::new();
+                let _ = self.builder.process_line_and_take_statements_with_boundary_observer(
+                    line,
+                    |chars, idx| {
+                        let max_idx = chars.len().saturating_sub(1);
+                        boundary_offsets
+                            .push(Self::char_index_to_byte_offset(line, idx.min(max_idx)));
+                    },
+                );
 
-                if start >= end {
-                    return true;
+                if self.current_start.is_none() {
+                    self.current_start =
+                        Self::line_non_whitespace_start(line, 0).map(|offset| line_start + offset);
                 }
 
-                let mut iter = sql[start..end].char_indices().peekable();
-                while let Some((relative_idx, c)) = iter.next() {
-                    let index = start + relative_idx;
-                    let next = iter.peek().map(|(_, ch)| *ch);
-
-                    match &self.state.lex_mode {
-                        LexMode::LineComment => {
-                            self.record_char(index, c);
-                            if c == '\n' {
-                                self.state.lex_mode = LexMode::Idle;
-                            }
-                            continue;
-                        }
-                        LexMode::BlockComment => {
-                            self.record_char(index, c);
-                            if c == '*' && next == Some('/') {
-                                if let Some((next_idx, next_char)) =
-                                    Self::consume_next_char(&mut iter, start)
-                                {
-                                    self.record_char(next_idx, next_char);
-                                }
-                                self.state.lex_mode = LexMode::Idle;
-                            }
-                            continue;
-                        }
-                        LexMode::QQuote { end_char } => {
-                            let end_char = *end_char;
-                            self.record_char(index, c);
-                            if c == end_char && next == Some('\'') {
-                                if let Some((next_idx, next_char)) =
-                                    Self::consume_next_char(&mut iter, start)
-                                {
-                                    self.record_char(next_idx, next_char);
-                                }
-                                self.state.lex_mode = LexMode::Idle;
-                            }
-                            continue;
-                        }
-                        LexMode::SingleQuote => {
-                            self.record_char(index, c);
-                            if c == '\'' {
-                                if next == Some('\'') {
-                                    if let Some((next_idx, next_char)) =
-                                        Self::consume_next_char(&mut iter, start)
-                                    {
-                                        self.record_char(next_idx, next_char);
-                                    }
-                                } else {
-                                    self.state.lex_mode = LexMode::Idle;
-                                }
-                            }
-                            continue;
-                        }
-                        LexMode::DoubleQuote => {
-                            self.record_char(index, c);
-                            if c == '"' {
-                                if next == Some('"') {
-                                    if let Some((next_idx, next_char)) =
-                                        Self::consume_next_char(&mut iter, start)
-                                    {
-                                        self.record_char(next_idx, next_char);
-                                    }
-                                } else {
-                                    self.state.lex_mode = LexMode::Idle;
-                                }
-                            }
-                            continue;
-                        }
-                        LexMode::BacktickQuote => {
-                            self.record_char(index, c);
-                            if c == '`' {
-                                if next == Some('`') {
-                                    if let Some((next_idx, next_char)) =
-                                        Self::consume_next_char(&mut iter, start)
-                                    {
-                                        self.record_char(next_idx, next_char);
-                                    }
-                                } else {
-                                    self.state.lex_mode = LexMode::Idle;
-                                }
-                            }
-                            continue;
-                        }
-                        LexMode::DollarQuote { .. } => {
-                            // Dollar-quoted strings not used in span collector
-                            self.record_char(index, c);
-                            continue;
-                        }
-                        LexMode::Idle => {
-                            // Fall through to normal code processing below.
-                        }
+                let mut search_from = 0usize;
+                for boundary_offset in boundary_offsets {
+                    if self.current_start.is_none() {
+                        self.current_start = Self::line_non_whitespace_start(line, search_from)
+                            .map(|offset| line_start + offset);
                     }
-
-                    if c == '-' && next == Some('-') {
-                        self.flush_token();
-                        self.state.lex_mode = LexMode::LineComment;
-                        self.record_char(index, c);
-                        if let Some((next_idx, next_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(next_idx, next_char);
-                        }
+                    let Some(start) = self.current_start else {
+                        search_from = boundary_offset.saturating_add(1);
                         continue;
+                    };
+                    let end = line_start + boundary_offset;
+                    self.current_end = end;
+                    if end > start && !self.emit_current_span(sql, on_span) {
+                        return false;
                     }
+                    search_from = boundary_offset.saturating_add(1);
+                    self.current_start = Self::line_non_whitespace_start(line, search_from)
+                        .map(|offset| line_start + offset);
+                }
 
-                    if c == '/' && next == Some('*') {
-                        self.flush_token();
-                        self.state.lex_mode = LexMode::BlockComment;
-                        self.record_char(index, c);
-                        if let Some((next_idx, next_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(next_idx, next_char);
-                        }
-                        continue;
-                    }
-
-                    if self.state.token.is_empty()
-                        && (c == 'n' || c == 'N')
-                        && (next == Some('q') || next == Some('Q'))
-                        && Self::peek_n_char(&iter, 1) == Some('\'')
-                        && Self::peek_n_char(&iter, 2).is_some()
-                    {
-                        let Some(delimiter) = Self::peek_n_char(&iter, 2) else {
-                            continue;
-                        };
-                        self.flush_token();
-                        self.state.start_q_quote(delimiter);
-                        self.record_char(index, c);
-                        if let Some((next_idx, next_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(next_idx, next_char);
-                        }
-                        if let Some((quote_idx, quote_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(quote_idx, quote_char);
-                        }
-                        if let Some((delimiter_idx, delimiter_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(delimiter_idx, delimiter_char);
-                        }
-                        continue;
-                    }
-
-                    if self.state.token.is_empty()
-                        && (c == 'q' || c == 'Q')
-                        && next == Some('\'')
-                        && Self::peek_n_char(&iter, 1).is_some()
-                    {
-                        let Some(delimiter) = Self::peek_n_char(&iter, 1) else {
-                            continue;
-                        };
-                        self.flush_token();
-                        self.state.start_q_quote(delimiter);
-                        self.record_char(index, c);
-                        if let Some((quote_idx, quote_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(quote_idx, quote_char);
-                        }
-                        if let Some((delimiter_idx, delimiter_char)) =
-                            Self::consume_next_char(&mut iter, start)
-                        {
-                            self.record_char(delimiter_idx, delimiter_char);
-                        }
-                        continue;
-                    }
-
-                    if c == '\'' {
-                        self.flush_token();
-                        self.state.lex_mode = LexMode::SingleQuote;
-                        self.record_char(index, c);
-                        continue;
-                    }
-
-                    if c == '"' {
-                        self.flush_token();
-                        self.state.lex_mode = LexMode::DoubleQuote;
-                        self.record_char(index, c);
-                        continue;
-                    }
-
-                    if c == '`' {
-                        self.flush_token();
-                        self.state.lex_mode = LexMode::BacktickQuote;
-                        self.record_char(index, c);
-                        continue;
-                    }
-
-                    if sql_text::is_identifier_char(c) {
-                        self.state.token.push(c);
-                        self.record_char(index, c);
-                        continue;
-                    }
-
-                    self.flush_token();
-
-                    if c == '(' {
-                        self.state.paren_depth += 1;
-                    } else if c == ')' {
-                        self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
-                    }
-
-                    if c == ';' {
-                        let semicolon_action = self.state.prepare_semicolon_action();
-                        match semicolon_action {
-                            crate::sql_parser_engine::SemicolonAction::AppendToCurrent => {
-                                self.record_char(index, c);
-                            }
-                            crate::sql_parser_engine::SemicolonAction::SplitTopLevel => {
-                                if let Some(span) = self.push_current_span(sql) {
-                                    if !on_span(span) {
-                                        return false;
-                                    }
-                                }
-                                self.state.reset_create_state();
-                            }
-                            crate::sql_parser_engine::SemicolonAction::SplitForcedRoutine => {
-                                self.state.reset_create_state();
-                                self.state.block_stack.clear();
-                                if let Some(span) = self.push_current_span(sql) {
-                                    if !on_span(span) {
-                                        return false;
-                                    }
-                                }
-                            }
-                            crate::sql_parser_engine::SemicolonAction::CloseRoutineBlock => {
-                                self.record_char(index, c);
-                                self.state.apply_close_routine_block_on_semicolon();
-                            }
-                        }
-                        continue;
-                    }
-
-                    self.record_char(index, c);
+                if self.builder.current_is_empty() {
+                    self.current_start = None;
+                    self.current_end = 0;
+                } else if let Some(start) = self.current_start {
+                    self.current_end = next_line_start.max(start);
                 }
 
                 true
             }
         }
 
-        let mut collector = StatementSpanCollector::default();
+        let mut collector = StatementSpanCollector {
+            builder: SqlParserEngine::new(),
+            current_start: None,
+            current_end: 0,
+        };
         let mut sqlblanklines_enabled = true;
         let mut line_start = 0usize;
 
@@ -1781,47 +1560,40 @@ impl QueryExecutor {
             let next_line_start = newline_relative
                 .map(|offset| line_start + offset + 1)
                 .unwrap_or(sql.len());
-            let has_newline = newline_relative.is_some();
             let line = &sql[line_start..line_end];
             let trimmed = line.trim();
 
             if Self::should_force_terminate_on_blank_line(
                 sqlblanklines_enabled,
                 trimmed,
-                collector.state.is_idle(),
-                collector.state.block_depth(),
+                collector.builder.is_idle(),
+                collector.builder.block_depth(),
                 collector.current_is_empty(),
             ) {
-                if let Some(span) = collector.force_terminate(sql) {
-                    if !on_span(span) {
-                        return;
-                    }
+                if !collector.force_terminate_current(sql, &mut on_span) {
+                    return;
                 }
                 line_start = next_line_start;
                 continue;
             }
 
-            collector.state.prepare_splitter_line_boundary(line);
             match collector
+                .builder
                 .state
-                .splitter_line_boundary_action_for_line(line, collector.current_is_empty())
+                .splitter_line_boundary_action_for_line(line, collector.builder.current_is_empty())
             {
                 LineBoundaryAction::None => {}
                 LineBoundaryAction::SplitBeforeLine => {
                     if !collector.current_is_empty() {
-                        if let Some(span) = collector.force_terminate(sql) {
-                            if !on_span(span) {
-                                return;
-                            }
+                        if !collector.force_terminate_current(sql, &mut on_span) {
+                            return;
                         }
                     }
                 }
                 LineBoundaryAction::SplitAndConsumeLine => {
                     if !collector.current_is_empty() {
-                        if let Some(span) = collector.force_terminate(sql) {
-                            if !on_span(span) {
-                                return;
-                            }
+                        if !collector.force_terminate_current(sql, &mut on_span) {
+                            return;
                         }
                     }
                     line_start = next_line_start;
@@ -1834,16 +1606,14 @@ impl QueryExecutor {
             }
 
             if Self::should_force_terminate_lone_semicolon(
-                collector.state.is_idle(),
+                collector.builder.is_idle(),
                 trimmed,
-                collector.state.in_create_plsql(),
-                collector.state.block_depth(),
+                collector.builder.in_create_plsql(),
+                collector.builder.block_depth(),
                 collector.current_is_empty(),
             ) {
-                if let Some(span) = collector.force_terminate(sql) {
-                    if !on_span(span) {
-                        return;
-                    }
+                if !collector.force_terminate_current(sql, &mut on_span) {
+                    return;
                 }
                 line_start = next_line_start;
                 continue;
@@ -1852,18 +1622,27 @@ impl QueryExecutor {
             let is_alter_session_set_clause =
                 collector.starts_with_alter_session() && Self::is_set_clause_line(trimmed);
 
+            if collector.builder.is_idle()
+                && !collector.builder.current_is_empty()
+                && collector.builder.paren_depth() == 0
+                && collector.builder.can_terminate_on_slash()
+                && Self::parse_tool_command(trimmed).is_some()
+            {
+                if !collector.force_terminate_current(sql, &mut on_span) {
+                    return;
+                }
+            }
+
             if Self::should_try_tool_command_with_open_statement(
-                collector.state.is_idle(),
+                collector.builder.is_idle(),
                 collector.current_is_empty(),
-                collector.state.block_depth() == 0,
+                collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
                 is_alter_session_set_clause,
             ) && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
-                    if let Some(span) = collector.force_terminate(sql) {
-                        if !on_span(span) {
-                            return;
-                        }
+                    if !collector.force_terminate_current(sql, &mut on_span) {
+                        return;
                     }
                     if let ToolCommand::SetSqlBlankLines { enabled } = command {
                         sqlblanklines_enabled = enabled;
@@ -1874,9 +1653,9 @@ impl QueryExecutor {
             }
 
             if Self::should_try_tool_command_without_open_statement(
-                collector.state.is_idle(),
+                collector.builder.is_idle(),
                 collector.current_is_empty(),
-                collector.state.block_depth() == 0,
+                collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
             ) && Self::line_might_be_tool_command_for_bounds(trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(trimmed) {
@@ -1888,16 +1667,13 @@ impl QueryExecutor {
                 }
             }
 
-            let process_end = if has_newline { line_end + 1 } else { line_end };
-            if !collector.process_segment(sql, line_start, process_end, &mut on_span) {
+            if !collector.process_line(sql, line, line_start, next_line_start, &mut on_span) {
                 return;
             }
             line_start = next_line_start;
         }
 
-        if let Some(span) = collector.finalize(sql) {
-            let _ = on_span(span);
-        }
+        let _ = collector.finalize_current(sql, &mut on_span);
     }
 
     fn line_first_word(trimmed: &str) -> Option<&str> {

@@ -338,12 +338,18 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn process_line(&mut self, line: &str) {
-        self.process_line_with_observer(line, |_, _, _, _| {});
+        self.process_line_with_boundary_observer(line, |_, _| {});
     }
 
-    fn process_chars_with_observer<F>(&mut self, chars: &[char], on_symbol: &mut F)
+    fn process_chars_with_observer<F, G>(
+        &mut self,
+        chars: &[char],
+        on_symbol: &mut F,
+        on_statement_boundary: &mut G,
+    )
     where
         F: FnMut(&[char], usize, char, Option<char>),
+        G: FnMut(&[char], usize),
     {
         let len = chars.len();
         let mut i = 0usize;
@@ -705,6 +711,12 @@ impl SqlParserEngine {
             if symbol_role == SymbolRole::Semicolon {
                 self.state.clear_skip_next_end_label_token();
                 let semicolon_action = self.state.prepare_semicolon_action();
+                if matches!(
+                    semicolon_action,
+                    SemicolonAction::SplitTopLevel | SemicolonAction::SplitForcedRoutine
+                ) {
+                    on_statement_boundary(chars, i);
+                }
                 self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
                 continue;
@@ -715,9 +727,31 @@ impl SqlParserEngine {
         }
     }
 
+    pub(crate) fn process_line_with_boundary_observer<F>(
+        &mut self,
+        line: &str,
+        on_statement_boundary: F,
+    ) where
+        F: FnMut(&[char], usize),
+    {
+        self.process_line_with_observers(line, |_, _, _, _| {}, on_statement_boundary);
+    }
+
     pub(crate) fn process_line_with_observer<F>(&mut self, line: &str, on_symbol: F)
     where
         F: FnMut(&[char], usize, char, Option<char>),
+    {
+        self.process_line_with_observers(line, on_symbol, |_, _| {});
+    }
+
+    fn process_line_with_observers<F, G>(
+        &mut self,
+        line: &str,
+        on_symbol: F,
+        on_statement_boundary: G,
+    ) where
+        F: FnMut(&[char], usize, char, Option<char>),
+        G: FnMut(&[char], usize),
     {
         let line_started_with_empty_current = self.current.trim().is_empty();
         let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
@@ -725,6 +759,7 @@ impl SqlParserEngine {
             && self.state.block_depth() == 0
             && self.state.paren_depth == 0;
         let mut on_symbol = on_symbol;
+        let mut on_statement_boundary = on_statement_boundary;
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
         scratch_chars.clear();
         scratch_chars.extend(line.chars());
@@ -751,7 +786,11 @@ impl SqlParserEngine {
             return;
         }
 
-        self.process_chars_with_observer(&scratch_chars, &mut on_symbol);
+        self.process_chars_with_observer(
+            &scratch_chars,
+            &mut on_symbol,
+            &mut on_statement_boundary,
+        );
         self.state.clear_skip_next_end_label_token();
 
         if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
@@ -764,6 +803,18 @@ impl SqlParserEngine {
         }
 
         self.scratch_chars = scratch_chars;
+    }
+
+    pub(crate) fn process_line_and_take_statements_with_boundary_observer<F>(
+        &mut self,
+        line: &str,
+        on_statement_boundary: F,
+    ) -> Vec<String>
+    where
+        F: FnMut(&[char], usize),
+    {
+        self.process_line_with_boundary_observer(line, on_statement_boundary);
+        self.take_statements()
     }
 
     pub(crate) fn force_terminate(&mut self) {

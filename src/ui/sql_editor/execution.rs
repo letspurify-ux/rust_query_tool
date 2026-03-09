@@ -2169,10 +2169,18 @@ impl SqlEditorWidget {
                                     suppress_comma_break_depth.saturating_sub(1);
                             }
                             if close_case_paren_on_newline {
+                                let close_case_extra_indent =
+                                    usize::from(!open_cursor_state.in_select());
+                                let close_case_indent_level =
+                                    if next_word_is("ELSE") || next_word_is("WHEN") {
+                                        indent_level.saturating_sub(1)
+                                    } else {
+                                        indent_level
+                                    };
                                 newline_with(
                                     &mut out,
-                                    base_indent(indent_level, open_cursor_state),
-                                    1,
+                                    close_case_indent_level,
+                                    close_case_extra_indent,
                                     &mut at_line_start,
                                     &mut needs_space,
                                     &mut line_indent,
@@ -2192,8 +2200,13 @@ impl SqlEditorWidget {
                         }
                         _ => {
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            let is_plsql_attribute_prefix =
+                                Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1));
                             // Don't add space between consecutive ampersands (&&var substitution)
-                            if needs_space && !(sym == "&" && out.ends_with('&')) {
+                            if needs_space
+                                && !(sym == "&" && out.ends_with('&'))
+                                && !is_plsql_attribute_prefix
+                            {
                                 out.push(' ');
                             }
                             out.push_str(sym);
@@ -2209,7 +2222,9 @@ impl SqlEditorWidget {
                                     matches!(t, SqlToken::Word(_))
                                         || matches!(t, SqlToken::Symbol(s) if s == "&")
                                 });
-                            needs_space = !is_bind_var_colon && !is_ampersand_prefix;
+                            needs_space = !is_bind_var_colon
+                                && !is_ampersand_prefix
+                                && !is_plsql_attribute_prefix;
                         }
                     }
                     if started_line {}
@@ -2343,9 +2358,9 @@ impl SqlEditorWidget {
                     let prev_upper = prev.to_ascii_uppercase();
                     Self::starts_with_plain_end(&prev_upper)
                 });
-            let mut next_significant_line_trimmed: Option<&str> = None;
+            let mut next_significant_line: Option<(usize, &str)> = None;
             let mut in_peek_block_comment = false;
-            for next in lines.iter().skip(idx + 1) {
+            for (next_idx, next) in lines.iter().enumerate().skip(idx + 1) {
                 let next_trimmed = next.trim_start();
                 if next_trimmed.is_empty() || Self::is_sqlplus_comment_line(next_trimmed) {
                     continue;
@@ -2369,12 +2384,21 @@ impl SqlEditorWidget {
                     continue;
                 }
 
-                next_significant_line_trimmed = Some(next_trimmed);
+                next_significant_line = Some((next_idx, next_trimmed));
                 break;
             }
+            let next_significant_line_trimmed = next_significant_line.map(|(_, next)| next);
             let next_line_is_named_plain_end = next_significant_line_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
+            });
+            let next_line_is_case_branch = next_significant_line_trimmed.is_some_and(|next| {
+                let next_upper = next.to_ascii_uppercase();
+                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE")
+            });
+            let next_line_existing_indent = next_significant_line.map(|(next_idx, next_trimmed)| {
+                let next_line = lines[next_idx];
+                next_line.len().saturating_sub(next_trimmed.len()) / 4
             });
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
@@ -2393,13 +2417,18 @@ impl SqlEditorWidget {
             let existing_indent = leading_spaces / 4;
             let parser_depth = depth + extra_indent + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
-            let paren_case_closer_extra_indent =
-                usize::from(pending_paren_case_closer_indent && starts_with_close_paren);
+            let is_paren_case_closer =
+                pending_paren_case_closer_indent && starts_with_close_paren;
+            let paren_case_closer_extra_indent = usize::from(is_paren_case_closer);
             let parser_depth = parser_depth + paren_case_closer_extra_indent;
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement && starts_with_close_paren {
-                if previous_line_is_plain_end {
+                if next_line_is_case_branch {
+                    next_line_existing_indent.unwrap_or(parser_depth)
+                } else if is_paren_case_closer {
+                    parser_depth
+                } else if previous_line_is_plain_end {
                     parser_depth.saturating_add(2)
                 } else {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
@@ -2444,6 +2473,59 @@ impl SqlEditorWidget {
                 into_list_active = false;
             }
             last_code_line_trimmed = Some(trimmed.to_string());
+        }
+
+        Self::align_case_close_parens_with_branch_depth(&out)
+    }
+
+    fn align_case_close_parens_with_branch_depth(formatted: &str) -> String {
+        let lines: Vec<&str> = formatted.lines().collect();
+        let mut out = String::new();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with(')') {
+                out.push_str(line);
+                continue;
+            }
+
+            let previous_code_line = lines[..idx].iter().rev().find(|candidate| {
+                let candidate_trimmed = candidate.trim_start();
+                !candidate_trimmed.is_empty()
+                    && !Self::is_sqlplus_comment_line(candidate_trimmed)
+                    && !candidate_trimmed.starts_with("/*")
+                    && candidate_trimmed != "*/"
+            });
+            let next_code_line = lines[idx + 1..].iter().find(|candidate| {
+                let candidate_trimmed = candidate.trim_start();
+                !candidate_trimmed.is_empty()
+                    && !Self::is_sqlplus_comment_line(candidate_trimmed)
+                    && !candidate_trimmed.starts_with("/*")
+                    && candidate_trimmed != "*/"
+            });
+
+            let previous_is_plain_end = previous_code_line.is_some_and(|candidate| {
+                let upper = candidate.trim_start().to_ascii_uppercase();
+                Self::starts_with_plain_end(&upper)
+            });
+            let next_is_case_branch = next_code_line.is_some_and(|candidate| {
+                let upper = candidate.trim_start().to_ascii_uppercase();
+                upper.starts_with("WHEN ") || upper.starts_with("ELSE")
+            });
+
+            if previous_is_plain_end && next_is_case_branch {
+                let branch_indent = next_code_line
+                    .map(|candidate| candidate.len().saturating_sub(candidate.trim_start().len()) / 4)
+                    .unwrap_or(0);
+                out.push_str(&" ".repeat(branch_indent * 4));
+                out.push_str(trimmed);
+            } else {
+                out.push_str(line);
+            }
         }
 
         out
@@ -2962,10 +3044,21 @@ impl SqlEditorWidget {
         }
     }
 
+    fn token_is_word_like(token: &SqlToken) -> bool {
+        matches!(token, SqlToken::Word(_))
+    }
+
+    fn is_plsql_attribute_prefix(sym: &str, next_token: Option<&SqlToken>) -> bool {
+        sym == "%"
+            && next_token
+                .map(Self::token_is_word_like)
+                .unwrap_or(false)
+    }
+
     fn join_tokens_compact(tokens: &[SqlToken]) -> String {
         let mut out = String::new();
         let mut needs_space = false;
-        for token in tokens {
+        for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text(token);
             match token {
                 SqlToken::Symbol(sym) if sym == "(" => {
@@ -2979,6 +3072,12 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == "," => {
                     out.push_str(&text);
                     out.push(' ');
+                    needs_space = false;
+                }
+                SqlToken::Symbol(sym)
+                    if Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1)) =>
+                {
+                    out.push_str(&text);
                     needs_space = false;
                 }
                 _ => {
@@ -2999,7 +3098,7 @@ impl SqlEditorWidget {
         let indent = " ".repeat(indent_level * 4);
         let mut at_line_start = true;
 
-        for token in tokens {
+        for (idx, token) in tokens.iter().enumerate() {
             let text = Self::token_text(token);
             match token {
                 SqlToken::Comment(comment) => {
@@ -3035,6 +3134,13 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == "," => {
                     out.push(',');
                     out.push(' ');
+                    needs_space = false;
+                    at_line_start = false;
+                }
+                SqlToken::Symbol(sym)
+                    if Self::is_plsql_attribute_prefix(sym, tokens.get(idx + 1)) =>
+                {
+                    out.push('%');
                     needs_space = false;
                     at_line_start = false;
                 }

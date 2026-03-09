@@ -657,7 +657,7 @@ fn semicolon_split_resets_transient_state_at_top_level() {
     engine.state.if_state = IfState::AwaitingThen;
     engine.state.paren_depth = 0;
 
-    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
+    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
 
     assert_eq!(engine.take_statements(), vec!["SELECT 1".to_string()]);
     assert!(engine.current.is_empty());
@@ -737,7 +737,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
     engine.state.if_state = IfState::AfterConditionParen;
     engine.state.paren_depth = 0;
 
-    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {});
+    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
 
     assert_eq!(engine.take_statements(), vec!["LANGUAGE C".to_string()]);
     assert!(engine.current.is_empty());
@@ -6019,6 +6019,253 @@ fn package_body_nested_routine_named_end_updates_depth_after_end_label() {
         1,
         "END <name> should close nested routine depth"
     );
+}
+
+#[test]
+fn package_body_inner_begin_end_keeps_nested_member_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_inner_begin AS");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("  PROCEDURE run_me IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    BEGIN");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("      NULL;");
+    engine.process_line("    EXCEPTION");
+    engine.process_line("      WHEN OTHERS THEN");
+    engine.process_line("        NULL;");
+    engine.process_line("    END;");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "inner BEGIN ... END must not close the enclosing package member"
+    );
+    engine.process_line("  END run_me;");
+    assert_eq!(engine.block_depth(), 1);
+}
+
+#[test]
+fn package_body_member_after_inner_begin_end_stays_in_same_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_inner_begin AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    BEGIN");
+    engine.process_line("      NULL;");
+    engine.process_line("    EXCEPTION");
+    engine.process_line("      WHEN OTHERS THEN");
+    engine.process_line("        NULL;");
+    engine.process_line("    END;");
+    engine.process_line("  END run_me;");
+    engine.process_line("  PROCEDURE run_next IS");
+    engine.process_line("    v_cnt NUMBER := 0;");
+    engine.process_line("  BEGIN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_next;");
+    engine.process_line("END pkg_inner_begin;");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PROCEDURE run_me IS"),
+        "first package member should remain in package body: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("PROCEDURE run_next IS\n    v_cnt NUMBER := 0;\n  BEGIN"),
+        "following package member should not split away after inner BEGIN ... END: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END pkg_inner_begin"),
+        "package body terminator should stay with the package statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_local_nested_subprograms_keep_member_and_initializer_depths() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY fmt_nested_pkg AS");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("  PROCEDURE run_demo (p_seed IN NUMBER DEFAULT 3, p_result OUT CLOB) IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    PROCEDURE process_row (p_row IN t_row, p_depth IN PLS_INTEGER DEFAULT 1) IS");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("      PROCEDURE nested_walk (p_start IN PLS_INTEGER) IS");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("      BEGIN");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("        NULL;");
+    engine.process_line("      END nested_walk;");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("    BEGIN");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("      FOR j IN REVERSE 1 .. 2 LOOP");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("        BEGIN");
+    assert_eq!(engine.block_depth(), 5);
+    engine.process_line("          NULL;");
+    engine.process_line("        EXCEPTION");
+    engine.process_line("          WHEN OTHERS THEN");
+    engine.process_line("            NULL;");
+    engine.process_line("        END;");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("      END LOOP;");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("    END process_row;");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "local nested procedure END should restore enclosing package member depth"
+    );
+    engine.process_line("  BEGIN");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "package member body BEGIN should not stay nested under the local procedure"
+    );
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_demo;");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("BEGIN");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "package body initializer BEGIN should start after nested member closes"
+    );
+    engine.process_line("  NULL;");
+    engine.process_line("END fmt_nested_pkg;");
+    assert_eq!(engine.block_depth(), 0);
+}
+
+#[test]
+fn package_body_torture_blocks_remain_single_statement_until_terminator() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY torture_pkg");
+    engine.process_line("IS");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("FUNCTION log_message(p_msg VARCHAR2)");
+    engine.process_line("RETURN NUMBER");
+    engine.process_line("IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("PRAGMA AUTONOMOUS_TRANSACTION;");
+    engine.process_line("BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  RETURN 1;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    RETURN -1;");
+    engine.process_line("END;");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("PROCEDURE bulk_raise_salary");
+    engine.process_line("IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  FORALL i IN 1 .. v_ids.COUNT SAVE EXCEPTIONS");
+    engine.process_line("      UPDATE emp");
+    engine.process_line("      SET sal = sal * 1.1");
+    engine.process_line("      WHERE empno = v_ids(i);");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    FOR i IN 1 .. SQL%BULK_EXCEPTIONS.COUNT LOOP");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("      NULL;");
+    engine.process_line("    END LOOP;");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("END;");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("END torture_pkg;");
+    assert_eq!(engine.block_depth(), 0);
+    engine.process_line("/");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PROCEDURE bulk_raise_salary"),
+        "bulk_raise_salary should remain inside the package body statement: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("SQL%BULK_EXCEPTIONS.COUNT"),
+        "cursor attribute references should remain attached inside the package statement: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END torture_pkg"),
+        "package body terminator should stay in the same statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_consecutive_plain_case_ends_restore_following_member_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("  FUNCTION f_deep RETURN NUMBER IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    v NUMBER := 0;");
+    engine.process_line("  BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    v :=");
+    engine.process_line("      CASE");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("        WHEN 1 = 1 THEN");
+    engine.process_line("          CASE");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("            WHEN 2 = 2 THEN 100");
+    engine.process_line("            ELSE 10");
+    engine.process_line("          END");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("        ELSE");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("          CASE");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("            WHEN 3 = 3 THEN 777");
+    engine.process_line("            ELSE 0");
+    engine.process_line("          END");
+    assert_eq!(engine.block_depth(), 4);
+    engine.process_line("      END;");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "outer CASE END; should fully unwind nested CASE expressions before the routine END"
+    );
+    engine.process_line("    RETURN v;");
+    engine.process_line("  END;");
+    assert_eq!(
+        engine.block_depth(),
+        1,
+        "function END after consecutive CASE END tokens should restore package-body depth"
+    );
+    engine.process_line("  PROCEDURE run_torture IS");
+    assert_eq!(
+        engine.block_depth(),
+        2,
+        "following package member should not stay nested under the previous function"
+    );
+    engine.process_line("  BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    NULL;");
+    engine.process_line("  END run_torture;");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("END oqt_mega_pkg;");
+    assert_eq!(engine.block_depth(), 0);
 }
 
 #[test]

@@ -53,7 +53,52 @@ pub(crate) struct SplitState {
     skip_next_end_label_token: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PlainEndParentClosure {
+    None,
+    NestedSubprogramDeclaration,
+    AdjacentAsIsParent,
+}
+
 impl SplitState {
+    fn plain_end_parent_closure(&self, token_upper: &str) -> PlainEndParentClosure {
+        let top = self.block_stack.last().copied();
+
+        if top == Some(BlockKind::Declare)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins > 0
+        {
+            return PlainEndParentClosure::NestedSubprogramDeclaration;
+        }
+
+        if top == Some(BlockKind::Begin)
+            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+        {
+            let closes_adjacent_as_is = match self.create_plsql_kind {
+                CreatePlsqlKind::PackageBody => self.outer_initializer_end_closes_as_is(token_upper),
+                _ => true,
+            };
+            if closes_adjacent_as_is {
+                return PlainEndParentClosure::AdjacentAsIsParent;
+            }
+        }
+
+        PlainEndParentClosure::None
+    }
+
+    fn outer_initializer_end_closes_as_is(&self, token_upper: &str) -> bool {
+        if self.block_depth() != 2 {
+            return false;
+        }
+
+        match self.create_plsql_kind {
+            CreatePlsqlKind::PackageBody => {
+                self.package_body_end_label_matches(token_upper) || token_upper.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn active_routine_frame(&self) -> Option<&RoutineFrame> {
         let current_depth = self.block_depth();
         self.routine_is_stack
@@ -613,6 +658,14 @@ impl SplitState {
             return true;
         }
 
+        if token_upper == "END" && suffix.is_none() {
+            self.resolve_plain_end("");
+            self.pending_end = PendingEnd::End;
+            self.pending_end_label_token = None;
+            self.skip_next_end_label_token = false;
+            return true;
+        }
+
         if let Some(suffix) = suffix {
             let parsed_suffix_closed_block = suffix.apply_to_state(self);
             let treat_suffix_as_label = !parsed_suffix_closed_block
@@ -829,19 +882,17 @@ impl SplitState {
             self.block_stack.push(BlockKind::Declare);
             self.begin_state = BeginState::AfterDeclare;
         } else if upper == "BEGIN" {
+            let begins_pending_routine_body = self
+                .routine_is_stack
+                .last()
+                .is_some_and(|frame| frame.block_depth == self.block_depth());
             if self.begin_state == BeginState::AfterDeclare {
                 // DECLARE ... BEGIN – same block, don't push
                 self.begin_state = BeginState::None;
-            } else if self.pending_subprogram_begins > 0 {
+            } else if begins_pending_routine_body {
                 // AS/IS ... BEGIN – same block
-                if self
-                    .routine_is_stack
-                    .last()
-                    .is_some_and(|frame| frame.block_depth == self.block_depth())
-                {
-                    let _ = self.routine_is_stack.pop();
-                }
-                self.pending_subprogram_begins -= 1;
+                let _ = self.routine_is_stack.pop();
+                self.pending_subprogram_begins = self.pending_subprogram_begins.saturating_sub(1);
             } else {
                 self.block_stack.push(BlockKind::Begin);
             }
@@ -904,41 +955,19 @@ impl SplitState {
     /// Plain END (not END CASE/IF/LOOP/WHILE/REPEAT/timing).
     /// If top is Case, treat as CASE expression end. Otherwise pop a PL/SQL block.
     fn resolve_plain_end(&mut self, token_upper: &str) {
-        let top = self.block_stack.last().copied();
+        let parent_closure = self.plain_end_parent_closure(token_upper);
         let _ = self.block_stack.pop();
 
-        if top == Some(BlockKind::Declare)
-            && self.block_stack.last() == Some(&BlockKind::AsIs)
-            && self.pending_subprogram_begins > 0
-        {
+        if matches!(
+            parent_closure,
+            PlainEndParentClosure::NestedSubprogramDeclaration
+                | PlainEndParentClosure::AdjacentAsIsParent
+        ) {
             let _ = self.block_stack.pop();
-            self.pending_subprogram_begins -= 1;
-            return;
         }
 
-        if top == Some(BlockKind::Begin) && self.block_stack.last() == Some(&BlockKind::AsIs) {
-            let as_is_depth = self
-                .block_stack
-                .iter()
-                .filter(|kind| **kind == BlockKind::AsIs)
-                .count();
-
-            let should_close_as_is = match self.create_plsql_kind {
-                CreatePlsqlKind::PackageBody => {
-                    if as_is_depth > 1 {
-                        true
-                    } else {
-                        let matches_named_end = self.package_body_end_label_matches(token_upper);
-                        let unlabeled_end = token_upper.is_empty();
-                        matches_named_end || unlabeled_end
-                    }
-                }
-                _ => true,
-            };
-
-            if should_close_as_is {
-                let _ = self.block_stack.pop();
-            }
+        if parent_closure == PlainEndParentClosure::NestedSubprogramDeclaration {
+            self.pending_subprogram_begins -= 1;
         }
     }
 
@@ -952,63 +981,18 @@ impl SplitState {
             return true;
         }
 
-        if top == Some(BlockKind::Begin)
+        top == Some(BlockKind::Begin)
             && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
-            && self.block_depth() <= 2
-        {
-            let matches_named_end = self.package_body_end_label_matches(token_upper);
-            let unlabeled_end = token_upper.is_empty();
-            return matches_named_end || unlabeled_end;
-        }
-
-        false
+            && self.outer_initializer_end_closes_as_is(token_upper)
     }
 
     pub(crate) fn plain_end_scope_pop_count(&self, token_upper: &str) -> usize {
-        let top = self.block_stack.last().copied();
-        if top.is_none() {
+        if self.block_stack.is_empty() {
             return 0;
         }
 
-        let mut pop_count = 1;
-
-        if top == Some(BlockKind::Declare)
-            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
-            && self.pending_subprogram_begins > 0
-        {
-            pop_count += 1;
-            return pop_count;
-        }
-
-        if top == Some(BlockKind::Begin)
-            && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
-        {
-            let as_is_depth = self
-                .block_stack
-                .iter()
-                .filter(|kind| **kind == BlockKind::AsIs)
-                .count();
-
-            let should_close_as_is = match self.create_plsql_kind {
-                CreatePlsqlKind::PackageBody => {
-                    if as_is_depth > 1 {
-                        true
-                    } else {
-                        let matches_named_end = self.package_body_end_label_matches(token_upper);
-                        let unlabeled_end = token_upper.is_empty();
-                        matches_named_end || unlabeled_end
-                    }
-                }
-                _ => true,
-            };
-
-            if should_close_as_is {
-                pop_count += 1;
-            }
-        }
-
-        pop_count
+        1 + usize::from(self.plain_end_parent_closure(token_upper) != PlainEndParentClosure::None)
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
@@ -1103,10 +1087,6 @@ impl SplitState {
         {
             self.block_stack.remove(pos);
         }
-    }
-
-    pub(crate) fn apply_close_routine_block_on_semicolon(&mut self) {
-        self.close_external_routine_on_semicolon();
     }
 
     fn clear_forward_subprogram_declaration_state_on_semicolon(&mut self) {
@@ -1212,10 +1192,6 @@ impl SplitState {
     pub(crate) fn reset_after_statement_boundary(&mut self) {
         self.reset_statement_boundary_state();
         self.reset_create_tracking_state();
-    }
-
-    pub(crate) fn reset_create_state(&mut self) {
-        self.reset_after_statement_boundary();
     }
 
     /// Reset all state to idle for force-terminate scenarios.

@@ -1648,6 +1648,1589 @@ fn format_sql_package_body_type_table_with_nested_case_keeps_newlines() {
         formatted
     );
 }
+
+#[test]
+fn format_sql_package_body_complex_nested_blocks_keeps_following_member_in_body() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY test_pkg
+IS
+
+    ----------------------------------------------------------------
+    -- nested function
+    ----------------------------------------------------------------
+    FUNCTION calc_bonus(
+        p_salary NUMBER,
+        p_grade  VARCHAR2
+    ) RETURN NUMBER
+    IS
+        v_bonus NUMBER := 0;
+    BEGIN
+
+        CASE p_grade
+            WHEN 'A' THEN
+                v_bonus := p_salary * 0.30;
+            WHEN 'B' THEN
+                v_bonus := p_salary * 0.20;
+            WHEN 'C' THEN
+                v_bonus := p_salary * 0.10;
+            ELSE
+                v_bonus := 0;
+        END CASE;
+
+        RETURN v_bonus;
+
+    END calc_bonus;
+
+    ----------------------------------------------------------------
+    -- procedure with complex nesting
+    ----------------------------------------------------------------
+    PROCEDURE process_emp(
+        p_deptno NUMBER
+    )
+    IS
+
+        CURSOR c_emp IS
+            SELECT empno, ename, sal
+            FROM emp
+            WHERE deptno = p_deptno;
+
+        v_sql       VARCHAR2(4000);
+        v_bonus     NUMBER;
+        v_total     NUMBER := 0;
+
+    BEGIN
+
+        FOR r IN c_emp
+        LOOP
+
+            BEGIN
+
+                v_bonus := calc_bonus(
+                    r.sal,
+                    CASE
+                        WHEN r.sal > 5000 THEN 'A'
+                        WHEN r.sal > 3000 THEN 'B'
+                        ELSE 'C'
+                    END
+                );
+
+                IF v_bonus > 0 THEN
+
+                    FOR i IN 1 .. 3
+                    LOOP
+
+                        v_total := v_total + (v_bonus * i);
+
+                        IF MOD(i,2) = 0 THEN
+                            DBMS_OUTPUT.PUT_LINE(
+                                'EMP=' || r.empno
+                                || ' BONUS=' || v_bonus
+                                || ' ITER=' || i
+                            );
+                        ELSE
+
+                            CASE
+                                WHEN i = 1 THEN
+                                    NULL;
+                                WHEN i = 3 THEN
+                                    DBMS_OUTPUT.PUT_LINE('FINAL ITERATION');
+                                ELSE
+                                    NULL;
+                            END CASE;
+
+                        END IF;
+
+                    END LOOP;
+
+                ELSE
+                    DBMS_OUTPUT.PUT_LINE('NO BONUS');
+                END IF;
+
+            EXCEPTION
+                WHEN OTHERS THEN
+                    DBMS_OUTPUT.PUT_LINE(
+                        'ERROR:' || SQLERRM
+                    );
+            END;
+
+        END LOOP;
+
+        ----------------------------------------------------------------
+        -- dynamic sql block
+        ----------------------------------------------------------------
+        BEGIN
+
+            v_sql := q'[
+                INSERT INTO bonus_log(emp_count,total_bonus)
+                SELECT COUNT(*), :1
+                FROM emp
+                WHERE deptno = :2
+            ]';
+
+            EXECUTE IMMEDIATE v_sql
+                USING v_total, p_deptno;
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('LOG ERROR');
+        END;
+
+    END process_emp;
+
+    ----------------------------------------------------------------
+    -- nested block test
+    ----------------------------------------------------------------
+    PROCEDURE nested_block_test
+    IS
+        v_cnt NUMBER := 0;
+    BEGIN
+
+        DECLARE
+            v_inner NUMBER := 10;
+        BEGIN
+
+            WHILE v_inner > 0
+            LOOP
+
+                BEGIN
+
+                    v_cnt := v_cnt + 1;
+
+                    IF v_cnt > 5 THEN
+                        EXIT;
+                    END IF;
+
+                END;
+
+                v_inner := v_inner - 1;
+
+            END LOOP;
+
+        END;
+
+        DBMS_OUTPUT.PUT_LINE('COUNT=' || v_cnt);
+
+    END nested_block_test;
+
+END test_pkg;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "    END process_emp;\n\n    ----------------------------------------------------------------\n    -- nested block test"
+        ),
+        "following package member comments should stay inside package body depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "    PROCEDURE nested_block_test IS\n        v_cnt NUMBER := 0;\n    BEGIN"
+        ),
+        "following package member declaration should not split away from its BEGIN block, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "        DECLARE\n            v_inner NUMBER := 10;\n        BEGIN"
+        ),
+        "nested DECLARE block should keep procedure-body indentation, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("    END nested_block_test;\nEND test_pkg;\n/"),
+        "package body should close only after the last nested member, got: {formatted}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(formatted, formatted_again);
+}
+
+#[test]
+fn format_sql_nested_package_script_keeps_body_initializer_and_following_block() {
+    let input = r#"CREATE OR REPLACE PACKAGE fmt_nested_pkg AS
+    TYPE t_num_tab IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+
+    PROCEDURE run_demo(
+        p_seed   IN NUMBER DEFAULT 3,
+        p_result OUT CLOB
+    );
+
+    FUNCTION calc_value(
+        p_base IN NUMBER,
+        p_mode IN VARCHAR2 DEFAULT 'NORMAL'
+    ) RETURN NUMBER;
+END fmt_nested_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY fmt_nested_pkg AS
+    c_limit CONSTANT PLS_INTEGER := 7;
+    g_state VARCHAR2(30) := 'INIT';
+
+    TYPE t_row IS RECORD (
+        id   NUMBER,
+        txt  VARCHAR2(100),
+        amt  NUMBER,
+        flag VARCHAR2(1)
+    );
+
+    TYPE t_row_tab IS TABLE OF t_row INDEX BY PLS_INTEGER;
+
+    PROCEDURE append_text(
+        io_text IN OUT NOCOPY CLOB,
+        p_piece IN VARCHAR2
+    ) IS
+    BEGIN
+        io_text := io_text || p_piece || CHR(10);
+    END append_text;
+
+    FUNCTION calc_value(
+        p_base IN NUMBER,
+        p_mode IN VARCHAR2 DEFAULT 'NORMAL'
+    ) RETURN NUMBER IS
+        l_result NUMBER := NVL(p_base, 0);
+        l_factor NUMBER := 1;
+
+        FUNCTION inner_adjust(
+            p_input IN NUMBER
+        ) RETURN NUMBER IS
+            l_tmp NUMBER := NVL(p_input, 0);
+        BEGIN
+            FOR i IN 1 .. 3 LOOP
+                l_tmp :=
+                    CASE
+                        WHEN MOD(i, 2) = 0 THEN l_tmp + 5
+                        ELSE l_tmp + 2
+                    END;
+            END LOOP;
+
+            RETURN l_tmp;
+        END inner_adjust;
+    BEGIN
+        l_factor :=
+            CASE UPPER(TRIM(p_mode))
+                WHEN 'HIGH'   THEN 3
+                WHEN 'MEDIUM' THEN 2
+                WHEN 'LOW'    THEN 1
+                ELSE 1
+            END;
+
+        l_result := inner_adjust(l_result) * l_factor;
+
+        <<validation_block>>
+        BEGIN
+            IF l_result > 100 THEN
+                l_result := ROUND(l_result / 2, 2);
+            ELSIF l_result BETWEEN 50 AND 100 THEN
+                l_result := ROUND(l_result * 1.1, 2);
+            ELSE
+                l_result := ROUND(l_result + 7, 2);
+            END IF;
+        EXCEPTION
+            WHEN VALUE_ERROR THEN
+                l_result := -1;
+        END validation_block;
+
+        RETURN l_result;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN -9999;
+    END calc_value;
+
+    PROCEDURE run_demo(
+        p_seed   IN NUMBER DEFAULT 3,
+        p_result OUT CLOB
+    ) IS
+        l_rows      t_row_tab;
+        l_idx       PLS_INTEGER := 0;
+        l_total     NUMBER := 0;
+        l_count     NUMBER := 0;
+        l_status    VARCHAR2(30);
+        l_sql       VARCHAR2(4000);
+        l_json_like VARCHAR2(4000);
+        l_mode      VARCHAR2(10);
+
+        CURSOR c_data(cp_seed NUMBER) IS
+            SELECT LEVEL AS id,
+                   'ITEM_' || TO_CHAR(LEVEL) AS txt,
+                   cp_seed * LEVEL AS amt,
+                   CASE
+                       WHEN MOD(LEVEL, 2) = 0 THEN 'Y'
+                       ELSE 'N'
+                   END AS flag
+              FROM dual
+           CONNECT BY LEVEL <= LEAST(GREATEST(cp_seed, 1), 6);
+
+        PROCEDURE process_row(
+            p_row   IN t_row,
+            p_depth IN PLS_INTEGER DEFAULT 1
+        ) IS
+            l_local NUMBER := 0;
+
+            PROCEDURE nested_walk(
+                p_start IN PLS_INTEGER
+            ) IS
+                l_step PLS_INTEGER := p_start;
+            BEGIN
+                WHILE l_step <= 3 LOOP
+                    l_local := l_local +
+                        CASE
+                            WHEN p_row.flag = 'Y' AND l_step = 1 THEN 100
+                            WHEN p_row.flag = 'Y' THEN 10 * l_step
+                            WHEN p_row.flag = 'N' AND l_step = 3 THEN 3
+                            ELSE l_step
+                        END;
+
+                    l_step := l_step + 1;
+                END LOOP;
+            END nested_walk;
+        BEGIN
+            IF p_depth <= 2 THEN
+                nested_walk(1);
+            ELSE
+                l_local := -1;
+            END IF;
+
+            FOR j IN REVERSE 1 .. 2 LOOP
+                BEGIN
+                    IF j = 2 THEN
+                        l_local := l_local + calc_value(p_row.amt, 'HIGH');
+                    ELSE
+                        l_local := l_local +
+                            CASE
+                                WHEN p_row.amt > 10 THEN calc_value(p_row.amt, 'MEDIUM')
+                                ELSE calc_value(p_row.amt, 'LOW')
+                            END;
+                    END IF;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        l_local := l_local - 50;
+                END;
+            END LOOP;
+
+            l_total := l_total + l_local;
+        EXCEPTION
+            WHEN OTHERS THEN
+                l_total := l_total - 999;
+        END process_row;
+    BEGIN
+        p_result := TO_CLOB('');
+
+        l_json_like := q'!{
+  "check": "formatter",
+  "text": "package body / nested begin-end / case / loop / dynamic sql"
+}!';
+
+        append_text(p_result, 'START');
+        append_text(p_result, 'STATE=' || g_state);
+        append_text(p_result, 'RAW=' || REPLACE(l_json_like, CHR(10), ' '));
+
+        FOR r IN c_data(p_seed) LOOP
+            l_idx := l_idx + 1;
+
+            l_rows(l_idx).id   := r.id;
+            l_rows(l_idx).txt  := r.txt;
+            l_rows(l_idx).amt  := r.amt;
+            l_rows(l_idx).flag := r.flag;
+
+            process_row(
+                l_rows(l_idx),
+                CASE
+                    WHEN MOD(r.id, 2) = 0 THEN 2
+                    ELSE 1
+                END
+            );
+
+            EXIT WHEN l_idx >= c_limit AND p_seed = 9999;
+        END LOOP;
+
+        BEGIN
+            l_sql := q'[select count(*) from dual connect by level <= :x]';
+
+            EXECUTE IMMEDIATE l_sql
+                INTO l_count
+                USING LEAST(GREATEST(p_seed, 1), 4);
+
+            CASE
+                WHEN l_count = 0 THEN
+                    l_status := 'EMPTY';
+                WHEN l_count BETWEEN 1 AND 2 THEN
+                    l_status := 'SMALL';
+                WHEN l_count BETWEEN 3 AND 4 THEN
+                    l_status := 'MEDIUM';
+                ELSE
+                    l_status := 'LARGE';
+            END CASE;
+        EXCEPTION
+            WHEN OTHERS THEN
+                l_status := 'DYN_SQL_ERROR';
+        END;
+
+        FOR i IN 1 .. l_rows.COUNT LOOP
+            CONTINUE WHEN l_rows.EXISTS(i)
+                      AND l_rows(i).flag = 'N'
+                      AND l_rows(i).amt < 5;
+
+            l_mode :=
+                CASE
+                    WHEN l_rows(i).amt >= 12 THEN 'HIGH'
+                    WHEN l_rows(i).amt >= 6 THEN 'MEDIUM'
+                    ELSE 'LOW'
+                END;
+
+            append_text(
+                p_result,
+                '[' || i || '] '
+                || l_rows(i).txt
+                || ' / mode=' || l_mode
+                || ' / calc=' || TO_CHAR(calc_value(l_rows(i).amt, l_mode))
+            );
+        END LOOP;
+
+        append_text(p_result, 'STATUS=' || l_status);
+        append_text(p_result, 'TOTAL=' || TO_CHAR(l_total));
+
+        <<final_block>>
+        BEGIN
+            IF l_total > 500 THEN
+                append_text(p_result, 'FINAL=VERY_HIGH');
+            ELSIF l_total > 200 THEN
+                append_text(p_result, 'FINAL=HIGH');
+            ELSIF l_total > 100 THEN
+                append_text(p_result, 'FINAL=MID');
+            ELSE
+                append_text(p_result, 'FINAL=LOW');
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                append_text(p_result, 'FINAL=ERROR');
+        END final_block;
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_result := 'RUN_DEMO_ERROR: ' || SQLERRM;
+    END run_demo;
+
+BEGIN
+    g_state :=
+        CASE
+            WHEN g_state IS NULL THEN 'BOOT'
+            ELSE g_state || '_READY'
+        END;
+END fmt_nested_pkg;
+/
+DECLARE
+    l_result CLOB;
+BEGIN
+    fmt_nested_pkg.run_demo(4, l_result);
+    DBMS_OUTPUT.PUT_LINE(DBMS_LOB.SUBSTR(l_result, 32767, 1));
+END;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("END fmt_nested_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY fmt_nested_pkg AS"),
+        "package spec/body separator should stay intact, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "FUNCTION inner_adjust (p_input IN NUMBER) RETURN NUMBER IS\n            l_tmp NUMBER := NVL (p_input, 0);\n        BEGIN"
+        ),
+        "nested local function should stay inside calc_value declaration depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "<<validation_block>>\n        BEGIN\n            IF l_result > 100 THEN"
+        ),
+        "labeled validation block should keep nested BEGIN depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "PROCEDURE process_row (p_row IN t_row, p_depth IN PLS_INTEGER DEFAULT 1) IS\n            l_local NUMBER := 0;\n            PROCEDURE nested_walk (p_start IN PLS_INTEGER) IS"
+        ),
+        "nested local procedures should remain within run_demo declaration section, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "    BEGIN\n        g_state :=\n        CASE\n            WHEN g_state IS NULL THEN\n                'BOOT'\n            ELSE\n                g_state || '_READY'\n        END;\n    END fmt_nested_pkg;\n/\n\nDECLARE"
+        ),
+        "package body initializer should close on package END and preserve following anonymous block, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "DECLARE\n    l_result CLOB;\nBEGIN\n    fmt_nested_pkg.run_demo (4, l_result);\n    DBMS_OUTPUT.PUT_LINE (DBMS_LOB.SUBSTR (l_result, 32767, 1));\nEND;\n/"
+        ),
+        "trailing anonymous block should remain a separate formatted statement, got: {formatted}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(formatted, formatted_again);
+}
+
+#[test]
+fn format_sql_torture_package_body_keeps_nested_blocks_and_labels() {
+    let input = r#"CREATE OR REPLACE PACKAGE BODY torture_pkg
+IS
+
+-------------------------------------------------------
+-- TYPE 정의
+-------------------------------------------------------
+
+TYPE refcur IS REF CURSOR;
+
+TYPE emp_rec IS RECORD
+(
+    empno   NUMBER,
+    ename   VARCHAR2(100),
+    sal     NUMBER
+);
+
+TYPE emp_tab IS TABLE OF emp_rec INDEX BY PLS_INTEGER;
+
+-------------------------------------------------------
+-- Autonomous Transaction Function
+-------------------------------------------------------
+
+FUNCTION log_message(p_msg VARCHAR2)
+RETURN NUMBER
+IS
+PRAGMA AUTONOMOUS_TRANSACTION;
+
+BEGIN
+
+    INSERT INTO log_table(msg, log_time)
+    VALUES(p_msg, SYSDATE);
+
+    COMMIT;
+
+    RETURN 1;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RETURN -1;
+END;
+
+-------------------------------------------------------
+-- Nested Logic Procedure
+-------------------------------------------------------
+
+PROCEDURE complex_logic(p_dept NUMBER)
+IS
+
+    v_tab      emp_tab;
+    v_idx      NUMBER := 0;
+    v_total    NUMBER := 0;
+
+    CURSOR c_emp IS
+        SELECT empno, ename, sal
+        FROM emp
+        WHERE deptno = p_dept;
+
+BEGIN
+
+    ---------------------------------------------------
+    -- BULK COLLECT
+    ---------------------------------------------------
+
+    OPEN c_emp;
+
+    LOOP
+        FETCH c_emp BULK COLLECT INTO v_tab LIMIT 50;
+
+        EXIT WHEN v_tab.COUNT = 0;
+
+        <<outer_loop>>
+        FOR i IN 1 .. v_tab.COUNT
+        LOOP
+
+            BEGIN
+
+                v_idx := v_idx + 1;
+
+                IF v_tab(i).sal > 5000 THEN
+
+                    CASE
+                        WHEN v_tab(i).sal > 10000 THEN
+                            v_total := v_total + v_tab(i).sal * 0.5;
+
+                        WHEN v_tab(i).sal > 7000 THEN
+                            v_total := v_total + v_tab(i).sal * 0.3;
+
+                        ELSE
+                            v_total := v_total + v_tab(i).sal * 0.1;
+                    END CASE;
+
+                ELSE
+
+                    DECLARE
+                        v_inner NUMBER := 3;
+                    BEGIN
+
+                        WHILE v_inner > 0
+                        LOOP
+
+                            EXIT outer_loop WHEN v_inner = -1;
+
+                            v_total := v_total + v_tab(i).sal;
+
+                            v_inner := v_inner - 1;
+
+                        END LOOP;
+
+                    END;
+
+                END IF;
+
+            EXCEPTION
+                WHEN ZERO_DIVIDE THEN
+                    log_message('DIV ERROR');
+                WHEN OTHERS THEN
+                    log_message(SQLERRM);
+            END;
+
+        END LOOP;
+
+    END LOOP;
+
+    CLOSE c_emp;
+
+END;
+
+-------------------------------------------------------
+-- Dynamic SQL + REF CURSOR
+-------------------------------------------------------
+
+PROCEDURE open_cursor(
+    p_dept   NUMBER,
+    p_cursor OUT refcur
+)
+IS
+
+    v_sql VARCHAR2(4000);
+
+BEGIN
+
+    v_sql := q'[
+        SELECT empno,
+               ename,
+               sal,
+               CASE
+                   WHEN sal > 5000 THEN 'HIGH'
+                   WHEN sal > 3000 THEN 'MID'
+                   ELSE 'LOW'
+               END grade
+        FROM emp
+        WHERE deptno = :1
+        ORDER BY sal DESC
+    ]';
+
+    OPEN p_cursor FOR v_sql USING p_dept;
+
+END;
+
+-------------------------------------------------------
+-- FORALL + Exception Handling
+-------------------------------------------------------
+
+PROCEDURE bulk_raise_salary
+IS
+
+    TYPE id_tab IS TABLE OF NUMBER;
+    v_ids id_tab := id_tab(7369, 7499, 7521, 7566);
+
+BEGIN
+
+    FORALL i IN 1 .. v_ids.COUNT SAVE EXCEPTIONS
+        UPDATE emp
+        SET sal = sal * 1.1
+        WHERE empno = v_ids(i);
+
+EXCEPTION
+
+    WHEN OTHERS THEN
+
+        FOR i IN 1 .. SQL%BULK_EXCEPTIONS.COUNT
+        LOOP
+            DBMS_OUTPUT.PUT_LINE(
+                'ERROR INDEX=' || SQL%BULK_EXCEPTIONS(i).ERROR_INDEX ||
+                ' CODE=' || SQL%BULK_EXCEPTIONS(i).ERROR_CODE
+            );
+        END LOOP;
+
+END;
+
+-------------------------------------------------------
+-- Deep Nested Block
+-------------------------------------------------------
+
+PROCEDURE deep_nesting
+IS
+
+    v_counter NUMBER := 0;
+
+BEGIN
+
+    <<main_loop>>
+    FOR i IN 1 .. 5
+    LOOP
+
+        DECLARE
+            v_tmp NUMBER := i;
+        BEGIN
+
+            FOR j IN 1 .. 3
+            LOOP
+
+                IF j = 2 THEN
+
+                    BEGIN
+
+                        CASE
+                            WHEN v_tmp = 1 THEN
+                                v_counter := v_counter + 1;
+
+                            WHEN v_tmp = 2 THEN
+                                v_counter := v_counter + 2;
+
+                            ELSE
+
+                                DECLARE
+                                    v_inner NUMBER := 5;
+                                BEGIN
+
+                                    LOOP
+                                        EXIT WHEN v_inner = 0;
+
+                                        v_counter := v_counter + v_inner;
+
+                                        v_inner := v_inner - 1;
+                                    END LOOP;
+
+                                END;
+
+                        END CASE;
+
+                    END;
+
+                ELSE
+                    NULL;
+                END IF;
+
+            END LOOP;
+
+        END;
+
+    END LOOP;
+
+    DBMS_OUTPUT.PUT_LINE('COUNTER=' || v_counter);
+
+END;
+
+END torture_pkg;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "FUNCTION log_message (p_msg VARCHAR2) RETURN NUMBER IS\n        PRAGMA AUTONOMOUS_TRANSACTION;\n    BEGIN"
+        ),
+        "autonomous transaction pragma should stay inside function declaration block, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "<<outer_loop>>\n            FOR i IN 1..v_tab.COUNT LOOP"
+        ),
+        "outer loop label should stay attached to the nested FOR loop, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "DECLARE\n                            v_inner NUMBER := 3;\n                        BEGIN\n                            WHILE v_inner > 0 LOOP"
+        ),
+        "nested DECLARE/WHILE block inside ELSE should keep procedure-body depth, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "EXIT outer_loop WHEN v_inner = - 1;"
+        ),
+        "labeled EXIT WHEN should stay on one line inside the nested loop, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "v_sql := q'[\n        SELECT empno,\n               ename,\n               sal,\n               CASE"
+        ),
+        "q-quoted dynamic SQL block should remain multiline with CASE layout, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "FORALL i IN 1..v_ids.COUNT SAVE EXCEPTIONS\n        UPDATE emp\n        SET sal = sal * 1.1\n        WHERE empno = v_ids (i);"
+        ),
+        "FORALL block should keep DML indentation and SAVE EXCEPTIONS on the loop header, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "FOR i IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP"
+        ),
+        "SQL%BULK_EXCEPTIONS cursor attributes should not be split by spaces, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "SQL%BULK_EXCEPTIONS (i).ERROR_INDEX || ' CODE=' || SQL%BULK_EXCEPTIONS (i).ERROR_CODE"
+        ),
+        "BULK_EXCEPTIONS attribute access should stay attached to SQL%, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "<<main_loop>>\n        FOR i IN 1..5 LOOP\n            DECLARE\n                v_tmp NUMBER := i;\n            BEGIN"
+        ),
+        "deep nested main loop should preserve DECLARE/BEGIN structure, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("END torture_pkg;\n/"),
+        "package body terminator should stay at the end of the formatted statement, got: {formatted}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(formatted, formatted_again);
+}
+
+#[test]
+fn format_sql_fmt_pkg_extreme_script_keeps_package_body_and_following_blocks_separate() {
+    let input = r#"--------------------------------------------------------------------------------
+-- 0) 정리
+--------------------------------------------------------------------------------
+BEGIN
+    EXECUTE IMMEDIATE 'DROP PACKAGE fmt_pkg_extreme';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -4043 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE fmtx_audit PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE fmtx_unit PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP SEQUENCE fmtx_audit_seq';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -2289 THEN
+            RAISE;
+        END IF;
+END;
+/
+--------------------------------------------------------------------------------
+-- 1) 테스트용 객체
+--------------------------------------------------------------------------------
+CREATE TABLE fmtx_unit (
+    id         NUMBER PRIMARY KEY,
+    parent_id  NUMBER,
+    code       VARCHAR2(50)  NOT NULL,
+    qty        NUMBER,
+    price      NUMBER(12, 2),
+    status     VARCHAR2(10),
+    note       VARCHAR2(4000),
+    created_at DATE DEFAULT SYSDATE,
+    CONSTRAINT fk_fmtx_unit_parent
+        FOREIGN KEY (parent_id)
+        REFERENCES fmtx_unit (id)
+);
+/
+
+CREATE TABLE fmtx_audit (
+    audit_id    NUMBER PRIMARY KEY,
+    phase       VARCHAR2(30),
+    message     VARCHAR2(4000),
+    created_at  TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+/
+
+CREATE SEQUENCE fmtx_audit_seq
+    START WITH 1
+    INCREMENT BY 1
+    NOCACHE;
+/
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (1, NULL, 'ROOT',      2, 100, 'NEW',  'root node');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (2, 1,    'ORD-A',     4,  15, 'OPEN', 'child a');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (3, 1,    'ORD-B',     1,  80, 'HOLD', 'child b');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (4, 2,    'ORD-A-01', 10,   5, 'DONE', 'leaf a-01');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (5, 2,    'ORD-A-02',  7,  12, 'NEW',  'leaf a-02');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (6, 3,    'ORD-B-01',  3,  25, 'OPEN', 'leaf b-01');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (7, 3,    'ORD-B-02',  8,   9, 'HOLD', 'leaf b-02');
+
+COMMIT;
+/
+--------------------------------------------------------------------------------
+-- 2) package spec
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE fmt_pkg_extreme AS
+    TYPE t_num_aat IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    TYPE t_vc_aat  IS TABLE OF VARCHAR2(32767) INDEX BY PLS_INTEGER;
+
+    PROCEDURE run_extreme(
+        p_root_id IN NUMBER DEFAULT 1,
+        p_text    OUT CLOB
+    );
+
+    PROCEDURE validate_and_process(
+        p_root_id IN NUMBER,
+        p_mode    IN VARCHAR2 DEFAULT 'NORMAL'
+    );
+
+    FUNCTION calc_score(
+        p_qty    IN NUMBER,
+        p_price  IN NUMBER,
+        p_status IN VARCHAR2,
+        p_depth  IN PLS_INTEGER DEFAULT 0
+    ) RETURN NUMBER;
+
+    FUNCTION render_snapshot(
+        p_root_id IN NUMBER
+    ) RETURN CLOB;
+END fmt_pkg_extreme;
+/
+--------------------------------------------------------------------------------
+-- 3) package body
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+    c_pkg_name   CONSTANT VARCHAR2(30) := 'FMT_PKG_EXTREME';
+    c_max_depth  CONSTANT PLS_INTEGER  := 9;
+
+    g_exec_count NUMBER       := 0;
+    g_last_mode  VARCHAR2(30) := 'BOOT';
+
+    SUBTYPE t_status IS VARCHAR2(10);
+
+    ----------------------------------------------------------------------------
+    -- audit log
+    ----------------------------------------------------------------------------
+    PROCEDURE audit(
+        p_phase   IN VARCHAR2,
+        p_message IN VARCHAR2
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO fmtx_audit (
+            audit_id,
+            phase,
+            message,
+            created_at
+        )
+        VALUES (
+            fmtx_audit_seq.NEXTVAL,
+            SUBSTR(UPPER(p_phase), 1, 30),
+            SUBSTR(p_message, 1, 4000),
+            SYSTIMESTAMP
+        );
+
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+    END audit;
+
+    ----------------------------------------------------------------------------
+    -- score calculation
+    ----------------------------------------------------------------------------
+    FUNCTION calc_score(
+        p_qty    IN NUMBER,
+        p_price  IN NUMBER,
+        p_status IN VARCHAR2,
+        p_depth  IN PLS_INTEGER DEFAULT 0
+    ) RETURN NUMBER IS
+        l_score       NUMBER := 0;
+        l_multiplier  NUMBER := 1;
+        l_status      t_status := UPPER(TRIM(NVL(p_status, 'NEW')));
+
+        FUNCTION base_score(
+            p_qty_inner   IN NUMBER,
+            p_price_inner IN NUMBER
+        ) RETURN NUMBER IS
+            l_base NUMBER := 0;
+        BEGIN
+            l_base :=
+                  NVL(p_qty_inner, 0) * NVL(p_price_inner, 0)
+                + CASE
+                      WHEN NVL(p_qty_inner, 0) >= 10 THEN 25
+                      WHEN NVL(p_qty_inner, 0) >= 5  THEN 10
+                      ELSE 3
+                  END;
+
+            RETURN l_base;
+        END base_score;
+
+        FUNCTION tier_bonus(
+            p_status_inner IN VARCHAR2
+        ) RETURN NUMBER IS
+        BEGIN
+            RETURN CASE UPPER(TRIM(NVL(p_status_inner, 'NEW')))
+                       WHEN 'DONE' THEN 40
+                       WHEN 'OPEN' THEN 20
+                       WHEN 'HOLD' THEN -5
+                       ELSE 0
+                   END;
+        END tier_bonus;
+    BEGIN
+        l_score := base_score(p_qty, p_price) + tier_bonus(l_status);
+
+        <<score_policy>>
+        DECLARE
+            l_depth_bonus NUMBER := 0;
+        BEGIN
+            IF p_depth <= 0 THEN
+                l_depth_bonus := 0;
+            ELSIF p_depth = 1 THEN
+                l_depth_bonus := 2;
+            ELSIF p_depth BETWEEN 2 AND 3 THEN
+                l_depth_bonus := 7;
+            ELSE
+                l_depth_bonus := 15;
+            END IF;
+
+            CASE
+                WHEN l_status IN ('NEW', 'OPEN') THEN
+                    l_multiplier := 1.10;
+                WHEN l_status = 'DONE' THEN
+                    l_multiplier := 1.35;
+                WHEN l_status = 'HOLD' THEN
+                    l_multiplier := 0.80;
+                ELSE
+                    l_multiplier := 1;
+            END CASE;
+
+            l_score := ROUND((l_score + l_depth_bonus) * l_multiplier, 2);
+        EXCEPTION
+            WHEN VALUE_ERROR THEN
+                l_score := -1;
+        END score_policy;
+
+        RETURN l_score;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN -999999;
+    END calc_score;
+
+    ----------------------------------------------------------------------------
+    -- current snapshot
+    ----------------------------------------------------------------------------
+    FUNCTION render_snapshot(
+        p_root_id IN NUMBER
+    ) RETURN CLOB IS
+        l_out CLOB := TO_CLOB('');
+
+        PROCEDURE push(
+            p_line IN VARCHAR2
+        ) IS
+        BEGIN
+            l_out := l_out || p_line || CHR(10);
+        END push;
+    BEGIN
+        push('=== SNAPSHOT START ===');
+        push('PACKAGE=' || c_pkg_name || ', EXEC_COUNT=' || g_exec_count || ', LAST_MODE=' || g_last_mode);
+
+        FOR r IN (
+            SELECT LEVEL AS lvl,
+                   id,
+                   parent_id,
+                   LPAD(' ', (LEVEL - 1) * 2) || code AS tree_code,
+                   qty,
+                   price,
+                   status
+              FROM fmtx_unit
+             START WITH id = p_root_id
+           CONNECT BY PRIOR id = parent_id
+             ORDER SIBLINGS BY id
+        ) LOOP
+            push(
+                   '[' || r.lvl || '] '
+                || 'ID=' || r.id
+                || ', PARENT=' || NVL(TO_CHAR(r.parent_id), 'NULL')
+                || ', CODE=' || r.tree_code
+                || ', QTY=' || NVL(TO_CHAR(r.qty), 'NULL')
+                || ', PRICE=' || NVL(TO_CHAR(r.price, 'FM9999990.00'), 'NULL')
+                || ', STATUS=' || NVL(r.status, 'NULL')
+                || ', BAND='
+                || CASE
+                       WHEN NVL(r.price, 0) >= 50 THEN 'HIGH'
+                       WHEN NVL(r.price, 0) >= 10 THEN 'MID'
+                       ELSE 'LOW'
+                   END
+            );
+        END LOOP;
+
+        push('=== SNAPSHOT END ===');
+        RETURN l_out;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN 'SNAPSHOT ERROR: ' || SQLERRM;
+    END render_snapshot;
+
+    ----------------------------------------------------------------------------
+    -- main processor
+    ----------------------------------------------------------------------------
+    PROCEDURE validate_and_process(
+        p_root_id IN NUMBER,
+        p_mode    IN VARCHAR2 DEFAULT 'NORMAL'
+    ) IS
+        CURSOR c_units(cp_root_id NUMBER) IS
+            SELECT id,
+                   parent_id,
+                   code,
+                   qty,
+                   price,
+                   status,
+                   note,
+                   LEVEL AS lvl
+              FROM fmtx_unit
+             START WITH id = cp_root_id
+           CONNECT BY PRIOR id = parent_id
+             ORDER SIBLINGS BY id;
+
+        TYPE t_units_tab IS TABLE OF c_units%ROWTYPE INDEX BY PLS_INTEGER;
+
+        l_units      t_units_tab;
+        l_ids        t_num_aat;
+        l_marks      t_vc_aat;
+        l_idx        PLS_INTEGER;
+        l_mode       VARCHAR2(30) := UPPER(TRIM(NVL(p_mode, 'NORMAL')));
+        l_total      NUMBER := 0;
+        l_sql        VARCHAR2(32767);
+        l_count      NUMBER := 0;
+
+        e_bad_mode    EXCEPTION;
+        e_deadlock    EXCEPTION;
+        e_bulk_errors EXCEPTION;
+
+        PRAGMA EXCEPTION_INIT(e_deadlock, -60);
+        PRAGMA EXCEPTION_INIT(e_bulk_errors, -24381);
+
+        PROCEDURE ensure_mode IS
+        BEGIN
+            IF l_mode NOT IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
+                RAISE e_bad_mode;
+            END IF;
+        END ensure_mode;
+
+        FUNCTION decorate_note(
+            p_old   IN VARCHAR2,
+            p_score IN NUMBER,
+            p_seq   IN PLS_INTEGER
+        ) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN SUBSTR(
+                       NVL(p_old, '')
+                    || CASE
+                           WHEN p_old IS NULL THEN ''
+                           ELSE CHR(10)
+                       END
+                    || q'~[fmt-begin
+quotes: 'single', "double", q'[inner]'
+purpose: formatter stress test
+]~'
+                    || 'seq=' || p_seq
+                    || ', score=' || TO_CHAR(p_score, 'FM9999990.00')
+                    || CHR(10)
+                    || q'~[fmt-end]~',
+                       1,
+                       4000
+                   );
+        END decorate_note;
+
+        PROCEDURE apply_one(
+            p_row IN c_units%ROWTYPE,
+            p_pos IN PLS_INTEGER
+        ) IS
+            l_score       NUMBER := 0;
+            l_new_status  VARCHAR2(10);
+        BEGIN
+            SAVEPOINT sp_apply_one;
+
+            IF l_mode = 'STRICT' AND p_row.qty IS NULL THEN
+                RAISE_APPLICATION_ERROR(-20001, 'qty is required for id=' || p_row.id);
+            END IF;
+
+            l_score := calc_score(
+                           p_qty    => p_row.qty,
+                           p_price  => p_row.price,
+                           p_status => p_row.status,
+                           p_depth  => p_row.lvl
+                       );
+
+            <<inner_rules>>
+            DECLARE
+                l_counter PLS_INTEGER := 0;
+                l_gate    VARCHAR2(10) := 'INIT';
+            BEGIN
+                LOOP
+                    l_counter := l_counter + 1;
+
+                    IF l_counter = 1 THEN
+                        l_gate := 'FIRST';
+                    ELSIF l_counter BETWEEN 2 AND 3 THEN
+                        l_gate := 'MID';
+                    ELSE
+                        l_gate := 'STOP';
+                    END IF;
+
+                    EXIT WHEN l_gate = 'STOP';
+                END LOOP;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    audit('INNER_RULES', 'inner_rules failed for id=' || p_row.id);
+            END inner_rules;
+
+            CASE
+                WHEN l_score >= 150 THEN
+                    l_new_status := 'DONE';
+                WHEN l_score >= 80 THEN
+                    l_new_status := 'OPEN';
+                WHEN l_score >= 40 THEN
+                    l_new_status := 'HOLD';
+                ELSE
+                    l_new_status := 'NEW';
+            END CASE;
+
+            l_sql := q'[
+MERGE INTO fmtx_unit t
+USING (
+    SELECT :1 AS id,
+           :2 AS status,
+           :3 AS note
+      FROM dual
+) s
+   ON (t.id = s.id)
+ WHEN MATCHED THEN
+      UPDATE
+         SET t.status = s.status,
+             t.note   = s.note,
+             t.price  = CASE
+                           WHEN t.price IS NULL THEN 0
+                           ELSE t.price
+                        END
+]';
+
+            EXECUTE IMMEDIATE l_sql
+                USING p_row.id,
+                      l_new_status,
+                      decorate_note(p_row.note, l_score, p_pos);
+
+            l_ids(p_pos)   := p_row.id;
+            l_marks(p_pos) := l_new_status || ':' || TO_CHAR(l_score, 'FM9999990.00');
+            l_total        := l_total + l_score;
+        EXCEPTION
+            WHEN e_deadlock THEN
+                ROLLBACK TO sp_apply_one;
+                audit('DEADLOCK', 'deadlock for id=' || p_row.id);
+                RAISE;
+            WHEN OTHERS THEN
+                ROLLBACK TO sp_apply_one;
+                audit(
+                    'ROW_ERROR',
+                    'apply_one failed for id=' || p_row.id || ': ' || SQLERRM
+                );
+
+                IF l_mode = 'STRICT' THEN
+                    RAISE;
+                END IF;
+        END apply_one;
+    BEGIN
+        ensure_mode;
+
+        g_exec_count := g_exec_count + 1;
+        g_last_mode  := l_mode;
+
+        OPEN c_units(p_root_id);
+        FETCH c_units BULK COLLECT INTO l_units;
+        CLOSE c_units;
+
+        IF l_units.COUNT = 0 THEN
+            audit('INFO', 'no rows for root_id=' || p_root_id);
+            RETURN;
+        END IF;
+
+        l_idx := l_units.FIRST;
+
+        <<scan_loop>>
+        WHILE l_idx IS NOT NULL LOOP
+            IF l_units(l_idx).lvl > c_max_depth THEN
+                l_idx := l_units.NEXT(l_idx);
+                CONTINUE scan_loop;
+            END IF;
+
+            BEGIN
+                CASE
+                    WHEN l_mode = 'DRYRUN' THEN
+                        audit(
+                            'DRYRUN',
+                            'skip id=' || l_units(l_idx).id || ', code=' || l_units(l_idx).code
+                        );
+
+                    WHEN l_mode = 'AGGRESSIVE' THEN
+                        apply_one(l_units(l_idx), l_idx);
+
+                        IF l_units(l_idx).status = 'HOLD' THEN
+                            apply_one(l_units(l_idx), l_idx);
+                        END IF;
+
+                    ELSE
+                        apply_one(l_units(l_idx), l_idx);
+                END CASE;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    audit(
+                        'LOOP_ERROR',
+                        'scan_loop item failed. idx=' || l_idx || ', id=' || l_units(l_idx).id
+                    );
+
+                    IF l_mode = 'STRICT' THEN
+                        RAISE;
+                    END IF;
+            END;
+
+            l_idx := l_units.NEXT(l_idx);
+        END LOOP scan_loop;
+
+        IF l_mode <> 'DRYRUN' AND l_ids.COUNT > 0 THEN
+            BEGIN
+                FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS
+                    UPDATE fmtx_unit
+                       SET note =
+                               SUBSTR(
+                                   NVL(note, '')
+                                || CASE
+                                       WHEN note IS NULL THEN ''
+                                       ELSE CHR(10)
+                                   END
+                                || '[batch-mark:' || l_marks(i) || ']',
+                                   1,
+                                   4000
+                               )
+                     WHERE id = l_ids(i);
+            EXCEPTION
+                WHEN e_bulk_errors THEN
+                    FOR j IN 1 .. SQL%BULK_EXCEPTIONS.COUNT LOOP
+                        audit(
+                            'FORALL_ERR',
+                            'index=' || SQL%BULK_EXCEPTIONS(j).ERROR_INDEX
+                            || ', code=' || SQL%BULK_EXCEPTIONS(j).ERROR_CODE
+                        );
+                    END LOOP;
+            END;
+        END IF;
+
+        BEGIN
+            EXECUTE IMMEDIATE q'[
+                SELECT COUNT(*)
+                  FROM fmtx_unit
+                 WHERE parent_id = :x
+            ]'
+                INTO l_count
+                USING p_root_id;
+
+            audit(
+                'SUMMARY',
+                'root_id=' || p_root_id
+                || ', mode=' || l_mode
+                || ', rows=' || l_units.COUNT
+                || ', child_count=' || l_count
+                || ', total=' || TO_CHAR(l_total, 'FM9999990.00')
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                audit('SUMMARY_ERR', 'summary failed for root_id=' || p_root_id);
+        END;
+    EXCEPTION
+        WHEN e_bad_mode THEN
+            audit('BAD_MODE', 'unsupported mode=' || l_mode);
+            RAISE_APPLICATION_ERROR(-20002, 'unsupported mode: ' || l_mode);
+        WHEN OTHERS THEN
+            audit(
+                'FATAL',
+                'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM
+            );
+            RAISE;
+    END validate_and_process;
+
+    ----------------------------------------------------------------------------
+    -- orchestrator
+    ----------------------------------------------------------------------------
+    PROCEDURE run_extreme(
+        p_root_id IN NUMBER DEFAULT 1,
+        p_text    OUT CLOB
+    ) IS
+        l_modes     t_vc_aat;
+        l_snapshot  CLOB;
+        l_done_cnt  NUMBER;
+        l_open_cnt  NUMBER;
+        l_hold_cnt  NUMBER;
+
+        PROCEDURE add_line(
+            p_target IN OUT NOCOPY CLOB,
+            p_line   IN VARCHAR2
+        ) IS
+        BEGIN
+            p_target := p_target || p_line || CHR(10);
+        END add_line;
+    BEGIN
+        p_text := TO_CLOB('');
+
+        l_modes(1) := 'NORMAL';
+        l_modes(2) := 'AGGRESSIVE';
+        l_modes(3) := 'DRYRUN';
+
+        FOR i IN 1 .. l_modes.COUNT LOOP
+            BEGIN
+                add_line(p_text, '=== MODE ' || l_modes(i) || ' START ===');
+
+                validate_and_process(
+                    p_root_id => p_root_id,
+                    p_mode    => l_modes(i)
+                );
+
+                l_snapshot := render_snapshot(p_root_id);
+
+                add_line(p_text, DBMS_LOB.SUBSTR(l_snapshot, 32767, 1));
+                add_line(p_text, '=== MODE ' || l_modes(i) || ' END ===');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    add_line(
+                        p_text,
+                        'MODE ' || l_modes(i) || ' ERROR: ' || SQLERRM
+                    );
+            END;
+        END LOOP;
+
+        <<summary_block>>
+        BEGIN
+            SELECT SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status = 'HOLD' THEN 1 ELSE 0 END)
+              INTO l_done_cnt,
+                   l_open_cnt,
+                   l_hold_cnt
+              FROM fmtx_unit;
+
+            add_line(
+                p_text,
+                'FINAL SUMMARY => DONE=' || NVL(l_done_cnt, 0)
+                || ', OPEN=' || NVL(l_open_cnt, 0)
+                || ', HOLD=' || NVL(l_hold_cnt, 0)
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                add_line(p_text, 'FINAL SUMMARY ERROR');
+        END summary_block;
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_text := 'RUN_EXTREME_ERROR: ' || SQLERRM;
+    END run_extreme;
+
+BEGIN
+    g_last_mode :=
+        CASE
+            WHEN TO_CHAR(SYSDATE, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT', 'SUN')
+                THEN 'WEEKEND_BOOT'
+            ELSE 'WEEKDAY_BOOT'
+        END;
+
+    audit('INIT', 'package initialized. mode=' || g_last_mode);
+END fmt_pkg_extreme;
+/
+--------------------------------------------------------------------------------
+-- 4) 실행 테스트
+--------------------------------------------------------------------------------
+SET SERVEROUTPUT ON;
+
+DECLARE
+    l_text CLOB;
+BEGIN
+    fmt_pkg_extreme.run_extreme(1, l_text);
+    DBMS_OUTPUT.PUT_LINE(DBMS_LOB.SUBSTR(l_text, 32767, 1));
+END;
+/
+--------------------------------------------------------------------------------
+-- 5) 결과 확인
+--------------------------------------------------------------------------------
+SELECT id,
+       parent_id,
+       code,
+       qty,
+       price,
+       status
+  FROM fmtx_unit
+ ORDER BY id;
+/
+
+SELECT audit_id,
+       phase,
+       message,
+       created_at
+  FROM fmtx_audit
+ ORDER BY audit_id;
+/"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "PROCEDURE AUDIT (p_phase IN VARCHAR2, p_message IN VARCHAR2) IS\n        PRAGMA AUTONOMOUS_TRANSACTION;\n    BEGIN"
+        ),
+        "autonomous transaction procedure should keep declaration/body structure, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("TYPE t_units_tab IS TABLE OF c_units%ROWTYPE INDEX BY PLS_INTEGER;"),
+        "%ROWTYPE attributes should stay attached inside package body declarations, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP"),
+        "SQL%BULK_EXCEPTIONS references should not be split by spaces, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "END fmt_pkg_extreme;\n/\n\n--------------------------------------------------------------------------------\n-- 4) 실행 테스트"
+        ),
+        "package body should close before the following execution block, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "DECLARE\n    l_text CLOB;\nBEGIN\n    fmt_pkg_extreme.run_extreme (1, l_text);"
+        ),
+        "following anonymous execution block should remain separate after package body formatting, got: {formatted}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(formatted, formatted_again);
+}
 #[test]
 fn format_sql_declare_begin_pre_dedent() {
     let input = r#"DECLARE
@@ -2284,7 +3867,7 @@ END;"#;
     );
     assert!(
         formatted.contains("END
-            ) AS bucket"),
+        ) AS bucket"),
         "outer CASE close-paren should stay aligned at OPEN FOR expression depth, got: {formatted}"
     );
 }
