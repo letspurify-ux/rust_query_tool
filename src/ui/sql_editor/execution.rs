@@ -2242,6 +2242,8 @@ impl SqlEditorWidget {
         let mut into_list_active = false;
         let mut in_dml_statement = false;
         let mut in_block_comment = false;
+        let mut block_comment_indent_spaces = 0usize;
+        let mut block_comment_input_base_leading = 0usize;
         let mut paren_case_expression_depth = 0usize;
         let mut last_code_line_trimmed: Option<String> = None;
         let lines: Vec<&str> = formatted.lines().collect();
@@ -2268,9 +2270,15 @@ impl SqlEditorWidget {
             }
 
             if in_block_comment {
-                out.push_str(line);
+                let line_leading_spaces = line.len().saturating_sub(trimmed.len());
+                let relative_leading =
+                    line_leading_spaces.saturating_sub(block_comment_input_base_leading);
+                out.push_str(&" ".repeat(block_comment_indent_spaces + relative_leading));
+                out.push_str(trimmed);
                 if trimmed.contains("*/") {
                     in_block_comment = false;
+                    block_comment_indent_spaces = 0;
+                    block_comment_input_base_leading = 0;
                 }
                 continue;
             }
@@ -2280,7 +2288,20 @@ impl SqlEditorWidget {
                 || trimmed == "*/";
             if is_comment {
                 if trimmed.starts_with("/*") {
-                    out.push_str(line);
+                    let leading_spaces = line.len().saturating_sub(trimmed.len());
+                    let existing_indent = leading_spaces / 4;
+                    let extra_indent = if into_list_active { 1 } else { 0 };
+                    let parser_depth = depth + extra_indent;
+                    let effective_depth = if in_dml_statement {
+                        parser_depth.max(existing_indent)
+                    } else {
+                        parser_depth
+                    };
+
+                    block_comment_indent_spaces = effective_depth * 4;
+                    block_comment_input_base_leading = leading_spaces;
+                    out.push_str(&" ".repeat(block_comment_indent_spaces));
+                    out.push_str(trimmed);
                     if !trimmed.contains("*/") {
                         in_block_comment = true;
                     }
