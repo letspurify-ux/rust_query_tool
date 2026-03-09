@@ -313,6 +313,17 @@ fn format_sql_breaks_minified_package_body_members() {
 }
 
 #[test]
+fn format_sql_keeps_nested_begin_depth_inside_package_body_procedure() {
+    let input = "create package body a as\nprocedure b (c in number) is\nd number := 0;\nbegin\nbegin\nv := v\nend\nend b;\nend a;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("        END\n    END b;"),
+        "outer END should keep procedure depth, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_preserves_oracle_labels() {
     // Test <<loop_label>> preservation
     let input = "<<outer_loop>>\nFOR i IN 1..10 LOOP\n<<inner_loop>>\nFOR j IN 1..5 LOOP\nNULL;\nEND LOOP inner_loop;\nEND LOOP outer_loop;";
