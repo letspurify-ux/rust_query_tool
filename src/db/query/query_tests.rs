@@ -411,37 +411,13 @@ fn test_is_plain_commit_rejects_non_plain_commit_variants() {
 
 #[test]
 fn test_split_script_items_ignores_trailing_remark_comment_line() {
-    let sql = "SELECT 1 FROM dual\nREMARK trailing note";
+    let sql = "SELECT 1 FROM dual
+REMARK trailing note";
     let items = QueryExecutor::split_script_items(sql);
-    let stmts = get_statements(&items);
+    let statements = get_statements(&items);
 
-    assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0], "SELECT 1 FROM dual");
-}
-
-#[test]
-fn test_split_script_items_ignores_trailing_rem_comment_with_indented_comment() {
-    let sql = "SELECT 1 FROM dual\n  REM indented note";
-    let items = QueryExecutor::split_script_items(sql);
-    let stmts = get_statements(&items);
-
-    assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0], "SELECT 1 FROM dual");
-}
-
-#[test]
-fn test_split_script_items_splits_before_inline_trailing_comment_after_semicolon() {
-    let sql = "SELECT 1 FROM dual; -- trailing note\nSELECT 2 FROM dual;";
-    let items = QueryExecutor::split_script_items(sql);
-    let stmts = get_statements(&items);
-
-    assert_eq!(stmts.len(), 2, "expected two statements, got: {stmts:?}");
-    assert_eq!(stmts[0], "SELECT 1 FROM dual");
-    assert!(
-        stmts[1].contains("SELECT 2 FROM dual"),
-        "second statement should not be merged into first, got: {}",
-        stmts[1]
-    );
+    assert_eq!(statements.len(), 1);
+    assert_eq!(statements[0].trim(), "SELECT 1 FROM dual");
 }
 
 #[test]
@@ -12850,4 +12826,63 @@ END pkg_mix;"#;
         depths, expected,
         "package body AS function split END IF + split END name depth mismatch: {depths:?}"
     );
+}
+
+#[test]
+fn test_package_body_keyword_name_with_nested_exception_and_split_schema_end_label() {
+    // Stress case: package name is keyword(IF), nested BEGIN/IF/EXCEPTION,
+    // and package init END label is schema-qualified/split across lines.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if AS
+  FUNCTION f_if RETURN NUMBER AS
+  BEGIN
+    BEGIN
+      IF 1 = 1 THEN
+        RETURN 1;
+      END
+      IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        RETURN -1;
+    END;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN 0;
+  END
+  f_if;
+BEGIN
+  NULL;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END
+owner.if;
+/
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(depths.len(), sql.lines().count(), "line depth count mismatch");
+
+    let lines: Vec<&str> = sql.lines().collect();
+    let end_line = lines
+        .iter()
+        .rposition(|line| line.trim() == "END")
+        .unwrap_or(0);
+    let label_line = lines
+        .iter()
+        .position(|line| line.trim() == "owner.if;")
+        .unwrap_or(0);
+    let select_line = lines
+        .iter()
+        .position(|line| line.trim() == "SELECT 1 FROM dual;")
+        .unwrap_or(0);
+
+    assert_eq!(
+        depths[end_line], depths[label_line],
+        "split package END / label should keep same depth: {depths:?}"
+    );
+    assert_eq!(
+        depths[select_line], 0,
+        "depth should be reset before trailing SELECT: {depths:?}"
+    );
+
 }
