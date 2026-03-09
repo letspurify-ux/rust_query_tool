@@ -61,16 +61,10 @@ fn is_external_language_target(token_upper: &str) -> bool {
 pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLineKind> {
     let trimmed = line.trim_start();
     let rest = trimmed.strip_prefix('/')?;
-    let rest = rest.trim_start();
+    let mut rest = rest.trim_start();
 
     if rest.is_empty() {
         return Some(SlashLineKind::PureTerminator);
-    }
-
-    if let Some(after_block_comment) = rest.strip_prefix("/*") {
-        let comment_end = after_block_comment.find("*/")?;
-        let tail = &after_block_comment[comment_end + 2..];
-        return tail.trim().is_empty().then_some(SlashLineKind::BlockComment);
     }
 
     if rest.starts_with("--") {
@@ -81,7 +75,22 @@ pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLine
         return Some(SlashLineKind::SqlPlusRemark);
     }
 
-    None
+    let mut saw_block_comment = false;
+    while let Some(after_block_comment) = rest.strip_prefix("/*") {
+        let comment_end = after_block_comment.find("*/")?;
+        rest = after_block_comment[comment_end + 2..].trim_start();
+        saw_block_comment = true;
+
+        if rest.is_empty() {
+            return Some(SlashLineKind::BlockComment);
+        }
+
+        if rest.starts_with("--") || sql_text::is_sqlplus_remark_comment_line(rest) {
+            return Some(SlashLineKind::PureTerminator);
+        }
+    }
+
+    saw_block_comment.then_some(SlashLineKind::BlockComment)
 }
 
 // ---------------------------------------------------------------------------
