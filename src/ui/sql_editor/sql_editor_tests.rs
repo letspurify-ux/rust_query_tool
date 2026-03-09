@@ -2147,6 +2147,92 @@ END;"#;
     );
 }
 
+
+#[test]
+fn format_sql_nested_paren_case_expression_keeps_inner_case_depth() {
+    let input = r#"BEGIN
+v_score := (
+CASE
+WHEN p_type = 'A' THEN
+CASE
+WHEN p_value > 10 THEN
+100
+ELSE
+50
+END
+ELSE
+0
+END
+);
+v_done := 1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let outer_when_line = formatted
+        .lines()
+        .find(|line| line.trim_start().starts_with("WHEN p_type = 'A' THEN"));
+    let inner_case_line = formatted
+        .lines()
+        .find(|line| line.trim_start().starts_with("CASE") && line.contains("                CASE"));
+    if let (Some(outer_when), Some(inner_case)) = (outer_when_line, inner_case_line) {
+        let outer_indent = outer_when.chars().take_while(|ch| ch.is_whitespace()).count();
+        let inner_indent = inner_case.chars().take_while(|ch| ch.is_whitespace()).count();
+        assert!(
+            inner_indent > outer_indent,
+            "inner CASE should be indented deeper than outer WHEN branch, got: {formatted}"
+        );
+    } else {
+        panic!("Expected outer WHEN and nested CASE lines were not found: {formatted}");
+    }
+
+    assert!(
+        formatted.contains("END
+            ELSE
+            0
+        END
+        );
+    v_done := 1;"),
+        "nested CASE depth should unwind before parent ELSE/END and next statement, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiple_paren_case_expressions_do_not_leak_depth_between_statements() {
+    let input = r#"BEGIN
+v_first := (
+CASE
+WHEN cond1 THEN
+1
+ELSE
+2
+END
+);
+v_second := (
+CASE
+WHEN cond2 THEN
+3
+ELSE
+4
+END
+);
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("v_first := (
+        CASE
+            WHEN cond1 THEN"),
+        "first parenthesized CASE indentation changed unexpectedly, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(");
+    v_second := (
+        CASE
+            WHEN cond2 THEN"),
+        "second parenthesized CASE should start at the same depth as first without leakage, got: {formatted}"
+    );
+}
+
 #[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"

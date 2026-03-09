@@ -2305,10 +2305,13 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(|prev| prev.ends_with('('));
+            let starts_case_line = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE");
             let starts_paren_case_expression = !in_dml_statement
-                && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                && starts_case_line
                 && previous_line_ends_with_open_paren;
-            if starts_paren_case_expression {
+            let starts_nested_paren_case_expression =
+                !in_dml_statement && starts_case_line && paren_case_expression_depth > 0;
+            if starts_paren_case_expression || starts_nested_paren_case_expression {
                 paren_case_expression_depth += 1;
             }
             let in_paren_case_expression = !in_dml_statement && paren_case_expression_depth > 0;
