@@ -359,6 +359,36 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             continue;
         }
 
+        if current.is_empty() && matches!(c, 'n' | 'N' | 'b' | 'B' | 'x' | 'X' | 'u' | 'U') {
+            let prefix_len = if matches!(c, 'u' | 'U') && next == Some('&') {
+                let mut lookahead = iter.clone();
+                match (lookahead.next(), lookahead.next()) {
+                    (Some((_, '&')), Some((_, '\''))) => Some(3usize),
+                    _ => None,
+                }
+            } else if next == Some('\'') {
+                Some(2usize)
+            } else {
+                None
+            };
+
+            if let Some(prefix_len) = prefix_len {
+                flush_word(&mut current, &mut current_start, idx, &mut tokens);
+                current_start = idx;
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::SingleQuote;
+                current.push(c);
+                if prefix_len == 3 {
+                    if let Some((_, amp)) = iter.next() {
+                        current.push(amp);
+                    }
+                }
+                if let Some((_, quote)) = iter.next() {
+                    current.push(quote);
+                }
+                continue;
+            }
+        }
+
         if c == '"' {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             current_start = idx;
@@ -1265,6 +1295,35 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "uq'[문자열;유지]'")));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_prefixed_single_quote_literals_as_string() {
+        let sql = "SELECT n'가', b'0101', x'FF', u'유니코드', u&'\\0041' FROM dual";
+        let tokens = tokenize_sql(sql);
+
+        for literal in ["n'가'", "b'0101'", "x'FF'", "u'유니코드'", "u&'\\0041'"] {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::String(value) if value == literal)),
+                "expected prefixed literal token: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenize_sql_spanned_treats_prefixed_single_quote_literals_as_single_span() {
+        let sql = "SELECT u&'\\0041\\0042' AS txt FROM dual";
+        let string_spans = tokenize_sql_spanned(sql)
+            .into_iter()
+            .filter_map(|span| match span.token {
+                SqlToken::String(value) => Some((value, span.start, span.end)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(string_spans, vec![("u&'\\0041\\0042'".to_string(), 7, 21)]);
     }
 
     #[test]
