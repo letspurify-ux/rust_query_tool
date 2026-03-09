@@ -600,16 +600,10 @@ impl SqlEditorWidget {
         let trimmed = &formatted[..trimmed_len];
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
-        let mut trailing_line_comment: Option<(usize, usize)> = None;
         let mut semicolon_span: Option<(usize, usize)> = None;
 
         for span in spans.iter().rev() {
             match &span.token {
-                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => {
-                    if trailing_line_comment.is_none() {
-                        trailing_line_comment = Some((span.start, span.end));
-                    }
-                }
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == ";" => {
                     semicolon_span = Some((span.start, span.end));
@@ -619,20 +613,7 @@ impl SqlEditorWidget {
             }
         }
 
-        if let Some(span) = semicolon_span {
-            return Some(span);
-        }
-
-        let (comment_start, comment_end) = trailing_line_comment?;
-        let comment_text = trimmed.get(comment_start..comment_end)?;
-        let comment_semicolon = comment_text.rfind(';')?;
-
-        Some((
-            comment_start.saturating_add(comment_semicolon),
-            comment_start
-                .saturating_add(comment_semicolon)
-                .saturating_add(1),
-        ))
+        semicolon_span
     }
 
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
@@ -774,16 +755,16 @@ impl SqlEditorWidget {
             match item {
                 FormatItem::Statement(statement) => {
                     let statement_tokens = Self::tokenize_sql(statement);
-                    let formatted_statement = Self::format_statement(
+                    let mut formatted_statement = Self::format_statement(
                         statement,
                         &statement_tokens,
                         select_list_break_state,
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
-                    formatted.push_str(&formatted_statement);
                     if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
-                        formatted.push(';');
+                        Self::append_statement_terminator(&mut formatted_statement);
                     }
+                    formatted.push_str(&formatted_statement);
                     select_list_break_state.track_statement_tail(
                         Self::statement_has_unbalanced_paren(&statement_tokens),
                     );
@@ -911,6 +892,34 @@ impl SqlEditorWidget {
 
     fn statement_has_unbalanced_paren(tokens: &[SqlToken]) -> bool {
         paren_depth_after(tokens) > 0
+    }
+
+    fn append_statement_terminator(formatted_statement: &mut String) {
+        let trimmed_len = formatted_statement.trim_end().len();
+        if trimmed_len == 0 {
+            formatted_statement.push(';');
+            return;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(&formatted_statement[..trimmed_len]);
+        if let Some(last_span) = spans.last() {
+            if let SqlToken::Comment(comment) = &last_span.token {
+                if comment.starts_with("--") {
+                    let mut insert_pos = last_span.start;
+                    let bytes = formatted_statement.as_bytes();
+                    while insert_pos > 0 {
+                        match bytes.get(insert_pos - 1) {
+                            Some(b' ' | b'\t') => insert_pos -= 1,
+                            _ => break,
+                        }
+                    }
+                    formatted_statement.insert(insert_pos, ';');
+                    return;
+                }
+            }
+        }
+
+        formatted_statement.push(';');
     }
 
     fn format_tool_command(command: &ToolCommand) -> String {
@@ -9553,6 +9562,42 @@ FROM DUAL"
             !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Statement terminator should stay absent, got:\n{}",
             preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_inserted_semicolon_before_trailing_line_comment() {
+        let source = "SELECT 1 FROM dual -- trailing comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; -- trailing comment"),
+            "Inserted statement terminator should be placed before trailing line comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn remove_trailing_statement_semicolon_does_not_touch_comment_semicolon_only() {
+        let formatted = "SELECT 1\nFROM DUAL -- trailing; comment";
+        let removed = SqlEditorWidget::remove_trailing_statement_semicolon(formatted);
+
+        assert!(
+            removed.is_none(),
+            "Comment semicolon is not a statement terminator and must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_comment_semicolon_when_no_terminator_exists() {
+        let source = "SELECT 1 FROM dual -- trailing; comment";
+        let formatted = "SELECT 1\nFROM DUAL -- trailing; comment".to_string();
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved,
+            "SELECT 1\nFROM DUAL -- trailing; comment",
+            "Formatter should not mutate trailing comment text when no removable terminator exists"
         );
     }
 
