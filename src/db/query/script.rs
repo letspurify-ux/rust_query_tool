@@ -769,13 +769,10 @@ impl QueryExecutor {
                 } else if builder.state.pending_end == PendingEnd::End
                     && pending_end_label_continuation
                 {
-                    block_depth_component = block_depth_component.saturating_sub(1);
                     let label_upper = leading_identifier_chain.clone().unwrap_or_default();
-                    if builder
-                        .state
-                        .plain_end_closes_parent_scope(label_upper.as_str())
-                    {
-                        block_depth_component = block_depth_component.saturating_sub(1);
+                    let pop_count = builder.state.plain_end_scope_pop_count(label_upper.as_str());
+                    if pop_count > 0 {
+                        block_depth_component = block_depth_component.saturating_sub(pop_count);
                     }
                 } else if builder.state.pending_end == PendingEnd::End {
                     let label_upper = leading_identifier_chain

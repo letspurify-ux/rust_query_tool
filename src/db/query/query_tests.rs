@@ -12885,6 +12885,52 @@ END pkg_as;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_initializer_split_named_end_with_nested_exception_and_suffix_keywords() {
+    // Extremely nested package initializer with END IF/LOOP/CASE and split package END label.
+    // Regression target: split END + label continuation must not over-dedent package AS/IS depth.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY exception AS
+BEGIN
+  DECLARE
+    v NUMBER := 0;
+  BEGIN
+    IF v = 0 THEN
+      FOR i IN 1..2 LOOP
+        CASE i
+          WHEN 1 THEN NULL;
+          ELSE NULL;
+        END CASE;
+      END LOOP;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END;
+END
+exception;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 3, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 3, 4, 2, 0, 0, 0];
+    assert_eq!(
+        depths, expected,
+        "package initializer split END label with nested exception/suffix keywords depth mismatch: {depths:?}"
+    );
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(sql) => Some(sql.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stmts.len(), 2, "expected package body + select, got: {stmts:?}");
+    assert!(stmts[0].contains("END
+exception"));
+    assert_eq!(stmts[1].trim(), "SELECT 1 FROM dual");
+}
+
+#[test]
 fn test_line_block_depths_package_body_as_with_split_end_if_and_split_end_name() {
     // Verify split END/IF and split END/name are both tracked correctly with AS + EXCEPTION.
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_mix AS
