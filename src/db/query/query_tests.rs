@@ -6615,6 +6615,83 @@ END test_pkg;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_with_schema_qualified_end_name_and_nested_blocks() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY test_schema.test_pkg AS
+  PROCEDURE p_run(p_flag IN NUMBER) IS
+  BEGIN
+    IF p_flag = 1 THEN
+      NULL;
+    ELSIF p_flag = 2 THEN
+      NULL;
+    ELSE
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p_run;
+BEGIN
+  NULL;
+END test_schema.test_pkg;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(depths.len(), 18, "unexpected depth vector: {depths:?}");
+    assert_eq!(
+        depths[16],
+        0,
+        "schema-qualified package END line should already be at top-level depth (depths: {depths:?})"
+    );
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+    assert_eq!(
+        statements.len(),
+        2,
+        "expected package body + trailing select; got: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("END test_schema.test_pkg"),
+        "first statement should include schema-qualified package END"
+    );
+    assert!(
+        statements[1].contains("SELECT 1 FROM dual"),
+        "second statement should be trailing select"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_with_quoted_schema_qualified_end_name() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY "TEST_SCHEMA"."TEST_PKG" AS
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END p;
+BEGIN
+  NULL;
+END "TEST_SCHEMA"."TEST_PKG";
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+    assert_eq!(
+        statements.len(),
+        2,
+        "quoted schema-qualified END should not swallow the trailing statement: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("END \"TEST_SCHEMA\".\"TEST_PKG\""),
+        "first statement should keep quoted schema-qualified END"
+    );
+    assert!(
+        statements[1].contains("SELECT 1 FROM dual"),
+        "second statement should be trailing select"
+    );
+}
+
+#[test]
 fn test_line_block_depths_increase_for_if_and_case() {
     let sql = r#"BEGIN
 IF v_flag = 'Y' THEN

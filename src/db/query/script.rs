@@ -406,68 +406,98 @@ impl QueryExecutor {
             }
             i += 3;
 
-            loop {
-                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-                    return None;
-                }
-                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                    i += 2;
-                    while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                            i += 2;
-                            break;
-                        }
+            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| {
+                loop {
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                         i += 1;
                     }
+                    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                        return i;
+                    }
+                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        i += 2;
+                        while i + 1 < bytes.len() {
+                            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    return i;
+                }
+            };
+
+            i = skip_ws_and_inline_comments(bytes, i);
+            if i >= bytes.len() || bytes[i] == b';' {
+                return Some(EndSuffixOrLabel::default());
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                return None;
+            }
+
+            let mut segments: Vec<String> = Vec::new();
+            let mut quoted_label = false;
+
+            loop {
+                i = skip_ws_and_inline_comments(bytes, i);
+                if i >= bytes.len() || bytes[i] == b';' {
+                    break;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                    break;
+                }
+
+                if bytes[i] == b'"' {
+                    quoted_label = true;
+                    i += 1;
+                    let mut segment = String::new();
+                    while i < bytes.len() {
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                segment.push('"');
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        segment.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    if segment.is_empty() {
+                        break;
+                    }
+                    segment.make_ascii_uppercase();
+                    segments.push(segment);
+                } else {
+                    if !sql_text::is_identifier_start_byte(bytes[i]) {
+                        break;
+                    }
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    segments.push(line[start..i].to_ascii_uppercase());
+                }
+
+                i = skip_ws_and_inline_comments(bytes, i);
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
                     continue;
                 }
                 break;
             }
 
-            if i >= bytes.len() {
+            if segments.is_empty() {
                 return Some(EndSuffixOrLabel::default());
             }
 
-            if bytes[i] == b';' {
-                return Some(EndSuffixOrLabel::default());
-            }
-
-            if bytes[i] == b'"' {
-                let mut out = String::new();
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            out.push('"');
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    out.push(bytes[i] as char);
-                    i += 1;
-                }
-                out.make_ascii_uppercase();
-                return Some(EndSuffixOrLabel {
-                    upper: out,
-                    quoted_label: true,
-                });
-            }
-
-            if !sql_text::is_identifier_start_byte(bytes[i]) {
-                return Some(EndSuffixOrLabel::default());
-            }
-            let start = i;
-            i += 1;
-            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
-                i += 1;
-            }
             Some(EndSuffixOrLabel {
-                upper: line[start..i].to_ascii_uppercase(),
-                quoted_label: false,
+                upper: segments.join("."),
+                quoted_label,
             })
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
