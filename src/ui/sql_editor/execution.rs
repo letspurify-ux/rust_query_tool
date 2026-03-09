@@ -348,10 +348,6 @@ impl SqlEditorWidget {
             return false;
         }
 
-        if trimmed_upper == "END" {
-            return true;
-        }
-
         let Some(rest) = trimmed_upper.strip_prefix("END") else {
             return false;
         };
@@ -363,6 +359,25 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(rest, "WHILE")
             || crate::sql_text::starts_with_keyword_token(rest, "FOR")
     }
+
+    fn starts_with_plain_end(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "END")
+            && !Self::starts_with_end_suffix_terminator(trimmed_upper)
+    }
+
+    fn starts_with_bare_end(trimmed_upper: &str) -> bool {
+        if !Self::starts_with_plain_end(trimmed_upper) {
+            return false;
+        }
+
+        let Some(rest) = trimmed_upper.strip_prefix("END") else {
+            return false;
+        };
+        let rest = rest.trim_start();
+
+        rest.is_empty() || rest.starts_with(';')
+    }
+
 
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
@@ -2259,7 +2274,10 @@ impl SqlEditorWidget {
         let mut in_block_comment = false;
         let mut paren_case_expression_depth = 0usize;
         let mut last_code_line_trimmed: Option<String> = None;
-        for (idx, (line, depth)) in formatted.lines().zip(depths.iter()).enumerate() {
+        let lines: Vec<&str> = formatted.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let line = *line;
+            let depth = depths.get(idx).copied().unwrap_or(0);
             if idx > 0 {
                 out.push('\n');
             }
@@ -2302,7 +2320,7 @@ impl SqlEditorWidget {
                 let leading_spaces = line.len().saturating_sub(trimmed.len());
                 let existing_indent = leading_spaces / 4;
                 let extra_indent = if into_list_active { 1 } else { 0 };
-                let effective_depth = (*depth + extra_indent).max(existing_indent);
+                let effective_depth = (depth + extra_indent).max(existing_indent);
                 out.push_str(&" ".repeat(effective_depth * 4));
                 out.push_str(trimmed);
                 continue;
@@ -2365,28 +2383,39 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let is_trigger_for_each_row = trimmed_upper.starts_with("FOR EACH ROW");
-            let force_end_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper);
+            let previous_line_is_plain_end = last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                let prev_upper = prev.to_ascii_uppercase();
+                Self::starts_with_plain_end(&prev_upper)
+            });
+            let next_significant_line_trimmed = lines.iter().skip(idx + 1).find_map(|next| {
+                let next_trimmed = next.trim_start();
+                if next_trimmed.is_empty() || Self::is_sqlplus_comment_line(next_trimmed) {
+                    return None;
+                }
+                Some(next_trimmed)
+            });
+            let next_line_is_named_plain_end = next_significant_line_trimmed.is_some_and(|next| {
+                let next_upper = next.to_ascii_uppercase();
+                Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
+            });
+            let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
+                && !previous_line_is_plain_end
+                && !next_line_is_named_plain_end;
             let force_block_depth = !in_dml_statement
                 && (trimmed_upper.starts_with("EXCEPTION")
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
                     || trimmed_upper.starts_with("ELSIF")
-                    || force_end_depth
-                    || trimmed_upper.starts_with("BEGIN")
                     || trimmed_upper.starts_with("CASE")
-                    || trimmed_upper.starts_with("IF ")
-                    || trimmed_upper.starts_with("LOOP")
-                    || (trimmed_upper.starts_with("FOR ") && !is_trigger_for_each_row)
-                    || trimmed_upper.starts_with("WHILE ")
-                    || trimmed_upper.starts_with("DECLARE"));
+                    || Self::starts_with_bare_end(&trimmed_upper)
+                    || force_end_suffix_depth);
 
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
             let effective_depth = if force_block_depth {
-                *depth + extra_indent + paren_case_extra_indent
+                depth + extra_indent + paren_case_extra_indent
             } else {
-                (*depth + extra_indent + paren_case_extra_indent).max(existing_indent)
+                (depth + extra_indent + paren_case_extra_indent).max(existing_indent)
             };
             out.push_str(&" ".repeat(effective_depth * 4));
             out.push_str(trimmed);
@@ -8851,9 +8880,25 @@ END if_owner;"#;
     fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
         assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END"));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
+    }
+
+    #[test]
+    fn starts_with_plain_end_excludes_qualified_end_suffixes() {
+        assert!(SqlEditorWidget::starts_with_plain_end("END"));
+        assert!(SqlEditorWidget::starts_with_plain_end("END pkg;"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END IF;"));
+        assert!(!SqlEditorWidget::starts_with_plain_end("END LOOP"));
+    }
+
+    #[test]
+    fn starts_with_bare_end_matches_only_unqualified_end() {
+        assert!(SqlEditorWidget::starts_with_bare_end("END"));
+        assert!(SqlEditorWidget::starts_with_bare_end("END;"));
+        assert!(!SqlEditorWidget::starts_with_bare_end("END pkg;"));
+        assert!(!SqlEditorWidget::starts_with_bare_end("END IF;"));
     }
 
     #[test]
