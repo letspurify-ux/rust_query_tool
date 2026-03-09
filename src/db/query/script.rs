@@ -362,6 +362,24 @@ impl QueryExecutor {
             }
         }
 
+        fn leading_subquery_close_paren_count(
+            line: &str,
+            subquery_paren_stack: &[SubqueryParenKind],
+        ) -> usize {
+            let close_count = leading_close_paren_count(line);
+            if close_count == 0 || subquery_paren_stack.is_empty() {
+                return 0;
+            }
+
+            let mut subquery_closes = 0usize;
+            for kind in subquery_paren_stack.iter().rev().take(close_count) {
+                if *kind == SubqueryParenKind::Subquery {
+                    subquery_closes += 1;
+                }
+            }
+            subquery_closes
+        }
+
         fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
             loop {
                 while idx < chars.len() && chars[idx].is_whitespace() {
@@ -886,9 +904,10 @@ impl QueryExecutor {
                 }
             }
 
-            let leading_close_parens = leading_close_paren_count(line);
+            let leading_subquery_close_parens =
+                leading_subquery_close_paren_count(line, &subquery_paren_stack);
             let query_paren_component = if subquery_paren_depth > 0 {
-                subquery_paren_depth.saturating_sub(leading_close_parens)
+                subquery_paren_depth.saturating_sub(leading_subquery_close_parens)
             } else {
                 0
             };
@@ -1004,9 +1023,6 @@ impl QueryExecutor {
                         subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     } else if closed_kind == Some(SubqueryParenKind::Pending) {
                         pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                    } else if closed_kind.is_none() {
-                        // Malformed SQL recovery path: keep depth accounting monotonic.
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     }
                     if with_cte_depth > 0 {
                         with_cte_paren -= 1;
@@ -4452,5 +4468,76 @@ WHERE 1 = 1;";
 
         let depths = QueryExecutor::line_block_depths(sql);
         assert_eq!(depths, vec![0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn line_block_depths_leading_closes_only_dedent_subquery_parens() {
+        let sql = "SELECT *
+FROM (
+  SELECT *
+  FROM (
+    SELECT NVL(
+      (
+        SELECT MAX(col)
+        FROM t
+      )
+    ) AS max_col
+    FROM dual
+  )
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_expr_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") AS max_col"))
+            .unwrap_or(0);
+        let from_dual_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[close_expr_idx],
+            depths[from_dual_idx],
+            "closing scalar-expression parens must not dedent outer FROM-subquery depth"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_keeps_depth_with_multiple_non_subquery_leading_closes() {
+        let sql = "SELECT *
+FROM (
+  SELECT *
+  FROM (
+    SELECT COALESCE(
+      (
+        SELECT MAX(col)
+        FROM t
+      )
+    , 0
+    ) AS max_col
+    FROM dual
+  )
+)
+WHERE 1 = 1;";
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let close_expr_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") AS max_col"))
+            .unwrap_or(0);
+        let from_dual_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "FROM dual")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[close_expr_idx],
+            depths[from_dual_idx],
+            "multiple non-subquery closes on same line must not over-dedent outer subquery"
+        );
     }
 }
