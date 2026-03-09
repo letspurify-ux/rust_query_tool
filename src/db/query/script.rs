@@ -716,8 +716,7 @@ impl QueryExecutor {
         let mut pending_subquery_paren = 0usize;
         let mut subquery_paren_stack: Vec<SubqueryParenKind> = Vec::new();
         let mut with_cte_depth = 0usize;
-        let mut with_cte_paren = 0isize;
-        let mut pending_with = false;
+        let mut with_cte_paren_stack: Vec<isize> = Vec::new();
         let mut exception_depth_stack: Vec<usize> = Vec::new();
         let mut exception_handler_body_stack: Vec<bool> = Vec::new();
         let mut case_branch_stack: Vec<bool> = Vec::new();
@@ -912,16 +911,14 @@ impl QueryExecutor {
                 0
             };
 
-            let with_cte_component = if with_cte_depth > 0 {
-                let starts_main_select =
-                    leading_word.is_some_and(&is_with_main_query_keyword) && with_cte_paren <= 0;
-                if starts_main_select {
-                    0
-                } else {
-                    with_cte_depth
-                }
+            let starts_with_main_query = leading_word.is_some_and(&is_with_main_query_keyword)
+                && with_cte_paren_stack
+                    .last()
+                    .is_some_and(|paren_depth| *paren_depth <= 0);
+            let with_cte_component = if starts_with_main_query {
+                with_cte_depth.saturating_sub(1)
             } else {
-                0
+                with_cte_depth
             };
 
             let in_exception_handler_body = exception_handler_body_stack
@@ -949,20 +946,12 @@ impl QueryExecutor {
             depths.push(depth);
 
             // Keep WITH-clause indentation context separate from block depth.
-            let with_line = leading_is("WITH");
-
-            if with_line {
-                pending_with = true;
-                with_cte_depth = with_cte_depth.max(1);
-                with_cte_paren = 0;
-            }
-
-            if pending_with
-                && leading_word.is_some_and(&is_with_main_query_keyword)
-                && with_cte_paren <= 0
-            {
-                with_cte_depth = 0;
-                pending_with = false;
+            if leading_is("WITH") {
+                with_cte_depth = with_cte_depth.saturating_add(1);
+                with_cte_paren_stack.push(0);
+            } else if starts_with_main_query && with_cte_depth > 0 {
+                with_cte_depth = with_cte_depth.saturating_sub(1);
+                with_cte_paren_stack.pop();
             }
 
             if leading_is("EXCEPTION") {
@@ -1015,7 +1004,9 @@ impl QueryExecutor {
                     }
                     subquery_paren_stack.push(paren_kind);
                     if with_cte_depth > 0 {
-                        with_cte_paren += 1;
+                        for paren_depth in &mut with_cte_paren_stack {
+                            *paren_depth += 1;
+                        }
                     }
                 } else if symbol == ')' {
                     let closed_kind = subquery_paren_stack.pop();
@@ -1025,7 +1016,9 @@ impl QueryExecutor {
                         pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
                     }
                     if with_cte_depth > 0 {
-                        with_cte_paren -= 1;
+                        for paren_depth in &mut with_cte_paren_stack {
+                            *paren_depth -= 1;
+                        }
                     }
                 }
             });
