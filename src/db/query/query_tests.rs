@@ -8908,6 +8908,86 @@ SELECT 1 FROM dual;"#;
     assert!(stmts[0].contains("END pkg_depth_mix"));
 }
 
+
+#[test]
+fn test_line_block_depths_package_body_end_name_on_next_line_after_nested_end_if() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split IS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END
+    IF;
+  END
+  p1;
+END
+pkg_depth_split;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let end_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END")
+        .expect("expected split END for IF");
+    let if_suffix_idx = end_if_idx + 1;
+    let package_name_suffix_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "pkg_depth_split;")
+        .expect("expected split package END name line");
+
+    assert_eq!(
+        depths[if_suffix_idx],
+        depths[end_if_idx],
+        "split END/IF should preserve the same dedented depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[package_name_suffix_idx],
+        0,
+        "split named package END should dedent to top-level (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_split_end_name_with_exception_and_if_suffix() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split2 AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END
+    IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END
+  p1;
+END
+pkg_depth_split2;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "split END labels in package body should not swallow trailing statement: {stmts:?}"
+    );
+    let first_upper = stmts[0].to_ascii_uppercase();
+    assert!(first_upper.contains("END
+    IF;"));
+    assert!(first_upper.contains("END
+  P1;"));
+    assert!(
+        first_upper.contains("END") && first_upper.contains("PKG_DEPTH_SPLIT2"),
+        "first statement missing split package end label: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+}
 #[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";
