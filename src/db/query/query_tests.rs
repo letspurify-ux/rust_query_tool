@@ -4134,8 +4134,8 @@ END;
         "SHOW ERRORS PACKAGE BODY should be a standalone tool command: {items:?}"
     );
     assert!(
-        matches!(&items[3], FormatItem::ToolCommand(ToolCommand::Prompt { text }) if text == "[6] trigger"),
-        "PROMPT after SHOW ERRORS should remain a standalone tool command: {items:?}"
+        matches!(&items[3], FormatItem::Verbatim(text) if text == "PROMPT [6] trigger"),
+        "PROMPT after SHOW ERRORS should remain a standalone verbatim format item: {items:?}"
     );
     assert!(
         stmts[0].contains("END oqt_mega_pkg")

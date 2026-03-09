@@ -50,6 +50,7 @@ pub enum ScriptItem {
 pub enum FormatItem {
     Statement(String),
     ToolCommand(ToolCommand),
+    Verbatim(String),
     Slash,
 }
 

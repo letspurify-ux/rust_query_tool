@@ -2639,7 +2639,7 @@ impl QueryExecutor {
                 items.push(ScriptItem::Statement(cleaned));
             }
         };
-        let on_tool_command = |cmd: ToolCommand, items: &mut Vec<ScriptItem>| {
+        let on_tool_command = |cmd: ToolCommand, _raw_line: &str, items: &mut Vec<ScriptItem>| {
             items.push(ScriptItem::ToolCommand(cmd));
         };
 
@@ -2717,8 +2717,12 @@ impl QueryExecutor {
                 &mut sqlblanklines_enabled,
                 &mut items,
                 &mut add_statement,
-                &mut |cmd: ToolCommand, items: &mut Vec<FormatItem>| {
-                    items.push(FormatItem::ToolCommand(cmd))
+                &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
+                    if matches!(cmd, ToolCommand::Prompt { .. }) {
+                        items.push(FormatItem::Verbatim(raw_line.to_string()));
+                    } else {
+                        items.push(FormatItem::ToolCommand(cmd));
+                    }
                 },
                 &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
             );
@@ -2738,7 +2742,7 @@ impl QueryExecutor {
         sql: &str,
         items: &mut Vec<T>,
         mut add_statement: impl FnMut(String, &mut Vec<T>),
-        mut on_tool_command: impl FnMut(ToolCommand, &mut Vec<T>),
+        mut on_tool_command: impl FnMut(ToolCommand, &str, &mut Vec<T>),
         mut on_slash: impl FnMut(&mut Vec<T>, &SqlParserEngine),
     ) {
         let mut builder = SqlParserEngine::new();
@@ -2791,7 +2795,7 @@ impl QueryExecutor {
         sqlblanklines_enabled: &mut bool,
         items: &mut Vec<T>,
         add_statement: &mut impl FnMut(String, &mut Vec<T>),
-        on_tool_command: &mut impl FnMut(ToolCommand, &mut Vec<T>),
+        on_tool_command: &mut impl FnMut(ToolCommand, &str, &mut Vec<T>),
         on_slash: &mut impl FnMut(&mut Vec<T>, &SqlParserEngine),
     ) {
         let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
@@ -2869,7 +2873,7 @@ impl QueryExecutor {
                 if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                     *sqlblanklines_enabled = *enabled;
                 }
-                on_tool_command(command, items);
+                on_tool_command(command, line, items);
                 return;
             }
         }
@@ -2885,7 +2889,7 @@ impl QueryExecutor {
                 if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                     *sqlblanklines_enabled = *enabled;
                 }
-                on_tool_command(command, items);
+                on_tool_command(command, line, items);
                 return;
             }
         }

@@ -776,6 +776,10 @@ impl SqlEditorWidget {
                     formatted.push_str(&Self::format_tool_command(command));
                     select_list_break_state.clear();
                 }
+                FormatItem::Verbatim(text) => {
+                    formatted.push_str(text);
+                    select_list_break_state.clear();
+                }
                 FormatItem::Slash => {
                     formatted.push('/');
                     select_list_break_state.clear();
@@ -805,10 +809,7 @@ impl SqlEditorWidget {
                     || (Self::is_create_trigger_statement(left)
                         && Self::is_alter_trigger_statement(right))
             }
-            (
-                FormatItem::ToolCommand(ToolCommand::Prompt { .. }),
-                FormatItem::ToolCommand(ToolCommand::Prompt { .. }),
-            ) => true,
+            _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
@@ -817,6 +818,15 @@ impl SqlEditorWidget {
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
             ) => true,
+            _ => false,
+        }
+    }
+
+    fn is_prompt_format_item(item: &FormatItem) -> bool {
+        match item {
+            FormatItem::ToolCommand(ToolCommand::Prompt { .. }) => true,
+            FormatItem::Verbatim(text) => QueryExecutor::parse_tool_command(text)
+                .is_some_and(|cmd| matches!(cmd, ToolCommand::Prompt { .. })),
             _ => false,
         }
     }
@@ -8852,6 +8862,17 @@ mod formatter_regression_tests {
             "Comment-preserving select formatting should remain stable, got:\n{}",
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_prompt_banner_lines_verbatim() {
+        let sql = "PROMPT =======================================================================\n\
+PROMPT [END] If you saw outputs + cursor print + summary selects, parsing/execution is OK\n\
+PROMPT =======================================================================";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
     }
 
     #[test]
