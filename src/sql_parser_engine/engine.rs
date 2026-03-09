@@ -75,11 +75,9 @@ pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLine
         return Some(SlashLineKind::SqlPlusRemark);
     }
 
-    let mut saw_block_comment = false;
     while let Some(after_block_comment) = rest.strip_prefix("/*") {
         let comment_end = after_block_comment.find("*/")?;
         rest = after_block_comment[comment_end + 2..].trim_start();
-        saw_block_comment = true;
 
         if rest.is_empty() {
             return Some(SlashLineKind::BlockComment);
@@ -90,7 +88,7 @@ pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLine
         }
     }
 
-    saw_block_comment.then_some(SlashLineKind::BlockComment)
+    None
 }
 
 // ---------------------------------------------------------------------------

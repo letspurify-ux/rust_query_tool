@@ -113,6 +113,15 @@ fn slash_line_kind_supports_multiple_leading_block_comments() {
 }
 
 #[test]
+fn slash_line_kind_rejects_non_comment_tokens_after_leading_block_comments() {
+    let marker = super::classify_line_leading_slash_marker("/ /*a*/ select 1");
+    assert_eq!(marker, None);
+
+    let marker = super::classify_line_leading_slash_marker("/ /*a*/ +");
+    assert_eq!(marker, None);
+}
+
+#[test]
 fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
     let waiting_main_query = SplitState {
         with_clause_state: WithClauseState::InPlsqlDeclaration(
