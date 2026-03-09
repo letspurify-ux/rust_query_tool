@@ -396,6 +396,14 @@ fn test_normalize_sql_for_execute_removes_sqlplus_slash_for_plsql_block() {
 }
 
 #[test]
+fn test_normalize_sql_for_execute_keeps_create_procedure_end_terminator() {
+    let normalized = QueryExecutor::normalize_sql_for_execute(
+        "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;;;   ",
+    );
+    assert_eq!(normalized, "CREATE OR REPLACE PROCEDURE p IS BEGIN NULL; END;");
+}
+
+#[test]
 fn test_is_plain_rollback_rejects_savepoint_clause() {
     assert!(!QueryExecutor::is_plain_rollback(
         "ROLLBACK TO SAVEPOINT before_update"
