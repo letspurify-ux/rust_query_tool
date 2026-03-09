@@ -8644,6 +8644,119 @@ fn test_line_block_depths_preserves_subquery_depth_after_non_subquery_parenthese
 }
 
 #[test]
+fn test_line_block_depths_package_body_mixed_end_suffix_and_named_end() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    ELSE
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p1;
+END pkg_depth;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF line");
+    let else_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("ELSE"))
+        .expect("expected ELSE line");
+    let end_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END IF"))
+        .expect("expected END IF line");
+    let exception_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("EXCEPTION"))
+        .expect("expected EXCEPTION line");
+    let when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN OTHERS THEN"))
+        .expect("expected WHEN OTHERS line");
+    let end_proc_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END p1"))
+        .expect("expected END p1 line");
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END pkg_depth"))
+        .expect("expected END pkg_depth line");
+
+    assert_eq!(
+        depths[end_if_idx], depths[if_idx],
+        "END IF should align with IF in nested package body blocks (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[else_idx], depths[if_idx],
+        "ELSE should align with IF in nested package body blocks (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[exception_idx], depths[end_proc_idx],
+        "EXCEPTION should align with END <subprogram_name> level (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[when_idx],
+        depths[exception_idx].saturating_add(1),
+        "WHEN branch should be one level deeper than EXCEPTION (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package body END should dedent to top-level (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_handles_end_name_with_inline_comment() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_comment AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1; -- procedure end
+END pkg_depth_comment; -- package end"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let proc_header_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PROCEDURE p1 IS"))
+        .expect("expected PROCEDURE header line");
+    let end_proc_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END p1"))
+        .expect("expected END p1 line");
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END pkg_depth_comment"))
+        .expect("expected END package line");
+
+    assert_eq!(
+        depths[end_proc_idx], depths[proc_header_idx],
+        "named subprogram END with inline comments should keep procedure depth (depths: {:?})",
+        depths
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package END with inline comments should dedent to top-level (depths: {:?})",
+        depths
+    );
+}
+
+#[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";
     let items = QueryExecutor::split_script_items(sql);

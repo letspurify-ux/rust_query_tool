@@ -389,7 +389,7 @@ impl QueryExecutor {
             })
         }
 
-        fn parse_end_label_upper(line: &str) -> Option<String> {
+        fn parse_end_suffix_or_label_upper(line: &str) -> Option<String> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -546,15 +546,17 @@ impl QueryExecutor {
             let innermost_case_depth = builder.state.innermost_case_depth();
             let at_case_header_level =
                 innermost_case_depth.is_some_and(|depth| depth + 1 == builder.block_depth());
-            let exception_end_line = exception_depth_stack
-                .last()
-                .is_some_and(|depth| *depth == builder.block_depth())
-                && leading_is("END");
-            let end_label_upper = if leading_is("END") {
-                parse_end_label_upper(line)
+            let end_suffix_or_label_upper = if leading_is("END") {
+                parse_end_suffix_or_label_upper(line)
             } else {
                 None
             };
+            let end_has_suffix = is_end_suffix_keyword(end_suffix_or_label_upper.as_deref());
+            let exception_end_line = exception_depth_stack
+                .last()
+                .is_some_and(|depth| *depth == builder.block_depth())
+                && leading_is("END")
+                && !end_has_suffix;
 
             let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
                 builder.block_depth().saturating_sub(1)
@@ -563,9 +565,12 @@ impl QueryExecutor {
             };
 
             if leading_is("END")
+                && !end_has_suffix
                 && builder
                     .state
-                    .plain_end_closes_parent_scope(end_label_upper.as_deref().unwrap_or_default())
+                    .plain_end_closes_parent_scope(
+                        end_suffix_or_label_upper.as_deref().unwrap_or_default(),
+                    )
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
