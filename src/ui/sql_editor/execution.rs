@@ -2426,7 +2426,16 @@ impl SqlEditorWidget {
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SET");
-                let max_extra = if is_dml_clause_line { 1 } else { 2 };
+                let starts_with_closing_paren = trimmed.starts_with(')');
+                let starts_select_after_open_paren = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
+                    && previous_line_ends_with_open_paren;
+                let max_extra = if starts_with_closing_paren || starts_select_after_open_paren {
+                    0
+                } else if is_dml_clause_line {
+                    1
+                } else {
+                    2
+                };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth

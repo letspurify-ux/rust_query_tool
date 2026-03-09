@@ -2185,6 +2185,43 @@ END;"#;
 }
 
 #[test]
+fn format_sql_plsql_if_exists_with_nested_subquery_keeps_then_and_end_if_depth() {
+    let input = r#"BEGIN
+IF EXISTS (
+SELECT 1
+FROM (
+SELECT deptno
+FROM emp
+WHERE deptno IN (
+SELECT deptno
+FROM dept
+)
+)
+) THEN
+NULL;
+END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains(
+            r#"FROM dept
+            )
+        )
+    ) THEN"#
+        ),
+        "nested EXISTS subquery should unwind closing paren depth before THEN, got:
+{}",
+        formatted
+    );
+    assert!(
+        formatted.contains("    END IF;\nEND;"),
+        "END IF should return to IF block depth after nested query, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn finalize_execution_state_clears_running_and_cancel_flags() {
     let query_running = Arc::new(Mutex::new(true));
     let cancel_flag = Arc::new(Mutex::new(true));
