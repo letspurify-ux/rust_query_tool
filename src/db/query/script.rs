@@ -938,12 +938,9 @@ impl QueryExecutor {
                         subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     } else if closed_kind == Some(SubqueryParenKind::Pending) {
                         pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                    } else if closed_kind.is_none() {
-                        // Malformed SQL recovery path: keep depth accounting monotonic.
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     }
-                    if with_cte_depth > 0 {
-                        with_cte_paren -= 1;
+                    if with_cte_depth > 0 && closed_kind.is_some() {
+                        with_cte_paren = with_cte_paren.saturating_sub(1);
                     }
                 }
             });
@@ -4331,6 +4328,26 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
             )
             .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_ignores_unmatched_close_paren_without_recovery() {
+        let sql = "WITH cte AS (\nSELECT 1\nFROM dual\n)\n)\nSELECT 2\nFROM dual";
+
+        assert_eq!(
+            QueryExecutor::line_block_depths(sql),
+            vec![0, 1, 1, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn line_block_depths_does_not_drive_with_cte_paren_negative_on_unmatched_close() {
+        let sql = "WITH cte AS (\nSELECT 1\nFROM dual\n)\n)\nSELECT 2\nFROM dual\nWHERE 1 = 1";
+
+        assert_eq!(
+            QueryExecutor::line_block_depths(sql),
+            vec![0, 1, 1, 0, 0, 0, 0, 0]
         );
     }
 }
