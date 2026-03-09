@@ -468,6 +468,7 @@ impl QueryExecutor {
         struct EndSuffixOrLabel {
             upper: String,
             quoted_label: bool,
+            leading_unquoted_segment: Option<String>,
         }
 
         fn parse_end_suffix_or_label(line: &str) -> Option<EndSuffixOrLabel> {
@@ -514,6 +515,7 @@ impl QueryExecutor {
 
             let mut segments: Vec<String> = Vec::new();
             let mut quoted_label = false;
+            let mut leading_unquoted_segment: Option<String> = None;
 
             loop {
                 i = skip_ws_and_inline_comments(bytes, i);
@@ -555,7 +557,11 @@ impl QueryExecutor {
                     while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
                         i += 1;
                     }
-                    segments.push(line[start..i].to_ascii_uppercase());
+                    let upper = line[start..i].to_ascii_uppercase();
+                    if leading_unquoted_segment.is_none() {
+                        leading_unquoted_segment = Some(upper.clone());
+                    }
+                    segments.push(upper);
                 }
 
                 i = skip_ws_and_inline_comments(bytes, i);
@@ -573,6 +579,7 @@ impl QueryExecutor {
             Some(EndSuffixOrLabel {
                 upper: segments.join("."),
                 quoted_label,
+                leading_unquoted_segment,
             })
         }
         let is_with_main_query_keyword = sql_text::is_with_main_query_keyword;
@@ -668,9 +675,10 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let end_has_suffix = end_suffix_or_label
-                .as_ref()
-                .is_some_and(|tail| !tail.quoted_label && is_end_suffix_keyword(Some(&tail.upper)));
+            let end_has_suffix = end_suffix_or_label.as_ref().is_some_and(|tail| {
+                !tail.quoted_label
+                    && is_end_suffix_keyword(tail.leading_unquoted_segment.as_deref())
+            });
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())

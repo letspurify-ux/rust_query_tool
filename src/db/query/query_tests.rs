@@ -8988,6 +8988,66 @@ SELECT 1 FROM dual;"#;
     );
     assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
 }
+
+#[test]
+fn test_line_block_depths_package_body_named_end_starting_with_end_suffix_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+END IF_PKG;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END IF_PKG"))
+        .expect("expected END IF_PKG line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package END should stay at top-level when label starts with IF (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "depth should fully reset after package END with IF-prefixed label (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_named_end_starting_with_end_suffix_keyword() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY if_pkg AS
+  PROCEDURE p1 IS
+  BEGIN
+    NULL;
+  END p1;
+END IF_PKG;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "package END IF_PKG should not keep following SELECT in same statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].to_ascii_uppercase().contains("END IF_PKG"),
+        "first statement should keep named package END: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+}
+
 #[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";
