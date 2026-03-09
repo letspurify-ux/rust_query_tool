@@ -517,27 +517,25 @@ impl QueryExecutor {
             }
             i += 3;
 
-            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| {
-                loop {
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-                        return i;
-                    }
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        i += 2;
-                        while i + 1 < bytes.len() {
-                            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                                i += 2;
-                                break;
-                            }
-                            i += 1;
-                        }
-                        continue;
-                    }
+            let skip_ws_and_inline_comments = |bytes: &[u8], mut i: usize| loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                     return i;
                 }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                return i;
             };
 
             i = skip_ws_and_inline_comments(bytes, i);
@@ -654,11 +652,13 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let pending_end_label_continuation = leading_identifier_chain.as_ref().is_some_and(
-                |identifier_chain| {
-                    identifier_chain.contains('.') || !is_non_label_control_keyword(leading_word)
-                },
-            );
+            let pending_end_label_continuation =
+                leading_identifier_chain
+                    .as_ref()
+                    .is_some_and(|identifier_chain| {
+                        identifier_chain.contains('.')
+                            || !is_non_label_control_keyword(leading_word)
+                    });
             let leading_is =
                 |keyword: &str| leading_word.is_some_and(|word| word.eq_ignore_ascii_case(keyword));
             let leading_is_any = |keywords: &[&str]| {
@@ -750,13 +750,11 @@ impl QueryExecutor {
 
             if leading_is("END")
                 && !end_has_suffix
-                && builder
-                    .state
-                    .plain_end_closes_parent_scope(
-                        end_suffix_or_label
-                            .as_ref()
-                            .map_or("", |tail| tail.upper.as_str()),
-                    )
+                && builder.state.plain_end_closes_parent_scope(
+                    end_suffix_or_label
+                        .as_ref()
+                        .map_or("", |tail| tail.upper.as_str()),
+                )
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -770,7 +768,9 @@ impl QueryExecutor {
                     && pending_end_label_continuation
                 {
                     let label_upper = leading_identifier_chain.clone().unwrap_or_default();
-                    let pop_count = builder.state.plain_end_scope_pop_count(label_upper.as_str());
+                    let pop_count = builder
+                        .state
+                        .plain_end_scope_pop_count(label_upper.as_str());
                     if pop_count > 0 {
                         block_depth_component = block_depth_component.saturating_sub(pop_count);
                     }
@@ -822,12 +822,17 @@ impl QueryExecutor {
                 }
             }
 
-            let query_paren_component =
-                if line.trim_start().starts_with(')') && subquery_paren_depth > 0 {
-                    subquery_paren_depth.saturating_sub(1)
-                } else {
-                    subquery_paren_depth
-                };
+            let leading_close_paren_count = line
+                .trim_start()
+                .bytes()
+                .take_while(|byte| *byte == b')')
+                .count();
+            let query_paren_component = if leading_close_paren_count > 0 && subquery_paren_depth > 0
+            {
+                subquery_paren_depth.saturating_sub(leading_close_paren_count)
+            } else {
+                subquery_paren_depth
+            };
 
             let with_cte_component = if with_cte_depth > 0 {
                 let starts_main_select =
@@ -841,8 +846,10 @@ impl QueryExecutor {
                 0
             };
 
-            let in_exception_handler_body =
-                exception_handler_body_stack.last().copied().unwrap_or(false);
+            let in_exception_handler_body = exception_handler_body_stack
+                .last()
+                .copied()
+                .unwrap_or(false);
             let exception_handler_component =
                 if in_exception_handler_body && !leading_is("WHEN") && !exception_end_line {
                     1
