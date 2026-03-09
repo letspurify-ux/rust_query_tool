@@ -46,6 +46,7 @@ pub(crate) struct SplitState {
 
     // -- Reusable buffer --
     token_upper_buf: String,
+    quoted_identifier_buf: String,
     pending_implicit_external_top_level_split: bool,
 }
 
@@ -799,6 +800,15 @@ impl SplitState {
         self.resolve_pending_end_with_policy(EndResolutionPolicy::KeepCreateState);
     }
 
+    pub(crate) fn resolve_pending_end_on_separator_with_token(&mut self, token_upper: &str) {
+        if self.pending_end != PendingEnd::End {
+            return;
+        }
+
+        self.resolve_plain_end(token_upper);
+        self.pending_end = PendingEnd::None;
+    }
+
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
         self.resolve_pending_end_with_policy(EndResolutionPolicy::ResetCreateStateWhenTopLevel);
     }
@@ -975,7 +985,36 @@ impl SplitState {
         self.reset_after_statement_boundary();
         self.lex_mode = LexMode::Idle;
         self.token.clear();
+        self.quoted_identifier_buf.clear();
         self.block_stack.clear();
+    }
+
+    pub(crate) fn begin_quoted_identifier(&mut self) {
+        self.quoted_identifier_buf.clear();
+    }
+
+    pub(crate) fn push_quoted_identifier_char(&mut self, ch: char) {
+        self.quoted_identifier_buf.push(ch);
+    }
+
+    pub(crate) fn finish_quoted_identifier(&mut self) -> Option<String> {
+        if self.quoted_identifier_buf.is_empty() {
+            return None;
+        }
+
+        let mut upper = std::mem::take(&mut self.quoted_identifier_buf);
+        upper.make_ascii_uppercase();
+        self.observe_quoted_identifier(&upper);
+        Some(upper)
+    }
+
+    fn observe_quoted_identifier(&mut self, upper: &str) {
+        if self.block_depth() == 0
+            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.awaiting_package_body_name
+        {
+            self.package_body_name = Some(upper.to_string());
+        }
     }
 
     fn track_create_plsql(&mut self, upper: &str) {

@@ -426,13 +426,19 @@ impl SqlParserEngine {
                     if c == '"' {
                         if next == Some('"') {
                             self.current.push('"');
+                            self.state.push_quoted_identifier_char('"');
                             i += 2;
                             continue;
                         }
                         self.state.lex_mode = LexMode::Idle;
-                        if self.state.pending_end == PendingEnd::End {
+                        if let Some(identifier_upper) = self.state.finish_quoted_identifier() {
+                            self.state
+                                .resolve_pending_end_on_separator_with_token(&identifier_upper);
+                        } else if self.state.pending_end == PendingEnd::End {
                             self.state.resolve_pending_end_on_separator();
                         }
+                    } else {
+                        self.state.push_quoted_identifier_char(c);
                     }
                     i += 1;
                     continue;
@@ -598,6 +604,7 @@ impl SqlParserEngine {
                     .observe_external_clause_literal_target(allow_implicit_target);
                 self.state
                     .consume_trigger_alias_subject_on_quoted_identifier();
+                self.state.begin_quoted_identifier();
                 self.state.lex_mode = LexMode::DoubleQuote;
                 self.current.push(c);
                 i += 1;
