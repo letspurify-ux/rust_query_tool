@@ -90,7 +90,11 @@ pub(crate) fn classify_line_leading_slash_marker(line: &str) -> Option<SlashLine
         }
     }
 
-    saw_block_comment.then_some(SlashLineKind::BlockComment)
+    if saw_block_comment && rest.is_empty() {
+        Some(SlashLineKind::BlockComment)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

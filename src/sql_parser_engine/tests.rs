@@ -113,6 +113,35 @@ fn slash_line_kind_supports_multiple_leading_block_comments() {
 }
 
 #[test]
+fn slash_line_kind_rejects_non_comment_text_after_leading_block_comment() {
+    let marker = super::classify_line_leading_slash_marker("/ /*a*/ SELECT 1");
+    assert_eq!(marker, None);
+}
+
+#[test]
+fn slash_line_with_leading_block_comment_and_sql_is_not_consumed_as_terminator() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+    engine.process_line("/ /* keep */ SELECT 99 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("BEGIN"),
+        "first statement should keep the PL/SQL block: {}",
+        statements[0]
+    );
+    assert_eq!(
+        statements[1],
+        "/ /* keep */ SELECT 99 FROM dual".to_string(),
+        "line must remain as executable SQL text, not slash terminator"
+    );
+}
+
+#[test]
 fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
     let waiting_main_query = SplitState {
         with_clause_state: WithClauseState::InPlsqlDeclaration(
