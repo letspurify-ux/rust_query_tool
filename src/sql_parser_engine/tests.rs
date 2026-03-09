@@ -5504,3 +5504,57 @@ fn external_language_target_without_semicolon_splits_before_following_statement_
         statements[1]
     );
 }
+
+#[test]
+fn external_language_target_without_semicolon_splits_before_grant_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_grant_split RETURN NUMBER");
+    engine.process_line("AS LANGUAGE C");
+    engine.process_line("GRANT EXECUTE ON ext_grant_split TO app_user;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE C"));
+    assert!(
+        statements[1].starts_with("GRANT EXECUTE ON ext_grant_split TO app_user"),
+        "GRANT should begin a new statement after implicit external call spec: {}",
+        statements[1]
+    );
+}
+
+#[test]
+fn external_language_target_without_semicolon_splits_before_revoke_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_revoke_split RETURN NUMBER");
+    engine.process_line("AS LANGUAGE C");
+    engine.process_line("REVOKE EXECUTE ON ext_revoke_split FROM app_user;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE C"));
+    assert!(
+        statements[1].starts_with("REVOKE EXECUTE ON ext_revoke_split FROM app_user"),
+        "REVOKE should begin a new statement after implicit external call spec: {}",
+        statements[1]
+    );
+}
+
+#[test]
+fn external_clause_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_external_clause RETURN NUMBER");
+    engine.process_line("AS EXTERNAL");
+    engine.process_line("SELECT 47 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS EXTERNAL"));
+    assert!(
+        statements[1].starts_with("SELECT 47 FROM dual"),
+        "SELECT should begin a new statement after EXTERNAL clause without semicolon: {}",
+        statements[1]
+    );
+}

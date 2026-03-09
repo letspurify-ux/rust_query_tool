@@ -11749,3 +11749,39 @@ fn test_split_format_items_non_ascii_q_quote_delimiter_splits_trailing_statement
         stmts[1]
     );
 }
+
+#[test]
+fn test_create_external_clause_without_semicolon_splits_before_grant_and_revoke_statement_heads() {
+    for trailing in [
+        "GRANT EXECUTE ON ext_clause_no_semicolon TO app_user;",
+        "REVOKE EXECUTE ON ext_clause_no_semicolon FROM app_user;",
+    ] {
+        let sql = format!(
+            "CREATE OR REPLACE FUNCTION ext_clause_no_semicolon RETURN NUMBER\nAS EXTERNAL\n{trailing}"
+        );
+        let items = QueryExecutor::split_script_items(&sql);
+        let stmts = get_statements(&items);
+
+        assert_eq!(
+            stmts.len(),
+            2,
+            "EXTERNAL clause without semicolon should split before trailing statement head {trailing}, got: {stmts:?}"
+        );
+        assert!(
+            stmts[0].starts_with("CREATE OR REPLACE FUNCTION ext_clause_no_semicolon RETURN NUMBER"),
+            "first statement should preserve CREATE FUNCTION header: {}",
+            stmts[0]
+        );
+        assert!(
+            stmts[0].contains("AS EXTERNAL"),
+            "first statement should preserve EXTERNAL clause: {}",
+            stmts[0]
+        );
+        let trailing_head = trailing.trim_end_matches(';');
+        assert!(
+            stmts[1].starts_with(trailing_head),
+            "trailing statement head should start a new statement for {trailing}: {}",
+            stmts[1]
+        );
+    }
+}

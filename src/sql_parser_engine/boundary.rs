@@ -248,6 +248,16 @@ impl RoutineFrame {
         self.external_clause_state = ExternalClauseState::Confirmed;
     }
 
+    fn has_unterminated_explicit_external_clause(self) -> bool {
+        matches!(
+            self.external_clause_state,
+            ExternalClauseState::SawExternalKeyword
+                | ExternalClauseState::SawUsingClauseSubject
+                | ExternalClauseState::SawMleKeyword
+                | ExternalClauseState::AwaitingLanguageTargetFromExternal
+        )
+    }
+
     fn observe_external_clause_token(&mut self, token_upper: &str, allow_implicit_language: bool) {
         if matches!(
             self.external_clause_state,

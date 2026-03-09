@@ -78,6 +78,10 @@ impl SplitState {
                 frame.external_clause_state,
                 ExternalClauseState::SawImplicitLanguageTarget
                     | ExternalClauseState::AwaitingLanguageTargetImplicit
+                    | ExternalClauseState::SawExternalKeyword
+                    | ExternalClauseState::SawUsingClauseSubject
+                    | ExternalClauseState::SawMleKeyword
+                    | ExternalClauseState::AwaitingLanguageTargetFromExternal
             )
         })
     }
@@ -98,6 +102,10 @@ impl SplitState {
                 frame.external_clause_state,
                 ExternalClauseState::SawImplicitLanguageTarget
                     | ExternalClauseState::AwaitingLanguageTargetImplicit
+                    | ExternalClauseState::SawExternalKeyword
+                    | ExternalClauseState::SawUsingClauseSubject
+                    | ExternalClauseState::SawMleKeyword
+                    | ExternalClauseState::AwaitingLanguageTargetFromExternal
             )
         })
     }
@@ -239,7 +247,12 @@ impl SplitState {
             return LineBoundaryAction::None;
         }
 
-        if !(self.can_terminate_on_slash() || self.pending_end == PendingEnd::End) {
+        if !(self.can_terminate_on_slash()
+            || self.pending_end == PendingEnd::End
+            || (self.block_depth() == 1
+                && self.paren_depth == 0
+                && self.has_unterminated_explicit_external_clause()))
+        {
             return LineBoundaryAction::None;
         }
 
@@ -840,6 +853,11 @@ impl SplitState {
         self.block_depth() == 0
             || self.pending_implicit_external_top_level_split
             || (self.paren_depth == 0 && self.should_split_on_semicolon())
+    }
+
+    fn has_unterminated_explicit_external_clause(&self) -> bool {
+        self.active_routine_frame()
+            .is_some_and(|frame| frame.has_unterminated_explicit_external_clause())
     }
 
     fn should_close_routine_block_on_semicolon(&self) -> bool {
