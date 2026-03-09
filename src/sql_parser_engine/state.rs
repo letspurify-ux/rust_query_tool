@@ -645,12 +645,16 @@ impl SplitState {
 
         if top == Some(BlockKind::Begin)
             && self.block_stack.iter().rev().nth(1) == Some(&BlockKind::AsIs)
+            && self.block_depth() <= 2
         {
             return true;
         }
 
-        if top == Some(BlockKind::AsIs) && self.create_plsql_kind == CreatePlsqlKind::PackageBody {
-            return true;
+        if top == Some(BlockKind::AsIs)
+            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.block_depth() <= 2
+        {
+            return self.package_body_end_label_matches(token_upper);
         }
 
         top == Some(BlockKind::Declare)
