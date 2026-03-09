@@ -389,6 +389,62 @@ impl QueryExecutor {
             })
         }
 
+        fn suffix_line_terminates_immediately_after_keyword(line: &str, keyword: &str) -> bool {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            let keyword_bytes = keyword.as_bytes();
+            if i + keyword_bytes.len() > bytes.len()
+                || !bytes[i..i + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes)
+            {
+                return false;
+            }
+            i += keyword_bytes.len();
+
+            if i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                return false;
+            }
+
+            loop {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+
+                if i >= bytes.len() || bytes[i] == b';' {
+                    return true;
+                }
+
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                    return true;
+                }
+
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                return false;
+            }
+        }
+
+        fn continues_end_suffix_line(line: &str, leading_word: Option<&str>) -> bool {
+            leading_word.is_some_and(|word| {
+                is_end_suffix_keyword(Some(word))
+                    && suffix_line_terminates_immediately_after_keyword(line, word)
+            })
+        }
+
         fn parse_end_label_upper(line: &str) -> Option<String> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
@@ -531,7 +587,7 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !is_end_suffix_keyword(leading_word)
+                    && !continues_end_suffix_line(line, leading_word)
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -572,7 +628,7 @@ impl QueryExecutor {
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
-                    && is_end_suffix_keyword(leading_word)
+                    && continues_end_suffix_line(line, leading_word)
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 } else if builder.state.pending_end == PendingEnd::End {

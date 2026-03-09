@@ -6966,6 +6966,46 @@ END;"#;
 }
 
 #[test]
+fn test_line_block_depths_split_end_then_new_if_opener_is_not_treated_as_end_if_suffix() {
+    let sql = r#"BEGIN
+  WHILE i < 5 LOOP
+    i := i + 1;
+  END
+  IF i > 2 THEN
+    NULL;
+  END IF;
+END;"#;
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 1, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "split END followed by a new IF opener must not be resolved as END IF suffix"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_end_then_new_if_opener_keeps_end_name_resolution() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY test_pkg AS
+  PROCEDURE p IS
+  BEGIN
+    NULL;
+  END
+  p;
+  IF 1 = 1 THEN
+    NULL;
+  END IF;
+END test_pkg;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+
+    let expected = vec![0, 1, 1, 2, 1, 1, 1, 2, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "package body should resolve split END name, then treat following IF as a new opener"
+    );
+}
+
+#[test]
 fn test_line_block_depths_with_for_update_clause() {
     let sql = r#"SELECT id, status
 FROM jobs
