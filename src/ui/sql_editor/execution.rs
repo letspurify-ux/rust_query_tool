@@ -185,7 +185,6 @@ enum OpenCursorFormatState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectListBreakState {
     None,
-    ForceOnNextSelect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,20 +225,11 @@ impl SelectListLayoutState {
 
 impl SelectListBreakState {
     fn consume_for_select(&mut self) -> bool {
-        if matches!(self, Self::ForceOnNextSelect) {
-            *self = Self::None;
-            true
-        } else {
-            false
-        }
+        false
     }
 
-    fn track_statement_tail(&mut self, has_unbalanced_paren: bool) {
-        *self = if has_unbalanced_paren {
-            Self::ForceOnNextSelect
-        } else {
-            Self::None
-        };
+    fn track_statement_tail(&mut self, _has_unbalanced_paren: bool) {
+        *self = Self::None;
     }
 
     fn clear(&mut self) {
@@ -2073,7 +2063,7 @@ impl SqlEditorWidget {
                             }
                         }
                         ";" => {
-                            let had_unbalanced_paren = suppress_comma_break_depth > 0
+                            let has_unbalanced_paren = suppress_comma_break_depth > 0
                                 || !paren_stack.is_empty()
                                 || !column_list_stack.is_empty();
                             trim_trailing_space(&mut out);
@@ -2093,17 +2083,12 @@ impl SqlEditorWidget {
                             routine_decl_pending = false;
                             let should_reset_paren_tracking =
                                 indent_level == 0 || block_stack.is_empty();
-                            if should_reset_paren_tracking {
-                                // Recover newline/comma wrapping behavior for the next top-level section
-                                // even if we encountered an unmatched parenthesis earlier in the statement.
+                            if should_reset_paren_tracking && !has_unbalanced_paren {
                                 suppress_comma_break_depth = 0;
                                 paren_stack.clear();
                                 paren_clause_restore_stack.clear();
                                 column_list_stack.clear();
                                 paren_indent_increase_stack.clear();
-                                if had_unbalanced_paren {
-                                    select_list_break_state.track_statement_tail(true);
-                                }
                             }
                             newline_with(
                                 &mut out,
@@ -8678,11 +8663,25 @@ mod formatter_regression_tests {
     use std::time::Duration;
 
     #[test]
-    fn resets_paren_tracking_after_malformed_statement_before_next_statement() {
+    fn does_not_recover_paren_tracking_after_malformed_statement() {
         let sql = "select fn(a, b;\nselect x, y from dual;";
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"));
+        assert!(
+            formatted.contains("SELECT x, y\nFROM DUAL;"),
+            "unexpected formatted output:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn does_not_recover_paren_tracking_after_malformed_statement_with_trailing_comment() {
+        let sql = "select fn(a, b -- broken\n;\nselect x, y from dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SELECT x, y\nFROM DUAL;"),
+            "unexpected formatted output:\n{formatted}"
+        );
     }
 
     #[test]

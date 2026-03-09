@@ -1708,13 +1708,13 @@ ORDER BY deptno,
 }
 
 #[test]
-fn format_sql_resets_paren_comma_suppression_after_top_level_semicolon() {
+fn format_sql_keeps_paren_comma_suppression_after_malformed_statement_semicolon() {
     let input = "SELECT func(a, b;\nSELECT c, d FROM dual";
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("SELECT\n    c,\n    d\nFROM DUAL;"),
-        "Comma wrapping should recover for next top-level statement after ';', got: {}",
+        formatted.contains("SELECT c, d\nFROM DUAL;"),
+        "Malformed statement state should not be recovered for next statement, got: {}",
         formatted
     );
 }
