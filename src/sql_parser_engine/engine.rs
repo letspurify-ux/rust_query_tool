@@ -238,6 +238,10 @@ impl SqlParserEngine {
             && ((self.state.block_depth() == 1 && self.state.paren_depth == 0)
                 || (self.state.in_with_plsql_declaration()
                     && self.state.block_depth() == 0
+                    && self.state.paren_depth == 0)
+                || (self.state.pending_end_top_level_split
+                    && !self.state.in_with_plsql_declaration()
+                    && self.state.block_depth() == 0
                     && self.state.paren_depth == 0));
 
         if !should_preview {
@@ -302,6 +306,18 @@ impl SqlParserEngine {
                         this.split_current_statement();
                     }
                 }
+            }
+
+
+            if this.state.pending_end_top_level_split
+                && !this.state.in_with_plsql_declaration()
+                && this.state.block_depth() == 0
+                && this.state.paren_depth == 0
+            {
+                if sql_text::is_statement_head_keyword(candidate_upper) {
+                    this.split_current_statement();
+                }
+                this.state.pending_end_top_level_split = false;
             }
         });
     }
@@ -472,9 +488,16 @@ impl SqlParserEngine {
 
             if c == '-' && next == Some('-') {
                 self.state.flush_token();
-                if self.state.pending_implicit_external_top_level_split
+                if self.state.pending_end == PendingEnd::End {
+                    self.state.resolve_pending_end_on_separator();
+                }
+                if ((self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth == 0)
+                    || (self.state.pending_end_top_level_split
+                        && !self.state.in_with_plsql_declaration()
+                        && self.state.block_depth() == 0
+                        && self.state.paren_depth == 0))
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();
@@ -488,9 +511,16 @@ impl SqlParserEngine {
 
             if c == '/' && next == Some('*') {
                 self.state.flush_token();
-                if self.state.pending_implicit_external_top_level_split
+                if self.state.pending_end == PendingEnd::End {
+                    self.state.resolve_pending_end_on_separator();
+                }
+                if ((self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth == 0)
+                    || (self.state.pending_end_top_level_split
+                        && !self.state.in_with_plsql_declaration()
+                        && self.state.block_depth() == 0
+                        && self.state.paren_depth == 0))
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();

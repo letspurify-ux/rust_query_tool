@@ -48,6 +48,7 @@ pub(crate) struct SplitState {
     token_upper_buf: String,
     quoted_identifier_buf: String,
     pending_implicit_external_top_level_split: bool,
+    pending_end_top_level_split: bool,
 }
 
 impl SplitState {
@@ -296,7 +297,15 @@ impl SplitState {
             return;
         }
 
+        let had_blocks_before_resolve = self.block_depth() > 0;
         self.resolve_plain_end("");
+        if had_blocks_before_resolve
+            && self.block_depth() == 0
+            && self.paren_depth == 0
+            && !self.in_with_plsql_declaration()
+        {
+            self.pending_end_top_level_split = true;
+        }
         if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
             && !self.in_with_plsql_declaration()
@@ -813,7 +822,15 @@ impl SplitState {
             return;
         }
 
+        let had_blocks_before_resolve = self.block_depth() > 0;
         self.resolve_plain_end(token_upper);
+        if had_blocks_before_resolve
+            && self.block_depth() == 0
+            && self.paren_depth == 0
+            && !self.in_with_plsql_declaration()
+        {
+            self.pending_end_top_level_split = true;
+        }
         self.pending_end = PendingEnd::None;
     }
 
@@ -959,6 +976,7 @@ impl SplitState {
         self.with_clause_state = WithClauseState::None;
         self.top_level_token_state = TopLevelTokenState::NoneSeen;
         self.pending_implicit_external_top_level_split = false;
+        self.pending_end_top_level_split = false;
     }
 
     pub(crate) fn reset_create_tracking_state(&mut self) {

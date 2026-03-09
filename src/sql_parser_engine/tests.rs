@@ -5706,3 +5706,50 @@ fn oracle_external_language_without_semicolon_splits_before_following_statement_
     assert!(statements[0].contains("AS EXTERNAL LANGUAGE C"));
     assert_eq!(statements[1], "SELECT 50 FROM dual".to_string());
 }
+
+#[test]
+fn create_function_without_slash_splits_before_block_comment_prefixed_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION no_slash_comment_head RETURN NUMBER");
+    engine.process_line("IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END");
+    engine.process_line("/* trailing note */ SELECT 51 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END"),
+        "function body should stay in first statement: {}",
+        statements[0]
+    );
+    assert!(
+        statements[1].starts_with("/* trailing note */ SELECT 51 FROM dual"),
+        "comment-prefixed SELECT should begin a new statement: {}",
+        statements[1]
+    );
+}
+
+
+#[test]
+fn create_function_without_slash_splits_before_line_comment_prefixed_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION no_slash_line_comment RETURN NUMBER");
+    engine.process_line("IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END");
+    engine.process_line("-- trailing note");
+    engine.process_line("SELECT 52 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[1].starts_with("-- trailing note\nSELECT 52 FROM dual"),
+        "line-comment-prefixed SELECT should begin a new statement: {}",
+        statements[1]
+    );
+}
