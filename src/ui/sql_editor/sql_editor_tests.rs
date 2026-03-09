@@ -857,6 +857,68 @@ END;"#;
 }
 
 #[test]
+fn format_sql_select_into_with_connect_by_keeps_clause_depth() {
+    let input = r#"BEGIN
+SELECT
+CASE
+WHEN LEVEL = 1 THEN 'ROOT'
+ELSE 'CHILD'
+END
+INTO
+v_kind
+FROM dual
+START WITH 1 = 1
+CONNECT BY PRIOR 1 = 1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    SELECT",
+        "        CASE",
+        "            WHEN LEVEL = 1 THEN 'ROOT'",
+        "            ELSE 'CHILD'",
+        "        END",
+        "    INTO v_kind",
+        "    FROM DUAL",
+        "    START WITH 1 = 1",
+        "    CONNECT BY PRIOR 1 = 1;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_select_into_with_union_stops_into_extra_indent() {
+    let input = r#"BEGIN
+SELECT col1
+INTO
+v_col
+FROM t1
+UNION ALL
+SELECT col2
+FROM t2;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    SELECT col1",
+        "    INTO v_col",
+        "    FROM t1",
+        "    UNION ALL",
+        "    SELECT col2",
+        "    FROM t2;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
 fn format_sql_where_exists_and_not_exists_layout_regression() {
     let input = "SELECT * FROM asdf WHERE EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.sku LIKE 'SKU-%') AND NOT EXISTS (SELECT 1 FROM oqt_t_order_item oi WHERE oi.order_id = v.order_id AND oi.qty <= 0);";
 
@@ -1187,7 +1249,6 @@ END;"#;
     assert_eq!(formatted, expected);
 }
 
-
 #[test]
 fn format_sql_plsql_depth_overrides_manual_overindent_for_code_lines() {
     let input = r#"BEGIN
@@ -1377,7 +1438,8 @@ END demo_pkg;
 }
 
 #[test]
-fn format_sql_keeps_end_if_depth_before_named_end_when_sqlplus_comment_and_block_comment_in_between() {
+fn format_sql_keeps_end_if_depth_before_named_end_when_sqlplus_comment_and_block_comment_in_between(
+) {
     let input = r#"CREATE OR REPLACE PACKAGE BODY demo_pkg AS
 PROCEDURE p IS
 BEGIN

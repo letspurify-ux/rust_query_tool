@@ -358,7 +358,6 @@ impl SqlEditorWidget {
         rest.is_empty() || rest.starts_with(';')
     }
 
-
     fn connection_info_for_ui(info: &ConnectionInfo) -> ConnectionInfo {
         let mut sanitized = info.clone();
         sanitized.clear_password();
@@ -884,8 +883,7 @@ impl SqlEditorWidget {
             .split_whitespace()
             .next()
             .is_some_and(|first_word| {
-                first_word.eq_ignore_ascii_case("REM")
-                    || first_word.eq_ignore_ascii_case("REMARK")
+                first_word.eq_ignore_ascii_case("REM") || first_word.eq_ignore_ascii_case("REMARK")
             })
     }
 
@@ -2322,30 +2320,7 @@ impl SqlEditorWidget {
                 into_list_active = false;
             }
             let starts_into = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
-            let starts_into_ender =
-                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHERE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXCEPTION")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHEN")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "BEGIN")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "LOOP")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INSERT")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FETCH")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "OPEN")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CLOSE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "RETURN")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "EXIT");
+            let starts_into_ender = Self::ends_into_list_context(&trimmed_upper);
             let extra_indent = if into_list_active && !starts_into_ender {
                 1
             } else {
@@ -2361,10 +2336,11 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let previous_line_is_plain_end = last_code_line_trimmed.as_deref().is_some_and(|prev| {
-                let prev_upper = prev.to_ascii_uppercase();
-                Self::starts_with_plain_end(&prev_upper)
-            });
+            let previous_line_is_plain_end =
+                last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    let prev_upper = prev.to_ascii_uppercase();
+                    Self::starts_with_plain_end(&prev_upper)
+                });
             let mut next_significant_line_trimmed: Option<&str> = None;
             let mut in_peek_block_comment = false;
             for next in lines.iter().skip(idx + 1) {
@@ -2417,15 +2393,8 @@ impl SqlEditorWidget {
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement {
-                let is_dml_clause_line = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHERE")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "GROUP")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "HAVING")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ORDER")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "VALUES")
-                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SET");
+                let is_dml_clause_line = Self::is_dml_clause_starter(&trimmed_upper)
+                    || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
                 let max_extra = if is_dml_clause_line { 1 } else { 2 };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if existing_indent > parser_depth.saturating_add(3) {
@@ -2459,6 +2428,44 @@ impl SqlEditorWidget {
         }
 
         out
+    }
+
+    fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "SELECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "VALUES")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SET")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "START")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+    }
+
+    fn ends_into_list_context(trimmed_upper: &str) -> bool {
+        Self::is_dml_clause_starter(trimmed_upper)
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "END")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "EXCEPTION")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSIF")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSEIF")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHEN")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "BEGIN")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "LOOP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CASE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INSERT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UPDATE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "DELETE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MERGE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FETCH")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OPEN")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CLOSE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "RETURN")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "EXIT")
     }
 
     fn multiline_string_continuation_lines(formatted: &str, line_count: usize) -> Vec<bool> {
@@ -3576,8 +3583,7 @@ impl SqlEditorWidget {
                                                 (Vec::new(), Vec::new())
                                             } else {
                                                 SqlEditorWidget::collect_print_all_data(
-                                                    &guard,
-                                                    &null_text,
+                                                    &guard, &null_text,
                                                 )
                                             }
                                         };
@@ -8661,9 +8667,7 @@ impl SqlEditorWidget {
 
 #[cfg(test)]
 mod formatter_regression_tests {
-    use super::{
-        QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH,
-    };
+    use super::{QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH};
     use crate::db::SessionState;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
@@ -8862,7 +8866,6 @@ END oqt_mega_pkg;"#;
             "Formatting should be idempotent for nested CASE expressions"
         );
     }
-
 
     #[test]
     fn package_body_named_end_with_if_prefix_is_not_treated_as_end_if_suffix() {
@@ -9068,15 +9071,31 @@ END;"#;
 
     #[test]
     fn starts_with_end_suffix_terminator_requires_keyword_boundary() {
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END IF;"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END LOOP"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END CASE"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END REPEAT"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF;"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END LOOP"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END CASE"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END REPEAT"
+        ));
         assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END FOR"));
-        assert!(SqlEditorWidget::starts_with_end_suffix_terminator("END WHILE"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END IF_OWNER;"));
-        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator("END FORWARD;"));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FOR"
+        ));
+        assert!(SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END WHILE"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END IF_OWNER;"
+        ));
+        assert!(!SqlEditorWidget::starts_with_end_suffix_terminator(
+            "END FORWARD;"
+        ));
     }
 
     #[test]
@@ -9438,7 +9457,10 @@ END;"#;
         match message {
             QueryProgress::Rows { index, rows } => {
                 assert_eq!(index, 9);
-                assert_eq!(rows, vec![vec!["(null)".to_string()], vec!["2".to_string()]]);
+                assert_eq!(
+                    rows,
+                    vec![vec!["(null)".to_string()], vec!["2".to_string()]]
+                );
             }
             _ => panic!("expected QueryProgress::Rows"),
         }
@@ -9761,8 +9783,7 @@ FROM DUAL"
 
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
         assert_eq!(
-            preserved,
-            "-- existing; comment semicolon",
+            preserved, "-- existing; comment semicolon",
             "Semicolon inside comment-only selections should not be removed"
         );
     }
@@ -9795,7 +9816,11 @@ FROM DUAL"
 
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.contains("REM keep this exact comment"), "{}", formatted);
+        assert!(
+            formatted.contains("REM keep this exact comment"),
+            "{}",
+            formatted
+        );
         assert!(formatted.contains("REMARK Keep;This;Too"), "{}", formatted);
         assert!(formatted.contains("SELECT 1\nFROM DUAL;"), "{}", formatted);
     }
