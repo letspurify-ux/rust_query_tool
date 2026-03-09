@@ -36,6 +36,7 @@ pub(crate) struct SplitState {
     saw_trigger_alias_subject: bool,
     package_body_name: Option<String>,
     awaiting_package_body_name: bool,
+    awaiting_package_body_name_dot: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
     pub(crate) paren_depth: usize,
@@ -1146,6 +1147,7 @@ impl SplitState {
         self.create_state = CreateState::None;
         self.package_body_name = None;
         self.awaiting_package_body_name = false;
+        self.awaiting_package_body_name_dot = false;
         self.as_is_follow_state = AsIsFollowState::None;
         self.begin_state = BeginState::None;
         self.as_is_state = AsIsState::None;
@@ -1204,8 +1206,31 @@ impl SplitState {
         if self.block_depth() == 0
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
             && self.awaiting_package_body_name
+            && (self.package_body_name.is_none() || self.awaiting_package_body_name_dot)
         {
             self.package_body_name = Some(upper.to_string());
+            self.awaiting_package_body_name_dot = false;
+        }
+    }
+
+
+
+    pub(crate) fn track_create_plsql_symbol(&mut self, ch: char) {
+        if self.block_depth() != 0
+            || self.create_plsql_kind != CreatePlsqlKind::PackageBody
+            || !self.awaiting_package_body_name
+        {
+            return;
+        }
+
+        match ch {
+            '.' if self.package_body_name.is_some() => {
+                self.awaiting_package_body_name_dot = true;
+            }
+            _ if !ch.is_whitespace() => {
+                self.awaiting_package_body_name_dot = false;
+            }
+            _ => {}
         }
     }
 
@@ -1227,6 +1252,7 @@ impl SplitState {
                 self.create_plsql_kind = CreatePlsqlKind::PackageBody;
                 self.package_body_name = None;
                 self.awaiting_package_body_name = true;
+                self.awaiting_package_body_name_dot = false;
                 return;
             }
 
@@ -1236,8 +1262,10 @@ impl SplitState {
             {
                 if matches!(upper, "AS" | "IS") {
                     self.awaiting_package_body_name = false;
-                } else {
+                    self.awaiting_package_body_name_dot = false;
+                } else if self.package_body_name.is_none() || self.awaiting_package_body_name_dot {
                     self.package_body_name = Some(upper.to_string());
+                    self.awaiting_package_body_name_dot = false;
                 }
             }
 
