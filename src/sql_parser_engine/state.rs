@@ -809,13 +809,10 @@ impl SplitState {
     }
 
     fn pop_top_matching_block(&mut self, kinds: &[BlockKind]) -> bool {
-        if self
-            .block_stack
-            .last()
-            .is_some_and(|kind| kinds.iter().any(|candidate| kind == candidate))
-        {
-            let _ = self.block_stack.pop();
-            return true;
+        for kind in kinds {
+            if self.pop_block_of_kind(*kind) {
+                return true;
+            }
         }
 
         false
