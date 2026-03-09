@@ -705,16 +705,8 @@ impl QueryExecutor {
         let mut case_branch_stack: Vec<bool> = Vec::new();
 
         for line in sql.lines() {
-            let leading_word = if builder.is_idle() {
-                leading_keyword_after_comments(line)
-            } else {
-                None
-            };
-            let leading_identifier_chain = if builder.is_idle() {
-                parse_identifier_chain(line)
-            } else {
-                None
-            };
+            let leading_word = leading_keyword_after_comments(line);
+            let leading_identifier_chain = parse_identifier_chain(line);
             let pending_end_label_continuation =
                 leading_identifier_chain
                     .as_ref()
