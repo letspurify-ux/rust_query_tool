@@ -12695,3 +12695,56 @@ END pkg;"#;
     );
 }
 
+#[test]
+fn test_line_block_depths_package_body_as_procedure_with_exception_and_end_name() {
+    // Ensure PROCEDURE ... AS inside package body follows the same depth behavior as IS.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_as AS
+  PROCEDURE p_as AS
+  BEGIN
+    IF x = 1 THEN
+      NULL;
+    ELSE
+      NULL;
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p_as;
+END pkg_as;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    // pkg AS(0) proc AS(1) BEGIN(1) IF(2) NULL(3) ELSE(2) NULL(3) END IF(2)
+    // EXCEPTION(1) WHEN(2) NULL(3) END p_as(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 2, 3, 2, 1, 2, 3, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "package body PROCEDURE ... AS with exception/end-name depth mismatch: {depths:?}"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_as_with_split_end_if_and_split_end_name() {
+    // Verify split END/IF and split END/name are both tracked correctly with AS + EXCEPTION.
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_mix AS
+  FUNCTION f_mix RETURN NUMBER AS
+  BEGIN
+    IF flag = 1 THEN
+      RETURN 1;
+    END
+    IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN 0;
+  END
+  f_mix;
+END pkg_mix;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    // pkg AS(0) fn AS(1) BEGIN(1) IF(2) RETURN(3) END(2) IF;(2)
+    // EXCEPTION(1) WHEN(2) RETURN(3) END(1) f_mix;(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 2, 3, 1, 1, 0];
+    assert_eq!(
+        depths, expected,
+        "package body AS function split END IF + split END name depth mismatch: {depths:?}"
+    );
+}
