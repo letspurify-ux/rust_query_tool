@@ -2365,21 +2365,16 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let is_trigger_for_each_row = trimmed_upper.starts_with("FOR EACH ROW");
             let force_end_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper);
+            // Only force parser depth for dedent-oriented control lines.
+            // Block starters (IF/FOR/WHILE/CASE/BEGIN/DECLARE/LOOP...) should keep
+            // an already-deeper indent from the first formatting pass.
             let force_block_depth = !in_dml_statement
                 && (trimmed_upper.starts_with("EXCEPTION")
                     || trimmed_upper.starts_with("WHEN ")
                     || trimmed_upper.starts_with("ELSE")
                     || trimmed_upper.starts_with("ELSIF")
-                    || force_end_depth
-                    || trimmed_upper.starts_with("BEGIN")
-                    || trimmed_upper.starts_with("CASE")
-                    || trimmed_upper.starts_with("IF ")
-                    || trimmed_upper.starts_with("LOOP")
-                    || (trimmed_upper.starts_with("FOR ") && !is_trigger_for_each_row)
-                    || trimmed_upper.starts_with("WHILE ")
-                    || trimmed_upper.starts_with("DECLARE"));
+                    || force_end_depth);
 
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
