@@ -11672,7 +11672,7 @@ fn test_split_script_items_oracle_with_function_keeps_slash_line_comment_with_ma
 }
 
 #[test]
-fn test_split_format_items_oracle_with_function_keeps_slash_block_comment_with_main_query() {
+fn test_split_format_items_oracle_with_function_consumes_slash_block_comment_terminator() {
     let sql = "WITH FUNCTION f RETURN NUMBER IS\nBEGIN\n  RETURN 1;\nEND\n/ /* sqlplus terminator */\nSELECT 3 FROM dual;";
     let items = QueryExecutor::split_format_items(sql);
     let stmts: Vec<&str> = items
@@ -11689,15 +11689,15 @@ fn test_split_format_items_oracle_with_function_keeps_slash_block_comment_with_m
 
     assert_eq!(
         stmts.len(),
-        1,
-        "expected WITH FUNCTION main query to keep slash block comment attached, got: {stmts:?}"
+        2,
+        "expected WITH FUNCTION and trailing SELECT split by slash block-comment terminator, got: {stmts:?}"
     );
     assert!(stmts[0].starts_with("WITH FUNCTION f RETURN NUMBER IS"));
     assert_eq!(
-        slash_count, 0,
-        "slash+block-comment line should stay in the next statement, got: {items:?}"
+        slash_count, 1,
+        "slash+block-comment line should be consumed as slash format item, got: {items:?}"
     );
-    assert!(stmts[0].contains("/ /* sqlplus terminator */\nSELECT 3 FROM dual"));
+    assert!(stmts[1].starts_with("SELECT 3 FROM dual"));
 }
 
 #[test]
