@@ -12313,3 +12313,130 @@ fn test_split_format_items_non_ascii_q_quote_delimiter_splits_trailing_statement
         stmts[1]
     );
 }
+
+#[test]
+fn test_line_block_depths_split_end_if_continuation_keeps_if_depth() {
+    let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    NULL;
+  END
+  IF;
+END;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF line");
+    let end_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END")
+        .expect("expected split END line");
+    let end_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "IF;")
+        .expect("expected END IF continuation line");
+
+    assert_eq!(
+        depths[end_idx], depths[if_idx],
+        "split END line should pre-dedent to IF depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[end_if_idx], depths[if_idx],
+        "END IF continuation line should keep IF depth (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_split_end_if_with_inline_comment_keeps_if_depth() {
+    let sql = r#"BEGIN
+  IF 1 = 1 THEN
+    NULL;
+  END
+  IF /* qualifier */;
+END;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF line");
+    let continuation_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF /* qualifier */;"))
+        .expect("expected split END IF continuation line");
+
+    assert_eq!(
+        depths[continuation_idx], depths[if_idx],
+        "END IF continuation with inline comment should keep IF depth (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_split_end_if_then_named_end() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split_end AS
+  PROCEDURE p IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END
+    IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END p;
+END pkg_depth_split_end;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let if_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("IF 1 = 1 THEN"))
+        .expect("expected IF line");
+    let split_if_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "IF;")
+        .expect("expected split END IF continuation line");
+    let end_proc_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END p"))
+        .expect("expected END p line");
+    let end_pkg_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("END pkg_depth_split_end"))
+        .expect("expected package END line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1 FROM dual"))
+        .expect("expected trailing SELECT line");
+
+    assert_eq!(
+        depths[split_if_idx], depths[if_idx],
+        "split END IF continuation must align with IF depth in package body (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package END should return to top-level depth (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx], 0,
+        "depth should reset before trailing SELECT (depths: {depths:?})"
+    );
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+    assert_eq!(
+        statements.len(),
+        2,
+        "package body with split END IF should still split trailing SELECT (statements: {statements:?})"
+    );
+    assert!(statements[0].contains("END pkg_depth_split_end"));
+    assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+    assert!(depths[end_proc_idx] > 0, "procedure END should remain nested (depths: {depths:?})");
+}

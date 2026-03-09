@@ -389,6 +389,54 @@ impl QueryExecutor {
             })
         }
 
+        fn is_end_suffix_continuation_line(line: &str, leading_word: Option<&str>) -> bool {
+            if !is_end_suffix_keyword(leading_word) {
+                return false;
+            }
+
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+
+            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+
+            while i < bytes.len() {
+                if bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+
+                if bytes[i] == b';' {
+                    return true;
+                }
+
+                if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                    return true;
+                }
+
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                return false;
+            }
+
+            true
+        }
+
         fn parse_identifier_chain(line: &str) -> Option<String> {
             let bytes = line.as_bytes();
             let mut i = 0usize;
@@ -655,7 +703,7 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !is_end_suffix_keyword(leading_word)
+                    && !is_end_suffix_continuation_line(line, leading_word)
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -706,7 +754,7 @@ impl QueryExecutor {
             {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
-                    && is_end_suffix_keyword(leading_word)
+                    && is_end_suffix_continuation_line(line, leading_word)
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 } else if builder.state.pending_end == PendingEnd::End {
