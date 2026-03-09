@@ -48,10 +48,6 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
     true
 }
 
-#[inline]
-fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-    !delimiter.is_whitespace() && delimiter != '\''
-}
 
 #[inline]
 fn is_external_language_target(token_upper: &str) -> bool {
@@ -519,7 +515,7 @@ impl SqlParserEngine {
 
                 if q_prefix_len > 0 {
                     if let Some(&delimiter) = chars.get(q_idx) {
-                        if !is_valid_q_quote_delimiter(delimiter) {
+                        if !sql_text::is_valid_q_quote_delimiter(delimiter) {
                             self.current.push(c);
                             self.state.token.push(c);
                             i += 1;
