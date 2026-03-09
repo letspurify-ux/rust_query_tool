@@ -1300,6 +1300,62 @@ fn package_body_init_nested_end_case_label_does_not_capture_outer_end_label() {
 }
 
 #[test]
+fn package_body_init_end_if_with_keyword_label_does_not_open_new_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_end_if_keyword_label AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF LOOP;");
+    engine.process_line("END pkg_end_if_keyword_label;");
+    engine.process_line("SELECT 101 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END IF LOOP;"),
+        "first statement should keep END IF keyword label verbatim: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END pkg_end_if_keyword_label"),
+        "outer package END should still close correctly: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 101 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_init_end_loop_with_keyword_label_does_not_open_new_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_end_loop_keyword_label AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  LOOP");
+    engine.process_line("    EXIT;");
+    engine.process_line("  END LOOP IF;");
+    engine.process_line("END pkg_end_loop_keyword_label;");
+    engine.process_line("SELECT 102 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END LOOP IF;"),
+        "first statement should keep END LOOP keyword label verbatim: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("END pkg_end_loop_keyword_label"),
+        "outer package END should still close correctly: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 102 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_init_end_exception_identifier_does_not_capture_outer_end_label() {
     let mut engine = SqlParserEngine::new();
 

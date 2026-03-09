@@ -702,6 +702,7 @@ impl SqlParserEngine {
             }
 
             if symbol_role == SymbolRole::Semicolon {
+                self.state.clear_skip_next_end_label_token();
                 let semicolon_action = self.state.prepare_semicolon_action();
                 self.apply_semicolon_action(semicolon_action, c);
                 i += 1;
@@ -750,6 +751,7 @@ impl SqlParserEngine {
         }
 
         self.process_chars_with_observer(&scratch_chars, &mut on_symbol);
+        self.state.clear_skip_next_end_label_token();
 
         if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
             && self.state.is_idle()
