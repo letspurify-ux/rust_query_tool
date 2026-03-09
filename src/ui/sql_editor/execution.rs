@@ -2319,6 +2319,7 @@ impl SqlEditorWidget {
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
             if starts_dml {
                 in_dml_statement = true;
+                into_list_active = false;
             }
             let starts_into = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
             let starts_into_ender =
@@ -2440,6 +2441,7 @@ impl SqlEditorWidget {
             }
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
+                into_list_active = false;
             }
             last_code_line_trimmed = Some(trimmed.to_string());
         }
