@@ -72,6 +72,7 @@ pub(crate) fn apply_paren_token(state: &mut ParenDepthState, token: &SqlToken) {
 }
 
 /// Returns the final parenthesis depth after all tokens are processed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn paren_depth_after(tokens: &[SqlToken]) -> usize {
     let mut state = ParenDepthState::default();
     for token in tokens {

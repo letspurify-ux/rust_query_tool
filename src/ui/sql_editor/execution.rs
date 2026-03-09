@@ -28,7 +28,7 @@ use crate::sql_text::{
     FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
 use crate::ui::sql_depth::{
-    is_depth, is_top_level_depth, paren_depth_after, paren_depths, split_top_level_keyword_groups,
+    is_depth, is_top_level_depth, paren_depths, split_top_level_keyword_groups,
     split_top_level_symbol_groups,
 };
 
@@ -185,7 +185,6 @@ enum OpenCursorFormatState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectListBreakState {
     None,
-    ForceOnNextSelect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,20 +225,11 @@ impl SelectListLayoutState {
 
 impl SelectListBreakState {
     fn consume_for_select(&mut self) -> bool {
-        if matches!(self, Self::ForceOnNextSelect) {
-            *self = Self::None;
-            true
-        } else {
-            false
-        }
+        false
     }
 
-    fn track_statement_tail(&mut self, has_unbalanced_paren: bool) {
-        *self = if has_unbalanced_paren {
-            Self::ForceOnNextSelect
-        } else {
-            Self::None
-        };
+    fn track_statement_tail(&mut self) {
+        *self = Self::None;
     }
 
     fn clear(&mut self) {
@@ -790,9 +780,7 @@ impl SqlEditorWidget {
                     if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
                         formatted.push(';');
                     }
-                    select_list_break_state.track_statement_tail(
-                        Self::statement_has_unbalanced_paren(&statement_tokens),
-                    );
+                    select_list_break_state.track_statement_tail();
                 }
                 FormatItem::ToolCommand(command) => {
                     formatted.push_str(&Self::format_tool_command(command));
@@ -924,10 +912,6 @@ impl SqlEditorWidget {
             }
         }
         false
-    }
-
-    fn statement_has_unbalanced_paren(tokens: &[SqlToken]) -> bool {
-        paren_depth_after(tokens) > 0
     }
 
     fn format_tool_command(command: &ToolCommand) -> String {
@@ -2073,9 +2057,6 @@ impl SqlEditorWidget {
                             }
                         }
                         ";" => {
-                            let had_unbalanced_paren = suppress_comma_break_depth > 0
-                                || !paren_stack.is_empty()
-                                || !column_list_stack.is_empty();
                             trim_trailing_space(&mut out);
                             out.push(';');
                             current_clause = None;
@@ -2094,16 +2075,13 @@ impl SqlEditorWidget {
                             let should_reset_paren_tracking =
                                 indent_level == 0 || block_stack.is_empty();
                             if should_reset_paren_tracking {
-                                // Recover newline/comma wrapping behavior for the next top-level section
-                                // even if we encountered an unmatched parenthesis earlier in the statement.
+                                // Reset top-level parenthesis/comma tracking at statement boundary only
+                                // when parser state is already at top-level block context.
                                 suppress_comma_break_depth = 0;
                                 paren_stack.clear();
                                 paren_clause_restore_stack.clear();
                                 column_list_stack.clear();
                                 paren_indent_increase_stack.clear();
-                                if had_unbalanced_paren {
-                                    select_list_break_state.track_statement_tail(true);
-                                }
                             }
                             newline_with(
                                 &mut out,
@@ -8678,11 +8656,15 @@ mod formatter_regression_tests {
     use std::time::Duration;
 
     #[test]
-    fn resets_paren_tracking_after_malformed_statement_before_next_statement() {
+    fn does_not_force_select_list_recovery_after_malformed_statement() {
         let sql = "select fn(a, b;\nselect x, y from dual;";
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"));
+        assert!(
+            formatted.contains("SELECT x,") && !formatted.contains("SELECT\n    x,"),
+            "Malformed input should not force a newline right after SELECT in next statement, got:\n{}",
+            formatted
+        );
     }
 
     #[test]

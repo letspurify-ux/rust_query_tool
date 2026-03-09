@@ -12999,3 +12999,14 @@ SELECT 1 FROM dual;"#;
     );
 
 }
+
+#[test]
+fn test_line_block_depths_does_not_recover_on_unmatched_closing_paren_within_block() {
+    let sql = "BEGIN\n)\nNULL;\nEND;";
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    assert_eq!(depths.len(), 4, "unexpected depths: {depths:?}");
+    assert_eq!(depths[1], 1, "unmatched ')' should not alter block depth: {depths:?}");
+    assert_eq!(depths[2], 1, "next line should keep same block depth: {depths:?}");
+}
+

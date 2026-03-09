@@ -938,11 +938,8 @@ impl QueryExecutor {
                         subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     } else if closed_kind == Some(SubqueryParenKind::Pending) {
                         pending_subquery_paren = pending_subquery_paren.saturating_sub(1);
-                    } else if closed_kind.is_none() {
-                        // Malformed SQL recovery path: keep depth accounting monotonic.
-                        subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
                     }
-                    if with_cte_depth > 0 {
+                    if with_cte_depth > 0 && with_cte_paren > 0 {
                         with_cte_paren -= 1;
                     }
                 }
