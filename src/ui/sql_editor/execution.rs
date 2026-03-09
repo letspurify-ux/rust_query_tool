@@ -1768,7 +1768,9 @@ impl SqlEditorWidget {
 
                     if create_table_paren_expected
                         && upper == "AS"
-                        && (next_word_is("SELECT") || next_word_is("WITH") || next_word_is("VALUES"))
+                        && (next_word_is("SELECT")
+                            || next_word_is("WITH")
+                            || next_word_is("VALUES"))
                     {
                         create_table_paren_expected = false;
                     }
@@ -2392,10 +2394,16 @@ impl SqlEditorWidget {
             let existing_indent = leading_spaces / 4;
             let parser_depth = depth + extra_indent + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
+            let previous_line_is_dml_case_end = in_dml_statement
+                && last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    let prev_upper = prev.trim_start().to_ascii_uppercase();
+                    crate::sql_text::starts_with_keyword_token(&prev_upper, "END")
+                });
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if in_dml_statement && starts_with_close_paren {
-                existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                let max_extra = if previous_line_is_dml_case_end { 2 } else { 1 };
+                existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if in_dml_statement {
                 let is_dml_clause_line = Self::is_dml_clause_starter(&trimmed_upper)
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");

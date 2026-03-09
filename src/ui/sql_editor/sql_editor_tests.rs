@@ -2258,6 +2258,55 @@ END;"#;
 }
 
 #[test]
+fn format_sql_select_case_start_with_inline_comment_keeps_close_paren_indented() {
+    let input = r#"SELECT ( -- inline comment
+CASE
+WHEN score > 10 THEN 'HIGH'
+ELSE 'LOW'
+END
+) AS bucket
+FROM dual;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains("( -- inline comment
+        CASE
+            WHEN score > 10 THEN 'HIGH'"),
+        "SELECT nested CASE should keep depth when opening paren line has inline comment, got: {formatted}"
+    );
+    assert!(
+        formatted.contains(
+            "END
+    ) AS bucket"
+        ),
+        "SELECT CASE close paren should remain at SELECT expression depth, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_nested_case_with_double_close_paren_keeps_alignment() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT (( -- inline comment
+CASE
+WHEN score > 10 THEN 'HIGH'
+ELSE 'LOW'
+END
+)) AS bucket
+FROM dual;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    assert!(
+        formatted.contains(
+            "END
+            )) AS bucket"
+        ),
+        "nested close parens after CASE END should keep expression alignment, got: {formatted}"
+    );
+}
+
+#[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
     let input = r#"CREATE OR REPLACE NONEDITIONABLE TRIGGER "SYSTEM"."OQT_TRG_CHILD_BIU"
 BEFORE
