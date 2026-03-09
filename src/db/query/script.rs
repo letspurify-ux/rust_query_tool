@@ -137,7 +137,7 @@ impl<'a> Iterator for TopLevelScanner<'a> {
                 && self.bytes.get(self.pos + 2) == Some(&b'\'')
             {
                 if let Some(&delimiter) = self.bytes.get(self.pos + 3) {
-                    if QueryExecutor::is_valid_q_quote_delimiter(delimiter as char) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delimiter) {
                         self.skip_q_quoted(delimiter, 4);
                         continue;
                     }
@@ -146,7 +146,7 @@ impl<'a> Iterator for TopLevelScanner<'a> {
 
             if (b == b'q' || b == b'Q') && self.bytes.get(self.pos + 1) == Some(&b'\'') {
                 if let Some(&delimiter) = self.bytes.get(self.pos + 2) {
-                    if QueryExecutor::is_valid_q_quote_delimiter(delimiter as char) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delimiter) {
                         self.skip_q_quoted(delimiter, 3);
                         continue;
                     }
@@ -223,11 +223,6 @@ impl<'a> Iterator for TopLevelScanner<'a> {
 }
 
 impl QueryExecutor {
-    #[inline]
-    fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
-        delimiter.is_ascii() && !delimiter.is_ascii_whitespace() && delimiter != '\''
-    }
-
     pub fn line_block_depths(sql: &str) -> Vec<usize> {
         #[derive(Copy, Clone, Eq, PartialEq)]
         enum SubqueryParenKind {
@@ -2063,7 +2058,7 @@ impl QueryExecutor {
                 && bytes.get(pos + 2) == Some(&b'\'')
             {
                 if let Some(&delim) = bytes.get(pos + 3) {
-                    if Self::is_valid_q_quote_delimiter(char::from(delim)) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delim) {
                         q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
                         pos += 4;
                         continue;
@@ -2072,7 +2067,7 @@ impl QueryExecutor {
             }
             if (b == b'q' || b == b'Q') && bytes.get(pos + 1) == Some(&b'\'') {
                 if let Some(&delim) = bytes.get(pos + 2) {
-                    if Self::is_valid_q_quote_delimiter(char::from(delim)) {
+                    if sql_text::is_valid_q_quote_delimiter_byte(delim) {
                         q_quote_end_byte = Some(sql_text::q_quote_closing_byte(delim));
                         pos += 3;
                         continue;

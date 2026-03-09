@@ -941,6 +941,17 @@ pub(crate) fn is_identifier_start_byte(byte: u8) -> bool {
 /// `q'[hello]'`  →  `[` opens, `]` closes.
 /// `q'!hello!'`  →  `!` opens and closes.
 #[inline]
+pub(crate) fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
+    delimiter.is_ascii() && !delimiter.is_ascii_whitespace() && delimiter != '\''
+}
+
+/// Byte version of [`is_valid_q_quote_delimiter`].
+#[inline]
+pub(crate) fn is_valid_q_quote_delimiter_byte(delimiter: u8) -> bool {
+    is_valid_q_quote_delimiter(char::from(delimiter))
+}
+
+#[inline]
 pub(crate) fn q_quote_closing(delimiter: char) -> char {
     match delimiter {
         '[' => ']',
