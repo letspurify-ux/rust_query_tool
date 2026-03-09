@@ -2345,12 +2345,7 @@ impl SqlEditorWidget {
                 0
             };
             let is_trigger_for_each_row = trimmed_upper.starts_with("FOR EACH ROW");
-            let force_end_depth = trimmed_upper == "END"
-                || trimmed_upper.starts_with("END IF")
-                || trimmed_upper.starts_with("END LOOP")
-                || trimmed_upper.starts_with("END CASE")
-                || trimmed_upper.starts_with("END WHILE")
-                || trimmed_upper.starts_with("END FOR");
+            let force_end_depth = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END");
             let force_block_depth = !in_dml_statement
                 && (trimmed_upper.starts_with("EXCEPTION")
                     || trimmed_upper.starts_with("WHEN ")

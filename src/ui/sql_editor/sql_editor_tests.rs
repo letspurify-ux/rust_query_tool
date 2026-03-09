@@ -935,6 +935,28 @@ END;"#;
     assert_eq!(formatted, expected);
 }
 
+
+#[test]
+fn format_sql_pre_dedents_named_end_lines() {
+    let input = r#"BEGIN
+IF v_flag = 'Y' THEN
+NULL;
+END IF done_flag;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = [
+        "BEGIN",
+        "    IF v_flag = 'Y' THEN",
+        "        NULL;",
+        "    END IF done_flag;",
+        "END;",
+    ]
+    .join("\n");
+
+    assert_eq!(formatted, expected);
+}
+
 #[test]
 fn format_sql_parser_depth_indents_if_and_case_one_level_more() {
     let input = r#"BEGIN

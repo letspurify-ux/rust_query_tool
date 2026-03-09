@@ -6906,6 +6906,24 @@ END;"#;
     );
 }
 
+
+#[test]
+fn test_line_block_depths_pre_dedent_named_end_lines() {
+    let sql = r#"BEGIN
+  IF v_flag = 'Y' THEN
+    NULL;
+  END IF done_flag;
+END;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let expected = vec![0, 1, 2, 1, 0];
+
+    assert_eq!(
+        depths, expected,
+        "Named END IF labels should pre-dedent like END IF"
+    );
+}
+
 #[test]
 fn test_line_block_depths_with_for_update_clause() {
     let sql = r#"SELECT id, status

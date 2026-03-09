@@ -364,12 +364,51 @@ impl QueryExecutor {
             idx
         }
 
-        fn should_pre_dedent(leading_word: &str) -> bool {
-            leading_word.eq_ignore_ascii_case("END")
-                || leading_word.eq_ignore_ascii_case("ELSE")
+        fn should_pre_dedent_non_end(leading_word: &str) -> bool {
+            leading_word.eq_ignore_ascii_case("ELSE")
                 || leading_word.eq_ignore_ascii_case("ELSIF")
                 || leading_word.eq_ignore_ascii_case("ELSEIF")
                 || leading_word.eq_ignore_ascii_case("EXCEPTION")
+        }
+
+        fn line_end_should_pre_dedent(line: &str) -> bool {
+            let trimmed = line.trim_start();
+            let bytes = trimmed.as_bytes();
+            let mut i = 0usize;
+
+            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+            if !trimmed
+                .get(..i)
+                .is_some_and(|word| word.eq_ignore_ascii_case("END"))
+            {
+                return false;
+            }
+
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return true;
+            }
+
+            if bytes[i] == b';' {
+                return true;
+            }
+
+            if !sql_text::is_identifier_byte(bytes[i]) {
+                return true;
+            }
+
+            let start = i;
+            while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+
+            trimmed
+                .get(start..i)
+                .is_some_and(|word| is_end_suffix_keyword(Some(word)))
         }
 
         fn is_end_suffix_keyword(leading_word: Option<&str>) -> bool {
@@ -480,7 +519,12 @@ impl QueryExecutor {
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
                 && leading_is("END");
-            let mut block_depth_component = if leading_word.is_some_and(should_pre_dedent) {
+            let should_pre_dedent = if leading_is("END") {
+                line_end_should_pre_dedent(line)
+            } else {
+                leading_word.is_some_and(should_pre_dedent_non_end)
+            };
+            let mut block_depth_component = if should_pre_dedent {
                 builder.block_depth().saturating_sub(1)
             } else {
                 builder.block_depth()
