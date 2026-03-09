@@ -318,6 +318,10 @@ impl SplitState {
             && self.block_stack.get(self.block_stack.len().saturating_sub(2)) == Some(&BlockKind::AsIs)
     }
 
+    pub(crate) fn pending_end_uses_package_label_context(&self) -> bool {
+        self.pending_end == PendingEnd::End && self.package_body_init_end_context()
+    }
+
     fn package_body_end_label_matches(&self, token_upper: &str) -> bool {
         let Some(package_name) = self.package_body_name.as_deref() else {
             return false;

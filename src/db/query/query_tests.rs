@@ -8988,6 +8988,67 @@ SELECT 1 FROM dual;"#;
     );
     assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
 }
+
+#[test]
+fn test_line_block_depths_package_body_keyword_named_end_not_treated_as_end_if_suffix() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY IF AS
+BEGIN
+  NULL;
+END
+IF;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+    let end_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END")
+        .expect("expected END line");
+    let label_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "IF;")
+        .expect("expected END label line");
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("SELECT 1"))
+        .expect("expected trailing SELECT line");
+
+    assert!(
+        depths[label_idx] <= depths[end_idx].saturating_add(1),
+        "split END label should not over-indent beyond one level from END line (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[select_idx],
+        0,
+        "trailing SELECT should return to top-level depth after package body END (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_split_script_items_package_body_keyword_named_end_on_next_line_still_splits() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY IF AS
+BEGIN
+  NULL;
+END
+IF;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "keyword package END label should keep package body as first statement: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("END\nIF"),
+        "first statement should preserve split END label for package body: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].to_ascii_uppercase().starts_with("SELECT 1 FROM DUAL"));
+}
 #[test]
 fn test_split_script_items_oracle_with_function_keeps_single_statement_until_main_select() {
     let sql = "WITH\n  FUNCTION f RETURN NUMBER IS\n  BEGIN\n    RETURN 1;\n  END;\nSELECT f() FROM dual;\nSELECT 2 FROM dual;";

@@ -648,7 +648,8 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && !is_comment_or_blank
-                    && !is_end_suffix_keyword(leading_word)
+                    && (!is_end_suffix_keyword(leading_word)
+                        || builder.state.pending_end_uses_package_label_context())
                 {
                     builder.state.resolve_pending_end_on_separator();
                 }
@@ -668,9 +669,11 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let end_has_suffix = end_suffix_or_label
-                .as_ref()
-                .is_some_and(|tail| !tail.quoted_label && is_end_suffix_keyword(Some(&tail.upper)));
+            let end_has_suffix = end_suffix_or_label.as_ref().is_some_and(|tail| {
+                !builder.state.pending_end_uses_package_label_context()
+                    && !tail.quoted_label
+                    && is_end_suffix_keyword(Some(&tail.upper))
+            });
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())
@@ -699,6 +702,7 @@ impl QueryExecutor {
                 use crate::sql_parser_engine::PendingEnd;
                 if builder.state.pending_end == PendingEnd::End
                     && is_end_suffix_keyword(leading_word)
+                    && !builder.state.pending_end_uses_package_label_context()
                 {
                     block_depth_component = block_depth_component.saturating_sub(1);
                 } else if builder.state.pending_end == PendingEnd::End {
