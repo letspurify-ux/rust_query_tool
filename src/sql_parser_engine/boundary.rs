@@ -271,13 +271,20 @@ impl RoutineFrame {
                 return;
             }
 
-            if from_external && sql_text::is_external_language_clause_keyword(token_upper) {
-                // Be permissive for malformed call specs such as
-                // `EXTERNAL LANGUAGE PARAMETERS ...` without an explicit
-                // language target. Once `EXTERNAL` was observed, subsequent
-                // call-spec tokens still belong to an external routine clause
-                // and semicolon handling should keep routine boundaries stable.
-                self.mark_external_clause();
+            if sql_text::is_external_language_clause_keyword(token_upper) {
+                if from_external {
+                    // Be permissive for malformed call specs such as
+                    // `EXTERNAL LANGUAGE PARAMETERS ...` without an explicit
+                    // language target. Once `EXTERNAL` was observed, subsequent
+                    // call-spec tokens still belong to an external routine clause
+                    // and semicolon handling should keep routine boundaries stable.
+                    self.mark_external_clause();
+                } else if allow_implicit_language {
+                    // Keep malformed implicit call specs (e.g. `AS LANGUAGE PARAMETERS ...`)
+                    // in call-spec mode so semicolon handling can still split before the
+                    // next top-level statement.
+                    self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+                }
                 return;
             }
         }
