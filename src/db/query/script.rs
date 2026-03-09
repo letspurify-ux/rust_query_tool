@@ -668,9 +668,18 @@ impl QueryExecutor {
             } else {
                 None
             };
-            let end_has_suffix = end_suffix_or_label
-                .as_ref()
-                .is_some_and(|tail| !tail.quoted_label && is_end_suffix_keyword(Some(&tail.upper)));
+            let named_parent_scope_end = leading_is("END")
+                && end_suffix_or_label.as_ref().is_some_and(|tail| {
+                    builder
+                        .state
+                        .plain_end_closes_parent_scope(tail.upper.as_str())
+                        || builder.state.plain_end_closes_parent_scope("")
+                });
+            let end_has_suffix = end_suffix_or_label.as_ref().is_some_and(|tail| {
+                !tail.quoted_label
+                    && is_end_suffix_keyword(Some(&tail.upper))
+                    && !named_parent_scope_end
+            });
             let exception_end_line = exception_depth_stack
                 .last()
                 .is_some_and(|depth| *depth == builder.block_depth())

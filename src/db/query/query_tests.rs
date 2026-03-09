@@ -8950,6 +8950,64 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_line_block_depths_package_body_split_end_keyword_label_closes_parent_scope() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY "IF" AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END IF;
+  END p1;
+END
+IF;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+
+    let split_end_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END")
+        .expect("expected split END line before package label");
+    let label_idx = split_end_idx + 1;
+
+    assert_eq!(
+        depths[split_end_idx], 0,
+        "split END line should already dedent to top-level for package body END label keyword (depths: {depths:?})"
+    );
+    assert_eq!(
+        depths[label_idx],
+        depths[split_end_idx],
+        "package label line that equals END suffix keyword should keep split END depth (depths: {depths:?})"
+    );
+}
+
+#[test]
+fn test_line_block_depths_package_body_named_end_keyword_same_line_closes_parent_scope() {
+    let sql = r#"CREATE OR REPLACE PACKAGE BODY IF AS
+  PROCEDURE p1 IS
+  BEGIN
+    IF 1 = 1 THEN
+      NULL;
+    END IF;
+  END p1;
+END IF;
+SELECT 1 FROM dual;"#;
+
+    let depths = QueryExecutor::line_block_depths(sql);
+    let lines: Vec<&str> = sql.lines().collect();
+    let end_pkg_idx = lines
+        .iter()
+        .rposition(|line| line.trim_start() == "END IF;")
+        .expect("expected named package END IF line");
+
+    assert_eq!(
+        depths[end_pkg_idx], 0,
+        "named package END IF should dedent to top-level even when name equals suffix keyword (depths: {depths:?})"
+    );
+}
+
+#[test]
 fn test_split_script_items_package_body_split_end_name_with_exception_and_if_suffix() {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_depth_split2 AS
   PROCEDURE p1 IS
