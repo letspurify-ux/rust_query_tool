@@ -833,17 +833,30 @@ impl SplitState {
             return;
         }
 
-        if top == Some(BlockKind::Begin)
-            && self.block_stack.last() == Some(&BlockKind::AsIs)
-            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
-        {
-            let matches_named_end = self
-                .package_body_name
-                .as_deref()
-                .is_some_and(|name| name == token_upper);
-            let unlabeled_end = token_upper.is_empty();
+        if top == Some(BlockKind::Begin) && self.block_stack.last() == Some(&BlockKind::AsIs) {
+            let as_is_depth = self
+                .block_stack
+                .iter()
+                .filter(|kind| **kind == BlockKind::AsIs)
+                .count();
 
-            if matches_named_end || unlabeled_end {
+            let should_close_as_is = match self.create_plsql_kind {
+                CreatePlsqlKind::PackageBody => {
+                    if as_is_depth > 1 {
+                        true
+                    } else {
+                        let matches_named_end = self
+                            .package_body_name
+                            .as_deref()
+                            .is_some_and(|name| name == token_upper);
+                        let unlabeled_end = token_upper.is_empty();
+                        matches_named_end || unlabeled_end
+                    }
+                }
+                _ => true,
+            };
+
+            if should_close_as_is {
                 let _ = self.block_stack.pop();
             }
         }

@@ -5744,6 +5744,26 @@ fn quoted_package_body_name_with_quoted_end_label_splits_following_statement() {
     assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
 }
 
+
+#[test]
+fn package_body_nested_routine_named_end_updates_depth_after_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_depth_chk AS");
+    assert_eq!(engine.block_depth(), 1);
+    engine.process_line("  PROCEDURE run_me IS");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  BEGIN");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("    IF 1 = 1 THEN");
+    assert_eq!(engine.block_depth(), 3);
+    engine.process_line("      NULL;");
+    engine.process_line("    END IF;");
+    assert_eq!(engine.block_depth(), 2);
+    engine.process_line("  END run_me;");
+    assert_eq!(engine.block_depth(), 1, "END <name> should close nested routine depth");
+}
+
 #[test]
 fn slash_terminator_with_block_comment_then_line_comment_is_consumed() {
     let mut engine = SqlParserEngine::new();
@@ -5794,6 +5814,61 @@ fn oracle_external_name_quoted_identifier_splits_before_next_statement() {
         statements[0]
     );
     assert_eq!(statements[1], "SELECT 49 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_initializer_with_nested_if_and_exception_keeps_single_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_depth AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  IF 1 = 1 THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("  ELSE");
+    engine.process_line("    NULL;");
+    engine.process_line("  END IF;");
+    engine.process_line("EXCEPTION");
+    engine.process_line("  WHEN OTHERS THEN");
+    engine.process_line("    NULL;");
+    engine.process_line("END pkg_depth;");
+    engine.process_line("SELECT 100 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END IF;"));
+    assert!(statements[0].contains("EXCEPTION"));
+    assert!(statements[0].contains("END pkg_depth"));
+    assert_eq!(statements[1], "SELECT 100 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_nested_routine_end_name_with_if_else_exception_keeps_package_depth() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_nested AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    IF 1 = 1 THEN");
+    engine.process_line("      NULL;");
+    engine.process_line("    ELSE");
+    engine.process_line("      NULL;");
+    engine.process_line("    END IF;");
+    engine.process_line("  EXCEPTION");
+    engine.process_line("    WHEN OTHERS THEN");
+    engine.process_line("      NULL;");
+    engine.process_line("  END run_me;");
+    engine.process_line("END pkg_nested;");
+    engine.process_line("SELECT 101 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END IF;"));
+    assert!(statements[0].contains("END run_me"));
+    assert!(
+        statements[0].contains("END pkg_nested"),
+        "package body end label moved out of first statement: {statements:?}"
+    );
+    assert_eq!(statements[1], "SELECT 101 FROM dual".to_string());
 }
 
 #[test]
