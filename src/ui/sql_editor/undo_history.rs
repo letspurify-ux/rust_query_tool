@@ -525,16 +525,20 @@ impl SqlEditorWidget {
             if ins <= 0 && del <= 0 {
                 return;
             }
+
+            let is_applying_navigation = *applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if is_applying_navigation {
+                return;
+            }
+
             let inserted = inserted_text(buf, pos, ins);
             let mut state = undo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            if state.applying_history
-                || *applying_history_navigation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            {
+            if state.applying_history {
                 return;
             }
 
