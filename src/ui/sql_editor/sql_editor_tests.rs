@@ -3227,6 +3227,12 @@ SELECT audit_id,
         ),
         "following anonymous execution block should remain separate after package body formatting, got: {formatted}"
     );
+    assert!(
+        formatted.contains(
+            "END run_extreme;\nBEGIN\n    g_last_mode :="
+        ),
+        "package initializer BEGIN should recover to package-body top level after the last member END, got: {formatted}"
+    );
 
     let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
     assert_eq!(formatted, formatted_again);
