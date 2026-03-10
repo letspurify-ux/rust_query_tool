@@ -352,6 +352,16 @@ impl SplitState {
         }
     }
 
+    pub(crate) fn should_split_before_new_statement_head(&self) -> bool {
+        if self.block_depth() != 1 || self.paren_depth != 0 {
+            return false;
+        }
+
+        self.active_routine_frame().is_some_and(|frame| {
+            frame.has_pending_external_clause() || frame.should_split_on_semicolon(self.block_depth())
+        })
+    }
+
     fn pop_case_block(&mut self) -> bool {
         if self.top_is_case() {
             let _ = self.block_stack.pop();
