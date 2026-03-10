@@ -827,6 +827,10 @@ impl SqlEditorWidget {
             (FormatItem::Slash, FormatItem::Statement(right)) => {
                 Self::is_alter_trigger_statement(right)
             }
+            (FormatItem::Slash, item) if Self::is_show_errors_format_item(item) => true,
+            _ if Self::is_show_errors_format_item(current) && Self::is_show_errors_format_item(next) => {
+                true
+            }
             _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
@@ -836,6 +840,15 @@ impl SqlEditorWidget {
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
             ) => true,
+            _ => false,
+        }
+    }
+
+    fn is_show_errors_format_item(item: &FormatItem) -> bool {
+        match item {
+            FormatItem::ToolCommand(ToolCommand::ShowErrors { .. }) => true,
+            FormatItem::Verbatim(text) => QueryExecutor::parse_tool_command(text)
+                .is_some_and(|cmd| matches!(cmd, ToolCommand::ShowErrors { .. })),
             _ => false,
         }
     }
@@ -10054,6 +10067,71 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             !formatted.contains("END;\n/\n\nALTER TRIGGER"),
             "Unexpected blank line inserted between slash and ALTER TRIGGER, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_trigger_slash_and_show_errors_tightly_grouped() {
+        let sql = r#"CREATE OR REPLACE TRIGGER trg_demo
+BEFORE INSERT ON demo
+BEGIN
+    NULL;
+END;
+/
+SHOW ERRORS TRIGGER trg_demo;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("END;
+/
+SHOW ERRORS TRIGGER trg_demo"),
+            "CREATE TRIGGER + slash + SHOW ERRORS should stay tightly grouped, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("END;
+/
+
+SHOW ERRORS"),
+            "Unexpected blank line inserted between slash and SHOW ERRORS, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_consecutive_show_errors_tightly_grouped() {
+        let sql = "SHOW ERRORS PACKAGE pkg;
+SHOW ERRORS PACKAGE BODY pkg;
+SELECT 1 FROM dual;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SHOW ERRORS PACKAGE pkg
+SHOW ERRORS PACKAGE BODY pkg"),
+            "Consecutive SHOW ERRORS commands should stay tightly grouped, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SHOW ERRORS PACKAGE pkg
+
+SHOW ERRORS PACKAGE BODY pkg"),
+            "Unexpected blank line inserted between consecutive SHOW ERRORS commands, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SHOW ERRORS PACKAGE BODY pkg
+
+SELECT 1
+FROM DUAL;"),
+            "Non-SHOW ERRORS statements should still be separated with a blank line, got:
+{}",
             formatted
         );
     }
