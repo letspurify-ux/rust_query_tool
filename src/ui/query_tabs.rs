@@ -290,10 +290,12 @@ impl QueryTabsWidget {
 
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
-        if self.tabs.find(&group) >= 0 {
+        if !self.tabs.was_deleted() && self.tabs.find(&group) >= 0 {
             self.tabs.remove(&group);
         }
-        fltk::group::Group::delete(group);
+        if !group.was_deleted() {
+            fltk::group::Group::delete(group);
+        }
         self.reset_tab_strip_left_anchor();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
