@@ -343,7 +343,9 @@ fn send_log_command(command: LogCommand) -> Result<(), mpsc::SendError<LogComman
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = spawn_log_writer();
-    guard.send(command)
+    let recovered_sender = guard.clone();
+    drop(guard);
+    recovered_sender.send(command)
 }
 
 pub fn flush_log_writer() -> Result<(), String> {
@@ -395,10 +397,12 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
     };
 
     // Update in-memory buffer
-    if let Ok(mut buf) = in_memory_log().lock() {
-        buf.push_front(entry.clone());
-        buf.truncate(MAX_LOG_ENTRIES);
-    }
+    let mut buf = in_memory_log()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    buf.push_front(entry.clone());
+    buf.truncate(MAX_LOG_ENTRIES);
+    drop(buf);
 
     // Persist via background writer
     if let Err(send_err) = send_log_command(LogCommand::Write(entry)) {
@@ -433,8 +437,10 @@ pub fn log_debug(source: &str, message: &str) {
 pub fn get_log_entries() -> Vec<LogEntry> {
     in_memory_log()
         .lock()
-        .map(|buf| buf.iter().cloned().collect())
-        .unwrap_or_default()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Clear all log entries (in-memory + persisted).
@@ -442,9 +448,10 @@ pub fn clear_log() -> Result<(), String> {
     match send_log_command(LogCommand::Clear) {
         Ok(()) => {
             flush_log_writer()?;
-            if let Ok(mut buf) = in_memory_log().lock() {
-                buf.clear();
-            }
+            let mut buf = in_memory_log()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            buf.clear();
             Ok(())
         }
         Err(send_err) => {
@@ -453,9 +460,10 @@ pub fn clear_log() -> Result<(), String> {
                 log.entries.clear();
                 log.save()
                     .map_err(|err| format!("Failed to clear persisted log: {err}"))?;
-                if let Ok(mut buf) = in_memory_log().lock() {
-                    buf.clear();
-                }
+                let mut buf = in_memory_log()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                buf.clear();
                 Ok(())
             } else {
                 Err("Failed to clear application log".to_string())
