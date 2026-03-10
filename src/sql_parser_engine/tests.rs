@@ -6023,6 +6023,47 @@ fn quoted_package_body_name_with_quoted_end_label_splits_following_statement() {
 }
 
 #[test]
+fn schema_qualified_quoted_package_body_name_with_dot_keeps_end_label_attached() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"App\".\"Pkg.Ext\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"App\".\"Pkg.Ext\";");
+    engine.process_line("SELECT 2 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"App\".\"Pkg.Ext\""),
+        "schema-qualified quoted package END label should remain attached: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+}
+
+#[test]
+fn schema_qualified_quoted_package_body_name_with_split_end_label_splits_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"App\".\"Pkg.Ext\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END");
+    engine.process_line("\"App\".\"Pkg.Ext\";");
+    engine.process_line("SELECT 3 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END\n\"App\".\"Pkg.Ext\""),
+        "split schema-qualified quoted package END label should remain in package body: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 3 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_nested_routine_named_end_updates_depth_after_end_label() {
     let mut engine = SqlParserEngine::new();
 
