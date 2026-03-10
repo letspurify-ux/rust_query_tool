@@ -759,17 +759,23 @@ impl ResultTabsWidget {
         // additional child widgets that may be added to result tabs in the future.
         let mut group = tab.group;
         let table_widget = tab.table.get_widget();
-        if group.find(&table_widget) >= 0 {
+        if !group.was_deleted() && !table_widget.was_deleted() && group.find(&table_widget) >= 0 {
             group.remove(&table_widget);
         }
-        fltk::table::Table::delete(table_widget);
-        group.clear();
+        if !table_widget.was_deleted() {
+            fltk::table::Table::delete(table_widget);
+        }
+        if !group.was_deleted() {
+            group.clear();
+        }
 
         // Step 4: Remove group from tabs and delete
-        if self.tabs.find(&group) >= 0 {
+        if !self.tabs.was_deleted() && !group.was_deleted() && self.tabs.find(&group) >= 0 {
             self.tabs.remove(&group);
         }
-        fltk::group::Group::delete(group);
+        if !group.was_deleted() {
+            fltk::group::Group::delete(group);
+        }
     }
 
     /// Close the currently active result tab, freeing its data and FLTK resources.
