@@ -2163,6 +2163,11 @@ impl SqlEditorWidget {
                             let should_reset_paren_tracking =
                                 indent_level == 0 || block_stack.is_empty();
                             if should_reset_paren_tracking {
+                                suppress_comma_break_depth = 0;
+                                paren_stack.clear();
+                                paren_clause_restore_stack.clear();
+                                column_list_stack.clear();
+                                paren_indent_increase_stack.clear();
                                 select_list_break_state.clear();
                             }
                             let next_is_inline_line_comment = matches!(
@@ -8951,8 +8956,33 @@ mod formatter_regression_tests {
         let sql = "select fn(a, b;\nselect x, y from dual;";
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.contains("SELECT x, y\nFROM DUAL;"));
-        assert!(!formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"));
+        assert!(
+            formatted.contains("SELECT x,\n    y\nFROM DUAL;"),
+            "Subsequent valid statement should return to normal comma layout, got: {}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"),
+            "Malformed prior statement must not force legacy recovery layout on next statement, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn malformed_statement_resets_paren_tracking_before_following_statement() {
+        let sql = "SELECT fn(a, b;\nSELECT c, d, e FROM dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SELECT c,\n    d,\n    e\nFROM DUAL;"),
+            "Following statement should format with normal SELECT-list wrapping, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("SELECT\n    c,\n    d,\n    e\nFROM DUAL;"),
+            "Formatter should not keep stale malformed-state recovery layout, got:\n{}",
+            formatted
+        );
     }
 
     #[test]
