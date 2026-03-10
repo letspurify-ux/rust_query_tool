@@ -5,7 +5,6 @@ use super::{
     SymbolRole, TimingPointState, TriggerKind, WithClauseState, WithDeclarationState,
 };
 
-
 #[test]
 fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end() {
     let mut state = SplitState {
@@ -26,7 +25,11 @@ fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end()
         state.pending_subprogram_begins, 0,
         "malformed END sequence must not underflow nested subprogram tracking"
     );
-    assert_eq!(state.block_depth(), 0, "plain END should still close both nested scopes");
+    assert_eq!(
+        state.block_depth(),
+        0,
+        "plain END should still close both nested scopes"
+    );
 }
 
 #[test]
@@ -1877,7 +1880,9 @@ fn language_followed_by_quoted_identifier_then_name_marks_external_routine_split
 
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
-    assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_qident_name RETURN NUMBER"));
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_qident_name RETURN NUMBER")
+    );
     assert!(
         statements[0].contains("AS LANGUAGE \"C\" NAME 'ext_lang_qident_name'"),
         "first statement should keep quoted LANGUAGE target and NAME clause: {}",

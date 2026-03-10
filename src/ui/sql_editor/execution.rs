@@ -2073,10 +2073,9 @@ impl SqlEditorWidget {
                                 base_indent(indent_level, open_cursor_state) + 1;
                             line_indent = select_list_indent;
                             if hint_after_select {
-                                select_list_layout_state =
-                                    SelectListLayoutState::Multiline {
-                                        indent: select_list_indent,
-                                    };
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: select_list_indent,
+                                };
                             }
                         } else {
                             line_indent = 0;
@@ -9358,9 +9357,7 @@ END fmt_pkg_extreme;"#;
             formatted
         );
         assert!(
-            !formatted.contains(
-                "END calc_mode;\n\n    BEGIN\n        g_last_mode :="
-            ),
+            !formatted.contains("END calc_mode;\n\n    BEGIN\n        g_last_mode :="),
             "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
             formatted
         );
@@ -9788,7 +9785,10 @@ END;"#;
             SqlEditorWidget::map_cursor_after_format(source, &formatted, mid_byte as i32, false)
         });
 
-        assert!(result.is_ok(), "cursor mapping should not panic on mid-byte cursor offset");
+        assert!(
+            result.is_ok(),
+            "cursor mapping should not panic on mid-byte cursor offset"
+        );
     }
 
     #[test]

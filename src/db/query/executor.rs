@@ -1498,14 +1498,13 @@ impl QueryExecutor {
                 F: FnMut((usize, usize)) -> bool,
             {
                 let mut boundary_offsets = Vec::new();
-                let _ = self.builder.process_line_and_take_statements_with_boundary_observer(
-                    line,
-                    |chars, idx| {
+                let _ = self
+                    .builder
+                    .process_line_and_take_statements_with_boundary_observer(line, |chars, idx| {
                         let max_idx = chars.len().saturating_sub(1);
                         boundary_offsets
                             .push(Self::char_index_to_byte_offset(line, idx.min(max_idx)));
-                    },
-                );
+                    });
 
                 if self.current_start.is_none() {
                     self.current_start =

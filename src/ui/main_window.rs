@@ -904,7 +904,10 @@ impl MainWindow {
     }
 
     pub fn new() -> Self {
-        let config = AppConfig::load();
+        Self::new_with_config(AppConfig::load())
+    }
+
+    pub fn new_with_config(config: AppConfig) -> Self {
         let connection = create_shared_connection();
 
         let current_group = fltk::group::Group::try_current();
@@ -4298,47 +4301,43 @@ impl MainWindow {
         }
     }
 
+    pub fn show_previous_crash_report(crash_report: &str) {
+        crate::utils::logging::log_warning(
+            "app",
+            "Previous session ended with a crash. Crash report was shown to user.",
+        );
+        let crash_message = format!(
+            "The previous session ended unexpectedly.
+
+{}
+
+The crash has been recorded in the application log.",
+            crash_report
+        );
+        SqlEditorWidget::show_quick_describe_text_dialog(
+            "Previous Session Crash Report",
+            &crash_message,
+        );
+    }
+
     pub fn run() {
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)
             .load_system_fonts();
         let config = AppConfig::load();
-        let ui_size = config.ui_font_size.clamp(8, 24) as i32;
-        app::set_font_size(ui_size);
-        fltk::misc::Tooltip::set_font_size(ui_size);
-
-        // Set default colors for Windows 11-inspired theme
-        let (bg_r, bg_g, bg_b) = theme::app_background().to_rgb();
-        app::background(bg_r, bg_g, bg_b);
-        let (fg_r, fg_g, fg_b) = theme::app_foreground().to_rgb();
-        app::foreground(fg_r, fg_g, fg_b);
+        crate::app::configure_fltk_globals(&config);
 
         let current_group = fltk::group::Group::try_current();
 
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
-        let mut main_window = MainWindow::new();
+        let mut main_window = MainWindow::new_with_config(config);
         main_window.setup_callbacks();
         main_window.show();
 
         // Check for crash log from a previous session
         if let Some(crash_report) = crate::utils::logging::take_crash_log() {
-            crate::utils::logging::log_warning(
-                "app",
-                "Previous session ended with a crash. Crash report was shown to user.",
-            );
-            let crash_message = format!(
-                "The previous session ended unexpectedly.
-
-{}
-
-The crash has been recorded in the application log.",
-                crash_report
-            );
-            SqlEditorWidget::show_quick_describe_text_dialog(
-                "Previous Session Crash Report",
-                &crash_message,
-            );
+            Self::show_previous_crash_report(&crash_report);
         }
 
         match app.run() {

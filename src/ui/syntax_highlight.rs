@@ -430,12 +430,15 @@ impl SqlHighlighter {
             bounded_start -= 1;
         }
         let bounded_probe = probe_text.get(bounded_start..).unwrap_or(probe_text);
-        let bounded_state = self.generate_styles_with_state(bounded_probe, LexerState::Normal).1;
+        let bounded_state = self
+            .generate_styles_with_state(bounded_probe, LexerState::Normal)
+            .1;
         if bounded_state != LexerState::Normal || bounded_start == 0 {
             return bounded_state;
         }
 
-        self.generate_styles_with_state(probe_text, LexerState::Normal).1
+        self.generate_styles_with_state(probe_text, LexerState::Normal)
+            .1
     }
 
     #[cfg(test)]
@@ -848,8 +851,10 @@ fn windowed_range_from_buffer(
 fn windowed_range_from_text(text: &str, cursor_pos: usize) -> (usize, usize) {
     let text_len = text.len();
     let cursor_pos = clamp_to_char_boundary(text, cursor_pos.min(text_len));
-    let start_candidate = clamp_to_char_boundary(text, cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS));
-    let end_candidate = clamp_to_char_boundary(text, (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text_len));
+    let start_candidate =
+        clamp_to_char_boundary(text, cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS));
+    let end_candidate =
+        clamp_to_char_boundary(text, (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text_len));
 
     let start = text
         .get(..start_candidate)

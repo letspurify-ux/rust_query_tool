@@ -261,7 +261,9 @@ fn test_statement_bounds_at_cursor_mega_torture_resolves_trigger_after_package_b
     let statement = &sql[bounds.0..bounds.1];
 
     assert!(
-        statement.trim_start().starts_with("CREATE OR REPLACE TRIGGER oqt_trg_test_bi"),
+        statement
+            .trim_start()
+            .starts_with("CREATE OR REPLACE TRIGGER oqt_trg_test_bi"),
         "cursor on trigger should resolve trigger statement, got: {statement}"
     );
     assert!(
@@ -4069,7 +4071,8 @@ SHOW ERRORS"#;
 }
 
 #[test]
-fn test_split_format_items_package_body_then_show_errors_prompt_trigger_after_consecutive_case_ends() {
+fn test_split_format_items_package_body_then_show_errors_prompt_trigger_after_consecutive_case_ends(
+) {
     let sql = r#"CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
   FUNCTION f_deep RETURN NUMBER IS
     v NUMBER := 0;
@@ -4123,14 +4126,24 @@ END;
         .filter(|item| matches!(item, FormatItem::Slash))
         .count();
 
-    assert_eq!(stmts.len(), 3, "expected package, trigger, and block statements: {items:?}");
-    assert_eq!(slash_count, 3, "slash delimiters should be preserved around each block: {items:?}");
+    assert_eq!(
+        stmts.len(),
+        3,
+        "expected package, trigger, and block statements: {items:?}"
+    );
+    assert_eq!(
+        slash_count, 3,
+        "slash delimiters should be preserved around each block: {items:?}"
+    );
     assert!(
         matches!(&items[1], FormatItem::Slash),
         "package body should terminate on its own slash before SHOW ERRORS: {items:?}"
     );
     assert!(
-        matches!(&items[2], FormatItem::ToolCommand(ToolCommand::ShowErrors { .. })),
+        matches!(
+            &items[2],
+            FormatItem::ToolCommand(ToolCommand::ShowErrors { .. })
+        ),
         "SHOW ERRORS PACKAGE BODY should be a standalone tool command: {items:?}"
     );
     assert!(
@@ -8572,7 +8585,8 @@ WHERE EXISTS (
 }
 
 #[test]
-fn test_line_block_depths_detects_with_subquery_after_multiline_block_comment_between_paren_and_with() {
+fn test_line_block_depths_detects_with_subquery_after_multiline_block_comment_between_paren_and_with(
+) {
     let sql = r#"SELECT
   col
 FROM t
@@ -13231,7 +13245,10 @@ END fmt_pkg_extreme;"#;
         .expect("expected apply_one EXCEPTION line");
     let validate_idx = lines
         .iter()
-        .position(|line| line.trim_start().starts_with("PROCEDURE validate_and_process"))
+        .position(|line| {
+            line.trim_start()
+                .starts_with("PROCEDURE validate_and_process")
+        })
         .expect("expected validate_and_process header line");
     let run_extreme_idx = lines
         .iter()
@@ -13346,8 +13363,8 @@ END;
 
     let depths = QueryExecutor::line_block_depths(sql);
     let expected = vec![
-        0, 1, 1, 1, 2, 1, 0, 1, 1, 2, 1, 2, 3, 3, 3, 3, 4, 3, 4, 5, 5, 5, 6, 7, 6, 6, 6, 7, 8,
-        7, 8, 6, 6, 5, 6, 7, 7, 8, 7, 5, 5, 4, 3, 3, 2, 1, 1, 0, 1, 2, 0, 0,
+        0, 1, 1, 1, 2, 1, 0, 1, 1, 2, 1, 2, 3, 3, 3, 3, 4, 3, 4, 5, 5, 5, 6, 7, 6, 6, 6, 7, 8, 7,
+        8, 6, 6, 5, 6, 7, 7, 8, 7, 5, 5, 4, 3, 3, 2, 1, 1, 0, 1, 2, 0, 0,
     ];
     assert_eq!(
         depths, expected,
