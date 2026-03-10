@@ -443,6 +443,14 @@ impl SplitState {
         self.begin_state == BeginState::AfterDeclare
     }
 
+    pub(crate) fn is_package_body_initializer_begin_context(&self) -> bool {
+        self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.block_depth() == 1
+            && self.block_stack.last() == Some(&BlockKind::AsIs)
+            && self.pending_subprogram_begins == 0
+            && self.begin_state != BeginState::AfterDeclare
+    }
+
     pub(crate) fn in_create_plsql(&self) -> bool {
         self.create_plsql_kind != CreatePlsqlKind::None
     }
@@ -896,6 +904,8 @@ impl SplitState {
             } else if self.begin_state == BeginState::AfterDeclare {
                 // DECLARE ... BEGIN – same block, don't push
                 self.begin_state = BeginState::None;
+            } else if self.is_package_body_initializer_begin_context() {
+                // PACKAGE BODY ... BEGIN initializer – same block as package AS/IS.
             } else {
                 self.block_stack.push(BlockKind::Begin);
             }
