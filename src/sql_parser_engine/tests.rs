@@ -143,6 +143,18 @@ fn slash_line_kind_rejects_non_comment_text_after_leading_block_comment() {
 }
 
 #[test]
+fn slash_line_kind_handles_unterminated_block_comment_without_panic() {
+    let result = std::panic::catch_unwind(|| {
+        super::classify_line_leading_slash_marker("/ /* unterminated");
+    });
+
+    assert!(
+        result.is_ok(),
+        "unterminated slash-leading block comment should not panic"
+    );
+}
+
+#[test]
 fn slash_line_with_leading_block_comment_and_sql_is_not_consumed_as_terminator() {
     let mut engine = SqlParserEngine::new();
 
