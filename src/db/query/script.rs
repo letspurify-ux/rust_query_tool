@@ -894,8 +894,7 @@ impl QueryExecutor {
 
             if leading_is("BEGIN")
                 && (builder.state.pending_subprogram_begins > 0
-                    || builder.state.has_pending_declare_begin()
-                    || builder.state.is_package_body_initializer_begin_context())
+                    || builder.state.has_pending_declare_begin())
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }

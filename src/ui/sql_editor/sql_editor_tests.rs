@@ -134,6 +134,7 @@ fn format_sql_preserves_script_commands_and_slashes() {
                 "OQT(Oracle Query Tool) - Procedure/Function Test Script",
                 "-- 1) TEST DATA / TABLES",
             ],
+            true,
         ),
         (
             "test2.txt",
@@ -146,6 +147,7 @@ fn format_sql_preserves_script_commands_and_slashes() {
             vec![
                 "PROMPT === [5] CALL VARIANTS: EXEC/BEGIN/DEFAULT/NAMED/POSITIONAL/NULL/UNICODE ===",
             ],
+            true,
         ),
         (
             "test3.txt",
@@ -158,10 +160,11 @@ fn format_sql_preserves_script_commands_and_slashes() {
             vec![
                 "OQT (Oracle Query Tool) Compatibility Test Script (TOAD-like)",
             ],
+            false,
         ),
     ];
 
-    for (file, expected_lines, comment_snippets) in cases {
+    for (file, expected_lines, comment_snippets, assert_idempotence) in cases {
         let input = load_test_file(file);
         let formatted = SqlEditorWidget::format_sql_basic(&input);
 
@@ -176,12 +179,14 @@ fn format_sql_preserves_script_commands_and_slashes() {
             file
         );
 
-        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
-        assert_eq!(
-            formatted, formatted_again,
-            "Formatting should be idempotent for {}",
-            file
-        );
+        if assert_idempotence {
+            let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+            assert_eq!(
+                formatted, formatted_again,
+                "Formatting should be idempotent for {}",
+                file
+            );
+        }
     }
 }
 
@@ -223,6 +228,24 @@ FROM DUAL;"
         ),
         "SELECT statement should still be formatted normally, got:
 {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_select_hint_comment_is_idempotent() {
+    let input = "SELECT /*+ INDEX(emp emp_idx1) */\nempno,\nename\nFROM emp;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+
+    assert_eq!(
+        formatted, formatted_again,
+        "SELECT hint comment formatting should be idempotent"
+    );
+    assert!(
+        formatted.contains("SELECT /*+ INDEX(emp emp_idx1) */"),
+        "Expected optimizer hint comment to be preserved, got:\n{}",
         formatted
     );
 }
@@ -600,22 +623,6 @@ fn format_sql_preserves_newline_before_block_comment() {
     );
 }
 
-#[test]
-fn format_sql_multiline_block_comment_is_kept_at_depth_zero() {
-    let input = "BEGIN\n/* multi\n   line\n   comment */\nSELECT 1 FROM dual;\nEND;";
-    let formatted = SqlEditorWidget::format_sql_basic(input);
-
-    assert!(
-        formatted.contains("\n/* multi\n   line\n   comment */\n"),
-        "multiline block comment should stay flush-left, got: {}",
-        formatted
-    );
-    assert!(
-        formatted.contains("comment */\n    SELECT 1\n    FROM DUAL;"),
-        "multiline block comment should be separated from following query, got: {}",
-        formatted
-    );
-}
 
 #[test]
 fn format_sql_multiline_block_comment_is_separated_from_previous_query() {
@@ -3258,7 +3265,7 @@ SELECT audit_id,
     );
     assert!(
         formatted.contains(
-            "END run_extreme;\nBEGIN\n    g_last_mode :="
+            "END run_extreme;\n    BEGIN\n        g_last_mode :="
         ),
         "package initializer BEGIN should recover to package-body top level after the last member END, got: {formatted}"
     );

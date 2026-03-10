@@ -362,8 +362,15 @@ impl SplitState {
     }
 
     fn package_body_init_end_context(&self) -> bool {
-        self.create_plsql_kind == CreatePlsqlKind::PackageBody
-            && self.block_depth() == 2
+        if self.create_plsql_kind != CreatePlsqlKind::PackageBody || self.pending_subprogram_begins != 0 {
+            return false;
+        }
+
+        if self.block_depth() == 1 && self.block_stack.last() == Some(&BlockKind::AsIs) {
+            return true;
+        }
+
+        self.block_depth() == 2
             && self.block_stack.last() == Some(&BlockKind::Begin)
             && self.block_stack.get(self.block_stack.len().saturating_sub(2)) == Some(&BlockKind::AsIs)
     }
@@ -905,7 +912,8 @@ impl SplitState {
                 // DECLARE ... BEGIN – same block, don't push
                 self.begin_state = BeginState::None;
             } else if self.is_package_body_initializer_begin_context() {
-                // PACKAGE BODY ... BEGIN initializer – same block as package AS/IS.
+                // PACKAGE BODY initializer BEGIN opens its own executable scope.
+                self.block_stack.push(BlockKind::Begin);
             } else {
                 self.block_stack.push(BlockKind::Begin);
             }
@@ -1114,7 +1122,8 @@ impl SplitState {
     }
 
     fn finalize_external_clause_on_semicolon(&mut self) {
-        let allow_implicit_target_split = true;
+        let allow_implicit_target_split = self.block_depth() == 1
+            || self.create_plsql_kind != CreatePlsqlKind::PackageBody;
 
         if let Some(frame) = self.active_routine_frame_mut() {
             frame.finalize_external_clause_on_semicolon(allow_implicit_target_split);
