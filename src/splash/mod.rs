@@ -13,7 +13,9 @@ use fltk::{
     enums::{Align, Color, Font, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group},
+    image::RgbImage,
     prelude::*,
+    surface::ImageSurface,
     window::Window,
 };
 use std::sync::{
@@ -49,7 +51,7 @@ impl SplashOptions {
             initial_stage: "BOOTSTRAPPING WORKSPACE",
             initial_detail: "Preparing launch surface",
             minimum_display: Duration::from_millis(5000),
-            default_size: (980, 560),
+            default_size: (628, 358),
         }
     }
 }
@@ -96,6 +98,7 @@ where
         build_splash_window(&options, &loading_state, &animation_state, &event_sender);
     visuals.window.show();
     app::flush();
+    apply_window_shape(&mut visuals.window);
     let _ = app::wait();
 
     let mut overlay_panel_for_timer = visuals.overlay_panel.clone();
@@ -469,6 +472,31 @@ fn install_overlay_panel(
             draw::draw_rectf(bar_x + glint_offset, bar_y, glint_width, 3);
         }
     });
+}
+
+fn apply_window_shape(window: &mut Window) {
+    if let Some(shape) = create_window_shape(window.w(), window.h(), 26) {
+        window.set_shape(Some(shape));
+    }
+}
+
+fn create_window_shape(width: i32, height: i32, radius: i32) -> Option<RgbImage> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let surface = ImageSurface::new(width, height, false);
+    ImageSurface::push_current(&surface);
+
+    draw::set_draw_color(Color::Black);
+    draw::draw_rectf(0, 0, width, height);
+
+    draw::set_draw_color(Color::White);
+    draw::draw_rounded_rectf(0, 0, width, height, radius.max(0));
+
+    let image = surface.image();
+    ImageSurface::pop_current();
+    image
 }
 
 fn draw_brand_mark(x: i32, y: i32, size: i32) {

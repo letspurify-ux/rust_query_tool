@@ -245,7 +245,9 @@ fn create_title_mask(
     screen_width: i32,
     screen_height: i32,
 ) -> Result<TitleMaskData, String> {
-    let target_width = ((screen_width as f32) * 0.50).round() as i32;
+    // Reserve extra texture margin so the GPU halo can expand beyond the glyph edges
+    // without being clipped by the title texture bounds.
+    let target_width = ((screen_width as f32) * 0.42).round() as i32;
     let mut font_size = ((screen_height as f32) * 0.17).round() as i32;
     font_size = font_size.clamp(44, 92);
 
@@ -260,8 +262,10 @@ fn create_title_mask(
 
     draw::set_font(Font::HelveticaBold, font_size);
     let (measured_width, measured_height) = draw::measure(title_text, false);
-    let texture_width = (measured_width + font_size).max(64);
-    let texture_height = (measured_height + font_size / 2 + 12).max(64);
+    let padding_x = (font_size as f32 * 1.20).round() as i32;
+    let padding_y = (font_size as f32 * 0.88).round() as i32;
+    let texture_width = (measured_width + padding_x * 2).max(64);
+    let texture_height = (measured_height + padding_y * 2).max(64);
 
     let surface = ImageSurface::new(texture_width, texture_height, false);
     ImageSurface::push_current(&surface);
@@ -514,6 +518,32 @@ vec3 render_planet(vec2 uv, float aspect, out float alpha) {{
     return color;
 }}
 
+vec3 render_planet_corona(vec2 uv, float aspect) {{
+    vec2 center = vec2(0.77, 0.31) + u_camera * vec2(0.015, 0.010);
+    vec2 p = vec2((uv.x - center.x) * aspect, uv.y - center.y);
+    float radius = 0.235;
+    float dist = length(p);
+    float outer_band = smoothstep(radius + 0.135, radius + 0.010, dist);
+    float inner_cut = smoothstep(radius + 0.018, radius - 0.004, dist);
+    float corona_band = max(outer_band - inner_cut, 0.0);
+
+    if (corona_band <= 0.0) {{
+        return vec3(0.0);
+    }}
+
+    vec2 dir = normalize(p + vec2(0.0001, 0.0001));
+    vec2 light_2d = normalize(vec2(-0.86, 0.34));
+    float directional = pow(clamp(dot(dir, -light_2d) * 0.5 + 0.5, 0.0, 1.0), 1.9);
+    float angle = atan(p.y, p.x);
+    float flicker = 0.82 + 0.18 * sin(u_time * 1.35 + angle * 7.0 + dist * 24.0);
+    float turbulence = fbm(vec2(angle * 2.8, u_time * 0.28 - dist * 9.5));
+    float arc = 0.55 + 0.45 * sin(angle * 10.0 - u_time * 0.95 + turbulence * 2.0);
+    float corona = corona_band * (0.55 + turbulence * 0.65) * flicker * (0.60 + arc * 0.40);
+    vec3 corona_base = mix(vec3(0.10, 0.18, 0.40), vec3(0.56, 0.74, 1.00), directional);
+    vec3 corona_hot = vec3(0.90, 0.95, 1.00) * pow(directional, 3.4);
+    return corona_base * corona * 0.55 + corona_hot * corona * 0.22;
+}}
+
 float sd_segment(vec2 p, vec2 a, vec2 b) {{
     vec2 pa = p - a;
     vec2 ba = b - a;
@@ -627,6 +657,7 @@ void main() {{
     float planet_alpha = 0.0;
     vec3 planet = render_planet(uv, aspect, planet_alpha);
     color = mix(color, planet, planet_alpha);
+    color += render_planet_corona(uv, aspect);
 
     float accent_arc = smoothstep(0.0, 0.012, abs(uv.y - 0.86 + sin(uv.x * 9.0 + u_time * 0.25) * 0.006));
     color += vec3(0.00, 0.02, 0.05) * (1.0 - accent_arc) * (0.08 + u_progress * 0.04);
@@ -637,10 +668,48 @@ void main() {{
             vec2 sample_uv = vec2(title_uv.x, 1.0 - title_uv.y);
             float title_mask = texture(u_title_tex, sample_uv).r;
             float title_shadow = texture(u_title_tex, clamp(sample_uv + vec2(-0.004, 0.010), 0.0, 1.0)).r;
-            float title_glow = smoothstep(0.06, 0.92, title_mask);
+            vec2 title_texel = vec2(
+                1.0 / max(u_title_size.x * u_resolution.x, 1.0),
+                1.0 / max(u_title_size.y * u_resolution.y, 1.0)
+            );
+            float inner_halo = 0.0;
+            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(3.0, 0.0), 0.0, 1.0)).r;
+            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-3.0, 0.0), 0.0, 1.0)).r;
+            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 3.0), 0.0, 1.0)).r;
+            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -3.0), 0.0, 1.0)).r;
+            inner_halo *= 0.25;
+
+            float outer_halo = 0.0;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(10.0, 0.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-10.0, 0.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 10.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -10.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(8.0, 8.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-8.0, 8.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(8.0, -8.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-8.0, -8.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(16.0, 0.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-16.0, 0.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 16.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -16.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(18.0, 18.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-18.0, 18.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(18.0, -18.0), 0.0, 1.0)).r;
+            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-18.0, -18.0), 0.0, 1.0)).r;
+            outer_halo *= (1.0 / 16.0);
+
+            float title_heat = 0.86
+                + 0.14 * sin(u_time * 1.25 + sample_uv.x * 9.0 + sample_uv.y * 4.0);
+            float title_glow = max(inner_halo - title_mask * 0.78, 0.0) * title_heat;
+            float title_aura = max(outer_halo - title_mask * 0.18, 0.0) * (0.98 + title_heat * 0.24);
+            float title_core = title_mask * (0.97 + 0.03 * sin(u_time * 1.10 + sample_uv.x * 8.0));
             color = mix(color, vec3(0.01, 0.02, 0.05), title_shadow * 0.28);
-            color += vec3(0.18, 0.24, 0.38) * title_glow * 0.08;
-            color = mix(color, vec3(0.97, 0.98, 1.0), title_mask);
+            color += vec3(0.05, 0.10, 0.26) * title_aura * 0.84;
+            color += vec3(0.24, 0.38, 0.80) * pow(title_aura, 1.02) * 0.66;
+            color += vec3(0.84, 0.92, 1.00) * pow(title_aura, 1.32) * 0.12;
+            color += vec3(0.18, 0.28, 0.58) * title_glow * 0.50;
+            color += vec3(0.92, 0.96, 1.00) * pow(title_glow, 1.50) * 0.12;
+            color = mix(color, vec3(0.97, 0.98, 1.0), title_core);
         }}
     }}
 
