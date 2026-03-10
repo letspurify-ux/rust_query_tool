@@ -314,7 +314,9 @@ impl RoutineFrame {
         if matches!(token_upper, "MODULE" | "SIGNATURE" | "ENV" | "ENVIRONMENT") {
             if matches!(
                 self.external_clause_state,
-                ExternalClauseState::SawMleKeyword | ExternalClauseState::Confirmed
+                ExternalClauseState::SawMleKeyword
+                    | ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::Confirmed
             ) {
                 self.mark_external_clause();
             }

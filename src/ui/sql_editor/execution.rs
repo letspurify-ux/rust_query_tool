@@ -1959,7 +1959,9 @@ impl SqlEditorWidget {
                     let is_block_comment =
                         trimmed_comment.starts_with("/*") && trimmed_comment.ends_with("*/");
                     let is_hint_comment = trimmed_comment.starts_with("/*+");
-                    if is_hint_comment && matches!(prev_word_upper.as_deref(), Some("SELECT")) {
+                    let hint_after_select =
+                        is_hint_comment && matches!(prev_word_upper.as_deref(), Some("SELECT"));
+                    if hint_after_select {
                         has_leading_newline = false;
                     }
                     let comment_body = if has_leading_newline {
@@ -2060,12 +2062,16 @@ impl SqlEditorWidget {
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
                         needs_space = false;
-                        if in_select_list || column_list_stack.last().copied().unwrap_or(false) {
+                        if in_select_list
+                            || column_list_stack.last().copied().unwrap_or(false)
+                            || hint_after_select
+                        {
                             line_indent = base_indent(indent_level, open_cursor_state) + 1;
                         }
                     } else if is_block_comment && next_is_word_like {
                         let list_extra = if in_select_list
                             || column_list_stack.last().copied().unwrap_or(false)
+                            || hint_after_select
                         {
                             1
                         } else {
@@ -2557,6 +2563,17 @@ impl SqlEditorWidget {
                 parser_depth
             } else {
                 parser_depth.max(existing_indent)
+            };
+            let previous_line_is_select_hint = last_code_line_trimmed
+                .as_deref()
+                .is_some_and(|prev| prev.trim_start().to_ascii_uppercase().starts_with("SELECT /*+"));
+            let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
+            let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
+                effective_depth.max(1)
+            } else {
+                effective_depth
             };
             out.push_str(&" ".repeat(effective_depth * 4));
             out.push_str(trimmed);
