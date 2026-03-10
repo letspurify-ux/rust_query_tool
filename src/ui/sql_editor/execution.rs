@@ -824,6 +824,9 @@ impl SqlEditorWidget {
                     || (Self::is_create_trigger_statement(left)
                         && Self::is_alter_trigger_statement(right))
             }
+            (FormatItem::Slash, FormatItem::Statement(right)) => {
+                Self::is_alter_trigger_statement(right)
+            }
             _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
@@ -9999,6 +10002,30 @@ END;"#;
 FROM DUAL"
         );
         assert!(!preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_trigger_slash_and_alter_trigger_tightly_grouped() {
+        let sql = r#"CREATE OR REPLACE TRIGGER trg_demo
+BEFORE INSERT ON demo
+BEGIN
+    NULL;
+END;
+/
+ALTER TRIGGER trg_demo ENABLE;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("END;\n/\nALTER TRIGGER trg_demo ENABLE;"),
+            "CREATE TRIGGER + slash + ALTER TRIGGER should stay tightly grouped, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("END;\n/\n\nALTER TRIGGER"),
+            "Unexpected blank line inserted between slash and ALTER TRIGGER, got:\n{}",
+            formatted
+        );
     }
 
     #[test]
