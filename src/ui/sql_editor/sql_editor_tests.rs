@@ -648,6 +648,42 @@ fn format_sql_keeps_sql_after_multiline_block_comment_closing_line() {
 }
 
 #[test]
+fn format_sql_splits_sql_after_single_line_block_comment_closing_token() {
+    let input = "/* banner */ SELECT col1, col2 FROM dual";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "/* banner */
+SELECT col1,
+    col2
+FROM DUAL;"
+        ),
+        "SQL after single-line block comment should be parsed as SQL statement, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_splits_sql_after_multiline_block_comment_closing_token() {
+    let input = "/* banner
+comment */ SELECT col1, col2 FROM dual";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "/* banner
+comment */
+SELECT col1,
+    col2
+FROM DUAL;"
+        ),
+        "SQL after multiline block comment should be parsed as SQL statement, got: {}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_recognizes_prompt_after_leading_block_comment_on_same_line() {
     let input = "/* banner */ PROMPT hello";
     let formatted = SqlEditorWidget::format_sql_basic(input);

@@ -2695,32 +2695,36 @@ impl QueryExecutor {
                 if trimmed.starts_with("/*") {
                     let mut comment = String::new();
                     let mut trailing_after_comment: Option<String> = None;
-                    let maybe_extract_trailing_command = |trailing_raw: &str| {
-                        let trailing_trimmed = trailing_raw.trim();
-                        if trailing_trimmed == "/" {
-                            return Some(trailing_trimmed.to_string());
+                    let extract_trailing_segment = |trailing_raw: &str| {
+                        let trailing_trimmed = trailing_raw.trim_start();
+                        if trailing_trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trailing_trimmed.to_string())
+                        }
+                    };
+                    let is_standalone_trailing_item = |trailing_line: &str| {
+                        if trailing_line == "/" {
+                            return true;
                         }
 
-                        if let Some(command) = Self::parse_tool_command(trailing_trimmed) {
-                            if !matches!(command, ToolCommand::Unsupported { .. }) {
-                                return Some(trailing_trimmed.to_string());
-                            }
+                        if let Some(command) = Self::parse_tool_command(trailing_line) {
+                            return !matches!(command, ToolCommand::Unsupported { .. });
                         }
 
-                        None
+                        false
                     };
 
                     if let Some(close_idx) = line.find("*/") {
                         let close_end = close_idx + 2;
                         comment.push_str(&line[..close_end]);
                         let trailing_raw = &line[close_end..];
-                        if !trailing_raw.trim().is_empty() {
-                            if let Some(trailing_line) =
-                                maybe_extract_trailing_command(trailing_raw)
-                            {
+                        if let Some(trailing_line) = extract_trailing_segment(trailing_raw) {
+                            if is_standalone_trailing_item(&trailing_line) {
                                 trailing_after_comment = Some(trailing_line);
                             } else {
-                                comment.push_str(trailing_raw);
+                                comment.push('\n');
+                                comment.push_str(&trailing_line);
                             }
                         }
                     } else {
@@ -2731,13 +2735,13 @@ impl QueryExecutor {
                                 comment.push('\n');
                                 comment.push_str(&next_line[..close_end]);
                                 let trailing_raw = &next_line[close_end..];
-                                if !trailing_raw.trim().is_empty() {
-                                    if let Some(trailing_line) =
-                                        maybe_extract_trailing_command(trailing_raw)
-                                    {
+                                if let Some(trailing_line) = extract_trailing_segment(trailing_raw)
+                                {
+                                    if is_standalone_trailing_item(&trailing_line) {
                                         trailing_after_comment = Some(trailing_line);
                                     } else {
-                                        comment.push_str(trailing_raw);
+                                        comment.push('\n');
+                                        comment.push_str(&trailing_line);
                                     }
                                 }
                                 break;
@@ -2750,23 +2754,7 @@ impl QueryExecutor {
                     items.push(FormatItem::Statement(comment));
 
                     if let Some(trailing_line) = trailing_after_comment {
-                        let trailing_trimmed = trailing_line.trim();
-                        Self::process_split_line(
-                            &trailing_line,
-                            trailing_trimmed,
-                            &mut builder,
-                            &mut sqlblanklines_enabled,
-                            &mut items,
-                            &mut add_statement,
-                            &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
-                                if matches!(cmd, ToolCommand::Prompt { .. }) {
-                                    items.push(FormatItem::Verbatim(raw_line.to_string()));
-                                } else {
-                                    items.push(FormatItem::ToolCommand(cmd));
-                                }
-                            },
-                            &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
-                        );
+                        items.extend(Self::split_format_items(&trailing_line));
                     }
                     continue;
                 }
