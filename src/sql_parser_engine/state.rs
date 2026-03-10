@@ -476,6 +476,13 @@ impl SplitState {
             && self.begin_state != BeginState::AfterDeclare
     }
 
+    pub(crate) fn in_package_body_initializer_body(&self) -> bool {
+        self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.pending_subprogram_begins == 0
+            && self.block_stack.first() == Some(&BlockKind::AsIs)
+            && self.block_stack.get(1) == Some(&BlockKind::Begin)
+    }
+
     pub(crate) fn in_create_plsql(&self) -> bool {
         self.create_plsql_kind != CreatePlsqlKind::None
     }

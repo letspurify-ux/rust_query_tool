@@ -1,12 +1,18 @@
 use oracle::{Connection, Error as OracleError, ErrorKind as OracleErrorKind, InitParams};
 use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::db::session::SessionState;
 use crate::utils::logging;
 
 pub const NOT_CONNECTED_MESSAGE: &str = "Not connected to database";
+const ORACLE_CLIENT_LOAD_HELP_URL: &str =
+    "https://oracle.github.io/odpi/doc/installation.html#macos";
+const ORACLE_CLIENT_LIB_ENV_VAR: &str = "ORACLE_CLIENT_LIB_DIR";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionInfo {
@@ -258,16 +264,131 @@ fn ensure_oracle_client_initialized() -> Result<(), OracleError> {
         return Ok(());
     }
 
-    match InitParams::new().init() {
+    match init_oracle_client() {
         Ok(_) => {
             ORACLE_CLIENT_INIT_SUCCESS.get_or_init(|| ());
             Ok(())
         }
         Err(err) => Err(OracleError::new(
             OracleErrorKind::InternalError,
-            format!("Failed to initialize Oracle client library: {err}"),
+            format_oracle_client_init_error(&err),
         )),
     }
+}
+
+fn init_oracle_client() -> Result<(), OracleError> {
+    let candidate_dirs = oracle_client_lib_dir_candidates();
+    let mut last_error: Option<OracleError> = None;
+
+    for dir in candidate_dirs {
+        if !dir.join("libclntsh.dylib").is_file() {
+            continue;
+        }
+
+        let mut params = InitParams::new();
+        params.load_error_url(ORACLE_CLIENT_LOAD_HELP_URL)?;
+        params.oracle_client_lib_dir(&dir)?;
+
+        match params.init() {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    let mut params = InitParams::new();
+    params.load_error_url(ORACLE_CLIENT_LOAD_HELP_URL)?;
+    params.init().map(|_| ())
+}
+
+fn oracle_client_lib_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(env_dir) = env::var_os(ORACLE_CLIENT_LIB_ENV_VAR) {
+        push_oracle_client_dir_candidate(&mut candidates, PathBuf::from(env_dir));
+    }
+
+    for root in oracle_client_search_roots() {
+        for dir in collect_instantclient_dirs(&root) {
+            push_oracle_client_dir_candidate(&mut candidates, dir);
+        }
+    }
+
+    candidates
+}
+
+fn oracle_client_search_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/opt/oracle")];
+        if let Some(home) = env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Downloads"));
+        }
+        return roots;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+fn collect_instantclient_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut dirs = Vec::new();
+    for entry_result in entries {
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("instantclient_") {
+            dirs.push(path);
+        }
+    }
+
+    dirs.sort_unstable_by(|left, right| right.as_os_str().cmp(left.as_os_str()));
+    dirs
+}
+
+fn push_oracle_client_dir_candidate(candidates: &mut Vec<PathBuf>, dir: PathBuf) {
+    if candidates.iter().any(|existing| existing == &dir) {
+        return;
+    }
+    candidates.push(dir);
+}
+
+fn format_oracle_client_init_error(err: &OracleError) -> String {
+    let err_text = err.to_string();
+    let mut message = format!("Failed to initialize Oracle client library: {err_text}");
+
+    if is_oracle_client_architecture_mismatch(&err_text) {
+        message.push_str(
+            " Detected an Oracle Client CPU architecture mismatch. Install an Oracle Instant Client that matches this app's architecture. On Apple Silicon, use an arm64 client and set ORACLE_CLIENT_LIB_DIR if you need to override auto-detection.",
+        );
+    } else if err_text.contains("DPI-1047") {
+        message.push_str(
+            " Set ORACLE_CLIENT_LIB_DIR to the directory containing libclntsh.dylib if the client is installed in a non-default location.",
+        );
+    }
+
+    message
+}
+
+fn is_oracle_client_architecture_mismatch(err_text: &str) -> bool {
+    err_text.contains("incompatible architecture")
+        || (err_text.contains("have 'x86_64'") && err_text.contains("need 'arm64"))
 }
 
 fn db_activity_slot() -> &'static Mutex<Option<String>> {
@@ -476,5 +597,22 @@ mod tests {
         };
         assert!(!continue_on_error);
         assert_eq!(colsep, " | ");
+    }
+
+    #[test]
+    fn architecture_mismatch_detection_identifies_x86_client_on_arm_runtime() {
+        let err = "DPI-1047: Cannot locate a 64-bit Oracle Client library: \"dlopen(libclntsh.dylib, 0x0001): tried: '/opt/homebrew/libclntsh.dylib' (mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64'))\"";
+        assert!(is_oracle_client_architecture_mismatch(err));
+    }
+
+    #[test]
+    fn formatted_init_error_adds_actionable_architecture_hint() {
+        let err = OracleError::new(
+            OracleErrorKind::InternalError,
+            "DPI-1047: incompatible architecture (have 'x86_64', need 'arm64')".to_string(),
+        );
+        let message = format_oracle_client_init_error(&err);
+        assert!(message.contains("CPU architecture mismatch"));
+        assert!(message.contains("ORACLE_CLIENT_LIB_DIR"));
     }
 }

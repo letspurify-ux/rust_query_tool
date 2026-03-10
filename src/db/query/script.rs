@@ -898,6 +898,13 @@ impl QueryExecutor {
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
+            if builder.state.in_package_body_initializer_body() {
+                block_depth_component = block_depth_component.saturating_sub(1);
+            } else if leading_is("BEGIN")
+                && builder.state.is_package_body_initializer_begin_context()
+            {
+                block_depth_component = block_depth_component.saturating_sub(1);
+            }
 
             // Compute CASE branch indentation from the block_stack.
             let mut case_branch_indent = 0usize;
@@ -4603,6 +4610,60 @@ WHERE 1 = 1;";
         assert_eq!(
             depths[close_expr_idx], depths[from_dual_idx],
             "multiple non-subquery closes on same line must not over-dedent outer subquery"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_dedents_package_body_initializer_scope_by_one_level() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+g_last_mode VARCHAR2 (30) := 'BOOT';
+FUNCTION calc_mode RETURN VARCHAR2 IS
+BEGIN
+    RETURN
+    CASE
+        WHEN 1 = 1 THEN
+            'WEEKDAY_BOOT'
+        ELSE
+            'WEEKEND_BOOT'
+    END;
+END calc_mode;
+
+BEGIN
+    g_last_mode :=
+    CASE
+        WHEN 1 = 1 THEN
+            'WEEKDAY_BOOT'
+        ELSE
+            'WEEKEND_BOOT'
+    END;
+END fmt_pkg_extreme;"#;
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let begin_idx = lines
+            .windows(2)
+            .position(|pair| pair[0].trim() == "BEGIN" && pair[1].trim() == "g_last_mode :=")
+            .unwrap_or(0);
+        let assign_idx = lines
+            .iter()
+            .position(|line| line.trim() == "g_last_mode :=")
+            .unwrap_or(0);
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim() == "END fmt_pkg_extreme;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            depths[begin_idx], 0,
+            "package body initializer BEGIN should align with package scope"
+        );
+        assert_eq!(
+            depths[assign_idx], 1,
+            "initializer body statements should be indented exactly one level"
+        );
+        assert_eq!(
+            depths[end_idx], 0,
+            "package body END label should return to top-level depth"
         );
     }
 }

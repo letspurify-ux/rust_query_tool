@@ -978,25 +978,31 @@ fn test_cross_window_block_comment_round_trip() {
 #[test]
 fn test_probe_entry_state_recovers_from_stale_default_inside_comment() {
     let highlighter = SqlHighlighter::new();
-    let mut buffer = TextBuffer::default();
-    let mut style_buffer = TextBuffer::default();
-
     let text = "SELECT 1; /* open comment\ncontinued comment\nSELECT 2";
-    buffer.set_text(text);
-
-    // Simulate stale style bytes (window not yet highlighted): all default.
-    style_buffer.set_text(&std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>());
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
 
     let pos = text.find("continued").unwrap_or(0);
-    let entry = highlighter.probe_entry_state(&buffer, &style_buffer, pos);
+    let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
     assert_eq!(entry, LexerState::InBlockComment);
 }
 
 #[test]
 fn test_select_highlight_ranges_drops_empty_ranges_when_line_end_is_before_anchor() {
-    let mut buffer = TextBuffer::default();
-    buffer.set_text("SELECT 1");
-
-    let ranges = select_highlight_ranges(&buffer, buffer.length() as usize, 0, Some((3, 3)), None);
+    let text = "SELECT 1";
+    let ranges = select_highlight_ranges_for_text(text, 0, Some((3, 3)), None);
     assert!(ranges.iter().all(|(start, end)| start < end));
+}
+
+#[test]
+fn test_probe_entry_state_clamps_mid_byte_cursor_inside_comment() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 1; /* 한글\n계속 */";
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+    let comment_pos = text.find("한").unwrap_or(0);
+    let mid_byte_pos = comment_pos + 1;
+
+    assert!(!text.is_char_boundary(mid_byte_pos));
+
+    let entry = highlighter.probe_entry_state_for_text(text, &style_text, mid_byte_pos);
+    assert_eq!(entry, LexerState::InBlockComment);
 }

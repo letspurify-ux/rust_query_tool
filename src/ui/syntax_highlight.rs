@@ -432,11 +432,44 @@ impl SqlHighlighter {
         // Re-probing avoids dropping comment/string continuation at viewport
         // boundaries when the previous pass has not covered that region yet.
         let probe_start = pos.saturating_sub(STATE_PROBE_DISTANCE);
-        let Some(probe_text) = buffer.text_range(probe_start as i32, pos as i32) else {
+        let probe_text = buffer.text_range(probe_start as i32, pos as i32);
+        self.resolve_entry_state_from_probe_text(prev_style, probe_text.as_deref())
+    }
+
+    fn resolve_entry_state_from_probe_text(
+        &self,
+        prev_style: char,
+        probe_text: Option<&str>,
+    ) -> LexerState {
+        match prev_style {
+            // STYLE_DATETIME_LITERAL is intentionally excluded because an
+            // unclosed DATE/TIMESTAMP/INTERVAL literal can span windows.
+            STYLE_COMMENT => LexerState::InBlockComment,
+            STYLE_HINT => LexerState::InHintComment,
+            STYLE_STRING => LexerState::InSingleQuote,
+            STYLE_IDENTIFIER => LexerState::InDoubleQuote,
+            _ => probe_text
+                .map(|text| self.generate_styles_with_state(text, LexerState::Normal).1)
+                .unwrap_or(LexerState::Normal),
+        }
+    }
+
+    #[cfg(test)]
+    fn probe_entry_state_for_text(&self, text: &str, style_text: &str, pos: usize) -> LexerState {
+        let pos = clamp_to_char_boundary(text, pos.min(text.len()));
+        if pos == 0 {
             return LexerState::Normal;
-        };
-        self.generate_styles_with_state(&probe_text, LexerState::Normal)
-            .1
+        }
+
+        let prev_style = style_text
+            .as_bytes()
+            .get(pos - 1)
+            .copied()
+            .map(char::from)
+            .unwrap_or(STYLE_DEFAULT);
+        let probe_start = clamp_to_char_boundary(text, pos.saturating_sub(STATE_PROBE_DISTANCE));
+        let probe_text = text.get(probe_start..pos);
+        self.resolve_entry_state_from_probe_text(prev_style, probe_text)
     }
 
     /// Generates the style string for the given text, starting from Normal state.
@@ -834,6 +867,27 @@ fn windowed_range_from_buffer(
     (start.min(text_len), end.min(text_len))
 }
 
+#[cfg(test)]
+fn windowed_range_from_text(text: &str, cursor_pos: usize) -> (usize, usize) {
+    let text_len = text.len();
+    let cursor_pos = clamp_to_char_boundary(text, cursor_pos.min(text_len));
+    let start_candidate = clamp_to_char_boundary(text, cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS));
+    let end_candidate = clamp_to_char_boundary(text, (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text_len));
+
+    let start = text
+        .get(..start_candidate)
+        .and_then(|prefix| prefix.rfind('\n'))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let end = text
+        .get(end_candidate..)
+        .and_then(|suffix| suffix.find('\n'))
+        .map(|offset| end_candidate + offset)
+        .unwrap_or(text_len);
+
+    (start.min(text_len), end.min(text_len))
+}
+
 fn select_highlight_ranges(
     buffer: &TextBuffer,
     text_len: usize,
@@ -935,6 +989,114 @@ fn select_highlight_ranges(
     }
 
     merged
+}
+
+#[cfg(test)]
+fn select_highlight_ranges_for_text(
+    text: &str,
+    cursor_pos: usize,
+    edited_range: Option<(usize, usize)>,
+    viewport: Option<(usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let text_len = text.len();
+    let mut anchors = vec![clamp_to_char_boundary(text, cursor_pos.min(text_len))];
+    let mut large_edit_focus_only = false;
+
+    if let Some((vp_start, vp_end)) = viewport {
+        let vp_mid = ((vp_start.min(text_len)) + (vp_end.min(text_len))) / 2;
+        anchors.push(clamp_to_char_boundary(text, vp_mid));
+    }
+
+    if let Some((edit_start, edit_end)) = edited_range {
+        let mut start = clamp_to_char_boundary(text, edit_start.min(text_len));
+        let mut end = clamp_to_char_boundary(text, edit_end.min(text_len));
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+
+        if start == end {
+            anchors.push(start);
+        } else {
+            let span = end - start;
+            if span >= LARGE_EDIT_SPAN_FOCUS_THRESHOLD {
+                large_edit_focus_only = true;
+                anchors.push(start);
+                anchors.push(end);
+            } else {
+                let step = (HIGHLIGHT_WINDOW_RADIUS * 2).max(1);
+                let mut windows = span.div_ceil(step).max(1);
+                windows = windows.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS.saturating_sub(1).max(1));
+
+                for i in 0..=windows {
+                    let offset = span.saturating_mul(i) / windows;
+                    anchors.push(clamp_to_char_boundary(text, start + offset));
+                }
+            }
+        }
+    }
+
+    let mut ranges: Vec<(usize, usize)> = anchors
+        .into_iter()
+        .filter_map(|anchor| {
+            let (raw_start, raw_end) = windowed_range_from_text(text, anchor);
+            let mut start = clamp_to_char_boundary(text, raw_start.min(text_len));
+            let mut end = clamp_to_char_boundary(text, raw_end.min(text_len));
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            if start == end {
+                return None;
+            }
+            Some((start, end))
+        })
+        .collect();
+
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, prev_end)) = merged.last_mut() {
+            if start <= *prev_end {
+                *prev_end = (*prev_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    if large_edit_focus_only {
+        let mut focus_points = vec![clamp_to_char_boundary(text, cursor_pos.min(text_len))];
+        if let Some((vp_start, vp_end)) = viewport {
+            let clamped_start = clamp_to_char_boundary(text, vp_start.min(text_len));
+            let clamped_end = clamp_to_char_boundary(text, vp_end.min(text_len));
+            focus_points.push(clamped_start);
+            focus_points.push(clamped_end);
+            focus_points.push((clamped_start + clamped_end) / 2);
+        }
+        let max_ranges = MAX_HIGHLIGHT_WINDOWS_FOR_LARGE_EDIT.min(MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+        merged = prioritize_ranges_for_focus(merged, &focus_points, max_ranges.max(1));
+    } else if merged.len() > MAX_HIGHLIGHT_WINDOWS_PER_PASS {
+        let mut focus_points = vec![clamp_to_char_boundary(text, cursor_pos.min(text_len))];
+        if let Some((edit_start, edit_end)) = edited_range {
+            focus_points.push(clamp_to_char_boundary(text, edit_start.min(text_len)));
+            focus_points.push(clamp_to_char_boundary(text, edit_end.min(text_len)));
+        }
+        if let Some((vp_start, vp_end)) = viewport {
+            focus_points.push(clamp_to_char_boundary(text, vp_start.min(text_len)));
+            focus_points.push(clamp_to_char_boundary(text, vp_end.min(text_len)));
+        }
+        merged = prioritize_ranges_for_focus(merged, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
+    }
+
+    merged
+}
+
+#[cfg(test)]
+fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 fn prioritize_ranges_for_focus(

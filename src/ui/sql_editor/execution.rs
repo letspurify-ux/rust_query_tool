@@ -9303,6 +9303,50 @@ END fmt_pkg_extreme;"#;
     }
 
     #[test]
+    fn package_body_initializer_begin_stays_at_top_level_after_case_declaration() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+g_last_mode VARCHAR2 (30) := 'BOOT';
+FUNCTION calc_mode RETURN VARCHAR2 IS
+BEGIN
+  RETURN
+  CASE
+    WHEN 1 = 1 THEN
+      'WEEKDAY_BOOT'
+    ELSE
+      'WEEKEND_BOOT'
+  END;
+END calc_mode;
+
+BEGIN
+    g_last_mode :=
+    CASE
+        WHEN TO_CHAR (SYSDATE, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT', 'SUN') THEN
+            'WEEKEND_BOOT'
+        ELSE
+            'WEEKDAY_BOOT'
+    END;
+    AUDIT ('INIT', 'package initialized. mode=' || g_last_mode);
+END fmt_pkg_extreme;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "END calc_mode;\nBEGIN\n    g_last_mode :=\n    CASE"
+            ),
+            "package body initializer BEGIN should not remain indented under declarations, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "END calc_mode;\n\n    BEGIN\n        g_last_mode :="
+            ),
+            "initializer BEGIN/body should not be shifted one extra level, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn plsql_else_if_clause_uses_block_depth_without_extra_into_indent() {
         let sql = r#"BEGIN
   IF 1 = 1 THEN
