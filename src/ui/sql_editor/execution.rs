@@ -1815,12 +1815,17 @@ impl SqlEditorWidget {
                             in_plsql_block = true;
                         }
                     } else if upper == "BEGIN" {
-                        let inside_declare = block_stack.last().is_some_and(|s| s == "DECLARE");
+                        let inside_declare = block_stack
+                            .last()
+                            .is_some_and(|s| s == "DECLARE" || s == "PACKAGE_BODY");
                         if inside_declare {
-                            // Replace DECLARE with BEGIN on the stack (same block continues)
-                            block_stack.pop();
-                            block_stack.push("BEGIN".to_string());
-                            // indent_level stays the same
+                            // DECLARE ... BEGIN - same block depth.
+                            // PACKAGE BODY initialization BEGIN is also same depth as PACKAGE_BODY.
+                            if block_stack.last().is_some_and(|s| s == "DECLARE") {
+                                block_stack.pop();
+                                block_stack.push("BEGIN".to_string());
+                            }
+                            // indent_level stays the same for both cases
                         } else {
                             // Standalone BEGIN block
                             block_stack.push("BEGIN".to_string());
@@ -9105,8 +9110,8 @@ END if_owner;"#;
             .lines()
             .find(|line| line.trim().eq_ignore_ascii_case("END if_owner;"));
         assert!(
-            end_if_owner_line.is_some_and(|line| line.starts_with("    ")),
-            "Package named END label should stay at package-body depth, got:
+            end_if_owner_line.is_some_and(|line| !line.starts_with(' ')),
+            "Package named END label should close package body at top-level depth, got:
 {}",
             formatted
         );
@@ -9118,6 +9123,30 @@ END if_owner;"#;
             end_if_line.is_some_and(|line| line.starts_with("        ")),
             "Nested END IF should remain more indented than END package label, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn package_body_final_end_label_aligns_to_top_level() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+PROCEDURE run_extreme IS
+BEGIN
+  NULL;
+END run_extreme;
+
+BEGIN
+  NULL;
+END fmt_pkg_extreme;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+        let end_pkg_line = formatted
+            .lines()
+            .find(|line| line.trim().eq_ignore_ascii_case("END fmt_pkg_extreme;"));
+
+        assert!(
+            end_pkg_line.is_some_and(|line| !line.starts_with(' ')),
+            "Final package END label should align with CREATE at top-level, got:\n{}",
             formatted
         );
     }
