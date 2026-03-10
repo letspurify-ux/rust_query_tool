@@ -1162,8 +1162,9 @@ impl SplitState {
             return;
         }
 
+        let allow_implicit_target = self.allow_implicit_external_literal_target();
         if let Some(frame) = self.active_routine_frame_mut() {
-            frame.observe_external_clause_quoted_identifier_target();
+            frame.observe_external_clause_quoted_identifier_target(allow_implicit_target);
         }
     }
 

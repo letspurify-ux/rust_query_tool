@@ -208,6 +208,7 @@ enum ExternalClauseState {
     AwaitingLanguageTargetFromExternal,
     AwaitingLanguageTargetImplicit,
     SawImplicitLanguageTarget,
+    SawImplicitQuotedLanguageTarget,
     Confirmed,
 }
 
@@ -302,7 +303,9 @@ impl RoutineFrame {
         if token_upper == "MLE" {
             if matches!(
                 self.external_clause_state,
-                ExternalClauseState::SawImplicitLanguageTarget | ExternalClauseState::Confirmed
+                ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
+                    | ExternalClauseState::Confirmed
             ) {
                 self.mark_external_clause();
             } else {
@@ -316,6 +319,7 @@ impl RoutineFrame {
                 self.external_clause_state,
                 ExternalClauseState::SawMleKeyword
                     | ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
                     | ExternalClauseState::Confirmed
             ) {
                 self.mark_external_clause();
@@ -353,6 +357,7 @@ impl RoutineFrame {
                 self.external_clause_state,
                 ExternalClauseState::SawExternalKeyword
                     | ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
                     | ExternalClauseState::Confirmed
             ) {
                 self.mark_external_clause();
@@ -365,18 +370,24 @@ impl RoutineFrame {
             ExternalClauseState::SawExternalKeyword
                 | ExternalClauseState::SawUsingClauseSubject
                 | ExternalClauseState::SawMleKeyword
+                | ExternalClauseState::SawImplicitQuotedLanguageTarget
         ) {
             self.external_clause_state = ExternalClauseState::None;
         }
     }
 
-    fn observe_external_clause_quoted_identifier_target(&mut self) {
+    fn observe_external_clause_quoted_identifier_target(&mut self, allow_implicit_target: bool) {
         match self.external_clause_state {
             ExternalClauseState::AwaitingLanguageTargetFromExternal => {
                 self.mark_external_clause();
             }
             ExternalClauseState::AwaitingLanguageTargetImplicit => {
-                self.external_clause_state = ExternalClauseState::None;
+                if allow_implicit_target {
+                    self.external_clause_state =
+                        ExternalClauseState::SawImplicitQuotedLanguageTarget;
+                } else {
+                    self.external_clause_state = ExternalClauseState::None;
+                }
             }
             _ => {}
         }
@@ -457,6 +468,9 @@ impl RoutineFrame {
                 } else {
                     self.external_clause_state = ExternalClauseState::None;
                 }
+            }
+            ExternalClauseState::SawImplicitQuotedLanguageTarget => {
+                self.external_clause_state = ExternalClauseState::None;
             }
             _ => {}
         }

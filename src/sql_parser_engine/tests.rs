@@ -6502,6 +6502,42 @@ fn oracle_external_language_without_semicolon_splits_before_following_statement_
 }
 
 #[test]
+fn mle_environment_clause_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_env_no_term RETURN NUMBER");
+    engine.process_line("AS MLE ENVIRONMENT ext_env_impl");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS MLE ENVIRONMENT ext_env_impl"),
+        "first statement should keep MLE ENVIRONMENT clause tokens: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn implicit_language_with_quoted_target_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_quoted_lang RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"C\" NAME 'ext_quoted_lang'");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS LANGUAGE \"C\" NAME 'ext_quoted_lang'"),
+        "first statement should keep LANGUAGE quoted target clause tokens: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
 fn malformed_external_clause_without_language_target_still_splits_before_next_statement() {
     let mut engine = SqlParserEngine::new();
 
