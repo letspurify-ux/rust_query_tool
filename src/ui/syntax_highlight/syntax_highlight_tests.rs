@@ -474,6 +474,67 @@ fn test_nq_quote_case_insensitive_highlighting() {
 }
 
 #[test]
+fn test_uq_quote_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT uq'[unicode string]' FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let uq_start = text.find("uq'[").unwrap();
+    let uq_end = text.find("]'").unwrap() + 2;
+    assert!(
+        styles[uq_start..uq_end].chars().all(|c| c == STYLE_STRING),
+        "uq'[...]' should be string style, got: {}",
+        &styles[uq_start..uq_end]
+    );
+}
+
+#[test]
+fn test_unicode_q_quote_delimiter_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT q'가한글가' AS txt FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let q_start = text.find("q'가").unwrap();
+    let q_end = text.find("가'").unwrap() + "가'".len();
+    assert!(
+        styles[q_start..q_end].chars().all(|c| c == STYLE_STRING),
+        "unicode q-quote should remain one string span, got: {}",
+        &styles[q_start..q_end]
+    );
+}
+
+#[test]
+fn test_unicode_uq_quote_delimiter_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT uq'가문자열가' AS txt FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let uq_start = text.find("uq'가").unwrap();
+    let uq_end = text.find("가'").unwrap() + "가'".len();
+    assert!(
+        styles[uq_start..uq_end].chars().all(|c| c == STYLE_STRING),
+        "unicode uq-quote should remain one string span, got: {}",
+        &styles[uq_start..uq_end]
+    );
+}
+
+#[test]
+fn test_prefixed_single_quote_literals_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT n'가', b'0101', x'FF', u'유니코드', u&'\\0041' FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    for literal in ["n'가'", "b'0101'", "x'FF'", "u'유니코드'", "u&'\\0041'"] {
+        let start = text.find(literal).unwrap();
+        let end = start + literal.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_STRING),
+            "prefixed literal should be a single string span: {literal}"
+        );
+    }
+}
+
+#[test]
 fn test_q_quote_different_delimiters() {
     let highlighter = SqlHighlighter::new();
 
@@ -847,7 +908,7 @@ fn test_exit_state_unclosed_q_quote() {
     let text = "SELECT q'[unclosed q-string";
     let (_styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
     assert!(
-        matches!(exit, LexerState::InQQuote { closing: b']' }),
+        matches!(exit, LexerState::InQQuote { closing: ']' }),
         "expected InQQuote with ']', got {:?}",
         exit
     );
@@ -915,7 +976,7 @@ fn test_entry_state_in_q_quote_continues() {
     let highlighter = SqlHighlighter::new();
     let text = "still in q-string]' FROM dual";
     let (styles, exit) =
-        highlighter.generate_styles_with_state(text, LexerState::InQQuote { closing: b']' });
+        highlighter.generate_styles_with_state(text, LexerState::InQQuote { closing: ']' });
     assert_eq!(exit, LexerState::Normal);
     let q_end = text.find("]'").unwrap() + 2;
     assert!(
@@ -1005,4 +1066,39 @@ fn test_probe_entry_state_clamps_mid_byte_cursor_inside_comment() {
 
     let entry = highlighter.probe_entry_state_for_text(text, &style_text, mid_byte_pos);
     assert_eq!(entry, LexerState::InBlockComment);
+}
+
+#[test]
+fn test_probe_entry_state_recovers_q_quote_state_inside_scroll_window() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT q'[first line\nsecond line with ' quote\nthird line]'\nFROM dual";
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+    let pos = text.find("second line").unwrap();
+
+    let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
+    assert_eq!(entry, LexerState::InQQuote { closing: ']' });
+}
+
+#[test]
+fn test_probe_entry_state_recovers_long_offscreen_block_comment() {
+    let highlighter = SqlHighlighter::new();
+    let filler = "a".repeat(STATE_PROBE_DISTANCE + 128);
+    let text = format!("/*{}{}", filler, "\ncontinued comment");
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+    let pos = text.find("continued").unwrap();
+
+    let entry = highlighter.probe_entry_state_for_text(&text, &style_text, pos);
+    assert_eq!(entry, LexerState::InBlockComment);
+}
+
+#[test]
+fn test_probe_entry_state_recovers_long_offscreen_q_quote() {
+    let highlighter = SqlHighlighter::new();
+    let filler = "가".repeat((STATE_PROBE_DISTANCE / 3) + 64);
+    let text = format!("SELECT uq'가{}계속가' FROM dual", filler);
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+    let pos = text.find("계속").unwrap();
+
+    let entry = highlighter.probe_entry_state_for_text(&text, &style_text, pos);
+    assert_eq!(entry, LexerState::InQQuote { closing: '가' });
 }

@@ -13004,7 +13004,7 @@ END my_proc;"#;
 fn test_line_block_depths_split_end_if_inside_package_procedure() {
     // Package body procedure with split END / IF inside.
     // BEGIN after IS is at the same depth as IS (pending_subprogram_begins pre-dedent).
-    // Package init NULL is one level deeper than the package init BEGIN.
+    // Package initializer BEGIN aligns with package scope; its body is one level deeper.
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
   PROCEDURE p1 IS
   BEGIN
@@ -13017,8 +13017,8 @@ BEGIN
   NULL;
 END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
-    // AS(0) PROC IS(1) BEGIN(1) IF(2) NULL(3) END(2) IF;(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
-    let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 1, 2, 0];
+    // AS(0) PROC IS(1) BEGIN(1) IF(2) NULL(3) END(2) IF;(2) END p1(1) BEGIN(0) NULL(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 2, 2, 1, 0, 1, 0];
     assert_eq!(
         depths, expected,
         "split END IF in package body procedure mismatch: {depths:?}"
@@ -13050,7 +13050,7 @@ END;"#;
 fn test_line_block_depths_package_body_multiple_procs_end_names() {
     // Package body with two procedures, each with END name.
     // BEGIN after IS is at the same depth as IS.
-    // Package init body (NULL inside BEGIN...END pkg) is one level deeper.
+    // Package initializer BEGIN aligns with package scope; its body is one level deeper.
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
   PROCEDURE p1 IS
   BEGIN
@@ -13064,8 +13064,8 @@ BEGIN
   NULL;
 END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
-    // AS(0) p1 IS(1) BEGIN(1) NULL(2) END p1(1) p2 IS(1) BEGIN(1) NULL(2) END p2(1) BEGIN(1) NULL(2) END pkg(0)
-    let expected = vec![0, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 0];
+    // AS(0) p1 IS(1) BEGIN(1) NULL(2) END p1(1) p2 IS(1) BEGIN(1) NULL(2) END p2(1) BEGIN(0) NULL(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 1, 1, 2, 1, 0, 1, 0];
     assert_eq!(
         depths, expected,
         "package body multiple procedures END name depth tracking mismatch: {depths:?}"
@@ -13096,7 +13096,7 @@ END pkg;"#;
 fn test_line_block_depths_loop_inside_if_with_end_name() {
     // LOOP inside IF inside package body procedure with END name.
     // BEGIN after IS is at the same depth as IS.
-    // Package init body is one level deeper than BEGIN.
+    // Package initializer BEGIN aligns with package scope; its body is one level deeper.
     let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg AS
   PROCEDURE p1 IS
   BEGIN
@@ -13110,8 +13110,8 @@ BEGIN
   NULL;
 END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
-    // AS(0) PROC IS(1) BEGIN(1) IF(2) FOR-LOOP(3) NULL(4) END-LOOP(3) END-IF(2) END p1(1) BEGIN(1) NULL(2) END pkg(0)
-    let expected = vec![0, 1, 1, 2, 3, 4, 3, 2, 1, 1, 2, 0];
+    // AS(0) PROC IS(1) BEGIN(1) IF(2) FOR-LOOP(3) NULL(4) END-LOOP(3) END-IF(2) END p1(1) BEGIN(0) NULL(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 3, 4, 3, 2, 1, 0, 1, 0];
     assert_eq!(
         depths, expected,
         "LOOP inside IF inside package procedure END name mismatch: {depths:?}"
@@ -13373,8 +13373,8 @@ BEGIN
   NULL;
 END pkg;"#;
     let depths = QueryExecutor::line_block_depths(sql);
-    // AS(0) FN IS(1) BEGIN(1) NULL(2) EXCEPTION(1) WHEN(2) RETURN(3) END(1) f1;(1) BEGIN(1) NULL(2) END pkg(0)
-    let expected = vec![0, 1, 1, 2, 1, 2, 3, 1, 1, 1, 2, 0];
+    // AS(0) FN IS(1) BEGIN(1) NULL(2) EXCEPTION(1) WHEN(2) RETURN(3) END(1) f1;(1) BEGIN(0) NULL(1) END pkg(0)
+    let expected = vec![0, 1, 1, 2, 1, 2, 3, 1, 1, 0, 1, 0];
     assert_eq!(
         depths, expected,
         "package body function with exception handler + split END name depth mismatch: {depths:?}"
@@ -13505,7 +13505,8 @@ END pkg_as;"#;
 fn test_line_block_depths_package_body_initializer_split_named_end_with_nested_exception_and_suffix_keywords(
 ) {
     // Extremely nested package initializer with END IF/LOOP/CASE and split package END label.
-    // Regression target: split END + label continuation must not over-dedent package AS/IS depth.
+    // Regression target: split END + label continuation must keep initializer BEGIN at package scope
+    // while nesting only the executable body.
     let sql = r#"CREATE OR REPLACE PACKAGE BODY exception AS
 BEGIN
   DECLARE
@@ -13528,7 +13529,7 @@ exception;
 SELECT 1 FROM dual;"#;
 
     let depths = QueryExecutor::line_block_depths(sql);
-    let expected = vec![0, 1, 2, 3, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 3, 4, 2, 0, 0, 0];
+    let expected = vec![0, 0, 1, 2, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 2, 3, 1, 0, 0, 0];
     assert_eq!(
         depths, expected,
         "package initializer split END label with nested exception/suffix keywords depth mismatch: {depths:?}"

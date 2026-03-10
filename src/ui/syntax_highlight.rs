@@ -143,7 +143,7 @@ pub enum LexerState {
     InHintComment,
     InSingleQuote,
     InQQuote {
-        closing: u8,
+        closing: char,
     },
     InDoubleQuote,
 }
@@ -413,45 +413,29 @@ impl SqlHighlighter {
             .map(|b| b as char)
             .unwrap_or(STYLE_DEFAULT);
 
-        match prev_style {
-            // STYLE_DATETIME_LITERAL is intentionally excluded because an
-            // unclosed DATE/TIMESTAMP/INTERVAL literal can span windows.
-            STYLE_COMMENT => return LexerState::InBlockComment,
-            STYLE_HINT => return LexerState::InHintComment,
-            STYLE_STRING => return LexerState::InSingleQuote,
-            STYLE_IDENTIFIER => return LexerState::InDoubleQuote,
-            _ => {}
+        if let Some(known_state) = immediate_entry_state_from_style(prev_style) {
+            return known_state;
         }
 
-        // The previous byte looks like a multi-line token (COMMENT, HINT,
-        // STRING, or IDENTIFIER).  Re-lex a backward window to determine the
-        // exact state.
-        // Always re-lex a bounded backward window for uncertain styles
-        // (including STYLE_DEFAULT). In windowed mode, style_buffer may still
-        // contain stale default bytes outside previously highlighted ranges.
-        // Re-probing avoids dropping comment/string continuation at viewport
-        // boundaries when the previous pass has not covered that region yet.
-        let probe_start = pos.saturating_sub(STATE_PROBE_DISTANCE);
-        let probe_text = buffer.text_range(probe_start as i32, pos as i32);
-        self.resolve_entry_state_from_probe_text(prev_style, probe_text.as_deref())
+        self.resolve_entry_state_by_probe(buffer.text_range(0, pos as i32).as_deref())
     }
 
-    fn resolve_entry_state_from_probe_text(
-        &self,
-        prev_style: char,
-        probe_text: Option<&str>,
-    ) -> LexerState {
-        match prev_style {
-            // STYLE_DATETIME_LITERAL is intentionally excluded because an
-            // unclosed DATE/TIMESTAMP/INTERVAL literal can span windows.
-            STYLE_COMMENT => LexerState::InBlockComment,
-            STYLE_HINT => LexerState::InHintComment,
-            STYLE_STRING => LexerState::InSingleQuote,
-            STYLE_IDENTIFIER => LexerState::InDoubleQuote,
-            _ => probe_text
-                .map(|text| self.generate_styles_with_state(text, LexerState::Normal).1)
-                .unwrap_or(LexerState::Normal),
+    fn resolve_entry_state_by_probe(&self, probe_text: Option<&str>) -> LexerState {
+        let Some(probe_text) = probe_text else {
+            return LexerState::Normal;
+        };
+
+        let mut bounded_start = probe_text.len().saturating_sub(STATE_PROBE_DISTANCE);
+        while bounded_start > 0 && !probe_text.is_char_boundary(bounded_start) {
+            bounded_start -= 1;
         }
+        let bounded_probe = probe_text.get(bounded_start..).unwrap_or(probe_text);
+        let bounded_state = self.generate_styles_with_state(bounded_probe, LexerState::Normal).1;
+        if bounded_state != LexerState::Normal || bounded_start == 0 {
+            return bounded_state;
+        }
+
+        self.generate_styles_with_state(probe_text, LexerState::Normal).1
     }
 
     #[cfg(test)]
@@ -467,9 +451,11 @@ impl SqlHighlighter {
             .copied()
             .map(char::from)
             .unwrap_or(STYLE_DEFAULT);
-        let probe_start = clamp_to_char_boundary(text, pos.saturating_sub(STATE_PROBE_DISTANCE));
-        let probe_text = text.get(probe_start..pos);
-        self.resolve_entry_state_from_probe_text(prev_style, probe_text)
+        if let Some(known_state) = immediate_entry_state_from_style(prev_style) {
+            return known_state;
+        }
+
+        self.resolve_entry_state_by_probe(text.get(..pos))
     }
 
     /// Generates the style string for the given text, starting from Normal state.
@@ -632,16 +618,11 @@ impl SqlHighlighter {
                 continue;
             }
 
-            // nq-quoted strings: nq'[...]', nq'{...}', etc.
-            if (byte == b'n' || byte == b'N')
-                && (bytes.get(idx + 1) == Some(&b'q') || bytes.get(idx + 1) == Some(&b'Q'))
-                && bytes.get(idx + 2) == Some(&b'\'')
-            {
-                if let Some(&delimiter) = bytes.get(idx + 3) {
-                    let closing = sql_text::q_quote_closing_byte(delimiter);
+            if is_literal_prefix_boundary(bytes, idx) {
+                if let Some(q_quote_start) = detect_q_quote_start(text, idx) {
                     let start = idx;
-                    idx += 4;
-                    let scan_result = scan_until_q_quote_end(bytes, idx, closing);
+                    idx += q_quote_start.prefix_len;
+                    let scan_result = scan_until_q_quote_end(bytes, idx, q_quote_start.closing);
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -652,15 +633,11 @@ impl SqlHighlighter {
                     }
                     continue;
                 }
-            }
 
-            // q-quoted strings: q'[...]', q'{...}', etc.
-            if (byte == b'q' || byte == b'Q') && bytes.get(idx + 1) == Some(&b'\'') {
-                if let Some(&delimiter) = bytes.get(idx + 2) {
-                    let closing = sql_text::q_quote_closing_byte(delimiter);
+                if let Some(prefix_len) = detect_prefixed_single_quote_start(text, idx) {
                     let start = idx;
-                    idx += 3;
-                    let scan_result = scan_until_q_quote_end(bytes, idx, closing);
+                    idx += prefix_len;
+                    let scan_result = scan_until_single_quote_end(bytes, idx);
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -1177,16 +1154,20 @@ fn scan_until_single_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
     }
 }
 
-fn scan_until_q_quote_end(bytes: &[u8], mut idx: usize, closing: u8) -> ScanResult {
+fn scan_until_q_quote_end(bytes: &[u8], mut idx: usize, closing: char) -> ScanResult {
+    let mut closing_buf = [0u8; 4];
+    let closing_bytes = closing.encode_utf8(&mut closing_buf).as_bytes();
     loop {
+        if bytes
+            .get(idx..)
+            .is_some_and(|remaining| remaining.starts_with(closing_bytes))
+            && bytes.get(idx + closing_bytes.len()) == Some(&b'\'')
+        {
+            idx += closing_bytes.len() + 1;
+            return ScanResult::Closed { next_idx: idx };
+        }
+
         match bytes.get(idx) {
-            Some(&b) if b == closing => {
-                if bytes.get(idx + 1) == Some(&b'\'') {
-                    idx += 2;
-                    return ScanResult::Closed { next_idx: idx };
-                }
-                idx += 1;
-            }
             Some(_) => idx += 1,
             None => {
                 return ScanResult::Unterminated {
@@ -1244,6 +1225,88 @@ fn is_operator_byte(byte: u8) -> bool {
             | b':'
             | b'.'
     )
+}
+
+fn immediate_entry_state_from_style(style: char) -> Option<LexerState> {
+    match style {
+        STYLE_COMMENT => Some(LexerState::InBlockComment),
+        STYLE_HINT => Some(LexerState::InHintComment),
+        STYLE_IDENTIFIER => Some(LexerState::InDoubleQuote),
+        _ => None,
+    }
+}
+
+fn is_literal_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || !bytes
+            .get(idx - 1)
+            .copied()
+            .is_some_and(sql_text::is_identifier_byte)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QQuoteStart {
+    prefix_len: usize,
+    closing: char,
+}
+
+fn detect_q_quote_start(text: &str, idx: usize) -> Option<QQuoteStart> {
+    let suffix = text.get(idx..)?;
+    let mut chars = suffix.char_indices();
+    let (_, first) = chars.next()?;
+
+    let delimiter = match first {
+        'q' | 'Q' => {
+            let (_, quote) = chars.next()?;
+            if quote != '\'' {
+                return None;
+            }
+            chars.next()?
+        }
+        'n' | 'N' | 'u' | 'U' => {
+            let (_, q_char) = chars.next()?;
+            let (_, quote) = chars.next()?;
+            if !matches!(q_char, 'q' | 'Q') || quote != '\'' {
+                return None;
+            }
+            chars.next()?
+        }
+        _ => return None,
+    };
+
+    let (delimiter_offset, delimiter_char) = delimiter;
+    if !sql_text::is_valid_q_quote_delimiter(delimiter_char) {
+        return None;
+    }
+
+    Some(QQuoteStart {
+        prefix_len: delimiter_offset + delimiter_char.len_utf8(),
+        closing: sql_text::q_quote_closing(delimiter_char),
+    })
+}
+
+fn detect_prefixed_single_quote_start(text: &str, idx: usize) -> Option<usize> {
+    let suffix = text.get(idx..)?;
+    let mut chars = suffix.char_indices();
+    let (_, first) = chars.next()?;
+    if !matches!(first, 'n' | 'N' | 'b' | 'B' | 'x' | 'X' | 'u' | 'U') {
+        return None;
+    }
+
+    let (second_offset, second_char) = chars.next()?;
+    if matches!(first, 'u' | 'U') && second_char == '&' {
+        let (quote_offset, quote_char) = chars.next()?;
+        if quote_char != '\'' {
+            return None;
+        }
+        return Some(quote_offset + quote_char.len_utf8());
+    }
+
+    if second_char == '\'' {
+        return Some(second_offset + second_char.len_utf8());
+    }
+
+    None
 }
 
 fn is_prompt_keyword(bytes: &[u8], start: usize) -> bool {

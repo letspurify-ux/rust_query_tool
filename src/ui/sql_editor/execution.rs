@@ -2065,7 +2065,22 @@ impl SqlEditorWidget {
                         if !out.ends_with('\n') {
                             out.push('\n');
                         }
-                        line_indent = 0;
+                        if in_select_list
+                            || column_list_stack.last().copied().unwrap_or(false)
+                            || hint_after_select
+                        {
+                            let select_list_indent =
+                                base_indent(indent_level, open_cursor_state) + 1;
+                            line_indent = select_list_indent;
+                            if hint_after_select {
+                                select_list_layout_state =
+                                    SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
+                            }
+                        } else {
+                            line_indent = 0;
+                        }
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
                         needs_space = false;
@@ -2092,6 +2107,11 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
+                        if hint_after_select {
+                            select_list_layout_state = SelectListLayoutState::Multiline {
+                                indent: base_indent(indent_level, open_cursor_state) + 1,
+                            };
+                        }
                     } else if comment_starts_line {
                     }
                 }

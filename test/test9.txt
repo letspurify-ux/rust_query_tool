@@ -328,16 +328,16 @@ purpose: formatter stress test
                 WHEN OTHERS THEN
                     AUDIT ('INNER_RULES', 'inner_rules failed for id=' || p_row.id);
             END inner_rules;
-        CASE
-            WHEN l_score >= 150 THEN
-                l_new_status := 'DONE';
-            WHEN l_score >= 80 THEN
-                l_new_status := 'OPEN';
-            WHEN l_score >= 40 THEN
-                l_new_status := 'HOLD';
-            ELSE
-                l_new_status := 'NEW';
-        END CASE;
+            CASE
+                WHEN l_score >= 150 THEN
+                    l_new_status := 'DONE';
+                WHEN l_score >= 80 THEN
+                    l_new_status := 'OPEN';
+                WHEN l_score >= 40 THEN
+                    l_new_status := 'HOLD';
+                ELSE
+                    l_new_status := 'NEW';
+            END CASE;
             l_sql := q'[
 MERGE INTO fmtx_unit t
 USING (
@@ -362,17 +362,17 @@ USING (
             l_ids (p_pos) := p_row.id;
             l_marks (p_pos) := l_new_status || ':' || TO_CHAR (l_score, 'FM9999990.00');
             l_total := l_total + l_score;
-    EXCEPTION
-        WHEN e_deadlock THEN
-            ROLLBACK TO sp_apply_one;
-            AUDIT ('DEADLOCK', 'deadlock for id=' || p_row.id);
-            RAISE;
-        WHEN OTHERS THEN
-            ROLLBACK TO sp_apply_one;
-            AUDIT ('ROW_ERROR', 'apply_one failed for id=' || p_row.id || ': ' || SQLERRM);
-            IF l_mode = 'STRICT' THEN
+        EXCEPTION
+            WHEN e_deadlock THEN
+                ROLLBACK TO sp_apply_one;
+                AUDIT ('DEADLOCK', 'deadlock for id=' || p_row.id);
                 RAISE;
-            END IF;
+            WHEN OTHERS THEN
+                ROLLBACK TO sp_apply_one;
+                AUDIT ('ROW_ERROR', 'apply_one failed for id=' || p_row.id || ': ' || SQLERRM);
+                IF l_mode = 'STRICT' THEN
+                    RAISE;
+                END IF;
         END apply_one;
     BEGIN
         ensure_mode;
@@ -442,92 +442,82 @@ USING (
             ]'
             INTO l_count USING p_root_id;
             AUDIT ('SUMMARY', 'root_id=' || p_root_id || ', mode=' || l_mode || ', rows=' || l_units.COUNT || ', child_count=' || l_count || ', total=' || TO_CHAR (l_total, 'FM9999990.00'));
-    EXCEPTION
-        WHEN OTHERS THEN
-            AUDIT ('SUMMARY_ERR', 'summary failed for root_id=' || p_root_id);
-END;
-
-EXCEPTION
-    WHEN e_bad_mode THEN AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);
-
-RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);
-
-    WHEN OTHERS THEN AUDIT ('FATAL', 'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM);
-
-RAISE;
-
-END validate_and_process;
-
-----------------------------------------------------------------------------
--- orchestrator
-----------------------------------------------------------------------------
-
-PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS l_modes t_vc_aat;
-
-l_snapshot CLOB;
-
-l_done_cnt NUMBER;
-
-l_open_cnt NUMBER;
-
-l_hold_cnt NUMBER;
-
-PROCEDURE add_line (p_target IN OUT NOCOPY CLOB, p_line IN VARCHAR2) IS
-BEGIN
-    p_target := p_target || p_line || CHR (10);
-END add_line;
-
-BEGIN
-    p_text := TO_CLOB ('');
-    l_modes (1) := 'NORMAL';
-    l_modes (2) := 'AGGRESSIVE';
-    l_modes (3) := 'DRYRUN';
-    FOR i IN 1..l_modes.COUNT LOOP
-        BEGIN
-            add_line (p_text, '=== MODE ' || l_modes (i) || ' START ===');
-            validate_and_process (p_root_id => p_root_id, p_mode => l_modes (i));
-            l_snapshot := render_snapshot (p_root_id);
-            add_line (p_text, DBMS_LOB.SUBSTR (l_snapshot, 32767, 1));
-            add_line (p_text, '=== MODE ' || l_modes (i) || ' END ===');
         EXCEPTION
             WHEN OTHERS THEN
-                add_line (p_text, 'MODE ' || l_modes (i) || ' ERROR: ' || SQLERRM);
+                AUDIT ('SUMMARY_ERR', 'summary failed for root_id=' || p_root_id);
         END;
-    END LOOP;
-    <<summary_block>>
+    EXCEPTION
+        WHEN e_bad_mode THEN
+            AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);
+            RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);
+        WHEN OTHERS THEN
+            AUDIT ('FATAL', 'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM);
+            RAISE;
+    END validate_and_process;
+
+    ----------------------------------------------------------------------------
+    -- orchestrator
+    ----------------------------------------------------------------------------
+    PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS
+        l_modes t_vc_aat;
+        l_snapshot CLOB;
+        l_done_cnt NUMBER;
+        l_open_cnt NUMBER;
+        l_hold_cnt NUMBER;
+        PROCEDURE add_line (p_target IN OUT NOCOPY CLOB, p_line IN VARCHAR2) IS
+        BEGIN
+            p_target := p_target || p_line || CHR (10);
+        END add_line;
     BEGIN
-        SELECT SUM (
-                CASE
-                    WHEN status = 'DONE' THEN 1
-                    ELSE 0
-                END
-            ),
-            SUM (
-                CASE
-                    WHEN status = 'OPEN' THEN 1
-                    ELSE 0
-                END
-            ),
-            SUM (
-                CASE
-                    WHEN status = 'HOLD' THEN 1
-                    ELSE 0
-                END
-            )
-        INTO l_done_cnt,
-            l_open_cnt,
-            l_hold_cnt
-        FROM fmtx_unit;
-        add_line (p_text, 'FINAL SUMMARY => DONE=' || NVL (l_done_cnt, 0) || ', OPEN=' || NVL (l_open_cnt, 0) || ', HOLD=' || NVL (l_hold_cnt, 0));
+        p_text := TO_CLOB ('');
+        l_modes (1) := 'NORMAL';
+        l_modes (2) := 'AGGRESSIVE';
+        l_modes (3) := 'DRYRUN';
+        FOR i IN 1..l_modes.COUNT LOOP
+            BEGIN
+                add_line (p_text, '=== MODE ' || l_modes (i) || ' START ===');
+                validate_and_process (p_root_id => p_root_id, p_mode => l_modes (i));
+                l_snapshot := render_snapshot (p_root_id);
+                add_line (p_text, DBMS_LOB.SUBSTR (l_snapshot, 32767, 1));
+                add_line (p_text, '=== MODE ' || l_modes (i) || ' END ===');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    add_line (p_text, 'MODE ' || l_modes (i) || ' ERROR: ' || SQLERRM);
+            END;
+        END LOOP;
+        <<summary_block>>
+        BEGIN
+            SELECT SUM (
+                    CASE
+                        WHEN status = 'DONE' THEN 1
+                        ELSE 0
+                    END
+                ),
+                SUM (
+                    CASE
+                        WHEN status = 'OPEN' THEN 1
+                        ELSE 0
+                    END
+                ),
+                SUM (
+                    CASE
+                        WHEN status = 'HOLD' THEN 1
+                        ELSE 0
+                    END
+                )
+            INTO l_done_cnt,
+                l_open_cnt,
+                l_hold_cnt
+            FROM fmtx_unit;
+            add_line (p_text, 'FINAL SUMMARY => DONE=' || NVL (l_done_cnt, 0) || ', OPEN=' || NVL (l_open_cnt, 0) || ', HOLD=' || NVL (l_hold_cnt, 0));
+        EXCEPTION
+            WHEN OTHERS THEN
+                add_line (p_text, 'FINAL SUMMARY ERROR');
+        END summary_block;
     EXCEPTION
         WHEN OTHERS THEN
-            add_line (p_text, 'FINAL SUMMARY ERROR');
-    END summary_block;
-EXCEPTION
-    WHEN OTHERS THEN
-        p_text := 'RUN_EXTREME_ERROR: ' || SQLERRM;
-END run_extreme;
-
+            p_text := 'RUN_EXTREME_ERROR: ' || SQLERRM;
+    END run_extreme;
 BEGIN
     g_last_mode :=
     CASE

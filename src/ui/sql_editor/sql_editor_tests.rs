@@ -251,6 +251,30 @@ fn format_sql_select_hint_comment_is_idempotent() {
 }
 
 #[test]
+fn format_sql_cte_select_hint_keeps_following_columns_indented() {
+    let input = r#"WITH sales_ranked AS (
+SELECT
+/*+ MATERIALIZE */
+e.emp_id,
+e.emp_name,
+d.dept_name
+FROM qt_emp e
+JOIN qt_dept d
+ON d.dept_id = e.dept_id
+)
+SELECT *
+FROM sales_ranked;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("    SELECT /*+ MATERIALIZE */\n        e.emp_id,"),
+        "CTE SELECT hint should preserve select-list indentation, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_mega_torture_script() {
     let input = load_test_file("mega_torture.txt");
     let formatted = SqlEditorWidget::format_sql_basic(&input);
@@ -2278,7 +2302,7 @@ END;
     );
     assert!(
         formatted.contains(
-            "    BEGIN\n        g_state :=\n        CASE\n            WHEN g_state IS NULL THEN\n                'BOOT'\n            ELSE\n                g_state || '_READY'\n        END;\nEND fmt_nested_pkg;\n/\n\nDECLARE"
+            "BEGIN\n    g_state :=\n    CASE\n        WHEN g_state IS NULL THEN\n            'BOOT'\n        ELSE\n            g_state || '_READY'\n    END;\nEND fmt_nested_pkg;\n/\n\nDECLARE"
         ),
         "package body initializer should close on package END and preserve following anonymous block, got: {formatted}"
     );
@@ -3353,7 +3377,7 @@ SELECT audit_id,
     );
     assert!(
         formatted.contains(
-            "END run_extreme;\n    BEGIN\n        g_last_mode :="
+            "END run_extreme;\nBEGIN\n    g_last_mode :="
         ),
         "package initializer BEGIN should recover to package-body top level after the last member END, got: {formatted}"
     );
