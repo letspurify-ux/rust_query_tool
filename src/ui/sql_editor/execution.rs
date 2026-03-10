@@ -269,6 +269,14 @@ enum TriggerHeaderState {
     InHeader,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommentAttachment {
+    Previous,
+    Next,
+    Block,
+    FileHeader,
+}
+
 impl TriggerHeaderState {
     fn is_active(self) -> bool {
         matches!(self, Self::InHeader)
@@ -917,6 +925,31 @@ impl SqlEditorWidget {
             }
         }
         false
+    }
+
+    fn classify_comment_attachment(
+        out: &str,
+        at_line_start: bool,
+        has_leading_newline: bool,
+        is_multiline_block_comment: bool,
+    ) -> CommentAttachment {
+        if out.trim().is_empty() {
+            return CommentAttachment::FileHeader;
+        }
+
+        if has_leading_newline {
+            return CommentAttachment::Next;
+        }
+
+        if at_line_start {
+            if is_multiline_block_comment {
+                CommentAttachment::Block
+            } else {
+                CommentAttachment::Next
+            }
+        } else {
+            CommentAttachment::Previous
+        }
     }
 
     fn format_tool_command(command: &ToolCommand) -> String {
@@ -1916,15 +1949,24 @@ impl SqlEditorWidget {
                     if started_line {}
                 }
                 SqlToken::Comment(comment) => {
-                    let has_leading_newline = comment.starts_with('\n');
-                    let comment_body = if has_leading_newline {
+                    let mut has_leading_newline = comment.starts_with('\n');
+                    let raw_comment_body = if has_leading_newline {
                         &comment[1..]
                     } else {
                         comment.as_str()
                     };
-                    let trimmed_comment = comment_body.trim_end_matches('\n');
+                    let trimmed_comment = raw_comment_body.trim_end_matches('\n');
                     let is_block_comment =
                         trimmed_comment.starts_with("/*") && trimmed_comment.ends_with("*/");
+                    let is_hint_comment = trimmed_comment.starts_with("/*+");
+                    if is_hint_comment && matches!(prev_word_upper.as_deref(), Some("SELECT")) {
+                        has_leading_newline = false;
+                    }
+                    let comment_body = if has_leading_newline {
+                        &comment[1..]
+                    } else {
+                        raw_comment_body
+                    };
                     let is_multiline_block_comment = is_block_comment && comment_body.contains('\n');
                     let next_is_word_like = matches!(
                         tokens.get(idx + 1),
@@ -1933,11 +1975,21 @@ impl SqlEditorWidget {
                     let in_select_list = matches!(current_clause.as_deref(), Some("SELECT"));
                     let top_level_select_list =
                         in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
-                    if top_level_select_list && !has_leading_newline {
+                    if top_level_select_list && !has_leading_newline && !is_hint_comment {
                         force_select_list_newline(&mut out, &mut select_list_layout_state);
                     }
 
-                    if is_multiline_block_comment && !at_line_start {
+                    let attachment = Self::classify_comment_attachment(
+                        &out,
+                        at_line_start,
+                        has_leading_newline,
+                        is_multiline_block_comment,
+                    );
+
+                    if is_multiline_block_comment
+                        && !at_line_start
+                        && !matches!(attachment, CommentAttachment::Previous)
+                    {
                         newline_with(
                             &mut out,
                             0,
@@ -1948,7 +2000,9 @@ impl SqlEditorWidget {
                         );
                     }
 
-                    if has_leading_newline {
+                    if matches!(attachment, CommentAttachment::Next | CommentAttachment::Block)
+                        && has_leading_newline
+                    {
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -1957,17 +2011,13 @@ impl SqlEditorWidget {
                             &mut needs_space,
                             &mut line_indent,
                         );
-                    } else if !at_line_start {
+                    } else if matches!(attachment, CommentAttachment::Previous) && !at_line_start {
                         out.push(' ');
                     }
 
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
-                        let base = if is_multiline_block_comment {
-                            0
-                        } else {
-                            base_indent(indent_level, open_cursor_state)
-                        };
+                        let base = base_indent(indent_level, open_cursor_state);
                         let current_select_indent = base + 1;
                         if has_leading_newline {
                             line_indent =
@@ -1994,8 +2044,6 @@ impl SqlEditorWidget {
 
                     let output_comment = if comment_body.trim_start().starts_with("--") {
                         comment_body.to_string()
-                    } else if Self::is_sqlplus_comment_line(comment_body) {
-                        comment_body.to_uppercase()
                     } else {
                         comment_body.to_string()
                     };
@@ -2111,18 +2159,26 @@ impl SqlEditorWidget {
                             if should_reset_paren_tracking {
                                 select_list_break_state.clear();
                             }
-                            newline_with(
-                                &mut out,
-                                indent_level,
-                                0,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
+                            let next_is_inline_line_comment = matches!(
+                                tokens.get(idx + 1),
+                                Some(SqlToken::Comment(comment))
+                                    if !comment.starts_with('\n')
+                                        && comment.trim_start().starts_with("--")
                             );
-                            if indent_level == 0 {
-                                out.push('\n');
-                                at_line_start = true;
-                                needs_space = false;
+                            if !next_is_inline_line_comment {
+                                newline_with(
+                                    &mut out,
+                                    indent_level,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                                if indent_level == 0 {
+                                    out.push('\n');
+                                    at_line_start = true;
+                                    needs_space = false;
+                                }
                             }
                         }
                         "(" => {
@@ -10096,6 +10152,84 @@ FROM DUAL"
         assert!(formatted.contains("REMARK Keep;This;Too"), "{}", formatted);
         assert!(formatted.contains("SELECT 1\nFROM DUAL;"), "{}", formatted);
     }
+
+    #[test]
+    fn format_sql_basic_preserves_comment_attachment_depth_and_hint_layout() {
+        let sql = r#"-- file header keep
+CREATE OR REPLACE PACKAGE pkg AS
+-- package line comment
+PROCEDURE p;
+END pkg;
+/
+
+CREATE OR REPLACE TRIGGER trg
+BEFORE INSERT ON t
+BEGIN
+-- before if
+IF :NEW.id IS NULL THEN
+-- if branch
+:NEW.id := 1; -- inline   keep    spacing
+ELSIF :NEW.id < 0 THEN
+/* commented-out code
+SELECT *
+FROM dual;
+*/
+:NEW.id := 0;
+ELSE
+CASE WHEN :NEW.flag = 'Y' THEN
+NULL;
+END CASE;
+END IF;
+FOR i IN 1..2 LOOP
+-- in loop
+NULL;
+END LOOP;
+EXCEPTION
+WHEN OTHERS THEN
+-- in exception
+NULL;
+END;
+/
+SELECT /*+ INDEX(t idx_t) */ col -- inline tail keep
+FROM t;
+/* block
+  layout
+    keep
+*/
+"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.starts_with("-- file header keep\n"), "{}", formatted);
+        assert!(formatted.contains("    -- before if"), "{}", formatted);
+        assert!(formatted.contains("        -- if branch"), "{}", formatted);
+        assert!(formatted.contains("        -- in loop"), "{}", formatted);
+        assert!(formatted.contains("        -- in exception"), "{}", formatted);
+        assert!(formatted.contains(":= 1; -- inline   keep    spacing"), "{}", formatted);
+        assert!(
+            formatted.contains("/* commented-out code\nSELECT *\nFROM dual;\n*/"),
+            "{}",
+            formatted
+        );
+        assert!(formatted.contains("/*+ INDEX(t idx_t) */"), "{}", formatted);
+        assert!(formatted.contains("col -- inline tail keep"), "{}", formatted);
+        assert!(
+            formatted.contains("/* block\n  layout\n    keep\n*/"),
+            "{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_oracle_hint_position_in_case_expression() {
+        let sql = "SELECT CASE /*+ NO_EXPAND */ WHEN a = 1 THEN b ELSE c END -- keep\nFROM t";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(formatted.contains("/*+ NO_EXPAND */"), "{}", formatted);
+        assert!(formatted.contains("END -- keep"), "{}", formatted);
+    }
+
 
     #[test]
     fn format_tool_command_accept_escapes_single_quote_prompt() {
