@@ -1925,6 +1925,7 @@ impl SqlEditorWidget {
                     let trimmed_comment = comment_body.trim_end_matches('\n');
                     let is_block_comment =
                         trimmed_comment.starts_with("/*") && trimmed_comment.ends_with("*/");
+                    let is_multiline_block_comment = is_block_comment && comment_body.contains('\n');
                     let next_is_word_like = matches!(
                         tokens.get(idx + 1),
                         Some(SqlToken::Word(_) | SqlToken::String(_))
@@ -1934,6 +1935,17 @@ impl SqlEditorWidget {
                         in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     if top_level_select_list && !has_leading_newline {
                         force_select_list_newline(&mut out, &mut select_list_layout_state);
+                    }
+
+                    if is_multiline_block_comment && !at_line_start {
+                        newline_with(
+                            &mut out,
+                            0,
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     }
 
                     if has_leading_newline {
@@ -1951,7 +1963,11 @@ impl SqlEditorWidget {
 
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
-                        let base = base_indent(indent_level, open_cursor_state);
+                        let base = if is_multiline_block_comment {
+                            0
+                        } else {
+                            base_indent(indent_level, open_cursor_state)
+                        };
                         let current_select_indent = base + 1;
                         if has_leading_newline {
                             line_indent =
@@ -1986,7 +2002,12 @@ impl SqlEditorWidget {
                     out.push_str(&output_comment);
 
                     needs_space = true;
-                    if comment_body.ends_with('\n') || comment_body.contains('\n') {
+                    if is_multiline_block_comment {
+                        at_line_start = true;
+                        needs_space = false;
+                        out.push('\n');
+                        line_indent = 0;
+                    } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;
                         needs_space = false;
                         if in_select_list || column_list_stack.last().copied().unwrap_or(false) {

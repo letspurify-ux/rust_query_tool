@@ -601,6 +601,35 @@ fn format_sql_preserves_newline_before_block_comment() {
 }
 
 #[test]
+fn format_sql_multiline_block_comment_is_kept_at_depth_zero() {
+    let input = "BEGIN\n/* multi\n   line\n   comment */\nSELECT 1 FROM dual;\nEND;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("\n/* multi\n   line\n   comment */\n"),
+        "multiline block comment should stay flush-left, got: {}",
+        formatted
+    );
+    assert!(
+        formatted.contains("comment */\n\n    SELECT 1\n    FROM DUAL;"),
+        "multiline block comment should be separated from following query, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_multiline_block_comment_is_separated_from_previous_query() {
+    let input = "SELECT 1 FROM dual; /* multi\nline\ncomment */ SELECT 2 FROM dual;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("FROM DUAL;\n\n/* multi\nline\ncomment */\nSELECT 2\nFROM DUAL;"),
+        "multiline block comment should not stick to surrounding queries, got: {}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_indents_select_list_item_starting_with_parenthesis() {
     let input = "SELECT (a + b) AS sum_value, c FROM dual";
     let formatted = SqlEditorWidget::format_sql_basic(input);
