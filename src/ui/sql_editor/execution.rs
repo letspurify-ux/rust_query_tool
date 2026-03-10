@@ -624,11 +624,21 @@ impl SqlEditorWidget {
         }
 
         let comment_text = trimmed.get(comment_start..comment_end)?;
-        if !comment_text.ends_with(';') {
+        let semicolon_offset = comment_text
+            .char_indices()
+            .rev()
+            .find_map(|(idx, ch)| match ch {
+                ';' => Some(idx),
+                ch if ch.is_whitespace() => None,
+                _ => Some(comment_text.len()),
+            })?;
+        if semicolon_offset == comment_text.len() {
             return None;
         }
 
-        Some((comment_end - 1, comment_end))
+        let semicolon_start = comment_start + semicolon_offset;
+        let semicolon_end = semicolon_start + ';'.len_utf8();
+        Some((semicolon_start, semicolon_end))
     }
 
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
@@ -10176,6 +10186,34 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Statement terminator should stay absent, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_semicolon_before_trailing_comment_with_spaces() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+        let formatted = "SELECT 1\nFROM DUAL; -- trailing note   ".to_string();
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved,
+            "SELECT 1\nFROM DUAL -- trailing note   ",
+            "Inserted semicolon before trailing line comment should be removed even with trailing spaces, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_semicolon_before_trailing_comment_with_non_ascii() {
+        let source = "SELECT 1 FROM dual -- 한글 주석";
+        let formatted = "SELECT 1\nFROM DUAL; -- 한글 주석".to_string();
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert_eq!(
+            preserved,
+            "SELECT 1\nFROM DUAL -- 한글 주석",
+            "Inserted semicolon before non-ASCII trailing comment should be removed, got:\n{}",
             preserved
         );
     }
