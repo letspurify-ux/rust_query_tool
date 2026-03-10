@@ -839,6 +839,10 @@ impl PopupState {
 impl IntellisensePopup {
     const POPUP_PAGE_STEP: i32 = 10;
 
+    fn is_deleted(&self) -> bool {
+        self.window.was_deleted() || self.browser.was_deleted()
+    }
+
     fn next_page_selection(current: i32, count: i32) -> Option<i32> {
         if count <= 0 {
             return None;
@@ -984,6 +988,14 @@ impl IntellisensePopup {
     }
 
     pub fn show_suggestions(&mut self, suggestions: Vec<String>, x: i32, y: i32) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
         if suggestions.is_empty() {
             self.hide();
             return;
@@ -1006,6 +1018,14 @@ impl IntellisensePopup {
     }
 
     fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
         let suggestion_count = suggestions.len();
         if suggestion_count == 0 {
             self.hide();
@@ -1040,6 +1060,14 @@ impl IntellisensePopup {
     }
 
     pub fn filter_visible_suggestions_by_prefix(&mut self, prefix: &str) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
         if !self.is_visible() {
             return;
         }
@@ -1067,6 +1095,14 @@ impl IntellisensePopup {
     }
 
     pub fn hide(&mut self) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
         self.window.hide();
         self.window.resize(0, 0, 0, 0);
         *self
@@ -1076,9 +1112,16 @@ impl IntellisensePopup {
     }
 
     pub fn clear_for_close(&mut self) {
-        self.hide();
-        self.browser.set_callback(|_| {});
-        self.browser.clear();
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+        } else {
+            self.hide();
+            self.browser.set_callback(|_| {});
+            self.browser.clear();
+        }
         self.suggestions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1094,6 +1137,14 @@ impl IntellisensePopup {
     }
 
     pub fn delete_for_close(&mut self) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
         self.clear_for_close();
         if !self.window.was_deleted() {
             Window::delete(self.window.clone());
@@ -1101,6 +1152,10 @@ impl IntellisensePopup {
     }
 
     pub fn is_visible(&self) -> bool {
+        if self.is_deleted() {
+            return false;
+        }
+
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1108,14 +1163,26 @@ impl IntellisensePopup {
     }
 
     pub fn popup_dimensions(&self) -> (i32, i32) {
+        if self.is_deleted() {
+            return (0, 0);
+        }
+
         (self.window.w(), self.window.h())
     }
 
     pub fn set_position(&mut self, x: i32, y: i32) {
+        if self.is_deleted() {
+            return;
+        }
+
         self.window.set_pos(x, y);
     }
 
     pub fn contains_point(&self, x: i32, y: i32) -> bool {
+        if self.is_deleted() {
+            return false;
+        }
+
         let left = self.window.x();
         let top = self.window.y();
         let right = left + self.window.w();
@@ -1134,6 +1201,10 @@ impl IntellisensePopup {
     }
 
     pub fn select_next(&mut self) {
+        if self.is_deleted() {
+            return;
+        }
+
         let current = self.browser.value();
         let count = self.browser.size();
         if current < count {
@@ -1142,6 +1213,10 @@ impl IntellisensePopup {
     }
 
     pub fn select_prev(&mut self) {
+        if self.is_deleted() {
+            return;
+        }
+
         let current = self.browser.value();
         if current > 1 {
             self.browser.select(current - 1);
@@ -1149,6 +1224,10 @@ impl IntellisensePopup {
     }
 
     pub fn select_next_page(&mut self) {
+        if self.is_deleted() {
+            return;
+        }
+
         let count = self.browser.size();
         let current = self.browser.value();
         if let Some(next) = Self::next_page_selection(current, count) {
@@ -1157,6 +1236,10 @@ impl IntellisensePopup {
     }
 
     pub fn select_prev_page(&mut self) {
+        if self.is_deleted() {
+            return;
+        }
+
         let count = self.browser.size();
         let current = self.browser.value();
         if let Some(prev) = Self::prev_page_selection(current, count) {
@@ -1165,6 +1248,10 @@ impl IntellisensePopup {
     }
 
     pub fn get_selected(&self) -> Option<String> {
+        if self.is_deleted() {
+            return None;
+        }
+
         let selected = self.browser.value();
         if selected > 0 {
             self.suggestions
