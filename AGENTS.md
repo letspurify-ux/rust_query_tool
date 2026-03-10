@@ -1,6 +1,6 @@
 # AGENTS.md — SPACE Query 에이전트 작업 표준
 
-> 최종 업데이트: 2026-02-21 (코드베이스 빠른 맵을 현재 디렉토리 구조로 현행화)  
+> 최종 업데이트: 2026-03-10 (코드베이스 빠른 맵을 현재 디렉토리 구조로 현행화)  
 > 적용 범위: 이 파일이 위치한 디렉터리(저장소 루트) 전체
 
 이 문서는 SPACE Query 저장소에서 작업하는 에이전트의 **실행 기준**입니다.  
@@ -64,33 +64,68 @@
 ```text
 src/
 ├── app.rs
+├── lib.rs
 ├── main.rs
 ├── sql_text.rs
+├── sql_parser_engine/
+│   ├── mod.rs
+│   ├── engine.rs
+│   ├── state.rs
+│   ├── boundary.rs
+│   └── tests.rs
 ├── db/
 │   ├── mod.rs
 │   ├── connection.rs
 │   ├── session.rs
 │   └── query/
+│       ├── mod.rs
 │       ├── executor.rs
 │       ├── query_tests.rs
 │       ├── script.rs
 │       └── types.rs
 ├── ui/
 │   ├── mod.rs
+│   ├── constants.rs
 │   ├── menu.rs
 │   ├── main_window.rs
+│   ├── connection_dialog.rs
+│   ├── find_replace.rs
+│   ├── font_settings.rs
+│   ├── log_viewer.rs
+│   ├── query_history.rs
 │   ├── query_tabs.rs
+│   ├── result_tabs.rs
 │   ├── result_table.rs
 │   ├── object_browser.rs
+│   ├── settings_dialog.rs
+│   ├── sql_depth.rs
+│   ├── syntax_highlight.rs
+│   ├── syntax_highlight/
+│   │   └── syntax_highlight_tests.rs
+│   ├── theme.rs
 │   ├── intellisense.rs
 │   ├── intellisense_context.rs
+│   ├── intellisense_context/
+│   │   └── tests.rs
 │   ├── sql_editor/
 │   │   ├── dba_tools.rs
 │   │   ├── execution.rs
-│   │   ├── intellisense.rs
+│   │   ├── highlighting.rs
+│   │   ├── intellisense_host.rs
+│   │   ├── intellisense_state.rs
+│   │   ├── intellisense/
+│   │   │   ├── mod.rs
+│   │   │   ├── completion.rs
+│   │   │   ├── context.rs
+│   │   │   ├── helpers.rs
+│   │   │   ├── popup.rs
+│   │   │   ├── runtime.rs
+│   │   │   └── tests.rs
+│   │   ├── mod.rs
 │   │   ├── session_monitor.rs
-│   │   └── query_text.rs
-│   └── ...
+│   │   ├── query_text.rs
+│   │   ├── sql_editor_tests.rs
+│   │   └── undo_history.rs
 └── utils/
     ├── mod.rs
     ├── config.rs
