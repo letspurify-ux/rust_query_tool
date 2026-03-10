@@ -600,6 +600,7 @@ impl SqlEditorWidget {
                     continue;
                 }
                 SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
                 SqlToken::Symbol(sym) if sym == ";" => {
                     semicolon_span = Some((span.start, span.end));
                     break;
@@ -920,6 +921,7 @@ impl SqlEditorWidget {
         for token in tokens.iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
                 SqlToken::Symbol(sym) if sym == ";" => return true,
                 _ => return false,
             }
@@ -10256,6 +10258,60 @@ FROM t;
         });
 
         assert_eq!(rendered, "ACCEPT v_name PROMPT 'Owner''s value?'");
+    }
+
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_terminator() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual;
+/"
+        ));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_sqlplus_slash() {
+        let source = "BEGIN
+  NULL;
+END
+/";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("END
+/"),
+            "Formatter should not keep an inserted semicolon before SQL*Plus slash terminator when source had none, got:
+{}",
+            preserved
+        );
+        assert!(
+            !preserved.contains("END;
+/"),
+            "Inserted semicolon before SQL*Plus slash terminator should be removed, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_existing_semicolon_before_sqlplus_slash() {
+        let source = "BEGIN
+  NULL;
+END;
+/";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("END;
+/"),
+            "Existing semicolon before SQL*Plus slash terminator should remain, got:
+{}",
+            preserved
+        );
     }
 
     #[test]
