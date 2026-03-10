@@ -988,7 +988,7 @@ impl SplitState {
         }
 
         if parent_closure == PlainEndParentClosure::NestedSubprogramDeclaration {
-            self.pending_subprogram_begins -= 1;
+            self.pending_subprogram_begins = self.pending_subprogram_begins.saturating_sub(1);
         }
     }
 
