@@ -588,47 +588,21 @@ impl SqlEditorWidget {
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
         let mut semicolon_span: Option<(usize, usize)> = None;
-        let mut trailing_line_comment_span: Option<(usize, usize)> = None;
-        let mut has_non_comment_token_before_trailing_comment = false;
 
         for span in spans.iter().rev() {
             match &span.token {
-                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => {
-                    if trailing_line_comment_span.is_none() {
-                        trailing_line_comment_span = Some((span.start, span.end));
-                    }
-                    continue;
-                }
+                SqlToken::Comment(comment_text) if comment_text.starts_with("--") => continue,
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == "/" => continue,
                 SqlToken::Symbol(sym) if sym == ";" => {
                     semicolon_span = Some((span.start, span.end));
                     break;
                 }
-                _ => {
-                    if trailing_line_comment_span.is_some() {
-                        has_non_comment_token_before_trailing_comment = true;
-                    }
-                    break;
-                }
+                _ => break,
             }
         }
 
-        if semicolon_span.is_some() {
-            return semicolon_span;
-        }
-
-        let (comment_start, comment_end) = trailing_line_comment_span?;
-        if !has_non_comment_token_before_trailing_comment || comment_end == comment_start {
-            return None;
-        }
-
-        let comment_text = trimmed.get(comment_start..comment_end)?;
-        if !comment_text.ends_with(';') {
-            return None;
-        }
-
-        Some((comment_end - 1, comment_end))
+        semicolon_span
     }
 
     fn remove_trailing_statement_semicolon(formatted: &str) -> Option<String> {
@@ -642,6 +616,33 @@ impl SqlEditorWidget {
         out.push_str(&formatted[..semicolon_start]);
         out.push_str(&formatted[semicolon_end..]);
         Some(out)
+    }
+
+    fn append_missing_statement_terminator(formatted_statement: &mut String) {
+        let trim_len = formatted_statement.trim_end().len();
+        if trim_len == 0 {
+            return;
+        }
+
+        let trimmed = &formatted_statement[..trim_len];
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        let insert_at = spans
+            .last()
+            .and_then(|span| match &span.token {
+                SqlToken::Comment(comment) if comment.starts_with("--") => {
+                    let mut idx = span.start;
+                    while idx > 0 {
+                        match trimmed.as_bytes().get(idx - 1) {
+                            Some(b' ' | b'\t') => idx -= 1,
+                            _ => break,
+                        }
+                    }
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .unwrap_or(trim_len);
+        formatted_statement.insert(insert_at, ';');
     }
 
     pub fn toggle_comment(&self) {
@@ -776,10 +777,11 @@ impl SqlEditorWidget {
                         select_list_break_state,
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
-                    formatted.push_str(&formatted_statement);
+                    let mut formatted_statement = formatted_statement;
                     if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
-                        formatted.push(';');
+                        Self::append_missing_statement_terminator(&mut formatted_statement);
                     }
+                    formatted.push_str(&formatted_statement);
                 }
                 FormatItem::ToolCommand(command) => {
                     formatted.push_str(&Self::format_tool_command(command));
@@ -1337,7 +1339,8 @@ impl SqlEditorWidget {
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
-                    let at_package_body_member_depth = is_package_body_statement && indent_level == 1;
+                    let at_package_body_member_depth =
+                        is_package_body_statement && indent_level == 1;
                     if upper == "END" {
                         let end_qualifier = {
                             let mut qualifier = None;
@@ -1837,7 +1840,9 @@ impl SqlEditorWidget {
 
                     if create_table_paren_expected
                         && upper == "AS"
-                        && (next_word_is("SELECT") || next_word_is("WITH") || next_word_is("VALUES"))
+                        && (next_word_is("SELECT")
+                            || next_word_is("WITH")
+                            || next_word_is("VALUES"))
                     {
                         create_table_paren_expected = false;
                     }
@@ -1974,7 +1979,8 @@ impl SqlEditorWidget {
                     } else {
                         raw_comment_body
                     };
-                    let is_multiline_block_comment = is_block_comment && comment_body.contains('\n');
+                    let is_multiline_block_comment =
+                        is_block_comment && comment_body.contains('\n');
                     let next_is_word_like = matches!(
                         tokens.get(idx + 1),
                         Some(SqlToken::Word(_) | SqlToken::String(_))
@@ -2007,8 +2013,10 @@ impl SqlEditorWidget {
                         );
                     }
 
-                    if matches!(attachment, CommentAttachment::Next | CommentAttachment::Block)
-                        && has_leading_newline
+                    if matches!(
+                        attachment,
+                        CommentAttachment::Next | CommentAttachment::Block
+                    ) && has_leading_newline
                     {
                         newline_with(
                             &mut out,
@@ -2451,8 +2459,9 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
-            let starts_paren_case_expression = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
-                && previous_line_ends_with_open_paren;
+            let starts_paren_case_expression =
+                crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
+                    && previous_line_ends_with_open_paren;
             if starts_paren_case_expression {
                 paren_case_expression_depth += 1;
             }
@@ -2527,10 +2536,11 @@ impl SqlEditorWidget {
                 let next_upper = next.to_ascii_uppercase();
                 next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE")
             });
-            let next_line_existing_indent = next_significant_line.map(|(next_idx, next_trimmed)| {
-                let next_line = lines[next_idx];
-                next_line.len().saturating_sub(next_trimmed.len()) / 4
-            });
+            let next_line_existing_indent =
+                next_significant_line.map(|(next_idx, next_trimmed)| {
+                    let next_line = lines[next_idx];
+                    next_line.len().saturating_sub(next_trimmed.len()) / 4
+                });
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
                 && !next_line_is_named_plain_end;
@@ -2548,8 +2558,7 @@ impl SqlEditorWidget {
             let existing_indent = leading_spaces / 4;
             let parser_depth = depth + extra_indent + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
-            let is_paren_case_closer =
-                pending_paren_case_closer_indent && starts_with_close_paren;
+            let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
             let paren_case_closer_extra_indent = usize::from(is_paren_case_closer);
             let parser_depth = parser_depth + paren_case_closer_extra_indent;
             let effective_depth = if force_block_depth {
@@ -2574,9 +2583,12 @@ impl SqlEditorWidget {
             } else {
                 parser_depth.max(existing_indent)
             };
-            let previous_line_is_select_hint = last_code_line_trimmed
-                .as_deref()
-                .is_some_and(|prev| prev.trim_start().to_ascii_uppercase().starts_with("SELECT /*+"));
+            let previous_line_is_select_hint =
+                last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    prev.trim_start()
+                        .to_ascii_uppercase()
+                        .starts_with("SELECT /*+")
+                });
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
@@ -2661,7 +2673,9 @@ impl SqlEditorWidget {
 
             if previous_is_plain_end && next_is_case_branch {
                 let branch_indent = next_code_line
-                    .map(|candidate| candidate.len().saturating_sub(candidate.trim_start().len()) / 4)
+                    .map(|candidate| {
+                        candidate.len().saturating_sub(candidate.trim_start().len()) / 4
+                    })
                     .unwrap_or(0);
                 out.push_str(&" ".repeat(branch_indent * 4));
                 out.push_str(trimmed);
@@ -3191,10 +3205,7 @@ impl SqlEditorWidget {
     }
 
     fn is_plsql_attribute_prefix(sym: &str, next_token: Option<&SqlToken>) -> bool {
-        sym == "%"
-            && next_token
-                .map(Self::token_is_word_like)
-                .unwrap_or(false)
+        sym == "%" && next_token.map(Self::token_is_word_like).unwrap_or(false)
     }
 
     fn join_tokens_compact(tokens: &[SqlToken]) -> String {
@@ -9008,7 +9019,8 @@ mod formatter_regression_tests {
 
     #[test]
     fn format_sql_basic_preserves_prompt_banner_lines_verbatim() {
-        let sql = "PROMPT =======================================================================\n\
+        let sql =
+            "PROMPT =======================================================================\n\
 PROMPT [END] If you saw outputs + cursor print + summary selects, parsing/execution is OK\n\
 PROMPT =======================================================================";
 
@@ -10059,6 +10071,26 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     }
 
     #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_line_comment() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; -- trailing note"),
+            "Formatter should place statement terminator before trailing line comment, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with("note;"),
+            "Formatter should not append semicolon into trailing line comment text, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_comment() {
         let source = "SELECT 1 FROM dual -- trailing note";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -10151,6 +10183,27 @@ ALTER TRIGGER trg_demo ENABLE;"#;
             "Semicolon should remain when selection already ended with semicolon before comment, got:
 {}",
             preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_extra_semicolon_into_trailing_comment_text() {
+        let source = "SELECT 1 FROM dual -- existing; comment semicolon";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; -- existing; comment semicolon"),
+            "Formatter should preserve trailing comment text while inserting SQL terminator, got:
+{}",
+            formatted
+        );
+        assert_eq!(
+            formatted.matches(';').count(),
+            2,
+            "Expected one SQL terminator + one comment semicolon only, got:
+{}",
+            formatted
         );
     }
 
@@ -10276,19 +10329,35 @@ FROM t;
 
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
-        assert!(formatted.starts_with("-- file header keep\n"), "{}", formatted);
+        assert!(
+            formatted.starts_with("-- file header keep\n"),
+            "{}",
+            formatted
+        );
         assert!(formatted.contains("    -- before if"), "{}", formatted);
         assert!(formatted.contains("        -- if branch"), "{}", formatted);
         assert!(formatted.contains("        -- in loop"), "{}", formatted);
-        assert!(formatted.contains("        -- in exception"), "{}", formatted);
-        assert!(formatted.contains(":= 1; -- inline   keep    spacing"), "{}", formatted);
+        assert!(
+            formatted.contains("        -- in exception"),
+            "{}",
+            formatted
+        );
+        assert!(
+            formatted.contains(":= 1; -- inline   keep    spacing"),
+            "{}",
+            formatted
+        );
         assert!(
             formatted.contains("/* commented-out code\nSELECT *\nFROM dual;\n*/"),
             "{}",
             formatted
         );
         assert!(formatted.contains("/*+ INDEX(t idx_t) */"), "{}", formatted);
-        assert!(formatted.contains("col -- inline tail keep"), "{}", formatted);
+        assert!(
+            formatted.contains("col -- inline tail keep"),
+            "{}",
+            formatted
+        );
         assert!(
             formatted.contains("/* block\n  layout\n    keep\n*/"),
             "{}",
@@ -10306,7 +10375,6 @@ FROM t;
         assert!(formatted.contains("END -- keep"), "{}", formatted);
     }
 
-
     #[test]
     fn format_tool_command_accept_escapes_single_quote_prompt() {
         let rendered = SqlEditorWidget::format_tool_command(&crate::db::ToolCommand::Accept {
@@ -10316,7 +10384,6 @@ FROM t;
 
         assert_eq!(rendered, "ACCEPT v_name PROMPT 'Owner''s value?'");
     }
-
 
     #[test]
     fn statement_ends_with_semicolon_recognizes_sqlplus_slash_terminator() {
@@ -10344,8 +10411,10 @@ END
             preserved
         );
         assert!(
-            !preserved.contains("END;
-/"),
+            !preserved.contains(
+                "END;
+/"
+            ),
             "Inserted semicolon before SQL*Plus slash terminator should be removed, got:
 {}",
             preserved
@@ -10363,8 +10432,10 @@ END;
         let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
 
         assert!(
-            preserved.contains("END;
-/"),
+            preserved.contains(
+                "END;
+/"
+            ),
             "Existing semicolon before SQL*Plus slash terminator should remain, got:
 {}",
             preserved
@@ -10499,18 +10570,18 @@ END;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
         assert!(
-            formatted.contains("WITH filt AS (
+            formatted.contains(
+                "WITH filt AS (
                 SELECT id
                 FROM inner_t
                 WHERE flag = 'Y'
-            )"),
+            )"
+            ),
             "CTE body inside nested subquery should indent one level deeper than WITH header, got:
 {}",
             formatted
         );
     }
-
-
 
     #[test]
     fn plsql_nested_union_subquery_keeps_consistent_depth() {
@@ -10535,21 +10606,24 @@ END;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
         assert!(
-            formatted.contains("FROM (
-                SELECT i.id"),
+            formatted.contains(
+                "FROM (
+                SELECT i.id"
+            ),
             "Nested subquery under FROM should increase depth, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains("UNION ALL
-                SELECT j.id"),
+            formatted.contains(
+                "UNION ALL
+                SELECT j.id"
+            ),
             "Set operator branch inside nested subquery should keep same nested depth, got:
 {}",
             formatted
         );
     }
-
 
     #[test]
     fn plsql_nested_with_multiple_ctes_keeps_cte_depth_aligned() {
@@ -10597,7 +10671,6 @@ END;"#;
         assert_eq!(formatted, expected);
     }
 
-
     #[test]
     fn plsql_nested_with_clause_resets_excess_manual_indent() {
         let sql = r#"BEGIN
@@ -10626,7 +10699,6 @@ END;"#;
         );
     }
 
-
     #[test]
     fn plsql_nested_with_clause_does_not_keep_two_level_extra_indent() {
         let sql = r#"BEGIN
@@ -10647,8 +10719,10 @@ END;"#;
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
         assert!(
-            formatted.contains("WHERE EXISTS (
-            WITH filt AS ("),
+            formatted.contains(
+                "WHERE EXISTS (
+            WITH filt AS ("
+            ),
             "WITH clause should not keep two-level extra indent in nested DML depth, got:
 {}",
             formatted
