@@ -1874,3 +1874,27 @@
 ### [검증]
 - `cargo test -q external_language_target_without_semicolon_splits_before_following_statement_head -- --nocapture` 통과
 - `cargo test -q -- --test-threads=1` 통과
+
+## 2026-03-10 Oracle SQL/PLSQL 포맷터 comment attachment/depth 안정화
+
+### [중] 주석을 재작성하지 않고 소속 위치/내부 레이아웃을 보존하도록 포맷터 규칙 정리
+- **배경**:
+  - 기존 포맷 경로에서 comment는 토큰 단위로 처리되지만, line/inline/block/hint 구분이 느슨해
+    일부 케이스에서 줄바꿈/들여쓰기/대문자화가 과하게 적용될 수 있었습니다.
+- **수정**:
+  - `src/ui/sql_editor/execution.rs`에 comment attachment 분류(`previous/next/block/file_header`)를 추가해
+    comment를 앞 토큰/다음 토큰/블록 시작/파일 헤더 단위로 안정적으로 배치했습니다.
+  - line comment는 현재 block depth 기준 들여쓰기를 따르되, inline comment는 앞 코드만 정렬하고
+    comment text는 그대로 유지하도록 정리했습니다.
+  - block comment는 외부 들여쓰기만 맞추고 내부 레이아웃은 변경하지 않도록 처리했습니다.
+  - Oracle hint(`/*+ ... */`)는 select-list 강제 줄바꿈 대상에서 제외해 위치 보존을 우선하도록 분리했습니다.
+  - SQL*Plus comment line(`REM`/`REMARK`) 대문자화는 제거해 원문 텍스트를 보존하도록 변경했습니다.
+
+### [테스트] 회귀 테스트 추가
+- `format_sql_basic_preserves_comment_attachment_depth_and_hint_layout`
+- `format_sql_basic_preserves_oracle_hint_position_in_case_expression`
+
+### [검증]
+- `cargo test format_sql_basic_preserves_comment_attachment_depth_and_hint_layout -- --nocapture`
+- `cargo test format_sql_basic_preserves_oracle_hint_position_in_case_expression -- --nocapture`
+- `cargo test`
