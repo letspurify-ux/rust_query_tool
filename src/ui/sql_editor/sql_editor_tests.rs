@@ -2148,7 +2148,7 @@ END;
     );
     assert!(
         formatted.contains(
-            "    BEGIN\n        g_state :=\n        CASE\n            WHEN g_state IS NULL THEN\n                'BOOT'\n            ELSE\n                g_state || '_READY'\n        END;\n    END fmt_nested_pkg;\n/\n\nDECLARE"
+            "    BEGIN\n        g_state :=\n        CASE\n            WHEN g_state IS NULL THEN\n                'BOOT'\n            ELSE\n                g_state || '_READY'\n        END;\nEND fmt_nested_pkg;\n/\n\nDECLARE"
         ),
         "package body initializer should close on package END and preserve following anonymous block, got: {formatted}"
     );
