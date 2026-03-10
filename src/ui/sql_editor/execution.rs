@@ -9705,6 +9705,29 @@ END;"#;
     }
 
     #[test]
+    fn format_sql_basic_handles_unterminated_q_quote_without_panic() {
+        let sql = "SELECT q'[unterminated FROM dual";
+        let result = std::panic::catch_unwind(|| SqlEditorWidget::format_sql_basic(sql));
+        assert!(
+            result.is_ok(),
+            "formatter should not panic on unterminated q-quote literal"
+        );
+    }
+
+    #[test]
+    fn map_cursor_after_format_clamps_mid_utf8_byte_without_panic() {
+        let source = "SELECT 한글, b FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let mid_byte = source.find('한').unwrap_or(0) + 1;
+
+        let result = std::panic::catch_unwind(|| {
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, mid_byte as i32, false)
+        });
+
+        assert!(result.is_ok(), "cursor mapping should not panic on mid-byte cursor offset");
+    }
+
+    #[test]
     fn choose_execution_error_message_prioritizes_timeout_over_cancel() {
         let message = SqlEditorWidget::choose_execution_error_message(
             true,
