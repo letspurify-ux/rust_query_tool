@@ -3678,18 +3678,18 @@ ORDER BY deptno,
 }
 
 #[test]
-fn format_sql_keeps_suppressed_comma_break_after_unbalanced_paren_semicolon() {
+fn format_sql_resets_comma_break_suppression_after_unbalanced_paren_semicolon() {
     let input = "SELECT func(a, b;\nSELECT c, d FROM dual";
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("SELECT c, d\nFROM DUAL;"),
-        "Second statement should keep its original compact SELECT-line layout, got: {}",
+        formatted.contains("SELECT c,\n    d\nFROM DUAL;"),
+        "Second statement should recover to normal SELECT-list wrapping, got: {}",
         formatted
     );
     assert!(
         !formatted.contains("SELECT\n    c,\n    d\nFROM DUAL;"),
-        "Invalid statement should not force SELECT-line break recovery pattern, got: {}",
+        "Invalid statement should not force stale recovery layout on next statement, got: {}",
         formatted
     );
 }
