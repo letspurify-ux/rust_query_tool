@@ -5,6 +5,8 @@ use fltk::{
     prelude::*,
     text::{TextBuffer, TextDisplay},
 };
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
@@ -42,6 +44,28 @@ struct ScriptOutputTab {
 }
 
 impl ResultTabsWidget {
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn invoke_change_callback(callback: &mut ResultTabsChangeCallback) {
+        let callback_result = panic::catch_unwind(AssertUnwindSafe(|| callback()));
+        if let Err(payload) = callback_result {
+            let panic_payload = Self::panic_payload_to_string(payload.as_ref());
+            crate::utils::logging::log_error(
+                "result_tabs::callback",
+                &format!("result tabs change callback panicked: {panic_payload}"),
+            );
+            eprintln!("result tabs change callback panicked: {panic_payload}");
+        }
+    }
+
     fn fire_on_change_callback(&self) {
         let mut callback = self
             .on_change_callback
@@ -49,7 +73,7 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(callback_fn) = callback.as_mut() {
-            callback_fn();
+            Self::invoke_change_callback(callback_fn);
         }
         *self
             .on_change_callback
@@ -63,7 +87,7 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(callback_fn) = callback.as_mut() {
-            callback_fn();
+            Self::invoke_change_callback(callback_fn);
         }
         *callback_ref
             .lock()
@@ -357,7 +381,9 @@ impl ResultTabsWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             script_output.group.clone()
         };
-        let _ = self.tabs.set_value(&script_group);
+        if !self.tabs.was_deleted() && !script_group.was_deleted() {
+            let _ = self.tabs.set_value(&script_group);
+        }
         self.reset_tab_strip_left_anchor();
         self.tabs.redraw();
         let script_output = self
@@ -828,7 +854,9 @@ impl ResultTabsWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .group
                 .clone();
-            let _ = self.tabs.set_value(&script_group);
+            if !self.tabs.was_deleted() && !script_group.was_deleted() {
+                let _ = self.tabs.set_value(&script_group);
+            }
         } else {
             let new_index = if index >= remaining {
                 remaining - 1
@@ -847,11 +875,15 @@ impl ResultTabsWidget {
                     .map(|tab| tab.group.clone())
             };
             if let Some(group) = group {
-                let _ = self.tabs.set_value(&group);
+                if !self.tabs.was_deleted() && !group.was_deleted() {
+                    let _ = self.tabs.set_value(&group);
+                }
             }
         }
 
-        self.tabs.redraw();
+        if !self.tabs.was_deleted() {
+            self.tabs.redraw();
+        }
         self.fire_on_change_callback();
         true
     }
@@ -863,7 +895,9 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .group
             .clone();
-        let _ = self.tabs.set_value(&script_group);
+        if !self.tabs.was_deleted() && !script_group.was_deleted() {
+            let _ = self.tabs.set_value(&script_group);
+        }
         *self
             .active_index
             .lock()
