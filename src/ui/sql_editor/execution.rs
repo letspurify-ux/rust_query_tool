@@ -2005,7 +2005,9 @@ impl SqlEditorWidget {
                     if is_multiline_block_comment {
                         at_line_start = true;
                         needs_space = false;
-                        out.push('\n');
+                        if !out.ends_with('\n') {
+                            out.push('\n');
+                        }
                         line_indent = 0;
                     } else if comment_body.ends_with('\n') || comment_body.contains('\n') {
                         at_line_start = true;

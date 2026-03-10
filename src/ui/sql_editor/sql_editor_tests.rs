@@ -611,7 +611,7 @@ fn format_sql_multiline_block_comment_is_kept_at_depth_zero() {
         formatted
     );
     assert!(
-        formatted.contains("comment */\n\n    SELECT 1\n    FROM DUAL;"),
+        formatted.contains("comment */\n    SELECT 1\n    FROM DUAL;"),
         "multiline block comment should be separated from following query, got: {}",
         formatted
     );
