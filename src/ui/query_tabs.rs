@@ -275,7 +275,7 @@ impl QueryTabsWidget {
     }
 
     pub fn close_tab(&mut self, tab_id: QueryTabId) -> bool {
-        let group = {
+        let (group, replacement_group) = {
             let mut entries = self
                 .entries
                 .lock()
@@ -284,12 +284,21 @@ impl QueryTabsWidget {
                 return false;
             };
             let group = entries.remove(index).group;
+            let replacement = entries
+                .get(index)
+                .or_else(|| index.checked_sub(1).and_then(|prev| entries.get(prev)))
+                .map(|entry| entry.group.clone());
             Self::maybe_shrink_entry_storage(&mut entries);
-            group
+            (group, replacement)
         };
 
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
+        if let Some(replacement_group) = replacement_group {
+            if !replacement_group.was_deleted() && self.tabs.find(&replacement_group) >= 0 {
+                let _ = self.tabs.set_value(&replacement_group);
+            }
+        }
         if !self.tabs.was_deleted() && self.tabs.find(&group) >= 0 {
             self.tabs.remove(&group);
         }
