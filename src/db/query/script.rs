@@ -2694,17 +2694,80 @@ impl QueryExecutor {
                 }
                 if trimmed.starts_with("/*") {
                     let mut comment = String::new();
-                    comment.push_str(line);
-                    if !trimmed.contains("*/") {
+                    let mut trailing_after_comment: Option<String> = None;
+                    let maybe_extract_trailing_command = |trailing_raw: &str| {
+                        let trailing_trimmed = trailing_raw.trim();
+                        if trailing_trimmed == "/" {
+                            return Some(trailing_trimmed.to_string());
+                        }
+
+                        if let Some(command) = Self::parse_tool_command(trailing_trimmed) {
+                            if !matches!(command, ToolCommand::Unsupported { .. }) {
+                                return Some(trailing_trimmed.to_string());
+                            }
+                        }
+
+                        None
+                    };
+
+                    if let Some(close_idx) = line.find("*/") {
+                        let close_end = close_idx + 2;
+                        comment.push_str(&line[..close_end]);
+                        let trailing_raw = &line[close_end..];
+                        if !trailing_raw.trim().is_empty() {
+                            if let Some(trailing_line) =
+                                maybe_extract_trailing_command(trailing_raw)
+                            {
+                                trailing_after_comment = Some(trailing_line);
+                            } else {
+                                comment.push_str(trailing_raw);
+                            }
+                        }
+                    } else {
+                        comment.push_str(line);
                         for next_line in lines.by_ref() {
-                            comment.push('\n');
-                            comment.push_str(next_line);
-                            if next_line.contains("*/") {
+                            if let Some(close_idx) = next_line.find("*/") {
+                                let close_end = close_idx + 2;
+                                comment.push('\n');
+                                comment.push_str(&next_line[..close_end]);
+                                let trailing_raw = &next_line[close_end..];
+                                if !trailing_raw.trim().is_empty() {
+                                    if let Some(trailing_line) =
+                                        maybe_extract_trailing_command(trailing_raw)
+                                    {
+                                        trailing_after_comment = Some(trailing_line);
+                                    } else {
+                                        comment.push_str(trailing_raw);
+                                    }
+                                }
                                 break;
                             }
+
+                            comment.push('\n');
+                            comment.push_str(next_line);
                         }
                     }
                     items.push(FormatItem::Statement(comment));
+
+                    if let Some(trailing_line) = trailing_after_comment {
+                        let trailing_trimmed = trailing_line.trim();
+                        Self::process_split_line(
+                            &trailing_line,
+                            trailing_trimmed,
+                            &mut builder,
+                            &mut sqlblanklines_enabled,
+                            &mut items,
+                            &mut add_statement,
+                            &mut |cmd: ToolCommand, raw_line: &str, items: &mut Vec<FormatItem>| {
+                                if matches!(cmd, ToolCommand::Prompt { .. }) {
+                                    items.push(FormatItem::Verbatim(raw_line.to_string()));
+                                } else {
+                                    items.push(FormatItem::ToolCommand(cmd));
+                                }
+                            },
+                            &mut |items: &mut Vec<FormatItem>, _| items.push(FormatItem::Slash),
+                        );
+                    }
                     continue;
                 }
             }
@@ -4515,8 +4578,7 @@ WHERE 1 = 1;";
             .unwrap_or(0);
 
         assert_eq!(
-            depths[close_expr_idx],
-            depths[from_dual_idx],
+            depths[close_expr_idx], depths[from_dual_idx],
             "closing scalar-expression parens must not dedent outer FROM-subquery depth"
         );
     }
@@ -4551,8 +4613,7 @@ WHERE 1 = 1;";
             .unwrap_or(0);
 
         assert_eq!(
-            depths[close_expr_idx],
-            depths[from_dual_idx],
+            depths[close_expr_idx], depths[from_dual_idx],
             "multiple non-subquery closes on same line must not over-dedent outer subquery"
         );
     }

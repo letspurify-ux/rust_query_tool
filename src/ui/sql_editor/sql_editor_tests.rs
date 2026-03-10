@@ -623,7 +623,6 @@ fn format_sql_preserves_newline_before_block_comment() {
     );
 }
 
-
 #[test]
 fn format_sql_multiline_block_comment_is_separated_from_previous_query() {
     let input = "SELECT 1 FROM dual; /* multi\nline\ncomment */ SELECT 2 FROM dual;";
@@ -632,6 +631,67 @@ fn format_sql_multiline_block_comment_is_separated_from_previous_query() {
     assert!(
         formatted.contains("FROM DUAL;\n\n/* multi\nline\ncomment */\nSELECT 2\nFROM DUAL;"),
         "multiline block comment should not stick to surrounding queries, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_sql_after_multiline_block_comment_closing_line() {
+    let input = "/* head\ncomment */ SELECT 1 FROM dual";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("/* head\ncomment */\nSELECT 1\nFROM DUAL;"),
+        "SQL after multiline block comment should be formatted as SQL, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_recognizes_prompt_after_leading_block_comment_on_same_line() {
+    let input = "/* banner */ PROMPT hello";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "/* banner */
+
+PROMPT hello"
+        ),
+        "PROMPT after leading block comment should remain SQL*Plus command, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_recognizes_slash_after_leading_block_comment_on_same_line() {
+    let input = "/* banner */ /";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "/* banner */
+/"
+        ),
+        "Slash command after leading block comment should remain separate item, got: {}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_recognizes_tool_command_after_multiline_block_comment_closing_line() {
+    let input = "/* banner
+comment */ CLEAR BREAKS";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains(
+            "/* banner
+comment */
+
+CLEAR BREAKS"
+        ),
+        "Tool command after multiline block comment should remain SQL*Plus command, got: {}",
         formatted
     );
 }
@@ -1865,9 +1925,7 @@ END test_pkg;
         "following package member declaration should not split away from its BEGIN block, got: {formatted}"
     );
     assert!(
-        formatted.contains(
-            "        DECLARE\n            v_inner NUMBER := 10;\n        BEGIN"
-        ),
+        formatted.contains("        DECLARE\n            v_inner NUMBER := 10;\n        BEGIN"),
         "nested DECLARE block should keep procedure-body indentation, got: {formatted}"
     );
     assert!(
@@ -2161,7 +2219,8 @@ END;
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("END fmt_nested_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY fmt_nested_pkg AS"),
+        formatted
+            .contains("END fmt_nested_pkg;\n/\n\nCREATE OR REPLACE PACKAGE BODY fmt_nested_pkg AS"),
         "package spec/body separator should stay intact, got: {formatted}"
     );
     assert!(
@@ -2171,9 +2230,8 @@ END;
         "nested local function should stay inside calc_value declaration depth, got: {formatted}"
     );
     assert!(
-        formatted.contains(
-            "<<validation_block>>\n        BEGIN\n            IF l_result > 100 THEN"
-        ),
+        formatted
+            .contains("<<validation_block>>\n        BEGIN\n            IF l_result > 100 THEN"),
         "labeled validation block should keep nested BEGIN depth, got: {formatted}"
     );
     assert!(
@@ -2471,9 +2529,7 @@ END torture_pkg;
         "autonomous transaction pragma should stay inside function declaration block, got: {formatted}"
     );
     assert!(
-        formatted.contains(
-            "<<outer_loop>>\n            FOR i IN 1..v_tab.COUNT LOOP"
-        ),
+        formatted.contains("<<outer_loop>>\n            FOR i IN 1..v_tab.COUNT LOOP"),
         "outer loop label should stay attached to the nested FOR loop, got: {formatted}"
     );
     assert!(
@@ -2483,9 +2539,7 @@ END torture_pkg;
         "nested DECLARE/WHILE block inside ELSE should keep procedure-body depth, got: {formatted}"
     );
     assert!(
-        formatted.contains(
-            "EXIT outer_loop WHEN v_inner = - 1;"
-        ),
+        formatted.contains("EXIT outer_loop WHEN v_inner = - 1;"),
         "labeled EXIT WHEN should stay on one line inside the nested loop, got: {formatted}"
     );
     assert!(
@@ -2501,9 +2555,7 @@ END torture_pkg;
         "FORALL block should keep DML indentation and SAVE EXCEPTIONS on the loop header, got: {formatted}"
     );
     assert!(
-        formatted.contains(
-            "FOR i IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP"
-        ),
+        formatted.contains("FOR i IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP"),
         "SQL%BULK_EXCEPTIONS cursor attributes should not be split by spaces, got: {formatted}"
     );
     assert!(
@@ -3982,18 +4034,21 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("END
+        formatted.contains(
+            "END
                 )
-                ELSE 'LOW'"),
+                ELSE 'LOW'"
+        ),
         "inner CASE close-paren should stay aligned at nested depth, got: {formatted}"
     );
     assert!(
-        formatted.contains("END
-        ) AS bucket"),
+        formatted.contains(
+            "END
+        ) AS bucket"
+        ),
         "outer CASE close-paren should stay aligned at OPEN FOR expression depth, got: {formatted}"
     );
 }
-
 
 #[test]
 fn format_sql_trigger_if_elsif_alignment_matches_expected() {
