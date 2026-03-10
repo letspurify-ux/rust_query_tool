@@ -5,6 +5,30 @@ use super::{
     SymbolRole, TimingPointState, TriggerKind, WithClauseState, WithDeclarationState,
 };
 
+
+#[test]
+fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end() {
+    let mut state = SplitState {
+        block_stack: vec![BlockKind::AsIs, BlockKind::Declare],
+        routine_is_stack: vec![RoutineFrame {
+            block_depth: 2,
+            semicolon_policy: SemicolonPolicy::ForceSplit,
+            external_clause_state: ExternalClauseState::None,
+        }],
+        pending_end: PendingEnd::End,
+        pending_subprogram_begins: 0,
+        ..SplitState::default()
+    };
+
+    state.resolve_pending_end_on_separator_with_token("");
+
+    assert_eq!(
+        state.pending_subprogram_begins, 0,
+        "malformed END sequence must not underflow nested subprogram tracking"
+    );
+    assert_eq!(state.block_depth(), 0, "plain END should still close both nested scopes");
+}
+
 #[test]
 fn semicolon_action_classifies_top_level_split() {
     let state = SplitState::default();
