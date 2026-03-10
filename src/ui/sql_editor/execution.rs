@@ -786,13 +786,7 @@ impl SqlEditorWidget {
                     select_list_break_state.clear();
                 }
                 FormatItem::Verbatim(text) => {
-                    if let Some(command) = QueryExecutor::parse_tool_command(text)
-                        .filter(|cmd| matches!(cmd, ToolCommand::Prompt { .. }))
-                    {
-                        formatted.push_str(&Self::format_tool_command(&command));
-                    } else {
-                        formatted.push_str(text);
-                    }
+                    formatted.push_str(text);
                     select_list_break_state.clear();
                 }
                 FormatItem::Slash => {
@@ -9015,6 +9009,20 @@ PROMPT =======================================================================";
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
         assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_prompt_lines_with_original_case_and_indentation() {
+        let sql = "  prompt first line\n\
+prompt second line\n\
+    PROMPT third line";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+
+        let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+        assert_eq!(formatted_again, sql);
     }
 
     #[test]
