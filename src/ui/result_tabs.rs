@@ -5,6 +5,8 @@ use fltk::{
     prelude::*,
     text::{TextBuffer, TextDisplay},
 };
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants;
@@ -42,32 +44,48 @@ struct ScriptOutputTab {
 }
 
 impl ResultTabsWidget {
-    fn fire_on_change_callback(&self) {
-        let mut callback = self
-            .on_change_callback
+    fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn invoke_change_callback(callback_ref: &Arc<Mutex<Option<ResultTabsChangeCallback>>>) {
+        let callback = callback_ref
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(callback_fn) = callback.as_mut() {
-            callback_fn();
+
+        if let Some(mut callback_fn) = callback {
+            let callback_result = panic::catch_unwind(AssertUnwindSafe(|| callback_fn()));
+            let mut slot = callback_ref
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_none() {
+                *slot = Some(callback_fn);
+            }
+
+            if let Err(payload) = callback_result {
+                let panic_payload = Self::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "result_tabs::callback",
+                    &format!("result tabs callback panicked: {panic_payload}"),
+                );
+                eprintln!("result tabs callback panicked: {panic_payload}");
+            }
         }
-        *self
-            .on_change_callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+    }
+
+    fn fire_on_change_callback(&self) {
+        Self::invoke_change_callback(&self.on_change_callback);
     }
 
     fn fire_on_change_with(callback_ref: &Arc<Mutex<Option<ResultTabsChangeCallback>>>) {
-        let mut callback = callback_ref
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(callback_fn) = callback.as_mut() {
-            callback_fn();
-        }
-        *callback_ref
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback;
+        Self::invoke_change_callback(callback_ref);
     }
 
     fn content_bounds(tabs: &Tabs) -> (i32, i32, i32, i32) {
@@ -888,5 +906,52 @@ impl ResultTabsWidget {
 impl Default for ResultTabsWidget {
     fn default() -> Self {
         Self::new(0, 0, 100, 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fire_on_change_with_restores_callback_after_panic() {
+        let callback_slot: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
+            Arc::new(Mutex::new(Some(Box::new(|| {
+                panic!("expected callback panic");
+            }))));
+
+        ResultTabsWidget::fire_on_change_with(&callback_slot);
+
+        assert!(callback_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+    }
+
+    #[test]
+    fn fire_on_change_with_can_run_again_after_panic() {
+        let runs = Arc::new(Mutex::new(0usize));
+        let runs_for_callback = runs.clone();
+        let callback_slot: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
+            Arc::new(Mutex::new(Some(Box::new(move || {
+                let mut count = runs_for_callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *count == 0 {
+                    *count = 1;
+                    panic!("expected first callback panic");
+                }
+                *count = count.saturating_add(1);
+            }))));
+
+        ResultTabsWidget::fire_on_change_with(&callback_slot);
+        ResultTabsWidget::fire_on_change_with(&callback_slot);
+
+        assert_eq!(
+            *runs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            2
+        );
     }
 }
