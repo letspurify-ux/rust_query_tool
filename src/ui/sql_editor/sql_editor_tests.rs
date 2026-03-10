@@ -126,7 +126,7 @@ fn format_sql_preserves_script_commands_and_slashes() {
         (
             "test1.txt",
             vec![
-                "PROMPT 프로시저 테스트1",
+                "Prompt 프로시저 테스트1",
                 "SET SERVEROUTPUT ON",
                 "SHOW ERRORS",
             ],
@@ -139,7 +139,7 @@ fn format_sql_preserves_script_commands_and_slashes() {
         (
             "test2.txt",
             vec![
-                "PROMPT 프로시저 테스트 4",
+                "prompt 프로시저 테스트 4",
                 "SET SERVEROUTPUT ON SIZE UNLIMITED",
                 "SHOW ERRORS PACKAGE oqt_pkg",
                 "SHOW ERRORS PACKAGE BODY oqt_pkg",
@@ -152,7 +152,7 @@ fn format_sql_preserves_script_commands_and_slashes() {
         (
             "test3.txt",
             vec![
-                "PROMPT 프로시저 테스트3",
+                "Prompt 프로시저 테스트3",
                 "SET DEFINE OFF",
                 "PROMPT === [B] Cleanup ===",
                 "SHOW ERRORS",
