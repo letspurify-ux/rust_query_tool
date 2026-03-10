@@ -1267,7 +1267,7 @@ END;"#;
     let expected = [
         "BEGIN",
         "    IF 1 = 1 THEN",
-        "        /* block comment",
+        "/* block comment",
         "still block comment */",
         "        NULL;",
         "    END IF;",
@@ -1276,6 +1276,15 @@ END;"#;
     .join("\n");
 
     assert_eq!(formatted, expected);
+}
+
+#[test]
+fn format_sql_preserves_standalone_multiline_block_comment_verbatim() {
+    let input = "/* keep\n      user indent\n\tand tabs\n*/";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert_eq!(formatted, input);
 }
 
 #[test]

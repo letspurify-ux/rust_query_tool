@@ -1162,6 +1162,10 @@ impl SqlEditorWidget {
         tokens: &[SqlToken],
         select_list_break_state_on_start: SelectListBreakState,
     ) -> String {
+        if Self::is_standalone_multiline_block_comment(statement, tokens) {
+            return statement.to_string();
+        }
+
         if Self::is_sqlplus_remark_comment_statement(statement) {
             return statement.trim().to_string();
         }
@@ -2295,6 +2299,29 @@ impl SqlEditorWidget {
 
         let is_plsql_like = Self::is_plsql_like_tokens(statement, tokens);
         Self::apply_parser_depth_indentation(out.trim_end(), is_plsql_like)
+    }
+
+    fn is_standalone_multiline_block_comment(statement: &str, tokens: &[SqlToken]) -> bool {
+        if !statement.contains('\n') || tokens.is_empty() {
+            return false;
+        }
+
+        let mut has_multiline_block_comment = false;
+        for token in tokens {
+            match token {
+                SqlToken::Comment(comment)
+                    if comment.starts_with("/*")
+                        && comment.ends_with("*/")
+                        && comment.contains('\n') =>
+                {
+                    has_multiline_block_comment = true;
+                }
+                SqlToken::Comment(_) => {}
+                _ => return false,
+            }
+        }
+
+        has_multiline_block_comment
     }
 
     fn apply_parser_depth_indentation(formatted: &str, is_plsql_like: bool) -> String {
