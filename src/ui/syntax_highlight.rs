@@ -414,18 +414,23 @@ impl SqlHighlighter {
             .unwrap_or(STYLE_DEFAULT);
 
         match prev_style {
-            // These styles never span across window boundaries.
-            // NOTE: STYLE_DATETIME_LITERAL is intentionally excluded here
-            // because an unclosed DATE/TIMESTAMP/INTERVAL literal can span a
-            // window boundary and must be re-lexed to detect InSingleQuote.
-            STYLE_DEFAULT | STYLE_KEYWORD | STYLE_FUNCTION | STYLE_NUMBER | STYLE_OPERATOR
-            | STYLE_COLUMN => return LexerState::Normal,
+            // STYLE_DATETIME_LITERAL is intentionally excluded because an
+            // unclosed DATE/TIMESTAMP/INTERVAL literal can span windows.
+            STYLE_COMMENT => return LexerState::InBlockComment,
+            STYLE_HINT => return LexerState::InHintComment,
+            STYLE_STRING => return LexerState::InSingleQuote,
+            STYLE_IDENTIFIER => return LexerState::InDoubleQuote,
             _ => {}
         }
 
         // The previous byte looks like a multi-line token (COMMENT, HINT,
         // STRING, or IDENTIFIER).  Re-lex a backward window to determine the
         // exact state.
+        // Always re-lex a bounded backward window for uncertain styles
+        // (including STYLE_DEFAULT). In windowed mode, style_buffer may still
+        // contain stale default bytes outside previously highlighted ranges.
+        // Re-probing avoids dropping comment/string continuation at viewport
+        // boundaries when the previous pass has not covered that region yet.
         let probe_start = pos.saturating_sub(STATE_PROBE_DISTANCE);
         let Some(probe_text) = buffer.text_range(probe_start as i32, pos as i32) else {
             return LexerState::Normal;
@@ -879,7 +884,18 @@ fn select_highlight_ranges(
 
     let mut ranges: Vec<(usize, usize)> = anchors
         .into_iter()
-        .map(|anchor| windowed_range_from_buffer(buffer, anchor, text_len))
+        .filter_map(|anchor| {
+            let (raw_start, raw_end) = windowed_range_from_buffer(buffer, anchor, text_len);
+            let mut start = raw_start.min(text_len);
+            let mut end = raw_end.min(text_len);
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            if start == end {
+                return None;
+            }
+            Some((start, end))
+        })
         .collect();
 
     ranges.sort_unstable_by_key(|(start, _)| *start);
