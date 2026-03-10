@@ -66,6 +66,7 @@ pub struct LoadingState {
     started_at: Instant,
     minimum_display: Duration,
     bootstrap_finished_at: Option<Instant>,
+    dismiss_requested: bool,
 }
 
 impl LoadingState {
@@ -79,6 +80,7 @@ impl LoadingState {
             started_at: Instant::now(),
             minimum_display,
             bootstrap_finished_at: None,
+            dismiss_requested: false,
         }
     }
 
@@ -93,9 +95,13 @@ impl LoadingState {
         }
     }
 
+    pub fn request_close(&mut self) {
+        self.dismiss_requested = true;
+    }
+
     pub fn stage_label(&self) -> String {
         if self.bootstrap_finished_at.is_some() && !self.should_close() {
-            "FINALIZING INTERFACE".to_string()
+            "WORKSPACE READY".to_string()
         } else {
             self.snapshot.stage.clone()
         }
@@ -104,7 +110,7 @@ impl LoadingState {
     pub fn detail_label(&self, dot_count: usize) -> String {
         let suffix = ".".repeat(dot_count.max(1));
         if self.bootstrap_finished_at.is_some() && !self.should_close() {
-            format!("Bringing workspace online{suffix}")
+            "Click anywhere to continue".to_string()
         } else {
             format!("{}{suffix}", self.snapshot.detail)
         }
@@ -127,6 +133,6 @@ impl LoadingState {
     }
 
     pub fn should_close(&self) -> bool {
-        self.bootstrap_finished_at.is_some() && self.started_at.elapsed() >= self.minimum_display
+        self.bootstrap_finished_at.is_some() && self.dismiss_requested
     }
 }

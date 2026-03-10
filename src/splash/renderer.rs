@@ -245,6 +245,7 @@ fn create_title_mask(
     screen_width: i32,
     screen_height: i32,
 ) -> Result<TitleMaskData, String> {
+    let subtitle_text = "Built with Rust";
     // Reserve extra texture margin so the GPU halo can expand beyond the glyph edges
     // without being clipped by the title texture bounds.
     let target_width = ((screen_width as f32) * 0.42).round() as i32;
@@ -262,24 +263,42 @@ fn create_title_mask(
 
     draw::set_font(Font::HelveticaBold, font_size);
     let (measured_width, measured_height) = draw::measure(title_text, false);
+    let subtitle_font_size = ((font_size as f32) * 0.24).round() as i32;
+    let subtitle_font_size = subtitle_font_size.clamp(12, 22);
+    draw::set_font(Font::Helvetica, subtitle_font_size);
+    let (subtitle_width, subtitle_height) = draw::measure(subtitle_text, false);
+    let line_gap = ((font_size as f32) * 0.18).round() as i32;
     let padding_x = (font_size as f32 * 1.20).round() as i32;
     let padding_y = (font_size as f32 * 0.88).round() as i32;
-    let texture_width = (measured_width + padding_x * 2).max(64);
-    let texture_height = (measured_height + padding_y * 2).max(64);
+    let content_width = measured_width.max(subtitle_width);
+    let texture_width = (content_width + padding_x * 2).max(64);
+    let texture_height = (measured_height + line_gap + subtitle_height + padding_y * 2).max(64);
 
     let surface = ImageSurface::new(texture_width, texture_height, false);
     ImageSurface::push_current(&surface);
     draw::set_draw_color(Color::Black);
     draw::draw_rectf(0, 0, texture_width, texture_height);
+
     draw::set_font(Font::HelveticaBold, font_size);
     draw::set_draw_color(Color::White);
     draw::draw_text2(
         title_text,
-        0,
-        0,
-        texture_width,
-        texture_height,
+        padding_x,
+        padding_y - ((font_size as f32) * 0.08).round() as i32,
+        texture_width - padding_x * 2,
+        measured_height + font_size / 4,
         Align::Center | Align::Inside,
+    );
+
+    draw::set_font(Font::Helvetica, subtitle_font_size);
+    draw::set_draw_color(Color::from_rgb(170, 176, 188));
+    draw::draw_text2(
+        subtitle_text,
+        padding_x,
+        padding_y + measured_height + line_gap,
+        texture_width - padding_x * 2,
+        subtitle_height + subtitle_font_size / 2,
+        Align::Right | Align::Inside,
     );
     ImageSurface::pop_current();
 

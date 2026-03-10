@@ -10,7 +10,7 @@ use self::renderer::GpuRenderer;
 
 use fltk::{
     app, draw,
-    enums::{Align, Color, Font, FrameType},
+    enums::{Align, Color, Event, Font, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group},
     image::RgbImage,
@@ -278,7 +278,7 @@ fn build_splash_window(
     root.begin();
 
     #[cfg(feature = "gpu-splash")]
-    let gpu_background = {
+    let mut gpu_background = {
         let mut gl_window = GlWindow::default_fill();
         gl_window.set_frame(FrameType::FlatBox);
         gl_window.set_mode(
@@ -334,6 +334,24 @@ fn build_splash_window(
     root.end();
     window.end();
 
+    let redraw_window = window.clone();
+    let redraw_panel = overlay_panel.clone();
+    install_dismiss_handler(&mut window, loading_state, &redraw_window, &redraw_panel);
+    let redraw_window = window.clone();
+    let redraw_panel = overlay_panel.clone();
+    install_dismiss_handler(
+        &mut overlay_panel,
+        loading_state,
+        &redraw_window,
+        &redraw_panel,
+    );
+    #[cfg(feature = "gpu-splash")]
+    if let Some(ref mut gl_window) = gpu_background {
+        let redraw_window = window.clone();
+        let redraw_panel = overlay_panel.clone();
+        install_dismiss_handler(gl_window, loading_state, &redraw_window, &redraw_panel);
+    }
+
     if let Some(ref group) = current_group {
         Group::set_current(Some(group));
     }
@@ -344,6 +362,29 @@ fn build_splash_window(
         #[cfg(feature = "gpu-splash")]
         gpu_background,
     }
+}
+
+fn install_dismiss_handler<W: WidgetExt + WidgetBase>(
+    widget: &mut W,
+    loading_state: &Arc<Mutex<LoadingState>>,
+    redraw_window: &Window,
+    redraw_panel: &Frame,
+) {
+    let loading_state = loading_state.clone();
+    let mut redraw_window = redraw_window.clone();
+    let mut redraw_panel = redraw_panel.clone();
+    widget.handle(move |_widget, event| match event {
+        Event::Push => {
+            match loading_state.lock() {
+                Ok(mut guard) => guard.request_close(),
+                Err(poisoned) => poisoned.into_inner().request_close(),
+            }
+            redraw_window.redraw();
+            redraw_panel.redraw();
+            true
+        }
+        _ => false,
+    });
 }
 
 fn install_overlay_panel(
