@@ -1856,6 +1856,45 @@ fn language_followed_by_double_quoted_identifier_literal_does_not_force_external
 }
 
 #[test]
+fn language_followed_by_quoted_identifier_then_name_marks_external_routine_split() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_qident_name RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"C\" NAME 'ext_lang_qident_name';");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].starts_with("CREATE OR REPLACE FUNCTION ext_lang_qident_name RETURN NUMBER"));
+    assert!(
+        statements[0].contains("AS LANGUAGE \"C\" NAME 'ext_lang_qident_name'"),
+        "first statement should keep quoted LANGUAGE target and NAME clause: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
+}
+
+#[test]
+fn language_followed_by_backtick_identifier_then_name_marks_external_routine_split() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_backtick_name RETURN NUMBER");
+    engine.process_line("AS LANGUAGE `C` NAME 'ext_lang_backtick_name';");
+    engine.process_line("SELECT 2 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0]
+        .starts_with("CREATE OR REPLACE FUNCTION ext_lang_backtick_name RETURN NUMBER"));
+    assert!(
+        statements[0].contains("AS LANGUAGE `C` NAME 'ext_lang_backtick_name'"),
+        "first statement should keep backtick LANGUAGE target and NAME clause: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 2 FROM dual".to_string());
+}
+
+#[test]
 fn nested_language_identifier_targets_do_not_force_external_split() {
     for target in ["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"] {
         let mut engine = SqlParserEngine::new();

@@ -207,6 +207,7 @@ enum ExternalClauseState {
     SawMleKeyword,
     AwaitingLanguageTargetFromExternal,
     AwaitingLanguageTargetImplicit,
+    SawImplicitQuotedLanguageTarget,
     SawImplicitLanguageTarget,
     Confirmed,
 }
@@ -364,6 +365,7 @@ impl RoutineFrame {
             if matches!(
                 self.external_clause_state,
                 ExternalClauseState::SawExternalKeyword
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
                     | ExternalClauseState::SawImplicitLanguageTarget
                     | ExternalClauseState::Confirmed
             ) {
@@ -377,6 +379,7 @@ impl RoutineFrame {
             ExternalClauseState::SawExternalKeyword
                 | ExternalClauseState::SawUsingClauseSubject
                 | ExternalClauseState::SawMleKeyword
+                | ExternalClauseState::SawImplicitQuotedLanguageTarget
         ) {
             self.external_clause_state = ExternalClauseState::None;
         }
@@ -388,7 +391,7 @@ impl RoutineFrame {
                 self.mark_external_clause();
             }
             ExternalClauseState::AwaitingLanguageTargetImplicit => {
-                self.external_clause_state = ExternalClauseState::None;
+                self.external_clause_state = ExternalClauseState::SawImplicitQuotedLanguageTarget;
             }
             _ => {}
         }
