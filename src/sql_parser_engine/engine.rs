@@ -258,6 +258,12 @@ impl SqlParserEngine {
                     .should_split_begin_after_implicit_external_semicolon(candidate_upper)
                 {
                     this.split_current_and_reset_external_boundary();
+                } else if this.state.should_split_before_new_statement_head()
+                    && sql_text::is_statement_head_keyword(candidate_upper)
+                    && !sql_text::is_external_language_clause_keyword(candidate_upper)
+                    && candidate_upper != "BEGIN"
+                {
+                    this.split_current_and_reset_external_boundary();
                 } else if candidate_upper == "BEGIN"
                     && this.state.pending_implicit_external_top_level_split
                 {

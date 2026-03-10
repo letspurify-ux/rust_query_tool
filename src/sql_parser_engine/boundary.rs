@@ -230,6 +230,18 @@ impl RoutineFrame {
             && self.semicolon_policy == SemicolonPolicy::CloseRoutineBlock
     }
 
+    fn has_pending_external_clause(self) -> bool {
+        matches!(
+            self.external_clause_state,
+            ExternalClauseState::SawExternalKeyword
+                | ExternalClauseState::SawUsingClauseSubject
+                | ExternalClauseState::SawMleKeyword
+                | ExternalClauseState::AwaitingLanguageTargetFromExternal
+                | ExternalClauseState::AwaitingLanguageTargetImplicit
+                | ExternalClauseState::SawImplicitLanguageTarget
+        )
+    }
+
     fn mark_external_clause(&mut self) {
         self.semicolon_policy = if self.block_depth == 1 {
             SemicolonPolicy::ForceSplit

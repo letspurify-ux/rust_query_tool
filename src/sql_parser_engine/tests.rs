@@ -6163,7 +6163,9 @@ fn package_body_local_nested_subprograms_keep_member_and_initializer_depths() {
     assert_eq!(engine.block_depth(), 1);
     engine.process_line("  PROCEDURE run_demo (p_seed IN NUMBER DEFAULT 3, p_result OUT CLOB) IS");
     assert_eq!(engine.block_depth(), 2);
-    engine.process_line("    PROCEDURE process_row (p_row IN t_row, p_depth IN PLS_INTEGER DEFAULT 1) IS");
+    engine.process_line(
+        "    PROCEDURE process_row (p_row IN t_row, p_depth IN PLS_INTEGER DEFAULT 1) IS",
+    );
     assert_eq!(engine.block_depth(), 3);
     engine.process_line("      PROCEDURE nested_walk (p_start IN PLS_INTEGER) IS");
     assert_eq!(engine.block_depth(), 4);
@@ -6620,6 +6622,35 @@ fn malformed_using_clause_without_target_still_splits_before_next_statement() {
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS AGGREGATE USING"));
     assert_eq!(statements[1], "SELECT 54 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_external_clause_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_external_semicolon RETURN NUMBER");
+    engine.process_line("AS EXTERNAL");
+    engine.process_line("SELECT 57 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS EXTERNAL"));
+    assert_eq!(statements[1], "SELECT 57 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_external_language_without_target_or_semicolon_splits_before_following_statement_head()
+{
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_language_target RETURN NUMBER");
+    engine.process_line("AS EXTERNAL LANGUAGE");
+    engine.process_line("SELECT 58 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS EXTERNAL LANGUAGE"));
+    assert_eq!(statements[1], "SELECT 58 FROM dual".to_string());
 }
 
 #[test]
