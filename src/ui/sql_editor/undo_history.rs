@@ -520,6 +520,7 @@ impl SqlEditorWidget {
     fn setup_word_undo_redo(&self) {
         let undo_state = self.undo_redo_state.clone();
         let applying_history_navigation = self.applying_history_navigation.clone();
+        let text_shadow = self.highlight_shadow.clone();
         let mut buffer = self.buffer.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             if ins <= 0 && del <= 0 {
@@ -533,7 +534,7 @@ impl SqlEditorWidget {
                 return;
             }
 
-            let inserted = inserted_text(buf, pos, ins);
+            let inserted = inserted_text(buf, &text_shadow, pos, ins);
             let mut state = undo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -708,8 +709,6 @@ impl SqlEditorWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *applying_navigation = false;
         }
-
-        self.refresh_highlighting();
         let cursor_pos = text.len().min(i32::MAX as usize) as i32;
         self.editor.set_insert_position(cursor_pos);
         self.editor.show_insert_position();
@@ -805,13 +804,18 @@ impl SqlEditorWidget {
     }
 }
 
-fn inserted_text(buf: &TextBuffer, pos: i32, ins: i32) -> String {
+fn inserted_text(
+    buf: &TextBuffer,
+    text_shadow: &Arc<Mutex<HighlightShadowState>>,
+    pos: i32,
+    ins: i32,
+) -> String {
     if ins <= 0 || pos < 0 {
         return String::new();
     }
 
     let insert_end = pos.saturating_add(ins).min(buf.length());
-    buf.text_range(pos, insert_end).unwrap_or_default()
+    text_buffer_access::text_range(buf, Some(text_shadow), pos, insert_end)
 }
 
 fn classify_edit_granularity(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGranularity {

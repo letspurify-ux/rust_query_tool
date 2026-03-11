@@ -1,41 +1,5 @@
 use super::*;
 
-fn windowed_range_for_test(text: &str, cursor_pos: usize) -> (usize, usize) {
-    let start_candidate = cursor_pos.saturating_sub(HIGHLIGHT_WINDOW_RADIUS);
-    let end_candidate = (cursor_pos + HIGHLIGHT_WINDOW_RADIUS).min(text.len());
-
-    let start = match text.get(..start_candidate).and_then(|s| s.rfind('\n')) {
-        Some(pos) => pos + 1,
-        None => 0,
-    };
-    let end = match text.get(end_candidate..).and_then(|s| s.find('\n')) {
-        Some(pos) => end_candidate + pos,
-        None => text.len(),
-    };
-
-    (start, end)
-}
-
-fn generate_styles_windowed_for_test(
-    highlighter: &SqlHighlighter,
-    text: &str,
-    cursor_pos: usize,
-) -> String {
-    if text.len() <= HIGHLIGHT_WINDOW_THRESHOLD {
-        return highlighter.generate_styles(text);
-    }
-
-    let cursor_pos = cursor_pos.min(text.len());
-    let (range_start, range_end) = windowed_range_for_test(text, cursor_pos);
-    let window_text = &text[range_start..range_end];
-    let window_styles = highlighter.generate_styles(window_text);
-    let mut styles: Vec<char> = vec![STYLE_DEFAULT; text.len()];
-    for (offset, style_char) in window_styles.chars().enumerate() {
-        styles[range_start + offset] = style_char;
-    }
-    styles.into_iter().collect()
-}
-
 #[test]
 fn test_number_highlighting_supports_single_decimal_point() {
     let highlighter = SqlHighlighter::new();
@@ -366,36 +330,6 @@ fn test_path_keyword_in_xmltable_remains_keyword() {
             .all(|c| c == STYLE_KEYWORD),
         "XMLTABLE PATH clause should stay keyword style"
     );
-}
-
-#[test]
-fn test_windowed_highlighting_limits_scope() {
-    let highlighter = SqlHighlighter::new();
-    let text = "SELECT col FROM table;\n".repeat(2000);
-    assert!(text.len() > HIGHLIGHT_WINDOW_THRESHOLD);
-    let cursor_pos = text.len() / 2;
-    let styles = generate_styles_windowed_for_test(&highlighter, &text, cursor_pos);
-
-    assert_eq!(styles.len(), text.len());
-
-    let (range_start, range_end) = windowed_range_for_test(&text, cursor_pos);
-    assert!(range_start > 0);
-    assert!(range_end <= text.len());
-
-    let outside_select_pos = text.find("SELECT").unwrap();
-    if outside_select_pos + 6 < range_start {
-        assert!(styles[outside_select_pos..outside_select_pos + 6]
-            .chars()
-            .all(|c| c == STYLE_DEFAULT));
-    }
-
-    let inside_select_pos = text[range_start..range_end]
-        .find("SELECT")
-        .map(|pos| range_start + pos)
-        .unwrap();
-    assert!(styles[inside_select_pos..inside_select_pos + 6]
-        .chars()
-        .all(|c| c == STYLE_KEYWORD));
 }
 
 #[test]
@@ -780,30 +714,6 @@ fn test_quoted_identifier_with_escaped_quote_is_identifier_style() {
 }
 
 #[test]
-fn test_prioritize_ranges_keeps_focus_window_when_truncating() {
-    let ranges = vec![
-        (0, 100),
-        (200, 300),
-        (400, 500),
-        (600, 700),
-        (800, 900),
-        (1000, 1100),
-        (5000, 5100),
-    ];
-    let focus_points = vec![5050];
-    let prioritized =
-        prioritize_ranges_for_focus(ranges, &focus_points, MAX_HIGHLIGHT_WINDOWS_PER_PASS);
-
-    assert_eq!(prioritized.len(), MAX_HIGHLIGHT_WINDOWS_PER_PASS);
-    assert!(
-        prioritized
-            .iter()
-            .any(|(start, end)| *start <= 5050 && 5050 <= *end),
-        "focus-adjacent range should be retained after truncation"
-    );
-}
-
-#[test]
 fn test_columns_and_relations_use_different_styles() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {
@@ -1048,13 +958,6 @@ fn test_probe_entry_state_recovers_from_stale_default_inside_comment() {
 }
 
 #[test]
-fn test_select_highlight_ranges_drops_empty_ranges_when_line_end_is_before_anchor() {
-    let text = "SELECT 1";
-    let ranges = select_highlight_ranges_for_text(text, 0, Some((3, 3)), None);
-    assert!(ranges.iter().all(|(start, end)| start < end));
-}
-
-#[test]
 fn test_probe_entry_state_clamps_mid_byte_cursor_inside_comment() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT 1; /* 한글\n계속 */";
@@ -1148,36 +1051,6 @@ fn test_probe_entry_state_recovers_long_offscreen_q_quote() {
 }
 
 #[test]
-fn test_prepare_window_requests_clamps_mid_byte_inputs_to_utf8_boundaries() {
-    let highlighter = SqlHighlighter::new();
-    let text = "SELECT '한글 문자열' FROM dual\nWHERE col = q'[값]';";
-    let mut buffer = TextBuffer::default();
-    buffer.set_text(text);
-    let mut style_buffer = TextBuffer::default();
-    style_buffer.set_text(&std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>());
-
-    let char_pos = text.find('한').unwrap_or(0);
-    let mid_byte_pos = char_pos + 1;
-    assert!(!text.is_char_boundary(mid_byte_pos));
-
-    let requests = highlighter.prepare_window_highlight_requests(
-        &buffer,
-        &style_buffer,
-        mid_byte_pos,
-        Some((mid_byte_pos, mid_byte_pos + 5)),
-        Some((mid_byte_pos, text.len())),
-    );
-
-    assert!(!requests.is_empty());
-    for request in requests {
-        assert!(text.is_char_boundary(request.start));
-        assert!(text.is_char_boundary(request.end));
-        assert!(request.start < request.end);
-        assert_eq!(request.text.len(), request.end - request.start);
-    }
-}
-
-#[test]
 fn test_incremental_highlight_inherits_comment_entry_state() {
     let highlighter = SqlHighlighter::new();
     let text = "/* open comment\nupdated text still comment */\nSELECT 1";
@@ -1186,8 +1059,8 @@ fn test_incremental_highlight_inherits_comment_entry_state() {
 
     let result = highlighter.generate_incremental_styles(IncrementalHighlightRequest {
         start,
-        text: text.to_string(),
-        previous_styles,
+        tail_text: text[start..].to_string(),
+        previous_tail_styles: previous_styles[start..].to_string(),
         entry_state: LexerState::InBlockComment,
     });
 
@@ -1212,8 +1085,8 @@ fn test_incremental_highlight_stops_when_style_tail_matches() {
     let previous_styles = highlighter.generate_styles(original);
     let result = highlighter.generate_incremental_styles(IncrementalHighlightRequest {
         start: "SELECT ".len(),
-        text: updated_text.to_string(),
-        previous_styles,
+        tail_text: updated_text["SELECT ".len()..].to_string(),
+        previous_tail_styles: previous_styles["SELECT ".len()..].to_string(),
         entry_state: LexerState::Normal,
     });
 

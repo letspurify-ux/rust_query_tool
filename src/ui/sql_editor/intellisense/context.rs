@@ -1,29 +1,18 @@
 impl SqlEditorWidget {
-    fn bounded_text_window(buffer: &TextBuffer, start: i32, end: i32) -> (String, i32) {
-        let buffer_len = buffer.length().max(0);
-        let start = start.clamp(0, buffer_len);
-        let end = end.clamp(start, buffer_len);
-        if start >= end {
-            return (String::new(), start);
-        }
-
-        if let Some(text) = buffer.text_range(start, end) {
-            return (text, start);
-        }
-
-        // Rare fallback for invalid UTF-8 boundary offsets from editor events.
-        let fallback_start = buffer.line_start(start).max(0).min(end);
-        let fallback_end = buffer.line_end(end).max(fallback_start).min(buffer_len);
-        if fallback_start < fallback_end {
-            if let Some(text) = buffer.text_range(fallback_start, fallback_end) {
-                return (text, fallback_start);
-            }
-        }
-
-        (String::new(), start)
+    fn bounded_text_window(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        start: i32,
+        end: i32,
+    ) -> (String, i32) {
+        text_buffer_access::bounded_text_window(buffer, Some(text_shadow), start, end)
     }
 
-    fn word_at_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize, usize) {
+    fn word_at_cursor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+    ) -> (String, usize, usize) {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
             return (String::new(), 0, 0);
@@ -31,7 +20,7 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_WORD_WINDOW).max(0);
         let end = (cursor_pos + INTELLISENSE_WORD_WINDOW).min(buffer_len);
-        let (text, start) = Self::bounded_text_window(buffer, start, end);
+        let (text, start) = Self::bounded_text_window(buffer, text_shadow, start, end);
         if text.is_empty() {
             let cursor = cursor_pos.max(0) as usize;
             return (String::new(), cursor, cursor);
@@ -167,15 +156,19 @@ impl SqlEditorWidget {
         }
     }
 
-    fn identifier_at_position(buffer: &TextBuffer, pos: i32) -> Option<(String, i32, i32)> {
+    fn identifier_at_position(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        pos: i32,
+    ) -> Option<(String, i32, i32)> {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
             return None;
         }
         let pos = pos.clamp(0, buffer_len);
-        let line_start = buffer.line_start(pos).max(0);
-        let line_end = buffer.line_end(pos).max(line_start);
-        let text = buffer.text_range(line_start, line_end).unwrap_or_default();
+        let line_start = text_buffer_access::line_start(buffer, Some(text_shadow), pos).max(0);
+        let line_end = text_buffer_access::line_end(buffer, Some(text_shadow), pos).max(line_start);
+        let text = text_buffer_access::text_range(buffer, Some(text_shadow), line_start, line_end);
         if text.is_empty() {
             return None;
         }
@@ -424,11 +417,16 @@ impl SqlEditorWidget {
         ))
     }
 
-    fn context_before_cursor(buffer: &TextBuffer, cursor_pos: i32) -> String {
+    fn context_before_cursor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+    ) -> String {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
-        let (window, window_start) = Self::bounded_text_window(buffer, start, cursor_pos);
+        let (window, window_start) =
+            Self::bounded_text_window(buffer, text_shadow, start, cursor_pos);
         if window.is_empty() {
             return String::new();
         }
@@ -476,7 +474,11 @@ impl SqlEditorWidget {
         Self::cursor_position(buffer, editor.insert_position())
     }
 
-    fn statement_context_with_cursor(buffer: &TextBuffer, cursor_pos: i32) -> (String, usize) {
+    fn statement_context_with_cursor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+    ) -> (String, usize) {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
             return (String::new(), 0);
@@ -484,7 +486,8 @@ impl SqlEditorWidget {
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
         let start_candidate = (cursor_pos - INTELLISENSE_STATEMENT_WINDOW).max(0);
         let end_candidate = (cursor_pos + INTELLISENSE_STATEMENT_WINDOW).min(buffer_len);
-        let (text, start) = Self::bounded_text_window(buffer, start_candidate, end_candidate);
+        let (text, start) =
+            Self::bounded_text_window(buffer, text_shadow, start_candidate, end_candidate);
         if text.is_empty() {
             return (String::new(), 0);
         }
@@ -709,7 +712,11 @@ impl SqlEditorWidget {
         }
     }
 
-    fn qualifier_before_word(buffer: &TextBuffer, word_start: usize) -> Option<String> {
+    fn qualifier_before_word(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        word_start: usize,
+    ) -> Option<String> {
         if word_start == 0 {
             return None;
         }
@@ -720,8 +727,12 @@ impl SqlEditorWidget {
         let start = word_start
             .saturating_sub(INTELLISENSE_QUALIFIER_WINDOW as usize)
             .min(word_start);
-        let (text, start) =
-            Self::bounded_text_window(buffer, start as i32, (word_start as i32).max(0));
+        let (text, start) = Self::bounded_text_window(
+            buffer,
+            text_shadow,
+            start as i32,
+            (word_start as i32).max(0),
+        );
         let mut rel_word_start = (word_start as i32 - start).max(0) as usize;
         if rel_word_start > text.len() {
             rel_word_start = text.len();
@@ -797,6 +808,7 @@ impl SqlEditorWidget {
     fn try_fast_path_intellisense_filter(
         editor: &TextEditor,
         buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         runtime: &Arc<IntellisenseRuntimeState>,
         cursor_pos: i32,
@@ -828,8 +840,8 @@ impl SqlEditorWidget {
 
         // Fast path: keep existing suggestions and just filter by the current in-range prefix.
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
-        let prefix = Self::prefix_in_completion_range(buffer, start, cursor_pos);
-        let qualifier = Self::qualifier_before_word(buffer, start);
+        let prefix = Self::prefix_in_completion_range(buffer, text_shadow, start, cursor_pos);
+        let qualifier = Self::qualifier_before_word(buffer, text_shadow, start);
         if Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key) {
             intellisense_popup
                 .lock()
@@ -958,32 +970,43 @@ impl SqlEditorWidget {
         qualifier.is_some() || Self::has_min_intellisense_prefix(word)
     }
 
-    fn prefix_in_completion_range(buffer: &TextBuffer, start: usize, cursor_pos: i32) -> String {
+    fn prefix_in_completion_range(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        start: usize,
+        cursor_pos: i32,
+    ) -> String {
         let cursor = cursor_pos.max(0) as usize;
         let end = cursor.max(start);
-        buffer
-            .text_range(start as i32, end as i32)
-            .unwrap_or_default()
+        text_buffer_access::text_range(buffer, Some(text_shadow), start as i32, end as i32)
             .chars()
             .filter(|ch| sql_text::is_identifier_char(*ch))
             .collect()
     }
 
-    fn char_before_cursor(buffer: &TextBuffer, cursor_pos: i32) -> Option<char> {
+    fn char_before_cursor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+    ) -> Option<char> {
         if cursor_pos <= 0 {
             return None;
         }
         let start = (cursor_pos - 4).max(0);
-        let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
+        let text = text_buffer_access::text_range(buffer, Some(text_shadow), start, cursor_pos);
         text.chars().next_back()
     }
 
-    fn non_whitespace_char_before_cursor(buffer: &TextBuffer, cursor_pos: i32) -> Option<char> {
+    fn non_whitespace_char_before_cursor(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+    ) -> Option<char> {
         if cursor_pos <= 0 {
             return None;
         }
         let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
-        let text = buffer.text_range(start, cursor_pos).unwrap_or_default();
+        let text = text_buffer_access::text_range(buffer, Some(text_shadow), start, cursor_pos);
         text.chars().rev().find(|ch| !ch.is_whitespace())
     }
 

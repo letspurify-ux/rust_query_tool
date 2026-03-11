@@ -1,5 +1,6 @@
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
+use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use fltk::{
     app,
@@ -439,7 +440,7 @@ impl FindReplaceDialog {
                                 search_text.clone();
                         }
                         if let Some((start, end)) = buffer.selection_position() {
-                            let selected = buffer.text_range(start, end).unwrap_or_default();
+                            let selected = text_buffer_access::text_range(&buffer, None, start, end);
                             let matches = if case_sensitive {
                                 selected == search_text
                             } else {

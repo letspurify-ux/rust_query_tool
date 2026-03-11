@@ -2,6 +2,7 @@ impl SqlEditorWidget {
     pub(super) fn trigger_intellisense(
         editor: &TextEditor,
         buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
@@ -10,11 +11,11 @@ impl SqlEditorWidget {
     ) {
         let request_generation = runtime.next_parse_generation();
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
-        let (prefix, word_start, _) = Self::word_at_cursor(buffer, cursor_pos);
-        let qualifier = Self::qualifier_before_word(buffer, word_start);
+        let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
+        let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
-            && Self::non_whitespace_char_before_cursor(buffer, cursor_pos) == Some(';');
+            && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos) == Some(';');
 
         if should_hide_after_statement_terminator {
             intellisense_popup
@@ -26,7 +27,7 @@ impl SqlEditorWidget {
         }
 
         let (statement_context_text, cursor_in_statement_raw) =
-            Self::statement_context_with_cursor(buffer, cursor_pos);
+            Self::statement_context_with_cursor(buffer, text_shadow, cursor_pos);
         let cursor_in_statement_raw =
             Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
         let (statement_text, cursor_in_statement) =
@@ -75,6 +76,7 @@ impl SqlEditorWidget {
         Self::queue_async_intellisense_parse(
             editor,
             buffer,
+            text_shadow,
             intellisense_data,
             intellisense_popup,
             column_sender,
@@ -100,6 +102,7 @@ impl SqlEditorWidget {
     fn is_intellisense_snapshot_current(
         editor: &TextEditor,
         buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         snapshot: &IntellisenseTriggerSnapshot,
     ) -> bool {
         if editor.was_deleted() {
@@ -112,7 +115,7 @@ impl SqlEditorWidget {
         }
 
         let (statement_context_text, cursor_in_statement_raw) =
-            Self::statement_context_with_cursor(buffer, cursor_pos);
+            Self::statement_context_with_cursor(buffer, text_shadow, cursor_pos);
         let cursor_in_statement_raw =
             Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
         let (statement_text, cursor_in_statement) =
@@ -262,6 +265,7 @@ impl SqlEditorWidget {
     fn queue_async_intellisense_parse(
         editor: &TextEditor,
         buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
@@ -305,7 +309,12 @@ impl SqlEditorWidget {
                 &format!("failed to spawn parse worker: {err}"),
             );
             if Self::is_intellisense_parse_generation_current(runtime, snapshot.as_ref())
-                && Self::is_intellisense_snapshot_current(editor, buffer, snapshot.as_ref())
+                && Self::is_intellisense_snapshot_current(
+                    editor,
+                    buffer,
+                    text_shadow,
+                    snapshot.as_ref(),
+                )
             {
                 Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             }
@@ -314,6 +323,7 @@ impl SqlEditorWidget {
 
         let editor_for_poll = editor.clone();
         let buffer_for_poll = buffer.clone();
+        let text_shadow_for_poll = text_shadow.clone();
         let intellisense_data_for_poll = intellisense_data.clone();
         let intellisense_popup_for_poll = intellisense_popup.clone();
         let column_sender_for_poll = column_sender.clone();
@@ -323,6 +333,7 @@ impl SqlEditorWidget {
             Self::poll_async_intellisense_parse(
                 editor_for_poll.clone(),
                 buffer_for_poll.clone(),
+                text_shadow_for_poll.clone(),
                 intellisense_data_for_poll.clone(),
                 intellisense_popup_for_poll.clone(),
                 column_sender_for_poll.clone(),
@@ -337,6 +348,7 @@ impl SqlEditorWidget {
     fn poll_async_intellisense_parse(
         editor: TextEditor,
         buffer: TextBuffer,
+        text_shadow: Arc<Mutex<HighlightShadowState>>,
         intellisense_data: Arc<Mutex<IntellisenseData>>,
         intellisense_popup: Arc<Mutex<IntellisensePopup>>,
         column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -364,7 +376,12 @@ impl SqlEditorWidget {
         match recv_result {
             Ok(Ok(parsed)) => {
                 if !Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    || !Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                    || !Self::is_intellisense_snapshot_current(
+                        &editor,
+                        &buffer,
+                        &text_shadow,
+                        snapshot.as_ref(),
+                    )
                 {
                     return;
                 }
@@ -392,7 +409,12 @@ impl SqlEditorWidget {
                     &format!("failed to parse intellisense context: {message}"),
                 );
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    && Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                    && Self::is_intellisense_snapshot_current(
+                        &editor,
+                        &buffer,
+                        &text_shadow,
+                        snapshot.as_ref(),
+                    )
                 {
                     Self::clear_intellisense_ui_state(&intellisense_popup, &runtime);
                 }
@@ -402,6 +424,7 @@ impl SqlEditorWidget {
                     Self::poll_async_intellisense_parse(
                         editor.clone(),
                         buffer.clone(),
+                        text_shadow.clone(),
                         intellisense_data.clone(),
                         intellisense_popup.clone(),
                         column_sender.clone(),
@@ -414,7 +437,12 @@ impl SqlEditorWidget {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
-                    && Self::is_intellisense_snapshot_current(&editor, &buffer, snapshot.as_ref())
+                    && Self::is_intellisense_snapshot_current(
+                        &editor,
+                        &buffer,
+                        &text_shadow,
+                        snapshot.as_ref(),
+                    )
                 {
                     Self::clear_intellisense_ui_state(&intellisense_popup, &runtime);
                 }

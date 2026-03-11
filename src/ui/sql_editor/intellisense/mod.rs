@@ -25,6 +25,7 @@ use crate::ui::intellisense::{
     detect_sql_context, get_word_at_cursor, IntellisenseData, IntellisensePopup, SqlContext,
 };
 use crate::ui::intellisense_context;
+use crate::ui::text_buffer_access;
 use crate::ui::FindReplaceDialog;
 
 use super::*;

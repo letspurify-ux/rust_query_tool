@@ -513,7 +513,6 @@ impl SqlEditorWidget {
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
-        self.refresh_highlighting();
     }
 
     fn normalize_index(text: &str, index: i32) -> usize {
@@ -659,14 +658,22 @@ impl SqlEditorWidget {
                 (end, start)
             }
         } else {
-            let line_start = buffer.line_start(original_pos);
-            let line_end = buffer.line_end(original_pos);
+            let line_start =
+                text_buffer_access::line_start(&buffer, Some(&self.highlight_shadow), original_pos);
+            let line_end =
+                text_buffer_access::line_end(&buffer, Some(&self.highlight_shadow), original_pos);
             (line_start, line_end)
         };
 
-        let line_start = buffer.line_start(start);
-        let line_end = buffer.line_end(end);
-        let text = buffer.text_range(line_start, line_end).unwrap_or_default();
+        let line_start =
+            text_buffer_access::line_start(&buffer, Some(&self.highlight_shadow), start);
+        let line_end = text_buffer_access::line_end(&buffer, Some(&self.highlight_shadow), end);
+        let text = text_buffer_access::text_range(
+            &buffer,
+            Some(&self.highlight_shadow),
+            line_start,
+            line_end,
+        );
         let ends_with_newline = text.ends_with('\n');
         let lines: Vec<&str> = text.lines().collect();
 
@@ -717,7 +724,6 @@ impl SqlEditorWidget {
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
-        self.refresh_highlighting();
     }
 
     pub fn convert_selection_case(&self, to_upper: bool) {
@@ -754,7 +760,6 @@ impl SqlEditorWidget {
         let mut editor = self.editor.clone();
         editor.set_insert_position(start + converted.len() as i32);
         editor.show_insert_position();
-        self.refresh_highlighting();
     }
 
     pub(crate) fn format_sql_basic(sql: &str) -> String {

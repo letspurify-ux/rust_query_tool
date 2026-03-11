@@ -1,5 +1,7 @@
 use super::*;
-use crate::ui::syntax_highlight::{STYLE_COMMENT, STYLE_DEFAULT, STYLE_KEYWORD, STYLE_STRING};
+use crate::ui::syntax_highlight::{
+    STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_IDENTIFIER, STYLE_KEYWORD, STYLE_STRING,
+};
 
 use std::fs;
 use std::path::PathBuf;
@@ -24,6 +26,213 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
             needle
         );
     }
+}
+
+fn apply_style_text_edit_delta_for_test(
+    style_text: &str,
+    pos: usize,
+    inserted_len: usize,
+    deleted_len: usize,
+) -> Option<String> {
+    let start = pos.min(style_text.len());
+    let delete_end = start.saturating_add(deleted_len).min(style_text.len());
+    let prefix = style_text.get(..start)?;
+    let suffix = style_text.get(delete_end..)?;
+
+    let mut updated =
+        String::with_capacity(prefix.len() + inserted_len + suffix.len());
+    updated.push_str(prefix);
+    updated.extend(std::iter::repeat_n(STYLE_DEFAULT, inserted_len));
+    updated.push_str(suffix);
+    Some(updated)
+}
+
+fn apply_incremental_highlight_for_test(
+    original_text: &str,
+    updated_text: &str,
+    pos: usize,
+    inserted_len: usize,
+    deleted_len: usize,
+) -> Option<String> {
+    let highlighter = SqlHighlighter::new();
+    let previous_styles = highlighter.generate_styles_for_text(original_text);
+    let mut adjusted_styles = apply_style_text_edit_delta_for_test(
+        &previous_styles,
+        pos,
+        inserted_len,
+        deleted_len,
+    )?;
+    let deleted_text = original_text
+        .get(pos..pos.saturating_add(deleted_len))
+        .unwrap_or_default()
+        .to_string();
+    let text_len = updated_text.len();
+    let start =
+        incremental_rehighlight_start_for_text(updated_text, pos, inserted_len, &deleted_text);
+    let must_cover_end = incremental_direct_rehighlight_end_for_text(
+        updated_text,
+        pos,
+        inserted_len,
+        deleted_len,
+    );
+    let mut current_start = start.min(text_len);
+    let mut minimum_end = must_cover_end.max(current_start);
+    let mut entry_state =
+        highlighter.probe_entry_state_for_style_text(updated_text, &adjusted_styles, current_start);
+    let mut bytes_processed = 0usize;
+    let mut lines_processed = 0usize;
+
+    while current_start < text_len {
+        let current_end =
+            incremental_line_chunk_end_for_text(updated_text, current_start, minimum_end);
+        if current_end <= current_start {
+            break;
+        }
+
+        let range_text = updated_text.get(current_start..current_end)?;
+        let previous_range_styles = adjusted_styles.get(current_start..current_end)?;
+        let old_exit_style = continuation_style_before_position_for_text(&adjusted_styles, current_end);
+        let (new_styles, new_exit_state) =
+            highlighter.generate_styles_for_window(range_text, entry_state);
+        if new_styles.len() != range_text.len() {
+            return None;
+        }
+        if new_styles != previous_range_styles {
+            adjusted_styles.replace_range(current_start..current_end, &new_styles);
+        }
+
+        bytes_processed = bytes_processed.saturating_add(current_end.saturating_sub(current_start));
+        lines_processed = lines_processed.saturating_add(
+            count_lines_in_range_for_text(updated_text, current_start, current_end).max(1),
+        );
+
+        if current_end >= must_cover_end
+            && continuation_style_for_lexer_state_for_test(new_exit_state) == old_exit_style
+        {
+            break;
+        }
+        if current_end >= text_len
+            || bytes_processed >= MAIN_THREAD_HIGHLIGHT_MAX_BYTES
+            || lines_processed >= MAIN_THREAD_HIGHLIGHT_MAX_LINES
+        {
+            break;
+        }
+
+        current_start = current_end;
+        minimum_end = current_start.saturating_add(1);
+        entry_state = new_exit_state;
+    }
+
+    Some(adjusted_styles)
+}
+
+fn line_start_for_text(text: &str, pos: usize) -> usize {
+    let clamped = pos.min(text.len());
+    let mut boundary = clamped;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.get(..boundary)
+        .and_then(|prefix| prefix.rfind('\n'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0)
+}
+
+fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
+    let clamped = pos.min(text.len());
+    let mut boundary = clamped;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.get(boundary..)
+        .and_then(|suffix| suffix.find('\n'))
+        .map(|offset| boundary + offset + 1)
+        .unwrap_or(text.len())
+}
+
+fn incremental_rehighlight_start_for_text(
+    text: &str,
+    pos: usize,
+    inserted_len: usize,
+    deleted_text: &str,
+) -> usize {
+    let mut start = line_start_for_text(text, pos);
+    let inserted_has_newline = text
+        .get(pos..pos.saturating_add(inserted_len))
+        .map(|segment| segment.contains('\n'))
+        .unwrap_or(false);
+    if start > 0 && (deleted_text.contains('\n') || inserted_has_newline) {
+        start = line_start_for_text(text, start.saturating_sub(1));
+    }
+    start
+}
+
+fn continuation_style_before_position_for_text(style_text: &str, pos: usize) -> char {
+    if pos == 0 {
+        return STYLE_DEFAULT;
+    }
+
+    match style_text.as_bytes().get(pos.saturating_sub(1)).copied().map(char::from) {
+        Some(STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT) => {
+            style_text
+                .as_bytes()
+                .get(pos.saturating_sub(1))
+                .copied()
+                .map(char::from)
+                .unwrap_or(STYLE_DEFAULT)
+        }
+        _ => STYLE_DEFAULT,
+    }
+}
+
+fn continuation_style_for_lexer_state_for_test(
+    state: crate::ui::syntax_highlight::LexerState,
+) -> char {
+    match state {
+        crate::ui::syntax_highlight::LexerState::Normal => STYLE_DEFAULT,
+        crate::ui::syntax_highlight::LexerState::InBlockComment => STYLE_COMMENT,
+        crate::ui::syntax_highlight::LexerState::InHintComment => STYLE_HINT,
+        crate::ui::syntax_highlight::LexerState::InSingleQuote
+        | crate::ui::syntax_highlight::LexerState::InQQuote { .. } => STYLE_STRING,
+        crate::ui::syntax_highlight::LexerState::InDoubleQuote => STYLE_IDENTIFIER,
+    }
+}
+
+fn incremental_direct_rehighlight_end_for_text(
+    text: &str,
+    pos: usize,
+    inserted_len: usize,
+    deleted_len: usize,
+) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let changed_end = pos
+        .saturating_add(inserted_len.max(deleted_len))
+        .min(text.len());
+    inclusive_line_end_for_text(text, changed_end)
+}
+
+fn incremental_line_chunk_end_for_text(text: &str, start: usize, minimum_end: usize) -> usize {
+    if start >= text.len() {
+        return text.len();
+    }
+    let target = minimum_end.max(start.saturating_add(1)).min(text.len());
+    if target >= text.len() {
+        return text.len();
+    }
+    if target > 0 && text.as_bytes().get(target - 1) == Some(&b'\n') {
+        return target;
+    }
+    inclusive_line_end_for_text(text, target)
+        .max(start.saturating_add(1))
+        .min(text.len())
+}
+
+fn count_lines_in_range_for_text(text: &str, start: usize, end: usize) -> usize {
+    text.get(start..end)
+        .map(|segment| segment.bytes().filter(|&byte| byte == b'\n').count())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -1101,20 +1310,6 @@ fn format_sql_where_exists_and_not_exists_layout_regression() {
 }
 
 #[test]
-fn compute_edited_range_handles_insert_delete_and_replace() {
-    assert_eq!(compute_edited_range(5, 3, 0, 20), Some((5, 8)));
-    assert_eq!(compute_edited_range(5, 0, 4, 20), Some((5, 9)));
-    assert_eq!(compute_edited_range(5, 2, 6, 20), Some((5, 11)));
-}
-
-#[test]
-fn compute_edited_range_clamps_and_handles_invalid_pos() {
-    assert_eq!(compute_edited_range(-1, 3, 0, 20), None);
-    assert_eq!(compute_edited_range(50, 3, 0, 20), Some((20, 20)));
-    assert_eq!(compute_edited_range(18, 10, 0, 20), Some((18, 20)));
-}
-
-#[test]
 fn compute_incremental_start_rewinds_to_whitespace_boundary() {
     let text = "SELECT column_name FROM dual";
     let pos = text.find("name").unwrap_or(0) as i32;
@@ -1134,36 +1329,79 @@ fn compute_incremental_start_clamps_to_utf8_boundary() {
 }
 
 #[test]
-fn has_stateful_sql_delimiter_detects_comment_and_string_tokens() {
-    assert!(has_stateful_sql_delimiter("/* comment"));
-    assert!(has_stateful_sql_delimiter("end */"));
-    assert!(has_stateful_sql_delimiter("-- line"));
-    assert!(has_stateful_sql_delimiter("'text'"));
-    assert!(has_stateful_sql_delimiter("q'[x]'"));
-    assert!(has_stateful_sql_delimiter("NQ'[x]'"));
-    assert!(!has_stateful_sql_delimiter("SELECT col FROM tab"));
-}
-
-#[test]
-fn has_stateful_sql_delimiter_treats_partial_tokens_as_safe() {
-    assert!(!has_stateful_sql_delimiter("SELECT / value"));
-    assert!(!has_stateful_sql_delimiter("SELECT - value"));
-    assert!(!has_stateful_sql_delimiter("SELECT * value"));
-}
-
-#[test]
-fn has_stateful_sql_delimiter_detects_mixed_sequence_patterns() {
-    assert!(has_stateful_sql_delimiter("a/*b"));
-    assert!(has_stateful_sql_delimiter("a*/b"));
-    assert!(has_stateful_sql_delimiter("a--b"));
-}
-
-#[test]
 fn is_string_or_comment_style_matches_only_comment_or_string() {
     assert!(is_string_or_comment_style(STYLE_COMMENT));
     assert!(is_string_or_comment_style(STYLE_STRING));
     assert!(!is_string_or_comment_style(STYLE_DEFAULT));
     assert!(!is_string_or_comment_style(STYLE_KEYWORD));
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_inserting_block_comment() {
+    let original = "SELECT 1\nvalue\nSELECT 2";
+    let insert_pos = original.find("value").unwrap_or(0);
+    let updated = format!(
+        "{}/* {}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 3, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_deleting_block_comment() {
+    let original = "SELECT 1\n/* value\nSELECT 2";
+    let delete_pos = original.find("/* ").unwrap_or(0);
+    let updated = format!(
+        "{}{}",
+        original.get(..delete_pos).unwrap_or(""),
+        original.get(delete_pos.saturating_add(3)..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, delete_pos, 0, 3)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_inserting_q_quote_prefix() {
+    let original = "SELECT body\nline]'\nFROM dual";
+    let insert_pos = original.find("body").unwrap_or(0);
+    let updated = format!(
+        "{}q'[{}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 3, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_inserting_single_quote() {
+    let original = "SELECT value\nFROM dual";
+    let insert_pos = original.find("value").unwrap_or(0);
+    let updated = format!(
+        "{}'{}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 1, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
 }
 
 #[test]

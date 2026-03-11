@@ -10,7 +10,7 @@ use fltk::{
     window::Window,
 };
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,10 +25,9 @@ use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
-    create_style_table_with, HighlightData, IncrementalHighlightRequest,
-    IncrementalHighlightResult, SqlHighlighter, WindowHighlightRequest, WindowHighlightResult,
-    STYLE_COMMENT, STYLE_STRING, WINDOWED_HIGHLIGHT_THRESHOLD,
+    create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_STRING,
 };
+use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistoryEntry};
 use oracle::Connection;
@@ -71,8 +70,6 @@ const PROGRESS_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.001;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
-const DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT: usize = 16_384;
-const VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS: f64 = 0.08;
 const EDITOR_TOP_PADDING: i32 = 4;
 const ALERT_RETRY_INTERVAL_SECONDS: f64 = 0.25;
 
@@ -270,6 +267,7 @@ pub struct SqlEditorWidget {
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
     highlighter: Arc<Mutex<SqlHighlighter>>,
+    highlight_shadow: Arc<Mutex<HighlightShadowState>>,
     timeout_input: IntInput,
     status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
     find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
@@ -282,10 +280,6 @@ pub struct SqlEditorWidget {
     applying_history_navigation: Arc<Mutex<bool>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     last_explain_plan: Arc<Mutex<Option<Vec<String>>>>,
-    highlight_result_sender: mpsc::Sender<HighlightResult>,
-    highlight_revision: Arc<AtomicU64>,
-    highlight_generation: Arc<AtomicU64>,
-    highlight_editor_id: u64,
 }
 impl SqlEditorWidget {
     fn is_main_window_visible() -> bool {
@@ -526,8 +520,6 @@ impl SqlEditorWidget {
         let (progress_sender, progress_receiver) = mpsc::channel::<QueryProgress>();
         let (column_sender, column_receiver) = mpsc::channel::<ColumnLoadUpdate>();
         let (ui_action_sender, ui_action_receiver) = mpsc::channel::<UiActionResult>();
-        let (highlight_result_sender, highlight_result_receiver) =
-            mpsc::channel::<HighlightResult>();
         let query_running = Arc::new(Mutex::new(false));
         let current_query_connection = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -535,6 +527,7 @@ impl SqlEditorWidget {
         let intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
         let intellisense_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
         let highlighter = Arc::new(Mutex::new(SqlHighlighter::new()));
+        let highlight_shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
         let status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Arc::new(Mutex::new(None));
         let find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
         let replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
@@ -547,8 +540,6 @@ impl SqlEditorWidget {
         let applying_history_navigation = Arc::new(Mutex::new(false));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let last_explain_plan = Arc::new(Mutex::new(None::<Vec<String>>));
-        let highlight_revision = Arc::new(AtomicU64::new(0));
-        let highlight_generation = Arc::new(AtomicU64::new(0));
 
         let mut widget = Self {
             group,
@@ -567,6 +558,7 @@ impl SqlEditorWidget {
             intellisense_data,
             intellisense_popup,
             highlighter,
+            highlight_shadow,
             timeout_input,
             status_callback,
             find_callback,
@@ -579,20 +571,14 @@ impl SqlEditorWidget {
             applying_history_navigation,
             undo_redo_state,
             last_explain_plan,
-            highlight_result_sender,
-            highlight_revision,
-            highlight_generation,
-            highlight_editor_id: Self::next_highlight_editor_id(),
         };
 
         widget.setup_intellisense();
         widget.setup_word_undo_redo();
         widget.setup_syntax_highlighting();
-        widget.setup_viewport_highlight_poll();
         widget.setup_progress_handler(progress_receiver, progress_callback, query_running);
         widget.setup_column_loader(column_receiver);
         widget.setup_ui_action_handler(ui_action_receiver);
-        widget.setup_highlight_worker(highlight_result_receiver);
 
         widget
     }
@@ -1448,7 +1434,6 @@ impl SqlEditorWidget {
         let style_table = create_style_table_with(profile, size);
         self.editor
             .set_highlight_data(self.style_buffer.clone(), style_table);
-        self.refresh_highlighting();
         // Force FLTK to recalculate internal display metrics (line heights,
         // character widths, scroll positions) by triggering a no-op resize.
         // Without this, the TextEditor may render with stale cached metrics
@@ -1483,7 +1468,7 @@ impl SqlEditorWidget {
         let cursor_pos = self.editor.insert_position().max(0);
 
         if selection.is_none() || selection == Some((cursor_pos, cursor_pos)) {
-            let (start, end) = Self::block_bounds(&self.buffer, cursor_pos);
+            let (start, end) = Self::block_bounds(&self.buffer, &self.highlight_shadow, cursor_pos);
             self.buffer.select(start, end);
             self.editor.set_insert_position(end);
             self.editor.show_insert_position();
@@ -1496,7 +1481,8 @@ impl SqlEditorWidget {
                 return;
             }
             let prev_pos = sel_start.saturating_sub(1);
-            let (block_start, _) = Self::block_bounds(&self.buffer, prev_pos);
+            let (block_start, _) =
+                Self::block_bounds(&self.buffer, &self.highlight_shadow, prev_pos);
             self.buffer.select(block_start, sel_end);
             self.editor.set_insert_position(block_start);
         } else {
@@ -1505,20 +1491,25 @@ impl SqlEditorWidget {
                 return;
             }
             let next_pos = (sel_end + 1).min(buffer_len.saturating_sub(1));
-            let (_, block_end) = Self::block_bounds(&self.buffer, next_pos);
+            let (_, block_end) =
+                Self::block_bounds(&self.buffer, &self.highlight_shadow, next_pos);
             self.buffer.select(sel_start, block_end);
             self.editor.set_insert_position(block_end);
         }
         self.editor.show_insert_position();
     }
 
-    fn block_bounds(buffer: &TextBuffer, pos: i32) -> (i32, i32) {
-        let mut start = buffer.line_start(pos).max(0);
-        let mut end = buffer.line_end(pos).max(start);
+    fn block_bounds(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        pos: i32,
+    ) -> (i32, i32) {
+        let mut start = text_buffer_access::line_start(buffer, Some(text_shadow), pos).max(0);
+        let mut end = text_buffer_access::line_end(buffer, Some(text_shadow), pos).max(start);
         let buffer_len = buffer.length();
 
         let is_blank = |start: i32, end: i32| {
-            let text = buffer.text_range(start, end).unwrap_or_default();
+            let text = text_buffer_access::text_range(buffer, Some(text_shadow), start, end);
             text.trim().is_empty()
         };
 
@@ -1527,8 +1518,10 @@ impl SqlEditorWidget {
         let mut scan = start;
         while scan > 0 {
             let prev_pos = scan.saturating_sub(1);
-            let prev_start = buffer.line_start(prev_pos).max(0);
-            let prev_end = buffer.line_end(prev_pos).max(prev_start);
+            let prev_start =
+                text_buffer_access::line_start(buffer, Some(text_shadow), prev_pos).max(0);
+            let prev_end =
+                text_buffer_access::line_end(buffer, Some(text_shadow), prev_pos).max(prev_start);
             if is_blank(prev_start, prev_end) != blank {
                 break;
             }
@@ -1539,8 +1532,10 @@ impl SqlEditorWidget {
         let mut scan = end;
         while scan < buffer_len {
             let next_pos = (scan + 1).min(buffer_len.saturating_sub(1));
-            let next_start = buffer.line_start(next_pos).max(0);
-            let next_end = buffer.line_end(next_pos).max(next_start);
+            let next_start =
+                text_buffer_access::line_start(buffer, Some(text_shadow), next_pos).max(0);
+            let next_end =
+                text_buffer_access::line_end(buffer, Some(text_shadow), next_pos).max(next_start);
             if is_blank(next_start, next_end) != blank {
                 break;
             }

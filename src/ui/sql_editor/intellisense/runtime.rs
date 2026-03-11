@@ -6,6 +6,7 @@ impl SqlEditorWidget {
         let intellisense_popup = self.intellisense_popup.clone();
         let connection = self.connection.clone();
         let column_sender = self.column_sender.clone();
+        let text_shadow = self.highlight_shadow.clone();
         let enter_keyup_suppression = Arc::new(Mutex::new(EnterKeyupSuppression::None));
         let navigation_keyup_state = Arc::new(Mutex::new(NavigationKeyupState::Idle));
         let intellisense_runtime = self.intellisense_runtime.clone();
@@ -17,16 +18,21 @@ impl SqlEditorWidget {
         let intellisense_data_for_insert = intellisense_data.clone();
         let column_sender_for_insert = column_sender.clone();
         let connection_for_insert = connection.clone();
+        let text_shadow_for_insert = text_shadow.clone();
         {
             let mut popup = intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             popup.set_selected_callback(move |selected| {
-                let (cursor_pos, cursor_pos_usize) =
-                    Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
-                let context_text = Self::normalize_intellisense_context_text(
-                    &Self::context_before_cursor(&buffer_for_insert, cursor_pos),
-                );
+                    let (cursor_pos, cursor_pos_usize) =
+                        Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
+                    let context_text = Self::normalize_intellisense_context_text(
+                    &Self::context_before_cursor(
+                        &buffer_for_insert,
+                        &text_shadow_for_insert,
+                        cursor_pos,
+                    ),
+                    );
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
                     let should_prefetch = {
@@ -48,7 +54,8 @@ impl SqlEditorWidget {
                 let (start, end) = if let Some(range) = range {
                     (range.start(), range.end())
                 } else {
-                    let (word, start, _end) = Self::word_at_cursor(&buffer_for_insert, cursor_pos);
+                    let (word, start, _end) =
+                        Self::word_at_cursor(&buffer_for_insert, &text_shadow_for_insert, cursor_pos);
                     if word.is_empty() {
                         (cursor_pos_usize, cursor_pos_usize)
                     } else {
@@ -79,6 +86,7 @@ impl SqlEditorWidget {
         let enter_keyup_suppression_for_handle = enter_keyup_suppression;
         let navigation_keyup_state_for_handle = navigation_keyup_state;
         let intellisense_runtime_for_handle = intellisense_runtime;
+        let text_shadow_for_handle = text_shadow;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
         let replace_callback_for_handle = self.replace_callback.clone();
@@ -86,21 +94,7 @@ impl SqlEditorWidget {
         let dnd_drop_state_for_handle = Arc::new(Mutex::new(DndDropState::Idle));
 
         editor.handle(move |ed, ev| {
-            let schedule_viewport_refresh = |widget: &SqlEditorWidget| {
-                let widget = widget.clone();
-                app::add_timeout3(0.0, move |_| {
-                    widget.refresh_highlighting();
-                });
-            };
             match ev {
-                Event::MouseWheel => {
-                    schedule_viewport_refresh(&widget_for_shortcuts);
-                    false
-                }
-                Event::Released => {
-                    schedule_viewport_refresh(&widget_for_shortcuts);
-                    false
-                }
                 Event::DndEnter | Event::DndDrag => {
                     *dnd_drop_state_for_handle
                         .lock()
@@ -134,7 +128,11 @@ impl SqlEditorWidget {
                         if pos >= 0 {
                             let (pos, _) = Self::cursor_position(&buffer_for_handle, pos);
                             if let Some((_, start, end)) =
-                                Self::identifier_at_position(&buffer_for_handle, pos)
+                                Self::identifier_at_position(
+                                    &buffer_for_handle,
+                                    &text_shadow_for_handle,
+                                    pos,
+                                )
                             {
                                 buffer_for_handle.select(start, end);
                                 ed.set_insert_position(end);
@@ -284,8 +282,11 @@ impl SqlEditorWidget {
                                     let (start, end) = if let Some(range) = range {
                                         (range.start(), range.end())
                                     } else {
-                                        let (word, start, _end) =
-                                            Self::word_at_cursor(&buffer_for_handle, cursor_pos);
+                                        let (word, start, _end) = Self::word_at_cursor(
+                                            &buffer_for_handle,
+                                            &text_shadow_for_handle,
+                                            cursor_pos,
+                                        );
                                         if word.is_empty() {
                                             (cursor_pos_usize, cursor_pos_usize)
                                         } else {
@@ -310,8 +311,6 @@ impl SqlEditorWidget {
                                         &intellisense_runtime_for_handle,
                                     );
 
-                                    // Update syntax highlighting after insertion
-                                    widget_for_shortcuts.refresh_highlighting();
                                 }
                                 if matches!(key, Key::Enter | Key::KPEnter) {
                                     *enter_keyup_suppression_for_handle
@@ -372,6 +371,7 @@ impl SqlEditorWidget {
                                 Self::trigger_intellisense(
                                     ed,
                                     &buffer_for_handle,
+                                    &text_shadow_for_handle,
                                     &intellisense_data_for_handle,
                                     &intellisense_popup_for_handle,
                                     &column_sender_for_handle,
@@ -496,8 +496,11 @@ impl SqlEditorWidget {
 
                     // Keep KeyUp lightweight by using raw offsets (no full-buffer clones).
                     let cursor_pos = ed.insert_position();
-                    let char_before_cursor =
-                        Self::char_before_cursor(&buffer_for_handle, cursor_pos);
+                    let char_before_cursor = Self::char_before_cursor(
+                        &buffer_for_handle,
+                        &text_shadow_for_handle,
+                        cursor_pos,
+                    );
                     let typed_char = Self::typed_char_from_key_event(
                         &event_text,
                         key,
@@ -601,7 +604,6 @@ impl SqlEditorWidget {
                             &intellisense_runtime_for_handle,
                             true,
                         );
-                        widget_for_shortcuts.refresh_highlighting();
                         return false;
                     }
 
@@ -623,14 +625,18 @@ impl SqlEditorWidget {
                     }
 
                     // Handle typing - update intellisense filter
-                    let (word, word_start, _) =
-                        Self::word_at_cursor(&buffer_for_handle, cursor_pos);
+                    let (word, word_start, _) = Self::word_at_cursor(
+                        &buffer_for_handle,
+                        &text_shadow_for_handle,
+                        cursor_pos,
+                    );
                     let buffer_len = buffer_for_handle.length();
 
                     let fast_path_applied = if popup_visible {
                         Self::try_fast_path_intellisense_filter(
                             ed,
                             &buffer_for_handle,
+                            &text_shadow_for_handle,
                             &intellisense_popup_for_handle,
                             &intellisense_runtime_for_handle,
                             cursor_pos,
@@ -656,6 +662,7 @@ impl SqlEditorWidget {
                                 buffer_len,
                                 ed,
                                 &buffer_for_handle,
+                                &text_shadow_for_handle,
                                 &intellisense_data_for_handle,
                                 &intellisense_popup_for_handle,
                                 &column_sender_for_handle,
@@ -675,7 +682,11 @@ impl SqlEditorWidget {
                     } else if let Some(ch) = typed_char {
                         if Self::should_force_full_analysis(ch) {
                             let qualifier =
-                                Self::qualifier_before_word(&buffer_for_handle, word_start);
+                                Self::qualifier_before_word(
+                                    &buffer_for_handle,
+                                    &text_shadow_for_handle,
+                                    word_start,
+                                );
                             if Self::should_auto_trigger_intellisense_for_forced_char(
                                 &word,
                                 qualifier.as_deref(),
@@ -686,6 +697,7 @@ impl SqlEditorWidget {
                                     buffer_len,
                                     ed,
                                     &buffer_for_handle,
+                                    &text_shadow_for_handle,
                                     &intellisense_data_for_handle,
                                     &intellisense_popup_for_handle,
                                     &column_sender_for_handle,
@@ -711,6 +723,7 @@ impl SqlEditorWidget {
                                     buffer_len,
                                     ed,
                                     &buffer_for_handle,
+                                    &text_shadow_for_handle,
                                     &intellisense_data_for_handle,
                                     &intellisense_popup_for_handle,
                                     &column_sender_for_handle,
@@ -749,9 +762,6 @@ impl SqlEditorWidget {
                             &column_sender_for_handle,
                             &connection_for_handle,
                         );
-                    }
-                    if matches!(key, Key::Up | Key::Down | Key::PageUp | Key::PageDown) {
-                        widget_for_shortcuts.refresh_highlighting();
                     }
                     false
                 }

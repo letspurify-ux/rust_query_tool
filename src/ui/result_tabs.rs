@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::ui::constants;
 use crate::ui::font_settings::{configured_editor_profile, FontProfile};
 use crate::ui::result_table::ResultGridSqlExecuteCallback;
+use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::ui::ResultTableWidget;
 
@@ -133,10 +134,7 @@ impl ResultTabsWidget {
         if len <= 0 {
             return false;
         }
-        buffer
-            .text_range(len - 1, len)
-            .map(|s| s == "\n")
-            .unwrap_or(false)
+        text_buffer_access::text_range(buffer, None, len - 1, len) == "\n"
     }
 
     fn trim_script_output_buffer(buffer: &mut TextBuffer) {
@@ -152,7 +150,7 @@ impl ResultTabsWidget {
             return;
         }
 
-        let prefix = buffer.text_range(0, remove_upto as i32).unwrap_or_default();
+        let prefix = text_buffer_access::text_range(buffer, None, 0, remove_upto as i32);
         let cut = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(remove_upto);
         if cut > 0 {
             buffer.remove(0, cut as i32);

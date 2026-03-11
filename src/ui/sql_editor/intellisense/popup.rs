@@ -169,6 +169,7 @@ impl SqlEditorWidget {
         Self::trigger_intellisense(
             &self.editor,
             &self.buffer,
+            &self.highlight_shadow,
             &self.intellisense_data,
             &self.intellisense_popup,
             &self.column_sender,
@@ -179,10 +180,15 @@ impl SqlEditorWidget {
 
     pub fn quick_describe_at_cursor(&self) {
         let (cursor_pos, _) = Self::editor_cursor_position(&self.editor, &self.buffer);
-        let Some((word, start, _)) = Self::identifier_at_position(&self.buffer, cursor_pos) else {
+        let Some((word, start, _)) = Self::identifier_at_position(
+            &self.buffer,
+            &self.highlight_shadow,
+            cursor_pos,
+        ) else {
             return;
         };
-        let qualifier = Self::qualifier_before_word(&self.buffer, start as usize);
+        let qualifier =
+            Self::qualifier_before_word(&self.buffer, &self.highlight_shadow, start as usize);
         let object_name = if let Some(ref qualifier) = qualifier {
             format!("{}.{}", qualifier.to_uppercase(), word.to_uppercase())
         } else {

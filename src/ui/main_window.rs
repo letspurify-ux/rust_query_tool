@@ -234,10 +234,6 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(highlight_data);
         tab.schema_generation = target_generation;
-
-        if !tab.sql_editor.get_editor().was_deleted() {
-            tab.sql_editor.refresh_highlighting();
-        }
     }
 
     fn apply_schema_to_active_tab_if_needed(&mut self) {
@@ -1888,7 +1884,6 @@ impl MainWindow {
                     MainWindow::attach_file_drop_callback(state, tab_id, file_sender);
                 }
                 if let Some(mut editor) = created_editor {
-                    editor.refresh_highlighting();
                     editor.focus();
                 }
                 if let Some(mut right_tile) = created_right_tile {
@@ -3782,7 +3777,6 @@ impl MainWindow {
                         let insert_pos = editor.insert_position();
                         s.sql_buffer.insert(insert_pos, &text);
                         editor.set_insert_position(insert_pos + text.len() as i32);
-                        s.sql_editor.refresh_highlighting();
                     }
                     SqlAction::OpenInNewTab(sql) => {
                         if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
@@ -3790,7 +3784,6 @@ impl MainWindow {
                             s.sql_editor.reset_undo_redo_history();
                             s.set_tab_file_path(tab_id, None);
                             s.set_tab_pristine_text(tab_id, sql);
-                            s.sql_editor.refresh_highlighting();
                             s.sql_editor.focus();
                             s.right_tile.redraw();
                             created_tab_for_generated_sql = Some(tab_id);
@@ -4175,7 +4168,6 @@ impl MainWindow {
                                     file_sender.clone(),
                                 );
                                 if let Some(mut editor) = created_editor_for_open {
-                                    editor.refresh_highlighting();
                                     editor.focus();
                                 }
                                 if let Some(mut right_tile) = created_right_tile_for_open {

@@ -14,7 +14,6 @@ impl SqlEditorWidget {
         let editor = self.editor.clone();
         let buffer = self.buffer.clone();
         let highlighter = self.highlighter.clone();
-        let highlight_generation = self.highlight_generation.clone();
         let widget = self.clone();
         let intellisense_popup = self.intellisense_popup.clone();
         let column_sender = self.column_sender.clone();
@@ -34,7 +33,6 @@ impl SqlEditorWidget {
             editor: TextEditor,
             buffer: TextBuffer,
             highlighter: Arc<Mutex<SqlHighlighter>>,
-            highlight_generation: Arc<AtomicU64>,
             widget: SqlEditorWidget,
             intellisense_popup: Arc<Mutex<IntellisensePopup>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
@@ -111,7 +109,7 @@ impl SqlEditorWidget {
             }
 
             if let Some(highlight_columns) = highlight_columns {
-                let should_refresh_highlighting = {
+                let highlight_data_changed = {
                     let mut highlighter = highlighter
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -125,9 +123,8 @@ impl SqlEditorWidget {
                     }
                 };
 
-                if should_refresh_highlighting {
-                    highlight_generation.fetch_add(1, Ordering::Relaxed);
-                    widget.refresh_highlighting();
+                if highlight_data_changed {
+                    widget.rehighlight_full_buffer();
                 }
             }
 
@@ -139,6 +136,7 @@ impl SqlEditorWidget {
                         SqlEditorWidget::trigger_intellisense(
                             &editor,
                             &buffer,
+                            &widget.highlight_shadow,
                             &intellisense_data,
                             &intellisense_popup,
                             &column_sender,
@@ -208,7 +206,6 @@ impl SqlEditorWidget {
                     editor.clone(),
                     buffer.clone(),
                     highlighter.clone(),
-                    highlight_generation.clone(),
                     widget.clone(),
                     intellisense_popup.clone(),
                     column_sender.clone(),
@@ -224,7 +221,6 @@ impl SqlEditorWidget {
             editor,
             buffer,
             highlighter,
-            highlight_generation,
             widget,
             intellisense_popup,
             column_sender,
@@ -242,7 +238,6 @@ impl SqlEditorWidget {
             intellisense_runtime.clear_parse_cache();
             widget.handle_buffer_highlight_update(buf, pos, ins, del, deleted_text);
         });
-        self.refresh_highlighting();
     }
 
     pub fn cleanup_for_close(&mut self) {
@@ -291,7 +286,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set_highlight_data(HighlightData::new());
-        self.highlight_generation.fetch_add(1, Ordering::Relaxed);
+        self.rehighlight_full_buffer();
 
         self.buffer.set_text("");
         self.style_buffer.set_text("");

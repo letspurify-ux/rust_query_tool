@@ -423,6 +423,7 @@ impl SqlEditorWidget {
         buffer_len: i32,
         editor: &TextEditor,
         buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
@@ -432,6 +433,7 @@ impl SqlEditorWidget {
         let runtime_for_timeout = runtime.clone();
         let editor_for_timeout = editor.clone();
         let buffer_for_timeout = buffer.clone();
+        let text_shadow_for_timeout = text_shadow.clone();
         let intellisense_data_for_timeout = intellisense_data.clone();
         let intellisense_popup_for_timeout = intellisense_popup.clone();
         let column_sender_for_timeout = column_sender.clone();
@@ -470,6 +472,7 @@ impl SqlEditorWidget {
                 Self::trigger_intellisense(
                     &editor_for_timeout,
                     &buffer_for_timeout,
+                    &text_shadow_for_timeout,
                     &intellisense_data_for_timeout,
                     &intellisense_popup_for_timeout,
                     &column_sender_for_timeout,
