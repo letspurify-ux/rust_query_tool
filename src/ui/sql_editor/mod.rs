@@ -25,8 +25,9 @@ use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
-    create_style_table_with, HighlightData, SqlHighlighter, WindowHighlightRequest,
-    WindowHighlightResult, STYLE_COMMENT, STYLE_STRING, WINDOWED_HIGHLIGHT_THRESHOLD,
+    create_style_table_with, HighlightData, IncrementalHighlightRequest,
+    IncrementalHighlightResult, SqlHighlighter, WindowHighlightRequest, WindowHighlightResult,
+    STYLE_COMMENT, STYLE_STRING, WINDOWED_HIGHLIGHT_THRESHOLD,
 };
 use crate::ui::theme;
 use crate::utils::{AppConfig, QueryHistoryEntry};
@@ -70,12 +71,6 @@ const PROGRESS_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.001;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
 const MAX_WORD_UNDO_HISTORY: usize = 500;
 const MAX_WORD_UNDO_HISTORY_BYTES: usize = 64 * 1024 * 1024;
-const HIGHLIGHT_RANGE_EXPANSION_WINDOW: usize = 4096;
-const MAX_CONNECTED_WORD_EXPANSION_SPAN: usize = 16_384;
-const MAX_CONNECTED_WORD_SCAN_WINDOW_BYTES: usize = 32_768;
-/// Maximum scan radius for stateful delimiter changes (e.g. `'`, `/*`).
-/// Replaces the old full-buffer scan with a bounded 128 KB window.
-const STATEFUL_DELIMITER_SCAN_RADIUS: usize = 65_536;
 const DIRECT_STATEFUL_DELIMITER_SCAN_LIMIT: usize = 16_384;
 const VIEWPORT_HIGHLIGHT_POLL_INTERVAL_SECONDS: f64 = 0.08;
 const EDITOR_TOP_PADDING: i32 = 4;
