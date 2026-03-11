@@ -14,6 +14,10 @@ enum HighlightRequestKind {
         text_len: usize,
         windows: Vec<WindowHighlightRequest>,
     },
+    Incremental {
+        text_len: usize,
+        request: IncrementalHighlightRequest,
+    },
 }
 
 #[derive(Clone)]
@@ -31,6 +35,10 @@ enum HighlightResultKind {
     Windowed {
         text_len: usize,
         windows: Vec<WindowHighlightResult>,
+    },
+    Incremental {
+        text_len: usize,
+        result: IncrementalHighlightResult,
     },
 }
 
@@ -111,6 +119,16 @@ impl SqlEditorWidget {
                                         text_len,
                                         windows: guard.generate_window_styles(windows),
                                     }
+                                }
+                                HighlightRequestKind::Incremental { text_len, request } => {
+                                    let result = guard.generate_incremental_styles(request).unwrap_or(
+                                        IncrementalHighlightResult {
+                                            start: 0,
+                                            end: 0,
+                                            styles: String::new(),
+                                        },
+                                    );
+                                    HighlightResultKind::Incremental { text_len, result }
                                 }
                             }
                         }));
@@ -221,6 +239,17 @@ impl SqlEditorWidget {
                     windows: fallback_windows,
                 }
             }
+            HighlightRequestKind::Incremental { text_len, request } => {
+                let start = request.start.min(*text_len);
+                HighlightResultKind::Incremental {
+                    text_len: *text_len,
+                    result: IncrementalHighlightResult {
+                        start,
+                        end: start,
+                        styles: String::new(),
+                    },
+                }
+            }
         }
     }
 }
@@ -289,6 +318,24 @@ impl SqlEditorWidget {
                                     };
                                     if end > start {
                                         style_buffer.replace(start, end, &window.styles);
+                                    }
+                                }
+                            }
+                        }
+                        HighlightResultKind::Incremental { text_len, result } => {
+                            if SqlEditorWidget::ensure_style_buffer_len(&mut style_buffer, text_len)
+                            {
+                                if result.end <= text_len
+                                    && result.start <= result.end
+                                    && result.styles.len()
+                                        == result.end.saturating_sub(result.start)
+                                {
+                                    if let (Ok(start), Ok(end)) =
+                                        (i32::try_from(result.start), i32::try_from(result.end))
+                                    {
+                                        if end > start {
+                                            style_buffer.replace(start, end, &result.styles);
+                                        }
                                     }
                                 }
                             }
@@ -406,44 +453,38 @@ impl SqlEditorWidget {
 
         self.invalidate_pending_highlight_results();
 
-        let edited_range = Self::expanded_edited_range_for_windowed_highlight(
-            buf,
-            pos,
-            ins,
-            del,
-            deleted_text,
-            text_len,
-        );
-        let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
-        // Edit updates already include cursor and edited anchors, so avoid
-        // per-keystroke viewport probing (skip_lines) on very large buffers.
-        self.apply_windowed_highlighting(cursor_pos, edited_range, None, Some((pos, ins, del)));
-    }
-
-    fn expanded_edited_range_for_windowed_highlight(
-        buf: &TextBuffer,
-        pos: i32,
-        ins: i32,
-        del: i32,
-        deleted_text: &str,
-        text_len: usize,
-    ) -> Option<(usize, usize)> {
-        let (range_start, range_end) = compute_edited_range(pos, ins, del, text_len)?;
-        let (mut expanded_start, mut expanded_end) =
-            expand_connected_word_range(buf, range_start, range_end);
-
-        if needs_full_rehighlight(buf, pos, ins, deleted_text) {
-            expanded_start = expanded_start.saturating_sub(STATEFUL_DELIMITER_SCAN_RADIUS);
-            expanded_end = expanded_end
-                .saturating_add(STATEFUL_DELIMITER_SCAN_RADIUS)
-                .min(text_len);
+        let mut style_buffer = self.style_buffer.clone();
+        Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, ins, del);
+        if !Self::ensure_style_buffer_len(&mut style_buffer, text_len) {
+            return;
         }
 
-        Some(normalize_highlight_range(
-            expanded_start,
-            expanded_end,
+        let text = buf.text();
+        let previous_styles = style_buffer.text();
+        let start = compute_incremental_start_from_text(&text, pos, ins, del);
+        let start = start.min(text_len);
+        let entry_state = {
+            let highlighter = self
+                .highlighter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            highlighter.probe_entry_state_for_style_text(&text, &previous_styles, start)
+        };
+
+        self.enqueue_incremental_highlight_request(
             text_len,
-        ))
+            IncrementalHighlightRequest {
+                start,
+                text,
+                previous_styles,
+                entry_state,
+            },
+        );
+
+        if needs_full_rehighlight(buf, pos, ins, deleted_text) {
+            let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
+            self.apply_windowed_highlighting(cursor_pos, None, None, None);
+        }
     }
 
     fn apply_windowed_highlighting(
@@ -586,6 +627,27 @@ impl SqlEditorWidget {
         self.enqueue_worker_task_with_retry(task);
     }
 
+    fn enqueue_incremental_highlight_request(
+        &self,
+        text_len: usize,
+        request: IncrementalHighlightRequest,
+    ) {
+        let revision = self.highlight_revision.load(Ordering::Relaxed);
+        let generation = self.highlight_generation.load(Ordering::Relaxed);
+        let task = HighlightWorkerTask {
+            editor_id: self.highlight_editor_id,
+            request: HighlightRequest {
+                revision,
+                generation,
+                kind: HighlightRequestKind::Incremental { text_len, request },
+            },
+            highlighter: self.highlighter.clone(),
+            result_sender: self.highlight_result_sender.clone(),
+        };
+
+        self.enqueue_worker_task_with_retry(task);
+    }
+
     fn enqueue_windowed_highlight_request(
         &self,
         text_len: usize,
@@ -646,51 +708,6 @@ fn normalize_highlight_range(start: usize, end: usize, text_len: usize) -> (usiz
     (bounded_start, bounded_end)
 }
 
-fn expand_connected_word_range(buf: &TextBuffer, start: usize, end: usize) -> (usize, usize) {
-    let text_len = buf.length().max(0) as usize;
-    if text_len == 0 {
-        return (0, 0);
-    }
-
-    let bounded_start = start.min(text_len);
-    let bounded_end = end.min(text_len).max(bounded_start);
-    let changed_span = bounded_end.saturating_sub(bounded_start);
-    if changed_span > MAX_CONNECTED_WORD_EXPANSION_SPAN {
-        // Large paste/load paths can make `text_range` copy massive buffers.
-        // Skip word-boundary expansion and keep the raw edited range.
-        return (bounded_start, bounded_end);
-    }
-
-    let window_start = bounded_start.saturating_sub(HIGHLIGHT_RANGE_EXPANSION_WINDOW);
-    let window_end = bounded_end
-        .saturating_add(HIGHLIGHT_RANGE_EXPANSION_WINDOW)
-        .min(text_len);
-    if window_end.saturating_sub(window_start) > MAX_CONNECTED_WORD_SCAN_WINDOW_BYTES {
-        return (bounded_start, bounded_end);
-    }
-
-    let Some(window_text) = buf.text_range(window_start as i32, window_end as i32) else {
-        return (bounded_start, bounded_end);
-    };
-
-    let bytes = window_text.as_bytes();
-    let mut rel_start = bounded_start.saturating_sub(window_start).min(bytes.len());
-    let mut rel_end = bounded_end.saturating_sub(window_start).min(bytes.len());
-
-    while rel_start > 0 && crate::sql_text::is_identifier_byte(bytes[rel_start - 1]) {
-        rel_start -= 1;
-    }
-
-    while rel_end < bytes.len() && crate::sql_text::is_identifier_byte(bytes[rel_end]) {
-        rel_end += 1;
-    }
-
-    (
-        window_start.saturating_add(rel_start).min(text_len),
-        window_start.saturating_add(rel_end).min(text_len),
-    )
-}
-
 fn editor_viewport_range(editor: &TextEditor, buffer: &TextBuffer) -> Option<(usize, usize)> {
     let text_len = buffer.length().max(0) as usize;
     if text_len == 0 {
@@ -731,6 +748,39 @@ fn infer_cursor_after_edit(pos: i32, ins: i32, text_len: usize) -> usize {
     base.saturating_add(inserted).min(text_len)
 }
 
+fn compute_incremental_start_from_text(text: &str, pos: i32, ins: i32, del: i32) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let text_len = text.len();
+    let raw_start = pos.max(0) as usize;
+    let start = raw_start.min(text_len);
+    let changed_end = start
+        .saturating_add((ins.max(0) as usize).max(del.max(0) as usize))
+        .min(text_len);
+    let mut probe = start.min(changed_end);
+
+    let bytes = text.as_bytes();
+    while probe > 0 {
+        let prev = probe - 1;
+        let Some(&byte) = bytes.get(prev) else {
+            break;
+        };
+        if byte == b'\n' || byte == b'\r' || byte.is_ascii_whitespace() {
+            break;
+        }
+        probe -= 1;
+    }
+
+    while probe > 0 && !text.is_char_boundary(probe) {
+        probe -= 1;
+    }
+
+    probe
+}
+
+#[cfg(test)]
 fn compute_edited_range(pos: i32, ins: i32, del: i32, text_len: usize) -> Option<(usize, usize)> {
     if pos < 0 {
         return None;
@@ -744,6 +794,7 @@ fn compute_edited_range(pos: i32, ins: i32, del: i32, text_len: usize) -> Option
 
     Some((start, end))
 }
+
 
 fn needs_full_rehighlight(buf: &TextBuffer, pos: i32, ins: i32, deleted_text: &str) -> bool {
     if !deleted_text.is_empty() {

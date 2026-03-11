@@ -226,6 +226,21 @@ pub struct WindowHighlightResult {
     pub styles: String,
 }
 
+#[derive(Clone)]
+pub struct IncrementalHighlightRequest {
+    pub start: usize,
+    pub text: String,
+    pub previous_styles: String,
+    pub entry_state: LexerState,
+}
+
+#[derive(Clone)]
+pub struct IncrementalHighlightResult {
+    pub start: usize,
+    pub end: usize,
+    pub styles: String,
+}
+
 impl HighlightData {
     pub fn new() -> Self {
         Self {
@@ -403,6 +418,57 @@ impl SqlHighlighter {
         results
     }
 
+    pub fn generate_incremental_styles(
+        &self,
+        request: IncrementalHighlightRequest,
+    ) -> Option<IncrementalHighlightResult> {
+        if request.start >= request.text.len() {
+            return Some(IncrementalHighlightResult {
+                start: request.start,
+                end: request.start,
+                styles: String::new(),
+            });
+        }
+
+        let start = clamp_to_utf8_boundary(&request.text, request.start);
+        let tail_text = request.text.get(start..)?;
+        let (new_tail_styles, _exit_state) =
+            self.generate_styles_with_state(tail_text, request.entry_state);
+        if new_tail_styles.len() != tail_text.len() {
+            return None;
+        }
+
+        let previous_tail = request.previous_styles.get(start..).unwrap_or_default();
+        let mut last_changed = 0usize;
+        let mut saw_change = false;
+        for (idx, (new_style, old_style)) in new_tail_styles
+            .bytes()
+            .zip(previous_tail.bytes().chain(std::iter::repeat(0)))
+            .enumerate()
+        {
+            if new_style != old_style {
+                saw_change = true;
+                last_changed = idx;
+            }
+        }
+
+        if !saw_change {
+            return Some(IncrementalHighlightResult {
+                start,
+                end: start,
+                styles: String::new(),
+            });
+        }
+
+        let changed_end = start.saturating_add(last_changed + 1);
+        let styles = new_tail_styles.get(..=last_changed)?.to_owned();
+        Some(IncrementalHighlightResult {
+            start,
+            end: changed_end,
+            styles,
+        })
+    }
+
     /// Probe backward from `pos` to determine the lexer state at that position.
     /// Uses the style buffer for a quick check and falls back to re-lexing a
     /// limited backward window when the position appears to be inside a
@@ -461,6 +527,30 @@ impl SqlHighlighter {
             }
             probe_distance = next_probe_distance;
         }
+    }
+
+    pub fn probe_entry_state_for_style_text(
+        &self,
+        text: &str,
+        style_text: &str,
+        pos: usize,
+    ) -> LexerState {
+        let pos = clamp_to_utf8_boundary(text, pos.min(text.len()));
+        if pos == 0 {
+            return LexerState::Normal;
+        }
+
+        let prev_style = style_text
+            .as_bytes()
+            .get(pos.saturating_sub(1))
+            .copied()
+            .map(char::from)
+            .unwrap_or(STYLE_DEFAULT);
+        if !requires_entry_state_probe(prev_style) {
+            return LexerState::Normal;
+        }
+
+        self.resolve_entry_state_by_probe(text, pos)
     }
 
     #[cfg(test)]
