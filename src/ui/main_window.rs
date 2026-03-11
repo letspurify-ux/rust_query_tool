@@ -2683,6 +2683,7 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                 }
                 QueryProgress::BatchFinished => {
+                    s.progress_contexts.remove(&tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2700,7 +2701,6 @@ impl MainWindow {
                         let mut s = state_for_progress
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.progress_contexts.remove(&tab_id);
                         s.result_grid_execution_target = None;
                         s.result_tab_offset = s.result_tabs.tab_count();
                         if s.pending_connection_metadata_refresh && s.has_live_connection {
