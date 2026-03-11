@@ -2,11 +2,10 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const APP_DIR_NAME: &str = "space_query";
@@ -14,7 +13,6 @@ const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
 const MAX_LOG_ENTRIES: usize = 100;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
-const LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS: u64 = 200;
 
 fn app_data_base_dir() -> Option<PathBuf> {
     if let Some(path) = dirs::data_dir() {
@@ -32,14 +30,6 @@ fn log_writer_response_timeout() -> Duration {
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS))
-}
-
-fn log_writer_save_debounce() -> Duration {
-    std::env::var("SPACE_QUERY_LOG_SAVE_DEBOUNCE_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(LOG_WRITER_SAVE_DEBOUNCE_DEFAULT_MS))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,57 +134,14 @@ impl AppLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let now_millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        let tmp_path =
-            path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_millis));
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, self)?;
-        use std::io::Write;
-        writer.flush()?;
-        rename_overwrite(&tmp_path, &path)?;
+        let file = fs::File::create(&path)?;
+        serde_json::to_writer(file, self)?;
         Ok(())
     }
 
     pub fn add_entry(&mut self, entry: LogEntry) {
         self.entries.push_front(entry);
         self.entries.truncate(MAX_LOG_ENTRIES);
-    }
-}
-
-fn rename_overwrite(from: &PathBuf, to: &PathBuf) -> Result<(), std::io::Error> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            if !to.exists() {
-                return Err(rename_err);
-            }
-
-            if let Err(remove_err) = fs::remove_file(to) {
-                return Err(std::io::Error::new(
-                    remove_err.kind(),
-                    format!(
-                        "Failed to replace destination file {} while finalizing {}: {remove_err}",
-                        to.display(),
-                        from.display()
-                    ),
-                ));
-            }
-
-            fs::rename(from, to).map_err(|retry_err| {
-                std::io::Error::new(
-                    retry_err.kind(),
-                    format!(
-                        "Failed to finalize log file move from {} to {} after removing destination: {retry_err}",
-                        from.display(),
-                        to.display()
-                    ),
-                )
-            })
-        }
     }
 }
 
@@ -214,107 +161,28 @@ fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
     let (sender, receiver) = mpsc::channel::<LogCommand>();
     thread::spawn(move || {
         let mut log = AppLog::load();
-        let save_debounce = log_writer_save_debounce();
-        let mut save_pending = false;
-        let apply_command = |log: &mut AppLog,
-                             command: LogCommand,
-                             flush_replies: &mut Vec<mpsc::Sender<Result<(), String>>>|
-         -> bool {
-            match command {
-                LogCommand::Write(entry) => {
-                    log.add_entry(entry);
-                    true
-                }
-                LogCommand::Clear => {
-                    log.entries.clear();
-                    true
-                }
-                LogCommand::Flush(reply) => {
-                    flush_replies.push(reply);
-                    false
-                }
-            }
-        };
         loop {
             let cmd = match receiver.recv() {
                 Ok(cmd) => cmd,
                 Err(_) => break,
             };
 
-            let mut channel_connected = true;
-            let mut mutated_in_batch = false;
-            let mut flush_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
-            let mut persist_result: Result<(), String> = Ok(());
-
-            if apply_command(&mut log, cmd, &mut flush_replies) {
-                save_pending = true;
-                mutated_in_batch = true;
-            }
-
-            while let Ok(next) = receiver.try_recv() {
-                if apply_command(&mut log, next, &mut flush_replies) {
-                    save_pending = true;
-                    mutated_in_batch = true;
-                }
-            }
-
-            // Small debounce window to coalesce bursts of log writes into
-            // one disk write while keeping Flush responsive.
-            if save_pending && mutated_in_batch && flush_replies.is_empty() {
-                let mut save_deadline = Instant::now() + save_debounce;
-                loop {
-                    if !flush_replies.is_empty() {
-                        break;
-                    }
-                    let now = Instant::now();
-                    if now >= save_deadline {
-                        break;
-                    }
-
-                    let wait_for = save_deadline.saturating_duration_since(now);
-                    match receiver.recv_timeout(wait_for) {
-                        Ok(next) => {
-                            if apply_command(&mut log, next, &mut flush_replies) {
-                                save_pending = true;
-                                save_deadline = Instant::now() + save_debounce;
-                            }
-                            while let Ok(pending_next) = receiver.try_recv() {
-                                if apply_command(&mut log, pending_next, &mut flush_replies) {
-                                    save_pending = true;
-                                    save_deadline = Instant::now() + save_debounce;
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => break,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            channel_connected = false;
-                            break;
-                        }
+            match cmd {
+                LogCommand::Write(entry) => {
+                    log.add_entry(entry);
+                    if let Err(err) = log.save() {
+                        eprintln!("Log save error: {err}");
                     }
                 }
-            }
-
-            if save_pending {
-                match log.save() {
-                    Ok(()) => {
-                        persist_result = Ok(());
-                        save_pending = false;
-                    }
-                    Err(err) => {
-                        let msg = format!("Log save error: {err}");
-                        eprintln!("{msg}");
-                        persist_result = Err(msg);
-                        // Keep entries in memory; they will be retried on the next save cycle.
+                LogCommand::Clear => {
+                    log.entries.clear();
+                    if let Err(err) = log.save() {
+                        eprintln!("Log clear save error: {err}");
                     }
                 }
-            }
-
-            for reply in flush_replies {
-                let _ = reply.send(persist_result.clone());
-            }
-
-            if !channel_connected {
-                break;
+                LogCommand::Flush(reply) => {
+                    let _ = reply.send(Ok(()));
+                }
             }
         }
     });
@@ -525,7 +393,6 @@ pub fn take_crash_log() -> Option<String> {
 #[cfg(test)]
 mod logging_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn log_level_label_returns_expected_strings() {
@@ -554,30 +421,5 @@ mod logging_tests {
     #[test]
     fn log_level_display_matches_label() {
         assert_eq!(format!("{}", LogLevel::Warning), "WARN");
-    }
-
-    #[test]
-    fn rename_overwrite_replaces_existing_destination_file() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("space_query_logging_test_{}", unique));
-        fs::create_dir_all(&base).expect("failed to create test directory");
-
-        let from = base.join("from.tmp");
-        let to = base.join("to.log");
-
-        fs::write(&from, "new").expect("failed to write source file");
-        fs::write(&to, "old").expect("failed to write destination file");
-
-        rename_overwrite(&from, &to).expect("rename_overwrite should replace destination");
-
-        let contents = fs::read_to_string(&to).expect("failed to read destination file");
-        assert_eq!(contents, "new");
-        assert!(!from.exists());
-
-        let _ = fs::remove_file(&to);
-        let _ = fs::remove_dir_all(&base);
     }
 }
