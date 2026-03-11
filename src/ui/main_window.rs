@@ -3720,6 +3720,7 @@ impl MainWindow {
                 return;
             };
             let mut created_tab_for_generated_sql: Option<QueryTabId> = None;
+            let mut sql_to_execute: Option<String> = None;
             {
                 let mut s = state_for_browser
                     .lock()
@@ -3745,8 +3746,14 @@ impl MainWindow {
                         }
                     }
                     SqlAction::Execute(sql) => {
-                        s.sql_editor.execute_sql_text(&sql);
+                        sql_to_execute = Some(sql);
                     }
+                }
+            }
+
+            if let Some(sql) = sql_to_execute {
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
+                    editor.execute_sql_text(&sql);
                 }
             }
 
