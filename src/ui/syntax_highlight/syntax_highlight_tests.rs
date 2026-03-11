@@ -1080,6 +1080,50 @@ fn test_probe_entry_state_recovers_q_quote_state_inside_scroll_window() {
 }
 
 #[test]
+fn test_probe_entry_state_recovers_single_quote_state_inside_scroll_window() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 'first line\nsecond line with '' quote\nthird line'\nFROM dual";
+    let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+    let pos = text.find("second line").unwrap();
+
+    let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
+    assert_eq!(entry, LexerState::InSingleQuote);
+}
+
+#[test]
+fn test_probe_entry_state_returns_normal_for_non_multiline_prev_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT abc FROM dual";
+    let style_text = highlighter.generate_styles(text);
+    let pos = text.find("FROM").unwrap();
+
+    let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
+    assert_eq!(entry, LexerState::Normal);
+}
+
+#[test]
+fn test_clamp_buffer_boundary_keeps_ascii_boundary() {
+    let mut buffer = TextBuffer::default();
+    buffer.set_text("SELECT 1");
+
+    let idx = "SELECT".len();
+    assert_eq!(clamp_buffer_boundary(&buffer, idx), idx);
+}
+
+#[test]
+fn test_clamp_buffer_boundary_clamps_mid_byte_utf8() {
+    let mut buffer = TextBuffer::default();
+    let text = "SELECT 한글";
+    buffer.set_text(text);
+
+    let char_start = text.find('한').unwrap_or(0);
+    let mid_byte = char_start + 1;
+    assert!(!text.is_char_boundary(mid_byte));
+
+    assert_eq!(clamp_buffer_boundary(&buffer, mid_byte), char_start);
+}
+
+#[test]
 fn test_probe_entry_state_recovers_long_offscreen_block_comment() {
     let highlighter = SqlHighlighter::new();
     let filler = "a".repeat(STATE_PROBE_DISTANCE + 128);
@@ -1101,4 +1145,34 @@ fn test_probe_entry_state_recovers_long_offscreen_q_quote() {
 
     let entry = highlighter.probe_entry_state_for_text(&text, &style_text, pos);
     assert_eq!(entry, LexerState::InQQuote { closing: '가' });
+}
+
+#[test]
+fn test_prepare_window_requests_clamps_mid_byte_inputs_to_utf8_boundaries() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT '한글 문자열' FROM dual\nWHERE col = q'[값]';";
+    let mut buffer = TextBuffer::default();
+    buffer.set_text(text);
+    let mut style_buffer = TextBuffer::default();
+    style_buffer.set_text(&std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>());
+
+    let char_pos = text.find('한').unwrap_or(0);
+    let mid_byte_pos = char_pos + 1;
+    assert!(!text.is_char_boundary(mid_byte_pos));
+
+    let requests = highlighter.prepare_window_highlight_requests(
+        &buffer,
+        &style_buffer,
+        mid_byte_pos,
+        Some((mid_byte_pos, mid_byte_pos + 5)),
+        Some((mid_byte_pos, text.len())),
+    );
+
+    assert!(!requests.is_empty());
+    for request in requests {
+        assert!(text.is_char_boundary(request.start));
+        assert!(text.is_char_boundary(request.end));
+        assert!(request.start < request.end);
+        assert_eq!(request.text.len(), request.end - request.start);
+    }
 }

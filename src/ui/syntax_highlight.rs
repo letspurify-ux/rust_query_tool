@@ -347,19 +347,31 @@ impl SqlHighlighter {
             return Vec::new();
         }
 
+        let source_text = buffer.text();
+        let source_len = source_text.len();
+
         let ranges = select_highlight_ranges(buffer, text_len, cursor_pos, edited_range, viewport);
         let mut requests = Vec::with_capacity(ranges.len());
         for (range_start, range_end) in ranges {
             if range_start >= range_end {
                 continue;
             }
-            let entry_state = self.probe_entry_state(buffer, style_buffer, range_start);
-            let Some(window_text) = buffer.text_range(range_start as i32, range_end as i32) else {
+
+            let start = clamp_to_utf8_boundary(&source_text, range_start.min(source_len));
+            let end = clamp_to_utf8_boundary(&source_text, range_end.min(source_len));
+            if start >= end {
+                continue;
+            }
+
+            let entry_state =
+                self.probe_entry_state_for_source_text(&source_text, style_buffer, start);
+            let Some(window_text) = source_text.get(start..end).map(str::to_owned) else {
                 continue;
             };
+
             requests.push(WindowHighlightRequest {
-                start: range_start,
-                end: range_end,
+                start,
+                end,
                 text: window_text,
                 entry_state,
             });
@@ -395,12 +407,13 @@ impl SqlHighlighter {
     /// Uses the style buffer for a quick check and falls back to re-lexing a
     /// limited backward window when the position appears to be inside a
     /// multi-line token (comment, string, quoted identifier).
-    fn probe_entry_state(
+    fn probe_entry_state_for_source_text(
         &self,
-        buffer: &TextBuffer,
+        source_text: &str,
         style_buffer: &TextBuffer,
         pos: usize,
     ) -> LexerState {
+        let pos = clamp_to_utf8_boundary(source_text, pos.min(source_text.len()));
         if pos == 0 {
             return LexerState::Normal;
         }
@@ -413,32 +426,41 @@ impl SqlHighlighter {
             .map(|b| b as char)
             .unwrap_or(STYLE_DEFAULT);
 
-        if let Some(known_state) = immediate_entry_state_from_style(prev_style) {
-            return known_state;
+        if !requires_entry_state_probe(prev_style) {
+            return LexerState::Normal;
         }
 
-        self.resolve_entry_state_by_probe(buffer.text_range(0, pos as i32).as_deref())
+        self.resolve_entry_state_by_probe(source_text, pos)
     }
 
-    fn resolve_entry_state_by_probe(&self, probe_text: Option<&str>) -> LexerState {
-        let Some(probe_text) = probe_text else {
-            return LexerState::Normal;
-        };
+    fn resolve_entry_state_by_probe(&self, source_text: &str, pos: usize) -> LexerState {
+        let max_pos = clamp_to_utf8_boundary(source_text, pos.min(source_text.len()));
+        let mut probe_distance = STATE_PROBE_DISTANCE.max(1);
 
-        let mut bounded_start = probe_text.len().saturating_sub(STATE_PROBE_DISTANCE);
-        while bounded_start > 0 && !probe_text.is_char_boundary(bounded_start) {
-            bounded_start -= 1;
-        }
-        let bounded_probe = probe_text.get(bounded_start..).unwrap_or(probe_text);
-        let bounded_state = self
-            .generate_styles_with_state(bounded_probe, LexerState::Normal)
-            .1;
-        if bounded_state != LexerState::Normal || bounded_start == 0 {
-            return bounded_state;
-        }
+        loop {
+            let raw_start = max_pos.saturating_sub(probe_distance);
+            let start = clamp_to_utf8_boundary(source_text, raw_start);
+            let end = max_pos;
+            if end <= start {
+                return LexerState::Normal;
+            }
 
-        self.generate_styles_with_state(probe_text, LexerState::Normal)
-            .1
+            let Some(probe_text) = source_text.get(start..end) else {
+                return LexerState::Normal;
+            };
+            let state = self
+                .generate_styles_with_state(probe_text, LexerState::Normal)
+                .1;
+            if state != LexerState::Normal || start == 0 {
+                return state;
+            }
+
+            let next_probe_distance = probe_distance.saturating_mul(2);
+            if next_probe_distance <= probe_distance {
+                return state;
+            }
+            probe_distance = next_probe_distance;
+        }
     }
 
     #[cfg(test)]
@@ -454,11 +476,41 @@ impl SqlHighlighter {
             .copied()
             .map(char::from)
             .unwrap_or(STYLE_DEFAULT);
-        if let Some(known_state) = immediate_entry_state_from_style(prev_style) {
-            return known_state;
+        if !requires_entry_state_probe(prev_style) {
+            return LexerState::Normal;
         }
 
-        self.resolve_entry_state_by_probe(text.get(..pos))
+        self.resolve_entry_state_by_probe_for_text(text, pos)
+    }
+
+    #[cfg(test)]
+    fn resolve_entry_state_by_probe_for_text(&self, text: &str, pos: usize) -> LexerState {
+        let max_pos = clamp_to_char_boundary(text, pos.min(text.len()));
+        let mut probe_distance = STATE_PROBE_DISTANCE.max(1);
+
+        loop {
+            let raw_start = max_pos.saturating_sub(probe_distance);
+            let start = clamp_to_char_boundary(text, raw_start);
+            if max_pos <= start {
+                return LexerState::Normal;
+            }
+
+            let Some(probe_text) = text.get(start..max_pos) else {
+                return LexerState::Normal;
+            };
+            let state = self
+                .generate_styles_with_state(probe_text, LexerState::Normal)
+                .1;
+            if state != LexerState::Normal || start == 0 {
+                return state;
+            }
+
+            let next_probe_distance = probe_distance.saturating_mul(2);
+            if next_probe_distance <= probe_distance {
+                return state;
+            }
+            probe_distance = next_probe_distance;
+        }
     }
 
     /// Generates the style string for the given text, starting from Normal state.
@@ -1074,11 +1126,7 @@ fn select_highlight_ranges_for_text(
 
 #[cfg(test)]
 fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
-    let mut idx = idx.min(text.len());
-    while idx > 0 && !text.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
+    clamp_to_utf8_boundary(text, idx)
 }
 
 fn prioritize_ranges_for_focus(
@@ -1232,13 +1280,30 @@ fn is_operator_byte(byte: u8) -> bool {
     )
 }
 
-fn immediate_entry_state_from_style(style: char) -> Option<LexerState> {
-    match style {
-        STYLE_COMMENT => Some(LexerState::InBlockComment),
-        STYLE_HINT => Some(LexerState::InHintComment),
-        STYLE_IDENTIFIER => Some(LexerState::InDoubleQuote),
-        _ => None,
+fn requires_entry_state_probe(style: char) -> bool {
+    !matches!(
+        style,
+        STYLE_KEYWORD
+            | STYLE_FUNCTION
+            | STYLE_NUMBER
+            | STYLE_OPERATOR
+            | STYLE_DATETIME_LITERAL
+            | STYLE_COLUMN
+    )
+}
+
+#[cfg(test)]
+fn clamp_buffer_boundary(buffer: &TextBuffer, idx: usize) -> usize {
+    let text = buffer.text();
+    clamp_to_utf8_boundary(&text, idx)
+}
+
+fn clamp_to_utf8_boundary(text: &str, idx: usize) -> usize {
+    let mut clamped = idx.min(text.len());
+    while clamped > 0 && !text.is_char_boundary(clamped) {
+        clamped -= 1;
     }
+    clamped
 }
 
 fn is_literal_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
