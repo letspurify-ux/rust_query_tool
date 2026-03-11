@@ -186,6 +186,14 @@ where
             match result_receiver.try_recv() {
                 Ok(BootstrapResult::Ready(result)) => {
                     boot_result = Some(result);
+                    let lock_result = loading_state.lock();
+                    match lock_result {
+                        Ok(mut guard) => guard.mark_bootstrap_finished(),
+                        Err(poisoned) => {
+                            let mut guard = poisoned.into_inner();
+                            guard.mark_bootstrap_finished();
+                        }
+                    }
                 }
                 Ok(BootstrapResult::Failed(error)) => {
                     fatal_error = Some(error);
