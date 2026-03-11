@@ -72,7 +72,7 @@ impl AppConfig {
 
     pub fn load() -> Self {
         let mut loaded_from_legacy = false;
-        let mut config = if let Some(path) = Self::config_path() {
+        let config = if let Some(path) = Self::config_path() {
             if let Some(loaded) = Self::load_from_path(&path) {
                 loaded
             } else if let Some(legacy_path) = Self::legacy_config_path() {
@@ -89,26 +89,7 @@ impl AppConfig {
             Self::new()
         };
 
-        // Migrate plain-text passwords from old config to keyring.
-        // Passwords are NOT loaded eagerly; use get_password_for_connection() on demand.
-        let mut needs_resave = false;
-        for conn in &mut config.recent_connections {
-            if !conn.password.is_empty() {
-                if let Err(e) = credential_store::store_password(&conn.name, &conn.password) {
-                    eprintln!("Keyring migration warning: {}", e);
-                } else {
-                    conn.clear_password();
-                    needs_resave = true;
-                }
-            }
-        }
-
-        // Re-save to strip plain-text passwords from config.json
-        if needs_resave {
-            if let Err(e) = config.save() {
-                eprintln!("Failed to re-save config after keyring migration: {}", e);
-            }
-        } else if loaded_from_legacy {
+        if loaded_from_legacy {
             // Migrate config location from legacy app folder to new app folder.
             if let Err(e) = config.save() {
                 eprintln!("Failed to migrate config path: {}", e);

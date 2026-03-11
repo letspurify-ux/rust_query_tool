@@ -102,11 +102,6 @@ pub(crate) fn configure_fltk_globals(config: &AppConfig) {
 }
 
 fn configure_gpu_visual() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        return false;
-    }
-
     #[cfg(feature = "gpu-splash")]
     {
         let mode = Mode::Rgb8
