@@ -20,7 +20,7 @@ use fltk::{
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, TryRecvError},
+    mpsc::{self, RecvTimeoutError, TryRecvError},
     Arc, Mutex,
 };
 use std::thread;
@@ -245,17 +245,33 @@ where
     if skip_splash {
         destroy_window(&mut visuals.window);
         if boot_result.is_none() && fatal_error.is_none() {
-            match result_receiver.recv() {
+            let elapsed = splash_started_at.elapsed();
+            let remaining = options
+                .bootstrap_timeout
+                .checked_sub(elapsed)
+                .unwrap_or_else(|| Duration::from_secs(0));
+
+            match result_receiver.recv_timeout(remaining) {
                 Ok(BootstrapResult::Ready(result)) => {
                     boot_result = Some(result);
                 }
                 Ok(BootstrapResult::Failed(error)) => {
                     fatal_error = Some(error);
                 }
-                Err(err) => {
-                    fatal_error = Some(format!(
-                        "Startup bootstrap channel disconnected before completion: {err}"
-                    ));
+                Err(RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    crate::utils::logging::log_warning(
+                        "splash",
+                        &format!(
+                            "Startup bootstrap exceeded {:?} after GPU splash was skipped; continuing with timeout fallback.",
+                            options.bootstrap_timeout
+                        ),
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    fatal_error = Some(
+                        "Startup bootstrap channel disconnected before completion.".to_string(),
+                    );
                 }
             }
         }
