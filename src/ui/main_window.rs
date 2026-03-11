@@ -88,6 +88,25 @@ struct QueryEditorTab {
     schema_generation: u64,
 }
 
+#[derive(Clone)]
+struct QueryProgressContext {
+    result_tab_offset: usize,
+    execution_target: Option<usize>,
+    fetch_row_counts: HashMap<usize, usize>,
+    last_fetch_status_update: Instant,
+}
+
+impl QueryProgressContext {
+    fn new(result_tab_offset: usize, execution_target: Option<usize>) -> Self {
+        Self {
+            result_tab_offset,
+            execution_target,
+            fetch_row_counts: HashMap::new(),
+            last_fetch_status_update: Instant::now(),
+        }
+    }
+}
+
 pub struct AppState {
     pub connection: SharedConnection,
     query_tabs: QueryTabsWidget,
@@ -115,9 +134,9 @@ pub struct AppState {
     rollback_btn: Button,
     pub result_tab_offset: usize,
     result_grid_execution_target: Option<usize>,
+    progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
     pub object_browser: ObjectBrowserWidget,
     pub status_bar: Frame,
-    pub fetch_row_counts: HashMap<usize, usize>,
     pub current_file: Arc<Mutex<Option<PathBuf>>>,
     pub popups: Arc<Mutex<Vec<Window>>>,
     pub window: Window,
@@ -127,7 +146,6 @@ pub struct AppState {
     has_live_connection: bool,
     pending_connection_metadata_refresh: bool,
     pub config: Arc<Mutex<AppConfig>>,
-    pub last_fetch_status_update: Instant,
     status_animation_running: bool,
     status_animation_message: String,
     status_animation_frame: usize,
@@ -637,7 +655,11 @@ fn resolve_progress_tab_index(
     base_offset.saturating_add(statement_index)
 }
 
-fn resolve_active_progress_tab_index(state: &AppState, statement_index: usize) -> Option<usize> {
+fn resolve_active_progress_tab_index(
+    state: &AppState,
+    tab_id: QueryTabId,
+    statement_index: usize,
+) -> Option<usize> {
     let has_running_queries = state.sql_editor.is_query_running()
         || state
             .editor_tabs
@@ -650,10 +672,12 @@ fn resolve_active_progress_tab_index(state: &AppState, statement_index: usize) -
         return None;
     }
 
+    let context = state.progress_contexts.get(&tab_id)?;
+
     Some(resolve_progress_tab_index(
         state.result_tabs.tab_count(),
-        state.result_tab_offset,
-        state.result_grid_execution_target,
+        context.result_tab_offset,
+        context.execution_target,
         statement_index,
     ))
 }
@@ -705,6 +729,7 @@ impl MainWindow {
         // result grid exits streaming mode immediately so edit controls are not
         // left disabled waiting for a BatchFinished event that may never arrive.
         state.result_tabs.finish_all_streaming();
+        state.progress_contexts.clear();
 
         let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
         let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
@@ -1416,9 +1441,9 @@ impl MainWindow {
             rollback_btn: rollback_btn.clone(),
             result_tab_offset: 0,
             result_grid_execution_target: None,
+            progress_contexts: HashMap::new(),
             object_browser,
             status_bar,
-            fetch_row_counts: HashMap::new(),
             current_file: Arc::new(Mutex::new(None)),
             popups: Arc::new(Mutex::new(Vec::new())),
             window,
@@ -1428,7 +1453,6 @@ impl MainWindow {
             has_live_connection: false,
             pending_connection_metadata_refresh: false,
             config: Arc::new(Mutex::new(config)),
-            last_fetch_status_update: Instant::now(),
             status_animation_running: false,
             status_animation_message: String::new(),
             status_animation_frame: 0,
@@ -2168,6 +2192,7 @@ impl MainWindow {
                 return false;
             }
             s.editor_tabs.remove(index);
+            s.progress_contexts.remove(&tab_id);
 
             let mut created_tab_id = None;
             if s.editor_tabs.is_empty() {
@@ -2459,9 +2484,11 @@ impl MainWindow {
                         return;
                     }
                     let tab_count = s.result_tabs.tab_count();
-                    s.result_tab_offset =
-                        resolve_result_tab_offset(tab_count, s.result_grid_execution_target);
-                    s.fetch_row_counts.clear();
+                    let context = QueryProgressContext::new(
+                        resolve_result_tab_offset(tab_count, s.result_grid_execution_target),
+                        s.result_grid_execution_target,
+                    );
+                    s.progress_contexts.insert(tab_id, context);
                 }
                 QueryProgress::StatementStart { index } => {
                     let has_live_connection = s.has_live_connection;
@@ -2475,14 +2502,20 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = resolve_progress_tab_index(
-                        s.result_tabs.tab_count(),
-                        s.result_tab_offset,
-                        s.result_grid_execution_target,
-                        index,
-                    );
+                    let tab_count = s.result_tabs.tab_count();
                     let mut result_tabs = s.result_tabs.clone();
-                    s.fetch_row_counts.remove(&index);
+                    let tab_index = {
+                        let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                            return;
+                        };
+                        context.fetch_row_counts.remove(&index);
+                        resolve_progress_tab_index(
+                            tab_count,
+                            context.result_tab_offset,
+                            context.execution_target,
+                            index,
+                        )
+                    };
                     let was_running = s.status_animation_running;
                     s.start_status_animation("Executing query...");
                     if !was_running {
@@ -2508,15 +2541,21 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = resolve_progress_tab_index(
-                        s.result_tabs.tab_count(),
-                        s.result_tab_offset,
-                        s.result_grid_execution_target,
-                        index,
-                    );
+                    let tab_count = s.result_tabs.tab_count();
                     let mut result_tabs = s.result_tabs.clone();
-                    s.fetch_row_counts.insert(index, 0);
-                    s.last_fetch_status_update = Instant::now();
+                    let tab_index = {
+                        let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                            return;
+                        };
+                        context.fetch_row_counts.insert(index, 0);
+                        context.last_fetch_status_update = Instant::now();
+                        resolve_progress_tab_index(
+                            tab_count,
+                            context.result_tab_offset,
+                            context.execution_target,
+                            index,
+                        )
+                    };
                     let was_running = s.status_animation_running;
                     s.start_status_animation("Fetching rows: 0");
                     if !was_running {
@@ -2527,22 +2566,26 @@ impl MainWindow {
                     result_tabs.start_streaming(tab_index, &columns, &null_text);
                 }
                 QueryProgress::Rows { index, rows } => {
-                    let Some(tab_index) = resolve_active_progress_tab_index(&s, index) else {
+                    let Some(tab_index) = resolve_active_progress_tab_index(&s, tab_id, index)
+                    else {
                         return;
                     };
                     let rows_len = rows.len();
                     let mut result_tabs = s.result_tabs.clone();
+                    let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                        return;
+                    };
                     let new_count = {
-                        let count = s.fetch_row_counts.entry(index).or_insert(0);
+                        let count = context.fetch_row_counts.entry(index).or_insert(0);
                         *count += rows_len;
                         *count
                     };
                     // Throttle status bar updates to avoid formatting a new string
                     // and touching the label widget on every row batch.
                     let needs_status_update =
-                        s.last_fetch_status_update.elapsed() >= FETCH_STATUS_UPDATE_INTERVAL;
+                        context.last_fetch_status_update.elapsed() >= FETCH_STATUS_UPDATE_INTERVAL;
                     if needs_status_update {
-                        s.last_fetch_status_update = Instant::now();
+                        context.last_fetch_status_update = Instant::now();
                         s.update_status_animation(&format!("Fetching rows: {}", new_count));
                     }
                     drop(s);
@@ -2611,20 +2654,28 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let tab_index = resolve_progress_tab_index(
-                        s.result_tabs.tab_count(),
-                        s.result_tab_offset,
-                        s.result_grid_execution_target,
-                        index,
-                    );
+                    let tab_count = s.result_tabs.tab_count();
                     let mut result_tabs = s.result_tabs.clone();
+                    let tab_index = {
+                        let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                            return;
+                        };
+                        resolve_progress_tab_index(
+                            tab_count,
+                            context.result_tab_offset,
+                            context.execution_target,
+                            index,
+                        )
+                    };
                     let mut show_script_output = false;
                     let mut script_lines: Vec<String> = Vec::new();
                     if !result.success && !result.message.trim().is_empty() {
                         script_lines = result.message.lines().map(|l| l.to_string()).collect();
                         show_script_output = true;
                     }
-                    s.fetch_row_counts.remove(&index);
+                    if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                        context.fetch_row_counts.remove(&index);
+                    }
 
                     s.refresh_result_edit_controls();
                     drop(s);
@@ -2647,6 +2698,7 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                 }
                 QueryProgress::BatchFinished => {
+                    s.progress_contexts.remove(&tab_id);
                     let has_running_queries = s.sql_editor.is_query_running()
                         || s.editor_tabs
                             .iter()
@@ -2664,7 +2716,6 @@ impl MainWindow {
                         let mut s = state_for_progress
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.fetch_row_counts.clear();
                         s.result_grid_execution_target = None;
                         s.result_tab_offset = s.result_tabs.tab_count();
                         if s.pending_connection_metadata_refresh && s.has_live_connection {
