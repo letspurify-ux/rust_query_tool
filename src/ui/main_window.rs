@@ -602,6 +602,25 @@ fn validate_result_edit_action_allowed(has_running_queries: bool) -> Result<(), 
     }
 }
 
+fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorWidget> {
+    let editor = {
+        let guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_any_query_running() {
+            None
+        } else {
+            Some(guard.sql_editor.clone())
+        }
+    };
+
+    if editor.is_none() {
+        SqlEditorWidget::show_alert_dialog(&crate::db::format_connection_busy_message());
+    }
+
+    editor
+}
+
 fn resolve_result_tab_offset(tab_count: usize, target: Option<usize>) -> usize {
     target.filter(|idx| *idx < tab_count).unwrap_or(tab_count)
 }
@@ -1473,11 +1492,9 @@ impl MainWindow {
         let weak_state_for_execute = Arc::downgrade(&state);
         execute_btn.set_callback(move |_| {
             if let Some(state_for_execute) = weak_state_for_execute.upgrade() {
-                state_for_execute
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_current();
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_execute) {
+                    editor.execute_current();
+                }
             }
         });
 
@@ -1491,11 +1508,9 @@ impl MainWindow {
         let weak_state_for_explain = Arc::downgrade(&state);
         explain_btn.set_callback(move |_| {
             if let Some(state_for_explain) = weak_state_for_explain.upgrade() {
-                state_for_explain
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .explain_current();
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_explain) {
+                    editor.explain_current();
+                }
             }
         });
 
@@ -3022,11 +3037,9 @@ impl MainWindow {
                 true
             }
             "Query/Execute" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_current();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.execute_current();
+                }
                 true
             }
             "Query/New Tab" => {
@@ -3059,27 +3072,21 @@ impl MainWindow {
                 true
             }
             "Query/Execute Statement" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_statement_at_cursor();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.execute_statement_at_cursor();
+                }
                 true
             }
             "Query/Execute Statement (F9)" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_statement_at_cursor();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.execute_statement_at_cursor();
+                }
                 true
             }
             "Query/Execute Selected" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .execute_selected();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.execute_selected();
+                }
                 true
             }
             "Query/Quick Describe" => {
@@ -3091,11 +3098,9 @@ impl MainWindow {
                 true
             }
             "Query/Explain Plan" => {
-                state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .sql_editor
-                    .explain_current();
+                if let Some(editor) = acquire_sql_editor_if_idle(state) {
+                    editor.explain_current();
+                }
                 true
             }
             "Query/Commit" => {
@@ -3715,6 +3720,7 @@ impl MainWindow {
                 return;
             };
             let mut created_tab_for_generated_sql: Option<QueryTabId> = None;
+            let mut sql_to_execute: Option<String> = None;
             {
                 let mut s = state_for_browser
                     .lock()
@@ -3740,8 +3746,14 @@ impl MainWindow {
                         }
                     }
                     SqlAction::Execute(sql) => {
-                        s.sql_editor.execute_sql_text(&sql);
+                        sql_to_execute = Some(sql);
                     }
+                }
+            }
+
+            if let Some(sql) = sql_to_execute {
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
+                    editor.execute_sql_text(&sql);
                 }
             }
 
