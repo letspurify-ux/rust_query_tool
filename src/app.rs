@@ -53,7 +53,11 @@ impl App {
 
         let prefer_gpu = configure_gpu_visual();
         let startup = if prefer_gpu {
-            splash::run_with_splash(SplashOptions::space_query(), Self::bootstrap)
+            splash::run_with_splash(
+                SplashOptions::space_query(),
+                Self::bootstrap,
+                Self::bootstrap_without_splash,
+            )
         } else {
             Self::bootstrap_without_splash()
         };

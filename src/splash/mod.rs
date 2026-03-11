@@ -40,6 +40,7 @@ pub struct SplashOptions {
     pub initial_stage: &'static str,
     pub initial_detail: &'static str,
     pub minimum_display: Duration,
+    pub bootstrap_timeout: Duration,
     pub default_size: (i32, i32),
 }
 
@@ -51,6 +52,7 @@ impl SplashOptions {
             initial_stage: "BOOTSTRAPPING WORKSPACE",
             initial_detail: "Preparing launch surface",
             minimum_display: Duration::from_millis(5000),
+            bootstrap_timeout: Duration::from_secs(10),
             default_size: (628, 358),
         }
     }
@@ -79,10 +81,11 @@ enum BootstrapResult<T> {
 ///
 /// The background initialization closure runs on a worker thread. The splash
 /// stays in the FLTK UI thread so it never fights the main window event loop.
-pub fn run_with_splash<T, F>(options: SplashOptions, bootstrap: F) -> T
+pub fn run_with_splash<T, F, G>(options: SplashOptions, bootstrap: F, timeout_fallback: G) -> T
 where
     T: Send + 'static,
     F: FnOnce(LoadingHandle) -> T + Send + 'static,
+    G: FnOnce() -> T,
 {
     let loading_state = Arc::new(Mutex::new(LoadingState::new(
         options.minimum_display,
@@ -134,6 +137,9 @@ where
 
     let mut boot_result: Option<T> = None;
     let mut fatal_error: Option<String> = None;
+    let mut timeout_fallback = Some(timeout_fallback);
+    let splash_started_at = Instant::now();
+    let mut timed_out = false;
     #[cfg_attr(not(feature = "gpu-splash"), allow(unused_mut))]
     let mut skip_splash = false;
 
@@ -210,6 +216,21 @@ where
                 break;
             }
         }
+
+        if boot_result.is_none()
+            && fatal_error.is_none()
+            && splash_started_at.elapsed() >= options.bootstrap_timeout
+        {
+            timed_out = true;
+            crate::utils::logging::log_warning(
+                "splash",
+                &format!(
+                    "Startup bootstrap exceeded {:?}; continuing with timeout fallback.",
+                    options.bootstrap_timeout
+                ),
+            );
+            break;
+        }
     }
 
     running.store(false, Ordering::Relaxed);
@@ -232,6 +253,20 @@ where
         }
     } else {
         fade_out_and_destroy(&mut visuals.window);
+    }
+
+    if timed_out && boot_result.is_none() {
+        if let Some(fallback) = timeout_fallback.take() {
+            return fallback();
+        }
+        crate::utils::logging::log_error(
+            "splash",
+            "Startup bootstrap timeout fallback was not available.",
+        );
+        fltk::dialog::alert_default(
+            "SPACE Query failed to start.\n\nBootstrap timed out and fallback was unavailable.",
+        );
+        std::process::exit(1);
     }
 
     if let Some(error) = fatal_error {
