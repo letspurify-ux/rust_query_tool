@@ -54,6 +54,7 @@ pub(crate) struct IntellisenseRuntimeState {
     pending_intellisense: Arc<Mutex<Option<PendingIntellisense>>>,
     parse_cache: Arc<Mutex<Option<IntellisenseParseCacheEntry>>>,
     parse_generation: Arc<AtomicU64>,
+    buffer_revision: Arc<AtomicU64>,
     popup_show_in_progress: Arc<AtomicU8>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<app::TimeoutHandle>>>,
@@ -66,6 +67,7 @@ impl IntellisenseRuntimeState {
             pending_intellisense: Arc::new(Mutex::new(None::<PendingIntellisense>)),
             parse_cache: Arc::new(Mutex::new(None::<IntellisenseParseCacheEntry>)),
             parse_generation: Arc::new(AtomicU64::new(0)),
+            buffer_revision: Arc::new(AtomicU64::new(0)),
             popup_show_in_progress: Arc::new(AtomicU8::new(
                 IntellisensePopupTransitionState::Idle as u8,
             )),
@@ -144,6 +146,16 @@ impl IntellisenseRuntimeState {
         self.parse_generation.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn next_buffer_revision(&self) -> u64 {
+        self.buffer_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn current_buffer_revision(&self) -> u64 {
+        self.buffer_revision.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn popup_transition_state(&self) -> IntellisensePopupTransitionState {
         load_popup_transition_state(&self.popup_show_in_progress)
     }
@@ -206,5 +218,10 @@ impl IntellisenseRuntimeState {
     #[cfg(test)]
     pub(crate) fn set_parse_generation_for_test(&self, generation: u64) {
         self.parse_generation.store(generation, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_buffer_revision_for_test(&self, revision: u64) {
+        self.buffer_revision.store(revision, Ordering::Relaxed);
     }
 }

@@ -58,13 +58,14 @@ enum DndDropState {
 #[derive(Clone)]
 struct IntellisenseTriggerSnapshot {
     request_generation: u64,
+    buffer_revision: u64,
     cursor_pos: i32,
     cursor_pos_usize: usize,
     prefix: String,
     word_start: usize,
     qualifier: Option<String>,
-    statement_text: String,
-    cursor_in_statement: usize,
+    statement_window_text: String,
+    cursor_in_window: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

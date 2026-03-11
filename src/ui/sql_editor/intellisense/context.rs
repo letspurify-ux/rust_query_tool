@@ -474,7 +474,7 @@ impl SqlEditorWidget {
         Self::cursor_position(buffer, editor.insert_position())
     }
 
-    fn statement_context_with_cursor(
+    fn statement_window_with_cursor(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: i32,
@@ -496,10 +496,7 @@ impl SqlEditorWidget {
             rel_cursor = text.len();
         }
         rel_cursor = Self::clamp_to_char_boundary_local(&text, rel_cursor);
-        let (stmt_start, stmt_end) = Self::statement_bounds_in_text(&text, rel_cursor);
-        let statement = text.get(stmt_start..stmt_end).unwrap_or("").to_string();
-        let cursor_in_statement = rel_cursor.saturating_sub(stmt_start).min(statement.len());
-        (statement, cursor_in_statement)
+        (text, rel_cursor)
     }
 
     #[cfg(test)]

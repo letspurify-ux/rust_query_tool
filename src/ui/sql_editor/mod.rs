@@ -222,8 +222,8 @@ pub(crate) struct PendingIntellisense {
 
 #[derive(Clone)]
 pub(crate) struct IntellisenseParseCacheEntry {
-    statement_text: String,
-    cursor_in_statement: usize,
+    buffer_revision: u64,
+    cursor_pos: i32,
     context: Arc<crate::ui::intellisense_context::CursorContext>,
 }
 

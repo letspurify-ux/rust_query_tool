@@ -10,6 +10,7 @@ impl SqlEditorWidget {
         runtime: &Arc<IntellisenseRuntimeState>,
     ) {
         let request_generation = runtime.next_parse_generation();
+        let buffer_revision = runtime.current_buffer_revision();
         let (cursor_pos, cursor_pos_usize) = Self::editor_cursor_position(editor, buffer);
         let (prefix, word_start, _) = Self::word_at_cursor(buffer, text_shadow, cursor_pos);
         let qualifier = Self::qualifier_before_word(buffer, text_shadow, word_start);
@@ -26,30 +27,24 @@ impl SqlEditorWidget {
             return;
         }
 
-        let (statement_context_text, cursor_in_statement_raw) =
-            Self::statement_context_with_cursor(buffer, text_shadow, cursor_pos);
-        let cursor_in_statement_raw =
-            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
-        let (statement_text, cursor_in_statement) =
-            Self::normalize_intellisense_context_with_cursor(
-                &statement_context_text,
-                cursor_in_statement_raw,
-            );
+        let (statement_window_text, cursor_in_window) =
+            Self::statement_window_with_cursor(buffer, text_shadow, cursor_pos);
         let snapshot = Arc::new(IntellisenseTriggerSnapshot {
             request_generation,
+            buffer_revision,
             cursor_pos,
             cursor_pos_usize,
             prefix,
             word_start,
             qualifier,
-            statement_text,
-            cursor_in_statement,
+            statement_window_text,
+            cursor_in_window,
         });
 
         let cached_context = runtime.parse_cache().and_then(|entry| {
-            (entry.cursor_in_statement == snapshot.cursor_in_statement
-                && entry.statement_text.as_str() == snapshot.statement_text.as_str())
-            .then_some(entry.context.clone())
+            (entry.buffer_revision == snapshot.buffer_revision
+                && entry.cursor_pos == snapshot.cursor_pos)
+                .then_some(entry.context.clone())
         });
 
         if let Some(context) = cached_context {
@@ -99,33 +94,44 @@ impl SqlEditorWidget {
         intellisense_context::analyze_cursor_context(&full_tokens, split_idx)
     }
 
+    fn analyze_statement_window_context(
+        statement_window_text: &str,
+        cursor_in_window: usize,
+    ) -> intellisense_context::CursorContext {
+        if statement_window_text.is_empty() {
+            return Self::analyze_statement_context("", 0);
+        }
+
+        let cursor_in_window =
+            Self::clamp_to_char_boundary_local(statement_window_text, cursor_in_window);
+        let (stmt_start, stmt_end) =
+            Self::statement_bounds_in_text(statement_window_text, cursor_in_window);
+        let statement = statement_window_text.get(stmt_start..stmt_end).unwrap_or("");
+        let cursor_in_statement_raw = cursor_in_window
+            .saturating_sub(stmt_start)
+            .min(statement.len());
+        let (statement_text, cursor_in_statement) =
+            Self::normalize_intellisense_context_with_cursor(
+                statement,
+                cursor_in_statement_raw,
+            );
+        Self::analyze_statement_context(&statement_text, cursor_in_statement)
+    }
+
     fn is_intellisense_snapshot_current(
         editor: &TextEditor,
-        buffer: &TextBuffer,
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        runtime: &Arc<IntellisenseRuntimeState>,
         snapshot: &IntellisenseTriggerSnapshot,
     ) -> bool {
         if editor.was_deleted() {
             return false;
         }
 
-        let (cursor_pos, _) = Self::editor_cursor_position(editor, buffer);
-        if cursor_pos != snapshot.cursor_pos {
+        if editor.insert_position() != snapshot.cursor_pos {
             return false;
         }
 
-        let (statement_context_text, cursor_in_statement_raw) =
-            Self::statement_context_with_cursor(buffer, text_shadow, cursor_pos);
-        let cursor_in_statement_raw =
-            Self::clamp_to_char_boundary_local(&statement_context_text, cursor_in_statement_raw);
-        let (statement_text, cursor_in_statement) =
-            Self::normalize_intellisense_context_with_cursor(
-                &statement_context_text,
-                cursor_in_statement_raw,
-            );
-
-        cursor_in_statement == snapshot.cursor_in_statement
-            && statement_text.as_str() == snapshot.statement_text.as_str()
+        runtime.current_buffer_revision() == snapshot.buffer_revision
     }
 
     fn is_intellisense_parse_generation_current(
@@ -281,9 +287,9 @@ impl SqlEditorWidget {
             .name("intellisense-parse-worker".to_string())
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    Self::analyze_statement_context(
-                        &snapshot_for_thread.statement_text,
-                        snapshot_for_thread.cursor_in_statement,
+                    Self::analyze_statement_window_context(
+                        &snapshot_for_thread.statement_window_text,
+                        snapshot_for_thread.cursor_in_window,
                     )
                 }));
 
@@ -309,12 +315,7 @@ impl SqlEditorWidget {
                 &format!("failed to spawn parse worker: {err}"),
             );
             if Self::is_intellisense_parse_generation_current(runtime, snapshot.as_ref())
-                && Self::is_intellisense_snapshot_current(
-                    editor,
-                    buffer,
-                    text_shadow,
-                    snapshot.as_ref(),
-                )
+                && Self::is_intellisense_snapshot_current(editor, runtime, snapshot.as_ref())
             {
                 Self::clear_intellisense_ui_state(intellisense_popup, runtime);
             }
@@ -378,8 +379,7 @@ impl SqlEditorWidget {
                 if !Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
                     || !Self::is_intellisense_snapshot_current(
                         &editor,
-                        &buffer,
-                        &text_shadow,
+                        &runtime,
                         snapshot.as_ref(),
                     )
                 {
@@ -387,8 +387,8 @@ impl SqlEditorWidget {
                 }
                 let parsed = Arc::new(parsed);
                 runtime.set_parse_cache(Some(IntellisenseParseCacheEntry {
-                    statement_text: snapshot.statement_text.clone(),
-                    cursor_in_statement: snapshot.cursor_in_statement,
+                    buffer_revision: snapshot.buffer_revision,
+                    cursor_pos: snapshot.cursor_pos,
                     context: parsed.clone(),
                 }));
 
@@ -411,8 +411,7 @@ impl SqlEditorWidget {
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
                     && Self::is_intellisense_snapshot_current(
                         &editor,
-                        &buffer,
-                        &text_shadow,
+                        &runtime,
                         snapshot.as_ref(),
                     )
                 {
@@ -439,8 +438,7 @@ impl SqlEditorWidget {
                 if Self::is_intellisense_parse_generation_current(&runtime, snapshot.as_ref())
                     && Self::is_intellisense_snapshot_current(
                         &editor,
-                        &buffer,
-                        &text_shadow,
+                        &runtime,
                         snapshot.as_ref(),
                     )
                 {
