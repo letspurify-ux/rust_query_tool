@@ -7,7 +7,7 @@ authors = ["Developer"]
 build = "build.rs"
 
 [features]
-default = ["gpu-splash"]
+default = []
 gpu-splash = ["fltk/enable-glwindow", "dep:glow"]
 
 [[bin]]

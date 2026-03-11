@@ -7,6 +7,7 @@ use std::time::Instant;
 /// loading text pulse.
 #[derive(Debug)]
 pub struct AnimationState {
+    #[cfg(feature = "gpu-splash")]
     started_at: Instant,
     last_tick: Instant,
     time_seconds: f32,
@@ -16,6 +17,7 @@ impl AnimationState {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
+            #[cfg(feature = "gpu-splash")]
             started_at: now,
             last_tick: now,
             time_seconds: 0.0,
@@ -34,12 +36,14 @@ impl AnimationState {
         self.time_seconds += dt;
     }
 
+    #[cfg(feature = "gpu-splash")]
     pub fn elapsed_seconds(&self) -> f32 {
         self.started_at.elapsed().as_secs_f32()
     }
 
     /// A very small camera offset keeps the scene from feeling static while
     /// remaining restrained enough for a professional desktop tool.
+    #[cfg(feature = "gpu-splash")]
     pub fn camera_offset(&self) -> [f32; 2] {
         let t = self.time_seconds;
         [
