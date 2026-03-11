@@ -482,6 +482,9 @@ impl SqlEditorWidget {
         );
 
         if needs_full_rehighlight(buf, pos, ins, deleted_text) {
+            // Ensure delimiter-sensitive fallback wins over any already queued
+            // incremental task for the same edit.
+            self.invalidate_pending_highlight_results();
             let cursor_pos = infer_cursor_after_edit(pos, ins, text_len);
             self.apply_windowed_highlighting(cursor_pos, None, None, None);
         }
@@ -760,6 +763,9 @@ fn compute_incremental_start_from_text(text: &str, pos: i32, ins: i32, del: i32)
         .saturating_add((ins.max(0) as usize).max(del.max(0) as usize))
         .min(text_len);
     let mut probe = start.min(changed_end);
+    while probe > 0 && !text.is_char_boundary(probe) {
+        probe -= 1;
+    }
 
     let bytes = text.as_bytes();
     while probe > 0 {

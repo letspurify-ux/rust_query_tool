@@ -1115,6 +1115,25 @@ fn compute_edited_range_clamps_and_handles_invalid_pos() {
 }
 
 #[test]
+fn compute_incremental_start_rewinds_to_whitespace_boundary() {
+    let text = "SELECT column_name FROM dual";
+    let pos = text.find("name").unwrap_or(0) as i32;
+    let start = compute_incremental_start_from_text(text, pos, 1, 0);
+    let expected = text.find("column_name").unwrap_or(0);
+    assert_eq!(start, expected);
+}
+
+#[test]
+fn compute_incremental_start_clamps_to_utf8_boundary() {
+    let text = "SELECT 한글컬럼 FROM dual";
+    let base = text.find("글").unwrap_or(0);
+    let mid_byte = base.saturating_add(1) as i32;
+    let start = compute_incremental_start_from_text(text, mid_byte, 1, 0);
+    assert!(text.is_char_boundary(start));
+    assert!(start <= base);
+}
+
+#[test]
 fn has_stateful_sql_delimiter_detects_comment_and_string_tokens() {
     assert!(has_stateful_sql_delimiter("/* comment"));
     assert!(has_stateful_sql_delimiter("end */"));
