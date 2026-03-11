@@ -1,6 +1,8 @@
 use fltk::app;
 use std::time::{Duration, Instant};
 
+const AUTO_DISMISS_AFTER_READY: Duration = Duration::from_millis(1500);
+
 /// Small UI event payload sent from the background bootstrap thread to the
 /// splash window on the FLTK UI thread.
 #[derive(Clone, Debug)]
@@ -133,6 +135,49 @@ impl LoadingState {
     }
 
     pub fn should_close(&self) -> bool {
-        self.bootstrap_finished_at.is_some() && self.dismiss_requested
+        let minimum_display_elapsed = self.started_at.elapsed() >= self.minimum_display;
+        let auto_dismiss_elapsed = self
+            .bootstrap_finished_at
+            .map(|finished_at| finished_at.elapsed() >= AUTO_DISMISS_AFTER_READY)
+            .unwrap_or(false);
+
+        self.bootstrap_finished_at.is_some()
+            && minimum_display_elapsed
+            && (self.dismiss_requested || auto_dismiss_elapsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_close_after_bootstrap_when_auto_dismiss_elapsed() {
+        let mut state = LoadingState::new(
+            Duration::from_millis(5),
+            "BOOTSTRAPPING WORKSPACE",
+            "Preparing launch surface",
+        );
+
+        std::thread::sleep(Duration::from_millis(6));
+        state.mark_bootstrap_finished();
+        std::thread::sleep(AUTO_DISMISS_AFTER_READY + Duration::from_millis(20));
+
+        assert!(state.should_close());
+    }
+
+    #[test]
+    fn should_close_after_bootstrap_when_user_requests_close() {
+        let mut state = LoadingState::new(
+            Duration::from_millis(5),
+            "BOOTSTRAPPING WORKSPACE",
+            "Preparing launch surface",
+        );
+
+        std::thread::sleep(Duration::from_millis(6));
+        state.mark_bootstrap_finished();
+        state.request_close();
+
+        assert!(state.should_close());
     }
 }
