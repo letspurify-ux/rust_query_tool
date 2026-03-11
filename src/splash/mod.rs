@@ -134,6 +134,7 @@ where
 
     let mut boot_result: Option<T> = None;
     let mut fatal_error: Option<String> = None;
+    #[cfg_attr(not(feature = "gpu-splash"), allow(unused_mut))]
     let mut skip_splash = false;
 
     loop {
@@ -163,6 +164,7 @@ where
                     }
                     visuals.overlay_panel.redraw();
                 }
+                #[cfg(feature = "gpu-splash")]
                 SplashEvent::GpuUnavailable(reason) => {
                     crate::utils::logging::log_warning(
                         "splash",
@@ -259,7 +261,7 @@ fn build_splash_window(
     options: &SplashOptions,
     loading_state: &Arc<Mutex<LoadingState>>,
     animation_state: &Arc<Mutex<AnimationState>>,
-    event_sender: &app::Sender<SplashEvent>,
+    _event_sender: &app::Sender<SplashEvent>,
 ) -> SplashVisuals {
     let current_group = Group::try_current();
     Group::set_current(None::<&Group>);
@@ -294,7 +296,7 @@ fn build_splash_window(
             options.app_name,
             loading_state,
             animation_state,
-            event_sender,
+            _event_sender,
         );
         Some(gl_window)
     };

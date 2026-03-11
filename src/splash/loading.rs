@@ -9,6 +9,7 @@ const AUTO_DISMISS_AFTER_READY: Duration = Duration::from_millis(1500);
 pub enum SplashEvent {
     Loading(LoadingSnapshot),
     BootstrapFinished,
+    #[cfg(feature = "gpu-splash")]
     GpuUnavailable(String),
 }
 
