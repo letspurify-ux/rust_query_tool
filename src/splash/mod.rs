@@ -374,7 +374,7 @@ fn install_dismiss_handler<W: WidgetExt + WidgetBase>(
     let mut redraw_window = redraw_window.clone();
     let mut redraw_panel = redraw_panel.clone();
     widget.handle(move |_widget, event| match event {
-        Event::Push => {
+        Event::Push | Event::Released | Event::KeyDown => {
             match loading_state.lock() {
                 Ok(mut guard) => guard.request_close(),
                 Err(poisoned) => poisoned.into_inner().request_close(),
