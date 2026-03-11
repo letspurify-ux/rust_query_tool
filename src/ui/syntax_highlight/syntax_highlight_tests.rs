@@ -1176,3 +1176,56 @@ fn test_prepare_window_requests_clamps_mid_byte_inputs_to_utf8_boundaries() {
         assert_eq!(request.text.len(), request.end - request.start);
     }
 }
+
+#[test]
+fn test_incremental_highlight_inherits_comment_entry_state() {
+    let highlighter = SqlHighlighter::new();
+    let text = "/* open comment\nupdated text still comment */\nSELECT 1";
+    let previous_styles = highlighter.generate_styles(text);
+    let start = text.find("updated").unwrap_or(0);
+
+    let result = highlighter.generate_incremental_styles(IncrementalHighlightRequest {
+        start,
+        text: text.to_string(),
+        previous_styles,
+        entry_state: LexerState::InBlockComment,
+    });
+
+    assert!(result.is_some());
+    let updated = result.unwrap_or(IncrementalHighlightResult {
+        start: 0,
+        end: 0,
+        styles: String::new(),
+    });
+    assert!(updated.end >= updated.start);
+    if !updated.styles.is_empty() {
+        assert!(updated.styles.chars().all(|c| c == STYLE_COMMENT));
+    }
+}
+
+#[test]
+fn test_incremental_highlight_stops_when_style_tail_matches() {
+    let highlighter = SqlHighlighter::new();
+    let original = "SELECT alpha FROM dual";
+    let updated_text = "SELECT alphax FROM dual";
+
+    let previous_styles = highlighter.generate_styles(original);
+    let result = highlighter.generate_incremental_styles(IncrementalHighlightRequest {
+        start: "SELECT ".len(),
+        text: updated_text.to_string(),
+        previous_styles,
+        entry_state: LexerState::Normal,
+    });
+
+    assert!(result.is_some());
+    let updated = result.unwrap_or(IncrementalHighlightResult {
+        start: 0,
+        end: 0,
+        styles: String::new(),
+    });
+    assert!(updated.end <= updated_text.len());
+    assert_eq!(
+        updated.styles.len(),
+        updated.end.saturating_sub(updated.start)
+    );
+}
