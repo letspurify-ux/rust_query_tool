@@ -825,6 +825,21 @@ fn test_plsql_control_keyword_implicit_alias_in_select_list_is_not_keyword() {
 }
 
 #[test]
+fn test_plsql_control_keyword_implicit_alias_before_close_paren_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT * FROM (SELECT salary IF FROM dual)";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find(" IF FROM").unwrap_or(0) + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias IF before close paren should not be keyword"
+    );
+}
+
+#[test]
 fn test_plsql_control_keyword_aliases_can_be_identifiers_when_known_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {
