@@ -1361,7 +1361,6 @@ impl SqlEditorWidget {
                         upper == "END" && block_stack.last().is_some_and(|s| s == "CASE");
                     let treat_control_keyword_as_identifier =
                         sql_text::is_plsql_control_keyword(upper.as_str())
-                            && !in_plsql_block
                             && !closes_case_expression
                             && !next_word_is("THEN")
                             && !(upper == "END"
@@ -11427,6 +11426,50 @@ END"
         assert!(
             !formatted.contains("\nIF,"),
             "IF alias should not be split as PL/SQL block token, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_in_plsql_block_keeps_keyword_like_aliases_inline() {
+        let sql = "BEGIN SELECT amount AS IF, total AS END INTO v_amount, v_total FROM sales; END;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("AS IF") && formatted.contains("AS END"),
+            "keyword-like aliases inside PL/SQL SELECT should stay aliases, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("
+        IF") && !formatted.contains("
+        END"),
+            "alias IF/END inside PL/SQL block should not be split as control keywords, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_in_plsql_block_keeps_keyword_like_implicit_alias_inline() {
+        let sql = "BEGIN SELECT amount IF INTO v_amount FROM sales; END;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF") && formatted.contains("INTO v_amount"),
+            "implicit alias IF inside PL/SQL SELECT should stay inline, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("
+        IF
+"),
+            "implicit alias IF inside PL/SQL block should not be split as block keyword, got:
+{}",
             formatted
         );
     }
