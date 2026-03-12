@@ -350,8 +350,10 @@ fn test_q_quote_highlighting() {
     let q_start = text.find("q'[").unwrap();
     let q_end = text.find("]'").unwrap() + 2;
     assert!(
-        styles[q_start..q_end].chars().all(|c| c == STYLE_STRING),
-        "q'[...]' should be string style, got: {}",
+        styles[q_start..q_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "q'[...]' should be q-quote string style, got: {}",
         &styles[q_start..q_end]
     );
 }
@@ -372,8 +374,10 @@ fn test_nq_quote_highlighting() {
     let nq_start = text.find("nq'[").unwrap();
     let nq_end = text.find("]'").unwrap() + 2;
     assert!(
-        styles[nq_start..nq_end].chars().all(|c| c == STYLE_STRING),
-        "nq'[...]' should be string style, got: {}",
+        styles[nq_start..nq_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "nq'[...]' should be q-quote string style, got: {}",
         &styles[nq_start..nq_end]
     );
 }
@@ -390,8 +394,8 @@ fn test_nq_quote_case_insensitive_highlighting() {
     assert!(
         styles1[nq_start1..nq_end1]
             .chars()
-            .all(|c| c == STYLE_STRING),
-        "NQ'[...]' should be string style"
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "NQ'[...]' should be q-quote string style"
     );
 
     // Test Nq (mixed case)
@@ -402,8 +406,8 @@ fn test_nq_quote_case_insensitive_highlighting() {
     assert!(
         styles2[nq_start2..nq_end2]
             .chars()
-            .all(|c| c == STYLE_STRING),
-        "Nq'[...]' should be string style"
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "Nq'[...]' should be q-quote string style"
     );
 }
 
@@ -416,8 +420,10 @@ fn test_uq_quote_highlighting() {
     let uq_start = text.find("uq'[").unwrap();
     let uq_end = text.find("]'").unwrap() + 2;
     assert!(
-        styles[uq_start..uq_end].chars().all(|c| c == STYLE_STRING),
-        "uq'[...]' should be string style, got: {}",
+        styles[uq_start..uq_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "uq'[...]' should be q-quote string style, got: {}",
         &styles[uq_start..uq_end]
     );
 }
@@ -431,7 +437,9 @@ fn test_unicode_q_quote_delimiter_highlighting() {
     let q_start = text.find("q'가").unwrap();
     let q_end = text.find("가'").unwrap() + "가'".len();
     assert!(
-        styles[q_start..q_end].chars().all(|c| c == STYLE_STRING),
+        styles[q_start..q_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "unicode q-quote should remain one string span, got: {}",
         &styles[q_start..q_end]
     );
@@ -446,7 +454,9 @@ fn test_unicode_uq_quote_delimiter_highlighting() {
     let uq_start = text.find("uq'가").unwrap();
     let uq_end = text.find("가'").unwrap() + "가'".len();
     assert!(
-        styles[uq_start..uq_end].chars().all(|c| c == STYLE_STRING),
+        styles[uq_start..uq_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "unicode uq-quote should remain one string span, got: {}",
         &styles[uq_start..uq_end]
     );
@@ -478,7 +488,9 @@ fn test_q_quote_different_delimiters() {
     let q_start1 = text1.find("q'(").unwrap();
     let q_end1 = text1.find(")'").unwrap() + 2;
     assert!(
-        styles1[q_start1..q_end1].chars().all(|c| c == STYLE_STRING),
+        styles1[q_start1..q_end1]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "q'(...)' should be string style"
     );
 
@@ -488,7 +500,9 @@ fn test_q_quote_different_delimiters() {
     let q_start2 = text2.find("q'{").unwrap();
     let q_end2 = text2.find("}'").unwrap() + 2;
     assert!(
-        styles2[q_start2..q_end2].chars().all(|c| c == STYLE_STRING),
+        styles2[q_start2..q_end2]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "q'{{...}}' should be string style"
     );
 
@@ -498,7 +512,9 @@ fn test_q_quote_different_delimiters() {
     let q_start3 = text3.find("q'<").unwrap();
     let q_end3 = text3.find(">'").unwrap() + 2;
     assert!(
-        styles3[q_start3..q_end3].chars().all(|c| c == STYLE_STRING),
+        styles3[q_start3..q_end3]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "q'<...>' should be string style"
     );
 }
@@ -513,7 +529,9 @@ fn test_q_quote_with_embedded_quotes() {
     let q_start = text.find("q'[").unwrap();
     let q_end = text.find("]'").unwrap() + 2;
     assert!(
-        styles[q_start..q_end].chars().all(|c| c == STYLE_STRING),
+        styles[q_start..q_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
         "q'[...]' with embedded quote should be string style"
     );
 }
@@ -786,8 +804,10 @@ fn test_exit_state_unclosed_block_comment() {
     assert_eq!(exit, LexerState::InBlockComment);
     let comment_start = text.find("/*").unwrap();
     assert!(
-        styles[comment_start..].chars().all(|c| c == STYLE_COMMENT),
-        "unclosed block comment should be COMMENT style"
+        styles[comment_start..]
+            .chars()
+            .all(|c| c == STYLE_BLOCK_COMMENT),
+        "unclosed block comment should be BLOCK_COMMENT style"
     );
 }
 
@@ -842,8 +862,10 @@ fn test_entry_state_in_block_comment_continues() {
     // "still commenting */" should be comment
     let comment_end = text.find("*/").unwrap() + 2;
     assert!(
-        styles[..comment_end].chars().all(|c| c == STYLE_COMMENT),
-        "continued block comment should be COMMENT"
+        styles[..comment_end]
+            .chars()
+            .all(|c| c == STYLE_BLOCK_COMMENT),
+        "continued block comment should be BLOCK_COMMENT"
     );
     // "SELECT" after should be keyword
     let select_pos = text.find("SELECT").unwrap();
@@ -890,7 +912,7 @@ fn test_entry_state_in_q_quote_continues() {
     assert_eq!(exit, LexerState::Normal);
     let q_end = text.find("]'").unwrap() + 2;
     assert!(
-        styles[..q_end].chars().all(|c| c == STYLE_STRING),
+        styles[..q_end].chars().all(|c| c == STYLE_Q_QUOTE_STRING),
         "continued q-quote should be STRING"
     );
 }
@@ -903,7 +925,9 @@ fn test_entry_state_in_double_quote_continues() {
     assert_eq!(exit, LexerState::Normal);
     let ident_end = text.find('"').unwrap() + 1;
     assert!(
-        styles[..ident_end].chars().all(|c| c == STYLE_IDENTIFIER),
+        styles[..ident_end]
+            .chars()
+            .all(|c| c == STYLE_QUOTED_IDENTIFIER),
         "continued quoted identifier should be IDENTIFIER"
     );
 }
@@ -915,8 +939,8 @@ fn test_entry_state_block_comment_never_closes() {
     let (styles, exit) = highlighter.generate_styles_with_state(text, LexerState::InBlockComment);
     assert_eq!(exit, LexerState::InBlockComment);
     assert!(
-        styles.chars().all(|c| c == STYLE_COMMENT),
-        "entire text should be COMMENT when starting InBlockComment and no close"
+        styles.chars().all(|c| c == STYLE_BLOCK_COMMENT),
+        "entire text should be BLOCK_COMMENT when starting InBlockComment and no close"
     );
 }
 
@@ -943,6 +967,24 @@ fn test_cross_window_block_comment_round_trip() {
             .chars()
             .all(|c| c == STYLE_KEYWORD),
         "SELECT after comment close should be KEYWORD"
+    );
+}
+
+#[test]
+fn test_entry_state_from_continuation_style_maps_segmented_styles() {
+    let highlighter = SqlHighlighter::new();
+
+    assert_eq!(
+        highlighter.entry_state_from_continuation_style(STYLE_BLOCK_COMMENT),
+        LexerState::InBlockComment
+    );
+    assert_eq!(
+        highlighter.entry_state_from_continuation_style(STYLE_Q_QUOTE_STRING),
+        LexerState::InSingleQuote
+    );
+    assert_eq!(
+        highlighter.entry_state_from_continuation_style(STYLE_QUOTED_IDENTIFIER),
+        LexerState::InDoubleQuote
     );
 }
 
