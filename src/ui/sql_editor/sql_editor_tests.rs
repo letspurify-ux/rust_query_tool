@@ -1,6 +1,7 @@
 use super::*;
 use crate::ui::syntax_highlight::{
-    STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_IDENTIFIER, STYLE_KEYWORD, STYLE_STRING,
+    STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_IDENTIFIER, STYLE_KEYWORD,
+    STYLE_QUOTED_IDENTIFIER, STYLE_Q_QUOTE_STRING, STYLE_STRING,
 };
 
 use std::fs;
@@ -149,19 +150,25 @@ fn continuation_style_before_position_for_text(style_text: &str, pos: usize) -> 
         return STYLE_DEFAULT;
     }
 
-    match style_text
+    let style = style_text
         .as_bytes()
         .get(pos.saturating_sub(1))
         .copied()
         .map(char::from)
-    {
-        Some(STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT) => style_text
-            .as_bytes()
-            .get(pos.saturating_sub(1))
-            .copied()
-            .map(char::from)
-            .unwrap_or(STYLE_DEFAULT),
-        _ => STYLE_DEFAULT,
+        .unwrap_or(STYLE_DEFAULT);
+    if matches!(
+        style,
+        STYLE_COMMENT
+            | STYLE_BLOCK_COMMENT
+            | STYLE_STRING
+            | STYLE_Q_QUOTE_STRING
+            | STYLE_IDENTIFIER
+            | STYLE_QUOTED_IDENTIFIER
+            | STYLE_HINT
+    ) {
+        style
+    } else {
+        STYLE_DEFAULT
     }
 }
 
@@ -170,11 +177,11 @@ fn continuation_style_for_lexer_state_for_test(
 ) -> char {
     match state {
         crate::ui::syntax_highlight::LexerState::Normal => STYLE_DEFAULT,
-        crate::ui::syntax_highlight::LexerState::InBlockComment => STYLE_COMMENT,
+        crate::ui::syntax_highlight::LexerState::InBlockComment => STYLE_BLOCK_COMMENT,
         crate::ui::syntax_highlight::LexerState::InHintComment => STYLE_HINT,
-        crate::ui::syntax_highlight::LexerState::InSingleQuote
-        | crate::ui::syntax_highlight::LexerState::InQQuote { .. } => STYLE_STRING,
-        crate::ui::syntax_highlight::LexerState::InDoubleQuote => STYLE_IDENTIFIER,
+        crate::ui::syntax_highlight::LexerState::InSingleQuote => STYLE_STRING,
+        crate::ui::syntax_highlight::LexerState::InQQuote { .. } => STYLE_Q_QUOTE_STRING,
+        crate::ui::syntax_highlight::LexerState::InDoubleQuote => STYLE_QUOTED_IDENTIFIER,
     }
 }
 

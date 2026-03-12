@@ -87,23 +87,12 @@ impl HighlightShadowState {
             .copied()
             .map(char::from)
             .unwrap_or(STYLE_DEFAULT);
-        if matches!(
-            style,
-            STYLE_COMMENT
-                | STYLE_STRING
-                | crate::ui::syntax_highlight::STYLE_IDENTIFIER
-                | crate::ui::syntax_highlight::STYLE_HINT
-        ) {
+        if is_continuation_style(style) {
             style
         } else {
             STYLE_DEFAULT
         }
     }
-
-    fn style_text(&self) -> Option<&str> {
-        std::str::from_utf8(&self.styles).ok()
-    }
-
     pub(crate) fn text_range_string(&self, start: usize, end: usize) -> Option<String> {
         let start = Self::clamp_boundary(&self.text, start.min(self.text.len()));
         let end = Self::clamp_boundary(&self.text, end.min(self.text.len()));
@@ -294,16 +283,10 @@ impl SqlEditorWidget {
             .highlighter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(style_text) = shadow.style_text() else {
-            return false;
-        };
-
         let mut current_start = start;
         let mut minimum_end = must_cover_end.max(start);
-        let mut entry_state = highlighter.probe_entry_state_for_style_text(
-            shadow.text.as_str(),
-            style_text,
-            start,
+        let mut entry_state = highlighter.entry_state_from_continuation_style(
+            continuation_style_before_position(shadow, start),
         );
         let mut changed_range: Option<(usize, usize)> = None;
 
@@ -320,7 +303,7 @@ impl SqlEditorWidget {
                 break;
             };
 
-            let old_exit_style = shadow.continuation_style_before_position(current_end);
+            let old_exit_style = continuation_style_before_position(shadow, current_end);
             let (new_styles, new_exit_state) =
                 highlighter.generate_styles_for_window(&range_text, entry_state);
             if new_styles.len() != range_text.len() {
@@ -394,16 +377,37 @@ fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<S
 fn continuation_style_for_lexer_state(state: crate::ui::syntax_highlight::LexerState) -> char {
     match state {
         crate::ui::syntax_highlight::LexerState::Normal => STYLE_DEFAULT,
-        crate::ui::syntax_highlight::LexerState::InBlockComment => STYLE_COMMENT,
+        crate::ui::syntax_highlight::LexerState::InBlockComment => {
+            crate::ui::syntax_highlight::STYLE_BLOCK_COMMENT
+        }
         crate::ui::syntax_highlight::LexerState::InHintComment => {
             crate::ui::syntax_highlight::STYLE_HINT
         }
-        crate::ui::syntax_highlight::LexerState::InSingleQuote
-        | crate::ui::syntax_highlight::LexerState::InQQuote { .. } => STYLE_STRING,
+        crate::ui::syntax_highlight::LexerState::InSingleQuote => STYLE_STRING,
+        crate::ui::syntax_highlight::LexerState::InQQuote { .. } => {
+            crate::ui::syntax_highlight::STYLE_Q_QUOTE_STRING
+        }
         crate::ui::syntax_highlight::LexerState::InDoubleQuote => {
-            crate::ui::syntax_highlight::STYLE_IDENTIFIER
+            crate::ui::syntax_highlight::STYLE_QUOTED_IDENTIFIER
         }
     }
+}
+
+fn continuation_style_before_position(shadow: &HighlightShadowState, pos: usize) -> char {
+    shadow.continuation_style_before_position(pos)
+}
+
+fn is_continuation_style(style: char) -> bool {
+    matches!(
+        style,
+        STYLE_COMMENT
+            | STYLE_STRING
+            | crate::ui::syntax_highlight::STYLE_BLOCK_COMMENT
+            | crate::ui::syntax_highlight::STYLE_Q_QUOTE_STRING
+            | crate::ui::syntax_highlight::STYLE_IDENTIFIER
+            | crate::ui::syntax_highlight::STYLE_QUOTED_IDENTIFIER
+            | crate::ui::syntax_highlight::STYLE_HINT
+    )
 }
 
 fn incremental_rehighlight_start(
@@ -498,5 +502,5 @@ fn compute_incremental_start_from_text(text: &str, pos: i32, ins: i32, del: i32)
 
 #[allow(dead_code)]
 fn is_string_or_comment_style(style: char) -> bool {
-    style == STYLE_COMMENT || style == STYLE_STRING
+    is_continuation_style(style)
 }

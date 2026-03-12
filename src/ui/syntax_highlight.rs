@@ -22,6 +22,9 @@ pub const STYLE_IDENTIFIER: char = 'H';
 pub const STYLE_HINT: char = 'I';
 pub const STYLE_DATETIME_LITERAL: char = 'J';
 pub const STYLE_COLUMN: char = 'K';
+pub const STYLE_BLOCK_COMMENT: char = 'L';
+pub const STYLE_Q_QUOTE_STRING: char = 'M';
+pub const STYLE_QUOTED_IDENTIFIER: char = 'N';
 
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| ORACLE_FUNCTIONS.iter().copied().collect());
@@ -91,6 +94,24 @@ pub fn create_style_table_with(profile: FontProfile, size: u32) -> Vec<StyleTabl
         // K - Columns (near-white)
         StyleTableEntry {
             color: Color::from_rgb(225, 235, 242),
+            font: profile.normal,
+            size: size as i32,
+        },
+        // L - Block comments (green)
+        StyleTableEntry {
+            color: Color::from_rgb(106, 153, 85),
+            font: profile.italic,
+            size: size as i32,
+        },
+        // M - Q-Quote strings (orange)
+        StyleTableEntry {
+            color: Color::from_rgb(206, 145, 120),
+            font: profile.normal,
+            size: size as i32,
+        },
+        // N - Quoted identifiers (cyan)
+        StyleTableEntry {
+            color: Color::from_rgb(78, 201, 176),
             font: profile.normal,
             size: size as i32,
         },
@@ -189,7 +210,7 @@ impl BlockCommentKind {
 
     fn style_byte(self) -> u8 {
         match self {
-            Self::Regular => STYLE_COMMENT as u8,
+            Self::Regular => STYLE_BLOCK_COMMENT as u8,
             Self::Hint => STYLE_HINT as u8,
         }
     }
@@ -369,6 +390,17 @@ impl SqlHighlighter {
         }
     }
 
+    pub fn entry_state_from_continuation_style(&self, style: char) -> LexerState {
+        match style {
+            STYLE_BLOCK_COMMENT => LexerState::InBlockComment,
+            STYLE_HINT => LexerState::InHintComment,
+            STYLE_STRING => LexerState::InSingleQuote,
+            STYLE_Q_QUOTE_STRING => LexerState::InSingleQuote,
+            STYLE_IDENTIFIER | STYLE_QUOTED_IDENTIFIER => LexerState::InDoubleQuote,
+            _ => LexerState::Normal,
+        }
+    }
+
     pub fn probe_entry_state_for_style_text(
         &self,
         text: &str,
@@ -478,10 +510,10 @@ impl SqlHighlighter {
                 match scan_until_block_comment_end(bytes, idx, BlockCommentKind::Regular) {
                     ScanResult::Closed { next_idx } => {
                         idx = next_idx;
-                        styles[..idx].fill(STYLE_COMMENT as u8);
+                        styles[..idx].fill(STYLE_BLOCK_COMMENT as u8);
                     }
                     ScanResult::Unterminated { state, .. } => {
-                        styles[..].fill(STYLE_COMMENT as u8);
+                        styles[..].fill(STYLE_BLOCK_COMMENT as u8);
                         return (style_bytes_to_string(styles), state);
                     }
                 }
@@ -511,20 +543,20 @@ impl SqlHighlighter {
             LexerState::InQQuote { closing } => match scan_until_q_quote_end(bytes, idx, closing) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
-                    styles[..idx].fill(STYLE_STRING as u8);
+                    styles[..idx].fill(STYLE_Q_QUOTE_STRING as u8);
                 }
                 ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_STRING as u8);
+                    styles[..].fill(STYLE_Q_QUOTE_STRING as u8);
                     return (style_bytes_to_string(styles), state);
                 }
             },
             LexerState::InDoubleQuote => match scan_until_double_quote_end(bytes, idx) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
-                    styles[..idx].fill(STYLE_IDENTIFIER as u8);
+                    styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
                 }
                 ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_IDENTIFIER as u8);
+                    styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
                     return (style_bytes_to_string(styles), state);
                 }
             },
@@ -612,7 +644,7 @@ impl SqlHighlighter {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
                     };
-                    styles[start..idx].fill(STYLE_STRING as u8);
+                    styles[start..idx].fill(STYLE_Q_QUOTE_STRING as u8);
                     if let ScanResult::Unterminated { state, .. } = scan_result {
                         exit_state = state;
                     }
@@ -662,7 +694,7 @@ impl SqlHighlighter {
                         next_idx
                     }
                 };
-                styles[start..idx].fill(STYLE_IDENTIFIER as u8);
+                styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
@@ -940,7 +972,13 @@ fn is_operator_byte(byte: u8) -> bool {
 fn requires_entry_state_probe(style: char) -> bool {
     matches!(
         style,
-        STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT
+        STYLE_COMMENT
+            | STYLE_BLOCK_COMMENT
+            | STYLE_STRING
+            | STYLE_Q_QUOTE_STRING
+            | STYLE_IDENTIFIER
+            | STYLE_QUOTED_IDENTIFIER
+            | STYLE_HINT
     )
 }
 
