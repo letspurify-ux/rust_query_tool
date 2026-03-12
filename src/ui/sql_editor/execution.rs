@@ -1347,7 +1347,11 @@ impl SqlEditorWidget {
                     });
                     let next_token_ends_select_item = matches!(
                         next_non_comment,
-                        Some(SqlToken::Symbol(sym)) if sym == ","
+                        Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "," | ")")
+                    ) || next_word_is_clause_keyword;
+                    let next_token_ends_from_alias = matches!(
+                        next_non_comment,
+                        Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "," | ")")
                     ) || next_word_is_clause_keyword;
                     let closes_case_expression =
                         upper == "END" && block_stack.last().is_some_and(|s| s == "CASE");
@@ -1359,7 +1363,7 @@ impl SqlEditorWidget {
                             && !(upper == "END"
                                 && block_stack.last().is_some_and(|value| value == "CASE"))
                             && (follows_alias_keyword
-                                || (in_from_clause && next_word_is_clause_keyword)
+                                || (in_from_clause && next_token_ends_from_alias)
                                 || (in_select_clause
                                     && !next_word_is("AS")
                                     && next_token_ends_select_item));
@@ -11345,6 +11349,24 @@ IF"
         assert!(
             !formatted.contains("\nIF,") && !formatted.contains("\nEND"),
             "implicit aliases IF/END should not be moved to block lines, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_alias_before_subquery_close_paren() {
+        let sql = "SELECT * FROM (SELECT amount IF FROM sales) IF";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF") && formatted.contains(") IF"),
+            "keyword-like aliases near subquery closing paren should remain inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nIF") && !formatted.contains("\n)"),
+            "aliases IF should not be reformatted as block keyword near ')', got:\n{}",
             formatted
         );
     }
