@@ -896,6 +896,8 @@ fn should_treat_control_keyword_as_implicit_alias(
         SignificantTokenKind::Comma
             | SignificantTokenKind::ClauseWord
             | SignificantTokenKind::RightParen
+            | SignificantTokenKind::StatementTerminator
+            | SignificantTokenKind::EndOfInput
     ) {
         return false;
     }
@@ -920,7 +922,9 @@ enum SignificantTokenKind {
     String,
     RightParen,
     Comma,
+    StatementTerminator,
     ClauseWord,
+    EndOfInput,
 }
 
 fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<SignificantTokenKind> {
@@ -954,6 +958,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
         return match byte {
             b',' => Some(SignificantTokenKind::Comma),
             b')' => Some(SignificantTokenKind::RightParen),
+            b';' => Some(SignificantTokenKind::StatementTerminator),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
                 let start = idx;
                 idx += 1;
@@ -975,7 +980,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
         };
     }
 
-    None
+    Some(SignificantTokenKind::EndOfInput)
 }
 
 fn prev_significant_token_kind(

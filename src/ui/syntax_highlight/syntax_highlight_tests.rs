@@ -863,6 +863,36 @@ fn test_plsql_control_keyword_implicit_alias_before_close_paren_is_not_keyword()
 }
 
 #[test]
+fn test_plsql_control_keyword_implicit_alias_before_semicolon_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary IF;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find(" IF;").unwrap_or(0) + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias IF before semicolon should not be keyword"
+    );
+}
+
+#[test]
+fn test_plsql_control_keyword_implicit_alias_at_end_of_input_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary IF";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find(" IF").unwrap_or(0) + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias IF at end of input should not be keyword"
+    );
+}
+
+#[test]
 fn test_plsql_control_keyword_alias_if_before_case_then_is_not_keyword() {
     let highlighter = SqlHighlighter::new();
 
