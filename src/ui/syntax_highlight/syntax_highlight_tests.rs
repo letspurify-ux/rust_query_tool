@@ -56,6 +56,57 @@ fn test_if_alias_member_access_is_not_highlighted_as_keyword() {
 }
 
 #[test]
+fn test_trim_cte_alias_and_qualified_access_are_not_function_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "WITH trim AS\n\
+(\n\
+    SELECT\n\
+        a,\n\
+        TRIM(b) AS b_trimmed,\n\
+        c\n\
+    FROM qt_kw_base\n\
+)\n\
+SELECT trim.a, trim.b_trimmed, trim.c\n\
+FROM trim\n\
+ORDER BY trim.a;";
+    let styles = highlighter.generate_styles(text);
+
+    let cte_trim_start = text.find("trim AS").unwrap_or(0);
+    assert!(
+        styles[cte_trim_start..cte_trim_start + 4]
+            .chars()
+            .all(|c| c != STYLE_FUNCTION && c != STYLE_KEYWORD),
+        "CTE alias trim should not be highlighted as function or keyword"
+    );
+
+    let function_trim_start = text.find("TRIM(").unwrap_or(0);
+    assert!(
+        styles[function_trim_start..function_trim_start + 4]
+            .chars()
+            .all(|c| c == STYLE_FUNCTION),
+        "TRIM function call should remain function-highlighted"
+    );
+
+    for token in ["trim.a", "trim.b_trimmed", "trim.c"] {
+        let start = text.find(token).unwrap_or(0);
+        assert!(
+            styles[start..start + 4]
+                .chars()
+                .all(|c| c != STYLE_FUNCTION && c != STYLE_KEYWORD),
+            "qualified alias `{token}` should not be highlighted as function or keyword"
+        );
+    }
+
+    let from_trim_start = text.find("FROM trim").unwrap_or(0) + 5;
+    assert!(
+        styles[from_trim_start..from_trim_start + 4]
+            .chars()
+            .all(|c| c != STYLE_FUNCTION && c != STYLE_KEYWORD),
+        "relation reference trim should not be highlighted as function or keyword"
+    );
+}
+
+#[test]
 fn test_string_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "'hello world'";
@@ -833,6 +884,38 @@ IF",
 }
 
 #[test]
+fn test_package_spec_first_procedure_after_as_newline_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE OR REPLACE PACKAGE oqt_demo_pkg AS\nPROCEDURE proc_in_only (p_tag IN VARCHAR2);";
+    let styles = highlighter.generate_styles(text);
+
+    let procedure_start = text.find("PROCEDURE").unwrap_or(0);
+    let procedure_end = procedure_start + "PROCEDURE".len();
+    assert!(
+        styles[procedure_start..procedure_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "first package-spec PROCEDURE after AS newline should remain keyword style"
+    );
+}
+
+#[test]
+fn test_package_spec_first_procedure_after_as_comment_newline_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE OR REPLACE PACKAGE oqt_demo_pkg AS\n    -- (A) IN only\n    PROCEDURE proc_in_only (p_tag IN VARCHAR2);";
+    let styles = highlighter.generate_styles(text);
+
+    let procedure_start = text.find("PROCEDURE").unwrap_or(0);
+    let procedure_end = procedure_start + "PROCEDURE".len();
+    assert!(
+        styles[procedure_start..procedure_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "first package-spec PROCEDURE after AS comment newline should remain keyword style"
+    );
+}
+
+#[test]
 fn test_plsql_control_keyword_alias_after_as_with_comment_is_not_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT salary AS /* marker */ IF FROM dual";
@@ -929,6 +1012,32 @@ fn test_plsql_control_keyword_alias_if_before_case_then_is_not_keyword() {
             .get(then_start..then_start + 4)
             .is_some_and(|slice| slice.iter().all(|&c| c == STYLE_KEYWORD as u8)),
         "CASE expression THEN should remain keyword"
+    );
+}
+
+#[test]
+fn test_begin_after_set_commands_and_comment_banner_remains_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SET SERVEROUTPUT ON\n\
+SET DEFINE OFF\n\
+\n\
+--------------------------------------------------------------------------------\n\
+-- CLEANUP\n\
+--------------------------------------------------------------------------------\n\
+BEGIN\n\
+    EXECUTE IMMEDIATE 'DROP TABLE qt_if_child PURGE';\n\
+EXCEPTION\n\
+    WHEN OTHERS THEN NULL;\n\
+END;\n\
+/";
+    let styles = highlighter.generate_styles(text);
+
+    let begin_start = text.find("BEGIN").unwrap_or(0);
+    assert!(
+        styles[begin_start..begin_start + 5]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "statement-head BEGIN after SET/comment banner should stay keyword"
     );
 }
 
@@ -1309,24 +1418,19 @@ fn test_probe_entry_state_returns_normal_for_non_multiline_prev_style() {
 
 #[test]
 fn test_clamp_buffer_boundary_keeps_ascii_boundary() {
-    let mut buffer = TextBuffer::default();
-    buffer.set_text("SELECT 1");
-
+    let text = "SELECT 1";
     let idx = "SELECT".len();
-    assert_eq!(clamp_buffer_boundary(&buffer, idx), idx);
+    assert_eq!(clamp_to_utf8_boundary(text, idx), idx);
 }
 
 #[test]
 fn test_clamp_buffer_boundary_clamps_mid_byte_utf8() {
-    let mut buffer = TextBuffer::default();
     let text = "SELECT 한글";
-    buffer.set_text(text);
-
     let char_start = text.find('한').unwrap_or(0);
     let mid_byte = char_start + 1;
     assert!(!text.is_char_boundary(mid_byte));
 
-    assert_eq!(clamp_buffer_boundary(&buffer, mid_byte), char_start);
+    assert_eq!(clamp_to_utf8_boundary(text, mid_byte), char_start);
 }
 
 #[test]

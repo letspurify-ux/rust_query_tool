@@ -1,5 +1,3 @@
-#[cfg(test)]
-use fltk::text::TextBuffer;
 use fltk::{enums::Color, text::StyleTableEntry};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
@@ -625,6 +623,7 @@ impl SqlHighlighter {
                     idx += 1;
                 }
                 styles[start..idx].fill(STYLE_COMMENT as u8);
+                expect_alias_identifier = false;
                 continue;
             }
 
@@ -646,6 +645,12 @@ impl SqlHighlighter {
                 styles[start..idx].fill(style_byte);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
+                }
+                if text
+                    .get(start..idx)
+                    .is_some_and(|comment| comment.bytes().any(is_line_terminator))
+                {
+                    expect_alias_identifier = false;
                 }
                 continue;
             }
@@ -792,12 +797,15 @@ impl SqlHighlighter {
                     || should_treat_control_keyword_as_implicit_alias(
                         text, bytes, start, idx, word,
                     );
-                let token_type =
-                    if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
-                        self.classify_non_keyword_word(word)
-                    } else {
-                        self.classify_word(word, treat_control_keyword_as_alias)
-                    };
+                let token_type = if expect_alias_identifier
+                    || should_treat_function_name_as_identifier(text, bytes, start, idx, word)
+                {
+                    self.classify_identifier_like_word(word)
+                } else if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
+                    self.classify_non_keyword_word(word)
+                } else {
+                    self.classify_word(word, treat_control_keyword_as_alias)
+                };
                 styles[start..idx].fill(token_type.to_style_byte());
                 expect_alias_identifier = word.eq_ignore_ascii_case("AS");
                 continue;
@@ -811,6 +819,9 @@ impl SqlHighlighter {
                 continue;
             }
 
+            if is_line_terminator(byte) {
+                expect_alias_identifier = false;
+            }
             idx += 1;
         }
 
@@ -871,6 +882,24 @@ impl SqlHighlighter {
 
         TokenType::Default
     }
+
+    fn classify_identifier_like_word(&self, word: &str) -> TokenType {
+        let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+            Cow::Owned(word.to_ascii_uppercase())
+        } else {
+            Cow::Borrowed(word)
+        };
+        let upper = upper.as_ref();
+
+        if self.relation_lookup.contains(upper) {
+            return TokenType::Identifier;
+        }
+        if self.column_lookup.contains(upper) {
+            return TokenType::Column;
+        }
+
+        TokenType::Default
+    }
 }
 
 fn should_treat_control_keyword_as_implicit_alias(
@@ -881,6 +910,9 @@ fn should_treat_control_keyword_as_implicit_alias(
     word: &str,
 ) -> bool {
     if !sql_text::is_plsql_control_keyword(word) || word.eq_ignore_ascii_case("THEN") {
+        return false;
+    }
+    if has_significant_line_break_before(bytes, word_start) {
         return false;
     }
 
@@ -909,6 +941,153 @@ fn should_treat_control_keyword_as_implicit_alias(
             | SignificantTokenKind::RightParen
             | SignificantTokenKind::ClauseWord
             | SignificantTokenKind::Comma
+    )
+}
+
+fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
+    let mut saw_line_break = false;
+
+    while idx > 0 {
+        let Some(&prev) = bytes.get(idx - 1) else {
+            break;
+        };
+        if prev == b' ' || prev == b'\t' {
+            idx -= 1;
+            continue;
+        }
+        if is_line_terminator(prev) {
+            saw_line_break = true;
+            idx -= 1;
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
+            idx -= 2;
+            while idx > 0 {
+                let Some(&comment_byte) = bytes.get(idx - 1) else {
+                    break;
+                };
+                idx -= 1;
+                if is_line_terminator(comment_byte) {
+                    saw_line_break = true;
+                    break;
+                }
+            }
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
+            idx -= 2;
+            let mut comment_has_line_break = false;
+            while idx > 1 {
+                let Some(&comment_byte) = bytes.get(idx - 1) else {
+                    break;
+                };
+                if is_line_terminator(comment_byte) {
+                    comment_has_line_break = true;
+                }
+                if bytes.get(idx - 2) == Some(&b'/') && bytes.get(idx - 1) == Some(&b'*') {
+                    idx -= 2;
+                    break;
+                }
+                idx -= 1;
+            }
+            saw_line_break |= comment_has_line_break;
+            continue;
+        }
+
+        break;
+    }
+
+    saw_line_break
+}
+
+fn should_treat_function_name_as_identifier(
+    text: &str,
+    bytes: &[u8],
+    word_start: usize,
+    word_end: usize,
+    word: &str,
+) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+    let upper = upper.as_ref();
+
+    if !ORACLE_FUNCTIONS_SET.contains(upper) {
+        return false;
+    }
+
+    if matches!(
+        next_significant_token_kind(bytes, word_end),
+        Some(SignificantTokenKind::Dot)
+    ) {
+        return true;
+    }
+
+    prev_significant_word_upper(text, bytes, word_start)
+        .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str()))
+}
+
+fn prev_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Option<String> {
+    while idx > 0 {
+        let prev = *bytes.get(idx - 1)?;
+        if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            idx -= 1;
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
+            idx -= 2;
+            while idx > 0
+                && bytes
+                    .get(idx - 1)
+                    .copied()
+                    .is_some_and(|byte| !is_line_terminator(byte))
+            {
+                idx -= 1;
+            }
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
+            idx -= 2;
+            while idx > 1 {
+                if bytes.get(idx - 2) == Some(&b'/') && bytes.get(idx - 1) == Some(&b'*') {
+                    idx -= 2;
+                    break;
+                }
+                idx -= 1;
+            }
+            continue;
+        }
+        if !sql_text::is_identifier_byte(prev) {
+            return None;
+        }
+
+        let mut start = idx - 1;
+        while start > 0
+            && bytes
+                .get(start - 1)
+                .is_some_and(|&b| sql_text::is_identifier_byte(b))
+        {
+            start -= 1;
+        }
+
+        let word = text.get(start..idx)?;
+        let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+            Cow::Owned(word.to_ascii_uppercase())
+        } else {
+            Cow::Borrowed(word)
+        };
+        return Some(upper.into_owned());
+    }
+
+    None
+}
+
+fn is_relation_identifier_context_word(word: &str) -> bool {
+    matches!(
+        word,
+        "WITH" | "FROM" | "JOIN" | "UPDATE" | "INTO" | "USING" | "TABLE"
     )
 }
 
@@ -1187,12 +1366,6 @@ fn requires_entry_state_probe(style: char) -> bool {
             | STYLE_QUOTED_IDENTIFIER
             | STYLE_HINT
     )
-}
-
-#[cfg(test)]
-fn clamp_buffer_boundary(buffer: &TextBuffer, idx: usize) -> usize {
-    let text = buffer.text();
-    clamp_to_utf8_boundary(&text, idx)
 }
 
 fn clamp_to_utf8_boundary(text: &str, idx: usize) -> usize {

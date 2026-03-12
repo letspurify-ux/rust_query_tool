@@ -220,8 +220,4 @@ impl IntellisenseRuntimeState {
         self.parse_generation.store(generation, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_buffer_revision_for_test(&self, revision: u64) {
-        self.buffer_revision.store(revision, Ordering::Relaxed);
-    }
 }

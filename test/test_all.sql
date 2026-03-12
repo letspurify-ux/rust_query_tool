@@ -8,3 +8,6 @@ Connect system/password@localhost:1521/FREE
 @test/test6.txt;
 @test/test7.txt;
 @test/test8.txt;
+@test/test9.txt;
+@test/test10.txt;
+@test/test11.txt;

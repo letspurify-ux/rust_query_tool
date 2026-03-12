@@ -166,7 +166,6 @@ impl SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
-    #[allow(dead_code)]
     pub fn update_highlight_data(&mut self, data: HighlightData) {
         self.highlighter
             .lock()
@@ -305,7 +304,7 @@ impl SqlEditorWidget {
 
             let old_exit_style = continuation_style_before_position(shadow, current_end);
             let (new_styles, new_exit_state) =
-                highlighter.generate_styles_for_window(&range_text, entry_state);
+                highlighter.generate_styles_for_window(range_text, entry_state);
             if new_styles.len() != range_text.len() {
                 break;
             }

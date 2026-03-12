@@ -909,10 +909,8 @@ impl QueryExecutor {
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
-            if builder.state.in_package_body_initializer_body() {
-                block_depth_component = block_depth_component.saturating_sub(1);
-            } else if leading_is("BEGIN")
-                && builder.state.is_package_body_initializer_begin_context()
+            if builder.state.in_package_body_initializer_body()
+                || (leading_is("BEGIN") && builder.state.is_package_body_initializer_begin_context())
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }

@@ -908,7 +908,6 @@ impl SqlEditorWidget {
 
     fn is_sqlplus_remark_comment_statement(statement: &str) -> bool {
         statement
-            .trim_start()
             .split_whitespace()
             .next()
             .is_some_and(|first_word| {
@@ -1343,7 +1342,7 @@ impl SqlEditorWidget {
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_from_clause = matches!(current_clause.as_deref(), Some("FROM"));
                     let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
-                    let next_word_is_clause_keyword = next_word.map_or(true, |word| {
+                    let next_word_is_clause_keyword = next_word.is_none_or(|word| {
                         let next_upper = word.to_ascii_uppercase();
                         sql_text::is_oracle_sql_keyword(next_upper.as_str())
                     });
@@ -1363,8 +1362,6 @@ impl SqlEditorWidget {
                         sql_text::is_plsql_control_keyword(upper.as_str())
                             && !closes_case_expression
                             && !next_word_is("THEN")
-                            && !(upper == "END"
-                                && block_stack.last().is_some_and(|value| value == "CASE"))
                             && (follows_alias_keyword
                                 || (in_from_clause && next_token_ends_from_alias)
                                 || (in_select_clause
@@ -2108,12 +2105,7 @@ impl SqlEditorWidget {
                         ensure_indent(&mut out, &mut at_line_start, line_indent);
                     }
 
-                    let output_comment = if comment_body.trim_start().starts_with("--") {
-                        comment_body.to_string()
-                    } else {
-                        comment_body.to_string()
-                    };
-                    out.push_str(&output_comment);
+                    out.push_str(comment_body);
 
                     needs_space = true;
                     if is_multiline_block_comment {
@@ -2535,6 +2527,9 @@ impl SqlEditorWidget {
             let previous_line_ends_with_open_paren = last_code_line_trimmed
                 .as_deref()
                 .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
+            let previous_line_is_parenthesized_plsql_condition = last_code_line_trimmed
+                .as_deref()
+                .is_some_and(Self::is_parenthesized_plsql_condition_header);
             let starts_paren_case_expression =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     && previous_line_ends_with_open_paren;
@@ -2639,6 +2634,8 @@ impl SqlEditorWidget {
             let parser_depth = parser_depth + paren_case_closer_extra_indent;
             let effective_depth = if force_block_depth {
                 parser_depth
+            } else if !in_dml_statement && previous_line_is_parenthesized_plsql_condition {
+                parser_depth.saturating_add(1)
             } else if in_dml_statement && starts_with_close_paren {
                 if next_line_is_case_branch {
                     next_line_existing_indent.unwrap_or(parser_depth)
@@ -2972,6 +2969,37 @@ impl SqlEditorWidget {
         }
 
         false
+    }
+
+    fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        let mut paren_balance = 0usize;
+
+        for token in tokens {
+            if let SqlToken::Symbol(sym) = token {
+                for ch in sym.chars() {
+                    match ch {
+                        '(' => paren_balance = paren_balance.saturating_add(1),
+                        ')' => paren_balance = paren_balance.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        paren_balance > 0
+    }
+
+    fn is_parenthesized_plsql_condition_header(line: &str) -> bool {
+        if !Self::line_has_unclosed_open_paren_before_inline_comment(line) {
+            return false;
+        }
+
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        crate::sql_text::starts_with_keyword_token(&trimmed_upper, "IF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
+            || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHILE")
     }
 
     fn is_plsql_like_tokens(statement: &str, tokens: &[SqlToken]) -> bool {
@@ -4074,7 +4102,12 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                         } else {
-                                            let desired_size = size.unwrap_or(current_size);
+                                            let desired_size =
+                                                Self::resolve_serveroutput_enable_size(
+                                                    size,
+                                                    current_size,
+                                                    default_size,
+                                                );
                                             let mut applied_size = desired_size;
                                             let mut enable_result =
                                                 QueryExecutor::enable_dbms_output(
@@ -8860,6 +8893,18 @@ impl SqlEditorWidget {
             QueryExecutor::enable_dbms_output(conn, buffer_size)
         } else {
             QueryExecutor::disable_dbms_output(conn)
+        }
+    }
+
+    pub(crate) fn resolve_serveroutput_enable_size(
+        requested_size: Option<u32>,
+        current_size: u32,
+        default_size: u32,
+    ) -> u32 {
+        match requested_size {
+            Some(size) => size,
+            None if current_size == 0 => default_size,
+            None => current_size,
         }
     }
 

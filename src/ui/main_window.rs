@@ -228,11 +228,7 @@ impl AppState {
             .get_intellisense_data()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = schema_data;
-        tab.sql_editor
-            .get_highlighter()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set_highlight_data(highlight_data);
+        tab.sql_editor.update_highlight_data(highlight_data);
         tab.schema_generation = target_generation;
     }
 

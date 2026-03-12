@@ -56,7 +56,7 @@ impl ResultTabsWidget {
     }
 
     fn invoke_change_callback(callback: &mut ResultTabsChangeCallback) {
-        let callback_result = panic::catch_unwind(AssertUnwindSafe(|| callback()));
+        let callback_result = panic::catch_unwind(AssertUnwindSafe(callback));
         if let Err(payload) = callback_result {
             let panic_payload = Self::panic_payload_to_string(payload.as_ref());
             crate::utils::logging::log_error(

@@ -327,7 +327,7 @@ fn oracle_client_search_roots() -> Vec<PathBuf> {
         if let Some(home) = env::var_os("HOME") {
             roots.push(PathBuf::from(home).join("Downloads"));
         }
-        return roots;
+        roots
     }
 
     #[cfg(not(target_os = "macos"))]

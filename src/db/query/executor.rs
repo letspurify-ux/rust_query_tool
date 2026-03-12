@@ -1585,17 +1585,17 @@ impl QueryExecutor {
             {
                 LineBoundaryAction::None => {}
                 LineBoundaryAction::SplitBeforeLine => {
-                    if !collector.current_is_empty() {
-                        if !collector.force_terminate_current(sql, &mut on_span) {
-                            return;
-                        }
+                    if !collector.current_is_empty()
+                        && !collector.force_terminate_current(sql, &mut on_span)
+                    {
+                        return;
                     }
                 }
                 LineBoundaryAction::SplitAndConsumeLine => {
-                    if !collector.current_is_empty() {
-                        if !collector.force_terminate_current(sql, &mut on_span) {
-                            return;
-                        }
+                    if !collector.current_is_empty()
+                        && !collector.force_terminate_current(sql, &mut on_span)
+                    {
+                        return;
                     }
                     line_start = next_line_start;
                     continue;
@@ -1628,10 +1628,9 @@ impl QueryExecutor {
                 && collector.builder.paren_depth() == 0
                 && collector.builder.can_terminate_on_slash()
                 && Self::parse_tool_command(trimmed).is_some()
+                && !collector.force_terminate_current(sql, &mut on_span)
             {
-                if !collector.force_terminate_current(sql, &mut on_span) {
-                    return;
-                }
+                return;
             }
 
             if Self::should_try_tool_command_with_open_statement(

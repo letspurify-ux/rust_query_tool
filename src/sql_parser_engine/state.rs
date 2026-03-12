@@ -713,10 +713,8 @@ impl SplitState {
             let parsed_suffix_closed_block = suffix.apply_to_state(self);
             let treat_suffix_as_label = !parsed_suffix_closed_block
                 && self.pending_end_suffix_token_should_be_treated_as_label(token_upper);
-            if treat_suffix_as_label {
-                if !self.top_is_case() {
-                    self.resolve_plain_end(token_upper);
-                }
+            if treat_suffix_as_label && !self.top_is_case() {
+                self.resolve_plain_end(token_upper);
             }
             self.pending_end = PendingEnd::None;
             self.pending_end_label_token = None;
@@ -758,6 +756,29 @@ impl SplitState {
             && self.pending_subprogram_begins > 0
     }
 
+    fn has_non_case_block_context(&self) -> bool {
+        self.block_stack
+            .iter()
+            .any(|kind| !matches!(kind, BlockKind::Case))
+    }
+
+    fn should_arm_if_block(&self, end_token_role: EndTokenRole) -> bool {
+        if end_token_role.is_suffix(PendingEndSuffix::If) {
+            return false;
+        }
+
+        if self.top_level_token_state == TopLevelTokenState::NoneSeen {
+            return true;
+        }
+
+        // SQL expressions can legally use `if` as an alias inside CASE branches
+        // (`CASE WHEN if.flag = 'Y' THEN ...`). When the current statement has
+        // already started and the parser is only nested under CASE-expression
+        // depth, that token must remain an identifier alias instead of arming
+        // the PL/SQL IF...THEN state machine.
+        self.has_non_case_block_context()
+    }
+
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
     fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
         if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
@@ -780,18 +801,7 @@ impl SplitState {
         }
 
         // IF (opening, not END IF)
-        //
-        // `IF` can appear as a keyword-like alias within top-level SQL select
-        // lists (`SELECT amount IF, ...`). Once a statement has already started
-        // at top level, that token must not arm the PL/SQL IF state machine,
-        // otherwise a later CASE/THEN can open a phantom IF block.
-        // True top-level IF blocks still begin with IF as the first token.
-        let is_non_initial_top_level_token =
-            self.block_depth() == 0 && self.top_level_token_state == TopLevelTokenState::Seen;
-        if upper == "IF"
-            && !is_non_initial_top_level_token
-            && !end_token_role.is_suffix(PendingEndSuffix::If)
-        {
+        if upper == "IF" && self.should_arm_if_block(end_token_role) {
             self.if_state = IfState::ExpectConditionStart;
         }
 

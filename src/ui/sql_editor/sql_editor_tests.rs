@@ -4426,6 +4426,42 @@ END;"#;
 }
 
 #[test]
+fn format_sql_parenthesized_if_condition_continuation_uses_single_extra_indent() {
+    let input = r#"BEGIN
+    IF (i = 2
+                AND b = 2) THEN
+        RAISE_APPLICATION_ERROR (- 20002, 'forced nested error i=2 b=2');
+    END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let expected = r#"BEGIN
+    IF (i = 2
+        AND b = 2) THEN
+        RAISE_APPLICATION_ERROR (- 20002, 'forced nested error i=2 b=2');
+    END IF;
+END;"#;
+
+    assert_eq!(formatted, expected);
+}
+
+#[test]
+fn resolve_serveroutput_enable_size_uses_default_after_unlimited_session_state() {
+    assert_eq!(
+        SqlEditorWidget::resolve_serveroutput_enable_size(None, 0, 1_000_000),
+        1_000_000
+    );
+    assert_eq!(
+        SqlEditorWidget::resolve_serveroutput_enable_size(Some(2_000), 0, 1_000_000),
+        2_000
+    );
+    assert_eq!(
+        SqlEditorWidget::resolve_serveroutput_enable_size(None, 50_000, 1_000_000),
+        50_000
+    );
+}
+
+#[test]
 fn finalize_execution_state_clears_running_and_cancel_flags() {
     let query_running = Arc::new(Mutex::new(true));
     let cancel_flag = Arc::new(Mutex::new(true));

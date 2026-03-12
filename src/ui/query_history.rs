@@ -2,7 +2,7 @@ use fltk::{
     app,
     browser::HoldBrowser,
     button::{Button, CheckButton},
-    enums::FrameType,
+    enums::{Event, FrameType, Key, Shortcut},
     group::Flex,
     input::Input,
     prelude::*,
@@ -37,6 +37,12 @@ struct PendingHistoryEntry {
 }
 
 const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryTextShortcutAction {
+    SelectAll,
+    Copy,
+}
 
 fn fold_for_case_insensitive(value: &str) -> String {
     value.chars().flat_map(|ch| ch.to_lowercase()).collect()
@@ -234,6 +240,62 @@ fn build_preview_styles(sql: &str, error_line: Option<usize>) -> String {
     styles
 }
 
+fn matches_history_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
+    let lower = Key::from_char(ascii.to_ascii_lowercase());
+    let upper = Key::from_char(ascii.to_ascii_uppercase());
+    key == lower || key == upper || original_key == lower || original_key == upper
+}
+
+fn resolve_history_text_shortcut_action(
+    key: Key,
+    original_key: Key,
+    state: Shortcut,
+) -> Option<HistoryTextShortcutAction> {
+    let ctrl_or_cmd = state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
+    if !ctrl_or_cmd {
+        return None;
+    }
+
+    if matches_history_shortcut_key(key, original_key, 'a') {
+        return Some(HistoryTextShortcutAction::SelectAll);
+    }
+    if matches_history_shortcut_key(key, original_key, 'c') {
+        return Some(HistoryTextShortcutAction::Copy);
+    }
+
+    None
+}
+
+fn install_history_text_shortcuts(display: &mut TextDisplay, mut buffer: TextBuffer) {
+    display.handle(move |widget, ev| match ev {
+        Event::KeyDown | Event::Shortcut => {
+            let key = app::event_key();
+            let original_key = app::event_original_key();
+            let state = app::event_state();
+
+            match resolve_history_text_shortcut_action(key, original_key, state) {
+                Some(HistoryTextShortcutAction::SelectAll) => {
+                    let end = buffer.length().max(0);
+                    buffer.select(0, end);
+                    widget.redraw();
+                    true
+                }
+                Some(HistoryTextShortcutAction::Copy) => {
+                    let selected = buffer.selection_text();
+                    if selected.is_empty() {
+                        false
+                    } else {
+                        app::copy(&selected);
+                        true
+                    }
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    });
+}
+
 fn preview_style_table() -> Vec<StyleTableEntry> {
     let profile = configured_editor_profile();
     let size = configured_ui_font_size();
@@ -368,6 +430,7 @@ impl QueryHistoryDialog {
         preview_display.set_linenumber_font(configured_editor_profile().normal);
         preview_display.set_linenumber_size(configured_ui_font_size().saturating_sub(2));
         preview_display.set_highlight_data(preview_style_buffer.clone(), preview_style_table());
+        install_history_text_shortcuts(&mut preview_display, preview_buffer.clone());
 
         let mut error_label = fltk::frame::Frame::default().with_label("Error details:");
         error_label.set_label_color(theme::text_primary());
@@ -380,6 +443,7 @@ impl QueryHistoryDialog {
         error_display.set_text_color(theme::text_primary());
         error_display.set_text_font(configured_editor_profile().normal);
         error_display.set_text_size(configured_ui_font_size());
+        install_history_text_shortcuts(&mut error_display, error_buffer.clone());
         error_display.hide();
         error_label.hide();
         preview_flex.fixed(&error_display, 90);
@@ -758,6 +822,43 @@ fn history_entry_matches_filter(
     match entry.error_message.as_deref() {
         Some(message) => contains_lower(message, search_lower),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_shortcut_action_accepts_current_ascii_key() {
+        assert_eq!(
+            resolve_history_text_shortcut_action(
+                Key::from_char('c'),
+                Key::from_char('x'),
+                Shortcut::Ctrl,
+            ),
+            Some(HistoryTextShortcutAction::Copy)
+        );
+    }
+
+    #[test]
+    fn history_shortcut_action_accepts_original_ascii_key_under_hangul_layout() {
+        assert_eq!(
+            resolve_history_text_shortcut_action(
+                Key::from_char('ㅁ'),
+                Key::from_char('a'),
+                Shortcut::Ctrl,
+            ),
+            Some(HistoryTextShortcutAction::SelectAll)
+        );
+        assert_eq!(
+            resolve_history_text_shortcut_action(
+                Key::from_char('ㅊ'),
+                Key::from_char('c'),
+                Shortcut::Ctrl,
+            ),
+            Some(HistoryTextShortcutAction::Copy)
+        );
     }
 }
 

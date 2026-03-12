@@ -253,35 +253,26 @@ impl SqlParserEngine {
 
         let _ = self.with_preview_identifier_upper(chars, i, |candidate_upper, this| {
             if this.state.block_depth() == 1 && this.state.paren_depth == 0 {
-                if this
-                    .state
-                    .should_split_begin_after_implicit_external_semicolon(candidate_upper)
-                {
-                    this.split_current_and_reset_external_boundary();
-                } else if this.state.should_split_before_new_statement_head()
+                let should_split_before_new_statement = this.state.should_split_before_new_statement_head()
                     && sql_text::is_statement_head_keyword(candidate_upper)
                     && !sql_text::is_external_language_clause_keyword(candidate_upper)
+                    && candidate_upper != "BEGIN";
+                let should_split_pending_top_level = this.state.pending_implicit_external_top_level_split
                     && candidate_upper != "BEGIN"
-                {
-                    this.split_current_and_reset_external_boundary();
-                } else if candidate_upper == "BEGIN"
-                    && this.state.pending_implicit_external_top_level_split
-                {
-                    this.state.pending_implicit_external_top_level_split = false;
-                } else if this.state.pending_implicit_external_top_level_split
                     && (sql_text::is_with_main_query_keyword(candidate_upper)
-                        || sql_text::is_statement_head_keyword(candidate_upper))
-                {
-                    this.split_current_and_reset_external_boundary();
-                } else if this
+                        || sql_text::is_statement_head_keyword(candidate_upper));
+                let should_split = this
                     .state
-                    .should_split_before_external_begin_block(candidate_upper)
-                {
-                    this.split_current_and_reset_external_boundary();
-                } else if this
-                    .state
-                    .should_split_before_external_statement_head(candidate_upper)
-                {
+                    .should_split_begin_after_implicit_external_semicolon(candidate_upper)
+                    || should_split_before_new_statement
+                    || should_split_pending_top_level
+                    || this
+                        .state
+                        .should_split_before_external_begin_block(candidate_upper)
+                    || this
+                        .state
+                        .should_split_before_external_statement_head(candidate_upper);
+                if should_split {
                     this.split_current_and_reset_external_boundary();
                 } else if this.state.pending_implicit_external_top_level_split {
                     this.state.pending_implicit_external_top_level_split = false;

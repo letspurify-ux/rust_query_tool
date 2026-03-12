@@ -5,7 +5,7 @@ use crate::ui::theme;
 use fltk::{
     app,
     button::{Button, CheckButton},
-    enums::{CallbackTrigger, FrameType},
+    enums::{CallbackTrigger, Event, FrameType, Key, Shortcut},
     group::Flex,
     input::Input,
     prelude::*,
@@ -35,6 +35,14 @@ thread_local! {
         Mutex::new(FindReplaceSessionState::default());
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindInputShortcutAction {
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+}
+
 fn normalize_search_pos(text: &str, pos: i32) -> i32 {
     if text.is_empty() {
         return 0;
@@ -49,6 +57,17 @@ fn normalize_search_pos(text: &str, pos: i32) -> i32 {
         p -= 1;
     }
     p as i32
+}
+
+fn resolve_find_start_pos(text: &str, cursor_pos: i32, saved_search_pos: i32) -> i32 {
+    let normalized_cursor = normalize_search_pos(text, cursor_pos);
+    let normalized_saved = normalize_search_pos(text, saved_search_pos);
+
+    if normalized_cursor != normalized_saved {
+        normalized_cursor
+    } else {
+        normalized_saved
+    }
 }
 
 fn save_find_replace_state(
@@ -69,6 +88,65 @@ fn save_find_replace_state(
         state.case_sensitive = case_check.value();
         state.search_pos = search_pos.max(0);
         state.last_search_text = last_search_text.to_string();
+    });
+}
+
+fn matches_input_shortcut_key(key: Key, original_key: Key, ascii: char) -> bool {
+    let lower = Key::from_char(ascii.to_ascii_lowercase());
+    let upper = Key::from_char(ascii.to_ascii_uppercase());
+    key == lower || key == upper || original_key == lower || original_key == upper
+}
+
+fn resolve_find_input_shortcut_action(
+    key: Key,
+    original_key: Key,
+    state: Shortcut,
+) -> Option<FindInputShortcutAction> {
+    let ctrl_or_cmd = state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Command);
+    if !ctrl_or_cmd {
+        return None;
+    }
+
+    if matches_input_shortcut_key(key, original_key, 'a') {
+        return Some(FindInputShortcutAction::SelectAll);
+    }
+    if matches_input_shortcut_key(key, original_key, 'c') {
+        return Some(FindInputShortcutAction::Copy);
+    }
+    if matches_input_shortcut_key(key, original_key, 'x') {
+        return Some(FindInputShortcutAction::Cut);
+    }
+    if matches_input_shortcut_key(key, original_key, 'v') {
+        return Some(FindInputShortcutAction::Paste);
+    }
+
+    None
+}
+
+fn install_find_input_shortcuts(input: &mut Input) {
+    input.handle(move |widget, ev| match ev {
+        Event::KeyDown | Event::Shortcut => {
+            let key = app::event_key();
+            let original_key = app::event_original_key();
+            let state = app::event_state();
+
+            match resolve_find_input_shortcut_action(key, original_key, state) {
+                Some(FindInputShortcutAction::SelectAll) => {
+                    let end = widget.value().len().min(i32::MAX as usize) as i32;
+                    let _ = widget.set_position(0);
+                    let _ = widget.set_mark(end);
+                    true
+                }
+                Some(FindInputShortcutAction::Copy) => widget.copy().is_ok(),
+                Some(FindInputShortcutAction::Cut) => widget.cut().is_ok(),
+                Some(FindInputShortcutAction::Paste) => {
+                    app::paste_text(widget);
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
     });
 }
 
@@ -153,6 +231,7 @@ impl FindReplaceDialog {
         find_input.set_color(theme::input_bg());
         find_input.set_text_color(theme::text_primary());
         find_input.set_trigger(CallbackTrigger::EnterKeyAlways);
+        install_find_input_shortcuts(&mut find_input);
         find_flex.end();
         main_flex.fixed(&find_flex, INPUT_ROW_HEIGHT);
 
@@ -166,6 +245,7 @@ impl FindReplaceDialog {
             let mut input = Input::default();
             input.set_color(theme::input_bg());
             input.set_text_color(theme::text_primary());
+            install_find_input_shortcuts(&mut input);
             replace_flex.end();
             main_flex.fixed(&replace_flex, INPUT_ROW_HEIGHT);
             Some(input)
@@ -260,7 +340,11 @@ impl FindReplaceDialog {
         }
 
         // State for search
-        let initial_search_pos = normalize_search_pos(&buffer.text(), session_snapshot.search_pos);
+        let initial_search_pos = resolve_find_start_pos(
+            &buffer.text(),
+            editor.insert_position(),
+            session_snapshot.search_pos,
+        );
         let search_pos = Arc::new(Mutex::new(initial_search_pos));
         let last_search_text = Arc::new(Mutex::new(session_snapshot.last_search_text));
 
@@ -392,11 +476,13 @@ impl FindReplaceDialog {
                                 search_text.clone();
                         }
                         let text = buffer.text();
-                        let start_pos = normalize_search_pos(
+                        let saved_search_pos = *search_pos
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let start_pos = resolve_find_start_pos(
                             &text,
-                            *search_pos
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            editor.insert_position(),
+                            saved_search_pos,
                         );
                         *search_pos
                             .lock()
@@ -590,9 +676,9 @@ impl FindReplaceDialog {
 
         let text = buffer.text();
         let start_pos = if session.last_search_text != session.find_text {
-            0
+            normalize_search_pos(&text, editor.insert_position())
         } else {
-            normalize_search_pos(&text, session.search_pos)
+            resolve_find_start_pos(&text, editor.insert_position(), session.search_pos)
         };
 
         let found = find_next_match(&text, &session.find_text, start_pos, session.case_sensitive)
@@ -710,7 +796,11 @@ fn find_unicode_case_insensitive_bounds(haystack: &str, needle: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{find_next_match, normalize_search_pos};
+    use super::{
+        find_next_match, normalize_search_pos, resolve_find_input_shortcut_action,
+        resolve_find_start_pos, FindInputShortcutAction,
+    };
+    use fltk::enums::{Key, Shortcut};
 
     #[test]
     fn normalize_search_pos_clamps_non_boundary_utf8_offset() {
@@ -718,6 +808,65 @@ mod tests {
         let mid_char_offset = text.find('한').expect("expected utf-8 anchor") + 1;
         let normalized = normalize_search_pos(text, mid_char_offset as i32);
         assert_eq!(normalized as usize, text.find('한').unwrap_or(0));
+    }
+
+    #[test]
+    fn resolve_find_start_pos_prefers_current_cursor_over_stale_saved_position() {
+        let text = "alpha beta gamma";
+        let cursor_pos = text.find("gamma").unwrap_or(0) as i32;
+        let stale_saved_pos = text.find("beta").unwrap_or(0) as i32;
+
+        let resolved = resolve_find_start_pos(text, cursor_pos, stale_saved_pos);
+
+        assert_eq!(resolved, cursor_pos);
+    }
+
+    #[test]
+    fn find_input_shortcut_action_accepts_current_ascii_key() {
+        assert_eq!(
+            resolve_find_input_shortcut_action(
+                Key::from_char('c'),
+                Key::from_char('x'),
+                Shortcut::Ctrl,
+            ),
+            Some(FindInputShortcutAction::Copy)
+        );
+    }
+
+    #[test]
+    fn find_input_shortcut_action_accepts_original_ascii_key_under_hangul_layout() {
+        assert_eq!(
+            resolve_find_input_shortcut_action(
+                Key::from_char('ㅁ'),
+                Key::from_char('a'),
+                Shortcut::Ctrl,
+            ),
+            Some(FindInputShortcutAction::SelectAll)
+        );
+        assert_eq!(
+            resolve_find_input_shortcut_action(
+                Key::from_char('ㅊ'),
+                Key::from_char('c'),
+                Shortcut::Ctrl,
+            ),
+            Some(FindInputShortcutAction::Copy)
+        );
+        assert_eq!(
+            resolve_find_input_shortcut_action(
+                Key::from_char('ㅌ'),
+                Key::from_char('x'),
+                Shortcut::Ctrl,
+            ),
+            Some(FindInputShortcutAction::Cut)
+        );
+        assert_eq!(
+            resolve_find_input_shortcut_action(
+                Key::from_char('ㅍ'),
+                Key::from_char('v'),
+                Shortcut::Ctrl,
+            ),
+            Some(FindInputShortcutAction::Paste)
+        );
     }
 
     #[test]

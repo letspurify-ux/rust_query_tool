@@ -54,6 +54,100 @@ SELECT 2 FROM dual;";
 }
 
 #[test]
+fn test_split_script_items_test12_if_alias_regression() {
+    let sql = load_query_test_file("test12.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
+    assert_eq!(statement_count, 44, "unexpected SQL statement split: {items:?}");
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| stmt.contains("WITH\nIF AS (")),
+        "WITH if CTE statement should stay intact: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("MERGE INTO qt_if_base")),
+        "MERGE statement should stay intact: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_test13_keyword_alias_regression() {
+    let sql = load_query_test_file("test13.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
+    assert_eq!(statement_count, 45, "unexpected SQL statement split: {items:?}");
+
+    let statements = get_statements(&items);
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("FROM qt_kw_base trim")),
+        "trim alias statement should stay intact: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("WITH trim AS (")),
+        "trim CTE statement should stay intact: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_test14_deep_monster_view_regression() {
+    let sql = load_query_test_file("test14.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
+    assert_eq!(statement_count, 13, "unexpected SQL statement split: {items:?}");
+
+    let statements = get_statements(&items);
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("CREATE OR REPLACE VIEW qt_depth_monster_v")),
+        "deep monster view should stay intact: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|stmt| stmt.contains("FROM qt_depth_monster_v trim")),
+        "final execution query should stay intact: {statements:?}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
     let sql = "SELECT 1 FROM dual;\nSELECT 한글 AS txt FROM dual;";
     let utf8_start = sql
@@ -1230,6 +1324,22 @@ fn test_maybe_inject_rowid_for_editing_quoted_join_alias() {
     let sql = r#"SELECT ENAME FROM EMP "join""#;
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
     assert_eq!(rewritten, r#"SELECT "join".ROWID, ENAME FROM EMP "join""#);
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_keyword_like_aliases_from_test13() {
+    let simple_alias_sql = "SELECT count.a, count.b FROM qt_kw_base count ORDER BY count.a";
+    let simple_rewritten = QueryExecutor::maybe_inject_rowid_for_editing(simple_alias_sql);
+    assert_eq!(
+        simple_rewritten,
+        "SELECT count.ROWID, count.a, count.b FROM qt_kw_base count ORDER BY count.a"
+    );
+
+    let with_keyword_cte_sql = "WITH level AS (SELECT a, b FROM qt_kw_base) SELECT level.a, level.b FROM level ORDER BY level.a";
+    assert!(
+        QueryExecutor::is_select_statement(with_keyword_cte_sql),
+        "WITH level CTE should be classified as SELECT"
+    );
 }
 
 #[test]
@@ -9107,6 +9217,25 @@ fn test_split_script_items_mysql_if_function_followed_by_case_then_stays_two_sta
     assert!(
         stmts[0].contains("CASE WHEN bonus > 0 THEN 1 ELSE 0 END"),
         "First statement should preserve CASE expression: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_if_alias_in_case_when_does_not_open_if_block() {
+    let sql = "SELECT\n    CASE\n        WHEN if.flag = 'Y' THEN 'YES'\n        ELSE 'NO'\n    END AS flag_text\nFROM qt_if_base if;\nSELECT 2 FROM dual;";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "if alias in CASE WHEN must not keep parser inside a phantom IF block: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("WHEN if.flag = 'Y' THEN 'YES'"),
+        "first statement should preserve CASE expression with if alias: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
