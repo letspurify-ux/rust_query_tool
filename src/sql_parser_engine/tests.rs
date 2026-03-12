@@ -6783,6 +6783,21 @@ fn package_body_name_end_exception_closes_outer_as_is_depth() {
 }
 
 #[test]
+fn select_alias_named_if_does_not_trigger_plsql_if_state_lowercase() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("select 1 as if, 2 as end from dual if;");
+
+    let statements = engine.take_statements();
+    assert_eq!(
+        statements,
+        vec!["select 1 as if, 2 as end from dual if".to_string()]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+
+#[test]
 fn select_alias_named_if_does_not_trigger_plsql_if_state() {
     let mut engine = SqlParserEngine::new();
 

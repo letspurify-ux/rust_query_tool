@@ -1,5 +1,6 @@
 //! Shared SQL text helpers used across execution, formatting, and IntelliSense.
 use once_cell::sync::Lazy;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// Shared Oracle SQL keywords used by parser, IntelliSense, and formatter.
@@ -1031,8 +1032,14 @@ pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {
 
 /// Returns true for PL/SQL control-flow keywords that may also appear as aliases.
 pub(crate) fn is_plsql_control_keyword(word: &str) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+
     matches!(
-        word,
+        upper.as_ref(),
         "IF" | "THEN"
             | "ELSE"
             | "ELSIF"
@@ -1341,6 +1348,14 @@ mod tests {
                 "missing shared keyword: {keyword}"
             );
         }
+    }
+
+    #[test]
+    fn plsql_control_keyword_lookup_is_case_insensitive() {
+        assert!(is_plsql_control_keyword("IF"));
+        assert!(is_plsql_control_keyword("if"));
+        assert!(is_plsql_control_keyword("Begin"));
+        assert!(!is_plsql_control_keyword("iff"));
     }
 
     #[test]
