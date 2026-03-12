@@ -629,7 +629,7 @@ impl SplitState {
                     self.handle_pending_end_on_token(upper, end_token_role.suffix());
 
                 if !consume_as_end_label {
-                    self.handle_block_openers(upper, end_token_role);
+                    self.handle_block_openers(upper, end_token_role, at_statement_start);
                 }
             }
         }
@@ -759,7 +759,12 @@ impl SplitState {
     }
 
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
-    fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
+    fn handle_block_openers(
+        &mut self,
+        upper: &str,
+        end_token_role: EndTokenRole,
+        at_statement_start: bool,
+    ) {
         if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
             if matches!(upper, "NEW" | "OLD" | "PARENT") {
                 self.saw_trigger_alias_subject = true;
@@ -780,7 +785,12 @@ impl SplitState {
         }
 
         // IF (opening, not END IF)
-        if upper == "IF" && !end_token_role.is_suffix(PendingEndSuffix::If) {
+        // Top-level SQL can use IF as an alias (`SELECT col IF FROM ...`).
+        // Only arm PL/SQL IF tracking when we are inside an opened block.
+        if upper == "IF"
+            && (self.block_depth() > 0 || at_statement_start)
+            && !end_token_role.is_suffix(PendingEndSuffix::If)
+        {
             self.if_state = IfState::ExpectConditionStart;
         }
 

@@ -563,11 +563,11 @@ fn package_body_end_with_schema_qualified_label_splits_following_statement() {
 fn declare_begin_state_machine_tracks_pending_begin() {
     let mut state = SplitState::default();
 
-    state.handle_block_openers("DECLARE", EndTokenRole::None);
+    state.handle_block_openers("DECLARE", EndTokenRole::None, false);
     assert!(state.has_pending_declare_begin());
     assert_eq!(state.block_depth(), 1);
 
-    state.handle_block_openers("BEGIN", EndTokenRole::None);
+    state.handle_block_openers("BEGIN", EndTokenRole::None, false);
     assert!(!state.has_pending_declare_begin());
     assert_eq!(state.block_depth(), 1);
 }
@@ -579,8 +579,8 @@ fn nested_subprogram_as_is_state_machine_resets_after_is() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("PROCEDURE", EndTokenRole::None);
-    state.handle_block_openers("IS", EndTokenRole::None);
+    state.handle_block_openers("PROCEDURE", EndTokenRole::None, false);
+    state.handle_block_openers("IS", EndTokenRole::None, false);
 
     assert_eq!(state.block_depth(), 2);
 }
@@ -715,7 +715,7 @@ fn pending_do_does_not_get_overwritten_by_new_candidates() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("FOR", EndTokenRole::None);
+    state.handle_block_openers("FOR", EndTokenRole::None, false);
     assert_eq!(
         state.pending_do,
         PendingDo::While {
@@ -723,7 +723,7 @@ fn pending_do_does_not_get_overwritten_by_new_candidates() {
         }
     );
 
-    state.handle_block_openers("DO", EndTokenRole::None);
+    state.handle_block_openers("DO", EndTokenRole::None, false);
     assert_eq!(state.block_depth(), 1);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::While));
     assert_eq!(state.pending_do, PendingDo::None);
@@ -733,7 +733,7 @@ fn pending_do_does_not_get_overwritten_by_new_candidates() {
 fn pending_do_arms_when_no_active_candidate_exists() {
     let mut state = SplitState::default();
 
-    state.handle_block_openers("FOR", EndTokenRole::None);
+    state.handle_block_openers("FOR", EndTokenRole::None, false);
     assert_eq!(
         state.pending_do,
         PendingDo::For {
@@ -741,7 +741,7 @@ fn pending_do_arms_when_no_active_candidate_exists() {
         }
     );
 
-    state.handle_block_openers("DO", EndTokenRole::None);
+    state.handle_block_openers("DO", EndTokenRole::None, false);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::For));
     assert_eq!(state.pending_do, PendingDo::None);
 }
@@ -750,9 +750,9 @@ fn pending_do_arms_when_no_active_candidate_exists() {
 fn pending_do_requires_matching_block_depth_for_do_resolution() {
     let mut state = SplitState::default();
 
-    state.handle_block_openers("FOR", EndTokenRole::None);
+    state.handle_block_openers("FOR", EndTokenRole::None, false);
     state.block_stack.push(BlockKind::Begin);
-    state.handle_block_openers("DO", EndTokenRole::None);
+    state.handle_block_openers("DO", EndTokenRole::None, false);
 
     assert_eq!(state.block_depth(), 1);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::Begin));
@@ -1536,10 +1536,10 @@ fn type_spec_as_is_follow_state_is_cleared_by_declarative_kind_token() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("AS", EndTokenRole::None);
+    state.handle_block_openers("AS", EndTokenRole::None, false);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
 
-    state.handle_block_openers("OBJECT", EndTokenRole::None);
+    state.handle_block_openers("OBJECT", EndTokenRole::None, false);
     assert!(state.block_stack.is_empty());
 }
 
@@ -1550,10 +1550,10 @@ fn type_body_as_is_does_not_clear_on_type_declarative_kind_tokens() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("AS", EndTokenRole::None);
+    state.handle_block_openers("AS", EndTokenRole::None, false);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
 
-    state.handle_block_openers("TABLE", EndTokenRole::None);
+    state.handle_block_openers("TABLE", EndTokenRole::None, false);
     assert_eq!(state.block_stack.last(), Some(&BlockKind::AsIs));
 }
 
@@ -1565,7 +1565,7 @@ fn compound_trigger_timing_point_uses_dedicated_block_kind() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("IS", EndTokenRole::None);
+    state.handle_block_openers("IS", EndTokenRole::None, false);
 
     assert_eq!(state.block_stack.last(), Some(&BlockKind::TimingPoint));
     assert_eq!(state.timing_point_state, TimingPointState::None);
@@ -1584,14 +1584,14 @@ fn compound_trigger_requires_compound_trigger_keyword_pair() {
         ..SplitState::default()
     };
 
-    state.handle_block_openers("COMPOUND", EndTokenRole::None);
+    state.handle_block_openers("COMPOUND", EndTokenRole::None, false);
     assert!(!state.block_stack.contains(&BlockKind::Compound));
     assert_eq!(
         state.create_plsql_kind,
         CreatePlsqlKind::Trigger(TriggerKind::Simple)
     );
 
-    state.handle_block_openers("IS", EndTokenRole::None);
+    state.handle_block_openers("IS", EndTokenRole::None, false);
     assert!(!state.block_stack.contains(&BlockKind::Compound));
     assert_eq!(
         state.create_plsql_kind,
@@ -6807,6 +6807,21 @@ fn select_alias_named_if_does_not_trigger_plsql_if_state() {
     assert_eq!(
         statements,
         vec!["SELECT 1 AS IF, 2 AS END FROM dual IF".to_string()]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+
+#[test]
+fn select_implicit_alias_named_if_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT amount IF, total END FROM sales IF;");
+
+    let statements = engine.take_statements();
+    assert_eq!(
+        statements,
+        vec!["SELECT amount IF, total END FROM sales IF".to_string()]
     );
     assert_eq!(engine.state.if_state, IfState::None);
     assert_eq!(engine.state.block_depth(), 0);
