@@ -83,6 +83,21 @@ fn test_prompt_highlighting_with_leading_whitespace() {
 }
 
 #[test]
+fn test_prompt_highlighting_with_carriage_return_line_break() {
+    let highlighter = SqlHighlighter::new();
+    let text = "PROMPT first line\rSELECT * FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let prompt_end = text.find('\r').unwrap();
+    assert!(styles[..prompt_end].chars().all(|c| c == STYLE_COMMENT));
+
+    let select_start = text.find("SELECT").unwrap();
+    assert!(styles[select_start..select_start + 6]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
 fn test_connect_line_disables_rest_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "CONNECT system/password@localhost:1521/FREE\nSELECT * FROM dual";
@@ -109,6 +124,22 @@ fn test_connect_line_with_leading_whitespace_disables_rest_highlighting() {
     assert!(styles[..2].chars().all(|c| c == STYLE_DEFAULT));
     assert!(styles[2..9].chars().all(|c| c == STYLE_KEYWORD));
     assert!(styles[9..].chars().all(|c| c == STYLE_DEFAULT));
+}
+
+#[test]
+fn test_connect_line_with_carriage_return_line_break_disables_rest_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CONNECT system/password@localhost:1521/FREE\rSELECT * FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let line_break = text.find('\r').unwrap();
+    assert!(styles[0..7].chars().all(|c| c == STYLE_KEYWORD));
+    assert!(styles[7..line_break].chars().all(|c| c == STYLE_DEFAULT));
+
+    let select_start = text.find("SELECT").unwrap();
+    assert!(styles[select_start..select_start + 6]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
 }
 
 #[test]
