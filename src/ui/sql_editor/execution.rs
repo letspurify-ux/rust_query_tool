@@ -1298,6 +1298,7 @@ impl SqlEditorWidget {
                 SqlToken::Word(w) => Some(w.as_str()),
                 _ => None,
             });
+            let next_non_comment = tokens[idx + 1..].iter().find(|t| !matches!(t, SqlToken::Comment(_)));
             let next_word_is =
                 |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
 
@@ -1339,16 +1340,22 @@ impl SqlEditorWidget {
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_from_clause = matches!(current_clause.as_deref(), Some("FROM"));
+                    let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
                     let next_word_is_clause_keyword = next_word.map_or(true, |word| {
                         let next_upper = word.to_ascii_uppercase();
                         sql_text::is_oracle_sql_keyword(next_upper.as_str())
                     });
+                    let next_token_ends_select_item = matches!(
+                        next_non_comment,
+                        Some(SqlToken::Symbol(sym)) if sym == ","
+                    ) || next_word_is_clause_keyword;
                     let treat_control_keyword_as_identifier =
                         sql_text::is_plsql_control_keyword(upper.as_str())
                             && !in_plsql_block
                             && !next_word_is("THEN")
                             && (follows_alias_keyword
-                                || (in_from_clause && next_word_is_clause_keyword));
+                                || (in_from_clause && next_word_is_clause_keyword)
+                                || (in_select_clause && next_token_ends_select_item));
                     let should_treat_as_block_start = block_start_keywords
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier
@@ -11313,6 +11320,24 @@ IF"
             ),
             "comment-separated alias IF should not be moved to block line, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_implicit_select_aliases_inline() {
+        let sql = "SELECT amount IF, total END FROM sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF,") && formatted.contains("total END"),
+            "implicit keyword-like aliases should remain inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nIF,") && !formatted.contains("\nEND"),
+            "implicit aliases IF/END should not be moved to block lines, got:\n{}",
             formatted
         );
     }
