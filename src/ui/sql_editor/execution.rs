@@ -1343,12 +1343,20 @@ impl SqlEditorWidget {
                         let next_upper = word.to_ascii_uppercase();
                         sql_text::is_oracle_sql_keyword(next_upper.as_str())
                     });
+                    let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
+                    let next_token_ends_select_item = matches!(
+                        tokens.get(idx + 1),
+                        Some(SqlToken::Symbol(sym)) if sym == ","
+                    );
                     let treat_control_keyword_as_identifier =
                         sql_text::is_plsql_control_keyword(upper.as_str())
                             && !in_plsql_block
                             && !next_word_is("THEN")
                             && (follows_alias_keyword
-                                || (in_from_clause && next_word_is_clause_keyword));
+                                || (in_from_clause && next_word_is_clause_keyword)
+                                || (in_select_clause
+                                    && (next_word_is_clause_keyword
+                                        || next_token_ends_select_item)));
                     let should_treat_as_block_start = block_start_keywords
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier
@@ -11312,6 +11320,29 @@ mod print_bind_state_tests {
 IF"
             ),
             "comment-separated alias IF should not be moved to block line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_select_alias_without_as_inline() {
+        let sql = "SELECT amount IF, total END FROM sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF") && formatted.contains("total END"),
+            "keyword-like select aliases should remain inline without AS, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("
+IF,") && !formatted.contains("
+END
+"),
+            "control-keyword aliases should not be moved to block lines, got:
 {}",
             formatted
         );
