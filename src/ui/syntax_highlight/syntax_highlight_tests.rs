@@ -763,7 +763,6 @@ fn test_columns_and_relations_use_different_styles() {
 }
 
 #[test]
-#[test]
 fn test_plsql_if_after_routine_is_with_comment_newline_stays_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "CREATE OR REPLACE PROCEDURE p IS /* comment */
@@ -802,24 +801,17 @@ fn test_plsql_control_keyword_alias_after_as_with_comment_is_not_keyword() {
     );
 }
 
-fn test_plsql_control_keywords_can_be_identifier_when_known_metadata() {
+#[test]
+fn test_plsql_control_keyword_aliases_can_be_identifiers_when_known_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {
         tables: vec!["IF".to_string()],
         views: Vec::new(),
-        columns: vec!["THEN".to_string(), "END".to_string()],
+        columns: vec!["END".to_string()],
     });
 
-    let text = "SELECT THEN AS END FROM IF";
+    let text = "SELECT salary AS END FROM sales IF";
     let styles = highlighter.generate_styles(text);
-
-    let then_start = text.find("THEN").unwrap_or(0);
-    assert!(
-        styles[then_start..then_start + 4]
-            .chars()
-            .all(|c| c == STYLE_COLUMN),
-        "known column THEN should be styled as column"
-    );
 
     let end_start = text.find("END").unwrap_or(0);
     assert!(
@@ -828,13 +820,42 @@ fn test_plsql_control_keywords_can_be_identifier_when_known_metadata() {
             .all(|c| c == STYLE_COLUMN),
         "known alias END should be styled as column"
     );
+}
 
-    let if_start = text.rfind("IF").unwrap_or(0);
+#[test]
+fn test_plsql_control_keywords_remain_keywords_outside_alias_context_with_metadata() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_highlight_data(HighlightData {
+        tables: vec!["IF".to_string()],
+        views: Vec::new(),
+        columns: vec!["THEN".to_string(), "END".to_string()],
+    });
+
+    let text = "BEGIN IF cond THEN NULL; END IF; END;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find("IF cond").unwrap_or(0);
     assert!(
         styles[if_start..if_start + 2]
             .chars()
-            .all(|c| c == STYLE_IDENTIFIER),
-        "known relation IF should be styled as identifier"
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL IF should remain keyword even when IF exists in metadata"
+    );
+
+    let then_start = text.find("THEN").unwrap_or(0);
+    assert!(
+        styles[then_start..then_start + 4]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL THEN should remain keyword even when THEN exists in metadata"
+    );
+
+    let end_if_start = text.find("END IF").unwrap_or(0);
+    assert!(
+        styles[end_if_start..end_if_start + 3]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL END should remain keyword in END IF"
     );
 }
 

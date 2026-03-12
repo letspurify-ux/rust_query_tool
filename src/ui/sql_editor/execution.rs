@@ -11287,6 +11287,13 @@ mod print_bind_state_tests {
             formatted
         );
         assert!(
+            !formatted.contains("\nIF,"),
+            "alias IF should not be moved to its own block line, got:
+{}",
+            formatted
+        );
+    }
+
     #[test]
     fn format_sql_basic_keeps_alias_with_comment_between_as_and_control_keyword() {
         let sql = "SELECT amount AS /* keep */ IF FROM sales";
@@ -11305,13 +11312,6 @@ mod print_bind_state_tests {
 IF"
             ),
             "comment-separated alias IF should not be moved to block line, got:
-{}",
-            formatted
-        );
-    }
-
-            !formatted.contains("\nIF,"),
-            "alias IF should not be moved to its own block line, got:
 {}",
             formatted
         );
