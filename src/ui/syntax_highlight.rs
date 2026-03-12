@@ -1,6 +1,6 @@
-use fltk::{enums::Color, text::StyleTableEntry};
 #[cfg(test)]
 use fltk::text::TextBuffer;
+use fltk::{enums::Color, text::StyleTableEntry};
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -938,14 +938,9 @@ fn is_operator_byte(byte: u8) -> bool {
 }
 
 fn requires_entry_state_probe(style: char) -> bool {
-    !matches!(
+    matches!(
         style,
-        STYLE_KEYWORD
-            | STYLE_FUNCTION
-            | STYLE_NUMBER
-            | STYLE_OPERATOR
-            | STYLE_DATETIME_LITERAL
-            | STYLE_COLUMN
+        STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT
     )
 }
 
