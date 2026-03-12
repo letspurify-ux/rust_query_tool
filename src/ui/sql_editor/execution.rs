@@ -1298,7 +1298,9 @@ impl SqlEditorWidget {
                 SqlToken::Word(w) => Some(w.as_str()),
                 _ => None,
             });
-            let next_non_comment = tokens[idx + 1..].iter().find(|t| !matches!(t, SqlToken::Comment(_)));
+            let next_non_comment = tokens[idx + 1..]
+                .iter()
+                .find(|t| !matches!(t, SqlToken::Comment(_)));
             let next_word_is =
                 |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
 
@@ -11348,9 +11350,13 @@ IF"
             formatted
         );
         assert!(
-            !formatted.contains("
-IF,") && !formatted.contains("
-END"),
+            !formatted.contains(
+                "
+IF,"
+            ) && !formatted.contains(
+                "
+END"
+            ),
             "implicit lowercase aliases IF/END should not be moved to block lines, got:
 {}",
             formatted
@@ -11389,6 +11395,24 @@ END"),
         assert!(
             !formatted.contains("\nIF") && !formatted.contains("\n)"),
             "aliases IF should not be reformatted as block keyword near ')', got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_alias_if_before_case_then_inline() {
+        let sql = "SELECT amount IF, CASE WHEN flag = 1 THEN 1 ELSE 0 END score FROM sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF,") && formatted.contains("CASE") && formatted.contains("THEN"),
+            "IF alias before CASE expression should remain alias while preserving CASE tokens, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nIF,"),
+            "IF alias should not be split as PL/SQL block token, got:\n{}",
             formatted
         );
     }
