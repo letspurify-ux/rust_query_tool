@@ -502,6 +502,7 @@ impl SqlHighlighter {
         let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; len];
         let bytes = text.as_bytes();
         let mut idx = 0usize;
+        let mut expect_alias_identifier = false;
         let mut exit_state = LexerState::Normal;
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
@@ -648,6 +649,7 @@ impl SqlHighlighter {
                     if let ScanResult::Unterminated { state, .. } = scan_result {
                         exit_state = state;
                     }
+                    expect_alias_identifier = false;
                     continue;
                 }
 
@@ -663,6 +665,7 @@ impl SqlHighlighter {
                     if let ScanResult::Unterminated { state, .. } = scan_result {
                         exit_state = state;
                     }
+                    expect_alias_identifier = false;
                     continue;
                 }
             }
@@ -681,6 +684,7 @@ impl SqlHighlighter {
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
+                expect_alias_identifier = false;
                 continue;
             }
 
@@ -697,6 +701,9 @@ impl SqlHighlighter {
                 styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
+                }
+                if expect_alias_identifier {
+                    expect_alias_identifier = false;
                 }
                 continue;
             }
@@ -723,6 +730,7 @@ impl SqlHighlighter {
                     }
                 }
                 styles[start..idx].fill(STYLE_NUMBER as u8);
+                expect_alias_identifier = false;
                 continue;
             }
 
@@ -770,9 +778,10 @@ impl SqlHighlighter {
                     if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
                         self.classify_non_keyword_word(word)
                     } else {
-                        self.classify_word(word)
+                        self.classify_word(word, expect_alias_identifier)
                     };
                 styles[start..idx].fill(token_type.to_style_byte());
+                expect_alias_identifier = word.eq_ignore_ascii_case("AS");
                 continue;
             }
 
@@ -780,6 +789,7 @@ impl SqlHighlighter {
             if is_operator_byte(byte) {
                 styles[idx] = STYLE_OPERATOR as u8;
                 idx += 1;
+                expect_alias_identifier = false;
                 continue;
             }
 
@@ -790,7 +800,7 @@ impl SqlHighlighter {
     }
 
     /// Classifies a word as keyword, function, identifier, or default
-    fn classify_word(&self, word: &str) -> TokenType {
+    fn classify_word(&self, word: &str, treat_control_keyword_as_alias: bool) -> TokenType {
         let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
             Cow::Owned(word.to_ascii_uppercase())
         } else {
@@ -798,7 +808,7 @@ impl SqlHighlighter {
         };
         let upper = upper.as_ref();
 
-        if self.is_alias_like_identifier(upper) {
+        if treat_control_keyword_as_alias && sql_text::is_plsql_control_keyword(upper) {
             return self.classify_non_keyword_word(upper);
         }
 
@@ -821,11 +831,6 @@ impl SqlHighlighter {
         }
 
         TokenType::Default
-    }
-
-    fn is_alias_like_identifier(&self, upper: &str) -> bool {
-        (self.relation_lookup.contains(upper) || self.column_lookup.contains(upper))
-            && sql_text::is_plsql_control_keyword(upper)
     }
 
     fn classify_non_keyword_word(&self, word: &str) -> TokenType {
