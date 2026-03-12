@@ -215,6 +215,13 @@ impl BlockCommentKind {
         }
     }
 
+    fn closed_style_byte(self) -> u8 {
+        match self {
+            Self::Regular => STYLE_COMMENT as u8,
+            Self::Hint => STYLE_HINT as u8,
+        }
+    }
+
     fn unterminated_state(self) -> LexerState {
         match self {
             Self::Regular => LexerState::InBlockComment,
@@ -315,8 +322,12 @@ impl SqlHighlighter {
             });
         }
 
-        let (new_tail_styles, _exit_state) =
+        let (mut new_tail_styles, _exit_state) =
             self.generate_styles_with_state(&request.tail_text, request.entry_state);
+        if request.entry_state == LexerState::InBlockComment {
+            new_tail_styles =
+                new_tail_styles.replace(STYLE_BLOCK_COMMENT, &STYLE_COMMENT.to_string());
+        }
         if new_tail_styles.len() != request.tail_text.len() {
             return None;
         }
@@ -629,7 +640,11 @@ impl SqlHighlighter {
                         next_idx
                     }
                 };
-                styles[start..idx].fill(comment_kind.style_byte());
+                let style_byte = match scan_result {
+                    ScanResult::Closed { .. } => comment_kind.closed_style_byte(),
+                    ScanResult::Unterminated { .. } => comment_kind.style_byte(),
+                };
+                styles[start..idx].fill(style_byte);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
@@ -698,7 +713,7 @@ impl SqlHighlighter {
                         next_idx
                     }
                 };
-                styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                styles[start..idx].fill(STYLE_IDENTIFIER as u8);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
