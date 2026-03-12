@@ -908,6 +908,29 @@ fn test_plsql_control_keyword_aliases_can_be_identifiers_when_known_metadata() {
 }
 
 #[test]
+fn test_plsql_control_keyword_alias_in_plsql_select_list_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "BEGIN SELECT salary AS IF, bonus END INTO v_salary, v_bonus FROM dual; END;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find("AS IF").unwrap_or(0) + 3;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "AS alias IF inside PL/SQL SELECT should not be keyword"
+    );
+
+    let end_start = text.find(" bonus END ").unwrap_or(0) + 7;
+    assert!(
+        styles[end_start..end_start + 3]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias END inside PL/SQL SELECT should not be keyword"
+    );
+}
+
+#[test]
 fn test_plsql_control_keywords_remain_keywords_outside_alias_context_with_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {

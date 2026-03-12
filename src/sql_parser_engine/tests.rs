@@ -6826,3 +6826,41 @@ fn select_alias_named_if_before_case_then_does_not_trigger_plsql_if_state() {
     assert_eq!(engine.state.if_state, IfState::None);
     assert_eq!(engine.state.block_depth(), 0);
 }
+
+#[test]
+fn plsql_select_alias_named_if_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("BEGIN");
+    engine.process_line("  SELECT amount AS IF INTO v_amount FROM sales;");
+    engine.process_line("END;");
+
+    let statements = engine.take_statements();
+    assert_eq!(statements.len(), 1);
+    assert!(
+        statements[0].contains("SELECT amount AS IF INTO v_amount FROM sales"),
+        "statement should preserve SELECT alias IF in PL/SQL block: {}",
+        statements[0]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+
+#[test]
+fn plsql_select_implicit_alias_named_if_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("BEGIN");
+    engine.process_line("  SELECT amount IF INTO v_amount FROM sales;");
+    engine.process_line("END;");
+
+    let statements = engine.take_statements();
+    assert_eq!(statements.len(), 1);
+    assert!(
+        statements[0].contains("SELECT amount IF INTO v_amount FROM sales"),
+        "statement should preserve implicit SELECT alias IF in PL/SQL block: {}",
+        statements[0]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
