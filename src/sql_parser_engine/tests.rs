@@ -6811,3 +6811,18 @@ fn select_alias_named_if_does_not_trigger_plsql_if_state() {
     assert_eq!(engine.state.if_state, IfState::None);
     assert_eq!(engine.state.block_depth(), 0);
 }
+
+#[test]
+fn select_alias_named_if_before_case_then_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT amount IF, CASE WHEN flag = 1 THEN 1 ELSE 0 END score FROM sales;");
+
+    let statements = engine.take_statements();
+    assert_eq!(
+        statements,
+        vec!["SELECT amount IF, CASE WHEN flag = 1 THEN 1 ELSE 0 END score FROM sales".to_string()]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}

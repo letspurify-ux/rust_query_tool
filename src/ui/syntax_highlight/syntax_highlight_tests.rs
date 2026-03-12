@@ -863,6 +863,30 @@ fn test_plsql_control_keyword_implicit_alias_before_close_paren_is_not_keyword()
 }
 
 #[test]
+fn test_plsql_control_keyword_alias_if_before_case_then_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+
+    let text = "SELECT amount IF, CASE WHEN flag = 1 THEN 1 ELSE 0 END score FROM sales";
+    let styles = highlighter.generate_styles(text).into_bytes();
+
+    let if_start = text.find(" IF,").unwrap_or(0) + 1;
+    assert!(
+        styles
+            .get(if_start..if_start + 2)
+            .is_some_and(|slice| slice.iter().all(|&c| c == STYLE_DEFAULT as u8)),
+        "select-list alias IF before CASE/THEN should not be keyword"
+    );
+
+    let then_start = text.find("THEN").unwrap_or(0);
+    assert!(
+        styles
+            .get(then_start..then_start + 4)
+            .is_some_and(|slice| slice.iter().all(|&c| c == STYLE_KEYWORD as u8)),
+        "CASE expression THEN should remain keyword"
+    );
+}
+
+#[test]
 fn test_plsql_control_keyword_aliases_can_be_identifiers_when_known_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {

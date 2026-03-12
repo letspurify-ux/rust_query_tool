@@ -780,7 +780,18 @@ impl SplitState {
         }
 
         // IF (opening, not END IF)
-        if upper == "IF" && !end_token_role.is_suffix(PendingEndSuffix::If) {
+        //
+        // `IF` can appear as a keyword-like alias within top-level SQL select
+        // lists (`SELECT amount IF, ...`). Once a statement has already started
+        // at top level, that token must not arm the PL/SQL IF state machine,
+        // otherwise a later CASE/THEN can open a phantom IF block.
+        // True top-level IF blocks still begin with IF as the first token.
+        let is_non_initial_top_level_token =
+            self.block_depth() == 0 && self.top_level_token_state == TopLevelTokenState::Seen;
+        if upper == "IF"
+            && !is_non_initial_top_level_token
+            && !end_token_role.is_suffix(PendingEndSuffix::If)
+        {
             self.if_state = IfState::ExpectConditionStart;
         }
 
