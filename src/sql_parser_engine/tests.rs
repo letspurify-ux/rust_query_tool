@@ -6781,3 +6781,18 @@ fn package_body_name_end_exception_closes_outer_as_is_depth() {
         "END EXCEPTION label for package body should close outer AS/IS depth"
     );
 }
+
+#[test]
+fn select_alias_named_if_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT 1 AS IF, 2 AS END FROM dual IF;");
+
+    let statements = engine.take_statements();
+    assert_eq!(
+        statements,
+        vec!["SELECT 1 AS IF, 2 AS END FROM dual IF".to_string()]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}

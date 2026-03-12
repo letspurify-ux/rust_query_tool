@@ -798,6 +798,10 @@ impl SqlHighlighter {
         };
         let upper = upper.as_ref();
 
+        if self.is_alias_like_identifier(upper) {
+            return self.classify_non_keyword_word(upper);
+        }
+
         // Check if it's a SQL keyword
         if sql_text::is_oracle_sql_keyword(upper) {
             return TokenType::Keyword;
@@ -817,6 +821,11 @@ impl SqlHighlighter {
         }
 
         TokenType::Default
+    }
+
+    fn is_alias_like_identifier(&self, upper: &str) -> bool {
+        (self.relation_lookup.contains(upper) || self.column_lookup.contains(upper))
+            && sql_text::is_plsql_control_keyword(upper)
     }
 
     fn classify_non_keyword_word(&self, word: &str) -> TokenType {
