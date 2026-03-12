@@ -11336,6 +11336,28 @@ IF"
     }
 
     #[test]
+    fn format_sql_basic_keeps_keyword_like_implicit_select_aliases_inline_lowercase() {
+        let sql = "select amount if, total end from sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF,") && formatted.contains("total END"),
+            "implicit lowercase keyword-like aliases should remain inline, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("
+IF,") && !formatted.contains("
+END"),
+            "implicit lowercase aliases IF/END should not be moved to block lines, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn format_sql_basic_keeps_keyword_like_implicit_select_aliases_inline() {
         let sql = "SELECT amount IF, total END FROM sales";
 

@@ -802,6 +802,29 @@ fn test_plsql_control_keyword_alias_after_as_with_comment_is_not_keyword() {
 }
 
 #[test]
+fn test_plsql_control_keyword_implicit_alias_in_select_list_is_not_keyword_lowercase() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary if, bonus end FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.find(" if,").unwrap_or(0) + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias if in select-list should not be keyword"
+    );
+
+    let end_start = text.find(" end ").unwrap_or(0) + 1;
+    assert!(
+        styles[end_start..end_start + 3]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "implicit alias end in select-list should not be keyword"
+    );
+}
+
+#[test]
 fn test_plsql_control_keyword_implicit_alias_in_select_list_is_not_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT salary IF, bonus END FROM dual";
