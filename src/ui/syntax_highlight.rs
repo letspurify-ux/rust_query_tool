@@ -577,7 +577,7 @@ impl SqlHighlighter {
         // ── Main scanning loop ─────────────────────────────────────────
         while let Some(&byte) = bytes.get(idx) {
             // Check for PROMPT command at the start of a line (SQL*Plus style)
-            if idx == 0 || bytes.get(idx.saturating_sub(1)) == Some(&b'\n') {
+            if is_line_start(bytes, idx) {
                 let mut scan = idx;
                 while bytes.get(scan).is_some_and(|&b| b == b' ' || b == b'\t') {
                     scan += 1;
@@ -586,7 +586,7 @@ impl SqlHighlighter {
                     let line_start = idx;
                     let mut end = scan;
                     while let Some(&b) = bytes.get(end) {
-                        if b == b'\n' {
+                        if is_line_terminator(b) {
                             break;
                         }
                         end += 1;
@@ -603,7 +603,7 @@ impl SqlHighlighter {
                         styles[scan..keyword_end].fill(STYLE_KEYWORD as u8);
                         let mut end = scan;
                         while let Some(&b) = bytes.get(end) {
-                            if b == b'\n' {
+                            if is_line_terminator(b) {
                                 break;
                             }
                             end += 1;
@@ -619,7 +619,7 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 2;
                 while let Some(&b) = bytes.get(idx) {
-                    if b == b'\n' {
+                    if is_line_terminator(b) {
                         break;
                     }
                     idx += 1;
@@ -933,7 +933,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
             idx += 2;
             while let Some(&b) = bytes.get(idx) {
                 idx += 1;
-                if b == b'\n' {
+                if is_line_terminator(b) {
                     break;
                 }
             }
@@ -992,7 +992,12 @@ fn prev_significant_token_kind(
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
             idx -= 2;
-            while idx > 0 && bytes.get(idx - 1) != Some(&b'\n') {
+            while idx > 0
+                && bytes
+                    .get(idx - 1)
+                    .copied()
+                    .is_some_and(|byte| !is_line_terminator(byte))
+            {
                 idx -= 1;
             }
             continue;
@@ -1287,7 +1292,7 @@ fn is_prompt_keyword(bytes: &[u8], start: usize) -> bool {
     }
     matches!(
         bytes.get(end),
-        None | Some(b' ') | Some(b'\t') | Some(b'\n')
+        None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
     )
 }
 
@@ -1307,8 +1312,20 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
     }
     matches!(
         bytes.get(end),
-        None | Some(b' ') | Some(b'\t') | Some(b'\n')
+        None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
     )
+}
+
+fn is_line_start(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || matches!(
+            bytes.get(idx.saturating_sub(1)),
+            Some(b'\n') | Some(b'\r')
+        )
+}
+
+fn is_line_terminator(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
 }
 
 fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContinuation {
@@ -1323,14 +1340,14 @@ fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContin
                     idx += 1;
                 }
 
-                if matches!(bytes.get(idx), None | Some(b'\n')) {
+                if matches!(bytes.get(idx), None | Some(b'\n') | Some(b'\r')) {
                     return ConnectContinuation::EndOfLine;
                 }
 
                 if bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-') {
                     while let Some(&b) = bytes.get(idx) {
                         idx += 1;
-                        if b == b'\n' {
+                        if is_line_terminator(b) {
                             return ConnectContinuation::EndOfLine;
                         }
                     }
@@ -1392,7 +1409,7 @@ fn skip_trivia_and_comments(bytes: &[u8], mut idx: usize) -> usize {
             idx += 2;
             while let Some(&b) = bytes.get(idx) {
                 idx += 1;
-                if b == b'\n' {
+                if is_line_terminator(b) {
                     break;
                 }
             }
