@@ -6796,3 +6796,23 @@ fn select_alias_named_if_does_not_trigger_plsql_if_state() {
     assert_eq!(engine.state.if_state, IfState::None);
     assert_eq!(engine.state.block_depth(), 0);
 }
+
+#[test]
+fn select_alias_named_if_then_does_not_open_false_if_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT 1 AS IF, 2 AS THEN FROM dual;");
+    engine.process_line("SELECT 3 FROM dual;");
+
+    let statements = engine.take_statements();
+    assert_eq!(
+        statements,
+        vec![
+            "SELECT 1 AS IF, 2 AS THEN FROM dual".to_string(),
+            "SELECT 3 FROM dual".to_string()
+        ]
+    );
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+

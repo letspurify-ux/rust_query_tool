@@ -885,7 +885,10 @@ fn should_treat_control_keyword_as_implicit_alias(
     word_end: usize,
     word: &str,
 ) -> bool {
-    if !sql_text::is_plsql_control_keyword(word) || word.eq_ignore_ascii_case("THEN") {
+    if !sql_text::is_plsql_control_keyword(word) {
+        return false;
+    }
+    if word.eq_ignore_ascii_case("THEN") {
         return false;
     }
 

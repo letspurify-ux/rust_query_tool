@@ -758,6 +758,14 @@ impl SplitState {
             && self.pending_subprogram_begins > 0
     }
 
+    fn should_track_if_control_flow(&self) -> bool {
+        self.block_depth() > 0
+            || self.in_create_plsql()
+            || (self.block_depth() == 0
+                && self.paren_depth == 0
+                && self.top_level_token_state == TopLevelTokenState::NoneSeen)
+    }
+
     /// Sub-handler: process block-opening keywords (CASE, IF/THEN, LOOP, etc.).
     fn handle_block_openers(&mut self, upper: &str, end_token_role: EndTokenRole) {
         if self.is_trigger() && !self.in_compound_trigger() && self.block_depth() == 0 {
@@ -780,7 +788,10 @@ impl SplitState {
         }
 
         // IF (opening, not END IF)
-        if upper == "IF" && !end_token_role.is_suffix(PendingEndSuffix::If) {
+        if upper == "IF"
+            && !end_token_role.is_suffix(PendingEndSuffix::If)
+            && self.should_track_if_control_flow()
+        {
             self.if_state = IfState::ExpectConditionStart;
         }
 
@@ -794,6 +805,7 @@ impl SplitState {
                 _ => {}
             }
         }
+
 
         // LOOP (opening, not END LOOP)
         if upper == "LOOP" && !end_token_role.is_suffix(PendingEndSuffix::Loop) {

@@ -1355,7 +1355,6 @@ impl SqlEditorWidget {
                         sql_text::is_plsql_control_keyword(upper.as_str())
                             && !in_plsql_block
                             && !closes_case_expression
-                            && !next_word_is("THEN")
                             && !(upper == "END"
                                 && block_stack.last().is_some_and(|value| value == "CASE"))
                             && (follows_alias_keyword
@@ -1367,8 +1366,7 @@ impl SqlEditorWidget {
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier
                         && !(follows_alias_keyword
-                            && sql_text::is_plsql_control_keyword(upper.as_str())
-                            && !next_word_is("THEN"));
+                            && sql_text::is_plsql_control_keyword(upper.as_str()));
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
                     let at_package_body_member_depth =
@@ -10512,6 +10510,22 @@ FROM t;
 
         assert!(formatted.contains("/*+ NO_EXPAND */"), "{}", formatted);
         assert!(formatted.contains("END -- keep"), "{}", formatted);
+    }
+
+    #[test]
+    fn format_sql_basic_treats_then_keyword_like_aliases_as_identifiers() {
+        let sql = "SELECT salary AS THEN, bonus THEN FROM dual";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("SELECT salary AS THEN,"),
+            "AS alias THEN should stay attached to select item, got: {formatted}"
+        );
+        assert!(
+            formatted.contains("bonus THEN"),
+            "implicit alias THEN should stay in select list, got: {formatted}"
+        );
     }
 
     #[test]

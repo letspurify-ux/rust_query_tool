@@ -825,6 +825,22 @@ fn test_plsql_control_keyword_implicit_alias_in_select_list_is_not_keyword() {
 }
 
 #[test]
+fn test_plsql_control_keyword_then_alias_after_as_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary AS THEN FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let then_start = text.find("AS THEN").unwrap_or(0) + 3;
+    assert!(
+        styles[then_start..then_start + 4]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "AS alias THEN should not be keyword"
+    );
+}
+
+
+#[test]
 fn test_plsql_control_keyword_aliases_can_be_identifiers_when_known_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {
