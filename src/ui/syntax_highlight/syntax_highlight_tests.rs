@@ -763,6 +763,82 @@ fn test_columns_and_relations_use_different_styles() {
 }
 
 #[test]
+#[test]
+fn test_plsql_if_after_routine_is_with_comment_newline_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE OR REPLACE PROCEDURE p IS /* comment */
+IF 1 = 1 THEN
+NULL;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text
+        .find(
+            "
+IF",
+        )
+        .unwrap_or(0)
+        + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL IF should remain keyword style after IS comment newline"
+    );
+}
+
+#[test]
+fn test_plsql_control_keyword_alias_after_as_with_comment_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary AS /* marker */ IF FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.rfind("IF").unwrap_or(0);
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "AS alias IF with inline comment should not be keyword"
+    );
+}
+
+fn test_plsql_control_keywords_can_be_identifier_when_known_metadata() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_highlight_data(HighlightData {
+        tables: vec!["IF".to_string()],
+        views: Vec::new(),
+        columns: vec!["THEN".to_string(), "END".to_string()],
+    });
+
+    let text = "SELECT THEN AS END FROM IF";
+    let styles = highlighter.generate_styles(text);
+
+    let then_start = text.find("THEN").unwrap_or(0);
+    assert!(
+        styles[then_start..then_start + 4]
+            .chars()
+            .all(|c| c == STYLE_COLUMN),
+        "known column THEN should be styled as column"
+    );
+
+    let end_start = text.find("END").unwrap_or(0);
+    assert!(
+        styles[end_start..end_start + 3]
+            .chars()
+            .all(|c| c == STYLE_COLUMN),
+        "known alias END should be styled as column"
+    );
+
+    let if_start = text.rfind("IF").unwrap_or(0);
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_IDENTIFIER),
+        "known relation IF should be styled as identifier"
+    );
+}
+
+#[test]
 fn test_multibyte_text_preserves_byte_length_styles() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT '한글🙂' AS 이름 FROM dual";

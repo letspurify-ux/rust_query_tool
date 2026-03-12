@@ -1336,11 +1336,30 @@ impl SqlEditorWidget {
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
                     let is_trigger_or_on_keyword =
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
+                    let follows_alias_keyword =
+                        matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
+                    let in_from_clause = matches!(current_clause.as_deref(), Some("FROM"));
+                    let next_word_is_clause_keyword = next_word.map_or(true, |word| {
+                        let next_upper = word.to_ascii_uppercase();
+                        sql_text::is_oracle_sql_keyword(next_upper.as_str())
+                    });
+                    let treat_control_keyword_as_identifier =
+                        sql_text::is_plsql_control_keyword(upper.as_str())
+                            && !in_plsql_block
+                            && !next_word_is("THEN")
+                            && (follows_alias_keyword
+                                || (in_from_clause && next_word_is_clause_keyword));
+                    let should_treat_as_block_start = block_start_keywords
+                        .contains(&upper.as_str())
+                        && !treat_control_keyword_as_identifier
+                        && !(follows_alias_keyword
+                            && sql_text::is_plsql_control_keyword(upper.as_str())
+                            && !next_word_is("THEN"));
                     let suppress_order_clause_break =
                         suppress_comma_break_depth > 0 && upper == "ORDER";
                     let at_package_body_member_depth =
                         is_package_body_statement && indent_level == 1;
-                    if upper == "END" {
+                    if upper == "END" && !treat_control_keyword_as_identifier {
                         let end_qualifier = {
                             let mut qualifier = None;
                             for t in &tokens[idx + 1..] {
@@ -1784,7 +1803,7 @@ impl SqlEditorWidget {
                             );
                         }
                         // In SELECT context, CASE stays inline
-                    } else if block_start_keywords.contains(&upper.as_str()) {
+                    } else if should_treat_as_block_start {
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -1850,7 +1869,7 @@ impl SqlEditorWidget {
                         && (create_object.is_some() || routine_decl_pending);
 
                     // Handle block start - push to stack and increase indent
-                    if block_start_keywords.contains(&upper.as_str()) {
+                    if should_treat_as_block_start {
                         block_stack.push(upper.clone());
                         indent_level += 1;
                         if upper == "DECLARE" || upper == "IF" {
@@ -2095,26 +2114,32 @@ impl SqlEditorWidget {
                             line_indent = base_indent(indent_level, open_cursor_state) + 1;
                         }
                     } else if is_block_comment && next_is_word_like {
-                        let list_extra = if in_select_list
-                            || column_list_stack.last().copied().unwrap_or(false)
-                            || hint_after_select
-                        {
-                            1
-                        } else {
-                            0
-                        };
-                        newline_with(
-                            &mut out,
-                            base_indent(indent_level, open_cursor_state),
-                            list_extra,
-                            &mut at_line_start,
-                            &mut needs_space,
-                            &mut line_indent,
+                        let keep_inline_alias_comment = matches!(
+                            (prev_word_upper.as_deref(), tokens.get(idx + 1)),
+                            (Some("AS" | "IS"), Some(SqlToken::Word(_)))
                         );
-                        if hint_after_select {
-                            select_list_layout_state = SelectListLayoutState::Multiline {
-                                indent: base_indent(indent_level, open_cursor_state) + 1,
+                        if !keep_inline_alias_comment {
+                            let list_extra = if in_select_list
+                                || column_list_stack.last().copied().unwrap_or(false)
+                                || hint_after_select
+                            {
+                                1
+                            } else {
+                                0
                             };
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                list_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            if hint_after_select {
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: base_indent(indent_level, open_cursor_state) + 1,
+                                };
+                            }
                         }
                     } else if comment_starts_line {
                     }
@@ -11241,6 +11266,55 @@ mod print_bind_state_tests {
             }
             _ => panic!("expected refcursor to remain in session after PRINT ALL snapshot"),
         }
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_aliases_inline() {
+        let sql = "SELECT amount AS IF, total AS END FROM sales IF";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("AS IF") && formatted.contains("AS END"),
+            "keyword-like aliases should stay as aliases, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("FROM sales IF"),
+            "table alias IF should remain inline, got:
+{}",
+            formatted
+        );
+        assert!(
+    #[test]
+    fn format_sql_basic_keeps_alias_with_comment_between_as_and_control_keyword() {
+        let sql = "SELECT amount AS /* keep */ IF FROM sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("AS /* keep */ IF"),
+            "alias with inline comment should remain alias, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "
+IF"
+            ),
+            "comment-separated alias IF should not be moved to block line, got:
+{}",
+            formatted
+        );
+    }
+
+            !formatted.contains("\nIF,"),
+            "alias IF should not be moved to its own block line, got:
+{}",
+            formatted
+        );
     }
 
     #[test]

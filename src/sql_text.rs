@@ -1029,6 +1029,24 @@ pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {
     ORACLE_SQL_KEYWORDS_SET.contains(word)
 }
 
+/// Returns true for PL/SQL control-flow keywords that may also appear as aliases.
+pub(crate) fn is_plsql_control_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "IF" | "THEN"
+            | "ELSE"
+            | "ELSIF"
+            | "CASE"
+            | "LOOP"
+            | "FOR"
+            | "WHILE"
+            | "REPEAT"
+            | "DECLARE"
+            | "BEGIN"
+            | "END"
+    )
+}
+
 /// Returns true when a keyword can start the main query after a WITH clause.
 pub(crate) fn is_with_main_query_keyword(word: &str) -> bool {
     matches_keyword(word, WITH_MAIN_QUERY_KEYWORDS)
