@@ -789,12 +789,20 @@ impl SqlHighlighter {
                     }
                 }
 
-                let token_type =
-                    if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
-                        self.classify_non_keyword_word(word)
-                    } else {
-                        self.classify_word(word, expect_alias_identifier)
-                    };
+                let treat_control_keyword_as_alias = expect_alias_identifier
+                    || should_treat_control_keyword_as_implicit_alias(
+                        text,
+                        bytes,
+                        start,
+                        idx,
+                        word,
+                    );
+                let token_type = if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx)
+                {
+                    self.classify_non_keyword_word(word)
+                } else {
+                    self.classify_word(word, treat_control_keyword_as_alias)
+                };
                 styles[start..idx].fill(token_type.to_style_byte());
                 expect_alias_identifier = word.eq_ignore_ascii_case("AS");
                 continue;
@@ -868,6 +876,163 @@ impl SqlHighlighter {
 
         TokenType::Default
     }
+}
+
+fn should_treat_control_keyword_as_implicit_alias(
+    text: &str,
+    bytes: &[u8],
+    word_start: usize,
+    word_end: usize,
+    word: &str,
+) -> bool {
+    if !sql_text::is_plsql_control_keyword(word) || word.eq_ignore_ascii_case("THEN") {
+        return false;
+    }
+
+    let Some(next_kind) = next_significant_token_kind(bytes, word_end) else {
+        return false;
+    };
+    if !matches!(next_kind, SignificantTokenKind::Comma | SignificantTokenKind::ClauseWord) {
+        return false;
+    }
+
+    let Some(prev_kind) = prev_significant_token_kind(text, bytes, word_start) else {
+        return false;
+    };
+
+    matches!(
+        prev_kind,
+        SignificantTokenKind::Identifier
+            | SignificantTokenKind::Number
+            | SignificantTokenKind::String
+            | SignificantTokenKind::RightParen
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignificantTokenKind {
+    Identifier,
+    Number,
+    String,
+    RightParen,
+    Comma,
+    ClauseWord,
+}
+
+fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<SignificantTokenKind> {
+    while let Some(&byte) = bytes.get(idx) {
+        if byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n' {
+            idx += 1;
+            continue;
+        }
+        if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            idx += 2;
+            while let Some(&b) = bytes.get(idx) {
+                idx += 1;
+                if b == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            idx += 2;
+            while bytes.get(idx).is_some() {
+                if bytes.get(idx) == Some(&b'*') && bytes.get(idx + 1) == Some(&b'/') {
+                    idx += 2;
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+
+        return match byte {
+            b',' => Some(SignificantTokenKind::Comma),
+            b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
+                let start = idx;
+                idx += 1;
+                while bytes
+                    .get(idx)
+                    .is_some_and(|&b| sql_text::is_identifier_byte(b))
+                {
+                    idx += 1;
+                }
+                let word = std::str::from_utf8(bytes.get(start..idx)?).ok()?;
+                let upper = word.to_ascii_uppercase();
+                if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                    Some(SignificantTokenKind::ClauseWord)
+                } else {
+                    Some(SignificantTokenKind::Identifier)
+                }
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn prev_significant_token_kind(
+    text: &str,
+    bytes: &[u8],
+    mut idx: usize,
+) -> Option<SignificantTokenKind> {
+    while idx > 0 {
+        let prev = *bytes.get(idx - 1)?;
+        if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            idx -= 1;
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
+            idx -= 2;
+            while idx > 0 && bytes.get(idx - 1) != Some(&b'\n') {
+                idx -= 1;
+            }
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
+            idx -= 2;
+            while idx > 1 {
+                if bytes.get(idx - 2) == Some(&b'/') && bytes.get(idx - 1) == Some(&b'*') {
+                    idx -= 2;
+                    break;
+                }
+                idx -= 1;
+            }
+            continue;
+        }
+
+        if prev == b')' {
+            return Some(SignificantTokenKind::RightParen);
+        }
+        if prev.is_ascii_digit() {
+            return Some(SignificantTokenKind::Number);
+        }
+        if prev == b'\'' || prev == b'"' {
+            return Some(SignificantTokenKind::String);
+        }
+        if sql_text::is_identifier_byte(prev) {
+            let mut start = idx - 1;
+            while start > 0
+                && bytes
+                    .get(start - 1)
+                    .is_some_and(|&b| sql_text::is_identifier_byte(b))
+            {
+                start -= 1;
+            }
+            let word = text.get(start..idx)?;
+            let upper = word.to_ascii_uppercase();
+            if sql_text::is_oracle_sql_keyword(upper.as_str()) {
+                return Some(SignificantTokenKind::ClauseWord);
+            }
+            return Some(SignificantTokenKind::Identifier);
+        }
+
+        return None;
+    }
+
+    None
 }
 
 impl Default for SqlHighlighter {

@@ -1349,9 +1349,12 @@ impl SqlEditorWidget {
                         next_non_comment,
                         Some(SqlToken::Symbol(sym)) if sym == ","
                     ) || next_word_is_clause_keyword;
+                    let closes_case_expression =
+                        upper == "END" && block_stack.last().is_some_and(|s| s == "CASE");
                     let treat_control_keyword_as_identifier =
                         sql_text::is_plsql_control_keyword(upper.as_str())
                             && !in_plsql_block
+                            && !closes_case_expression
                             && !next_word_is("THEN")
                             && (follows_alias_keyword
                                 || (in_from_clause && next_word_is_clause_keyword)
