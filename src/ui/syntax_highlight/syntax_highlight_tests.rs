@@ -148,6 +148,93 @@ fn test_connect_with_comment_then_by_is_not_sqlplus_connect() {
 }
 
 #[test]
+fn test_connect_with_newline_then_by_is_not_sqlplus_connect() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT level FROM dual CONNECT\nBY PRIOR level = level - 1";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CONNECT", "BY", "PRIOR"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
+}
+
+#[test]
+fn test_connect_with_comment_newline_then_by_keeps_comment_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT level FROM dual CONNECT /*comment*/\nBY level <= 2";
+    let styles = highlighter.generate_styles(text);
+
+    let comment_start = text.find("/*comment*/").unwrap_or(0);
+    let comment_end = comment_start + "/*comment*/".len();
+    assert!(styles[comment_start..comment_end]
+        .chars()
+        .all(|c| c == STYLE_COMMENT));
+
+    let by_start = text.find("BY").unwrap_or(0);
+    assert!(styles[by_start..by_start + 2]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
+fn test_line_start_connect_with_inline_comment_then_newline_by_keeps_comment_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CONNECT -- hierarchy\nBY PRIOR node_id = parent_id";
+    let styles = highlighter.generate_styles(text);
+
+    let connect_start = text.find("CONNECT").unwrap_or(0);
+    assert!(styles[connect_start..connect_start + "CONNECT".len()]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+
+    let comment_start = text.find("-- hierarchy").unwrap_or(0);
+    let comment_end = comment_start + "-- hierarchy".len();
+    assert!(styles[comment_start..comment_end]
+        .chars()
+        .all(|c| c == STYLE_COMMENT));
+
+    let by_start = text.find("BY").unwrap_or(0);
+    assert!(styles[by_start..by_start + 2]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
+fn test_line_start_connect_with_block_comment_then_newline_by_keeps_comment_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CONNECT /* hierarchy */\nBY PRIOR node_id = parent_id";
+    let styles = highlighter.generate_styles(text);
+
+    let comment_start = text.find("/* hierarchy */").unwrap_or(0);
+    let comment_end = comment_start + "/* hierarchy */".len();
+    assert!(styles[comment_start..comment_end]
+        .chars()
+        .all(|c| c == STYLE_COMMENT));
+
+    let by_start = text.find("BY").unwrap_or(0);
+    assert!(styles[by_start..by_start + 2]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
+fn test_parse_connect_continuation_detects_by_on_next_line() {
+    let bytes = b"CONNECT\nBY PRIOR id = parent_id";
+    let connect_end = "CONNECT".len();
+    assert_eq!(
+        parse_connect_continuation(bytes, connect_end),
+        ConnectContinuation::ByClause
+    );
+}
+
+#[test]
 fn test_parse_connect_continuation_detects_by_with_comment() {
     let bytes = b"CONNECT /*+ hint */ BY PRIOR id = parent_id";
     let connect_end = "CONNECT".len();
