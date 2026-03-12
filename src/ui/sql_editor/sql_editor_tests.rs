@@ -539,6 +539,23 @@ fn format_sql_preserves_whenever_sqlerror_options() {
 }
 
 #[test]
+fn format_sql_keeps_if_alias_member_access_intact() {
+    let input = "select if.a, if.b from tablename if";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("IF.a") && formatted.contains("IF.b"),
+        "IF alias member access should be preserved, got:\n{}",
+        formatted
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should remain idempotent for IF alias member access"
+    );
+}
+#[test]
 fn format_sql_breaks_minified_package_body_members() {
     let input = "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p IS BEGIN NULL; END; FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; END pkg;";
     let formatted = SqlEditorWidget::format_sql_basic(input);

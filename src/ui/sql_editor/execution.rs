@@ -1355,6 +1355,8 @@ impl SqlEditorWidget {
                         next_non_comment,
                         Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "," | ")")
                     ) || next_word_is_clause_keyword;
+                    let next_token_is_dot =
+                        matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == ".");
                     let closes_case_expression =
                         upper == "END" && block_stack.last().is_some_and(|s| s == "CASE");
                     let treat_control_keyword_as_identifier =
@@ -1368,7 +1370,19 @@ impl SqlEditorWidget {
                                 || (in_from_clause && next_token_ends_from_alias)
                                 || (in_select_clause
                                     && !next_word_is("AS")
-                                    && next_token_ends_select_item));
+                                    && next_token_ends_select_item)
+                                || (next_token_is_dot
+                                    && matches!(
+                                        current_clause.as_deref(),
+                                        Some(
+                                            "SELECT"
+                                                | "FROM"
+                                                | "WHERE"
+                                                | "GROUP"
+                                                | "HAVING"
+                                                | "ORDER"
+                                        )
+                                    )));
                     let should_treat_as_block_start = block_start_keywords
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier

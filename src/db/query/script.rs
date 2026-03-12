@@ -320,6 +320,17 @@ impl QueryExecutor {
                     while i < bytes.len() && sql_text::is_identifier_byte(bytes[i]) {
                         i += 1;
                     }
+
+                    // `alias.column` at the beginning of a line (e.g. `if.a`) must not be
+                    // interpreted as a control-flow keyword for indentation depth.
+                    let mut lookahead = i;
+                    while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+                        lookahead += 1;
+                    }
+                    if bytes.get(lookahead) == Some(&b'.') {
+                        return None;
+                    }
+
                     return line.get(start..i);
                 }
                 i += 1;
@@ -4664,6 +4675,21 @@ END fmt_pkg_extreme;"#;
         assert_eq!(
             depths[end_idx], 0,
             "package body END label should return to top-level depth"
+        );
+    }
+
+    #[test]
+    fn line_block_depths_treats_if_alias_like_regular_identifier_alias() {
+        let sql_with_if_alias = "SELECT\nif.a,\nif.b\nFROM tablename if\nWHERE if.a IS NOT NULL;";
+        let sql_with_regular_alias =
+            "SELECT\nt1.a,\nt1.b\nFROM tablename t1\nWHERE t1.a IS NOT NULL;";
+
+        let if_alias_depths = QueryExecutor::line_block_depths(sql_with_if_alias);
+        let regular_alias_depths = QueryExecutor::line_block_depths(sql_with_regular_alias);
+
+        assert_eq!(
+            if_alias_depths, regular_alias_depths,
+            "IF alias depth calculation should match non-keyword aliases"
         );
     }
 }
