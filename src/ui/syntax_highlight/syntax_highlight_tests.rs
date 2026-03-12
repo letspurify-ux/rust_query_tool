@@ -39,6 +39,21 @@ fn test_keyword_highlighting() {
     // "SELECT" should be keyword (B)
     assert!(styles.starts_with("BBBBBB"));
 }
+#[test]
+fn test_if_alias_member_access_is_not_highlighted_as_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT if.a, if.b FROM tablename if";
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["if.a", "if.b"] {
+        let start = text.find(token).unwrap_or(0);
+        let alias_end = start + 2;
+        assert!(
+            styles[start..alias_end].chars().all(|c| c != STYLE_KEYWORD),
+            "IF alias in `{token}` must not be highlighted as keyword"
+        );
+    }
+}
 
 #[test]
 fn test_string_highlighting() {
@@ -1169,7 +1184,6 @@ fn test_entry_state_from_continuation_style_maps_segmented_styles() {
         LexerState::InDoubleQuote
     );
 }
-
 
 #[test]
 fn test_q_quote_style_does_not_force_single_quote_entry_state() {
