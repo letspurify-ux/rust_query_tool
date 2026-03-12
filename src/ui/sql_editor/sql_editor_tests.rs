@@ -7,6 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const MAIN_THREAD_HIGHLIGHT_MAX_BYTES: usize = usize::MAX;
+const MAIN_THREAD_HIGHLIGHT_MAX_LINES: usize = usize::MAX;
+
 fn load_test_file(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("test");
@@ -39,8 +42,7 @@ fn apply_style_text_edit_delta_for_test(
     let prefix = style_text.get(..start)?;
     let suffix = style_text.get(delete_end..)?;
 
-    let mut updated =
-        String::with_capacity(prefix.len() + inserted_len + suffix.len());
+    let mut updated = String::with_capacity(prefix.len() + inserted_len + suffix.len());
     updated.push_str(prefix);
     updated.extend(std::iter::repeat_n(STYLE_DEFAULT, inserted_len));
     updated.push_str(suffix);
@@ -56,25 +58,12 @@ fn apply_incremental_highlight_for_test(
 ) -> Option<String> {
     let highlighter = SqlHighlighter::new();
     let previous_styles = highlighter.generate_styles_for_text(original_text);
-    let mut adjusted_styles = apply_style_text_edit_delta_for_test(
-        &previous_styles,
-        pos,
-        inserted_len,
-        deleted_len,
-    )?;
-    let deleted_text = original_text
-        .get(pos..pos.saturating_add(deleted_len))
-        .unwrap_or_default()
-        .to_string();
+    let mut adjusted_styles =
+        apply_style_text_edit_delta_for_test(&previous_styles, pos, inserted_len, deleted_len)?;
     let text_len = updated_text.len();
-    let start =
-        incremental_rehighlight_start_for_text(updated_text, pos, inserted_len, &deleted_text);
-    let must_cover_end = incremental_direct_rehighlight_end_for_text(
-        updated_text,
-        pos,
-        inserted_len,
-        deleted_len,
-    );
+    let start = incremental_rehighlight_start_for_text(updated_text, pos);
+    let must_cover_end =
+        incremental_direct_rehighlight_end_for_text(updated_text, pos, inserted_len, deleted_len);
     let mut current_start = start.min(text_len);
     let mut minimum_end = must_cover_end.max(current_start);
     let mut entry_state =
@@ -91,7 +80,8 @@ fn apply_incremental_highlight_for_test(
 
         let range_text = updated_text.get(current_start..current_end)?;
         let previous_range_styles = adjusted_styles.get(current_start..current_end)?;
-        let old_exit_style = continuation_style_before_position_for_text(&adjusted_styles, current_end);
+        let old_exit_style =
+            continuation_style_before_position_for_text(&adjusted_styles, current_end);
         let (new_styles, new_exit_state) =
             highlighter.generate_styles_for_window(range_text, entry_state);
         if new_styles.len() != range_text.len() {
@@ -150,21 +140,8 @@ fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn incremental_rehighlight_start_for_text(
-    text: &str,
-    pos: usize,
-    inserted_len: usize,
-    deleted_text: &str,
-) -> usize {
-    let mut start = line_start_for_text(text, pos);
-    let inserted_has_newline = text
-        .get(pos..pos.saturating_add(inserted_len))
-        .map(|segment| segment.contains('\n'))
-        .unwrap_or(false);
-    if start > 0 && (deleted_text.contains('\n') || inserted_has_newline) {
-        start = line_start_for_text(text, start.saturating_sub(1));
-    }
-    start
+fn incremental_rehighlight_start_for_text(text: &str, pos: usize) -> usize {
+    line_start_for_text(text, pos)
 }
 
 fn continuation_style_before_position_for_text(style_text: &str, pos: usize) -> char {
@@ -172,15 +149,18 @@ fn continuation_style_before_position_for_text(style_text: &str, pos: usize) -> 
         return STYLE_DEFAULT;
     }
 
-    match style_text.as_bytes().get(pos.saturating_sub(1)).copied().map(char::from) {
-        Some(STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT) => {
-            style_text
-                .as_bytes()
-                .get(pos.saturating_sub(1))
-                .copied()
-                .map(char::from)
-                .unwrap_or(STYLE_DEFAULT)
-        }
+    match style_text
+        .as_bytes()
+        .get(pos.saturating_sub(1))
+        .copied()
+        .map(char::from)
+    {
+        Some(STYLE_COMMENT | STYLE_STRING | STYLE_IDENTIFIER | STYLE_HINT) => style_text
+            .as_bytes()
+            .get(pos.saturating_sub(1))
+            .copied()
+            .map(char::from)
+            .unwrap_or(STYLE_DEFAULT),
         _ => STYLE_DEFAULT,
     }
 }
@@ -1402,6 +1382,23 @@ fn incremental_highlighting_matches_full_styles_after_inserting_single_quote() {
     let full = SqlHighlighter::new().generate_styles_for_text(&updated);
 
     assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_rehighlight_start_does_not_rewind_previous_line_on_newline_edit() {
+    let original = "SELECT 1\nWHERE col = 1\nORDER BY 1";
+    let delete_pos = original.find("\nWHERE").unwrap_or(0);
+    let updated = format!(
+        "{}{}",
+        original.get(..delete_pos).unwrap_or(""),
+        original.get(delete_pos.saturating_add(1)..).unwrap_or("")
+    );
+    let expected = line_start_for_text(&updated, delete_pos);
+
+    assert_eq!(
+        incremental_rehighlight_start_for_text(&updated, delete_pos),
+        expected
+    );
 }
 
 #[test]

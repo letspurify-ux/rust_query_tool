@@ -947,14 +947,14 @@ fn test_cross_window_block_comment_round_trip() {
 }
 
 #[test]
-fn test_probe_entry_state_recovers_from_stale_default_inside_comment() {
+fn test_probe_entry_state_skips_probe_for_stale_default_inside_comment() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT 1; /* open comment\ncontinued comment\nSELECT 2";
     let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
 
     let pos = text.find("continued").unwrap_or(0);
     let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
-    assert_eq!(entry, LexerState::InBlockComment);
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]
@@ -968,29 +968,29 @@ fn test_probe_entry_state_clamps_mid_byte_cursor_inside_comment() {
     assert!(!text.is_char_boundary(mid_byte_pos));
 
     let entry = highlighter.probe_entry_state_for_text(text, &style_text, mid_byte_pos);
-    assert_eq!(entry, LexerState::InBlockComment);
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]
-fn test_probe_entry_state_recovers_q_quote_state_inside_scroll_window() {
+fn test_probe_entry_state_skips_probe_for_stale_default_q_quote_window() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT q'[first line\nsecond line with ' quote\nthird line]'\nFROM dual";
     let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
     let pos = text.find("second line").unwrap();
 
     let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
-    assert_eq!(entry, LexerState::InQQuote { closing: ']' });
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]
-fn test_probe_entry_state_recovers_single_quote_state_inside_scroll_window() {
+fn test_probe_entry_state_skips_probe_for_stale_default_single_quote_window() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT 'first line\nsecond line with '' quote\nthird line'\nFROM dual";
     let style_text = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
     let pos = text.find("second line").unwrap();
 
     let entry = highlighter.probe_entry_state_for_text(text, &style_text, pos);
-    assert_eq!(entry, LexerState::InSingleQuote);
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]
@@ -1027,7 +1027,7 @@ fn test_clamp_buffer_boundary_clamps_mid_byte_utf8() {
 }
 
 #[test]
-fn test_probe_entry_state_recovers_long_offscreen_block_comment() {
+fn test_probe_entry_state_skips_probe_for_stale_default_long_block_comment() {
     let highlighter = SqlHighlighter::new();
     let filler = "a".repeat(STATE_PROBE_DISTANCE + 128);
     let text = format!("/*{}{}", filler, "\ncontinued comment");
@@ -1035,11 +1035,11 @@ fn test_probe_entry_state_recovers_long_offscreen_block_comment() {
     let pos = text.find("continued").unwrap();
 
     let entry = highlighter.probe_entry_state_for_text(&text, &style_text, pos);
-    assert_eq!(entry, LexerState::InBlockComment);
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]
-fn test_probe_entry_state_recovers_long_offscreen_q_quote() {
+fn test_probe_entry_state_skips_probe_for_stale_default_long_q_quote() {
     let highlighter = SqlHighlighter::new();
     let filler = "가".repeat((STATE_PROBE_DISTANCE / 3) + 64);
     let text = format!("SELECT uq'가{}계속가' FROM dual", filler);
@@ -1047,7 +1047,7 @@ fn test_probe_entry_state_recovers_long_offscreen_q_quote() {
     let pos = text.find("계속").unwrap();
 
     let entry = highlighter.probe_entry_state_for_text(&text, &style_text, pos);
-    assert_eq!(entry, LexerState::InQQuote { closing: '가' });
+    assert_eq!(entry, LexerState::Normal);
 }
 
 #[test]

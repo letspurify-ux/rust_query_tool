@@ -391,10 +391,6 @@ fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<S
     data.get_all_columns_for_highlighting()
 }
 
-fn edit_introduced_newline(inserted_text: &str, deleted_text: &str) -> bool {
-    deleted_text.contains('\n') || inserted_text.contains('\n')
-}
-
 fn continuation_style_for_lexer_state(state: crate::ui::syntax_highlight::LexerState) -> char {
     match state {
         crate::ui::syntax_highlight::LexerState::Normal => STYLE_DEFAULT,
@@ -413,14 +409,10 @@ fn continuation_style_for_lexer_state(state: crate::ui::syntax_highlight::LexerS
 fn incremental_rehighlight_start(
     shadow: &HighlightShadowState,
     pos: usize,
-    inserted_text: &str,
-    deleted_text: &str,
+    _inserted_text: &str,
+    _deleted_text: &str,
 ) -> usize {
-    let mut start = shadow.line_start(pos);
-    if start > 0 && edit_introduced_newline(inserted_text, deleted_text) {
-        start = shadow.line_start(start.saturating_sub(1));
-    }
-    start
+    shadow.line_start(pos)
 }
 
 fn incremental_direct_rehighlight_end(
