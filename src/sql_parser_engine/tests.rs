@@ -6798,6 +6798,30 @@ fn select_alias_named_if_does_not_trigger_plsql_if_state_lowercase() {
 }
 
 #[test]
+fn select_implicit_alias_named_if_before_semicolon_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT salary IF;");
+
+    let statements = engine.take_statements();
+    assert_eq!(statements, vec!["SELECT salary IF".to_string()]);
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+
+#[test]
+fn select_implicit_alias_named_if_at_eof_does_not_trigger_plsql_if_state() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT salary IF");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements, vec!["SELECT salary IF".to_string()]);
+    assert_eq!(engine.state.if_state, IfState::None);
+    assert_eq!(engine.state.block_depth(), 0);
+}
+
+#[test]
 fn select_alias_named_if_does_not_trigger_plsql_if_state() {
     let mut engine = SqlParserEngine::new();
 

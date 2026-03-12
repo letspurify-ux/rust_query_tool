@@ -1298,7 +1298,9 @@ impl SqlEditorWidget {
                 SqlToken::Word(w) => Some(w.as_str()),
                 _ => None,
             });
-            let next_non_comment = tokens[idx + 1..].iter().find(|t| !matches!(t, SqlToken::Comment(_)));
+            let next_non_comment = tokens[idx + 1..]
+                .iter()
+                .find(|t| !matches!(t, SqlToken::Comment(_)));
             let next_word_is =
                 |expected: &str| next_word.is_some_and(|word| word.eq_ignore_ascii_case(expected));
 
@@ -11348,9 +11350,13 @@ IF"
             formatted
         );
         assert!(
-            !formatted.contains("
-IF,") && !formatted.contains("
-END"),
+            !formatted.contains(
+                "
+IF,"
+            ) && !formatted.contains(
+                "
+END"
+            ),
             "implicit lowercase aliases IF/END should not be moved to block lines, got:
 {}",
             formatted
@@ -11389,6 +11395,52 @@ END"),
         assert!(
             !formatted.contains("\nIF") && !formatted.contains("\n)"),
             "aliases IF should not be reformatted as block keyword near ')', got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_implicit_select_alias_before_semicolon_inline() {
+        let sql = "SELECT amount IF;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF;"),
+            "implicit alias IF before semicolon should remain inline, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "
+IF;"
+            ),
+            "implicit alias IF before semicolon should not be moved to block line, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_implicit_select_alias_at_eof_inline() {
+        let sql = "SELECT amount IF";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("amount IF"),
+            "implicit alias IF at EOF should remain inline, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "
+IF"
+            ),
+            "implicit alias IF at EOF should not be moved to block line, got:
+{}",
             formatted
         );
     }

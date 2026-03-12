@@ -791,18 +791,14 @@ impl SqlHighlighter {
 
                 let treat_control_keyword_as_alias = expect_alias_identifier
                     || should_treat_control_keyword_as_implicit_alias(
-                        text,
-                        bytes,
-                        start,
-                        idx,
-                        word,
+                        text, bytes, start, idx, word,
                     );
-                let token_type = if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx)
-                {
-                    self.classify_non_keyword_word(word)
-                } else {
-                    self.classify_word(word, treat_control_keyword_as_alias)
-                };
+                let token_type =
+                    if word.eq_ignore_ascii_case("PATH") && !is_path_keyword_usage(bytes, idx) {
+                        self.classify_non_keyword_word(word)
+                    } else {
+                        self.classify_word(word, treat_control_keyword_as_alias)
+                    };
                 styles[start..idx].fill(token_type.to_style_byte());
                 expect_alias_identifier = word.eq_ignore_ascii_case("AS");
                 continue;
@@ -889,14 +885,14 @@ fn should_treat_control_keyword_as_implicit_alias(
         return false;
     }
 
-    let Some(next_kind) = next_significant_token_kind(bytes, word_end) else {
-        return false;
-    };
+    let next_kind = next_significant_token_kind(bytes, word_end)
+        .unwrap_or(SignificantTokenKind::StatementTerminator);
     if !matches!(
         next_kind,
         SignificantTokenKind::Comma
             | SignificantTokenKind::ClauseWord
             | SignificantTokenKind::RightParen
+            | SignificantTokenKind::StatementTerminator
     ) {
         return false;
     }
@@ -922,6 +918,7 @@ enum SignificantTokenKind {
     RightParen,
     Comma,
     ClauseWord,
+    StatementTerminator,
 }
 
 fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<SignificantTokenKind> {
@@ -955,6 +952,7 @@ fn next_significant_token_kind(bytes: &[u8], mut idx: usize) -> Option<Significa
         return match byte {
             b',' => Some(SignificantTokenKind::Comma),
             b')' => Some(SignificantTokenKind::RightParen),
+            b';' => Some(SignificantTokenKind::StatementTerminator),
             b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | b'#' => {
                 let start = idx;
                 idx += 1;
