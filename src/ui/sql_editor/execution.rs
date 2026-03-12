@@ -2114,26 +2114,32 @@ impl SqlEditorWidget {
                             line_indent = base_indent(indent_level, open_cursor_state) + 1;
                         }
                     } else if is_block_comment && next_is_word_like {
-                        let list_extra = if in_select_list
-                            || column_list_stack.last().copied().unwrap_or(false)
-                            || hint_after_select
-                        {
-                            1
-                        } else {
-                            0
-                        };
-                        newline_with(
-                            &mut out,
-                            base_indent(indent_level, open_cursor_state),
-                            list_extra,
-                            &mut at_line_start,
-                            &mut needs_space,
-                            &mut line_indent,
+                        let keep_inline_alias_comment = matches!(
+                            (prev_word_upper.as_deref(), tokens.get(idx + 1)),
+                            (Some("AS" | "IS"), Some(SqlToken::Word(_)))
                         );
-                        if hint_after_select {
-                            select_list_layout_state = SelectListLayoutState::Multiline {
-                                indent: base_indent(indent_level, open_cursor_state) + 1,
+                        if !keep_inline_alias_comment {
+                            let list_extra = if in_select_list
+                                || column_list_stack.last().copied().unwrap_or(false)
+                                || hint_after_select
+                            {
+                                1
+                            } else {
+                                0
                             };
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                list_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            if hint_after_select {
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: base_indent(indent_level, open_cursor_state) + 1,
+                                };
+                            }
                         }
                     } else if comment_starts_line {
                     }
@@ -11281,6 +11287,29 @@ mod print_bind_state_tests {
             formatted
         );
         assert!(
+    #[test]
+    fn format_sql_basic_keeps_alias_with_comment_between_as_and_control_keyword() {
+        let sql = "SELECT amount AS /* keep */ IF FROM sales";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("AS /* keep */ IF"),
+            "alias with inline comment should remain alias, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "
+IF"
+            ),
+            "comment-separated alias IF should not be moved to block line, got:
+{}",
+            formatted
+        );
+    }
+
             !formatted.contains("\nIF,"),
             "alias IF should not be moved to its own block line, got:
 {}",

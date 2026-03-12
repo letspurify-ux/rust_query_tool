@@ -763,6 +763,45 @@ fn test_columns_and_relations_use_different_styles() {
 }
 
 #[test]
+#[test]
+fn test_plsql_if_after_routine_is_with_comment_newline_stays_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "CREATE OR REPLACE PROCEDURE p IS /* comment */
+IF 1 = 1 THEN
+NULL;
+END;";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text
+        .find(
+            "
+IF",
+        )
+        .unwrap_or(0)
+        + 1;
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "PL/SQL IF should remain keyword style after IS comment newline"
+    );
+}
+
+#[test]
+fn test_plsql_control_keyword_alias_after_as_with_comment_is_not_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT salary AS /* marker */ IF FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let if_start = text.rfind("IF").unwrap_or(0);
+    assert!(
+        styles[if_start..if_start + 2]
+            .chars()
+            .all(|c| c == STYLE_DEFAULT),
+        "AS alias IF with inline comment should not be keyword"
+    );
+}
+
 fn test_plsql_control_keywords_can_be_identifier_when_known_metadata() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_highlight_data(HighlightData {
