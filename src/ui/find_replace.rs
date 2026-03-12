@@ -440,7 +440,8 @@ impl FindReplaceDialog {
                                 search_text.clone();
                         }
                         if let Some((start, end)) = buffer.selection_position() {
-                            let selected = text_buffer_access::text_range(&buffer, None, start, end);
+                            let selected =
+                                text_buffer_access::text_range(&buffer, None, start, end);
                             let matches = if case_sensitive {
                                 selected == search_text
                             } else {
@@ -688,25 +689,17 @@ fn find_unicode_case_insensitive_bounds(haystack: &str, needle: &str) -> Option<
         return None;
     }
 
-    let mut start_positions: Vec<usize> = haystack.char_indices().map(|(idx, _)| idx).collect();
-    start_positions.push(haystack.len());
+    let needle_folded_len = needle_folded.len();
 
-    for &start in &start_positions {
-        if start >= haystack.len() {
-            break;
-        }
-        for &end in &start_positions {
-            if end <= start {
-                continue;
-            }
-            let Some(candidate) = haystack.get(start..end) else {
-                continue;
-            };
-            let folded = fold_for_case_insensitive(candidate);
-            if folded == needle_folded {
+    for (start, _) in haystack.char_indices() {
+        let mut folded = String::new();
+        for (relative_idx, ch) in haystack[start..].char_indices() {
+            folded.extend(ch.to_lowercase());
+            if folded.len() == needle_folded_len && folded == needle_folded {
+                let end = start + relative_idx + ch.len_utf8();
                 return Some((start, end));
             }
-            if folded.len() > needle_folded.len() {
+            if folded.len() >= needle_folded_len {
                 break;
             }
         }
@@ -761,5 +754,14 @@ mod tests {
         let second =
             find_next_match(text, "A", first.1 as i32, false).expect("expected second match");
         assert_eq!(second, (second_ascii, second_ascii + "a".len()));
+    }
+
+    #[test]
+    fn find_next_match_case_insensitive_scales_for_long_ascii_text() {
+        let mut text = "x".repeat(20_000);
+        text.push_str("if.");
+
+        let found = find_next_match(&text, "IF.", 0, false).expect("expected to find match");
+        assert_eq!(found, (20_000, 20_003));
     }
 }
