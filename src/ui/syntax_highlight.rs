@@ -406,8 +406,7 @@ impl SqlHighlighter {
             STYLE_BLOCK_COMMENT => LexerState::InBlockComment,
             STYLE_HINT => LexerState::InHintComment,
             STYLE_STRING => LexerState::InSingleQuote,
-            STYLE_Q_QUOTE_STRING => LexerState::InSingleQuote,
-            STYLE_IDENTIFIER | STYLE_QUOTED_IDENTIFIER => LexerState::InDoubleQuote,
+            STYLE_QUOTED_IDENTIFIER => LexerState::InDoubleQuote,
             _ => LexerState::Normal,
         }
     }
@@ -713,7 +712,7 @@ impl SqlHighlighter {
                         next_idx
                     }
                 };
-                styles[start..idx].fill(STYLE_IDENTIFIER as u8);
+                styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
@@ -1176,7 +1175,6 @@ fn requires_entry_state_probe(style: char) -> bool {
             | STYLE_BLOCK_COMMENT
             | STYLE_STRING
             | STYLE_Q_QUOTE_STRING
-            | STYLE_IDENTIFIER
             | STYLE_QUOTED_IDENTIFIER
             | STYLE_HINT
     )

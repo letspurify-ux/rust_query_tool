@@ -701,8 +701,8 @@ fn test_quoted_identifier_does_not_trigger_keyword_or_comment() {
     assert!(
         styles[from_ident_start..from_ident_end]
             .chars()
-            .all(|c| c == STYLE_IDENTIFIER),
-        "quoted identifier should be identifier style"
+            .all(|c| c == STYLE_QUOTED_IDENTIFIER),
+        "quoted identifier should use quoted-identifier style"
     );
 
     let comment_like_start = text.find(r#""A--B""#).unwrap();
@@ -710,13 +710,13 @@ fn test_quoted_identifier_does_not_trigger_keyword_or_comment() {
     assert!(
         styles[comment_like_start..comment_like_end]
             .chars()
-            .all(|c| c == STYLE_IDENTIFIER),
+            .all(|c| c == STYLE_QUOTED_IDENTIFIER),
         "double dash inside quoted identifier must not start comment"
     );
 }
 
 #[test]
-fn test_quoted_identifier_with_escaped_quote_is_identifier_style() {
+fn test_quoted_identifier_with_escaped_quote_is_quoted_identifier_style() {
     let highlighter = SqlHighlighter::new();
     let text = r#"SELECT "A""B" FROM dual"#;
     let styles = highlighter.generate_styles(text);
@@ -726,8 +726,8 @@ fn test_quoted_identifier_with_escaped_quote_is_identifier_style() {
     assert!(
         styles[quoted_start..quoted_end]
             .chars()
-            .all(|c| c == STYLE_IDENTIFIER),
-        "escaped quote in quoted identifier should remain identifier style"
+            .all(|c| c == STYLE_QUOTED_IDENTIFIER),
+        "escaped quote in quoted identifier should remain quoted-identifier style"
     );
 }
 
@@ -1162,11 +1162,22 @@ fn test_entry_state_from_continuation_style_maps_segmented_styles() {
     );
     assert_eq!(
         highlighter.entry_state_from_continuation_style(STYLE_Q_QUOTE_STRING),
-        LexerState::InSingleQuote
+        LexerState::Normal
     );
     assert_eq!(
         highlighter.entry_state_from_continuation_style(STYLE_QUOTED_IDENTIFIER),
         LexerState::InDoubleQuote
+    );
+}
+
+
+#[test]
+fn test_q_quote_style_does_not_force_single_quote_entry_state() {
+    let highlighter = SqlHighlighter::new();
+
+    assert_eq!(
+        highlighter.entry_state_from_continuation_style(STYLE_Q_QUOTE_STRING),
+        LexerState::Normal
     );
 }
 
