@@ -1020,8 +1020,46 @@ impl SqlEditorWidget {
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
         spans.iter().rev().any(|span| {
             matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
         })
+    }
+
+    fn trailing_segment_allows_semicolon_terminator(suffix: &str) -> bool {
+        let mut rest = suffix.trim_start();
+        if rest.is_empty() {
+            return true;
+        }
+
+        loop {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = rest[..line_end].trim();
+
+            if line.is_empty() {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            if line == "/" {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+                rest = rest[line_end..].trim_start();
+                if rest.is_empty() {
+                    return true;
+                }
+                continue;
+            }
+
+            return false;
+        }
     }
 
     #[cfg(test)]
@@ -1039,7 +1077,7 @@ impl SqlEditorWidget {
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
         spans.iter().rev().any(|span| {
             matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
         })
     }
 
@@ -11168,6 +11206,20 @@ END;
     }
 
     #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_line_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; -- trailing comment"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_slash_and_line_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "BEGIN\n  NULL;\nEND;\n/\n-- keep"
+        ));
+    }
+
+    #[test]
     fn preserve_selected_text_terminator_keeps_semicolon_before_inline_sqlplus_remark_comment() {
         let source = "SELECT 1 FROM dual; REM trailing comment";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -11182,6 +11234,49 @@ END;
         assert!(
             SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Existing statement terminator before inline SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_line_comment() {
+        let source = "SELECT 1 FROM dual; -- keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;"),
+            "Existing semicolon before line comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- keep terminator"),
+            "Trailing line comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing terminator before line comment should remain explicit, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_slash_and_trailing_comment() {
+        let source = "BEGIN\n  NULL;\nEND;\n/\n-- keep";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("END;\n/"),
+            "Semicolon before SQL*Plus slash should remain when source had explicit terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("-- keep"),
+            "Trailing line comment should remain, got:\n{}",
             preserved
         );
     }
