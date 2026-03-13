@@ -6863,6 +6863,42 @@ fn oracle_external_name_quoted_identifier_splits_before_next_statement() {
 }
 
 #[test]
+fn oracle_external_clause_accepts_language_after_name_identifier() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_name_then_language RETURN NUMBER");
+    engine.process_line("AS EXTERNAL NAME ext_symbol LANGUAGE C;");
+    engine.process_line("SELECT 50 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS EXTERNAL NAME ext_symbol LANGUAGE C"),
+        "post-NAME LANGUAGE target should remain in call spec: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 50 FROM dual".to_string());
+}
+
+#[test]
+fn oracle_external_clause_accepts_language_after_name_quoted_identifier() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_qname_then_language RETURN NUMBER");
+    engine.process_line("AS EXTERNAL NAME \"Ext$Sym\" LANGUAGE C;");
+    engine.process_line("SELECT 51 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS EXTERNAL NAME \"Ext$Sym\" LANGUAGE C"),
+        "quoted NAME target with trailing LANGUAGE should remain in call spec: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 51 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_initializer_with_nested_if_and_exception_keeps_single_statement() {
     let mut engine = SqlParserEngine::new();
 

@@ -379,6 +379,10 @@ impl RoutineFrame {
                 self.external_clause_state =
                     ExternalClauseState::AwaitingLanguageTargetFromExternal;
                 self.implicit_language_target_is_quoted = false;
+            } else if self.external_clause_state == ExternalClauseState::SawMleKeyword {
+                // MLE call specs can include trailing LANGUAGE clauses; keep
+                // routine call-spec splitting active when that form appears.
+                self.mark_external_clause();
             } else if allow_implicit_language {
                 self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetImplicit;
                 self.implicit_language_target_is_quoted = false;
