@@ -290,24 +290,45 @@ impl SqlEditorWidget {
         let mut changed_range: Option<(usize, usize)> = None;
 
         while current_start < text_len {
-            let current_end = incremental_line_chunk_end(shadow, current_start, minimum_end, text_len);
+            let mut current_end =
+                incremental_line_chunk_end(shadow, current_start, minimum_end, text_len);
             if current_end <= current_start {
                 break;
             }
 
-            let Some(range_text) = shadow.text.get(current_start..current_end) else {
-                break;
+            let (new_styles, new_exit_state) = loop {
+                let Some(range_text) = shadow.text.get(current_start..current_end) else {
+                    return false;
+                };
+                let (new_styles, new_exit_state) =
+                    highlighter.generate_styles_for_window(range_text, entry_state);
+                if new_styles.len() != range_text.len() {
+                    return false;
+                }
+
+                if continuation_style_for_lexer_state(new_exit_state) == STYLE_DEFAULT
+                    || current_end >= text_len
+                {
+                    break (new_styles, new_exit_state);
+                }
+
+                let next_end = incremental_line_chunk_end(
+                    shadow,
+                    current_end,
+                    current_end.saturating_add(1),
+                    text_len,
+                );
+                if next_end <= current_end {
+                    break (new_styles, new_exit_state);
+                }
+                current_end = next_end;
             };
+
             let Some(previous_styles) = shadow.styles.get(current_start..current_end) else {
                 break;
             };
 
             let old_exit_style = continuation_style_before_position(shadow, current_end);
-            let (new_styles, new_exit_state) =
-                highlighter.generate_styles_for_window(range_text, entry_state);
-            if new_styles.len() != range_text.len() {
-                break;
-            }
 
             if new_styles.as_bytes() != previous_styles {
                 if let Some(style_slice) = shadow.styles.get_mut(current_start..current_end) {
@@ -399,11 +420,9 @@ fn continuation_style_before_position(shadow: &HighlightShadowState, pos: usize)
 fn is_continuation_style(style: char) -> bool {
     matches!(
         style,
-        STYLE_COMMENT
-            | STYLE_STRING
+        STYLE_STRING
             | crate::ui::syntax_highlight::STYLE_BLOCK_COMMENT
             | crate::ui::syntax_highlight::STYLE_Q_QUOTE_STRING
-            | crate::ui::syntax_highlight::STYLE_IDENTIFIER
             | crate::ui::syntax_highlight::STYLE_QUOTED_IDENTIFIER
             | crate::ui::syntax_highlight::STYLE_HINT
     )

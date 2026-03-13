@@ -67,8 +67,9 @@ fn apply_incremental_highlight_for_test(
         incremental_direct_rehighlight_end_for_text(updated_text, pos, inserted_len, deleted_len);
     let mut current_start = start.min(text_len);
     let mut minimum_end = must_cover_end.max(current_start);
-    let mut entry_state =
-        highlighter.probe_entry_state_for_style_text(updated_text, &adjusted_styles, current_start);
+    let mut entry_state = highlighter.entry_state_from_continuation_style(
+        continuation_style_before_position_for_text(&adjusted_styles, current_start),
+    );
     let mut bytes_processed = 0usize;
     let mut lines_processed = 0usize;
 
@@ -1420,9 +1421,11 @@ fn compute_incremental_start_clamps_to_utf8_boundary() {
 
 #[test]
 fn is_string_or_comment_style_matches_only_comment_or_string() {
-    assert!(is_string_or_comment_style(STYLE_COMMENT));
     assert!(is_string_or_comment_style(STYLE_STRING));
+    assert!(is_string_or_comment_style(STYLE_BLOCK_COMMENT));
+    assert!(is_string_or_comment_style(STYLE_Q_QUOTE_STRING));
     assert!(!is_string_or_comment_style(STYLE_DEFAULT));
+    assert!(!is_string_or_comment_style(STYLE_COMMENT));
     assert!(!is_string_or_comment_style(STYLE_KEYWORD));
 }
 
@@ -1509,6 +1512,40 @@ fn incremental_rehighlight_start_does_not_rewind_previous_line_on_newline_edit()
         incremental_rehighlight_start_for_text(&updated, delete_pos),
         expected
     );
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_line_comment_line_edit() {
+    let original = "-- line comment\nSELECT value FROM dual";
+    let insert_pos = original.find("SELECT").unwrap_or(0);
+    let updated = format!(
+        "{}{}",
+        original.get(..insert_pos).unwrap_or(""),
+        "XSELECT value FROM dual"
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 1, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_identifier_line_edit() {
+    let original = "SELECT table_alias.column_name\nFROM table_alias";
+    let insert_pos = original.find("FROM").unwrap_or(0);
+    let updated = format!(
+        "{}{}",
+        original.get(..insert_pos).unwrap_or(""),
+        "XFROM table_alias"
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 1, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
 }
 
 #[test]
