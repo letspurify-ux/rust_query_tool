@@ -147,7 +147,34 @@ impl HighlightShadowState {
         self.text.replace_range(start..end, inserted_text);
         self.styles
             .splice(start..end, std::iter::repeat_n(STYLE_DEFAULT as u8, inserted_text.len()));
+        self.recompute_line_breaks_around_edit(start, inserted_text.len());
         true
+    }
+
+    fn recompute_line_breaks_around_edit(&mut self, start: usize, inserted_len: usize) {
+        if self.text.is_empty() {
+            self.newline_positions.clear();
+            return;
+        }
+
+        let text_len = self.text.len();
+        let scan_start = start.saturating_sub(1).min(text_len);
+        let scan_end = start
+            .saturating_add(inserted_len)
+            .saturating_add(1)
+            .min(text_len);
+        if scan_end <= scan_start {
+            return;
+        }
+
+        let scan_start_idx = self.newline_positions.partition_point(|&pos| pos < scan_start);
+        let scan_end_idx = self.newline_positions.partition_point(|&pos| pos < scan_end);
+        self.newline_positions
+            .drain(scan_start_idx..scan_end_idx);
+
+        let rescanned = line_break_positions_in_byte_range(&self.text, scan_start, scan_end);
+        self.newline_positions
+            .splice(scan_start_idx..scan_start_idx, rescanned);
     }
 }
 
@@ -176,6 +203,38 @@ fn line_break_positions_with_offset(text: &str, offset: usize) -> impl Iterator<
 
 fn extend_line_break_positions(target: &mut Vec<usize>, text: &str, offset: usize) {
     target.extend(line_break_positions_with_offset(text, offset));
+}
+
+fn line_break_positions_in_byte_range(text: &str, start: usize, end: usize) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut idx = start.min(bytes.len());
+    let end = end.min(bytes.len());
+    let mut positions = Vec::new();
+
+    while idx < end {
+        match bytes.get(idx).copied() {
+            Some(b'\n') => {
+                positions.push(idx);
+                idx += 1;
+            }
+            Some(b'\r') => {
+                if bytes.get(idx.saturating_add(1)) == Some(&b'\n') {
+                    let line_end = idx.saturating_add(1);
+                    if line_end < end {
+                        positions.push(line_end);
+                    }
+                    idx += 2;
+                } else {
+                    positions.push(idx);
+                    idx += 1;
+                }
+            }
+            Some(_) => idx += 1,
+            None => break,
+        }
+    }
+
+    positions
 }
 
 impl SqlEditorWidget {

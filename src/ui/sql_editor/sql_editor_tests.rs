@@ -1596,6 +1596,38 @@ fn incremental_highlighting_matches_full_styles_after_crlf_block_comment_insert(
 }
 
 #[test]
+fn highlight_shadow_recomputes_crlf_boundaries_when_edit_splits_pair() {
+    let original = "A\r\nB";
+    let styles = SqlEditorWidget::default_style_text_for_len(original.len());
+    let mut shadow = HighlightShadowState::default();
+    shadow.rebuild(original.to_string(), &styles);
+
+    let newline_pos = original.find('\n').unwrap_or(0);
+    assert!(shadow.apply_edit(newline_pos, "", 1));
+
+    let expected_text = "A\rB";
+    assert_eq!(shadow.text, expected_text);
+    assert_eq!(shadow.line_start(2), 2);
+    assert_eq!(shadow.line_end(0), 1);
+}
+
+#[test]
+fn highlight_shadow_recomputes_crlf_boundaries_when_inserting_between_pair() {
+    let original = "A\r\nB";
+    let styles = SqlEditorWidget::default_style_text_for_len(original.len());
+    let mut shadow = HighlightShadowState::default();
+    shadow.rebuild(original.to_string(), &styles);
+
+    let insert_pos = original.find('\n').unwrap_or(0);
+    assert!(shadow.apply_edit(insert_pos, "X", 0));
+
+    let expected_text = "A\rX\nB";
+    assert_eq!(shadow.text, expected_text);
+    assert_eq!(shadow.line_start(2), 2);
+    assert_eq!(shadow.line_end(2), 3);
+}
+
+#[test]
 fn incremental_highlighting_matches_full_styles_after_crlf_single_quote_insert() {
     let original = "SELECT value\r\nFROM dual";
     let insert_pos = original.find("value").unwrap_or(0);
