@@ -512,7 +512,11 @@ impl SqlEditorWidget {
     }
 
     fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
-        let formatted = Self::format_sql_basic(source);
+        let formatted = if selected_only {
+            Self::format_sql_basic_with_terminator_policy(source, false)
+        } else {
+            Self::format_sql_basic(source)
+        };
         if selected_only {
             Self::preserve_selected_text_terminator(source, formatted)
         } else {
@@ -800,6 +804,10 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn format_sql_basic(sql: &str) -> String {
+        Self::format_sql_basic_with_terminator_policy(sql, true)
+    }
+
+    fn format_sql_basic_with_terminator_policy(sql: &str, append_missing_terminator: bool) -> String {
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = super::query_text::split_format_items(sql);
         if items.is_empty() {
@@ -820,7 +828,10 @@ impl SqlEditorWidget {
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     let mut formatted_statement = formatted_statement;
-                    if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
+                    if append_missing_terminator
+                        && has_code
+                        && !Self::statement_ends_with_semicolon_tokens(&statement_tokens)
+                    {
                         Self::append_missing_statement_terminator(&mut formatted_statement);
                     }
                     formatted.push_str(&formatted_statement);
@@ -10281,6 +10292,40 @@ END;"#;
 FROM DUAL"
         );
         assert!(!preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn selected_auto_formatting_path_does_not_insert_terminator_before_inline_comment() {
+        let source = "select 1 from dual -- trailing note";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL -- trailing note",
+            "Selected formatting should not insert temporary statement terminator before inline comment, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_path_does_not_insert_terminator_before_newline_comment() {
+        let source = "select 1 from dual
+-- trailing note";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL
+-- trailing note",
+            "Selected formatting should preserve newline comment attachment without injected terminator, got:
+{}",
+            formatted
+        );
     }
 
     #[test]
