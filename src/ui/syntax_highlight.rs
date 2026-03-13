@@ -754,7 +754,7 @@ impl SqlHighlighter {
                     let mut look_ahead = idx;
                     while bytes
                         .get(look_ahead)
-                        .is_some_and(|&b| b == b' ' || b == b'\t')
+                        .is_some_and(|&b| b.is_ascii_whitespace())
                     {
                         look_ahead += 1;
                     }

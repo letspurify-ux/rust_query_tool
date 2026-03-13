@@ -924,6 +924,43 @@ fn test_interval_literal_highlighting() {
     );
 }
 
+
+#[test]
+fn test_date_literal_with_newline_gap_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT DATE
+'2024-01-01' FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let date_start = text.find("DATE").unwrap();
+    let date_end = text.find("'2024-01-01'").unwrap() + "'2024-01-01'".len();
+
+    assert!(
+        styles[date_start..date_end]
+            .chars()
+            .all(|c| c == STYLE_DATETIME_LITERAL),
+        "DATE literal with newline gap should be styled as datetime literal"
+    );
+}
+
+#[test]
+fn test_interval_literal_with_carriage_return_gap_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT INTERVAL
+'5' DAY FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let int_start = text.find("INTERVAL").unwrap();
+    let int_end = text.find("'5'").unwrap() + "'5'".len();
+
+    assert!(
+        styles[int_start..int_end]
+            .chars()
+            .all(|c| c == STYLE_DATETIME_LITERAL),
+        "INTERVAL literal with carriage return gap should be styled as datetime literal"
+    );
+}
+
 #[test]
 fn test_date_keyword_without_literal() {
     let highlighter = SqlHighlighter::new();
