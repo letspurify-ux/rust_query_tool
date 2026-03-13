@@ -1329,6 +1329,13 @@ impl SplitState {
     }
 
     fn track_create_plsql(&mut self, upper: &str) {
+        if self.block_depth() > 0
+            && !self.in_create_plsql()
+            && self.create_state == CreateState::None
+        {
+            return;
+        }
+
         if self.create_plsql_kind == CreatePlsqlKind::TypeSpecAwaitingBody && upper == "BODY" {
             self.create_plsql_kind = CreatePlsqlKind::TypeBody;
             return;
