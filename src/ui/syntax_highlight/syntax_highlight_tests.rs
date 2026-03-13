@@ -30,6 +30,44 @@ fn test_number_highlighting_stops_before_second_decimal_point() {
         .all(|c| c == STYLE_NUMBER));
 }
 
+
+#[test]
+fn test_number_highlighting_supports_exponent_notation() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 1e10, 3.14E-2, .5e+7 FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["1e10", "3.14E-2", ".5e+7"] {
+        let start = text.find(token).unwrap_or(0);
+        let end = start + token.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_NUMBER),
+            "{token} should be highlighted as a single numeric literal"
+        );
+    }
+}
+
+#[test]
+fn test_number_highlighting_does_not_consume_incomplete_exponent() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT 1e+, 2E- FROM dual";
+    let styles = highlighter.generate_styles(text);
+
+    let first = text.find("1e+").unwrap_or(0);
+    assert_eq!(styles.as_bytes().get(first).copied(), Some(STYLE_NUMBER as u8));
+    assert_ne!(
+        styles.as_bytes().get(first + 1).copied(),
+        Some(STYLE_NUMBER as u8)
+    );
+
+    let second = text.find("2E-").unwrap_or(0);
+    assert_eq!(styles.as_bytes().get(second).copied(), Some(STYLE_NUMBER as u8));
+    assert_ne!(
+        styles.as_bytes().get(second + 1).copied(),
+        Some(STYLE_NUMBER as u8)
+    );
+}
+
 #[test]
 fn test_keyword_highlighting() {
     let highlighter = SqlHighlighter::new();
