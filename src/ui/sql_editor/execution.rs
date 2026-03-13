@@ -516,16 +516,33 @@ impl SqlEditorWidget {
     }
 
     fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
-        let formatted = if selected_only {
+        // A selected SQL fragment should keep canonical statement terminators.
+        // Otherwise select-all / partial-selection formatting can drop semicolons
+        // that `split_format_items()` strips internally, which then breaks
+        // statement boundaries for Ctrl+Enter execution on the formatted text.
+        let preserve_missing_selection_terminator =
+            selected_only && !Self::selected_formatting_has_statement(source);
+
+        let formatted = if preserve_missing_selection_terminator {
             Self::format_sql_basic_with_terminator_policy(source, false)
         } else {
             Self::format_sql_basic(source)
         };
-        if selected_only {
+
+        if preserve_missing_selection_terminator {
             Self::preserve_selected_text_terminator(source, formatted)
         } else {
             formatted
         }
+    }
+
+    fn selected_formatting_has_statement(source: &str) -> bool {
+        // Comment-only / tool-command-only selections still use the
+        // "preserve original missing terminator" path. Any real SQL statement
+        // should format to the same canonical shape as whole-buffer formatting.
+        super::query_text::split_script_items(source)
+            .iter()
+            .any(|item| matches!(item, ScriptItem::Statement(_)))
     }
 
     fn normalize_index(text: &str, index: i32) -> usize {
@@ -9436,9 +9453,30 @@ impl SqlEditorWidget {
 #[cfg(test)]
 mod formatter_regression_tests {
     use super::{QueryProgress, ScriptItem, SqlEditorWidget, PROGRESS_ROWS_INITIAL_BATCH};
-    use crate::db::SessionState;
+    use crate::db::{QueryExecutor, SessionState};
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+
+    fn load_formatter_test_file(name: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test");
+        path.push(name);
+        fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn count_statement_items(items: &[ScriptItem]) -> usize {
+        items.iter()
+            .filter(|item| matches!(item, ScriptItem::Statement(_)))
+            .count()
+    }
+
+    fn count_tool_command_items(items: &[ScriptItem]) -> usize {
+        items.iter()
+            .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+            .count()
+    }
 
     #[test]
     fn does_not_force_select_line_break_after_malformed_statement() {
@@ -10222,8 +10260,8 @@ END;"#;
             mapped_slice
         );
         assert!(
-            !formatted.contains("DUAL;\n/"),
-            "Selected auto-format should not inject a semicolon before SQL*Plus slash terminator, got:\n{}",
+            formatted.contains("DUAL;\n/"),
+            "Selected auto-format should keep the canonical semicolon before SQL*Plus slash terminator, got:\n{}",
             formatted
         );
     }
@@ -10685,7 +10723,7 @@ FROM DUAL"
     }
 
     #[test]
-    fn selected_auto_formatting_path_does_not_insert_terminator_before_inline_comment() {
+    fn selected_auto_formatting_path_keeps_terminator_before_inline_comment() {
         let source = "select 1 from dual -- trailing note";
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
@@ -10693,15 +10731,15 @@ FROM DUAL"
         assert_eq!(
             formatted,
             "SELECT 1
-FROM DUAL -- trailing note",
-            "Selected formatting should not insert temporary statement terminator before inline comment, got:
+FROM DUAL; -- trailing note",
+            "Selected formatting should keep the canonical statement terminator before inline comment, got:
 {}",
             formatted
         );
     }
 
     #[test]
-    fn selected_auto_formatting_path_does_not_insert_terminator_before_newline_comment() {
+    fn selected_auto_formatting_path_keeps_terminator_before_newline_comment() {
         let source = "select 1 from dual
 -- trailing note";
 
@@ -10710,16 +10748,16 @@ FROM DUAL -- trailing note",
         assert_eq!(
             formatted,
             "SELECT 1
-FROM DUAL
+FROM DUAL;
 -- trailing note",
-            "Selected formatting should preserve newline comment attachment without injected terminator, got:
+            "Selected formatting should keep the canonical statement terminator before newline comment, got:
 {}",
             formatted
         );
     }
 
     #[test]
-    fn selected_auto_formatting_path_preserves_original_missing_semicolon() {
+    fn selected_auto_formatting_path_keeps_canonical_semicolon_for_single_statement() {
         let source = "SELECT 1 FROM dual";
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
@@ -10727,11 +10765,11 @@ FROM DUAL
         assert_eq!(
             formatted.trim_end(),
             "SELECT 1
-FROM DUAL"
+FROM DUAL;"
         );
         assert!(
-            !formatted.trim_end().ends_with(';'),
-            "Selected auto-formatting should preserve a missing terminator, got:
+            formatted.trim_end().ends_with(';'),
+            "Selected auto-formatting should keep the canonical terminator for a selected statement, got:
 {}",
             formatted
         );
@@ -10748,6 +10786,118 @@ FROM DUAL"
             "Full-buffer formatting should keep canonical statement semicolon, got:
 {}",
             formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_keeps_semicolons_for_multi_statement_selection() {
+        let source = "SELECT 1 FROM dual;\nSELECT 2 FROM dual;\nCOMMIT;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains("SELECT 1\nFROM DUAL;"),
+            "First statement semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("SELECT 2\nFROM DUAL;"),
+            "Second statement semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("COMMIT;"),
+            "Trailing COMMIT semicolon should remain in multi-statement selection, got:\n{}",
+            formatted
+        );
+
+        let items = QueryExecutor::split_script_items(&formatted);
+        assert_eq!(
+            count_statement_items(&items),
+            3,
+            "Selected formatting must keep all statement boundaries intact, got: {items:?}"
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_test15_keeps_statement_boundaries_for_ctrl_enter() {
+        let source = load_formatter_test_file("test15.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, true);
+
+        // Re-splitting the formatted text must preserve execution boundaries so
+        // statement-at-cursor keeps working after select-all formatting.
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Selected formatting changed test15.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Selected formatting changed test15.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("qt_splitter_boss IS")
+            .expect("expected COMMENT ON TABLE statement after selected formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected COMMENT ON TABLE bounds after selected formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("COMMENT")
+                && statement.contains("ON TABLE qt_splitter_boss IS"),
+            "Ctrl+Enter boundary should stay on COMMENT statement after selected formatting, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("CREATE OR REPLACE PROCEDURE qt_splitter_proc"),
+            "Selected formatting must not merge earlier routine into COMMENT statement, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_test16_keeps_statement_boundaries_for_ctrl_enter() {
+        let source = load_formatter_test_file("test16.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, true);
+
+        // Re-splitting the formatted text must preserve execution boundaries so
+        // statement-at-cursor keeps working after select-all formatting.
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Selected formatting changed test16.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Selected formatting changed test16.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("qt_splitter_ultimate IS")
+            .expect("expected COMMENT ON TABLE statement after selected formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected COMMENT ON TABLE bounds after selected formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("COMMENT")
+                && statement.contains("ON TABLE qt_splitter_ultimate IS"),
+            "Ctrl+Enter boundary should stay on COMMENT statement after selected formatting, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg"),
+            "Selected formatting must not merge earlier package body into COMMENT statement, got:\n{}",
+            statement
         );
     }
 
@@ -11318,7 +11468,7 @@ NULL";
     }
 
     #[test]
-    fn selected_auto_formatting_ignores_prompt_semicolon_as_statement_terminator() {
+    fn selected_auto_formatting_keeps_canonical_terminator_before_trailing_prompt() {
         let source = "select 1 from dual
 PROMPT done;";
 
@@ -11326,17 +11476,19 @@ PROMPT done;";
 
         assert!(
             formatted.contains("FROM DUAL
+PROMPT done;")
+                || formatted.contains("FROM DUAL;
 PROMPT done;"),
-            "Selected auto-format should not keep inserted semicolon when only PROMPT line has semicolon, got:
+            "Selected auto-format should preserve the trailing PROMPT line, got:
 {}",
             formatted
         );
         assert!(
-            !formatted.contains(
+            formatted.contains(
                 "FROM DUAL;
 PROMPT done;"
             ),
-            "PROMPT semicolon must not be treated as SQL statement terminator, got:
+            "Selected auto-format should keep the canonical SQL terminator before PROMPT, got:
 {}",
             formatted
         );

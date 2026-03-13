@@ -283,6 +283,65 @@ fn test_split_script_items_test16_final_ultimate_boss_regression() {
 }
 
 #[test]
+fn test_split_script_items_test17_execution_unit_final_boss_regression() {
+    let sql = load_query_test_file("test17.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 0,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 23,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_split_pkg")
+                && stmt.contains("q'{ | q2=/* not comment */ }'")
+                && stmt.contains("END qt_split_pkg")
+        }),
+        "package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_split_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_split_proc")
+        }),
+        "standalone procedure should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("v_q1 := q'[")
+                && stmt.contains("END lvl1;")
+                && stmt.contains("END;")
+        }),
+        "lexical trap anonymous block should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT log_id,")
+                && stmt.contains("SUBSTR(payload, 1, 120) AS payload_preview")
+                && stmt.contains("ORDER BY log_id")
+        }),
+        "final log detail query should stay intact: {statements:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_standalone_procedure_nested_block_followed_by_dml() {
     let sql = r#"CREATE OR REPLACE PROCEDURE nested_proc IS
 BEGIN
@@ -348,6 +407,105 @@ fn test_split_format_items_test15_nested_q_quote_package_body_regression() {
         statements
             .iter()
             .all(|stmt| stmt.trim() != "END qt_splitter_proc"),
+        "orphan END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_test16_final_ultimate_boss_regression() {
+    let sql = load_query_test_file("test16.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 20, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_splitter_ultimate_proc")
+                && stmt.contains("AND t.\"COMMENT\" LIKE q'[%;%]'")
+                && stmt.contains("v_rendered := q'[fallback ; / ]'")
+                && stmt.contains("UPDATE qt_splitter_ultimate")
+                && stmt.contains("END qt_splitter_ultimate_proc")
+        }),
+        "standalone procedure should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg")
+                && stmt.contains("q'[dyn ; / -- '' ]'")
+                && stmt.contains("q'[payload from merge_like ; / ]'")
+                && stmt.contains("touch_row(p_id, 'AMOUNT>=1000;DONE-CANDIDATE');")
+                && stmt.contains("END qt_splitter_ultimate_pkg")
+        }),
+        "package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_splitter_ultimate_proc"),
+        "orphan END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_test17_execution_unit_final_boss_regression() {
+    let sql = load_query_test_file("test17.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 10, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_split_pkg")
+                && stmt.contains("q'{ | q2=/* not comment */ }'")
+                && stmt.contains("END qt_split_pkg")
+        }),
+        "package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_split_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_split_proc")
+        }),
+        "standalone procedure should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("v_q1 := q'[")
+                && stmt.contains("END lvl1;")
+                && stmt.contains("END;")
+        }),
+        "lexical trap anonymous block should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_split_proc"),
         "orphan END label should not remain standalone in format splitter: {statements:?}"
     );
 }

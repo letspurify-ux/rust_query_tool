@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::{QueryExecutor, ScriptItem};
 use crate::ui::syntax_highlight::{
     STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_KEYWORD,
     STYLE_QUOTED_IDENTIFIER, STYLE_Q_QUOTE_STRING, STYLE_STRING,
@@ -20,6 +21,12 @@ fn load_test_file(name: &str) -> String {
 
 fn count_slash_lines(text: &str) -> usize {
     text.lines().filter(|line| line.trim() == "/").count()
+}
+
+fn count_script_statements(items: &[ScriptItem]) -> usize {
+    items.iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count()
 }
 
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
@@ -568,6 +575,120 @@ fn format_sql_preserves_test15_nested_q_quote_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test15.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_test16_final_ultimate_boss_script() {
+    let input = load_test_file("test16.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "SET DEFINE ON",
+        "SET SERVEROUTPUT ON",
+        "PROMPT === QT SPLITTER FINAL ULTIMATE BOSS START ===",
+        "CREATE OR REPLACE PROCEDURE qt_splitter_ultimate_proc",
+        "AND t.\"COMMENT\" LIKE q'[%;%]'",
+        "v_rendered := q'[fallback ; / ]'",
+        "q'[payload from merge_like ; / ]'",
+        "q'[dyn ; / -- '' ]'",
+        "END qt_splitter_ultimate_proc;",
+        "END qt_splitter_ultimate_pkg;",
+        "PROMPT === QT SPLITTER FINAL ULTIMATE BOSS END ===",
+    ];
+
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for test16.sql"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test16.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_test17_execution_unit_final_boss_script() {
+    let input = load_test_file("test17.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "CREATE OR REPLACE PACKAGE BODY qt_split_pkg",
+        "q'{ | q2=/* not comment */ }'",
+        "END qt_split_proc;",
+        "END qt_split_trg;",
+        "v_q1 := q'[",
+        "SELECT unit_name,",
+    ];
+
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for test17.sql"
+    );
+
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test17.sql"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_split_pkg")
+                && stmt.contains("q'{ | q2=/* not comment */ }'")
+                && stmt.contains("END qt_split_pkg")
+        }),
+        "Formatting should preserve package body execution unit for test17.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_split_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_split_proc")
+        }),
+        "Formatting should preserve standalone procedure execution unit for test17.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("v_q1 := q'[")
+                && stmt.contains("END lvl1;")
+                && stmt.contains("END;")
+        }),
+        "Formatting should preserve lexical trap anonymous block for test17.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT log_id,")
+                && stmt.contains("payload_preview")
+                && stmt.contains("ORDER BY log_id")
+        }),
+        "Formatting should preserve final log detail query for test17.sql: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test17.sql"
     );
 }
 
