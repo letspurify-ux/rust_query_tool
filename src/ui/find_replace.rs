@@ -503,12 +503,25 @@ impl FindReplaceDialog {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                 match_end.min(text.len()) as i32;
                         } else if start_pos > 0 {
-                            *search_pos
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
-                            fltk::dialog::message_default(
-                                "Reached end, searching from beginning...",
-                            );
+                            if let Some((match_start, match_end)) =
+                                find_next_match(&text, &search_text, 0, case_sensitive)
+                            {
+                                buffer.select(match_start as i32, match_end as i32);
+                                editor.set_insert_position(match_end as i32);
+                                editor.show_insert_position();
+                                *search_pos
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    match_end.min(text.len()) as i32;
+                                fltk::dialog::message_default(
+                                    "Reached end, searching from beginning...",
+                                );
+                            } else {
+                                *search_pos
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+                                fltk::dialog::message_default("Text not found");
+                            }
                         } else {
                             fltk::dialog::message_default("Text not found");
                         }
