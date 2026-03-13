@@ -130,11 +130,7 @@ impl SplitState {
         }
 
         self.active_routine_frame().is_some_and(|frame| {
-            matches!(
-                frame.external_clause_state,
-                ExternalClauseState::SawImplicitLanguageTarget
-                    | ExternalClauseState::AwaitingLanguageTargetImplicit
-            )
+            frame.pending_external_clause_requires_top_level_split()
         })
     }
 
@@ -154,11 +150,7 @@ impl SplitState {
         }
 
         self.active_routine_frame().is_some_and(|frame| {
-            matches!(
-                frame.external_clause_state,
-                ExternalClauseState::SawImplicitLanguageTarget
-                    | ExternalClauseState::AwaitingLanguageTargetImplicit
-            )
+            frame.pending_external_clause_requires_top_level_split()
         })
     }
 

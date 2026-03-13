@@ -6808,6 +6808,38 @@ fn malformed_external_clause_without_semicolon_splits_before_following_statement
 }
 
 #[test]
+fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_before_following_statement_head(
+) {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_semicolon RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"C\"");
+    engine.process_line("SELECT 59 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE \"C\""));
+    assert_eq!(statements[1], "SELECT 59 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_before_following_begin_block(
+) {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_begin RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"C\"");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE \"C\""));
+    assert_eq!(statements[1], "BEGIN\n  NULL;\nEND".to_string());
+}
+
+#[test]
 fn malformed_external_language_without_target_or_semicolon_splits_before_following_statement_head()
 {
     let mut engine = SqlParserEngine::new();
