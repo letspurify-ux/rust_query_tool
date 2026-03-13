@@ -480,6 +480,27 @@ FROM d
     }
 
     #[test]
+    fn qualifier_before_word_rejects_unbalanced_quoted_identifier() {
+        let sql_with_cursor = r#"SELECT "e.| FROM emp e"#;
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
+        assert_eq!(qualifier, None);
+    }
+
+    #[test]
+    fn identifier_at_position_rejects_unbalanced_quoted_identifier() {
+        let sql = r#"SELECT "사용자 FROM dual"#;
+        let cursor = sql.find("사용자").unwrap_or(0) + "사용자".len();
+
+        let resolved = SqlEditorWidget::identifier_at_position_in_text(sql, cursor);
+        assert!(
+            resolved.is_none(),
+            "unbalanced quoted identifier should not be resolved"
+        );
+    }
+
+    #[test]
     fn parse_dropped_file_token_decodes_utf8_percent_sequences() {
         let token = "file:///tmp/%ED%95%9C%EA%B8%80.sql";
         let parsed = SqlEditorWidget::parse_dropped_file_token(token);
