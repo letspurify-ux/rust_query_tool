@@ -579,8 +579,41 @@ impl SqlEditorWidget {
         } else {
             Self::format_sql_basic(source_prefix)
         };
-        let formatted_pos = formatted_prefix.len().min(formatted.len());
-        Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
+        let mut formatted_pos = formatted_prefix.len().min(formatted.len());
+        formatted_pos = Self::clamp_to_char_boundary(formatted, formatted_pos);
+        formatted_pos = Self::advance_over_inserted_layout_whitespace(
+            source,
+            source_pos,
+            formatted,
+            formatted_pos,
+        );
+        formatted_pos as i32
+    }
+
+    fn advance_over_inserted_layout_whitespace(
+        source: &str,
+        source_pos: usize,
+        formatted: &str,
+        formatted_pos: usize,
+    ) -> usize {
+        let source_byte = match source.as_bytes().get(source_pos) {
+            Some(byte) => *byte,
+            None => return formatted_pos,
+        };
+
+        if source_byte.is_ascii_whitespace() {
+            return formatted_pos;
+        }
+
+        let mut cursor = formatted_pos;
+        while let Some(byte) = formatted.as_bytes().get(cursor) {
+            if !byte.is_ascii_whitespace() {
+                break;
+            }
+            cursor += 1;
+        }
+
+        Self::clamp_to_char_boundary(formatted, cursor)
     }
 
     fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
@@ -10017,6 +10050,32 @@ END;"#;
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
             "Mapped cursor should stay near token with byte-offset mapping, got: {}",
             mapped_slice
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selected_auto_format_keeps_slash_terminator_anchor() {
+        let source = "SELECT 1 FROM dual\n/";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find('/').expect("slash anchor should exist") as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source,
+            &formatted,
+            source_pos,
+            true,
+        );
+        let mapped_slice = &formatted[mapped as usize..];
+
+        assert!(
+            mapped_slice.trim_start().starts_with('/'),
+            "Selected auto-format cursor mapping should keep slash terminator anchor, got: {}",
+            mapped_slice
+        );
+        assert!(
+            !formatted.contains("DUAL;\n/"),
+            "Selected auto-format should not inject a semicolon before SQL*Plus slash terminator, got:\n{}",
+            formatted
         );
     }
 
