@@ -670,14 +670,33 @@ impl SqlEditorWidget {
         }
 
         let trimmed = &formatted_statement[..trim_len];
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
         let mut insert_at = trim_len;
         let mut has_trailing_comment = false;
+
+        let mut trailing_comment_start = trim_len;
+        loop {
+            let prefix = &trimmed[..trailing_comment_start];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trailing_comment_start];
+            let line_trimmed = line.trim_start();
+            if Self::is_sqlplus_remark_comment_statement(line_trimmed) {
+                has_trailing_comment = true;
+                insert_at = line_start;
+                trailing_comment_start = prefix[..line_start].trim_end().len();
+                if trailing_comment_start == 0 {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
         for span in spans.iter().rev() {
             match &span.token {
                 SqlToken::Comment(_) => {
                     has_trailing_comment = true;
-                    insert_at = span.start;
+                    insert_at = insert_at.min(span.start);
                 }
                 SqlToken::Symbol(sym) if sym == "/" => continue,
                 _ => break,
@@ -10744,6 +10763,76 @@ REMARK trailing script comment";
             "Trailing REMARK line should be preserved, got:
 {}",
             preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_semicolon_before_trailing_rem_line() {
+        let source = "SELECT 1 FROM dual
+REM trailing script comment";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\nREM trailing script comment"),
+            "Formatter should place statement terminator before trailing REM line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("REM trailing script comment;"),
+            "Formatter should not append semicolon to REM comment text, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_semicolon_before_trailing_remark_line() {
+        let source = "SELECT 1 FROM dual
+REMARK trailing script comment";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\nREMARK trailing script comment"),
+            "Formatter should place statement terminator before trailing REMARK line, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("REMARK trailing script comment;"),
+            "Formatter should not append semicolon to REMARK comment text, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_rem_line() {
+        let mut formatted = "SELECT 1
+FROM DUAL
+    REM trailing script comment".to_string();
+
+        SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL;
+    REM trailing script comment"
+        );
+    }
+
+    #[test]
+    fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_remark_line() {
+        let mut formatted = "SELECT 1
+FROM DUAL
+	REMARK trailing script comment".to_string();
+
+        SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
+
+        assert_eq!(
+            formatted,
+            "SELECT 1
+FROM DUAL;
+	REMARK trailing script comment"
         );
     }
 
