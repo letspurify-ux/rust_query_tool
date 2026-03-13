@@ -771,6 +771,22 @@ fn package_body_end_with_fully_quoted_qualified_label_splits_following_statement
 }
 
 #[test]
+fn package_body_end_with_mixed_quoted_label_segments_splits_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_mixed_label AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"owner\".pkg_mixed_label;");
+    engine.process_line("SELECT 212 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END \"owner\".pkg_mixed_label"));
+    assert_eq!(statements[1], "SELECT 212 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_end_label_followed_by_same_line_select_splits_correctly() {
     let mut engine = SqlParserEngine::new();
 
