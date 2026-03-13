@@ -264,6 +264,34 @@ SELECT * FROM cte
         );
     }
 
+
+    #[test]
+    fn normalize_intellisense_context_text_strips_unindented_sqlplus_numbered_prefixes() {
+        let input = "SQL> SELECT e.
+2  FROM emp e
+";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, "SELECT e.
+FROM emp e
+");
+    }
+
+    #[test]
+    fn normalize_intellisense_context_with_cursor_maps_unindented_numbered_prefixes() {
+        let raw = "SQL> SELECT e.
+2  FROM emp e
+";
+        let raw_cursor = raw.find("e.").unwrap_or(0) + 2;
+        let (normalized, normalized_cursor) =
+            SqlEditorWidget::normalize_intellisense_context_with_cursor(raw, raw_cursor);
+
+        assert_eq!(normalized, "SELECT e.
+FROM emp e
+");
+        assert_eq!(normalized.get(..normalized_cursor).unwrap_or(""), "SELECT e.");
+    }
+
     #[test]
     fn normalize_intellisense_context_text_keeps_numeric_literal_line_prefixes() {
         let input = "SELECT\n1 + 2 AS total\nFROM dual";
