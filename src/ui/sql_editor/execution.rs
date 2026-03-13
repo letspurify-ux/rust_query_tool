@@ -1063,10 +1063,13 @@ impl SqlEditorWidget {
         }
 
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans.iter().rev().any(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
-        })
+        spans
+            .iter()
+            .rev()
+            .find(|span| matches!(&span.token, SqlToken::Symbol(sym) if sym == ";"))
+            .is_some_and(|span| {
+                Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
+            })
     }
 
     fn trailing_segment_allows_semicolon_terminator(suffix: &str) -> bool {
@@ -1120,10 +1123,13 @@ impl SqlEditorWidget {
         }
 
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans.iter().rev().any(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
-        })
+        spans
+            .iter()
+            .rev()
+            .find(|span| matches!(&span.token, SqlToken::Symbol(sym) if sym == ";"))
+            .is_some_and(|span| {
+                Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
+            })
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
@@ -11561,6 +11567,14 @@ END;
         ));
         assert!(SqlEditorWidget::statement_ends_with_semicolon(
             "SELECT 1 FROM dual; REMARK trailing comment"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_rejects_semicolon_before_remark_with_following_statement() {
+        assert!(!SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REM note
+SELECT 2 FROM dual"
         ));
     }
 
