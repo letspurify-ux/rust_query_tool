@@ -705,7 +705,14 @@ pub(crate) enum LineLeadingMarker {
 
 impl LineLeadingMarker {
     pub(crate) fn from_line(line: &str) -> Self {
-        let trimmed = line.trim_start();
+        let mut trimmed = line.trim_start();
+
+        while let Some(block_body) = trimmed.strip_prefix("/*") {
+            let Some(block_end) = block_body.find("*/") else {
+                return Self::None;
+            };
+            trimmed = block_body[block_end + 2..].trim_start();
+        }
 
         match trimmed.chars().next() {
             Some('@') => Self::RunScriptAt,

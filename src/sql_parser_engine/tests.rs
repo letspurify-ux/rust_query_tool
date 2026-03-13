@@ -183,6 +183,43 @@ fn slash_line_with_leading_block_comment_and_sql_is_not_consumed_as_terminator()
     );
 }
 
+
+#[test]
+fn line_leading_marker_detects_host_and_run_after_leading_block_comment() {
+    assert_eq!(
+        super::classify_line_leading_marker("/*hint*/ @child.sql"),
+        LineLeadingMarker::RunScriptAt
+    );
+    assert_eq!(
+        super::classify_line_leading_marker("/*hint*/ !echo hi"),
+        LineLeadingMarker::BangHost
+    );
+}
+
+#[test]
+fn with_function_recovery_splits_before_script_commands_after_leading_block_comment() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH FUNCTION f RETURN NUMBER IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END;");
+    engine.process_line("/* keep parser state */ @next_script.sql");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("WITH FUNCTION f"),
+        "first statement should keep WITH FUNCTION declaration: {}",
+        statements[0]
+    );
+    assert_eq!(
+        statements[1],
+        "/* keep parser state */ @next_script.sql".to_string(),
+        "line with leading block comment and script command should stay isolated"
+    );
+}
+
 #[test]
 fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
     let waiting_main_query = SplitState {
