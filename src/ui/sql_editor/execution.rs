@@ -870,6 +870,7 @@ impl SqlEditorWidget {
                     if append_missing_terminator
                         && has_code
                         && !Self::statement_ends_with_semicolon_tokens(&statement_tokens)
+                        && Self::should_append_missing_statement_terminator(&statement_tokens)
                     {
                         Self::append_missing_statement_terminator(&mut formatted_statement);
                     }
@@ -1056,6 +1057,31 @@ impl SqlEditorWidget {
             }
         }
         false
+    }
+
+    fn should_append_missing_statement_terminator(tokens: &[SqlToken]) -> bool {
+        let mut trailing_token = None;
+
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                other => {
+                    trailing_token = Some(other);
+                    break;
+                }
+            }
+        }
+
+        trailing_token.is_some_and(Self::token_can_terminate_statement)
+    }
+
+    fn token_can_terminate_statement(token: &SqlToken) -> bool {
+        match token {
+            SqlToken::Word(_) | SqlToken::String(_) => true,
+            SqlToken::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]"),
+            SqlToken::Comment(_) => false,
+        }
     }
 
     fn classify_comment_attachment(
@@ -10834,6 +10860,33 @@ FROM DUAL
 FROM DUAL;
 	REMARK trailing script comment"
         );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_operator() {
+        let source = "SELECT 1 +";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT 1 +");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_comma() {
+        let source = "SELECT a,";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT a,");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_incomplete_trailing_dot() {
+        let source = "SELECT t.";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT t.");
     }
 
     #[test]
