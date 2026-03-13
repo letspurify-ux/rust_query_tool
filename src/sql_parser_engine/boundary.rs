@@ -294,6 +294,14 @@ impl RoutineFrame {
                 return;
             }
 
+            if !from_external
+                && token_upper.bytes().all(sql_text::is_identifier_byte)
+                && !sql_text::is_external_language_clause_keyword(token_upper)
+            {
+                self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+                return;
+            }
+
             if sql_text::is_external_language_clause_keyword(token_upper) {
                 if from_external {
                     // Be permissive for malformed call specs such as

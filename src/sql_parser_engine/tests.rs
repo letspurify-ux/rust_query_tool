@@ -354,6 +354,39 @@ fn create_function_external_call_spec_without_as_is_splits_from_following_statem
 }
 
 
+
+#[test]
+fn create_function_external_language_wasm_without_semicolon_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_wasm_nosemi RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  NAME \"ext_wasm_nosemi\"");
+    engine.process_line("  LANGUAGE WASM");
+    engine.process_line("SELECT 110 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("LANGUAGE WASM"));
+    assert_eq!(statements[1], "SELECT 110 FROM dual".to_string());
+}
+
+#[test]
+fn create_function_external_language_r_without_semicolon_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_r_nosemi RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  NAME \"ext_r_nosemi\"");
+    engine.process_line("  LANGUAGE R");
+    engine.process_line("SELECT 111 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("LANGUAGE R"));
+    assert_eq!(statements[1], "SELECT 111 FROM dual".to_string());
+}
+
 #[test]
 fn create_function_external_language_wasm_splits_from_following_statement() {
     let mut engine = SqlParserEngine::new();
