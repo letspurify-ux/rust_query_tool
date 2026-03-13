@@ -69,8 +69,8 @@ impl SqlEditorWidget {
                 idx += cur.len_utf8();
             }
 
-            if idx >= text.len() && rel_pos >= start && rel_pos <= text.len() {
-                return Some((start, text.len()));
+            if idx >= text.len() {
+                return None;
             }
         }
 
@@ -93,6 +93,10 @@ impl SqlEditorWidget {
             if !word.is_empty() {
                 return Some((word, start, end));
             }
+        }
+
+        if Self::has_unbalanced_identifier_quotes(text.get(..rel_pos).unwrap_or(text)) {
+            return None;
         }
 
         let anchor = if rel_pos < text.len() {
@@ -778,6 +782,9 @@ impl SqlEditorWidget {
         }
 
         let qualifier_candidate = text.get(..idx)?;
+        if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
+            return None;
+        }
         let mut start_byte = qualifier_candidate.len();
         for (pos, ch) in qualifier_candidate.char_indices().rev() {
             if sql_text::is_identifier_char(ch) {
@@ -800,6 +807,27 @@ impl SqlEditorWidget {
         } else {
             Some(qualifier)
         }
+    }
+
+    fn has_unbalanced_identifier_quotes(text: &str) -> bool {
+        let mut chars = text.chars().peekable();
+        let mut in_quotes = false;
+        while let Some(ch) = chars.next() {
+            if ch != '"' {
+                continue;
+            }
+
+            if in_quotes {
+                if chars.peek().copied() == Some('"') {
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                in_quotes = true;
+            }
+        }
+        in_quotes
     }
 
     fn try_fast_path_intellisense_filter(
