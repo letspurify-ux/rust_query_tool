@@ -20,12 +20,7 @@ impl HighlightShadowState {
 
     fn rebuild_newline_positions(&mut self) {
         self.newline_positions.clear();
-        self.newline_positions.extend(
-            self.text
-                .bytes()
-                .enumerate()
-                .filter_map(|(idx, byte)| (byte == b'\n').then_some(idx)),
-        );
+        extend_line_break_positions(&mut self.newline_positions, &self.text, 0);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -142,10 +137,7 @@ impl HighlightShadowState {
             *pos = Self::shift_offset(*pos, delta);
         }
         self.newline_positions.extend(
-            inserted_text
-                .bytes()
-                .enumerate()
-                .filter_map(|(idx, byte)| (byte == b'\n').then_some(start.saturating_add(idx))),
+            line_break_positions_with_offset(inserted_text, start),
         );
         self.newline_positions.extend(trailing_newlines);
 
@@ -157,6 +149,33 @@ impl HighlightShadowState {
             .splice(start..end, std::iter::repeat_n(STYLE_DEFAULT as u8, inserted_text.len()));
         true
     }
+}
+
+fn line_break_positions_with_offset(text: &str, offset: usize) -> impl Iterator<Item = usize> + '_ {
+    let bytes = text.as_bytes();
+    let mut idx = 0usize;
+    std::iter::from_fn(move || {
+        while idx < bytes.len() {
+            let current = idx;
+            idx += 1;
+            match bytes.get(current).copied() {
+                Some(b'\n') => return Some(offset.saturating_add(current)),
+                Some(b'\r') => {
+                    if bytes.get(idx) == Some(&b'\n') {
+                        idx += 1;
+                        return Some(offset.saturating_add(current.saturating_add(1)));
+                    }
+                    return Some(offset.saturating_add(current));
+                }
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
+fn extend_line_break_positions(target: &mut Vec<usize>, text: &str, offset: usize) {
+    target.extend(line_break_positions_with_offset(text, offset));
 }
 
 impl SqlEditorWidget {
