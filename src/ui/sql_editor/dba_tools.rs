@@ -10,6 +10,7 @@ use fltk::{
     prelude::*,
     window::Window,
 };
+use oracle::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
@@ -17,7 +18,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::db::{
-    format_connection_busy_message, try_lock_connection_with_activity, QueryExecutor, QueryResult,
+    format_connection_busy_message, lock_connection_with_activity, try_lock_connection_with_activity,
+    QueryExecutor, QueryResult,
 };
 use crate::ui::constants::*;
 use crate::ui::theme;
@@ -139,6 +141,77 @@ static RMAN_JOB_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static RMAN_JOB_NAME_PROCESS_TOKEN: OnceLock<u128> = OnceLock::new();
 
 impl SqlEditorWidget {
+    fn spawn_dba_query_thread<F>(&self, worker: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if !super::try_mark_query_running(&self.query_running) {
+            SqlEditorWidget::show_alert_dialog("A query is already running.");
+            return;
+        }
+
+        let query_running = self.query_running.clone();
+        let current_query_connection = self.current_query_connection.clone();
+        let cancel_flag = self.cancel_flag.clone();
+        let shared_connection = self.connection.clone();
+
+        self.spawn_dba_query_tracking_thread(
+            query_running,
+            current_query_connection,
+            cancel_flag,
+            shared_connection,
+            worker,
+        );
+    }
+
+    fn spawn_dba_query_tracking_thread<F>(
+        &self,
+        query_running: Arc<Mutex<bool>>,
+        current_query_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+        cancel_flag: Arc<Mutex<bool>>,
+        shared_connection: crate::db::SharedConnection,
+        worker: F,
+    ) where
+        F: FnOnce() + Send + 'static,
+    {
+        store_mutex_bool(&cancel_flag, false);
+
+        thread::spawn(move || {
+            SqlEditorWidget::publish_current_query_connection_for_dba(
+                &shared_connection,
+                &current_query_connection,
+                &cancel_flag,
+            );
+
+            worker();
+
+            SqlEditorWidget::set_current_query_connection(&current_query_connection, None);
+            SqlEditorWidget::finalize_execution_state(&query_running, &cancel_flag);
+        });
+    }
+
+    fn publish_current_query_connection_for_dba(
+        shared_connection: &crate::db::SharedConnection,
+        current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+    ) {
+        let mut guard =
+            lock_connection_with_activity(shared_connection, "Preparing DBA query execution");
+
+        let Ok(db_conn) = guard.require_live_connection() else {
+            return;
+        };
+
+        SqlEditorWidget::set_current_query_connection(
+            current_query_connection,
+            Some(Arc::clone(&db_conn)),
+        );
+
+        if load_mutex_bool(cancel_flag) {
+            let _ = db_conn.break_execution();
+        }
+    }
+
     pub fn show_cursor_plan_analyzer(&self) {
         enum CursorPlanMessage {
             LoadRequested {
@@ -374,7 +447,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading cursor execution plan",
@@ -409,7 +482,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading recent SQL candidates",
@@ -457,7 +530,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading SQL text for {}", sql_id),
@@ -901,7 +974,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading SQL monitor dashboard",
@@ -990,7 +1063,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Killing session {}", target_label),
@@ -1406,7 +1479,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading {} usage snapshot", storage_mode_label(mode)),
@@ -2087,7 +2160,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading scheduler jobs",
@@ -2153,7 +2226,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Creating scheduler job {}", qualified),
@@ -2239,7 +2312,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Altering scheduler job {}", qualified),
@@ -2299,7 +2372,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading scheduler job history",
@@ -2364,7 +2437,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Running scheduler job {}", qualified),
@@ -2424,7 +2497,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Stopping scheduler job {}", qualified),
@@ -2485,7 +2558,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Enabling scheduler job {}", qualified),
@@ -2548,7 +2621,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Disabling scheduler job {}", qualified),
@@ -2596,7 +2669,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Loading Data Pump jobs",
@@ -2666,7 +2739,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Starting Data Pump export {}", job_name),
@@ -2747,7 +2820,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Starting Data Pump import {}", job_name),
@@ -2815,7 +2888,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Stopping Data Pump job {}", qualified),
@@ -4005,7 +4078,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading security view: {}", mode.label()),
@@ -4104,7 +4177,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Granting role {} to {}", role, user),
@@ -4163,7 +4236,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Revoking role {} from {}", role, user),
@@ -4222,7 +4295,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Granting system privilege {} to {}", privilege, user),
@@ -4284,7 +4357,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Revoking system privilege {} from {}", privilege, user),
@@ -4347,7 +4420,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Setting profile {} for {}", profile, user),
@@ -4439,7 +4512,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Creating user {}", user),
@@ -4495,7 +4568,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Dropping user {}", user),
@@ -4548,7 +4621,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Creating role {}", role),
@@ -4595,7 +4668,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Dropping role {}", role),
@@ -4642,7 +4715,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result =
                                 match try_lock_connection_with_activity(
                                     &connection,
@@ -4691,7 +4764,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Locking user account {}", user),
@@ -4738,7 +4811,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Unlocking user account {}", user),
@@ -5184,7 +5257,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading {}", mode.label()),
@@ -5290,7 +5363,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Submitting RMAN backup job {}", qualified),
@@ -5375,7 +5448,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Submitting RMAN restore job {}", qualified),
@@ -5872,7 +5945,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading {}", mode.label()),
@@ -6353,7 +6426,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Loading Data Guard {}", mode.label()),
@@ -6469,7 +6542,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Starting Data Guard apply",
@@ -6545,7 +6618,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Stopping Data Guard apply",
@@ -6637,7 +6710,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 format!("Executing Data Guard switchover to {}", target),
@@ -6735,7 +6808,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result =
                                 match try_lock_connection_with_activity(
                                     &connection,
@@ -6813,7 +6886,7 @@ impl SqlEditorWidget {
 
                         let sender_result = sender.clone();
                         let connection = self.connection.clone();
-                        thread::spawn(move || {
+                        self.spawn_dba_query_thread(move || {
                             let result = match try_lock_connection_with_activity(
                                 &connection,
                                 "Forcing archive log switch",
