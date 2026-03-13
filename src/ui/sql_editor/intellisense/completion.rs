@@ -1067,7 +1067,9 @@ impl SqlEditorWidget {
     }
 
     fn table_lookup_key_candidates(table_name: &str) -> Vec<String> {
-        let segments = Self::relation_name_segments(table_name);
+        let Some(segments) = Self::relation_name_segments(table_name) else {
+            return Vec::new();
+        };
         let normalized = segments.join(".");
         if normalized.is_empty() {
             return Vec::new();
@@ -1085,7 +1087,7 @@ impl SqlEditorWidget {
         candidates
     }
 
-    fn relation_name_segments(value: &str) -> Vec<String> {
+    fn relation_name_segments(value: &str) -> Option<Vec<String>> {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut chars = value.trim().chars().peekable();
@@ -1110,6 +1112,8 @@ impl SqlEditorWidget {
                     let segment = Self::strip_identifier_quotes(current.trim());
                     if !segment.is_empty() {
                         parts.push(segment);
+                    } else {
+                        return None;
                     }
                     current.clear();
                 }
@@ -1117,12 +1121,18 @@ impl SqlEditorWidget {
             }
         }
 
+        if in_quotes {
+            return None;
+        }
+
         let segment = Self::strip_identifier_quotes(current.trim());
         if !segment.is_empty() {
             parts.push(segment);
+        } else {
+            return None;
         }
 
-        parts
+        Some(parts)
     }
 
     fn has_unquoted_dot(value: &str) -> bool {
