@@ -673,6 +673,9 @@ impl SqlEditorWidget {
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == "/" => continue,
                 SqlToken::Symbol(sym) if sym == ";" => {
+                    if Self::semicolon_belongs_to_non_sql_line(trimmed, span.start) {
+                        continue;
+                    }
                     semicolon_span = Some((span.start, span.end));
                     break;
                 }
@@ -950,6 +953,15 @@ impl SqlEditorWidget {
                 Self::is_alter_trigger_statement(right)
             }
             _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
+            (FormatItem::Statement(left), next_item)
+                if Self::is_prompt_format_item(next_item)
+                    && {
+                        let tokens = Self::tokenize_sql(left);
+                        Self::statement_has_code(left, &tokens)
+                    } =>
+            {
+                true
+            }
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
@@ -1037,39 +1049,32 @@ impl SqlEditorWidget {
     }
 
     fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
-        let mut saw_statement_item = false;
-        for item in super::query_text::split_format_items(statement)
-            .iter()
-            .rev()
-        {
-            if let FormatItem::Statement(sql_statement) = item {
-                saw_statement_item = true;
-                let tokens = Self::tokenize_sql(sql_statement);
-                if !Self::statement_has_code(sql_statement, &tokens) {
-                    continue;
-                }
-
-                return Self::statement_ends_with_semicolon_tokens(&tokens);
-            }
-        }
-
-        if saw_statement_item {
-            return false;
-        }
-
         let trimmed = statement.trim_end();
         if trimmed.is_empty() {
             return false;
         }
 
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans
-            .iter()
-            .rev()
-            .find(|span| matches!(&span.token, SqlToken::Symbol(sym) if sym == ";"))
-            .is_some_and(|span| {
-                Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
-            })
+        spans.iter().rev().any(|span| {
+            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && !Self::semicolon_belongs_to_non_sql_line(trimmed, span.start)
+                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
+        })
+    }
+
+    fn semicolon_belongs_to_non_sql_line(statement: &str, semicolon_start: usize) -> bool {
+        let line_start = statement[..semicolon_start].rfind('\n').map_or(0, |idx| idx + 1);
+        let line_end = statement[semicolon_start..]
+            .find('\n')
+            .map_or(statement.len(), |idx| semicolon_start + idx);
+        let line = statement[line_start..line_end].trim();
+
+        if line.starts_with("--") || Self::is_sqlplus_remark_comment_statement(line) {
+            return true;
+        }
+
+        QueryExecutor::parse_tool_command(line)
+            .is_some_and(|command| !matches!(command, ToolCommand::Unsupported { .. }))
     }
 
     fn trailing_segment_allows_semicolon_terminator(suffix: &str) -> bool {
