@@ -1131,9 +1131,14 @@ impl SqlEditorWidget {
     }
 
     fn should_append_missing_statement_terminator(tokens: &[SqlToken]) -> bool {
+        let trailing_tokens = Self::tokens_after_last_semicolon(tokens);
+        if !Self::delimiter_pairs_are_balanced(trailing_tokens) {
+            return false;
+        }
+
         let mut trailing_token = None;
 
-        for token in tokens.iter().rev() {
+        for token in trailing_tokens.iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == "/" => continue,
@@ -1145,6 +1150,53 @@ impl SqlEditorWidget {
         }
 
         trailing_token.is_some_and(Self::token_can_terminate_statement)
+    }
+
+    fn tokens_after_last_semicolon(tokens: &[SqlToken]) -> &[SqlToken] {
+        let mut last_semicolon_idx = None;
+
+        for (idx, token) in tokens.iter().enumerate() {
+            if matches!(token, SqlToken::Symbol(sym) if sym == ";") {
+                last_semicolon_idx = Some(idx);
+            }
+        }
+
+        if let Some(semicolon_idx) = last_semicolon_idx {
+            &tokens[semicolon_idx.saturating_add(1)..]
+        } else {
+            tokens
+        }
+    }
+
+    fn delimiter_pairs_are_balanced(tokens: &[SqlToken]) -> bool {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+
+        for token in tokens {
+            let SqlToken::Symbol(symbol) = token else {
+                continue;
+            };
+
+            match symbol.as_str() {
+                "(" => paren_depth = paren_depth.saturating_add(1),
+                ")" => {
+                    if paren_depth == 0 {
+                        return false;
+                    }
+                    paren_depth -= 1;
+                }
+                "[" => bracket_depth = bracket_depth.saturating_add(1),
+                "]" => {
+                    if bracket_depth == 0 {
+                        return false;
+                    }
+                    bracket_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        paren_depth == 0 && bracket_depth == 0
     }
 
     fn token_can_terminate_statement(token: &SqlToken) -> bool {
@@ -10975,6 +11027,61 @@ FROM DUAL;
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert_eq!(formatted, "SELECT a,");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_open_paren() {
+        let source = "SELECT (1 + 2 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unbalanced open paren, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_closing_paren() {
+        let source = "SELECT 1 + 2) FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unmatched closing paren, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_brackets() {
+        let source = "SELECT arr[1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "formatter must not append semicolon to malformed statement with unbalanced brackets, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_appends_semicolon_for_tail_statement_after_malformed_segment() {
+        let source = "SELECT func(a, b;
+SELECT c, d FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("SELECT c,
+    d
+FROM DUAL;"),
+            "formatter should keep canonical terminator for trailing valid statement, got:
+{}",
+            formatted
+        );
     }
 
     #[test]
