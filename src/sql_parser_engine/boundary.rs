@@ -353,6 +353,7 @@ impl RoutineFrame {
             if matches!(
                 self.external_clause_state,
                 ExternalClauseState::SawMleKeyword
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
                     | ExternalClauseState::SawImplicitLanguageTarget
                     | ExternalClauseState::Confirmed
             ) {
