@@ -4224,6 +4224,56 @@ fn materialized_view_log_with_commit_scn_resets_pending_with_declaration_mode() 
 }
 
 #[test]
+fn with_package_declaration_keeps_main_query_attached_until_semicolon() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH");
+    engine.process_line("  PACKAGE pkg_demo AS");
+    engine.process_line("    FUNCTION f RETURN NUMBER;");
+    engine.process_line("  END pkg_demo;");
+    engine.process_line("SELECT 1 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("WITH
+  PACKAGE pkg_demo AS"),
+        "WITH PACKAGE declaration must stay attached to the same top-level statement: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("SELECT 1 FROM dual"),
+        "main query should remain attached after WITH PACKAGE declarations: {}",
+        statements[0]
+    );
+}
+
+#[test]
+fn with_type_declaration_keeps_main_query_attached_until_semicolon() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("WITH");
+    engine.process_line("  TYPE t_num IS TABLE OF NUMBER;");
+    engine.process_line("SELECT * FROM TABLE(t_num(1, 2));");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("WITH
+  TYPE t_num IS TABLE OF NUMBER;"),
+        "WITH TYPE declaration must stay attached to the same top-level statement: {}",
+        statements[0]
+    );
+    assert!(
+        statements[0].contains("SELECT * FROM TABLE(t_num(1, 2))"),
+        "main query should remain attached after WITH TYPE declarations: {}",
+        statements[0]
+    );
+}
+
+#[test]
 fn with_clause_multiple_plsql_declarations_keep_main_query_attached() {
     let mut engine = SqlParserEngine::new();
 
