@@ -1387,7 +1387,7 @@ impl SplitState {
                 | "NORESOLVE" | "DEBUG" | "NODEBUG"
                 | "IF" | "NOT" | "EXISTS" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING"
                 | "NONEDITIONING" | "FORWARD" | "REVERSE" | "CROSSEDITION" | "SHARING"
-                | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
+                | "METADATA" | "DATA" | "EXTENDED" | "NONE" | "IMMUTABLE" => return,
 
                 // TYPE BODY member modifiers — only skip when inside type body
                 "MEMBER" | "STATIC" | "CONSTRUCTOR" | "MAP" | "ORDER" | "FINAL"

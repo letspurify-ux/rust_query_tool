@@ -622,6 +622,51 @@ fn create_or_replace_noresolve_debug_function_splits_before_next_statement() {
     assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
 }
 
+
+#[test]
+fn create_state_accepts_immutable_modifier_before_function() {
+    let mut state = SplitState::default();
+
+    state.track_create_plsql("CREATE");
+    assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+    state.track_create_plsql("OR");
+    assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+    state.track_create_plsql("REPLACE");
+    assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+    state.track_create_plsql("IMMUTABLE");
+    assert_eq!(state.create_state, CreateState::AwaitingObjectType);
+
+    state.track_create_plsql("FUNCTION");
+
+    assert!(state.in_create_plsql());
+    assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Function);
+}
+
+#[test]
+fn create_or_replace_immutable_function_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE IMMUTABLE FUNCTION f_immutable RETURN NUMBER IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END;");
+    engine.process_line("/");
+    engine.process_line("SELECT 77 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].starts_with("CREATE OR REPLACE IMMUTABLE FUNCTION f_immutable"),
+        "immutable function statement should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 77 FROM dual".to_string());
+}
+
 #[test]
 fn create_type_body_member_modifier_is_not_treated_as_new_create_target() {
     let mut state = SplitState {
