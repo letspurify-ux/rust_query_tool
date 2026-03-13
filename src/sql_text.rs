@@ -664,7 +664,7 @@ pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES", "WITH", "TABLE",
 ];
 
-const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE"];
+const WITH_PLSQL_DECLARATION_KEYWORDS: &[&str] = &["FUNCTION", "PROCEDURE", "PACKAGE", "TYPE"];
 
 /// Top-level `WITH ...` clause keywords that indicate non-PL/SQL clause usage
 /// (e.g. `WITH READ ONLY`, `WITH CHECK OPTION`, `WITH ROWID`).
