@@ -265,6 +265,16 @@ SELECT * FROM cte
     }
 
     #[test]
+    fn normalize_intellisense_context_text_strips_unindented_sqlplus_numbered_prefixes() {
+        let input = "SQL> SELECT e.
+2  FROM emp e
+";
+        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
+
+        assert_eq!(normalized, "SELECT e.\nFROM emp e\n");
+    }
+
+    #[test]
     fn normalize_intellisense_context_text_keeps_numeric_literal_line_prefixes() {
         let input = "SELECT\n1 + 2 AS total\nFROM dual";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
@@ -312,6 +322,17 @@ SELECT * FROM cte
                 .any(|t| t.name.eq_ignore_ascii_case("emp")),
             "emp should remain visible after byte-offset remapping"
         );
+    }
+
+    #[test]
+    fn normalize_intellisense_context_with_cursor_maps_offset_for_unindented_numbered_lines() {
+        let raw = "SQL> SELECT e.\n2  FROM emp e\n";
+        let raw_cursor = raw.find("e.").expect("cursor anchor should exist") + 2;
+        let (normalized, normalized_cursor) =
+            SqlEditorWidget::normalize_intellisense_context_with_cursor(raw, raw_cursor);
+
+        assert_eq!(normalized, "SELECT e.\nFROM emp e\n");
+        assert_eq!(&normalized[..normalized_cursor], "SELECT e.");
     }
 
     #[test]
