@@ -1354,7 +1354,7 @@ impl SqlEditorWidget {
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
                         current_clause.as_deref(),
-                        Some("FROM" | "UPDATE" | "INTO" | "MERGE")
+                        Some("FROM" | "UPDATE" | "INTO" | "MERGE" | "USING")
                     );
                     let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
                     let next_word_is_clause_keyword = next_word.is_none_or(|word| {

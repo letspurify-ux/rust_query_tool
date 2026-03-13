@@ -606,6 +606,42 @@ IF
 }
 
 #[test]
+fn format_sql_keeps_merge_using_alias_named_if_inline() {
+    let input = "merge into sales t using source_table if on (t.id = if.id) when matched then update set t.amount = if.amount";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("USING source_table IF")
+            && formatted.contains("IF.id")
+            && formatted.contains("IF.amount"),
+        "MERGE USING alias IF should remain inline, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("\nIF\n") && !formatted.contains("\n    IF\n"),
+        "MERGE USING alias IF should not be treated as block keyword, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_delete_alias_named_if_inline() {
+    let input = "delete from sales if where if.id = 1";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("DELETE\nFROM sales IF") && formatted.contains("WHERE IF.id = 1;"),
+        "DELETE alias IF should remain inline and usable in member access, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("\nIF\n") && !formatted.contains("\n    IF\n"),
+        "DELETE alias IF should not be treated as block keyword, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_breaks_minified_package_body_members() {
     let input = "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p IS BEGIN NULL; END; FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; END pkg;";
     let formatted = SqlEditorWidget::format_sql_basic(input);
