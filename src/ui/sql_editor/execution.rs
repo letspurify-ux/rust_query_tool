@@ -953,8 +953,26 @@ impl SqlEditorWidget {
     }
 
     fn statement_ends_with_semicolon(statement: &str) -> bool {
-        let tokens = Self::tokenize_sql(statement);
+        let tokens = Self::tokenize_sql(Self::trim_trailing_sqlplus_remark_lines(statement));
         Self::statement_ends_with_semicolon_tokens(&tokens)
+    }
+
+    fn trim_trailing_sqlplus_remark_lines(statement: &str) -> &str {
+        let mut trimmed_len = statement.trim_end().len();
+
+        while trimmed_len > 0 {
+            let prefix = &statement[..trimmed_len];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trimmed_len];
+
+            if !Self::is_sqlplus_remark_comment_statement(line.trim_start()) {
+                break;
+            }
+
+            trimmed_len = prefix[..line_start].trim_end().len();
+        }
+
+        &statement[..trimmed_len]
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
@@ -10675,6 +10693,52 @@ REMARK trailing script comment";
         assert_eq!(
             preserved, source,
             "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_existing_semicolon_before_trailing_rem_line() {
+        let source = "SELECT 1 FROM dual;\nREM trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing semicolon before trailing REM line must be preserved as statement terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("FROM DUAL;"),
+            "Formatted SQL should still keep statement terminator before trailing REM line, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("REM trailing script comment"),
+            "Existing semicolon before trailing REM line must be preserved, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_existing_semicolon_before_trailing_remark_line() {
+        let source = "SELECT 1 FROM dual;\nREMARK trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing semicolon before trailing REMARK line must be preserved as statement terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("FROM DUAL;"),
+            "Formatted SQL should still keep statement terminator before trailing REMARK line, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("REMARK trailing script comment"),
+            "Existing semicolon before trailing REMARK line must be preserved, got:\n{}",
             preserved
         );
     }
