@@ -245,6 +245,42 @@ fn test_connect_with_comment_then_by_is_not_sqlplus_connect() {
 }
 
 #[test]
+fn test_connect_followed_by_newline_and_by_is_not_sqlplus_connect() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT level\nFROM dual\nCONNECT\nBY PRIOR id = parent_id";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CONNECT", "BY", "PRIOR"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
+}
+
+#[test]
+fn test_connect_followed_by_comment_line_then_by_is_not_sqlplus_connect() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT level\nFROM dual\nCONNECT\n-- keep hierarchy\nBY PRIOR id = parent_id";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CONNECT", "BY", "PRIOR"] {
+        let start = text
+            .find(keyword)
+            .unwrap_or_else(|| panic!("missing keyword: {keyword}"));
+        let end = start + keyword.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+            "{keyword} should be highlighted as keyword"
+        );
+    }
+}
+
+#[test]
 fn test_parse_connect_continuation_detects_by_with_comment() {
     let bytes = b"CONNECT /*+ hint */ BY PRIOR id = parent_id";
     let connect_end = "CONNECT".len();
@@ -261,6 +297,16 @@ fn test_parse_connect_continuation_detects_sqlplus_connect_line() {
     assert_eq!(
         parse_connect_continuation(bytes, connect_end),
         ConnectContinuation::Other
+    );
+}
+
+#[test]
+fn test_parse_connect_continuation_detects_multiline_by_clause() {
+    let bytes = b"CONNECT\n-- comment\nBY PRIOR id = parent_id";
+    let connect_end = "CONNECT".len();
+    assert_eq!(
+        parse_connect_continuation(bytes, connect_end),
+        ConnectContinuation::ByClause
     );
 }
 

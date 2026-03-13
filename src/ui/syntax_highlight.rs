@@ -1509,11 +1509,11 @@ fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContin
     while idx <= bytes.len() {
         match state {
             ConnectContinuationScanState::SkipTrivia => {
-                while matches!(bytes.get(idx), Some(b' ' | b'\t' | b'\r')) {
+                while matches!(bytes.get(idx), Some(b' ' | b'\t' | b'\r' | b'\n')) {
                     idx += 1;
                 }
 
-                if matches!(bytes.get(idx), None | Some(b'\n') | Some(b'\r')) {
+                if bytes.get(idx).is_none() {
                     return ConnectContinuation::EndOfLine;
                 }
 
@@ -1521,10 +1521,10 @@ fn parse_connect_continuation(bytes: &[u8], connect_end: usize) -> ConnectContin
                     while let Some(&b) = bytes.get(idx) {
                         idx += 1;
                         if is_line_terminator(b) {
-                            return ConnectContinuation::EndOfLine;
+                            break;
                         }
                     }
-                    return ConnectContinuation::EndOfLine;
+                    continue;
                 }
 
                 if bytes.get(idx) == Some(&b'/') && bytes.get(idx + 1) == Some(&b'*') {
