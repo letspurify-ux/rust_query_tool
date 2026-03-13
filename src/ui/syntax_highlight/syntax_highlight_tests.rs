@@ -476,6 +476,26 @@ fn test_path_keyword_in_xmltable_remains_keyword() {
 }
 
 #[test]
+fn test_path_keyword_in_xmltable_remains_keyword_for_nq_and_uq_literals() {
+    let highlighter = SqlHighlighter::new();
+
+    for text in [
+        "SELECT * FROM XMLTABLE(nq'[x]' PASSING payload COLUMNS id NUMBER PATH '$.id') t",
+        "SELECT * FROM XMLTABLE(uq'[x]' PASSING payload COLUMNS id NUMBER PATH '$.id') t",
+        "SELECT * FROM XMLTABLE(UQ'[x]' PASSING payload COLUMNS id NUMBER PATH '$.id') t",
+    ] {
+        let styles = highlighter.generate_styles(text);
+        let path_start = text.find("PATH").unwrap_or(0);
+        assert!(
+            styles[path_start..path_start + 4]
+                .chars()
+                .all(|c| c == STYLE_KEYWORD),
+            "XMLTABLE PATH clause should stay keyword style for text: {text}"
+        );
+    }
+}
+
+#[test]
 fn test_q_quote_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT q'[test string]' FROM dual";
