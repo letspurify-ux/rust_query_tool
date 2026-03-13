@@ -641,15 +641,14 @@ impl SqlEditorWidget {
         if has_trailing_comment {
             while insert_at > 0 {
                 match trimmed.as_bytes().get(insert_at - 1) {
-                    Some(b' ' | b'\t') => insert_at -= 1,
+                    Some(b' ' | b'\t' | b'\n' | b'\r') => insert_at -= 1,
                     _ => break,
                 }
             }
             let suffix = &formatted_statement[insert_at..trim_len];
-            let separator = if suffix.starts_with([' ', '\t']) {
-                ";"
-            } else {
-                "; "
+            let separator = match suffix.as_bytes().first() {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => ";",
+                _ => "; ",
             };
             formatted_statement.insert_str(insert_at, separator);
         } else {
@@ -10336,6 +10335,42 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     }
 
     #[test]
+    fn format_sql_basic_does_not_insert_space_before_newline_line_comment() {
+        let source = "SELECT 1 FROM dual\n-- trailing note";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\n-- trailing note"),
+            "Formatter should insert semicolon without trailing space before newline comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("; \n-- trailing note"),
+            "Formatter should not leave whitespace before newline-attached line comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_insert_space_before_newline_block_comment() {
+        let source = "SELECT 1 FROM dual\n/* trailing block */";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;\n/* trailing block */"),
+            "Formatter should insert semicolon without trailing space before newline block comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("; \n/* trailing block */"),
+            "Formatter should not leave whitespace before newline-attached block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_comment() {
         let source = "SELECT 1 FROM dual -- trailing note";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -10356,6 +10391,19 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     }
 
     #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_comment() {
+        let source = "SELECT 1 FROM dual\n-- trailing note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !preserved.contains(";\n-- trailing note"),
+            "Selection-preserved formatting should remove inserted semicolon for newline comment attachment, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
     fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_block_comment()
     {
         let source = "SELECT 1 FROM dual /* trailing block */";
@@ -10370,6 +10418,20 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             preserved.trim_end().ends_with("/* trailing block */"),
             "Trailing block comment should be preserved, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_block_comment()
+    {
+        let source = "SELECT 1 FROM dual\n/* trailing block */";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !preserved.contains(";\n/* trailing block */"),
+            "Selection-preserved formatting should remove inserted semicolon for newline block comment attachment, got:\n{}",
             preserved
         );
     }
