@@ -107,6 +107,42 @@ ORDER BY trim.a;";
 }
 
 #[test]
+fn test_function_name_alias_after_dot_is_not_function_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT o.trim, o.count, o.max FROM orders o";
+    let styles = highlighter.generate_styles(text);
+
+    for token in ["trim", "count", "max"] {
+        let qualified = format!("o.{token}");
+        let start = text.find(&qualified).unwrap_or(0) + 2;
+        let end = start + token.len();
+        assert!(
+            styles[start..end]
+                .chars()
+                .all(|c| c != STYLE_FUNCTION && c != STYLE_KEYWORD),
+            "member access `{qualified}` should not be highlighted as function or keyword"
+        );
+    }
+}
+
+#[test]
+fn test_schema_qualified_function_name_is_not_function_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT user_env.trim FROM dual user_env";
+    let styles = highlighter.generate_styles(text);
+
+    let token = "user_env.trim";
+    let trim_start = text.find(token).unwrap_or(0) + "user_env.".len();
+    let trim_end = trim_start + "trim".len();
+    assert!(
+        styles[trim_start..trim_end]
+            .chars()
+            .all(|c| c != STYLE_FUNCTION && c != STYLE_KEYWORD),
+        "qualified name `user_env.trim` should not be highlighted as function or keyword"
+    );
+}
+
+#[test]
 fn test_string_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "'hello world'";

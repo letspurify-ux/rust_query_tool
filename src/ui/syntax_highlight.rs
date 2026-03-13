@@ -1021,6 +1021,13 @@ fn should_treat_function_name_as_identifier(
         return true;
     }
 
+    if matches!(
+        prev_significant_token_kind(text, bytes, word_start),
+        Some(SignificantTokenKind::Dot)
+    ) {
+        return true;
+    }
+
     prev_significant_word_upper(text, bytes, word_start)
         .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str()))
 }
@@ -1191,6 +1198,9 @@ fn prev_significant_token_kind(
 
         if prev == b')' {
             return Some(SignificantTokenKind::RightParen);
+        }
+        if prev == b'.' {
+            return Some(SignificantTokenKind::Dot);
         }
         if prev == b',' {
             return Some(SignificantTokenKind::Comma);
