@@ -485,7 +485,7 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_sql_basic(&source);
+        let formatted = Self::format_for_auto_formatting(&source, select_formatted);
         if formatted == source {
             return;
         }
@@ -509,6 +509,15 @@ impl SqlEditorWidget {
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
+    }
+
+    fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
+        let formatted = Self::format_sql_basic(source);
+        if selected_only {
+            Self::preserve_selected_text_terminator(source, formatted)
+        } else {
+            formatted
+        }
     }
 
     fn normalize_index(text: &str, index: i32) -> usize {
@@ -10275,13 +10284,33 @@ FROM DUAL"
     }
 
     #[test]
-    fn selected_formatting_path_keeps_canonical_statement_semicolon() {
+    fn selected_auto_formatting_path_preserves_original_missing_semicolon() {
         let source = "SELECT 1 FROM dual";
-        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert_eq!(
+            formatted.trim_end(),
+            "SELECT 1
+FROM DUAL"
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Selected auto-formatting should preserve a missing terminator, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_path_keeps_canonical_statement_semicolon() {
+        let source = "SELECT 1 FROM dual";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
 
         assert!(
             formatted.trim_end().ends_with(';'),
-            "Selection formatting now follows canonical formatter output, got:
+            "Full-buffer formatting should keep canonical statement semicolon, got:
 {}",
             formatted
         );
