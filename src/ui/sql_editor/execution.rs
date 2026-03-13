@@ -1131,6 +1131,14 @@ impl SqlEditorWidget {
     }
 
     fn should_append_missing_statement_terminator(tokens: &[SqlToken]) -> bool {
+        if !Self::has_balanced_grouping_symbols(tokens)
+            && !tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == ";"))
+        {
+            return false;
+        }
+
         let mut trailing_token = None;
 
         for token in tokens.iter().rev() {
@@ -1145,6 +1153,33 @@ impl SqlEditorWidget {
         }
 
         trailing_token.is_some_and(Self::token_can_terminate_statement)
+    }
+
+    fn has_balanced_grouping_symbols(tokens: &[SqlToken]) -> bool {
+        let mut grouping_stack: Vec<&str> = Vec::new();
+
+        for token in tokens {
+            let SqlToken::Symbol(symbol) = token else {
+                continue;
+            };
+
+            match symbol.as_str() {
+                "(" | "[" => grouping_stack.push(symbol),
+                ")" => {
+                    if !matches!(grouping_stack.pop(), Some("(")) {
+                        return false;
+                    }
+                }
+                "]" => {
+                    if !matches!(grouping_stack.pop(), Some("[")) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        grouping_stack.is_empty()
     }
 
     fn token_can_terminate_statement(token: &SqlToken) -> bool {
@@ -10984,6 +11019,66 @@ FROM DUAL;
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert_eq!(formatted, "SELECT t.");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_open_paren() {
+        let source = "SELECT (1 + 2 FROM dual";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL"),
+            "Formatter should still normalize SQL keywords, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Formatter should not append semicolon for unbalanced opening parenthesis, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_open_bracket() {
+        let source = "SELECT arr[1 FROM dual";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL"),
+            "Formatter should still normalize SQL keywords, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Formatter should not append semicolon for unbalanced opening bracket, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unbalanced_closing_paren() {
+        let source = "SELECT 1) FROM dual";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL"),
+            "Formatter should still normalize SQL keywords, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Formatter should not append semicolon for unbalanced closing parenthesis, got:
+{}",
+            formatted
+        );
     }
 
     #[test]
