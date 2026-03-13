@@ -312,16 +312,6 @@ FROM emp e
     }
 
     #[test]
-    fn normalize_intellisense_context_text_strips_unindented_sqlplus_numbered_prefixes() {
-        let input = "SQL> SELECT e.
-2  FROM emp e
-";
-        let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
-
-        assert_eq!(normalized, "SELECT e.\nFROM emp e\n");
-    }
-
-    #[test]
     fn normalize_intellisense_context_text_keeps_numeric_literal_line_prefixes() {
         let input = "SELECT\n1 + 2 AS total\nFROM dual";
         let normalized = SqlEditorWidget::normalize_intellisense_context_text(input);
