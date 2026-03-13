@@ -1270,8 +1270,8 @@ fn test_entry_state_in_block_comment_continues() {
     assert!(
         styles[..comment_end]
             .chars()
-            .all(|c| c == STYLE_BLOCK_COMMENT),
-        "continued block comment should be BLOCK_COMMENT"
+            .all(|c| c == STYLE_COMMENT),
+        "continued block comment should be COMMENT"
     );
     // "SELECT" after should be keyword
     let select_pos = text.find("SELECT").unwrap();
@@ -1526,7 +1526,21 @@ fn test_incremental_highlight_inherits_comment_entry_state() {
     assert!(updated.end >= updated.start);
     if !updated.styles.is_empty() {
         assert!(updated.styles.chars().all(|c| c == STYLE_COMMENT));
+        assert!(!updated.styles.chars().any(|c| c == STYLE_BLOCK_COMMENT));
     }
+}
+
+#[test]
+fn test_generate_styles_with_block_comment_entry_matches_full_highlighting() {
+    let highlighter = SqlHighlighter::new();
+    let text = "/* open comment\ncontinued line */\nSELECT 1";
+    let start = text.find("continued").unwrap_or(0);
+    let expected = highlighter.generate_styles(text);
+
+    let (window_styles, _) =
+        highlighter.generate_styles_for_window(&text[start..], LexerState::InBlockComment);
+
+    assert_eq!(window_styles, expected[start..]);
 }
 
 #[test]
