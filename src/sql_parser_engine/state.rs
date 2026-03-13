@@ -394,18 +394,20 @@ impl SplitState {
             return true;
         }
 
-        if token_upper
-            .rsplit('.')
-            .next()
-            .is_some_and(|segment| segment == package_name)
-        {
-            return true;
+        let mut package_segments = package_name.split('.');
+        let package_last_segment = package_segments.next_back();
+
+        if package_segments.next().is_none() {
+            return token_upper
+                .rsplit('.')
+                .next()
+                .is_some_and(|segment| Some(segment) == package_last_segment);
         }
 
-        let mut qualified_suffix = String::with_capacity(package_name.len() + 1);
-        qualified_suffix.push('.');
-        qualified_suffix.push_str(package_name);
-        token_upper.ends_with(&qualified_suffix)
+        token_upper
+            .split('.')
+            .collect::<Vec<_>>()
+            .ends_with(&package_name.split('.').collect::<Vec<_>>())
     }
 
     fn push_pending_end_label_segment(&mut self, token_upper: &str) {
