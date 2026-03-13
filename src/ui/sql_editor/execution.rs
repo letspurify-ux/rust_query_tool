@@ -567,7 +567,7 @@ impl SqlEditorWidget {
     }
 
     fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
-        if Self::statement_ends_with_semicolon(source) {
+        if Self::source_has_explicit_semicolon_terminator(source) {
             return formatted;
         }
 
@@ -963,6 +963,29 @@ impl SqlEditorWidget {
             })
     }
 
+    fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
+        for token in Self::tokenize_sql(statement).iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                SqlToken::Symbol(sym) if sym == ";" => return true,
+                _ => break,
+            }
+        }
+
+        let trimmed = statement.trim_end();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        spans.iter().rev().any(|span| {
+            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+        })
+    }
+
+    #[cfg(test)]
     fn statement_ends_with_semicolon(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
         if Self::statement_ends_with_semicolon_tokens(&tokens) {
@@ -982,12 +1005,15 @@ impl SqlEditorWidget {
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
+        let mut saw_sqlplus_slash = false;
         for token in tokens.iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,
-                SqlToken::Symbol(sym) if sym == "/" => continue,
+                SqlToken::Symbol(sym) if sym == "/" => {
+                    saw_sqlplus_slash = true;
+                }
                 SqlToken::Symbol(sym) if sym == ";" => return true,
-                _ => return false,
+                _ => return saw_sqlplus_slash,
             }
         }
         false
@@ -9878,6 +9904,28 @@ END;"#;
     }
 
     #[test]
+    fn cursor_mapping_selected_auto_format_without_terminator_keeps_inline_comment_anchor() {
+        let source = "SELECT 1 FROM dual -- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos_within_selection = source
+            .find("-- trailing note")
+            .expect("source inline comment anchor should exist") as i32;
+
+        let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
+            source,
+            &formatted,
+            source_pos_within_selection,
+        );
+        let mapped_slice = &formatted[mapped_within_selection as usize..];
+
+        assert!(
+            mapped_slice.starts_with("-- trailing note"),
+            "Selected formatting without terminator should keep inline-comment cursor anchor, got: {}",
+            mapped_slice
+        );
+    }
+
+    #[test]
     fn cursor_mapping_uses_utf8_byte_offsets() {
         let source = "SELECT 한글, b FROM dual";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -10878,6 +10926,23 @@ FROM t;
         assert!(SqlEditorWidget::statement_ends_with_semicolon(
             "SELECT 1 FROM dual;
 /"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_without_semicolon() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual
+/"
+        ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_sqlplus_slash_with_trailing_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual
+/
+REM keep"
         ));
     }
 
