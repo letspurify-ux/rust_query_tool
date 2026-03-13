@@ -677,11 +677,10 @@ impl SqlEditorWidget {
         }
 
         let number_start = idx;
-        let had_leading_whitespace = number_start > 0;
         while idx < bytes.len() && bytes[idx].is_ascii_digit() {
             idx += 1;
         }
-        if had_leading_whitespace && idx > number_start {
+        if idx > number_start {
             let mut sep = idx;
             while sep < bytes.len() && bytes[sep].is_ascii_whitespace() {
                 sep += 1;
