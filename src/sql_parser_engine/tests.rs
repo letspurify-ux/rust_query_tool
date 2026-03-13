@@ -13,6 +13,7 @@ fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end()
             block_depth: 2,
             semicolon_policy: SemicolonPolicy::ForceSplit,
             external_clause_state: ExternalClauseState::None,
+            implicit_language_target_is_quoted: false,
         }],
         pending_end: PendingEnd::End,
         pending_subprogram_begins: 0,
@@ -63,6 +64,7 @@ fn semicolon_action_detects_forced_routine_split() {
         block_depth: 1,
         semicolon_policy: SemicolonPolicy::ForceSplit,
         external_clause_state: ExternalClauseState::Confirmed,
+        implicit_language_target_is_quoted: false,
     });
     assert_eq!(
         SemicolonAction::from_state(&state),
@@ -79,6 +81,7 @@ fn semicolon_action_closes_nested_external_routine_without_split() {
         block_depth: 2,
         semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
         external_clause_state: ExternalClauseState::Confirmed,
+        implicit_language_target_is_quoted: false,
     });
     assert_eq!(
         SemicolonAction::from_state(&state),
@@ -206,6 +209,7 @@ fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
             block_depth: 1,
             semicolon_policy: SemicolonPolicy::ForceSplit,
             external_clause_state: ExternalClauseState::Confirmed,
+            implicit_language_target_is_quoted: false,
         }],
         ..SplitState::default()
     };
@@ -995,6 +999,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
         block_depth: 1,
         semicolon_policy: SemicolonPolicy::ForceSplit,
         external_clause_state: ExternalClauseState::Confirmed,
+        implicit_language_target_is_quoted: false,
     });
     engine.state.pending_end = PendingEnd::End;
     engine.state.pending_do = PendingDo::While {
@@ -1023,6 +1028,7 @@ fn close_external_routine_semicolon_only_closes_nested_routine_block() {
             block_depth: 2,
             semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
             external_clause_state: ExternalClauseState::Confirmed,
+            implicit_language_target_is_quoted: false,
         }],
         ..SplitState::default()
     };
@@ -2975,6 +2981,42 @@ fn function_declarative_language_quoted_identifier_does_not_split_before_begin()
     assert!(statements[0].contains("language \"C\";"));
     assert!(statements[0].contains("BEGIN\n  RETURN 1;\nEND"));
     assert!(statements[1].starts_with("SELECT 1 FROM dual"));
+}
+
+#[test]
+fn language_clause_with_quoted_target_and_semicolon_splits_before_next_top_level_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_lang_quoted RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"JavaScript\";");
+    engine.process_line("SELECT 56 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS LANGUAGE \"JavaScript\""),
+        "external call spec should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 56 FROM dual".to_string());
+}
+
+#[test]
+fn language_clause_with_quoted_target_and_semicolon_keeps_following_begin_in_same_function() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION fn_lang_quoted_block RETURN NUMBER");
+    engine.process_line("IS");
+    engine.process_line("  LANGUAGE \"C\";");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 1;");
+    engine.process_line("END;");
+    engine.process_line("SELECT 57 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("LANGUAGE \"C\";\nBEGIN"));
+    assert_eq!(statements[1], "SELECT 57 FROM dual".to_string());
 }
 
 #[test]

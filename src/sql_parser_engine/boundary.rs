@@ -189,6 +189,7 @@ struct RoutineFrame {
     block_depth: usize,
     semicolon_policy: SemicolonPolicy,
     external_clause_state: ExternalClauseState,
+    implicit_language_target_is_quoted: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -218,6 +219,7 @@ impl RoutineFrame {
             block_depth,
             semicolon_policy: SemicolonPolicy::Default,
             external_clause_state: ExternalClauseState::None,
+            implicit_language_target_is_quoted: false,
         }
     }
 
@@ -253,6 +255,10 @@ impl RoutineFrame {
         )
     }
 
+    fn should_defer_begin_split_after_implicit_semicolon(self) -> bool {
+        self.implicit_language_target_is_quoted
+    }
+
     fn mark_external_clause(&mut self) {
         self.semicolon_policy = if self.block_depth == 1 {
             SemicolonPolicy::ForceSplit
@@ -260,6 +266,7 @@ impl RoutineFrame {
             SemicolonPolicy::CloseRoutineBlock
         };
         self.external_clause_state = ExternalClauseState::Confirmed;
+        self.implicit_language_target_is_quoted = false;
     }
 
     fn mark_implicit_language_target_on_semicolon(&mut self) {
@@ -285,6 +292,7 @@ impl RoutineFrame {
                     self.mark_external_clause();
                 } else {
                     self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+                    self.implicit_language_target_is_quoted = false;
                 }
                 return;
             }
@@ -307,6 +315,7 @@ impl RoutineFrame {
                     // in call-spec mode so semicolon handling can still split before the
                     // next top-level statement.
                     self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+                    self.implicit_language_target_is_quoted = false;
                 }
                 return;
             }
@@ -314,11 +323,13 @@ impl RoutineFrame {
 
         if token_upper == "EXTERNAL" {
             self.external_clause_state = ExternalClauseState::SawExternalKeyword;
+            self.implicit_language_target_is_quoted = false;
             return;
         }
 
         if matches!(token_upper, "AGGREGATE" | "PIPELINED") {
             self.external_clause_state = ExternalClauseState::SawUsingClauseSubject;
+            self.implicit_language_target_is_quoted = false;
             return;
         }
 
@@ -330,6 +341,7 @@ impl RoutineFrame {
                 self.mark_external_clause();
             } else {
                 self.external_clause_state = ExternalClauseState::SawMleKeyword;
+                self.implicit_language_target_is_quoted = false;
             }
             return;
         }
@@ -366,10 +378,13 @@ impl RoutineFrame {
             if self.external_clause_state == ExternalClauseState::SawExternalKeyword {
                 self.external_clause_state =
                     ExternalClauseState::AwaitingLanguageTargetFromExternal;
+                self.implicit_language_target_is_quoted = false;
             } else if allow_implicit_language {
                 self.external_clause_state = ExternalClauseState::AwaitingLanguageTargetImplicit;
+                self.implicit_language_target_is_quoted = false;
             } else {
                 self.external_clause_state = ExternalClauseState::None;
+                self.implicit_language_target_is_quoted = false;
             }
             return;
         }
@@ -395,6 +410,7 @@ impl RoutineFrame {
                 | ExternalClauseState::SawImplicitQuotedLanguageTarget
         ) {
             self.external_clause_state = ExternalClauseState::None;
+            self.implicit_language_target_is_quoted = false;
         }
     }
 
@@ -405,6 +421,7 @@ impl RoutineFrame {
             }
             ExternalClauseState::AwaitingLanguageTargetImplicit => {
                 self.external_clause_state = ExternalClauseState::SawImplicitQuotedLanguageTarget;
+                self.implicit_language_target_is_quoted = true;
             }
             _ => {}
         }
@@ -422,6 +439,7 @@ impl RoutineFrame {
             self.mark_external_clause();
         } else if allow_implicit_target {
             self.external_clause_state = ExternalClauseState::SawImplicitLanguageTarget;
+            self.implicit_language_target_is_quoted = false;
         }
     }
 
@@ -467,6 +485,7 @@ impl RoutineFrame {
 
         if is_canceling_symbol {
             self.external_clause_state = ExternalClauseState::None;
+            self.implicit_language_target_is_quoted = false;
         }
     }
 
@@ -479,7 +498,13 @@ impl RoutineFrame {
                 self.mark_external_clause();
             }
             ExternalClauseState::SawImplicitQuotedLanguageTarget => {
-                self.external_clause_state = ExternalClauseState::None;
+                if allow_implicit_target_split {
+                    self.mark_implicit_language_target_on_semicolon();
+                    self.implicit_language_target_is_quoted = true;
+                } else {
+                    self.external_clause_state = ExternalClauseState::None;
+                    self.implicit_language_target_is_quoted = false;
+                }
             }
             ExternalClauseState::SawImplicitLanguageTarget
             | ExternalClauseState::AwaitingLanguageTargetImplicit => {
