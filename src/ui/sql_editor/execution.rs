@@ -497,8 +497,12 @@ impl SqlEditorWidget {
         if select_formatted {
             let original_within_selection =
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
-            let mapped_within_selection =
-                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
+            let mapped_within_selection = Self::map_cursor_after_format_with_terminator_policy(
+                &source,
+                &formatted,
+                original_within_selection,
+                false,
+            );
             let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
             let mapped_cursor =
                 start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
@@ -546,6 +550,15 @@ impl SqlEditorWidget {
     }
 
     fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
+        Self::map_cursor_after_format_with_terminator_policy(source, formatted, original_pos, true)
+    }
+
+    fn map_cursor_after_format_with_terminator_policy(
+        source: &str,
+        formatted: &str,
+        original_pos: i32,
+        append_missing_terminator: bool,
+    ) -> i32 {
         if original_pos <= 0 {
             return 0;
         }
@@ -561,7 +574,8 @@ impl SqlEditorWidget {
         }
 
         let source_prefix = &source[..source_pos];
-        let formatted_prefix = Self::format_sql_basic(source_prefix);
+        let formatted_prefix =
+            Self::format_sql_basic_with_terminator_policy(source_prefix, append_missing_terminator);
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -9874,6 +9888,54 @@ END;"#;
         assert!(
             formatted.trim_end().ends_with(';'),
             "Selection formatting should keep canonical semicolon terminator"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_without_terminator_policy_keeps_cursor_at_end() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_terminator_policy(
+            source,
+            &formatted,
+            source.len() as i32,
+            false,
+        ) as usize;
+
+        assert_eq!(
+            mapped,
+            formatted.len(),
+            "selected-only formatting should map end cursor to end without phantom terminator"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selected_mode_matches_formatted_prefix_without_semicolon() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let anchor = source.find("FROM").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_terminator_policy(
+            source,
+            &formatted,
+            anchor,
+            false,
+        ) as usize;
+
+        let expected_prefix = SqlEditorWidget::format_sql_basic_with_terminator_policy(
+            &source[..anchor as usize],
+            false,
+        );
+
+        assert_eq!(
+            mapped,
+            expected_prefix.len().min(formatted.len()),
+            "selected-mode cursor mapping should use selected terminator policy"
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "selected formatting fixture should keep missing semicolon"
         );
     }
 
