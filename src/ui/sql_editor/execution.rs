@@ -1370,15 +1370,16 @@ impl SqlEditorWidget {
                                 || (next_token_is_dot
                                     && matches!(
                                         current_clause.as_deref(),
-                                        Some(
-                                            "SELECT"
-                                                | "FROM"
-                                                | "WHERE"
-                                                | "GROUP"
-                                                | "HAVING"
-                                                | "ORDER"
-                                        )
-                                    )));
+                                Some(
+                                    "SELECT"
+                                        | "FROM"
+                                        | "WHERE"
+                                        | "ON"
+                                        | "GROUP"
+                                        | "HAVING"
+                                        | "ORDER"
+                                )
+                            )));
                     let should_treat_as_block_start = block_start_keywords
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier
@@ -11515,6 +11516,42 @@ END"
 "),
             "implicit alias IF inside PL/SQL block should not be split as block keyword, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_member_access_identifiers_inline_in_join_on_clause() {
+        let sql = "SELECT IF.amount FROM sales IF JOIN totals END ON IF.id = END.id";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("ON IF.id = END.id"),
+            "keyword-like member access identifiers in ON clause should remain inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nIF.id") && !formatted.contains("\nEND.id"),
+            "member access in ON clause should not be split as control keyword block tokens, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_keyword_like_member_access_identifiers_inline_in_where_clause() {
+        let sql = "SELECT IF.amount FROM sales IF WHERE IF.amount > 100";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains("WHERE IF.amount > 100"),
+            "keyword-like member access identifiers in WHERE clause should remain inline, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("\nIF.amount"),
+            "member access in WHERE clause should not be split as control keyword block token, got:\n{}",
             formatted
         );
     }
