@@ -1149,10 +1149,57 @@ impl SqlEditorWidget {
 
     fn token_can_terminate_statement(token: &SqlToken) -> bool {
         match token {
-            SqlToken::Word(_) | SqlToken::String(_) => true,
+            SqlToken::Word(word) => Self::word_token_can_terminate_statement(word),
+            SqlToken::String(literal) => Self::string_token_can_terminate_statement(literal),
             SqlToken::Symbol(symbol) => matches!(symbol.as_str(), ")" | "]"),
             SqlToken::Comment(_) => false,
         }
+    }
+
+    fn word_token_can_terminate_statement(word: &str) -> bool {
+        if word.starts_with('"') {
+            return word.ends_with('"') && word.len() > 1;
+        }
+
+        if word.starts_with("<<") {
+            return word.ends_with(">>") && word.len() > 3;
+        }
+
+        true
+    }
+
+    fn string_token_can_terminate_statement(literal: &str) -> bool {
+        if literal.starts_with('$') {
+            return Self::has_closed_dollar_quote(literal);
+        }
+
+        literal.ends_with('\'') && literal.len() > 1
+    }
+
+    fn has_closed_dollar_quote(literal: &str) -> bool {
+        let bytes = literal.as_bytes();
+        if bytes.first().copied() != Some(b'$') {
+            return false;
+        }
+
+        let close_tag_idx = bytes.iter().enumerate().skip(1).find_map(|(idx, byte)| {
+            if *byte == b'$' {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+
+        let Some(close_tag_idx) = close_tag_idx else {
+            return false;
+        };
+
+        let tag_end = close_tag_idx + 1;
+        let Some(tag) = literal.get(..tag_end) else {
+            return false;
+        };
+
+        literal.len() >= tag.len().saturating_mul(2) && literal.ends_with(tag)
     }
 
     fn classify_comment_attachment(
@@ -10985,6 +11032,52 @@ FROM DUAL;
 
         assert_eq!(formatted, "SELECT t.");
     }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_single_quote() {
+        let source = "SELECT 'unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT 'unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_quoted_identifier() {
+        let source = "SELECT \"unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT \"unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_dollar_quote() {
+        let source = "SELECT $$unterminated";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "SELECT $$unterminated");
+    }
+
+    #[test]
+    fn format_sql_basic_does_not_append_semicolon_for_unterminated_plsql_label() {
+        let source = "BEGIN <<label
+NULL";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert_eq!(formatted, "BEGIN
+    <<label
+    NULL");
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "unterminated PL/SQL label should not receive a terminator, got:
+{}",
+            formatted
+        );
+    }
+
 
     #[test]
     fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {
