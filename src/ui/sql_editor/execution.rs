@@ -1340,7 +1340,10 @@ impl SqlEditorWidget {
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
-                    let in_from_clause = matches!(current_clause.as_deref(), Some("FROM"));
+                    let in_table_alias_clause = matches!(
+                        current_clause.as_deref(),
+                        Some("FROM" | "UPDATE" | "INTO" | "MERGE")
+                    );
                     let in_select_clause = matches!(current_clause.as_deref(), Some("SELECT"));
                     let next_word_is_clause_keyword = next_word.is_none_or(|word| {
                         let next_upper = word.to_ascii_uppercase();
@@ -1363,7 +1366,7 @@ impl SqlEditorWidget {
                             && !closes_case_expression
                             && !next_word_is("THEN")
                             && (follows_alias_keyword
-                                || (in_from_clause && next_token_ends_from_alias)
+                                || (in_table_alias_clause && next_token_ends_from_alias)
                                 || (in_select_clause
                                     && !next_word_is("AS")
                                     && next_token_ends_select_item)
