@@ -690,7 +690,15 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     "HIERARCHY",
 ];
 
-const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &["C", "JAVA", "JAVASCRIPT", "PYTHON", "MLE"];
+const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &[
+    "C",
+    "JAVA",
+    "JAVASCRIPT",
+    "PYTHON",
+    "MLE",
+    "WASM",
+    "R",
+];
 
 const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "EXTERNAL",
@@ -1264,6 +1272,14 @@ mod tests {
         }
         assert!(!is_with_non_plsql_clause_keyword("FUNCTION"));
         assert!(!is_with_non_plsql_clause_keyword("SELECT"));
+    }
+
+    #[test]
+    fn external_language_target_keyword_supports_extended_oracle_targets() {
+        assert!(is_external_language_target_keyword("WASM"));
+        assert!(is_external_language_target_keyword("R"));
+        assert!(is_external_language_target_keyword("wasm"));
+        assert!(is_external_language_target_keyword("r"));
     }
 
     #[test]

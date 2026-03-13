@@ -383,6 +383,34 @@ fn create_function_external_language_r_splits_from_following_statement() {
 }
 
 #[test]
+fn malformed_implicit_language_wasm_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_wasm_semicolon RETURN NUMBER");
+    engine.process_line("AS LANGUAGE WASM");
+    engine.process_line("SELECT 601 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE WASM"));
+    assert_eq!(statements[1], "SELECT 601 FROM dual".to_string());
+}
+
+#[test]
+fn malformed_implicit_language_r_without_semicolon_splits_before_following_statement_head() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_r_semicolon RETURN NUMBER");
+    engine.process_line("AS LANGUAGE R");
+    engine.process_line("SELECT 602 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE R"));
+    assert_eq!(statements[1], "SELECT 602 FROM dual".to_string());
+}
+
+#[test]
 fn nested_create_tokens_inside_block_do_not_switch_to_create_mode() {
     let mut engine = SqlParserEngine::new();
 
