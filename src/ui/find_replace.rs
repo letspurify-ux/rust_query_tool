@@ -125,7 +125,10 @@ fn resolve_find_input_shortcut_action(
 
 fn install_find_input_shortcuts(input: &mut Input) {
     input.handle(move |widget, ev| match ev {
-        Event::KeyDown | Event::Shortcut => {
+        // Handle only `Event::Shortcut` for Ctrl/Cmd combinations.
+        // If we also process `Event::KeyDown`, some environments dispatch both
+        // events for the same key press (e.g. paste), causing duplicated input.
+        Event::Shortcut => {
             let key = app::event_key();
             let original_key = app::event_original_key();
             let state = app::event_state();
