@@ -758,6 +758,47 @@ fn package_body_with_qualified_name_uses_last_segment_for_end_label_matching() {
 }
 
 #[test]
+fn package_body_qualified_name_with_block_comment_after_dot_tracks_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY owner./*scope*/pkg_demo AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END owner.pkg_demo;");
+    engine.process_line("SELECT 201 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.pkg_demo"),
+        "package body END label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 201 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_quoted_qualified_name_with_line_comment_after_dot_tracks_end_label() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"owner\". -- keep");
+    engine.process_line("\"pkg_demo\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"owner\".\"pkg_demo\";");
+    engine.process_line("SELECT 202 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"owner\".\"pkg_demo\""),
+        "quoted package body END label should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 202 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_with_three_part_name_uses_last_segment_for_end_label_matching() {
     let mut engine = SqlParserEngine::new();
 
