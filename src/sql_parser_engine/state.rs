@@ -1301,11 +1301,14 @@ impl SplitState {
             return;
         }
 
+        let keeps_awaiting_segment_after_dot = self.awaiting_package_body_name_dot
+            && matches!(ch, '/' | '*' | '-');
+
         match ch {
             '.' if !self.package_body_name_segments.is_empty() => {
                 self.awaiting_package_body_name_dot = true;
             }
-            _ if !ch.is_whitespace() => {
+            _ if !ch.is_whitespace() && !keeps_awaiting_segment_after_dot => {
                 self.awaiting_package_body_name_dot = false;
             }
             _ => {}
