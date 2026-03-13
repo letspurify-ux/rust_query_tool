@@ -497,8 +497,12 @@ impl SqlEditorWidget {
         if select_formatted {
             let original_within_selection =
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
-            let mapped_within_selection =
-                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
+            let mapped_within_selection = Self::map_cursor_after_format_with_policy(
+                &source,
+                &formatted,
+                original_within_selection,
+                true,
+            );
             let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
             let mapped_cursor =
                 start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
@@ -546,6 +550,15 @@ impl SqlEditorWidget {
     }
 
     fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
+        Self::map_cursor_after_format_with_policy(source, formatted, original_pos, false)
+    }
+
+    fn map_cursor_after_format_with_policy(
+        source: &str,
+        formatted: &str,
+        original_pos: i32,
+        selected_only: bool,
+    ) -> i32 {
         if original_pos <= 0 {
             return 0;
         }
@@ -561,7 +574,11 @@ impl SqlEditorWidget {
         }
 
         let source_prefix = &source[..source_pos];
-        let formatted_prefix = Self::format_sql_basic(source_prefix);
+        let formatted_prefix = if selected_only {
+            Self::format_for_auto_formatting(source_prefix, true)
+        } else {
+            Self::format_sql_basic(source_prefix)
+        };
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -807,7 +824,10 @@ impl SqlEditorWidget {
         Self::format_sql_basic_with_terminator_policy(sql, true)
     }
 
-    fn format_sql_basic_with_terminator_policy(sql: &str, append_missing_terminator: bool) -> String {
+    fn format_sql_basic_with_terminator_policy(
+        sql: &str,
+        append_missing_terminator: bool,
+    ) -> String {
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = super::query_text::split_format_items(sql);
         if items.is_empty() {
@@ -9942,6 +9962,50 @@ END;"#;
     }
 
     #[test]
+    fn selected_auto_format_cursor_mapping_matches_selected_terminator_policy() {
+        let source = "select 1 from dual";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("dual").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source, &formatted, source_pos, true,
+        ) as usize;
+
+        assert!(
+            mapped <= formatted.len() && formatted.is_char_boundary(mapped),
+            "mapped cursor should stay on a valid UTF-8 boundary"
+        );
+        assert!(
+            formatted[mapped..].trim_start().starts_with("DUAL"),
+            "cursor should remain anchored near DUAL token after selected formatting, got: {}",
+            &formatted[mapped..]
+        );
+    }
+
+    #[test]
+    fn selected_auto_format_cursor_mapping_handles_trailing_inline_comment_without_injected_semicolon(
+    ) {
+        let source = "select 1 from dual -- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("-- trailing note").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
+            source, &formatted, source_pos, true,
+        ) as usize;
+
+        assert!(
+            formatted[mapped..]
+                .trim_start()
+                .starts_with("-- trailing note"),
+            "cursor should remain near inline comment after selected formatting, got: {}",
+            &formatted[mapped..]
+        );
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "selected formatting should preserve missing semicolon"
+        );
+    }
+    #[test]
     fn map_cursor_after_format_clamps_mid_utf8_byte_without_panic() {
         let source = "SELECT 한글, b FROM dual";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -10532,8 +10596,7 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     }
 
     #[test]
-    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_block_comment()
-    {
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_newline_block_comment() {
         let source = "SELECT 1 FROM dual\n/* trailing block */";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
