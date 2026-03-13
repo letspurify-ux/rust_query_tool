@@ -589,6 +589,7 @@ pub(crate) const FORMAT_CLAUSE_KEYWORDS: &[&str] = &[
     "UPDATE",
     "DELETE",
     "MERGE",
+    "USING",
     "VALUES",
     "SET",
     "INTO",
