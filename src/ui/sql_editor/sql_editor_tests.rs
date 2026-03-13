@@ -543,6 +543,35 @@ fn format_sql_preserves_mega_torture_script() {
 }
 
 #[test]
+fn format_sql_preserves_test15_nested_q_quote_script() {
+    let input = load_test_file("test15.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "CREATE OR REPLACE PACKAGE BODY qt_splitter_pkg",
+        "payload = q'[dynamic ; payload / still string]'",
+        "END qt_splitter_pkg;",
+        "CREATE OR REPLACE TRIGGER qt_splitter_biu",
+        "WITH base_data AS",
+    ];
+
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for test15.sql"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test15.sql"
+    );
+}
+
+#[test]
 fn format_sql_preserves_whenever_sqlerror_options() {
     let input = [
         "WHENEVER SQLERROR EXIT SQL.SQLCODE",

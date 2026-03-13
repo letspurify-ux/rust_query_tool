@@ -310,6 +310,49 @@ SELECT 1 FROM dual;"#;
 }
 
 #[test]
+fn test_split_format_items_test15_nested_q_quote_package_body_regression() {
+    let sql = load_query_test_file("test15.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 6, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_pkg")
+                && stmt.contains("payload = q'[dynamic ; payload / still string]'")
+                && stmt.contains("END qt_splitter_pkg")
+        }),
+        "package body with nested q-quote should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_splitter_proc")
+                && stmt.contains("END qt_splitter_proc")
+        }),
+        "stored procedure should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_splitter_proc"),
+        "orphan END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
     let sql = "SELECT 1 FROM dual;\nSELECT 한글 AS txt FROM dual;";
     let utf8_start = sql

@@ -3032,7 +3032,94 @@ impl QueryExecutor {
         for stmt in builder.finalize_and_take_statements() {
             add_statement(stmt, &mut items);
         }
-        items
+        Self::merge_fragmented_standalone_routine_format_items(items)
+    }
+
+    fn merge_fragmented_standalone_routine_format_items(items: Vec<FormatItem>) -> Vec<FormatItem> {
+        let mut merged: Vec<FormatItem> = Vec::with_capacity(items.len());
+        let mut index = 0usize;
+
+        while index < items.len() {
+            if let Some((combined, end_index)) =
+                Self::combine_fragmented_standalone_routine_format_statement(&items, index)
+            {
+                merged.push(FormatItem::Statement(combined));
+                index = end_index + 1;
+                continue;
+            }
+
+            match items.get(index) {
+                Some(item) => merged.push(item.clone()),
+                None => {}
+            }
+            index += 1;
+        }
+
+        merged
+    }
+
+    fn combine_fragmented_standalone_routine_format_statement(
+        items: &[FormatItem],
+        start_index: usize,
+    ) -> Option<(String, usize)> {
+        let statement = match items.get(start_index) {
+            Some(FormatItem::Statement(statement)) => statement,
+            _ => return None,
+        };
+
+        let routine_name = Self::extract_standalone_routine_name(statement)?;
+        if Self::statement_has_matching_end_label(statement, routine_name.as_str()) {
+            return None;
+        }
+
+        let mut end_index = start_index + 1;
+        while end_index < items.len() {
+            match items.get(end_index) {
+                Some(FormatItem::Statement(next_statement)) => {
+                    if Self::is_orphan_end_label_statement_matching_routine(
+                        next_statement,
+                        routine_name.as_str(),
+                    ) {
+                        return Self::combine_format_statement_range(items, start_index, end_index)
+                            .map(|combined| (combined, end_index));
+                    }
+
+                    if Self::starts_new_top_level_create_statement(next_statement) {
+                        return None;
+                    }
+                }
+                Some(FormatItem::Slash)
+                | Some(FormatItem::ToolCommand(_))
+                | Some(FormatItem::Verbatim(_))
+                | None => return None,
+            }
+            end_index += 1;
+        }
+
+        None
+    }
+
+    fn combine_format_statement_range(
+        items: &[FormatItem],
+        start_index: usize,
+        end_index: usize,
+    ) -> Option<String> {
+        let fragments = items[start_index..=end_index]
+            .iter()
+            .filter_map(|item| match item {
+                FormatItem::Statement(statement) => Some(statement.trim()),
+                FormatItem::ToolCommand(_) | FormatItem::Verbatim(_) | FormatItem::Slash => None,
+            })
+            .filter(|statement| !statement.is_empty())
+            .collect::<Vec<_>>();
+
+        if fragments.is_empty() {
+            return None;
+        }
+
+        let mut combined = fragments.join(";\n");
+        combined.push(';');
+        Some(combined)
     }
 
     /// Core split loop used by `split_script_items`.

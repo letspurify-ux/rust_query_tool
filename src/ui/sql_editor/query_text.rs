@@ -68,6 +68,56 @@ impl PendingTailTokenKind {
     }
 }
 
+#[inline]
+fn is_literal_prefix_boundary(bytes: &[u8], idx: usize) -> bool {
+    idx == 0
+        || !bytes
+            .get(idx - 1)
+            .copied()
+            .is_some_and(sql_text::is_identifier_byte)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QQuoteStart {
+    prefix_len: usize,
+    closing: char,
+}
+
+fn detect_q_quote_start(text: &str, idx: usize) -> Option<QQuoteStart> {
+    let suffix = text.get(idx..)?;
+    let mut chars = suffix.char_indices();
+    let (_, first) = chars.next()?;
+
+    let delimiter = match first {
+        'q' | 'Q' => {
+            let (_, quote) = chars.next()?;
+            if quote != '\'' {
+                return None;
+            }
+            chars.next()?
+        }
+        'n' | 'N' | 'u' | 'U' => {
+            let (_, q_char) = chars.next()?;
+            let (_, quote) = chars.next()?;
+            if !matches!(q_char, 'q' | 'Q') || quote != '\'' {
+                return None;
+            }
+            chars.next()?
+        }
+        _ => return None,
+    };
+
+    let (delimiter_offset, delimiter_char) = delimiter;
+    if !sql_text::is_valid_q_quote_delimiter(delimiter_char) {
+        return None;
+    }
+
+    Some(QQuoteStart {
+        prefix_len: delimiter_offset + delimiter_char.len_utf8(),
+        closing: sql_text::q_quote_closing(delimiter_char),
+    })
+}
+
 /// SQL 문자열을 토큰 단위로 분해합니다.
 ///
 /// 기존 에디터 토크나이저 동작(문자열, 주석, 라벨, 심벌 처리)을 유지합니다.
@@ -81,6 +131,7 @@ pub(crate) fn tokenize_sql(sql: &str) -> Vec<SqlToken> {
 pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
     let mut tokens = Vec::new();
     let mut iter = sql.char_indices().peekable();
+    let sql_bytes = sql.as_bytes();
     let mut current = String::new();
     let mut current_start = 0usize;
     let mut scan_state = SplitState::default();
@@ -168,17 +219,56 @@ pub(crate) fn tokenize_sql_spanned(sql: &str) -> Vec<SqlTokenSpan> {
             scan_state.lex_mode,
             crate::sql_parser_engine::LexMode::QQuote { .. }
         ) {
-            current.push(c);
-            if Some(c) == scan_state.q_quote_end() && next == Some('\'') {
-                iter.next();
-                current.push('\'');
+            let mut nested_prefix_end = None;
+            let mut should_emit = None;
+
+            if let crate::sql_parser_engine::LexMode::QQuote { end_char, depth } =
+                &mut scan_state.lex_mode
+            {
+                if is_literal_prefix_boundary(sql_bytes, idx) {
+                    if let Some(q_quote_start) = detect_q_quote_start(sql, idx) {
+                        if q_quote_start.closing == *end_char {
+                            let prefix_end = idx.saturating_add(q_quote_start.prefix_len);
+                            if let Some(prefix) = sql.get(idx..prefix_end) {
+                                current.push_str(prefix);
+                                *depth = depth.saturating_add(1);
+                                nested_prefix_end = Some(prefix_end);
+                            }
+                        }
+                    }
+                }
+
+                if nested_prefix_end.is_none() {
+                    current.push(c);
+                    if c == *end_char && next == Some('\'') {
+                        iter.next();
+                        current.push('\'');
+                        if *depth == 1 {
+                            should_emit = Some(idx + 2);
+                        } else {
+                            *depth -= 1;
+                        }
+                    }
+                }
+            }
+
+            if let Some(prefix_end) = nested_prefix_end {
+                while iter
+                    .peek()
+                    .is_some_and(|(next_idx, _)| *next_idx < prefix_end)
+                {
+                    let _ = iter.next();
+                }
+                continue;
+            }
+
+            if let Some(end) = should_emit {
                 tokens.push(SqlTokenSpan {
                     token: SqlToken::String(std::mem::take(&mut current)),
                     start: current_start,
-                    end: idx + 2,
+                    end,
                 });
                 scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
-                continue;
             }
             continue;
         }
@@ -1295,6 +1385,47 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "uq'[문자열;유지]'")));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_nested_same_delimiter_q_quote_as_single_string() {
+        let sql = "BEGIN v_sql := q'[payload = q'[dynamic ; payload / still string]']'; END;";
+        let tokens = tokenize_sql(sql);
+        let string_tokens = tokens
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::String(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            string_tokens,
+            vec!["q'[payload = q'[dynamic ; payload / still string]']'".to_string()],
+            "nested same-delimiter q-quote should stay in one string token"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_spanned_treats_nested_same_delimiter_q_quote_as_single_span() {
+        let sql = "BEGIN v_sql := q'[payload = q'[dynamic ; payload / still string]']'; END;";
+        let string_spans = tokenize_sql_spanned(sql)
+            .into_iter()
+            .filter_map(|span| match span.token {
+                SqlToken::String(value) => Some((value, span.start, span.end)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            string_spans,
+            vec![(
+                "q'[payload = q'[dynamic ; payload / still string]']'".to_string(),
+                15,
+                67,
+            )],
+            "nested same-delimiter q-quote should stay in one spanned string token"
+        );
     }
 
     #[test]
