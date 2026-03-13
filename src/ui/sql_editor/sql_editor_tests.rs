@@ -1,6 +1,6 @@
 use super::*;
 use crate::ui::syntax_highlight::{
-    STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_IDENTIFIER, STYLE_KEYWORD,
+    STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DEFAULT, STYLE_HINT, STYLE_KEYWORD,
     STYLE_QUOTED_IDENTIFIER, STYLE_Q_QUOTE_STRING, STYLE_STRING,
 };
 
@@ -158,11 +158,9 @@ fn continuation_style_before_position_for_text(style_text: &str, pos: usize) -> 
         .unwrap_or(STYLE_DEFAULT);
     if matches!(
         style,
-        STYLE_COMMENT
-            | STYLE_BLOCK_COMMENT
+        STYLE_BLOCK_COMMENT
             | STYLE_STRING
             | STYLE_Q_QUOTE_STRING
-            | STYLE_IDENTIFIER
             | STYLE_QUOTED_IDENTIFIER
             | STYLE_HINT
     ) {
@@ -1419,8 +1417,8 @@ fn compute_incremental_start_clamps_to_utf8_boundary() {
 }
 
 #[test]
-fn is_string_or_comment_style_matches_only_comment_or_string() {
-    assert!(is_string_or_comment_style(STYLE_COMMENT));
+fn is_string_or_comment_style_matches_only_multiline_continuations() {
+    assert!(!is_string_or_comment_style(STYLE_COMMENT));
     assert!(is_string_or_comment_style(STYLE_STRING));
     assert!(!is_string_or_comment_style(STYLE_DEFAULT));
     assert!(!is_string_or_comment_style(STYLE_KEYWORD));
@@ -1488,6 +1486,44 @@ fn incremental_highlighting_matches_full_styles_after_inserting_single_quote() {
     );
 
     let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 1, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_inserting_line_comment_prefix() {
+    let original = "SELECT 1
+value
+SELECT 2";
+    let insert_pos = original.find("value").unwrap_or(0);
+    let updated = format!(
+        "{}-- {}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 3, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_deleting_line_comment_prefix() {
+    let original = "SELECT 1
+-- value
+SELECT 2";
+    let delete_pos = original.find("-- ").unwrap_or(0);
+    let updated = format!(
+        "{}{}",
+        original.get(..delete_pos).unwrap_or(""),
+        original.get(delete_pos.saturating_add(3)..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, delete_pos, 0, 3)
         .unwrap_or_default();
     let full = SqlHighlighter::new().generate_styles_for_text(&updated);
 

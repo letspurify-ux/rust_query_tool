@@ -25,7 +25,7 @@ use crate::ui::intellisense::{IntellisenseData, IntellisensePopup};
 use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
 use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
-    create_style_table_with, HighlightData, SqlHighlighter, STYLE_COMMENT, STYLE_STRING,
+    create_style_table_with, HighlightData, SqlHighlighter, STYLE_STRING,
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
