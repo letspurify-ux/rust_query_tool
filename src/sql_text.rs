@@ -1189,6 +1189,12 @@ fn next_meaningful_word(line: &str, skip_words: usize) -> Option<(&str, usize)> 
     None
 }
 
+/// Returns the first meaningful token-like word on a line, skipping
+/// leading whitespace and comments.
+pub(crate) fn first_meaningful_word(line: &str) -> Option<&str> {
+    next_meaningful_word(line, 0).map(|(word, _)| word)
+}
+
 /// Returns true when a keyword can head a subquery body after `(`.
 pub(crate) fn is_subquery_head_keyword(word: &str) -> bool {
     matches_keyword(word, SUBQUERY_HEAD_KEYWORDS)
