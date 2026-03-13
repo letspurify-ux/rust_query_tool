@@ -579,11 +579,40 @@ impl SqlEditorWidget {
     }
 
     fn removable_trailing_semicolon_span(formatted: &str) -> Option<(usize, usize)> {
-        let trimmed_len = formatted.trim_end().len();
+        let mut trimmed_len = formatted.trim_end().len();
+        while trimmed_len > 0 {
+            let prefix = &formatted[..trimmed_len];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trimmed_len];
+            let line_trimmed = line.trim_start();
+
+            let is_trailing_comment_line = line_trimmed.starts_with("--")
+                || Self::is_sqlplus_remark_comment_statement(line_trimmed);
+
+            if !is_trailing_comment_line {
+                break;
+            }
+
+            trimmed_len = prefix[..line_start].trim_end().len();
+        }
+
         if trimmed_len == 0 {
             return None;
         }
         let trimmed = &formatted[..trimmed_len];
+        if let Some(last_line_start) = trimmed.rfind('\n').map(|idx| idx + 1).or(Some(0)) {
+            let last_line = &trimmed[last_line_start..];
+            let leading_ws = last_line.len().saturating_sub(last_line.trim_start().len());
+            let last_line_trimmed = &last_line[leading_ws..];
+            if let Some(rest) = last_line_trimmed.strip_prefix(';') {
+                let rest_trimmed = rest.trim_start();
+                if Self::is_sqlplus_remark_comment_statement(rest_trimmed) {
+                    let semicolon_start = last_line_start + leading_ws;
+                    return Some((semicolon_start, semicolon_start + 1));
+                }
+            }
+        }
+
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
 
         let mut semicolon_span: Option<(usize, usize)> = None;
@@ -10417,6 +10446,50 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Formatter should not append semicolon when original selection had none, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_rem_line() {
+        let source = "SELECT 1 FROM dual
+REM trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !preserved.contains(';'),
+            "Inserted semicolon should be removed when trailing REM line follows a statement with no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("REM trailing script comment"),
+            "Trailing REM line should be preserved, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_remark_line() {
+        let source = "SELECT 1 FROM dual
+REMARK trailing script comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            !preserved.contains(';'),
+            "Inserted semicolon should be removed when trailing REMARK line follows a statement with no terminator, got:
+{}",
+            preserved
+        );
+        assert!(
+            preserved.contains("REMARK trailing script comment"),
+            "Trailing REMARK line should be preserved, got:
+{}",
             preserved
         );
     }
