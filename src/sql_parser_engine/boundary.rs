@@ -239,7 +239,17 @@ impl RoutineFrame {
                 | ExternalClauseState::SawMleKeyword
                 | ExternalClauseState::AwaitingLanguageTargetFromExternal
                 | ExternalClauseState::AwaitingLanguageTargetImplicit
+                | ExternalClauseState::SawImplicitQuotedLanguageTarget
                 | ExternalClauseState::SawImplicitLanguageTarget
+        )
+    }
+
+    fn pending_external_clause_requires_top_level_split(self) -> bool {
+        matches!(
+            self.external_clause_state,
+            ExternalClauseState::SawImplicitQuotedLanguageTarget
+                | ExternalClauseState::SawImplicitLanguageTarget
+                | ExternalClauseState::AwaitingLanguageTargetImplicit
         )
     }
 
@@ -464,6 +474,9 @@ impl RoutineFrame {
             | ExternalClauseState::SawUsingClauseSubject
             | ExternalClauseState::SawMleKeyword => {
                 self.mark_external_clause();
+            }
+            ExternalClauseState::SawImplicitQuotedLanguageTarget => {
+                self.external_clause_state = ExternalClauseState::None;
             }
             ExternalClauseState::SawImplicitLanguageTarget
             | ExternalClauseState::AwaitingLanguageTargetImplicit => {
