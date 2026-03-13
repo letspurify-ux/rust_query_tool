@@ -512,7 +512,11 @@ impl SqlEditorWidget {
     }
 
     fn format_for_auto_formatting(source: &str, selected_only: bool) -> String {
-        let formatted = Self::format_sql_basic(source);
+        let formatted = if selected_only {
+            Self::format_sql_basic_internal(source, false)
+        } else {
+            Self::format_sql_basic_internal(source, true)
+        };
         if selected_only {
             Self::preserve_selected_text_terminator(source, formatted)
         } else {
@@ -800,6 +804,10 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn format_sql_basic(sql: &str) -> String {
+        Self::format_sql_basic_internal(sql, true)
+    }
+
+    fn format_sql_basic_internal(sql: &str, append_missing_terminators: bool) -> String {
         let mut formatted = String::with_capacity(sql.len().saturating_add(64));
         let items = super::query_text::split_format_items(sql);
         if items.is_empty() {
@@ -820,7 +828,10 @@ impl SqlEditorWidget {
                     );
                     let has_code = Self::statement_has_code(statement, &statement_tokens);
                     let mut formatted_statement = formatted_statement;
-                    if has_code && !Self::statement_ends_with_semicolon_tokens(&statement_tokens) {
+                    if append_missing_terminators
+                        && has_code
+                        && !Self::statement_ends_with_semicolon_tokens(&statement_tokens)
+                    {
                         Self::append_missing_statement_terminator(&mut formatted_statement);
                     }
                     formatted.push_str(&formatted_statement);
@@ -10298,6 +10309,42 @@ FROM DUAL"
             !formatted.trim_end().ends_with(';'),
             "Selected auto-formatting should preserve a missing terminator, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_does_not_insert_missing_semicolon_before_tool_command() {
+        let source = "SELECT 1 FROM dual\nPROMPT done";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains("SELECT 1\nFROM DUAL\n\nPROMPT done"),
+            "Selected auto-formatting should not inject statement semicolons before a following tool command, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("FROM DUAL;"),
+            "Selected auto-formatting should preserve missing semicolon from the source, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_does_not_insert_missing_semicolon_in_multistatement_selection() {
+        let source = "SELECT 1 FROM dual\n\nSELECT 2 FROM dual";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains("SELECT 1\nFROM DUAL\nSELECT 2\nFROM DUAL"),
+            "Selected auto-formatting should keep both statements unterminated when source did not include semicolons, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("FROM DUAL;"),
+            "Selected auto-formatting should not append semicolons in multi-statement selections, got:\n{}",
             formatted
         );
     }
