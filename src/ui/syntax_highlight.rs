@@ -728,22 +728,7 @@ impl SqlHighlighter {
                 || (byte == b'.' && bytes.get(idx + 1).is_some_and(|b| b.is_ascii_digit()))
             {
                 let start = idx;
-                let mut number_state = if byte == b'.' {
-                    NumberScanState::Fraction
-                } else {
-                    NumberScanState::Integer
-                };
-                idx += 1;
-                while let Some(&next_byte) = bytes.get(idx) {
-                    if next_byte.is_ascii_digit() {
-                        idx += 1;
-                    } else if next_byte == b'.' && number_state == NumberScanState::Integer {
-                        number_state = NumberScanState::Fraction;
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
+                idx = scan_number_end(bytes, idx);
                 styles[start..idx].fill(STYLE_NUMBER as u8);
                 expect_alias_identifier = false;
                 continue;
@@ -1335,6 +1320,60 @@ fn scan_until_double_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
         }
     }
 }
+
+fn scan_number_end(bytes: &[u8], start_idx: usize) -> usize {
+    let Some(&first_byte) = bytes.get(start_idx) else {
+        return start_idx;
+    };
+
+    let mut idx = start_idx + 1;
+    let mut number_state = if first_byte == b'.' {
+        NumberScanState::Fraction
+    } else {
+        NumberScanState::Integer
+    };
+
+    while let Some(&next_byte) = bytes.get(idx) {
+        if next_byte.is_ascii_digit() {
+            idx += 1;
+            continue;
+        }
+
+        if next_byte == b'.' && number_state == NumberScanState::Integer {
+            number_state = NumberScanState::Fraction;
+            idx += 1;
+            continue;
+        }
+
+        if (next_byte == b'e' || next_byte == b'E')
+            && bytes
+                .get(idx + 1)
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'+' || *b == b'-')
+        {
+            let mut exp_idx = idx + 1;
+            if bytes
+                .get(exp_idx)
+                .is_some_and(|b| *b == b'+' || *b == b'-')
+            {
+                exp_idx += 1;
+            }
+
+            if bytes.get(exp_idx).is_none_or(|b| !b.is_ascii_digit()) {
+                break;
+            }
+
+            idx = exp_idx + 1;
+            while bytes.get(idx).is_some_and(|b| b.is_ascii_digit()) {
+                idx += 1;
+            }
+        }
+
+        break;
+    }
+
+    idx
+}
+
 fn is_operator_byte(byte: u8) -> bool {
     matches!(
         byte,
