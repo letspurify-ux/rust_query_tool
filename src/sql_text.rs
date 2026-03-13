@@ -702,6 +702,8 @@ const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "PARAMETERS",
     "CALLING",
     "WITH",
+    "IMPORTS",
+    "EXPORTS",
 ];
 
 const SQLPLUS_SET_OPTION_KEYWORDS: &[&str] = &[

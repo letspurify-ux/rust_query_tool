@@ -324,7 +324,10 @@ impl RoutineFrame {
             return;
         }
 
-        if matches!(token_upper, "MODULE" | "SIGNATURE" | "ENV" | "ENVIRONMENT") {
+        if matches!(
+            token_upper,
+            "MODULE" | "SIGNATURE" | "ENV" | "ENVIRONMENT" | "IMPORTS" | "EXPORTS"
+        ) {
             if matches!(
                 self.external_clause_state,
                 ExternalClauseState::SawMleKeyword
