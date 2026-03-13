@@ -34,7 +34,7 @@ pub(crate) struct SplitState {
     timing_point_state: TimingPointState,
     saw_compound_keyword: bool,
     saw_trigger_alias_subject: bool,
-    package_body_name: Option<String>,
+    package_body_name_segments: Vec<String>,
     awaiting_package_body_name: bool,
     awaiting_package_body_name_dot: bool,
 
@@ -49,7 +49,7 @@ pub(crate) struct SplitState {
     token_upper_buf: String,
     quoted_identifier_buf: String,
     pending_implicit_external_top_level_split: bool,
-    pending_end_label_token: Option<String>,
+    pending_end_label_segments: Vec<String>,
     skip_next_end_label_token: bool,
 }
 
@@ -380,28 +380,17 @@ impl SplitState {
     }
 
     fn package_body_end_label_matches(&self, token_upper: &str) -> bool {
-        let Some(package_name) = self.package_body_name.as_deref() else {
+        if self.package_body_name_segments.is_empty() {
             return false;
-        };
-
-        if package_name == token_upper {
-            return true;
         }
 
-        let mut package_segments = package_name.split('.');
-        let package_last_segment = package_segments.next_back();
-
-        if package_segments.next().is_none() {
-            return token_upper
-                .rsplit('.')
-                .next()
-                .is_some_and(|segment| Some(segment) == package_last_segment);
+        if self.package_body_name_segments.len() == 1 {
+            return token_upper == self.package_body_name_segments[0];
         }
 
-        token_upper
-            .split('.')
-            .collect::<Vec<_>>()
-            .ends_with(&package_name.split('.').collect::<Vec<_>>())
+        self.package_body_name_segments
+            .last()
+            .is_some_and(|last_segment| token_upper == last_segment)
     }
 
     fn push_pending_end_label_segment(&mut self, token_upper: &str) {
@@ -409,18 +398,7 @@ impl SplitState {
             return;
         }
 
-        match self.pending_end_label_token.as_mut() {
-            Some(label) if !label.is_empty() => {
-                label.push('.');
-                label.push_str(token_upper);
-            }
-            Some(label) => {
-                label.push_str(token_upper);
-            }
-            None => {
-                self.pending_end_label_token = Some(token_upper.to_string());
-            }
-        }
+        self.pending_end_label_segments.push(token_upper.to_string());
     }
 
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
@@ -428,7 +406,11 @@ impl SplitState {
             return;
         }
 
-        let pending_end_label = self.pending_end_label_token.clone().unwrap_or_default();
+        let pending_end_label = self
+            .pending_end_label_segments
+            .last()
+            .cloned()
+            .unwrap_or_default();
         self.resolve_plain_end(&pending_end_label);
         if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
@@ -437,7 +419,7 @@ impl SplitState {
             self.reset_create_tracking_state();
         }
         self.pending_end = PendingEnd::None;
-        self.pending_end_label_token = None;
+        self.pending_end_label_segments.clear();
     }
 
     // -- Convenience accessors --------------------------------------------------
@@ -690,7 +672,7 @@ impl SplitState {
         if token_upper == "END" && suffix.is_none() {
             self.resolve_plain_end("");
             self.pending_end = PendingEnd::End;
-            self.pending_end_label_token = None;
+            self.pending_end_label_segments.clear();
             self.skip_next_end_label_token = false;
             return true;
         }
@@ -703,7 +685,7 @@ impl SplitState {
                 self.resolve_plain_end(token_upper);
             }
             self.pending_end = PendingEnd::None;
-            self.pending_end_label_token = None;
+            self.pending_end_label_segments.clear();
             self.skip_next_end_label_token = true;
             return true;
         }
@@ -711,7 +693,7 @@ impl SplitState {
         // Plain END – CASE expression or PL/SQL block
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
-        self.pending_end_label_token = None;
+        self.pending_end_label_segments.clear();
         self.skip_next_end_label_token = true;
         true
     }
@@ -1067,7 +1049,7 @@ impl SplitState {
 
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
-        self.pending_end_label_token = None;
+        self.pending_end_label_segments.clear();
     }
 
     pub(crate) fn resolve_pending_end_on_terminator(&mut self) {
@@ -1232,7 +1214,7 @@ impl SplitState {
 
     fn reset_statement_boundary_state(&mut self) {
         self.pending_end = PendingEnd::None;
-        self.pending_end_label_token = None;
+        self.pending_end_label_segments.clear();
         self.skip_next_end_label_token = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
@@ -1245,7 +1227,7 @@ impl SplitState {
     pub(crate) fn reset_create_tracking_state(&mut self) {
         self.create_plsql_kind = CreatePlsqlKind::None;
         self.create_state = CreateState::None;
-        self.package_body_name = None;
+        self.package_body_name_segments.clear();
         self.awaiting_package_body_name = false;
         self.awaiting_package_body_name_dot = false;
         self.as_is_follow_state = AsIsFollowState::None;
@@ -1302,9 +1284,9 @@ impl SplitState {
         if self.block_depth() == 0
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
             && self.awaiting_package_body_name
-            && (self.package_body_name.is_none() || self.awaiting_package_body_name_dot)
+            && (self.package_body_name_segments.is_empty() || self.awaiting_package_body_name_dot)
         {
-            self.package_body_name = Some(upper.to_string());
+            self.package_body_name_segments.push(upper.to_string());
             self.awaiting_package_body_name_dot = false;
         }
     }
@@ -1320,7 +1302,7 @@ impl SplitState {
         }
 
         match ch {
-            '.' if self.package_body_name.is_some() => {
+            '.' if !self.package_body_name_segments.is_empty() => {
                 self.awaiting_package_body_name_dot = true;
             }
             _ if !ch.is_whitespace() => {
@@ -1353,7 +1335,7 @@ impl SplitState {
                 && upper == "BODY"
             {
                 self.create_plsql_kind = CreatePlsqlKind::PackageBody;
-                self.package_body_name = None;
+                self.package_body_name_segments.clear();
                 self.awaiting_package_body_name = true;
                 self.awaiting_package_body_name_dot = false;
                 return;
@@ -1366,8 +1348,10 @@ impl SplitState {
                 if matches!(upper, "AS" | "IS") {
                     self.awaiting_package_body_name = false;
                     self.awaiting_package_body_name_dot = false;
-                } else if self.package_body_name.is_none() || self.awaiting_package_body_name_dot {
-                    self.package_body_name = Some(upper.to_string());
+                } else if self.package_body_name_segments.is_empty()
+                    || self.awaiting_package_body_name_dot
+                {
+                    self.package_body_name_segments.push(upper.to_string());
                     self.awaiting_package_body_name_dot = false;
                 }
             }
