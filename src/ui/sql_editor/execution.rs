@@ -485,7 +485,7 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_sql_basic(&source);
+        let formatted = Self::format_source_for_replacement(&source, select_formatted);
         if formatted == source {
             return;
         }
@@ -509,6 +509,15 @@ impl SqlEditorWidget {
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
+    }
+
+    fn format_source_for_replacement(source: &str, preserve_selection_terminator: bool) -> String {
+        let formatted = Self::format_sql_basic(source);
+        if preserve_selection_terminator {
+            return Self::preserve_selected_text_terminator(source, formatted);
+        }
+
+        formatted
     }
 
     fn normalize_index(text: &str, index: i32) -> usize {
@@ -10275,14 +10284,43 @@ FROM DUAL"
     }
 
     #[test]
-    fn selected_formatting_path_keeps_canonical_statement_semicolon() {
+    fn selected_formatting_path_removes_inserted_statement_semicolon() {
         let source = "SELECT 1 FROM dual";
-        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let formatted = SqlEditorWidget::format_source_for_replacement(source, true);
+
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&formatted),
+            "Selection formatting should preserve missing source terminator, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn full_document_formatting_path_keeps_canonical_statement_semicolon() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_source_for_replacement(source, false);
 
         assert!(
             formatted.trim_end().ends_with(';'),
-            "Selection formatting now follows canonical formatter output, got:
-{}",
+            "Whole-document formatting should keep canonical terminator insertion, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_formatting_path_removes_inserted_semicolon_before_sqlplus_slash() {
+        let source = "CREATE OR REPLACE VIEW v_test AS SELECT 1 FROM dual\n/";
+        let formatted = SqlEditorWidget::format_source_for_replacement(source, true);
+
+        assert!(
+            formatted.contains("FROM DUAL\n/"),
+            "Selection formatting should keep slash on next line without injected semicolon, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("FROM DUAL;\n/"),
+            "Selection formatting must remove injected semicolon before SQL*Plus slash, got:\n{}",
             formatted
         );
     }
