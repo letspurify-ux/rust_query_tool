@@ -67,8 +67,14 @@ fn test_split_script_items_test12_if_alias_regression() {
         .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
         .count();
 
-    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
-    assert_eq!(statement_count, 44, "unexpected SQL statement split: {items:?}");
+    assert_eq!(
+        tool_command_count, 2,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 44,
+        "unexpected SQL statement split: {items:?}"
+    );
 
     let statements = get_statements(&items);
     assert!(
@@ -97,8 +103,14 @@ fn test_split_script_items_test13_keyword_alias_regression() {
         .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
         .count();
 
-    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
-    assert_eq!(statement_count, 45, "unexpected SQL statement split: {items:?}");
+    assert_eq!(
+        tool_command_count, 2,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 45,
+        "unexpected SQL statement split: {items:?}"
+    );
 
     let statements = get_statements(&items);
     assert!(
@@ -129,8 +141,14 @@ fn test_split_script_items_test14_deep_monster_view_regression() {
         .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
         .count();
 
-    assert_eq!(tool_command_count, 2, "unexpected tool command split: {items:?}");
-    assert_eq!(statement_count, 13, "unexpected SQL statement split: {items:?}");
+    assert_eq!(
+        tool_command_count, 2,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 13,
+        "unexpected SQL statement split: {items:?}"
+    );
 
     let statements = get_statements(&items);
     assert!(
@@ -9815,6 +9833,82 @@ fn test_split_script_items_oracle_with_function_keeps_single_statement_until_mai
     assert!(
         stmts[0].contains("SELECT f() FROM dual"),
         "first statement should include main SELECT: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_script_items_oracle_with_function_and_search_cycle_keeps_single_statement() {
+    let sql = "WITH\n  FUNCTION f(p_id NUMBER) RETURN NUMBER IS\n  BEGIN\n    RETURN p_id;\n  END;\n  t (id, parent_id) AS (\n    SELECT 1, NULL FROM dual\n    UNION ALL\n    SELECT id + 1, id FROM t WHERE id < 3\n  )\nSEARCH DEPTH FIRST BY id SET order_col\nCYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'\nSELECT f(id), parent_id FROM t;\nSELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION + SEARCH/CYCLE should remain a single statement before trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("FUNCTION f(p_id NUMBER) RETURN NUMBER IS"),
+        "first statement should keep WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SEARCH DEPTH FIRST BY id SET order_col"),
+        "SEARCH clause should remain in the same statement: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("CYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'"),
+        "CYCLE clause should remain in the same statement: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f(id), parent_id FROM t"),
+        "main SELECT should remain in first statement: {}",
+        stmts[0]
+    );
+    assert!(stmts[1].starts_with("SELECT 2 FROM dual"));
+}
+
+#[test]
+fn test_split_format_items_oracle_with_function_and_search_cycle_keeps_single_statement() {
+    let sql = "WITH\n  FUNCTION f(p_id NUMBER) RETURN NUMBER IS\n  BEGIN\n    RETURN p_id;\n  END;\n  t (id, parent_id) AS (\n    SELECT 1, NULL FROM dual\n    UNION ALL\n    SELECT id + 1, id FROM t WHERE id < 3\n  )\nSEARCH DEPTH FIRST BY id SET order_col\nCYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'\nSELECT f(id), parent_id FROM t;\nSELECT 2 FROM dual;";
+
+    let items = QueryExecutor::split_format_items(sql);
+    let stmts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        stmts.len(),
+        2,
+        "WITH FUNCTION + SEARCH/CYCLE should remain a single format statement before trailing SELECT: {stmts:?}"
+    );
+    assert!(
+        stmts[0].contains("FUNCTION f(p_id NUMBER) RETURN NUMBER IS"),
+        "first statement should keep WITH FUNCTION declaration: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SEARCH DEPTH FIRST BY id SET order_col"),
+        "SEARCH clause should remain in the same format statement: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("CYCLE id SET cycle_mark TO 'Y' DEFAULT 'N'"),
+        "CYCLE clause should remain in the same format statement: {}",
+        stmts[0]
+    );
+    assert!(
+        stmts[0].contains("SELECT f(id), parent_id FROM t"),
+        "main SELECT should remain in first format statement: {}",
         stmts[0]
     );
     assert!(stmts[1].starts_with("SELECT 2 FROM dual"));

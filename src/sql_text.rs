@@ -655,6 +655,9 @@ pub static ORACLE_SQL_KEYWORDS_SET: Lazy<HashSet<&'static str>> =
 
 const WITH_MAIN_QUERY_KEYWORDS: &[&str] = &[
     "WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL", "VALUES", "TABLE",
+    // Recursive subquery factoring clauses that can appear before the main query
+    // and should keep WITH FUNCTION/PROCEDURE parsing attached to the same statement.
+    "SEARCH", "CYCLE",
 ];
 
 pub(crate) const SUBQUERY_HEAD_KEYWORDS: &[&str] = &[
