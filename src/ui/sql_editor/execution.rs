@@ -953,7 +953,22 @@ impl SqlEditorWidget {
     }
 
     fn statement_ends_with_semicolon(statement: &str) -> bool {
-        let tokens = Self::tokenize_sql(statement);
+        let trimmed_len = statement.trim_end().len();
+        if trimmed_len == 0 {
+            return false;
+        }
+
+        let trimmed = &statement[..trimmed_len];
+        let last_line_start = trimmed.rfind('\n').map_or(0, |idx| idx + 1);
+        let last_line = &trimmed[last_line_start..];
+        if let Some(semicolon_idx) = last_line.rfind(';') {
+            let trailing = last_line[semicolon_idx + 1..].trim_start();
+            if Self::is_sqlplus_remark_comment_statement(trailing) {
+                return true;
+            }
+        }
+
+        let tokens = Self::tokenize_sql(trimmed);
         Self::statement_ends_with_semicolon_tokens(&tokens)
     }
 
@@ -10675,6 +10690,34 @@ REMARK trailing script comment";
         assert_eq!(
             preserved, source,
             "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_same_line_rem_comment() {
+        let source = "SELECT 1 FROM dual; REM keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should stay when SQL*Plus REM follows on the same line, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_same_line_remark_comment() {
+        let source = "SELECT 1 FROM dual; REMARK keep terminator";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should stay when SQL*Plus REMARK follows on the same line, got:\n{}",
             preserved
         );
     }
