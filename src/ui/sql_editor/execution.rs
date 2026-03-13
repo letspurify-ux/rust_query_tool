@@ -965,7 +965,20 @@ impl SqlEditorWidget {
 
     fn statement_ends_with_semicolon(statement: &str) -> bool {
         let tokens = Self::tokenize_sql(statement);
-        Self::statement_ends_with_semicolon_tokens(&tokens)
+        if Self::statement_ends_with_semicolon_tokens(&tokens) {
+            return true;
+        }
+
+        let trimmed = statement.trim_end();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        spans.iter().rev().any(|span| {
+            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+        })
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
@@ -10925,6 +10938,35 @@ END;
         assert!(!SqlEditorWidget::statement_ends_with_semicolon(
             "REMARK this is a comment with ; semicolon"
         ));
+    }
+
+    #[test]
+    fn statement_ends_with_semicolon_recognizes_semicolon_before_inline_sqlplus_remark_comment() {
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REM trailing comment"
+        ));
+        assert!(SqlEditorWidget::statement_ends_with_semicolon(
+            "SELECT 1 FROM dual; REMARK trailing comment"
+        ));
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_semicolon_before_inline_sqlplus_remark_comment() {
+        let source = "SELECT 1 FROM dual; REM trailing comment";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;") && preserved.contains("REM trailing comment"),
+            "Existing semicolon and SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Existing statement terminator before inline SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
     }
 
     #[test]
