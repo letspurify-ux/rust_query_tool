@@ -1002,8 +1002,30 @@ impl SqlEditorWidget {
             })
     }
 
+    fn trim_trailing_sqlplus_remark_lines_len(statement: &str) -> usize {
+        let mut trimmed_len = statement.trim_end().len();
+        while trimmed_len > 0 {
+            let prefix = &statement[..trimmed_len];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..trimmed_len];
+            if !Self::is_sqlplus_remark_comment_statement(line.trim_start()) {
+                break;
+            }
+
+            trimmed_len = prefix[..line_start].trim_end().len();
+        }
+
+        trimmed_len
+    }
+
     fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
-        for token in Self::tokenize_sql(statement).iter().rev() {
+        let trimmed_len = Self::trim_trailing_sqlplus_remark_lines_len(statement);
+        if trimmed_len == 0 {
+            return false;
+        }
+        let trimmed_statement = &statement[..trimmed_len];
+
+        for token in Self::tokenize_sql(trimmed_statement).iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == "/" => continue,
@@ -1012,34 +1034,33 @@ impl SqlEditorWidget {
             }
         }
 
-        let trimmed = statement.trim_end();
-        if trimmed.is_empty() {
-            return false;
-        }
-
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        let spans = super::query_text::tokenize_sql_spanned(trimmed_statement);
         spans.iter().rev().any(|span| {
             matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+                && Self::is_sqlplus_remark_comment_statement(
+                    trimmed_statement[span.end..].trim_start(),
+                )
         })
     }
 
     #[cfg(test)]
     fn statement_ends_with_semicolon(statement: &str) -> bool {
-        let tokens = Self::tokenize_sql(statement);
+        let trimmed_len = Self::trim_trailing_sqlplus_remark_lines_len(statement);
+        if trimmed_len == 0 {
+            return false;
+        }
+        let trimmed_statement = &statement[..trimmed_len];
+        let tokens = Self::tokenize_sql(trimmed_statement);
         if Self::statement_ends_with_semicolon_tokens(&tokens) {
             return true;
         }
 
-        let trimmed = statement.trim_end();
-        if trimmed.is_empty() {
-            return false;
-        }
-
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
+        let spans = super::query_text::tokenize_sql_spanned(trimmed_statement);
         spans.iter().rev().any(|span| {
             matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
+                && Self::is_sqlplus_remark_comment_statement(
+                    trimmed_statement[span.end..].trim_start(),
+                )
         })
     }
 
@@ -11182,6 +11203,54 @@ END;
         assert!(
             SqlEditorWidget::statement_ends_with_semicolon(&preserved),
             "Existing statement terminator before inline SQL*Plus REM comment should remain, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_remark_lines() {
+        let source = "SELECT 1 FROM dual\nREM trailing one\nREMARK trailing two";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL\nREM trailing one\nREMARK trailing two"),
+            "Inserted semicolon should be removed when source has trailing SQL*Plus remark lines, got:\n{}",
+            preserved
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(source),
+            "Original source should not be treated as explicitly terminated, got:\n{}",
+            source
+        );
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Preserved selected formatting should keep missing terminator before trailing SQL*Plus remark lines, got:\n{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_keeps_existing_semicolon_before_trailing_remark_lines() {
+        let source = "SELECT 1 FROM dual;\nREM trailing one\nREMARK trailing two";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("FROM DUAL;")
+                && preserved.contains("REM trailing one\nREMARK trailing two"),
+            "Existing semicolon should stay when source is explicitly terminated before trailing SQL*Plus remark lines, got:\n{}",
+            preserved
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(source),
+            "Original source with semicolon before trailing SQL*Plus remark lines should be explicitly terminated"
+        );
+        assert!(
+            SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Preserved selected formatting should keep existing terminator before trailing SQL*Plus remark lines, got:\n{}",
             preserved
         );
     }
