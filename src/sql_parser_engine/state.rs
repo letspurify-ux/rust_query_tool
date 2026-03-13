@@ -262,7 +262,7 @@ impl SplitState {
             && self.block_depth() == 0
             && self.paren_depth == 0
         {
-            let first_word = line.split_whitespace().next();
+            let first_word = sql_text::first_meaningful_word(line);
             if first_word.is_some_and(sql_text::is_statement_head_keyword)
                 && !first_word.is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
             {
@@ -316,7 +316,7 @@ impl SplitState {
             return LineBoundaryAction::None;
         }
 
-        let first_word = line.split_whitespace().next();
+        let first_word = sql_text::first_meaningful_word(line);
         if first_word.is_some_and(|word| word.eq_ignore_ascii_case("BEGIN")) {
             return LineBoundaryAction::None;
         }
