@@ -418,11 +418,9 @@ fn continuation_style_before_position(shadow: &HighlightShadowState, pos: usize)
 fn is_continuation_style(style: char) -> bool {
     matches!(
         style,
-        STYLE_COMMENT
-            | STYLE_STRING
+        STYLE_STRING
             | crate::ui::syntax_highlight::STYLE_BLOCK_COMMENT
             | crate::ui::syntax_highlight::STYLE_Q_QUOTE_STRING
-            | crate::ui::syntax_highlight::STYLE_IDENTIFIER
             | crate::ui::syntax_highlight::STYLE_QUOTED_IDENTIFIER
             | crate::ui::syntax_highlight::STYLE_HINT
     )
