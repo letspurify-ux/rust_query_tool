@@ -320,12 +320,8 @@ impl SqlHighlighter {
             });
         }
 
-        let (mut new_tail_styles, _exit_state) =
+        let (new_tail_styles, _exit_state) =
             self.generate_styles_with_state(&request.tail_text, request.entry_state);
-        if request.entry_state == LexerState::InBlockComment {
-            new_tail_styles =
-                new_tail_styles.replace(STYLE_BLOCK_COMMENT, &STYLE_COMMENT.to_string());
-        }
         if new_tail_styles.len() != request.tail_text.len() {
             return None;
         }
@@ -519,7 +515,7 @@ impl SqlHighlighter {
                 match scan_until_block_comment_end(bytes, idx, BlockCommentKind::Regular) {
                     ScanResult::Closed { next_idx } => {
                         idx = next_idx;
-                        styles[..idx].fill(STYLE_BLOCK_COMMENT as u8);
+                        styles[..idx].fill(STYLE_COMMENT as u8);
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_BLOCK_COMMENT as u8);
