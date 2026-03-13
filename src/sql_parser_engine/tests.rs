@@ -560,6 +560,47 @@ fn package_body_end_with_schema_qualified_label_splits_following_statement() {
 }
 
 #[test]
+fn package_body_end_with_fully_quoted_qualified_label_splits_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"owner\".\"pkg_q\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"owner\".\"pkg_q\";");
+    engine.process_line("SELECT 211 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END \"owner\".\"pkg_q\""),
+        "quoted qualified package body end label should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 211 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_end_label_followed_by_same_line_select_splits_correctly() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_same_line AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END owner.pkg_same_line; SELECT 212 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.pkg_same_line"),
+        "package body END label should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 212 FROM dual".to_string());
+}
+
+#[test]
 fn declare_begin_state_machine_tracks_pending_begin() {
     let mut state = SplitState::default();
 
