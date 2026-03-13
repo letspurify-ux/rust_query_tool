@@ -583,7 +583,7 @@ impl SqlParserEngine {
             if self.state.token.is_empty()
                 && c == '$'
                 && (!looks_like_oracle_conditional_compilation_flag(chars, i)
-                    || self.state.awaiting_external_language_target())
+                    || self.state.allow_external_dollar_quote_literal_start())
             {
                 if let Some(tag) = parse_dollar_quote_tag(chars, i) {
                     let tag_len = tag.len();
