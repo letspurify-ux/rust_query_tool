@@ -1618,7 +1618,7 @@ fn is_path_keyword_usage(bytes: &[u8], word_end: usize) -> bool {
     match bytes.get(look_ahead) {
         Some(b'\'') => true,
         Some(b'q' | b'Q') => bytes.get(look_ahead + 1) == Some(&b'\''),
-        Some(b'n' | b'N') => {
+        Some(b'n' | b'N' | b'u' | b'U') => {
             matches!(bytes.get(look_ahead + 1), Some(b'q' | b'Q'))
                 && bytes.get(look_ahead + 2) == Some(&b'\'')
         }
