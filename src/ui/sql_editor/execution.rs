@@ -485,10 +485,7 @@ impl SqlEditorWidget {
             }
         };
 
-        let mut formatted = Self::format_sql_basic(&source);
-        if select_formatted {
-            formatted = Self::preserve_selected_text_terminator(&source, formatted);
-        }
+        let formatted = Self::format_sql_basic(&source);
         if formatted == source {
             return;
         }
@@ -501,15 +498,14 @@ impl SqlEditorWidget {
             let original_within_selection =
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
             let mapped_within_selection =
-                Self::map_cursor_after_format(&source, &formatted, original_within_selection, true);
+                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
             let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
             let mapped_cursor =
                 start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
             buffer.select(start as i32, selection_end as i32);
             editor.set_insert_position(mapped_cursor as i32);
         } else {
-            let new_pos =
-                Self::map_cursor_after_format(&source, &formatted, original_pos as i32, false);
+            let new_pos = Self::map_cursor_after_format(&source, &formatted, original_pos as i32);
             editor.set_insert_position(new_pos);
         }
         editor.show_insert_position();
@@ -536,12 +532,7 @@ impl SqlEditorWidget {
         idx
     }
 
-    fn map_cursor_after_format(
-        source: &str,
-        formatted: &str,
-        original_pos: i32,
-        preserve_selection_terminator: bool,
-    ) -> i32 {
+    fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
         if original_pos <= 0 {
             return 0;
         }
@@ -557,11 +548,7 @@ impl SqlEditorWidget {
         }
 
         let source_prefix = &source[..source_pos];
-        let mut formatted_prefix = Self::format_sql_basic(source_prefix);
-        if preserve_selection_terminator {
-            formatted_prefix =
-                Self::preserve_selected_text_terminator(source_prefix, formatted_prefix);
-        }
+        let formatted_prefix = Self::format_sql_basic(source_prefix);
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -1385,16 +1372,16 @@ impl SqlEditorWidget {
                                 || (next_token_is_dot
                                     && matches!(
                                         current_clause.as_deref(),
-                                Some(
-                                    "SELECT"
-                                        | "FROM"
-                                        | "WHERE"
-                                        | "ON"
-                                        | "GROUP"
-                                        | "HAVING"
-                                        | "ORDER"
-                                )
-                            )));
+                                        Some(
+                                            "SELECT"
+                                                | "FROM"
+                                                | "WHERE"
+                                                | "ON"
+                                                | "GROUP"
+                                                | "HAVING"
+                                                | "ORDER"
+                                        )
+                                    )));
                     let should_treat_as_block_start = block_start_keywords
                         .contains(&upper.as_str())
                         && !treat_control_keyword_as_identifier
@@ -9744,8 +9731,7 @@ END;"#;
         let source_pos = source
             .find("b FROM")
             .expect("source cursor anchor should exist") as i32;
-        let mapped =
-            SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos, false);
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, source_pos);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
@@ -9760,8 +9746,8 @@ END;"#;
         let formatted = "SELECT\n    1\nFROM DUAL;";
         let source_pos = (source.len() / 2) as i32;
 
-        let mapped = SqlEditorWidget::map_cursor_after_format(&source, formatted, source_pos, false)
-            as usize;
+        let mapped =
+            SqlEditorWidget::map_cursor_after_format(&source, formatted, source_pos) as usize;
 
         assert!(
             mapped <= formatted.len(),
@@ -9785,7 +9771,6 @@ END;"#;
             source,
             &formatted,
             source_pos_within_selection,
-            true,
         );
         let selection_start = 25i32;
         let final_cursor_pos = selection_start + mapped_within_selection;
@@ -9804,12 +9789,9 @@ END;"#;
     }
 
     #[test]
-    fn cursor_mapping_selection_without_semicolon_keeps_token_anchor() {
+    fn cursor_mapping_selection_keeps_token_anchor_with_canonical_terminator() {
         let source = "SELECT a, b FROM dual";
-        let formatted = SqlEditorWidget::preserve_selected_text_terminator(
-            source,
-            SqlEditorWidget::format_sql_basic(source),
-        );
+        let formatted = SqlEditorWidget::format_sql_basic(source);
         let source_pos_within_selection = source
             .find("b FROM")
             .expect("source cursor anchor should exist")
@@ -9819,18 +9801,17 @@ END;"#;
             source,
             &formatted,
             source_pos_within_selection,
-            true,
         );
         let formatted_slice = &formatted[mapped_within_selection as usize..];
 
         assert!(
             formatted_slice.trim_start().starts_with("b\nFROM DUAL"),
-            "Mapped cursor should stay near same token for semicolon-free selection, got: {}",
+            "Mapped cursor should stay near same token after selection format, got: {}",
             formatted_slice
         );
         assert!(
-            !formatted.trim_end().ends_with(';'),
-            "Selection-preserved formatted SQL should not end with semicolon"
+            formatted.trim_end().ends_with(';'),
+            "Selection formatting should keep canonical semicolon terminator"
         );
     }
 
@@ -9843,8 +9824,7 @@ END;"#;
             .find("b FROM")
             .expect("source cursor anchor should exist") as i32;
 
-        let mapped =
-            SqlEditorWidget::map_cursor_after_format(source, &formatted, byte_offset, false);
+        let mapped = SqlEditorWidget::map_cursor_after_format(source, &formatted, byte_offset);
         let mapped_slice = &formatted[mapped as usize..];
         assert!(
             mapped_slice.trim_start().starts_with("b\nFROM DUAL;"),
@@ -9906,7 +9886,7 @@ END;"#;
         let mid_byte = source.find('한').unwrap_or(0) + 1;
 
         let result = std::panic::catch_unwind(|| {
-            SqlEditorWidget::map_cursor_after_format(source, &formatted, mid_byte as i32, false)
+            SqlEditorWidget::map_cursor_after_format(source, &formatted, mid_byte as i32)
         });
 
         assert!(
@@ -10263,6 +10243,19 @@ END;"#;
 FROM DUAL"
         );
         assert!(!preserved.trim_end().ends_with(';'));
+    }
+
+    #[test]
+    fn selected_formatting_path_keeps_canonical_statement_semicolon() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.trim_end().ends_with(';'),
+            "Selection formatting now follows canonical formatter output, got:
+{}",
+            formatted
+        );
     }
 
     #[test]
@@ -11620,9 +11613,13 @@ END"
             formatted
         );
         assert!(
-            !formatted.contains("
-        IF") && !formatted.contains("
-        END"),
+            !formatted.contains(
+                "
+        IF"
+            ) && !formatted.contains(
+                "
+        END"
+            ),
             "alias IF/END inside PL/SQL block should not be split as control keywords, got:
 {}",
             formatted
@@ -11642,9 +11639,11 @@ END"
             formatted
         );
         assert!(
-            !formatted.contains("
+            !formatted.contains(
+                "
         IF
-"),
+"
+            ),
             "implicit alias IF inside PL/SQL block should not be split as block keyword, got:
 {}",
             formatted
