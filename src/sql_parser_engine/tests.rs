@@ -2455,6 +2455,42 @@ fn language_clause_with_dollar_quoted_target_without_external_keyword_marks_exte
 }
 
 #[test]
+fn external_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_js_body RETURN NUMBER");
+    engine.process_line("AS EXTERNAL LANGUAGE JAVASCRIPT NAME $$function run() { return 1; }$$;");
+    engine.process_line("SELECT 4 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("$$function run() { return 1; }$$"),
+        "dollar-quoted javascript body should remain inside routine definition: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 4 FROM dual"));
+}
+
+#[test]
+fn implicit_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_js_body2 RETURN NUMBER");
+    engine.process_line("AS LANGUAGE JAVASCRIPT NAME $$function run() { return 2; }$$;");
+    engine.process_line("SELECT 5 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("$$function run() { return 2; }$$"),
+        "implicit language clause should still treat $$..$$ body as one literal: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 5 FROM dual"));
+}
+
+#[test]
 fn mle_module_clause_without_external_keyword_marks_external_routine_split() {
     let mut engine = SqlParserEngine::new();
 

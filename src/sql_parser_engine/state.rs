@@ -499,16 +499,6 @@ impl SplitState {
         self.create_plsql_kind == CreatePlsqlKind::Wrapped
     }
 
-    fn awaiting_external_language_target(&self) -> bool {
-        self.routine_is_stack.last().is_some_and(|frame| {
-            matches!(
-                frame.external_clause_state,
-                ExternalClauseState::AwaitingLanguageTargetFromExternal
-                    | ExternalClauseState::AwaitingLanguageTargetImplicit
-            )
-        })
-    }
-
     fn keep_semicolons_inside_create_body(&self) -> bool {
         self.in_java_source_create() || self.in_wrapped_create()
     }
@@ -1216,6 +1206,19 @@ impl SplitState {
     fn allow_implicit_external_literal_target(&self) -> bool {
         self.active_routine_frame().is_some_and(|frame| {
             frame.external_clause_state == ExternalClauseState::AwaitingLanguageTargetImplicit
+        })
+    }
+
+    fn allow_external_dollar_quote_literal_start(&self) -> bool {
+        self.active_routine_frame().is_some_and(|frame| {
+            matches!(
+                frame.external_clause_state,
+                ExternalClauseState::AwaitingLanguageTargetFromExternal
+                    | ExternalClauseState::AwaitingLanguageTargetImplicit
+                    | ExternalClauseState::SawImplicitQuotedLanguageTarget
+                    | ExternalClauseState::SawImplicitLanguageTarget
+                    | ExternalClauseState::Confirmed
+            )
         })
     }
 
