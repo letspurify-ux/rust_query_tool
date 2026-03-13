@@ -1037,13 +1037,24 @@ impl SqlEditorWidget {
     }
 
     fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
-        for token in Self::tokenize_sql(statement).iter().rev() {
-            match token {
-                SqlToken::Comment(_) => continue,
-                SqlToken::Symbol(sym) if sym == "/" => continue,
-                SqlToken::Symbol(sym) if sym == ";" => return true,
-                _ => break,
+        let mut saw_statement_item = false;
+        for item in super::query_text::split_format_items(statement)
+            .iter()
+            .rev()
+        {
+            if let FormatItem::Statement(sql_statement) = item {
+                saw_statement_item = true;
+                let tokens = Self::tokenize_sql(sql_statement);
+                if !Self::statement_has_code(sql_statement, &tokens) {
+                    continue;
+                }
+
+                return Self::statement_ends_with_semicolon_tokens(&tokens);
             }
+        }
+
+        if saw_statement_item {
+            return false;
         }
 
         let trimmed = statement.trim_end();
@@ -10144,7 +10155,8 @@ END;"#;
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
         let source_pos_within_selection = source
             .find("-- trailing note")
-            .expect("source inline comment anchor should exist") as i32;
+            .expect("source inline comment anchor should exist")
+            as i32;
 
         let mapped_within_selection = SqlEditorWidget::map_cursor_after_format(
             source,
@@ -10185,10 +10197,7 @@ END;"#;
         let source_pos = source.find('/').expect("slash anchor should exist") as i32;
 
         let mapped = SqlEditorWidget::map_cursor_after_format_with_policy(
-            source,
-            &formatted,
-            source_pos,
-            true,
+            source, &formatted, source_pos, true,
         );
         let mapped_slice = &formatted[mapped as usize..];
 
@@ -11030,7 +11039,8 @@ REMARK trailing script comment";
     fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_rem_line() {
         let mut formatted = "SELECT 1
 FROM DUAL
-    REM trailing script comment".to_string();
+    REM trailing script comment"
+            .to_string();
 
         SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
 
@@ -11046,7 +11056,8 @@ FROM DUAL;
     fn append_missing_statement_terminator_places_semicolon_before_trailing_indented_remark_line() {
         let mut formatted = "SELECT 1
 FROM DUAL
-	REMARK trailing script comment".to_string();
+	REMARK trailing script comment"
+            .to_string();
 
         SqlEditorWidget::append_missing_statement_terminator(&mut formatted);
 
@@ -11284,6 +11295,42 @@ NULL";
             preserved, source,
             "Semicolon inside SQL*Plus remark comment should stay untouched, got:\n{}",
             preserved
+        );
+    }
+
+    #[test]
+    fn selected_auto_formatting_ignores_prompt_semicolon_as_statement_terminator() {
+        let source = "select 1 from dual
+PROMPT done;";
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+
+        assert!(
+            formatted.contains("FROM DUAL
+PROMPT done;"),
+            "Selected auto-format should not keep inserted semicolon when only PROMPT line has semicolon, got:
+{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains(
+                "FROM DUAL;
+PROMPT done;"
+            ),
+            "PROMPT semicolon must not be treated as SQL statement terminator, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn source_has_explicit_semicolon_terminator_ignores_trailing_prompt_line() {
+        let source = "SELECT 1 FROM dual
+PROMPT done;";
+
+        assert!(
+            !SqlEditorWidget::source_has_explicit_semicolon_terminator(source),
+            "Semicolon in trailing PROMPT line should not count as SQL terminator"
         );
     }
 
