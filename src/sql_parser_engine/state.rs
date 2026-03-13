@@ -169,6 +169,7 @@ impl SplitState {
 
         self.active_routine_frame().is_some_and(|frame| {
             frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
+                && !frame.should_defer_begin_split_after_implicit_semicolon()
         })
     }
 
