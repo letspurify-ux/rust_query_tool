@@ -485,7 +485,11 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_sql_basic(&source);
+        let formatted = if select_formatted {
+            Self::preserve_selected_text_terminator(&source, Self::format_sql_basic(&source))
+        } else {
+            Self::format_sql_basic(&source)
+        };
         if formatted == source {
             return;
         }
@@ -10275,14 +10279,32 @@ FROM DUAL"
     }
 
     #[test]
-    fn selected_formatting_path_keeps_canonical_statement_semicolon() {
+    fn selected_formatting_path_preserves_missing_statement_semicolon() {
         let source = "SELECT 1 FROM dual";
-        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let formatted = SqlEditorWidget::preserve_selected_text_terminator(
+            source,
+            SqlEditorWidget::format_sql_basic(source),
+        );
 
         assert!(
-            formatted.trim_end().ends_with(';'),
-            "Selection formatting now follows canonical formatter output, got:
+            !formatted.trim_end().ends_with(';'),
+            "Selection formatting should preserve missing semicolon when source had none, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn selected_formatting_path_preserves_missing_semicolon_before_trailing_remark() {
+        let source = "SELECT 1 FROM dual\nREM trailing note";
+        let formatted = SqlEditorWidget::preserve_selected_text_terminator(
+            source,
+            SqlEditorWidget::format_sql_basic(source),
+        );
+
+        assert!(
+            !formatted.contains(";\nREM trailing note"),
+            "Selection formatting should not inject semicolon before trailing REM line, got:\n{}",
             formatted
         );
     }
