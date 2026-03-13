@@ -1049,7 +1049,11 @@ impl SqlEditorWidget {
                     continue;
                 }
 
-                return Self::statement_ends_with_semicolon_tokens(&tokens);
+                if Self::statement_ends_with_semicolon_tokens(&tokens) {
+                    return true;
+                }
+
+                return Self::statement_ends_with_semicolon_span_fallback(sql_statement);
             }
         }
 
@@ -1057,6 +1061,10 @@ impl SqlEditorWidget {
             return false;
         }
 
+        Self::statement_ends_with_semicolon_span_fallback(statement)
+    }
+
+    fn statement_ends_with_semicolon_span_fallback(statement: &str) -> bool {
         let trimmed = statement.trim_end();
         if trimmed.is_empty() {
             return false;
@@ -1114,16 +1122,7 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let trimmed = statement.trim_end();
-        if trimmed.is_empty() {
-            return false;
-        }
-
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans.iter().rev().any(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::trailing_segment_allows_semicolon_terminator(&trimmed[span.end..])
-        })
+        Self::statement_ends_with_semicolon_span_fallback(statement)
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
