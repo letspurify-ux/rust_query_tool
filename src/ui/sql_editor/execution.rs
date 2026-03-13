@@ -625,22 +625,25 @@ impl SqlEditorWidget {
 
         let trimmed = &formatted_statement[..trim_len];
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        let insert_at = spans
-            .last()
-            .and_then(|span| match &span.token {
-                SqlToken::Comment(comment) if comment.starts_with("--") => {
-                    let mut idx = span.start;
-                    while idx > 0 {
-                        match trimmed.as_bytes().get(idx - 1) {
-                            Some(b' ' | b'\t') => idx -= 1,
-                            _ => break,
-                        }
-                    }
-                    Some(idx)
+        let mut insert_at = trim_len;
+        for span in spans.iter().rev() {
+            match &span.token {
+                SqlToken::Comment(_) => {
+                    insert_at = span.start;
                 }
-                _ => None,
-            })
-            .unwrap_or(trim_len);
+                _ => break,
+            }
+        }
+
+        if insert_at < trim_len {
+            while insert_at > 0 {
+                match trimmed.as_bytes().get(insert_at - 1) {
+                    Some(b' ' | b'\t') => insert_at -= 1,
+                    _ => break,
+                }
+            }
+        }
+
         formatted_statement.insert(insert_at, ';');
     }
 
@@ -10386,6 +10389,34 @@ ALTER TRIGGER trg_demo ENABLE;"#;
             "Semicolon should remain when selection already ended with semicolon before comment, got:
 {}",
             preserved
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_block_comment() {
+        let source = "SELECT 1 FROM dual /* trailing note */";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; /* trailing note */"),
+            "Formatter should place statement terminator before trailing block comment, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_mixed_comments() {
+        let source = "SELECT 1 FROM dual /* trailing note */ -- line note";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL; /* trailing note */ -- line note"),
+            "Formatter should place statement terminator before chained trailing comments, got:
+{}",
+            formatted
         );
     }
 
