@@ -749,6 +749,49 @@ fn package_body_end_with_schema_qualified_label_splits_following_statement() {
     assert_eq!(statements[1], "SELECT 102 FROM dual".to_string());
 }
 
+
+#[test]
+fn package_body_end_with_unquoted_qualified_label_matches_quoted_header_name() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"Owner\".\"PkgQuoted\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END Owner.PkgQuoted;");
+    engine.process_line("SELECT 301 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END Owner.PkgQuoted"),
+        "qualified END label should remain in package body statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 301 FROM dual".to_string());
+}
+
+#[test]
+fn package_body_end_with_mixed_quoted_qualified_label_matches_header_name() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY owner.\"PkgQuoted\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END owner.\"PkgQuoted\";");
+    engine.process_line("SELECT 302 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("END owner.\"PkgQuoted\""),
+        "mixed quoted END label should remain in package body statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 302 FROM dual".to_string());
+}
+
 #[test]
 fn package_body_end_with_fully_quoted_qualified_label_splits_following_statement() {
     let mut engine = SqlParserEngine::new();

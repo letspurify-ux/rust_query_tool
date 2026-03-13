@@ -1302,11 +1302,33 @@ impl SplitState {
         if self.block_depth() == 0
             && self.create_plsql_kind == CreatePlsqlKind::PackageBody
             && self.awaiting_package_body_name
-            && (self.package_body_name.is_none() || self.awaiting_package_body_name_dot)
         {
+            self.append_package_body_name_segment(upper);
+        }
+    }
+
+    fn append_package_body_name_segment(&mut self, upper: &str) {
+        if upper.is_empty() {
+            return;
+        }
+
+        if self.package_body_name.is_none() {
             self.package_body_name = Some(upper.to_string());
             self.awaiting_package_body_name_dot = false;
+            return;
         }
+
+        if !self.awaiting_package_body_name_dot {
+            return;
+        }
+
+        if let Some(name) = self.package_body_name.as_mut() {
+            if !name.ends_with('.') {
+                name.push('.');
+            }
+            name.push_str(upper);
+        }
+        self.awaiting_package_body_name_dot = false;
     }
 
 
@@ -1367,8 +1389,7 @@ impl SplitState {
                     self.awaiting_package_body_name = false;
                     self.awaiting_package_body_name_dot = false;
                 } else if self.package_body_name.is_none() || self.awaiting_package_body_name_dot {
-                    self.package_body_name = Some(upper.to_string());
-                    self.awaiting_package_body_name_dot = false;
+                    self.append_package_body_name_segment(upper);
                 }
             }
 
