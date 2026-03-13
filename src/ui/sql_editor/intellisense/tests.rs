@@ -933,6 +933,50 @@ FROM d
     }
 
     #[test]
+    fn request_table_columns_does_not_fallback_for_invalid_qualified_identifier() {
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        {
+            let mut guard = lock_or_recover(&data);
+            guard.tables = vec!["EMP".to_string()];
+            guard.rebuild_indices();
+        }
+
+        let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let _conn_guard = connection.lock().ok();
+
+        SqlEditorWidget::request_table_columns("HR.", &data, &sender, &connection);
+
+        let update = receiver.recv_timeout(Duration::from_millis(200));
+        assert!(
+            update.is_err(),
+            "invalid qualified identifier should not fall back to unrelated relation key"
+        );
+    }
+
+    #[test]
+    fn request_table_columns_ignores_unbalanced_quoted_identifier() {
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        {
+            let mut guard = lock_or_recover(&data);
+            guard.tables = vec!["EMP".to_string()];
+            guard.rebuild_indices();
+        }
+
+        let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let _conn_guard = connection.lock().ok();
+
+        SqlEditorWidget::request_table_columns("\"HR\".\"EMP", &data, &sender, &connection);
+
+        let update = receiver.recv_timeout(Duration::from_millis(200));
+        assert!(
+            update.is_err(),
+            "unbalanced quoted identifier should not trigger fallback column loading"
+        );
+    }
+
+    #[test]
     fn intellisense_data_clears_stale_column_loading_entries() {
         let mut data = IntellisenseData::new();
         assert!(data.mark_columns_loading("EMP"));
