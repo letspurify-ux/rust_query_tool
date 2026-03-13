@@ -2827,6 +2827,42 @@ fn language_clause_with_mle_environment_without_external_keyword_still_splits() 
 }
 
 #[test]
+fn language_clause_with_mle_imports_without_external_keyword_still_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_imports RETURN NUMBER");
+    engine.process_line("AS MLE IMPORTS ext_imports_impl;");
+    engine.process_line("SELECT 13 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS MLE IMPORTS ext_imports_impl"),
+        "first statement should keep MLE IMPORTS clause tokens: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 13 FROM dual"));
+}
+
+#[test]
+fn language_clause_with_mle_exports_without_external_keyword_still_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_exports RETURN NUMBER");
+    engine.process_line("AS MLE EXPORTS ext_exports_impl;");
+    engine.process_line("SELECT 14 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS MLE EXPORTS ext_exports_impl"),
+        "first statement should keep MLE EXPORTS clause tokens: {}",
+        statements[0]
+    );
+    assert!(statements[1].starts_with("SELECT 14 FROM dual"));
+}
+
+#[test]
 fn language_clause_with_mle_marker_after_language_target_still_splits() {
     let mut engine = SqlParserEngine::new();
 
