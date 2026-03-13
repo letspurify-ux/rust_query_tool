@@ -4690,4 +4690,35 @@ END fmt_pkg_extreme;"#;
             "IF alias depth calculation should match non-keyword aliases"
         );
     }
+
+    #[test]
+    fn line_block_depths_package_body_procedure_select_if_dot_alias_does_not_open_if_block() {
+        let sql = r#"CREATE OR REPLACE PACKAGE BODY pkg_test AS
+  PROCEDURE p_test IS
+  BEGIN
+    SELECT if_tab.name
+      INTO v_name
+      FROM employees if_tab;
+  END p_test;
+END pkg_test;"#;
+
+        let depths = QueryExecutor::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        let select_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT if_tab.name"))
+            .unwrap_or(0);
+        let into_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("INTO v_name"))
+            .unwrap_or(0);
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM employees if_tab"))
+            .unwrap_or(0);
+
+        assert_eq!(depths[select_idx], 2);
+        assert_eq!(depths[into_idx], 2);
+        assert_eq!(depths[from_idx], 2);
+    }
 }

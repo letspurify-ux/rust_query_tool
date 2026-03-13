@@ -561,6 +561,7 @@ enum AsIsFollowState {
 enum IfSymbolEvent {
     Whitespace,
     OpenParen,
+    Dot,
     Other,
 }
 
@@ -572,6 +573,10 @@ impl IfSymbolEvent {
 
         if ch == '(' {
             return Self::OpenParen;
+        }
+
+        if ch == '.' {
+            return Self::Dot;
         }
 
         Self::Other

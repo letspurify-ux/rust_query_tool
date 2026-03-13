@@ -678,6 +678,12 @@ impl SqlParserEngine {
                                 depth: condition_depth,
                             };
                         }
+                        IfSymbolEvent::Dot => {
+                            // `if.column` / `schema.if.field` style aliases can appear in SQL
+                            // expressions. A dot immediately after IF means identifier usage,
+                            // so cancel the IF...THEN state machine arm.
+                            self.state.if_state = IfState::None;
+                        }
                         IfSymbolEvent::Other => {
                             self.state.if_state = IfState::AwaitingThen;
                         }
