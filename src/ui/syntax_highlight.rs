@@ -793,7 +793,15 @@ impl SqlHighlighter {
                     || should_treat_control_keyword_as_implicit_alias(
                         text, bytes, start, idx, word,
                     );
+                let treat_keyword_as_identifier = should_treat_keyword_as_identifier_context(
+                    text,
+                    bytes,
+                    start,
+                    idx,
+                    word,
+                );
                 let token_type = if expect_alias_identifier
+                    || treat_keyword_as_identifier
                     || should_treat_function_name_as_identifier(text, bytes, start, idx, word)
                 {
                     self.classify_identifier_like_word(word)
@@ -1030,6 +1038,32 @@ fn should_treat_function_name_as_identifier(
 
     prev_significant_word_upper(text, bytes, word_start)
         .is_some_and(|prev_word| is_relation_identifier_context_word(prev_word.as_str()))
+}
+
+fn should_treat_keyword_as_identifier_context(
+    text: &str,
+    bytes: &[u8],
+    word_start: usize,
+    word_end: usize,
+    word: &str,
+) -> bool {
+    let upper: Cow<'_, str> = if word.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(word.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    };
+
+    if !sql_text::is_oracle_sql_keyword(upper.as_ref()) {
+        return false;
+    }
+
+    matches!(
+        prev_significant_token_kind(text, bytes, word_start),
+        Some(SignificantTokenKind::Dot)
+    ) || matches!(
+        next_significant_token_kind(bytes, word_end),
+        Some(SignificantTokenKind::Dot)
+    )
 }
 
 fn prev_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Option<String> {

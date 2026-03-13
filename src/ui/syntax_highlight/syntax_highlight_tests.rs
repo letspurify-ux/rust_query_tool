@@ -143,6 +143,40 @@ fn test_schema_qualified_function_name_is_not_function_highlighted() {
 }
 
 #[test]
+fn test_keyword_like_member_access_is_not_highlighted_as_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT t.group, t.order, t.from FROM keyword_table t";
+    let styles = highlighter.generate_styles(text);
+
+    for keyword_name in ["group", "order", "from"] {
+        let qualified = format!("t.{keyword_name}");
+        let start = text.find(&qualified).unwrap_or(0) + 2;
+        let end = start + keyword_name.len();
+        assert!(
+            styles[start..end]
+                .chars()
+                .all(|c| c != STYLE_KEYWORD && c != STYLE_FUNCTION),
+            "member access `{qualified}` should not be highlighted as keyword or function"
+        );
+    }
+}
+
+#[test]
+fn test_keyword_like_alias_before_dot_is_not_highlighted_as_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "SELECT from_alias.col1, from.col2 FROM dual from";
+    let styles = highlighter.generate_styles(text);
+
+    let alias_in_member = text.find("from.col2").unwrap_or(0);
+    assert!(
+        styles[alias_in_member..alias_in_member + 4]
+            .chars()
+            .all(|c| c != STYLE_KEYWORD && c != STYLE_FUNCTION),
+        "alias `from` used before dot should not be highlighted as keyword"
+    );
+}
+
+#[test]
 fn test_string_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "'hello world'";
