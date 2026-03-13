@@ -234,6 +234,9 @@ impl SqlEditorWidget {
         let widget = self.clone();
         let intellisense_runtime = self.intellisense_runtime.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
+            if ins <= 0 && del <= 0 {
+                return;
+            }
             intellisense_runtime.next_buffer_revision();
             intellisense_runtime.next_parse_generation();
             intellisense_runtime.clear_parse_cache();
