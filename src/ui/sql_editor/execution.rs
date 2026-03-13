@@ -1214,7 +1214,7 @@ impl SqlEditorWidget {
         select_list_break_state_on_start: SelectListBreakState,
     ) -> String {
         if Self::is_sqlplus_remark_comment_statement(statement) {
-            return statement.trim().to_string();
+            return statement.to_string();
         }
 
         if let Some(formatted) = Self::format_create_table(statement) {
@@ -10525,6 +10525,15 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     #[test]
     fn format_sql_basic_preserves_sqlplus_remark_comment_text_case() {
         let sql = "REMARK Keep MixedCase ; punctuation";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert_eq!(formatted, sql);
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_sqlplus_remark_comment_indentation() {
+        let sql = "    REMARK Keep indentation\n\tREM tab-indented";
 
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
