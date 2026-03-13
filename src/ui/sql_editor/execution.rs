@@ -485,7 +485,7 @@ impl SqlEditorWidget {
             }
         };
 
-        let formatted = Self::format_sql_basic(&source);
+        let formatted = Self::format_sql_for_target(&source, select_formatted);
         if formatted == source {
             return;
         }
@@ -551,6 +551,14 @@ impl SqlEditorWidget {
         let formatted_prefix = Self::format_sql_basic(source_prefix);
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
+    }
+
+    fn format_sql_for_target(source: &str, is_selected_fragment: bool) -> String {
+        let formatted = Self::format_sql_basic(source);
+        if is_selected_fragment {
+            return Self::preserve_selected_text_terminator(source, formatted);
+        }
+        formatted
     }
 
     fn preserve_selected_text_terminator(source: &str, formatted: String) -> String {
@@ -10275,14 +10283,43 @@ FROM DUAL"
     }
 
     #[test]
-    fn selected_formatting_path_keeps_canonical_statement_semicolon() {
+    fn format_sql_for_target_selection_removes_inserted_statement_semicolon() {
         let source = "SELECT 1 FROM dual";
-        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let formatted = SqlEditorWidget::format_sql_for_target(source, true);
+
+        assert!(
+            !formatted.trim_end().ends_with(';'),
+            "Selection formatting should preserve missing terminator from source, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_for_target_selection_removes_inserted_semicolon_before_trailing_comment() {
+        let source = "SELECT 1 FROM dual -- trailing";
+        let formatted = SqlEditorWidget::format_sql_for_target(source, true);
+
+        assert!(
+            formatted.contains("FROM DUAL -- trailing"),
+            "Selection formatting should not leave an inserted semicolon before trailing comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("FROM DUAL; -- trailing"),
+            "Selection formatting should remove inserted semicolon before trailing comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_for_target_full_document_keeps_canonical_statement_semicolon() {
+        let source = "SELECT 1 FROM dual";
+        let formatted = SqlEditorWidget::format_sql_for_target(source, false);
 
         assert!(
             formatted.trim_end().ends_with(';'),
-            "Selection formatting now follows canonical formatter output, got:
-{}",
+            "Full-document formatting should keep canonical statement terminator, got:\n{}",
             formatted
         );
     }
