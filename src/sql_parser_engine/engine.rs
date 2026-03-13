@@ -49,6 +49,48 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
 }
 
 
+fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
+    while idx < line.len() {
+        if line[idx..].starts_with("--") {
+            let line_comment_end = line[idx..].find('\n')?;
+            idx += line_comment_end + 1;
+            continue;
+        }
+
+        if line[idx..].starts_with("/*") {
+            let block_start = idx + 2;
+            let block_end = line[block_start..].find("*/")?;
+            idx = block_start + block_end + 2;
+            continue;
+        }
+
+        let ch = line[idx..].chars().next()?;
+        if ch.is_whitespace() {
+            idx += ch.len_utf8();
+            continue;
+        }
+
+        let mut end = idx;
+        while end < line.len() {
+            let Some(word_ch) = line[end..].chars().next() else {
+                break;
+            };
+            if word_ch.is_whitespace()
+                || line[end..].starts_with("/*")
+                || line[end..].starts_with("--")
+            {
+                break;
+            }
+            end += word_ch.len_utf8();
+        }
+
+        return Some((&line[idx..end], end));
+    }
+
+    None
+}
+
+
 #[inline]
 fn is_external_language_target(token_upper: &str) -> bool {
     sql_text::is_external_language_target_keyword(token_upper)
@@ -312,39 +354,22 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn starts_with_alter_session(&self) -> bool {
-        let mut remaining = self.current.as_str();
+        let current = self.current.as_str();
+        let Some((first, first_end)) = next_meaningful_word(current, 0) else {
+            return false;
+        };
 
-        loop {
-            let trimmed = remaining.trim_start();
-            if trimmed.is_empty() {
-                return false;
-            }
-
-            if trimmed.starts_with("/*") {
-                let Some(block_end) = trimmed.find("*/") else {
-                    return false;
-                };
-                remaining = &trimmed[block_end + 2..];
-                continue;
-            }
-
-            if trimmed.starts_with("--") || sql_text::is_sqlplus_remark_comment_line(trimmed) {
-                let Some(line_end) = trimmed.find('\n') else {
-                    return false;
-                };
-                remaining = &trimmed[line_end + 1..];
-                continue;
-            }
-
-            let mut words = trimmed.split_whitespace();
-            return matches!(
-                (words.next(), words.next()),
-                (Some(first), Some(second))
-                    if first.eq_ignore_ascii_case("ALTER")
-                        && second.eq_ignore_ascii_case("SESSION")
-            );
+        if !first.eq_ignore_ascii_case("ALTER") {
+            return false;
         }
+
+        let Some((second, _)) = next_meaningful_word(current, first_end) else {
+            return false;
+        };
+
+        second.eq_ignore_ascii_case("SESSION")
     }
+
 
     pub(crate) fn process_line(&mut self, line: &str) {
         self.process_line_with_boundary_observer(line, |_, _| {});

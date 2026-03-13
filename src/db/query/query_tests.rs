@@ -5537,6 +5537,159 @@ SELECT 1 FROM DUAL;"#;
 }
 
 #[test]
+fn test_alter_session_with_inline_block_comment_header_keeps_set_clause_as_sql() {
+    let sql = r#"ALTER /* session config */ SESSION
+SET CURRENT_SCHEMA = APP_USER;
+SELECT 2 FROM DUAL;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "ALTER SESSION with inline block comment should stay one statement before trailing SELECT: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("ALTER /* session config */ SESSION")
+            && statements[0].contains("SET CURRENT_SCHEMA = APP_USER"),
+        "first statement should keep commented ALTER SESSION header and SET clause together: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "commented ALTER SESSION SET should not be parsed as SQL*Plus SET command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_alter_session_with_inline_line_comment_header_keeps_set_clause_as_sql() {
+    let sql = r#"ALTER -- keep comment
+SESSION
+SET CURRENT_SCHEMA = APP_USER;
+SELECT 3 FROM DUAL;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "ALTER SESSION with inline line comment should stay one statement before trailing SELECT: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("ALTER -- keep comment")
+            && statements[0].contains("SESSION")
+            && statements[0].contains("SET CURRENT_SCHEMA = APP_USER"),
+        "first statement should keep inline-comment ALTER SESSION header and SET clause together: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "inline-comment ALTER SESSION SET should not be parsed as SQL*Plus SET command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_alter_session_line_comment_header_with_sqlplus_like_option_keeps_set_clause_as_sql() {
+    let sql = r#"ALTER -- keep header comment
+SESSION
+SET FLAGGER = ENTRY;
+SELECT 4 FROM DUAL;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "ALTER SESSION SET FLAGGER should remain SQL even when ALTER header has inline comment: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("SET FLAGGER = ENTRY"),
+        "first statement should preserve ALTER SESSION SET FLAGGER clause: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "ALTER SESSION SET FLAGGER must not be parsed as SQL*Plus SET command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
+fn test_alter_session_block_comment_header_with_sqlplus_like_option_keeps_set_clause_as_sql() {
+    let sql = r#"ALTER /* keep header comment */ SESSION
+SET FLAGGER = ENTRY;
+SELECT 5 FROM DUAL;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_commands: Vec<&ScriptItem> = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .collect();
+
+    assert_eq!(
+        statements.len(),
+        2,
+        "ALTER SESSION SET FLAGGER should remain SQL when ALTER header has inline block comment: {:?}",
+        statements
+    );
+    assert!(
+        statements[0].contains("SET FLAGGER = ENTRY"),
+        "first statement should preserve ALTER SESSION SET FLAGGER clause: {}",
+        statements[0]
+    );
+    assert!(
+        tool_commands.is_empty(),
+        "ALTER SESSION SET FLAGGER must not be parsed as SQL*Plus SET command: {:?}",
+        tool_commands
+    );
+}
+
+#[test]
 fn test_alter_session_q_quote_with_semicolon_not_split() {
     let sql = r#"ALTER SESSION SET TRACEFILE_IDENTIFIER = q'[trace;session]';
 SELECT 1 FROM DUAL;"#;
