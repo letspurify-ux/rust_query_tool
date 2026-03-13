@@ -2910,11 +2910,17 @@ impl QueryExecutor {
             return;
         }
 
+        let is_set_clause = Self::is_set_clause_line(trimmed);
+        let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
+        let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
+        let is_sql_set_clause_context = is_alter_session_set_clause || is_sql_set_statement;
+
         // Tool command appearing after a slash-terminable open statement
         if builder.is_idle()
             && !builder.current_is_empty()
             && builder.paren_depth() == 0
             && builder.can_terminate_on_slash()
+            && !is_sql_set_clause_context
             && Self::parse_tool_command(trimmed).is_some()
         {
             for stmt in builder.force_terminate_and_take_statements() {
@@ -2924,14 +2930,11 @@ impl QueryExecutor {
         }
 
         // Tool command with an open (non-empty) statement
-        let is_set_clause = Self::is_set_clause_line(trimmed);
-        let is_alter_session_set_clause = is_set_clause && builder.starts_with_alter_session();
-        let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
         if Self::should_try_tool_command_with_open_statement(
             builder.is_idle(),
             builder.current_is_empty(),
             parser_is_top_level,
-            is_alter_session_set_clause || is_sql_set_statement,
+            is_sql_set_clause_context,
         ) {
             if let Some(command) = Self::parse_tool_command(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {

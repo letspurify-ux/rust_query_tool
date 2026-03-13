@@ -241,6 +241,31 @@ fn slash_terminator_with_block_comment_is_consumed_after_plsql_block() {
 }
 
 #[test]
+fn starts_with_alter_session_skips_inline_comments_between_keywords() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("ALTER -- keep");
+    engine.process_line("SESSION");
+
+    assert!(
+        engine.starts_with_alter_session(),
+        "ALTER header with inline line comment should still be recognized as ALTER SESSION"
+    );
+}
+
+#[test]
+fn starts_with_alter_session_skips_inline_block_comments_between_keywords() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("ALTER /* keep */ SESSION");
+
+    assert!(
+        engine.starts_with_alter_session(),
+        "ALTER header with inline block comment should still be recognized as ALTER SESSION"
+    );
+}
+
+#[test]
 fn if_symbol_event_classifies_characters() {
     assert_eq!(IfSymbolEvent::from_char(' '), IfSymbolEvent::Whitespace);
     assert_eq!(IfSymbolEvent::from_char('('), IfSymbolEvent::OpenParen);
