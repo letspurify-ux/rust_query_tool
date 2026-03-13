@@ -625,23 +625,36 @@ impl SqlEditorWidget {
 
         let trimmed = &formatted_statement[..trim_len];
         let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        let insert_at = spans
-            .last()
-            .and_then(|span| match &span.token {
-                SqlToken::Comment(comment) if comment.starts_with("--") => {
-                    let mut idx = span.start;
-                    while idx > 0 {
-                        match trimmed.as_bytes().get(idx - 1) {
-                            Some(b' ' | b'\t') => idx -= 1,
-                            _ => break,
-                        }
-                    }
-                    Some(idx)
+        let mut insert_at = trim_len;
+        let mut has_trailing_comment = false;
+        for span in spans.iter().rev() {
+            match &span.token {
+                SqlToken::Comment(_) => {
+                    has_trailing_comment = true;
+                    insert_at = span.start;
                 }
-                _ => None,
-            })
-            .unwrap_or(trim_len);
-        formatted_statement.insert(insert_at, ';');
+                SqlToken::Symbol(sym) if sym == "/" => continue,
+                _ => break,
+            }
+        }
+
+        if has_trailing_comment {
+            while insert_at > 0 {
+                match trimmed.as_bytes().get(insert_at - 1) {
+                    Some(b' ' | b'\t') => insert_at -= 1,
+                    _ => break,
+                }
+            }
+            let suffix = &formatted_statement[insert_at..trim_len];
+            let separator = if suffix.starts_with([' ', '\t']) {
+                ";"
+            } else {
+                "; "
+            };
+            formatted_statement.insert_str(insert_at, separator);
+        } else {
+            formatted_statement.insert(insert_at, ';');
+        }
     }
 
     pub fn toggle_comment(&self) {
@@ -10294,6 +10307,31 @@ ALTER TRIGGER trg_demo ENABLE;"#;
     }
 
     #[test]
+    fn format_sql_basic_places_statement_semicolon_before_trailing_block_comment() {
+        let source = "SELECT 1 FROM dual /* trailing block */";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("FROM DUAL;"),
+            "Formatter should place statement terminator before trailing block comment, got:\n{}",
+            formatted
+        );
+        let semicolon_idx = formatted.find(';');
+        let comment_idx = formatted.find("/* trailing block */");
+        assert!(
+            matches!((semicolon_idx, comment_idx), (Some(semicolon), Some(comment)) if semicolon < comment),
+            "Statement terminator must appear before trailing block comment, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.trim_end().ends_with("*/;"),
+            "Formatter should not append semicolon after trailing block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_comment() {
         let source = "SELECT 1 FROM dual -- trailing note";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -10309,6 +10347,25 @@ ALTER TRIGGER trg_demo ENABLE;"#;
             preserved.trim_end().ends_with("-- trailing note"),
             "Trailing comment should be preserved, got:
 {}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_block_comment()
+    {
+        let source = "SELECT 1 FROM dual /* trailing block */";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+        assert!(
+            !SqlEditorWidget::statement_ends_with_semicolon(&preserved),
+            "Semicolon should be removed when original selection had no terminator, got:\n{}",
+            preserved
+        );
+        assert!(
+            preserved.trim_end().ends_with("/* trailing block */"),
+            "Trailing block comment should be preserved, got:\n{}",
             preserved
         );
     }
