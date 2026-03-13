@@ -1002,8 +1002,39 @@ impl SqlEditorWidget {
             })
     }
 
+    fn trim_trailing_sqlplus_suffix_lines(statement: &str) -> &str {
+        let mut end = statement.trim_end().len();
+
+        loop {
+            if end == 0 {
+                return "";
+            }
+
+            let prefix = &statement[..end];
+            let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+            let line = &prefix[line_start..end];
+            let line_trimmed = line.trim();
+
+            if line_trimmed == "/" || Self::is_sqlplus_remark_comment_statement(line_trimmed) {
+                end = prefix[..line_start].trim_end().len();
+                continue;
+            }
+
+            return &statement[..end];
+        }
+    }
+
+    fn has_semicolon_before_inline_sqlplus_remark(statement: &str) -> bool {
+        let spans = super::query_text::tokenize_sql_spanned(statement);
+        spans.iter().rev().any(|span| {
+            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
+                && Self::is_sqlplus_remark_comment_statement(statement[span.end..].trim_start())
+        })
+    }
+
     fn source_has_explicit_semicolon_terminator(statement: &str) -> bool {
-        for token in Self::tokenize_sql(statement).iter().rev() {
+        let trimmed = Self::trim_trailing_sqlplus_suffix_lines(statement);
+        for token in Self::tokenize_sql(trimmed).iter().rev() {
             match token {
                 SqlToken::Comment(_) => continue,
                 SqlToken::Symbol(sym) if sym == "/" => continue,
@@ -1012,16 +1043,11 @@ impl SqlEditorWidget {
             }
         }
 
-        let trimmed = statement.trim_end();
         if trimmed.is_empty() {
             return false;
         }
 
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans.iter().rev().any(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
-        })
+        Self::has_semicolon_before_inline_sqlplus_remark(trimmed)
     }
 
     #[cfg(test)]
@@ -1031,16 +1057,12 @@ impl SqlEditorWidget {
             return true;
         }
 
-        let trimmed = statement.trim_end();
+        let trimmed = Self::trim_trailing_sqlplus_suffix_lines(statement);
         if trimmed.is_empty() {
             return false;
         }
 
-        let spans = super::query_text::tokenize_sql_spanned(trimmed);
-        spans.iter().rev().any(|span| {
-            matches!(&span.token, SqlToken::Symbol(sym) if sym == ";")
-                && Self::is_sqlplus_remark_comment_statement(trimmed[span.end..].trim_start())
-        })
+        Self::has_semicolon_before_inline_sqlplus_remark(trimmed)
     }
 
     fn statement_ends_with_semicolon_tokens(tokens: &[SqlToken]) -> bool {
@@ -11142,6 +11164,47 @@ END;
 /"
             ),
             "Existing semicolon before SQL*Plus slash terminator should remain, got:
+{}",
+            preserved
+        );
+    }
+
+    #[test]
+    fn source_has_explicit_semicolon_terminator_ignores_trailing_sqlplus_suffix_lines() {
+        let source = "BEGIN
+  NULL;
+END
+/
+REM trailing script note";
+
+        assert!(
+            !SqlEditorWidget::source_has_explicit_semicolon_terminator(source),
+            "Slash/REM suffix should not make missing statement semicolon look explicit"
+        );
+    }
+
+    #[test]
+    fn preserve_selected_text_terminator_removes_inserted_semicolon_before_trailing_sqlplus_suffix_lines() {
+        let source = "BEGIN
+  NULL;
+END
+/
+REM trailing script note";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        let preserved = SqlEditorWidget::preserve_selected_text_terminator(source, formatted);
+
+        assert!(
+            preserved.contains("REM trailing script note"),
+            "Selected formatting should preserve trailing SQL*Plus remark suffix, got:
+{}",
+            preserved
+        );
+        assert!(
+            !preserved.contains("END;
+/
+REM trailing script note"),
+            "Inserted semicolon before trailing slash/REM suffix must be removed, got:
 {}",
             preserved
         );
