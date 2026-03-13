@@ -141,6 +141,7 @@ impl SplitState {
 
         if !sql_text::is_statement_head_keyword(token_upper)
             || sql_text::is_external_language_clause_keyword(token_upper)
+            || sql_text::is_external_language_target_keyword(token_upper)
         {
             return false;
         }

@@ -353,7 +353,6 @@ fn create_function_external_call_spec_without_as_is_splits_from_following_statem
     assert_eq!(statements[1], "SELECT 9 FROM dual".to_string());
 }
 
-
 #[test]
 fn create_function_external_language_wasm_splits_from_following_statement() {
     let mut engine = SqlParserEngine::new();
@@ -380,6 +379,46 @@ fn create_function_external_language_r_splits_from_following_statement() {
 
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+}
+
+#[test]
+fn create_function_external_language_quoted_target_splits_from_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_js RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  NAME \"ext_js\"");
+    engine.process_line("  LANGUAGE \"JavaScript\";");
+    engine.process_line("SELECT 13 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("LANGUAGE \"JavaScript\""),
+        "quoted language target should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 13 FROM dual".to_string());
+}
+
+#[test]
+fn create_function_external_language_q_quote_target_splits_from_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_js_q RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  NAME \"ext_js_q\"");
+    engine.process_line("  LANGUAGE q'[javascript]';");
+    engine.process_line("SELECT 14 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("LANGUAGE q'[javascript]'"),
+        "q-quoted language target should stay in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 14 FROM dual".to_string());
 }
 
 #[test]
@@ -2643,7 +2682,8 @@ fn language_clause_with_dollar_quoted_target_without_external_keyword_marks_exte
 }
 
 #[test]
-fn external_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons() {
+fn external_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons()
+{
     let mut engine = SqlParserEngine::new();
 
     engine.process_line("CREATE OR REPLACE FUNCTION ext_js_body RETURN NUMBER");
@@ -2661,7 +2701,8 @@ fn external_language_javascript_body_starting_with_identifier_inside_dollar_quot
 }
 
 #[test]
-fn implicit_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons() {
+fn implicit_language_javascript_body_starting_with_identifier_inside_dollar_quote_keeps_semicolons()
+{
     let mut engine = SqlParserEngine::new();
 
     engine.process_line("CREATE OR REPLACE FUNCTION ext_js_body2 RETURN NUMBER");
@@ -2952,6 +2993,34 @@ fn language_clause_with_future_tokens_without_external_keyword_still_splits() {
         statements[0]
     );
     assert!(statements[1].starts_with("SELECT 6 FROM dual"));
+}
+
+#[test]
+fn language_clause_with_r_without_external_keyword_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_r_implicit RETURN NUMBER");
+    engine.process_line("AS LANGUAGE R;");
+    engine.process_line("SELECT 15 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("LANGUAGE R"));
+    assert_eq!(statements[1], "SELECT 15 FROM dual".to_string());
+}
+
+#[test]
+fn language_clause_with_wasm_without_external_keyword_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_wasm_implicit RETURN NUMBER");
+    engine.process_line("AS LANGUAGE WASM;");
+    engine.process_line("SELECT 16 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("LANGUAGE WASM"));
+    assert_eq!(statements[1], "SELECT 16 FROM dual".to_string());
 }
 
 #[test]
@@ -6959,7 +7028,9 @@ fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_befor
 ) {
     let mut engine = SqlParserEngine::new();
 
-    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_semicolon RETURN NUMBER");
+    engine.process_line(
+        "CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_semicolon RETURN NUMBER",
+    );
     engine.process_line("AS LANGUAGE \"C\"");
     engine.process_line("SELECT 59 FROM dual;");
 
@@ -6974,7 +7045,8 @@ fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_befor
 ) {
     let mut engine = SqlParserEngine::new();
 
-    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_begin RETURN NUMBER");
+    engine
+        .process_line("CREATE OR REPLACE FUNCTION ext_missing_quoted_implicit_begin RETURN NUMBER");
     engine.process_line("AS LANGUAGE \"C\"");
     engine.process_line("BEGIN");
     engine.process_line("  NULL;");
