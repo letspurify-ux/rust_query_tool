@@ -135,10 +135,22 @@ fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
     while boundary > 0 && !text.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    text.get(boundary..)
-        .and_then(|suffix| suffix.find('\n'))
-        .map(|offset| boundary + offset + 1)
-        .unwrap_or(text.len())
+    let bytes = text.as_bytes();
+    let mut idx = boundary;
+    while idx < bytes.len() {
+        match bytes.get(idx).copied() {
+            Some(b'\n') => return idx.saturating_add(1),
+            Some(b'\r') => {
+                if bytes.get(idx.saturating_add(1)) == Some(&b'\n') {
+                    return idx.saturating_add(2);
+                }
+                return idx.saturating_add(1);
+            }
+            Some(_) => idx += 1,
+            None => break,
+        }
+    }
+    text.len()
 }
 
 fn incremental_rehighlight_start_for_text(text: &str, pos: usize) -> usize {
@@ -208,7 +220,13 @@ fn incremental_line_chunk_end_for_text(text: &str, start: usize, minimum_end: us
     if target >= text.len() {
         return text.len();
     }
-    if target > 0 && text.as_bytes().get(target - 1) == Some(&b'\n') {
+    if target > 0
+        && text
+            .as_bytes()
+            .get(target - 1)
+            .copied()
+            .is_some_and(|byte| byte == b'\n' || byte == b'\r')
+    {
         return target;
     }
     inclusive_line_end_for_text(text, target)
@@ -217,9 +235,30 @@ fn incremental_line_chunk_end_for_text(text: &str, start: usize, minimum_end: us
 }
 
 fn count_lines_in_range_for_text(text: &str, start: usize, end: usize) -> usize {
-    text.get(start..end)
-        .map(|segment| segment.bytes().filter(|&byte| byte == b'\n').count())
-        .unwrap_or(0)
+    let Some(segment) = text.get(start..end) else {
+        return 0;
+    };
+    let bytes = segment.as_bytes();
+    let mut idx = 0usize;
+    let mut lines = 0usize;
+    while idx < bytes.len() {
+        match bytes.get(idx).copied() {
+            Some(b'\n') => {
+                lines += 1;
+                idx += 1;
+            }
+            Some(b'\r') => {
+                lines += 1;
+                idx += 1;
+                if bytes.get(idx) == Some(&b'\n') {
+                    idx += 1;
+                }
+            }
+            Some(_) => idx += 1,
+            None => break,
+        }
+    }
+    lines
 }
 
 #[test]
@@ -569,11 +608,7 @@ fn format_sql_keeps_update_alias_named_if_inline() {
         formatted
     );
     assert!(
-        !formatted.contains("
-IF
-") && !formatted.contains("
-    IF
-"),
+        !formatted.contains("\nIF\n") && !formatted.contains("\n    IF\n"),
         "UPDATE alias IF should not be treated as block keyword, got:
 {}",
         formatted
@@ -594,11 +629,7 @@ fn format_sql_keeps_merge_into_alias_named_if_inline() {
         formatted
     );
     assert!(
-        !formatted.contains("
-IF
-") && !formatted.contains("
-    IF
-"),
+        !formatted.contains("\nIF\n") && !formatted.contains("\n    IF\n"),
         "MERGE INTO alias IF should not be treated as block keyword, got:
 {}",
         formatted
@@ -1509,6 +1540,40 @@ fn incremental_rehighlight_start_does_not_rewind_previous_line_on_newline_edit()
         incremental_rehighlight_start_for_text(&updated, delete_pos),
         expected
     );
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_crlf_block_comment_insert() {
+    let original = "SELECT 1\r\nvalue\r\nSELECT 2";
+    let insert_pos = original.find("value").unwrap_or(0);
+    let updated = format!(
+        "{}/* {}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 3, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
+}
+
+#[test]
+fn incremental_highlighting_matches_full_styles_after_crlf_single_quote_insert() {
+    let original = "SELECT value\r\nFROM dual";
+    let insert_pos = original.find("value").unwrap_or(0);
+    let updated = format!(
+        "{}'{}",
+        original.get(..insert_pos).unwrap_or(""),
+        original.get(insert_pos..).unwrap_or("")
+    );
+
+    let incremental = apply_incremental_highlight_for_test(original, &updated, insert_pos, 1, 0)
+        .unwrap_or_default();
+    let full = SqlHighlighter::new().generate_styles_for_text(&updated);
+
+    assert_eq!(incremental, full);
 }
 
 #[test]
