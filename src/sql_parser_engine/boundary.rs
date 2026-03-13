@@ -348,7 +348,14 @@ impl RoutineFrame {
 
         if matches!(
             token_upper,
-            "MODULE" | "SIGNATURE" | "ENV" | "ENVIRONMENT" | "IMPORTS" | "EXPORTS"
+            "MODULE"
+                | "SIGNATURE"
+                | "ENV"
+                | "ENVIRONMENT"
+                | "IMPORT"
+                | "IMPORTS"
+                | "EXPORT"
+                | "EXPORTS"
         ) {
             if matches!(
                 self.external_clause_state,
