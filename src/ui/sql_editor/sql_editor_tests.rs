@@ -556,6 +556,56 @@ fn format_sql_keeps_if_alias_member_access_intact() {
     );
 }
 #[test]
+fn format_sql_keeps_update_alias_named_if_inline() {
+    let input = "update sales if set if.amount = if.amount + 1 where if.id = 1";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("UPDATE sales IF")
+            && formatted.contains("IF.amount")
+            && formatted.contains("WHERE IF.id = 1;"),
+        "UPDATE alias IF should remain inline and usable in member access, got:
+{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("
+IF
+") && !formatted.contains("
+    IF
+"),
+        "UPDATE alias IF should not be treated as block keyword, got:
+{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_merge_into_alias_named_if_inline() {
+    let input = "merge into sales if using dual d on (if.id = d.dummy) when matched then update set if.amount = 0";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("MERGE INTO sales IF")
+            && formatted.contains("IF.id = d.dummy")
+            && formatted.contains("IF.amount = 0;"),
+        "MERGE INTO alias IF should remain inline, got:
+{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("
+IF
+") && !formatted.contains("
+    IF
+"),
+        "MERGE INTO alias IF should not be treated as block keyword, got:
+{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_breaks_minified_package_body_members() {
     let input = "CREATE OR REPLACE PACKAGE BODY pkg AS PROCEDURE p IS BEGIN NULL; END; FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; END pkg;";
     let formatted = SqlEditorWidget::format_sql_basic(input);
