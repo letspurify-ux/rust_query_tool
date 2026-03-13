@@ -48,6 +48,37 @@ fn chars_starts_with(chars: &[char], start: usize, pattern: &str) -> bool {
     true
 }
 
+#[inline]
+fn q_quote_prefix_has_boundary(chars: &[char], start: usize) -> bool {
+    start == 0
+        || chars
+            .get(start - 1)
+            .copied()
+            .is_none_or(|ch| !sql_text::is_identifier_char(ch))
+}
+
+fn detect_q_quote_start(chars: &[char], start: usize) -> Option<(usize, char)> {
+    let first = chars.get(start).copied()?;
+
+    let (prefix_len, delimiter_idx) = if matches!(first, 'n' | 'N' | 'u' | 'U')
+        && matches!(chars.get(start + 1).copied(), Some('q' | 'Q'))
+        && chars.get(start + 2).copied() == Some('\'')
+    {
+        (4, start + 3)
+    } else if matches!(first, 'q' | 'Q') && chars.get(start + 1).copied() == Some('\'') {
+        (3, start + 2)
+    } else {
+        return None;
+    };
+
+    let delimiter = chars.get(delimiter_idx).copied()?;
+    if !sql_text::is_valid_q_quote_delimiter(delimiter) {
+        return None;
+    }
+
+    Some((prefix_len, sql_text::q_quote_closing(delimiter)))
+}
+
 
 fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
     while idx < line.len() {
@@ -422,12 +453,37 @@ impl SqlParserEngine {
                     i += 1;
                     continue;
                 }
-                LexMode::QQuote { end_char } => {
+                LexMode::QQuote { end_char, depth } => {
                     let end_char = *end_char;
+                    let depth = *depth;
+                    if q_quote_prefix_has_boundary(chars, i) {
+                        if let Some((prefix_len, nested_end_char)) = detect_q_quote_start(chars, i)
+                        {
+                            if nested_end_char == end_char {
+                                for k in 0..prefix_len {
+                                    self.current.push(chars[i + k]);
+                                }
+                                self.state.lex_mode = LexMode::QQuote {
+                                    end_char,
+                                    depth: depth.saturating_add(1),
+                                };
+                                i += prefix_len;
+                                continue;
+                            }
+                        }
+                    }
+
                     self.current.push(c);
                     if c == end_char && next == Some('\'') {
                         self.current.push('\'');
-                        self.state.lex_mode = LexMode::Idle;
+                        self.state.lex_mode = if depth == 1 {
+                            LexMode::Idle
+                        } else {
+                            LexMode::QQuote {
+                                end_char,
+                                depth: depth - 1,
+                            }
+                        };
                         i += 2;
                         continue;
                     }
@@ -541,27 +597,10 @@ impl SqlParserEngine {
 
             // Q-quote literals: q'[...]' and nq'[...]'/uq'[...]'
             // Detect the start position of the q/Q character and the delimiter.
-            if self.state.token.is_empty() {
-                let (q_prefix_len, q_idx) = if matches!(c, 'n' | 'N' | 'u' | 'U')
-                    && matches!(next, Some('q' | 'Q'))
-                    && i + 2 < len
-                    && chars[i + 2] == '\''
-                {
-                    (4, i + 3) // nq'D or uq'D
-                } else if matches!(c, 'q' | 'Q') && next == Some('\'') {
-                    (3, i + 2) // q'D
-                } else {
-                    (0, 0)
-                };
-
-                if q_prefix_len > 0 {
-                    if let Some(&delimiter) = chars.get(q_idx) {
-                        if !sql_text::is_valid_q_quote_delimiter(delimiter) {
-                            self.current.push(c);
-                            self.state.token.push(c);
-                            i += 1;
-                            continue;
-                        }
+            if self.state.token.is_empty() && q_quote_prefix_has_boundary(chars, i) {
+                if let Some((q_prefix_len, _)) = detect_q_quote_start(chars, i) {
+                    let delimiter_idx = i + q_prefix_len - 1;
+                    if let Some(&delimiter) = chars.get(delimiter_idx) {
                         self.state.flush_token();
                         let allow_implicit_target =
                             self.state.allow_implicit_external_literal_target();

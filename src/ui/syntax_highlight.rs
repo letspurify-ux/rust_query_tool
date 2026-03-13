@@ -162,6 +162,7 @@ pub enum LexerState {
     InSingleQuote,
     InQQuote {
         closing: char,
+        depth: usize,
     },
     InDoubleQuote,
 }
@@ -545,16 +546,18 @@ impl SqlHighlighter {
                     return (style_bytes_to_string(styles), state);
                 }
             },
-            LexerState::InQQuote { closing } => match scan_until_q_quote_end(bytes, idx, closing) {
-                ScanResult::Closed { next_idx } => {
-                    idx = next_idx;
-                    styles[..idx].fill(STYLE_Q_QUOTE_STRING as u8);
+            LexerState::InQQuote { closing, depth } => {
+                match scan_until_q_quote_end(text, bytes, idx, closing, depth) {
+                    ScanResult::Closed { next_idx } => {
+                        idx = next_idx;
+                        styles[..idx].fill(STYLE_Q_QUOTE_STRING as u8);
+                    }
+                    ScanResult::Unterminated { state, .. } => {
+                        styles[..].fill(STYLE_Q_QUOTE_STRING as u8);
+                        return (style_bytes_to_string(styles), state);
+                    }
                 }
-                ScanResult::Unterminated { state, .. } => {
-                    styles[..].fill(STYLE_Q_QUOTE_STRING as u8);
-                    return (style_bytes_to_string(styles), state);
-                }
-            },
+            }
             LexerState::InDoubleQuote => match scan_until_double_quote_end(bytes, idx) {
                 ScanResult::Closed { next_idx } => {
                     idx = next_idx;
@@ -655,7 +658,8 @@ impl SqlHighlighter {
                 if let Some(q_quote_start) = detect_q_quote_start(text, idx) {
                     let start = idx;
                     idx += q_quote_start.prefix_len;
-                    let scan_result = scan_until_q_quote_end(bytes, idx, q_quote_start.closing);
+                    let scan_result =
+                        scan_until_q_quote_end(text, bytes, idx, q_quote_start.closing, 1);
                     idx = match scan_result {
                         ScanResult::Closed { next_idx }
                         | ScanResult::Unterminated { next_idx, .. } => next_idx,
@@ -778,13 +782,8 @@ impl SqlHighlighter {
                     || should_treat_control_keyword_as_implicit_alias(
                         text, bytes, start, idx, word,
                     );
-                let treat_keyword_as_identifier = should_treat_keyword_as_identifier_context(
-                    text,
-                    bytes,
-                    start,
-                    idx,
-                    word,
-                );
+                let treat_keyword_as_identifier =
+                    should_treat_keyword_as_identifier_context(text, bytes, start, idx, word);
                 let token_type = if expect_alias_identifier
                     || treat_keyword_as_identifier
                     || should_treat_function_name_as_identifier(text, bytes, start, idx, word)
@@ -1308,17 +1307,37 @@ fn scan_until_single_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
     }
 }
 
-fn scan_until_q_quote_end(bytes: &[u8], mut idx: usize, closing: char) -> ScanResult {
+fn scan_until_q_quote_end(
+    text: &str,
+    bytes: &[u8],
+    mut idx: usize,
+    closing: char,
+    mut depth: usize,
+) -> ScanResult {
     let mut closing_buf = [0u8; 4];
     let closing_bytes = closing.encode_utf8(&mut closing_buf).as_bytes();
     loop {
+        if is_literal_prefix_boundary(bytes, idx) {
+            if let Some(q_quote_start) = detect_q_quote_start(text, idx) {
+                if q_quote_start.closing == closing {
+                    idx += q_quote_start.prefix_len;
+                    depth = depth.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+
         if bytes
             .get(idx..)
             .is_some_and(|remaining| remaining.starts_with(closing_bytes))
             && bytes.get(idx + closing_bytes.len()) == Some(&b'\'')
         {
             idx += closing_bytes.len() + 1;
-            return ScanResult::Closed { next_idx: idx };
+            if depth == 1 {
+                return ScanResult::Closed { next_idx: idx };
+            }
+            depth -= 1;
+            continue;
         }
 
         match bytes.get(idx) {
@@ -1326,7 +1345,7 @@ fn scan_until_q_quote_end(bytes: &[u8], mut idx: usize, closing: char) -> ScanRe
             None => {
                 return ScanResult::Unterminated {
                     next_idx: idx,
-                    state: LexerState::InQQuote { closing },
+                    state: LexerState::InQQuote { closing, depth },
                 };
             }
         }
@@ -1385,10 +1404,7 @@ fn scan_number_end(bytes: &[u8], start_idx: usize) -> usize {
                 .is_some_and(|b| b.is_ascii_digit() || *b == b'+' || *b == b'-')
         {
             let mut exp_idx = idx + 1;
-            if bytes
-                .get(exp_idx)
-                .is_some_and(|b| *b == b'+' || *b == b'-')
-            {
+            if bytes.get(exp_idx).is_some_and(|b| *b == b'+' || *b == b'-') {
                 exp_idx += 1;
             }
 
@@ -1569,11 +1585,7 @@ fn is_connect_keyword(bytes: &[u8], start: usize) -> bool {
 }
 
 fn is_line_start(bytes: &[u8], idx: usize) -> bool {
-    idx == 0
-        || matches!(
-            bytes.get(idx.saturating_sub(1)),
-            Some(b'\n') | Some(b'\r')
-        )
+    idx == 0 || matches!(bytes.get(idx.saturating_sub(1)), Some(b'\n') | Some(b'\r'))
 }
 
 fn is_line_terminator(byte: u8) -> bool {

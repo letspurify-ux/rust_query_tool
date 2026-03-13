@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::db::{
-    format_connection_busy_message, lock_connection_with_activity, try_lock_connection_with_activity,
-    QueryExecutor, QueryResult,
+    format_connection_busy_message, lock_connection_with_activity,
+    try_lock_connection_with_activity, QueryExecutor, QueryResult,
 };
 use crate::ui::constants::*;
 use crate::ui::theme;

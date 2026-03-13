@@ -910,7 +910,8 @@ impl QueryExecutor {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
             if builder.state.in_package_body_initializer_body()
-                || (leading_is("BEGIN") && builder.state.is_package_body_initializer_begin_context())
+                || (leading_is("BEGIN")
+                    && builder.state.is_package_body_initializer_begin_context())
             {
                 block_depth_component = block_depth_component.saturating_sub(1);
             }
@@ -2660,7 +2661,240 @@ impl QueryExecutor {
         };
 
         Self::split_items_core(sql, &mut items, add_statement, on_tool_command, |_, _| {});
-        items
+        Self::merge_fragmented_standalone_routine_script_statements(items)
+    }
+
+    fn merge_fragmented_standalone_routine_script_statements(items: Vec<ScriptItem>) -> Vec<ScriptItem> {
+        let mut merged: Vec<ScriptItem> = Vec::with_capacity(items.len());
+        let mut index = 0usize;
+
+        while index < items.len() {
+            if let Some((combined, end_index)) =
+                Self::combine_fragmented_standalone_routine_statement(&items, index)
+            {
+                merged.push(ScriptItem::Statement(combined));
+                index = end_index + 1;
+                continue;
+            }
+
+            match items.get(index) {
+                Some(ScriptItem::Statement(statement)) => {
+                    merged.push(ScriptItem::Statement(statement.clone()));
+                }
+                Some(other) => merged.push(other.clone()),
+                None => {}
+            }
+            index += 1;
+        }
+
+        merged
+    }
+
+    fn combine_fragmented_standalone_routine_statement(
+        items: &[ScriptItem],
+        start_index: usize,
+    ) -> Option<(String, usize)> {
+        let statement = match items.get(start_index) {
+            Some(ScriptItem::Statement(statement)) => statement,
+            _ => return None,
+        };
+
+        let routine_name = Self::extract_standalone_routine_name(statement)?;
+        if Self::statement_has_matching_end_label(statement, routine_name.as_str()) {
+            return None;
+        }
+
+        let mut end_index = start_index + 1;
+        while end_index < items.len() {
+            match items.get(end_index) {
+                Some(ScriptItem::ToolCommand(_)) => return None,
+                Some(ScriptItem::Statement(next_statement)) => {
+                    if Self::is_orphan_end_label_statement_matching_routine(
+                        next_statement,
+                        routine_name.as_str(),
+                    ) {
+                        return Self::combine_statement_range(items, start_index, end_index)
+                            .map(|combined| (combined, end_index));
+                    }
+
+                    if Self::starts_new_top_level_create_statement(next_statement) {
+                        return None;
+                    }
+                }
+                None => return None,
+            }
+            end_index += 1;
+        }
+
+        None
+    }
+
+    fn combine_statement_range(
+        items: &[ScriptItem],
+        start_index: usize,
+        end_index: usize,
+    ) -> Option<String> {
+        let combined = items[start_index..=end_index]
+            .iter()
+            .filter_map(|item| match item {
+                ScriptItem::Statement(statement) => Some(statement.trim()),
+                ScriptItem::ToolCommand(_) => None,
+            })
+            .filter(|statement| !statement.is_empty())
+            .collect::<Vec<_>>()
+            .join(";\n");
+
+        if combined.is_empty() {
+            return None;
+        }
+
+        let stripped = Self::strip_comments(combined.as_str());
+        let cleaned = Self::strip_extra_trailing_semicolons(stripped.as_str());
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
+    fn extract_standalone_routine_name(statement: &str) -> Option<String> {
+        let chars: Vec<(usize, char)> = statement.char_indices().collect();
+        let mut pos = 0usize;
+
+        let first = Self::parse_keyword_token_at(chars.as_slice(), statement, &mut pos)?;
+        if first != "CREATE" {
+            return None;
+        }
+
+        let next = Self::parse_keyword_token_at(chars.as_slice(), statement, &mut pos)?;
+        let routine_keyword = if next == "OR" {
+            let replace = Self::parse_keyword_token_at(chars.as_slice(), statement, &mut pos)?;
+            if replace != "REPLACE" {
+                return None;
+            }
+            Self::parse_keyword_token_at(chars.as_slice(), statement, &mut pos)?
+        } else {
+            next
+        };
+
+        if !matches!(routine_keyword.as_str(), "PROCEDURE" | "FUNCTION") {
+            return None;
+        }
+
+        Self::parse_identifier_chain_upper_at(chars.as_slice(), statement, &mut pos)
+    }
+
+    fn statement_has_matching_end_label(statement: &str, routine_name: &str) -> bool {
+        Self::extract_end_label_chain(statement)
+            .is_some_and(|end_label| Self::identifier_chain_matches_routine(&end_label, routine_name))
+    }
+
+    fn is_orphan_end_label_statement_matching_routine(statement: &str, routine_name: &str) -> bool {
+        Self::extract_end_label_chain(statement).is_some_and(|end_label| {
+            Self::identifier_chain_matches_routine(&end_label, routine_name)
+                && Self::trimmed_statement_starts_with_end(statement)
+        })
+    }
+
+    fn trimmed_statement_starts_with_end(statement: &str) -> bool {
+        statement
+            .trim_start()
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("END"))
+    }
+
+    fn starts_new_top_level_create_statement(statement: &str) -> bool {
+        statement
+            .trim_start()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE"))
+    }
+
+    fn identifier_chain_matches_routine(label: &str, routine_name: &str) -> bool {
+        if label == routine_name {
+            return true;
+        }
+
+        routine_name
+            .rsplit('.')
+            .next()
+            .is_some_and(|tail| tail == label)
+    }
+
+    fn extract_end_label_chain(statement: &str) -> Option<String> {
+        let trimmed = statement.trim();
+        if !Self::trimmed_statement_starts_with_end(trimmed) {
+            return None;
+        }
+
+        let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+        let mut pos = 0usize;
+        let keyword = Self::parse_keyword_token_at(chars.as_slice(), trimmed, &mut pos)?;
+        if keyword != "END" {
+            return None;
+        }
+
+        Self::parse_identifier_chain_upper_at(chars.as_slice(), trimmed, &mut pos)
+    }
+
+    fn parse_keyword_token_at(
+        chars: &[(usize, char)],
+        text: &str,
+        pos: &mut usize,
+    ) -> Option<String> {
+        Self::skip_whitespace_chars(chars, pos);
+        let save_pos = *pos;
+        let token = Self::parse_identifier_at(chars, text, pos)?;
+        if token.starts_with('"') {
+            *pos = save_pos;
+            return None;
+        }
+        Some(token.to_ascii_uppercase())
+    }
+
+    fn parse_identifier_chain_upper_at(
+        chars: &[(usize, char)],
+        text: &str,
+        pos: &mut usize,
+    ) -> Option<String> {
+        let mut segments: Vec<String> = Vec::new();
+
+        loop {
+            Self::skip_whitespace_chars(chars, pos);
+            let segment = Self::parse_identifier_at(chars, text, pos)?;
+            segments.push(Self::normalize_identifier_segment(segment.as_str()));
+            Self::skip_whitespace_chars(chars, pos);
+
+            if chars.get(*pos).is_some_and(|(_, ch)| *ch == '.') {
+                *pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        if segments.is_empty() {
+            None
+        } else {
+            Some(segments.join("."))
+        }
+    }
+
+    fn normalize_identifier_segment(segment: &str) -> String {
+        if segment.starts_with('"') && segment.ends_with('"') && segment.len() >= 2 {
+            let inner = segment
+                .get(1..segment.len().saturating_sub(1))
+                .unwrap_or_default()
+                .replace("\"\"", "\"");
+            return inner.to_ascii_uppercase();
+        }
+
+        segment.to_ascii_uppercase()
+    }
+
+    fn skip_whitespace_chars(chars: &[(usize, char)], pos: &mut usize) {
+        while chars.get(*pos).is_some_and(|(_, ch)| ch.is_whitespace()) {
+            *pos += 1;
+        }
     }
 
     pub fn split_format_items(sql: &str) -> Vec<FormatItem> {

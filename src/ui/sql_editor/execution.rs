@@ -954,11 +954,10 @@ impl SqlEditorWidget {
             }
             _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
             (FormatItem::Statement(left), next_item)
-                if Self::is_prompt_format_item(next_item)
-                    && {
-                        let tokens = Self::tokenize_sql(left);
-                        Self::statement_has_code(left, &tokens)
-                    } =>
+                if Self::is_prompt_format_item(next_item) && {
+                    let tokens = Self::tokenize_sql(left);
+                    Self::statement_has_code(left, &tokens)
+                } =>
             {
                 true
             }
@@ -1063,7 +1062,9 @@ impl SqlEditorWidget {
     }
 
     fn semicolon_belongs_to_non_sql_line(statement: &str, semicolon_start: usize) -> bool {
-        let line_start = statement[..semicolon_start].rfind('\n').map_or(0, |idx| idx + 1);
+        let line_start = statement[..semicolon_start]
+            .rfind('\n')
+            .map_or(0, |idx| idx + 1);
         let line_end = statement[semicolon_start..]
             .find('\n')
             .map_or(statement.len(), |idx| semicolon_start + idx);
@@ -1256,13 +1257,16 @@ impl SqlEditorWidget {
             return false;
         }
 
-        let close_tag_idx = bytes.iter().enumerate().skip(1).find_map(|(idx, byte)| {
-            if *byte == b'$' {
-                Some(idx)
-            } else {
-                None
-            }
-        });
+        let close_tag_idx =
+            bytes.iter().enumerate().skip(1).find_map(
+                |(idx, byte)| {
+                    if *byte == b'$' {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                },
+            );
 
         let Some(close_tag_idx) = close_tag_idx else {
             return false;
@@ -11144,9 +11148,11 @@ SELECT c, d FROM dual";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("SELECT c,
+            formatted.contains(
+                "SELECT c,
     d
-FROM DUAL;"),
+FROM DUAL;"
+            ),
             "formatter should keep canonical terminator for trailing valid statement, got:
 {}",
             formatted
@@ -11196,9 +11202,12 @@ NULL";
 
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
-        assert_eq!(formatted, "BEGIN
+        assert_eq!(
+            formatted,
+            "BEGIN
     <<label
-    NULL");
+    NULL"
+        );
         assert!(
             !formatted.trim_end().ends_with(';'),
             "unterminated PL/SQL label should not receive a terminator, got:
@@ -11206,7 +11215,6 @@ NULL";
             formatted
         );
     }
-
 
     #[test]
     fn preserve_selected_text_terminator_keeps_semicolon_when_selection_had_one() {

@@ -219,5 +219,4 @@ impl IntellisenseRuntimeState {
     pub(crate) fn set_parse_generation_for_test(&self, generation: u64) {
         self.parse_generation.store(generation, Ordering::Relaxed);
     }
-
 }

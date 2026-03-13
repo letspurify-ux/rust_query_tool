@@ -9,7 +9,9 @@ fn with_current_shadow<R>(
 ) -> Option<R> {
     let shadow = shadow?;
     let buffer_len = buffer.length().max(0) as usize;
-    let guard = shadow.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = shadow
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.len() != buffer_len {
         return None;
     }
@@ -23,8 +25,10 @@ pub(crate) fn line_start(
 ) -> i32 {
     let buffer_len = buffer.length().max(0);
     let clamped = pos.clamp(0, buffer_len) as usize;
-    with_current_shadow(buffer, shadow, |shadow| i32::try_from(shadow.line_start(clamped)).ok())
-        .unwrap_or_else(|| buffer.line_start(pos.clamp(0, buffer_len)))
+    with_current_shadow(buffer, shadow, |shadow| {
+        i32::try_from(shadow.line_start(clamped)).ok()
+    })
+    .unwrap_or_else(|| buffer.line_start(pos.clamp(0, buffer_len)))
 }
 
 pub(crate) fn line_end(
@@ -34,8 +38,10 @@ pub(crate) fn line_end(
 ) -> i32 {
     let buffer_len = buffer.length().max(0);
     let clamped = pos.clamp(0, buffer_len) as usize;
-    with_current_shadow(buffer, shadow, |shadow| i32::try_from(shadow.line_end(clamped)).ok())
-        .unwrap_or_else(|| buffer.line_end(pos.clamp(0, buffer_len)))
+    with_current_shadow(buffer, shadow, |shadow| {
+        i32::try_from(shadow.line_end(clamped)).ok()
+    })
+    .unwrap_or_else(|| buffer.line_end(pos.clamp(0, buffer_len)))
 }
 
 pub(crate) fn text_range(
@@ -83,7 +89,9 @@ pub(crate) fn bounded_text_window(
     }
 
     let fallback_start = line_start(buffer, shadow, start).max(0).min(end);
-    let fallback_end = line_end(buffer, shadow, end).max(fallback_start).min(buffer_len);
+    let fallback_end = line_end(buffer, shadow, end)
+        .max(fallback_start)
+        .min(buffer_len);
     if fallback_start < fallback_end {
         return (
             text_range(buffer, shadow, fallback_start, fallback_end),

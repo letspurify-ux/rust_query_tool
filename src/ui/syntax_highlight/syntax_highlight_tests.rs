@@ -30,7 +30,6 @@ fn test_number_highlighting_stops_before_second_decimal_point() {
         .all(|c| c == STYLE_NUMBER));
 }
 
-
 #[test]
 fn test_number_highlighting_supports_exponent_notation() {
     let highlighter = SqlHighlighter::new();
@@ -54,14 +53,20 @@ fn test_number_highlighting_does_not_consume_incomplete_exponent() {
     let styles = highlighter.generate_styles(text);
 
     let first = text.find("1e+").unwrap_or(0);
-    assert_eq!(styles.as_bytes().get(first).copied(), Some(STYLE_NUMBER as u8));
+    assert_eq!(
+        styles.as_bytes().get(first).copied(),
+        Some(STYLE_NUMBER as u8)
+    );
     assert_ne!(
         styles.as_bytes().get(first + 1).copied(),
         Some(STYLE_NUMBER as u8)
     );
 
     let second = text.find("2E-").unwrap_or(0);
-    assert_eq!(styles.as_bytes().get(second).copied(), Some(STYLE_NUMBER as u8));
+    assert_eq!(
+        styles.as_bytes().get(second).copied(),
+        Some(STYLE_NUMBER as u8)
+    );
     assert_ne!(
         styles.as_bytes().get(second + 1).copied(),
         Some(STYLE_NUMBER as u8)
@@ -808,6 +813,108 @@ fn test_q_quote_with_embedded_quotes() {
 }
 
 #[test]
+fn test_multiline_q_quote_recovers_when_nested_same_delimiter_appears_inside() {
+    let highlighter = SqlHighlighter::new();
+    let text = "PROCEDURE upsert_row(\n\
+p_id NUMBER,\n\
+p_grp NUMBER,\n\
+p_name VARCHAR2,\n\
+p_note VARCHAR2,\n\
+p_amount NUMBER,\n\
+p_status VARCHAR2\n\
+)\n\
+IS\n\
+v_count NUMBER;\n\
+v_sql CLOB;\n\
+BEGIN\n\
+SELECT COUNT(*)\n\
+INTO v_count\n\
+FROM qt_splitter_boss\n\
+WHERE id = p_id;\n\
+\n\
+IF v_count = 0 THEN\n\
+INSERT INTO qt_splitter_boss\n\
+(\n\
+id, grp, name, note_text, created_at, amount, status_cd, payload\n\
+)\n\
+VALUES\n\
+(\n\
+p_id,\n\
+p_grp,\n\
+normalize_name(p_name),\n\
+p_note,\n\
+SYSDATE,\n\
+p_amount,\n\
+p_status,\n\
+q'[inserted;payload/with tricky tokens]'\n\
+);\n\
+ELSE\n\
+v_sql := q'[\n\
+UPDATE qt_splitter_boss\n\
+SET grp = :1,\n\
+name = :2,\n\
+note_text = :3,\n\
+amount = :4,\n\
+status_cd = :5,\n\
+payload = q'[dynamic ; payload / still string]'\n\
+WHERE id = :6\n\
+]';\n\
+\n\
+EXECUTE IMMEDIATE v_sql\n\
+USING p_grp, normalize_name(p_name), p_note, p_amount, p_status, p_id;\n\
+END IF;\n\
+\n\
+BEGIN\n\
+IF p_amount > 999 THEN\n\
+log_row(p_id, 'amount>999; flagged');\n\
+ELSE\n\
+log_row(p_id, 'amount<=999; ok');\n\
+END IF;\n\
+EXCEPTION\n\
+WHEN OTHERS THEN\n\
+NULL;\n\
+END;\n\
+END upsert_row;";
+    let styles = highlighter.generate_styles(text);
+
+    let outer_start = text.find("q'[\nUPDATE").unwrap_or(0);
+    let outer_end = text.rfind("\n]'").unwrap_or(text.len()) + "\n]'".len();
+    assert!(
+        styles[outer_start..outer_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "outer q-quote should keep string style through nested inner q-quote"
+    );
+
+    let where_start = text.find("WHERE id = :6").unwrap_or(0);
+    let where_end = where_start + "WHERE".len();
+    assert!(
+        styles[where_start..where_end]
+            .chars()
+            .all(|c| c == STYLE_Q_QUOTE_STRING),
+        "WHERE inside outer q-quote must remain string style"
+    );
+
+    let execute_start = text.find("EXECUTE IMMEDIATE").unwrap_or(0);
+    let execute_end = execute_start + "EXECUTE".len();
+    assert!(
+        styles[execute_start..execute_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "EXECUTE after outer q-quote should return to keyword style"
+    );
+
+    for literal in ["'amount>999; flagged'", "'amount<=999; ok'"] {
+        let start = text.find(literal).unwrap_or(0);
+        let end = start + literal.len();
+        assert!(
+            styles[start..end].chars().all(|c| c == STYLE_STRING),
+            "later quoted literal should remain string style: {literal}"
+        );
+    }
+}
+
+#[test]
 fn test_hint_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT /*+ FULL(t) */ * FROM table t";
@@ -923,7 +1030,6 @@ fn test_interval_literal_highlighting() {
         "INTERVAL literal should be styled as datetime literal"
     );
 }
-
 
 #[test]
 fn test_date_literal_with_newline_gap_highlighting() {
@@ -1097,7 +1203,8 @@ IF",
 #[test]
 fn test_package_spec_first_procedure_after_as_newline_is_keyword() {
     let highlighter = SqlHighlighter::new();
-    let text = "CREATE OR REPLACE PACKAGE oqt_demo_pkg AS\nPROCEDURE proc_in_only (p_tag IN VARCHAR2);";
+    let text =
+        "CREATE OR REPLACE PACKAGE oqt_demo_pkg AS\nPROCEDURE proc_in_only (p_tag IN VARCHAR2);";
     let styles = highlighter.generate_styles(text);
 
     let procedure_start = text.find("PROCEDURE").unwrap_or(0);
@@ -1409,7 +1516,13 @@ fn test_exit_state_unclosed_q_quote() {
     let text = "SELECT q'[unclosed q-string";
     let (_styles, exit) = highlighter.generate_styles_with_state(text, LexerState::Normal);
     assert!(
-        matches!(exit, LexerState::InQQuote { closing: ']' }),
+        matches!(
+            exit,
+            LexerState::InQQuote {
+                closing: ']',
+                depth: 1
+            }
+        ),
         "expected InQQuote with ']', got {:?}",
         exit
     );
@@ -1433,9 +1546,7 @@ fn test_entry_state_in_block_comment_continues() {
     // "still commenting */" should be comment
     let comment_end = text.find("*/").unwrap() + 2;
     assert!(
-        styles[..comment_end]
-            .chars()
-            .all(|c| c == STYLE_COMMENT),
+        styles[..comment_end].chars().all(|c| c == STYLE_COMMENT),
         "continued block comment should be COMMENT"
     );
     // "SELECT" after should be keyword
@@ -1478,8 +1589,13 @@ fn test_entry_state_in_single_quote_continues() {
 fn test_entry_state_in_q_quote_continues() {
     let highlighter = SqlHighlighter::new();
     let text = "still in q-string]' FROM dual";
-    let (styles, exit) =
-        highlighter.generate_styles_with_state(text, LexerState::InQQuote { closing: ']' });
+    let (styles, exit) = highlighter.generate_styles_with_state(
+        text,
+        LexerState::InQQuote {
+            closing: ']',
+            depth: 1,
+        },
+    );
     assert_eq!(exit, LexerState::Normal);
     let q_end = text.find("]'").unwrap() + 2;
     assert!(

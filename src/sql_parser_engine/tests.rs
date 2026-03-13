@@ -183,7 +183,6 @@ fn slash_line_with_leading_block_comment_and_sql_is_not_consumed_as_terminator()
     );
 }
 
-
 #[test]
 fn line_leading_marker_detects_host_and_run_after_leading_block_comment() {
     assert_eq!(
@@ -611,7 +610,6 @@ fn create_state_accepts_if_not_exists_before_procedure() {
     assert_eq!(state.create_plsql_kind, CreatePlsqlKind::Procedure);
 }
 
-
 #[test]
 fn create_state_accepts_noresolve_and_debug_modifiers_before_function() {
     let mut state = SplitState::default();
@@ -658,7 +656,6 @@ fn create_or_replace_noresolve_debug_function_splits_before_next_statement() {
     );
     assert_eq!(statements[1], "SELECT 1 FROM dual".to_string());
 }
-
 
 #[test]
 fn create_state_accepts_immutable_modifier_before_function() {
@@ -2838,6 +2835,32 @@ fn non_ascii_nq_quote_delimiter_is_treated_as_q_quote_and_preserves_semicolon_sp
 }
 
 #[test]
+fn package_body_nested_same_delimiter_q_quote_still_splits_on_slash() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY pkg_nested_qquote AS");
+    engine.process_line("  PROCEDURE run_me IS");
+    engine.process_line("    v_sql CLOB;");
+    engine.process_line("  BEGIN");
+    engine.process_line("    v_sql := q'[");
+    engine.process_line("      UPDATE qt_splitter_boss");
+    engine.process_line("         SET payload = q'[dynamic ; payload / still string]'");
+    engine.process_line("       WHERE id = :1");
+    engine.process_line("    ]';");
+    engine.process_line("  END run_me;");
+    engine.process_line("END pkg_nested_qquote;");
+    engine.process_line("/");
+    engine.process_line("SELECT 106 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("CREATE OR REPLACE PACKAGE BODY pkg_nested_qquote AS"));
+    assert!(statements[0].contains("payload = q'[dynamic ; payload / still string]'"));
+    assert!(statements[0].contains("END pkg_nested_qquote"));
+    assert_eq!(statements[1], "SELECT 106 FROM dual".to_string());
+}
+
+#[test]
 fn oracle_conditional_compilation_flag_does_not_enter_dollar_quote_mode() {
     let mut engine = SqlParserEngine::new();
 
@@ -3408,7 +3431,6 @@ fn language_clause_with_mle_exports_without_external_keyword_still_splits() {
     );
     assert!(statements[1].starts_with("SELECT 14 FROM dual"));
 }
-
 
 #[test]
 fn language_clause_with_mle_import_without_external_keyword_still_splits() {
@@ -4385,8 +4407,10 @@ fn with_package_declaration_keeps_main_query_attached_until_semicolon() {
 
     assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
     assert!(
-        statements[0].starts_with("WITH
-  PACKAGE pkg_demo AS"),
+        statements[0].starts_with(
+            "WITH
+  PACKAGE pkg_demo AS"
+        ),
         "WITH PACKAGE declaration must stay attached to the same top-level statement: {}",
         statements[0]
     );
@@ -4409,8 +4433,10 @@ fn with_type_declaration_keeps_main_query_attached_until_semicolon() {
 
     assert_eq!(statements.len(), 1, "unexpected statements: {statements:?}");
     assert!(
-        statements[0].starts_with("WITH
-  TYPE t_num IS TABLE OF NUMBER;"),
+        statements[0].starts_with(
+            "WITH
+  TYPE t_num IS TABLE OF NUMBER;"
+        ),
         "WITH TYPE declaration must stay attached to the same top-level statement: {}",
         statements[0]
     );

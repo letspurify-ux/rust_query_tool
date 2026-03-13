@@ -166,6 +166,150 @@ fn test_split_script_items_test14_deep_monster_view_regression() {
 }
 
 #[test]
+fn test_split_script_items_test15_nested_q_quote_package_body_regression() {
+    let sql = load_query_test_file("test15.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 0,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 20,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_pkg")
+                && stmt.contains("payload = q'[dynamic ; payload / still string]'")
+                && stmt.contains("END qt_splitter_pkg")
+        }),
+        "package body with nested q-quote should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_splitter_proc")
+                && stmt.contains("END qt_splitter_proc")
+        }),
+        "stored procedure should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("BEGIN")
+                && stmt.contains("qt_splitter_proc(10);")
+                && stmt.contains("END LOOP;")
+        }),
+        "final anonymous block should stay intact: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_test16_final_ultimate_boss_regression() {
+    let sql = load_query_test_file("test16.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 4,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 35,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_splitter_ultimate_proc")
+                && stmt.contains("v_rendered := q'[fallback ; / ]'")
+                && stmt.contains("UPDATE qt_splitter_ultimate")
+                && stmt.contains("END qt_splitter_ultimate_proc")
+        }),
+        "standalone procedure with nested block should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_splitter_ultimate_pkg")
+                && stmt.contains("touch_row(p_id, 'AMOUNT>=1000;DONE-CANDIDATE');")
+                && stmt.contains("END qt_splitter_ultimate_pkg")
+        }),
+        "package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("WITH base_data AS")
+                && stmt.contains("ORDER BY f.grp, f.rn, f.id")
+        }),
+        "WITH query should stay intact: {statements:?}"
+    );
+    assert!(
+        matches!(
+            items.first(),
+            Some(ScriptItem::ToolCommand(ToolCommand::SetDefine {
+                enabled: true,
+                define_char: None
+            }))
+        ),
+        "expected SET DEFINE ON tool command at the start: {items:?}"
+    );
+    assert!(
+        matches!(
+            items.last(),
+            Some(ScriptItem::ToolCommand(ToolCommand::Prompt { text }))
+                if text == "=== QT SPLITTER FINAL ULTIMATE BOSS END ==="
+        ),
+        "expected final PROMPT tool command at the end: {items:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_standalone_procedure_nested_block_followed_by_dml() {
+    let sql = r#"CREATE OR REPLACE PROCEDURE nested_proc IS
+BEGIN
+    BEGIN
+        NULL;
+    END;
+
+    UPDATE dual
+       SET dummy = dummy;
+END nested_proc;
+/
+SELECT 1 FROM dual;"#;
+
+    let items = QueryExecutor::split_script_items(sql);
+    let statements = get_statements(&items);
+
+    assert_eq!(statements.len(), 2, "unexpected split: {statements:?}");
+    assert!(
+        statements[0].contains("UPDATE dual")
+            && statements[0].contains("END nested_proc"),
+        "procedure body should stay intact: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1].trim(), "SELECT 1 FROM dual");
+}
+
+#[test]
 fn test_statement_bounds_at_cursor_clamps_non_boundary_utf8_offset() {
     let sql = "SELECT 1 FROM dual;\nSELECT 한글 AS txt FROM dual;";
     let utf8_start = sql

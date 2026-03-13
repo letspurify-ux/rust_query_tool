@@ -546,12 +546,13 @@ impl SplitState {
     pub(crate) fn start_q_quote(&mut self, delimiter: char) {
         self.lex_mode = LexMode::QQuote {
             end_char: sql_text::q_quote_closing(delimiter),
+            depth: 1,
         };
     }
 
     pub(crate) fn q_quote_end(&self) -> Option<char> {
         match &self.lex_mode {
-            LexMode::QQuote { end_char } => Some(*end_char),
+            LexMode::QQuote { end_char, .. } => Some(*end_char),
             _ => None,
         }
     }

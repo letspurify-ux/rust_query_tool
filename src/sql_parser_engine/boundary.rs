@@ -18,6 +18,7 @@ pub(crate) enum LexMode {
     BlockComment,
     QQuote {
         end_char: char,
+        depth: usize,
     },
     DollarQuote {
         tag: String,
