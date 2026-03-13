@@ -1,5 +1,6 @@
 use oracle::sql_type::{OracleType, RefCursor};
 use oracle::{Connection, Error as OracleError, Row, Statement};
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -15,6 +16,20 @@ pub struct QueryExecutor;
 
 const STREAM_FETCH_ARRAY_SIZE: u32 = 2_000;
 const STREAM_PREFETCH_ROWS: u32 = STREAM_FETCH_ARRAY_SIZE + 1;
+const MAX_NESTED_CURSOR_DEPTH: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct NestedCursorDisplay {
+    columns: Vec<String>,
+    rows: Vec<Vec<NestedCursorDisplayValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum NestedCursorDisplayValue {
+    Scalar(String),
+    Cursor(Box<NestedCursorDisplay>),
+}
 
 impl QueryExecutor {
     fn build_streaming_statement(conn: &Connection, sql: &str) -> Result<Statement, OracleError> {
@@ -37,11 +52,94 @@ impl QueryExecutor {
     }
 
     fn row_value_to_text(row: &Row, index: usize) -> Result<String, OracleError> {
+        if Self::row_column_is_ref_cursor(row, index) {
+            let cursor: Option<RefCursor> = row.get(index)?;
+            return match cursor {
+                Some(mut cursor) => {
+                    let display = Self::collect_nested_cursor_display(&mut cursor, 0)?;
+                    Self::nested_cursor_display_to_text(&display)
+                }
+                None => Ok("NULL".to_string()),
+            };
+        }
+
         // ROWID columns should be normalized to ROWIDTOCHAR(...) in
         // rowid_safe_execution_sql before fetch. Keep this path simple and fail-fast
         // via OracleError if conversion is not possible.
         let value: Option<String> = row.get(index)?;
         Ok(value.unwrap_or_else(|| "NULL".to_string()))
+    }
+
+    fn row_column_is_ref_cursor(row: &Row, index: usize) -> bool {
+        row.column_info()
+            .get(index)
+            .is_some_and(|column| matches!(column.oracle_type(), OracleType::RefCursor))
+    }
+
+    fn collect_nested_cursor_display(
+        cursor: &mut RefCursor,
+        depth: usize,
+    ) -> Result<NestedCursorDisplay, OracleError> {
+        let result_set = cursor.query()?;
+        let columns = result_set
+            .column_info()
+            .iter()
+            .map(|column| Self::normalize_result_column_name(column.name(), false))
+            .collect::<Vec<String>>();
+        let column_count = columns.len();
+        let mut rows = Vec::new();
+
+        for row_result in result_set {
+            let row = row_result?;
+            let mut row_values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                row_values.push(Self::row_value_to_nested_cursor_display(
+                    &row,
+                    index,
+                    depth.saturating_add(1),
+                )?);
+            }
+            rows.push(row_values);
+        }
+
+        Ok(NestedCursorDisplay { columns, rows })
+    }
+
+    fn row_value_to_nested_cursor_display(
+        row: &Row,
+        index: usize,
+        depth: usize,
+    ) -> Result<NestedCursorDisplayValue, OracleError> {
+        if Self::row_column_is_ref_cursor(row, index) {
+            if depth >= MAX_NESTED_CURSOR_DEPTH {
+                return Ok(NestedCursorDisplayValue::Scalar(
+                    "REFCURSOR (depth limit exceeded)".to_string(),
+                ));
+            }
+
+            let cursor: Option<RefCursor> = row.get(index)?;
+            return match cursor {
+                Some(mut cursor) => Ok(NestedCursorDisplayValue::Cursor(Box::new(
+                    Self::collect_nested_cursor_display(&mut cursor, depth)?,
+                ))),
+                None => Ok(NestedCursorDisplayValue::Scalar("NULL".to_string())),
+            };
+        }
+
+        let value: Option<String> = row.get(index)?;
+        Ok(NestedCursorDisplayValue::Scalar(
+            value.unwrap_or_else(|| "NULL".to_string()),
+        ))
+    }
+
+    fn nested_cursor_display_to_text(
+        display: &NestedCursorDisplay,
+    ) -> Result<String, OracleError> {
+        serde_json::to_string(display).map_err(|err| {
+            Self::invalid_argument_error(format!(
+                "Failed to serialize nested cursor result: {err}"
+            ))
+        })
     }
 
     fn normalize_result_column_name(name: &str, normalize_internal_rowid_alias: bool) -> String {
@@ -5199,12 +5297,16 @@ ORDER BY
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '#')
     }
 
-    fn invalid_security_input_error(message: impl Into<String>) -> OracleError {
+    fn invalid_argument_error(message: impl Into<String>) -> OracleError {
         #[allow(deprecated)]
         OracleError::InvalidArgument {
             message: Cow::Owned(message.into()),
             source: None,
         }
+    }
+
+    fn invalid_security_input_error(message: impl Into<String>) -> OracleError {
+        Self::invalid_argument_error(message)
     }
 
     fn validate_bounded_positive_u32(
@@ -8820,4 +8922,49 @@ pub struct ConstraintInfo {
     pub constraint_type: String,
     pub columns: String,
     pub ref_table: Option<String>,
+}
+
+#[cfg(test)]
+mod nested_cursor_serialization_tests {
+    use super::{NestedCursorDisplay, NestedCursorDisplayValue, QueryExecutor};
+
+    #[test]
+    fn nested_cursor_display_to_text_preserves_column_order_and_nested_rows() {
+        let display = NestedCursorDisplay {
+            columns: vec![
+                "EMP_ID".to_string(),
+                "EMP_NO".to_string(),
+                "SALES_CUR".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    NestedCursorDisplayValue::Scalar("100".to_string()),
+                    NestedCursorDisplayValue::Scalar("E-100".to_string()),
+                    NestedCursorDisplayValue::Cursor(Box::new(NestedCursorDisplay {
+                        columns: vec!["SALE_YEAR".to_string(), "TOTAL_SALES".to_string()],
+                        rows: vec![vec![
+                            NestedCursorDisplayValue::Scalar("2024".to_string()),
+                            NestedCursorDisplayValue::Scalar("1500".to_string()),
+                        ]],
+                    })),
+                ],
+                vec![
+                    NestedCursorDisplayValue::Scalar("101".to_string()),
+                    NestedCursorDisplayValue::Scalar("E-101".to_string()),
+                    NestedCursorDisplayValue::Cursor(Box::new(NestedCursorDisplay {
+                        columns: vec!["SALE_YEAR".to_string(), "TOTAL_SALES".to_string()],
+                        rows: Vec::new(),
+                    })),
+                ],
+            ],
+        };
+
+        let text = QueryExecutor::nested_cursor_display_to_text(&display)
+            .unwrap_or_else(|err| panic!("unexpected serialization error: {err}"));
+
+        assert_eq!(
+            text,
+            r#"{"columns":["EMP_ID","EMP_NO","SALES_CUR"],"rows":[["100","E-100",{"columns":["SALE_YEAR","TOTAL_SALES"],"rows":[["2024","1500"]]}],["101","E-101",{"columns":["SALE_YEAR","TOTAL_SALES"],"rows":[]}]]}"#
+        );
+    }
 }

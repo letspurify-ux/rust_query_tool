@@ -342,6 +342,65 @@ fn test_split_script_items_test17_execution_unit_final_boss_regression() {
 }
 
 #[test]
+fn test_split_script_items_test19_execution_unit_splitter_final_boss_regression() {
+    let sql = load_query_test_file("test19.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 0,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 24,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_boss_pkg")
+                && stmt.contains("g_body_trap CONSTANT VARCHAR2(32767) := q'~BODY-BEGIN")
+                && stmt.contains("END qt_boss_pkg")
+        }),
+        "package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_boss_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_boss_proc")
+        }),
+        "standalone procedure should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("LOG DISTRIBUTION FAIL")
+                && stmt.contains("v_lex_cnt")
+                && stmt.trim_end().ends_with("END")
+        }),
+        "verification anonymous block should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT log_id,")
+                && stmt.contains("SUBSTR(payload, 1, 120) AS payload_preview")
+                && stmt.contains("ORDER BY log_id")
+        }),
+        "final payload preview query should stay intact: {statements:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_standalone_procedure_nested_block_followed_by_dml() {
     let sql = r#"CREATE OR REPLACE PROCEDURE nested_proc IS
 BEGIN
@@ -507,6 +566,61 @@ fn test_split_format_items_test17_execution_unit_final_boss_regression() {
     assert!(
         statements.iter().all(|stmt| stmt.trim() != "END qt_split_proc"),
         "orphan END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_test19_execution_unit_splitter_final_boss_regression() {
+    let sql = load_query_test_file("test19.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 11, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_boss_pkg")
+                && stmt.contains("g_body_trap CONSTANT VARCHAR2(32767) := q'~BODY-BEGIN")
+                && stmt.contains("END qt_boss_pkg")
+        }),
+        "package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_boss_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_boss_proc")
+        }),
+        "standalone procedure should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("LOG DISTRIBUTION FAIL")
+                && stmt.contains("v_lex_cnt")
+                && stmt.trim_end().ends_with("END")
+        }),
+        "verification anonymous block should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_boss_pkg"),
+        "orphan package END label should not remain standalone in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_boss_proc"),
+        "orphan procedure END label should not remain standalone in format splitter: {statements:?}"
     );
 }
 

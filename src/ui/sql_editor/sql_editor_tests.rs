@@ -29,6 +29,12 @@ fn count_script_statements(items: &[ScriptItem]) -> usize {
         .count()
 }
 
+fn count_script_tool_commands(items: &[ScriptItem]) -> usize {
+    items.iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count()
+}
+
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
     for needle in needles {
         assert!(
@@ -689,6 +695,95 @@ fn format_sql_preserves_test17_execution_unit_final_boss_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test17.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
+    let input = load_test_file("test19.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "CREATE OR REPLACE PACKAGE BODY qt_boss_pkg",
+        "g_body_trap CONSTANT VARCHAR2",
+        "BODY-END~';",
+        "END qt_boss_pkg;",
+        "CREATE OR REPLACE PROCEDURE qt_boss_proc",
+        "END LOOP outer_loop;",
+        "END qt_boss_proc;",
+        "CREATE OR REPLACE VIEW qt_boss_view AS",
+        "LOG DISTRIBUTION FAIL:",
+        "SELECT log_id,",
+    ];
+
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for test19.sql"
+    );
+
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for test19.sql"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool command count for test19.sql"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_boss_pkg")
+                && stmt.contains("g_body_trap CONSTANT VARCHAR2")
+                && stmt.contains("BODY-END~';")
+                && stmt.contains("END qt_boss_pkg")
+        }),
+        "Formatting should preserve package body execution unit for test19.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PROCEDURE qt_boss_proc")
+                && stmt.contains("END LOOP outer_loop;")
+                && stmt.contains("END qt_boss_proc")
+        }),
+        "Formatting should preserve standalone procedure execution unit for test19.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("LOG DISTRIBUTION FAIL")
+                && stmt.contains("v_lex_cnt")
+                && stmt.trim_end().ends_with("END")
+        }),
+        "Formatting should preserve verification anonymous block for test19.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT log_id,")
+                && stmt.contains("payload_preview")
+                && stmt.contains("ORDER BY log_id")
+        }),
+        "Formatting should preserve final payload preview query for test19.sql: {formatted_statements:?}"
+    );
+
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for test19.sql"
     );
 }
 

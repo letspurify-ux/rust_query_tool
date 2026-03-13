@@ -12118,6 +12118,62 @@ END;"#;
 
         assert_eq!(formatted, expected);
     }
+
+    #[test]
+    fn formats_nested_cursor_expression_with_consistent_depth() {
+        let sql = r#"SELECT
+    d.dept_id,
+    d.dept_name,
+    CURSOR
+    (
+        SELECT
+            e.emp_id,
+            e.emp_no,
+            e.emp_name,
+            CURSOR
+            (
+                SELECT
+                    s.sale_year,
+                    SUM(s.sale_amount) AS total_sales
+                FROM qt_sales s
+                WHERE s.emp_id = e.emp_id
+                GROUP BY s.sale_year
+                ORDER BY s.sale_year
+            ) AS sales_cur
+        FROM qt_emp e
+        WHERE e.dept_id = d.dept_id
+        ORDER BY e.emp_id
+    ) AS emp_cur
+FROM qt_dept d
+ORDER BY d.dept_id"#;
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        let expected = [
+            "SELECT d.dept_id,",
+            "    d.dept_name,",
+            "    CURSOR (",
+            "        SELECT e.emp_id,",
+            "            e.emp_no,",
+            "            e.emp_name,",
+            "            CURSOR (",
+            "                SELECT s.sale_year,",
+            "                    SUM (s.sale_amount) AS total_sales",
+            "                FROM qt_sales s",
+            "                WHERE s.emp_id = e.emp_id",
+            "                GROUP BY s.sale_year",
+            "                ORDER BY s.sale_year",
+            "            ) AS sales_cur",
+            "        FROM qt_emp e",
+            "        WHERE e.dept_id = d.dept_id",
+            "        ORDER BY e.emp_id",
+            "    ) AS emp_cur",
+            "FROM qt_dept d",
+            "ORDER BY d.dept_id;",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted, expected);
+    }
 }
 
 #[cfg(test)]
