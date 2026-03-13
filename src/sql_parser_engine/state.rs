@@ -1384,6 +1384,7 @@ impl SplitState {
             match upper {
                 // Modifiers that appear between CREATE and the object type keyword
                 "OR" | "NO" | "FORCE" | "NOFORCE" | "REPLACE" | "AND" | "COMPILE" | "RESOLVE"
+                | "NORESOLVE" | "DEBUG" | "NODEBUG"
                 | "IF" | "NOT" | "EXISTS" | "EDITIONABLE" | "NONEDITIONABLE" | "EDITIONING"
                 | "NONEDITIONING" | "FORWARD" | "REVERSE" | "CROSSEDITION" | "SHARING"
                 | "METADATA" | "DATA" | "EXTENDED" | "NONE" => return,
