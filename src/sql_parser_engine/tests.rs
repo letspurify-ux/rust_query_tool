@@ -7220,6 +7220,42 @@ fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_befor
 }
 
 #[test]
+fn oracle_mle_module_clause_after_quoted_language_target_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_module RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"JavaScript\" MODULE ext_mod;");
+    engine.process_line("SELECT 58 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("LANGUAGE \"JavaScript\" MODULE ext_mod"),
+        "MODULE clause should remain in external call-spec statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 58 FROM dual".to_string());
+}
+
+#[test]
+fn oracle_mle_signature_clause_after_quoted_language_target_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_sig RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"JavaScript\" SIGNATURE 'f()';");
+    engine.process_line("SELECT 59 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("LANGUAGE \"JavaScript\" SIGNATURE 'f()'"),
+        "SIGNATURE clause should remain in external call-spec statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 59 FROM dual".to_string());
+}
+
+#[test]
 fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_before_following_begin_block(
 ) {
     let mut engine = SqlParserEngine::new();
