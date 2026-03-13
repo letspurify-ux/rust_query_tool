@@ -497,8 +497,12 @@ impl SqlEditorWidget {
         if select_formatted {
             let original_within_selection =
                 (original_pos as isize - start as isize).clamp(0, source.len() as isize) as i32;
-            let mapped_within_selection =
-                Self::map_cursor_after_format(&source, &formatted, original_within_selection);
+            let mapped_within_selection = Self::map_cursor_after_format_with_terminator_policy(
+                &source,
+                &formatted,
+                original_within_selection,
+                false,
+            );
             let selection_end = start + Self::clamp_to_char_boundary(&formatted, formatted.len());
             let mapped_cursor =
                 start + Self::clamp_to_char_boundary(&formatted, mapped_within_selection as usize);
@@ -546,6 +550,15 @@ impl SqlEditorWidget {
     }
 
     fn map_cursor_after_format(source: &str, formatted: &str, original_pos: i32) -> i32 {
+        Self::map_cursor_after_format_with_terminator_policy(source, formatted, original_pos, true)
+    }
+
+    fn map_cursor_after_format_with_terminator_policy(
+        source: &str,
+        formatted: &str,
+        original_pos: i32,
+        append_missing_terminator: bool,
+    ) -> i32 {
         if original_pos <= 0 {
             return 0;
         }
@@ -561,7 +574,8 @@ impl SqlEditorWidget {
         }
 
         let source_prefix = &source[..source_pos];
-        let formatted_prefix = Self::format_sql_basic(source_prefix);
+        let formatted_prefix =
+            Self::format_sql_basic_with_terminator_policy(source_prefix, append_missing_terminator);
         let formatted_pos = formatted_prefix.len().min(formatted.len());
         Self::clamp_to_char_boundary(formatted, formatted_pos) as i32
     }
@@ -9874,6 +9888,48 @@ END;"#;
         assert!(
             formatted.trim_end().ends_with(';'),
             "Selection formatting should keep canonical semicolon terminator"
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_without_semicolon_keeps_inline_comment_anchor() {
+        let source = "select 1 from dual -- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("--").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_terminator_policy(
+            source,
+            &formatted,
+            source_pos,
+            false,
+        ) as usize;
+
+        assert!(formatted.is_char_boundary(mapped));
+        assert!(
+            formatted[mapped..].trim_start().starts_with("-- trailing note"),
+            "Selected-only cursor mapping should keep inline comment anchor without synthetic terminator, got:\n{}",
+            &formatted[mapped..]
+        );
+    }
+
+    #[test]
+    fn cursor_mapping_selection_without_semicolon_keeps_newline_comment_anchor() {
+        let source = "select 1 from dual\n-- trailing note";
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let source_pos = source.find("--").unwrap_or(0) as i32;
+
+        let mapped = SqlEditorWidget::map_cursor_after_format_with_terminator_policy(
+            source,
+            &formatted,
+            source_pos,
+            false,
+        ) as usize;
+
+        assert!(formatted.is_char_boundary(mapped));
+        assert!(
+            formatted[mapped..].trim_start().starts_with("-- trailing note"),
+            "Selected-only cursor mapping should keep newline comment anchor without synthetic terminator, got:\n{}",
+            &formatted[mapped..]
         );
     }
 
