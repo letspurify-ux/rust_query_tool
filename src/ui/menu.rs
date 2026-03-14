@@ -331,60 +331,6 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Tools/&Session Lock Monitor...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/&Cursor Plan Analyzer...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/S&QL Monitor Dashboard...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/&Storage Dashboard...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/Scheduler &Manager...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/Security Mana&ger...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/&RMAN Dashboard...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/AWR/&ASH Dashboard...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
-            "&Tools/&Data Guard Dashboard...",
-            Shortcut::None,
-            MenuFlag::Inactive,
-            forward_menu_callback,
-        );
-        menu.add(
             "&Tools/",
             Shortcut::None,
             MenuFlag::MenuDivider,
