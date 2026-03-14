@@ -191,6 +191,7 @@ struct RoutineFrame {
     semicolon_policy: SemicolonPolicy,
     external_clause_state: ExternalClauseState,
     implicit_language_target_is_quoted: bool,
+    opened_with_as: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -221,6 +222,7 @@ impl RoutineFrame {
             semicolon_policy: SemicolonPolicy::Default,
             external_clause_state: ExternalClauseState::None,
             implicit_language_target_is_quoted: false,
+            opened_with_as: false,
         }
     }
 
@@ -254,10 +256,6 @@ impl RoutineFrame {
                 | ExternalClauseState::SawImplicitLanguageTarget
                 | ExternalClauseState::AwaitingLanguageTargetImplicit
         )
-    }
-
-    fn should_defer_begin_split_after_implicit_semicolon(self) -> bool {
-        self.implicit_language_target_is_quoted
     }
 
     fn mark_external_clause(&mut self) {

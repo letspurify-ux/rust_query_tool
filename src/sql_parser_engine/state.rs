@@ -170,7 +170,7 @@ impl SplitState {
 
         self.active_routine_frame().is_some_and(|frame| {
             frame.semicolon_policy == SemicolonPolicy::AwaitingImplicitTopLevelDecision
-                && !frame.should_defer_begin_split_after_implicit_semicolon()
+                && frame.opened_with_as
         })
     }
 
@@ -903,6 +903,11 @@ impl SplitState {
             if needs_begin_tracking {
                 self.routine_is_stack
                     .push(RoutineFrame::new(self.block_depth()));
+                if upper == "AS" {
+                    if let Some(frame) = self.routine_is_stack.last_mut() {
+                        frame.opened_with_as = true;
+                    }
+                }
                 if self.pending_sql_macro_call_spec {
                     if let Some(frame) = self.routine_is_stack.last_mut() {
                         frame.mark_external_clause();

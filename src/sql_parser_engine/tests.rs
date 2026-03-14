@@ -14,6 +14,7 @@ fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end()
             semicolon_policy: SemicolonPolicy::ForceSplit,
             external_clause_state: ExternalClauseState::None,
             implicit_language_target_is_quoted: false,
+            opened_with_as: false,
         }],
         pending_end: PendingEnd::End,
         pending_subprogram_begins: 0,
@@ -65,6 +66,7 @@ fn semicolon_action_detects_forced_routine_split() {
         semicolon_policy: SemicolonPolicy::ForceSplit,
         external_clause_state: ExternalClauseState::Confirmed,
         implicit_language_target_is_quoted: false,
+        opened_with_as: false,
     });
     assert_eq!(
         SemicolonAction::from_state(&state),
@@ -82,6 +84,7 @@ fn semicolon_action_closes_nested_external_routine_without_split() {
         semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
         external_clause_state: ExternalClauseState::Confirmed,
         implicit_language_target_is_quoted: false,
+        opened_with_as: false,
     });
     assert_eq!(
         SemicolonAction::from_state(&state),
@@ -246,6 +249,7 @@ fn line_boundary_action_distinguishes_preserved_and_consumed_slash_lines() {
             semicolon_policy: SemicolonPolicy::ForceSplit,
             external_clause_state: ExternalClauseState::Confirmed,
             implicit_language_target_is_quoted: false,
+            opened_with_as: false,
         }],
         ..SplitState::default()
     };
@@ -484,6 +488,247 @@ fn create_function_external_language_q_quote_target_splits_from_following_statem
         statements[0]
     );
     assert_eq!(statements[1], "SELECT 14 FROM dual".to_string());
+}
+
+#[test]
+fn probe_external_with_context_parameters_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_ctx RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  LANGUAGE C");
+    engine.process_line("  NAME \"ext_ctx\"");
+    engine.process_line("  LIBRARY ext_lib");
+    engine.process_line("  WITH CONTEXT PARAMETERS ('x');");
+    engine.process_line("SELECT 15 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+}
+
+#[test]
+fn probe_create_type_object_spec_splits_on_semicolon_without_slash() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE TYPE t_probe AS OBJECT (");
+    engine.process_line("  id NUMBER");
+    engine.process_line(");");
+    engine.process_line("SELECT 16 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].starts_with("CREATE OR REPLACE TYPE t_probe AS OBJECT"));
+    assert_eq!(statements[1], "SELECT 16 FROM dual".to_string());
+}
+
+#[test]
+fn probe_conditional_compilation_end_if_suffix_keeps_function_boundary() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION f_cc_suffix RETURN NUMBER IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  $IF $$DEBUG $THEN");
+    engine.process_line("    RETURN 1;");
+    engine.process_line("  $END IF;");
+    engine.process_line("  RETURN 0;");
+    engine.process_line("END;");
+    engine.process_line("/");
+    engine.process_line("SELECT 17 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+}
+
+#[test]
+fn probe_labeled_anonymous_block_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("<<outer_block>>");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END outer_block;");
+    engine.process_line("/");
+    engine.process_line("SELECT 18 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+}
+
+#[test]
+fn probe_type_body_member_external_with_context_does_not_split_type_body() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE TYPE BODY t_ctx AS");
+    engine.process_line("  MEMBER FUNCTION f RETURN NUMBER");
+    engine.process_line("    EXTERNAL NAME \"f\"");
+    engine.process_line("    LANGUAGE C");
+    engine.process_line("    LIBRARY ext_lib");
+    engine.process_line("    WITH CONTEXT;");
+    engine.process_line("END;");
+    engine.process_line("/");
+    engine.process_line("SELECT 19 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("WITH CONTEXT;\nEND"),
+        "WITH CONTEXT member call spec must stay inside TYPE BODY statement: {}",
+        statements[0]
+    );
+}
+
+#[test]
+fn create_function_external_parameter_style_java_without_semicolon_uses_slash_terminator() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_param RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  LANGUAGE JAVA");
+    engine.process_line("  NAME 'pkg.Clz.method(int) return int'");
+    engine.process_line("  PARAMETER STYLE JAVA");
+    engine.process_line("/");
+    engine.process_line("SELECT 20 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PARAMETER STYLE JAVA"),
+        "external call spec should preserve PARAMETER STYLE clause: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 20 FROM dual".to_string());
+}
+
+#[test]
+fn create_function_external_language_target_after_block_comment_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_comment RETURN NUMBER");
+    engine.process_line("  EXTERNAL");
+    engine.process_line("  LANGUAGE /* oracle */ C");
+    engine.process_line("  NAME \"ext_comment\";");
+    engine.process_line("SELECT 21 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+}
+
+#[test]
+fn create_function_implicit_quoted_language_target_with_parameter_style_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_quoted_clause RETURN NUMBER");
+    engine.process_line("  AS LANGUAGE \"JavaScript\"");
+    engine.process_line("  PARAMETER STYLE MLE;");
+    engine.process_line("SELECT 22 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PARAMETER STYLE MLE"),
+        "call spec clause should remain in first statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 22 FROM dual".to_string());
+}
+
+#[test]
+fn type_body_member_external_parameter_style_closes_nested_routine_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE TYPE BODY t_param AS");
+    engine.process_line("  MEMBER FUNCTION f RETURN NUMBER");
+    engine.process_line("    EXTERNAL");
+    engine.process_line("    LANGUAGE JAVA");
+    engine.process_line("    NAME 'pkg.Clz.f() return int'");
+    engine.process_line("    PARAMETER STYLE JAVA;");
+    engine.process_line("  MEMBER FUNCTION g RETURN NUMBER IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    RETURN 7;");
+    engine.process_line("  END g;");
+    engine.process_line("END;");
+    engine.process_line("/");
+    engine.process_line("SELECT 23 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PARAMETER STYLE JAVA;\n  MEMBER FUNCTION g RETURN NUMBER IS"),
+        "nested external member should close so following member function stays in same TYPE BODY statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 23 FROM dual".to_string());
+}
+
+#[test]
+fn type_body_member_implicit_quoted_language_parameter_style_closes_nested_routine_block() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE TYPE BODY t_param2 AS");
+    engine.process_line("  MEMBER FUNCTION f RETURN NUMBER");
+    engine.process_line("    AS LANGUAGE \"JavaScript\"");
+    engine.process_line("    PARAMETER STYLE MLE;");
+    engine.process_line("  MEMBER FUNCTION g RETURN NUMBER IS");
+    engine.process_line("  BEGIN");
+    engine.process_line("    RETURN 8;");
+    engine.process_line("  END g;");
+    engine.process_line("END;");
+    engine.process_line("/");
+    engine.process_line("SELECT 24 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PARAMETER STYLE MLE;\n  MEMBER FUNCTION g RETURN NUMBER IS"),
+        "nested implicit quoted language member should close before following member: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 24 FROM dual".to_string());
+}
+
+#[test]
+fn create_function_implicit_quoted_language_without_semicolon_uses_slash_terminator() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_slash RETURN NUMBER");
+    engine.process_line("  AS LANGUAGE \"JavaScript\"");
+    engine.process_line("  PARAMETER STYLE MLE");
+    engine.process_line("/");
+    engine.process_line("SELECT 25 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("PARAMETER STYLE MLE"),
+        "slash-terminated external function should keep full call spec: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 25 FROM dual".to_string());
+}
+
+#[test]
+fn create_function_implicit_quoted_language_then_anonymous_begin_block_splits() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_then_begin RETURN NUMBER");
+    engine.process_line("  AS LANGUAGE \"JavaScript\";");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END;");
+    engine.process_line("/");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("AS LANGUAGE \"JavaScript\""),
+        "first statement should keep create function call spec: {}",
+        statements[0]
+    );
+    assert!(
+        statements[1].starts_with("BEGIN"),
+        "second statement should start at anonymous block: {}",
+        statements[1]
+    );
 }
 
 #[test]
@@ -1209,6 +1454,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
         semicolon_policy: SemicolonPolicy::ForceSplit,
         external_clause_state: ExternalClauseState::Confirmed,
         implicit_language_target_is_quoted: false,
+        opened_with_as: false,
     });
     engine.state.pending_end = PendingEnd::End;
     engine.state.pending_do = PendingDo::While {
@@ -1238,6 +1484,7 @@ fn close_external_routine_semicolon_only_closes_nested_routine_block() {
             semicolon_policy: SemicolonPolicy::CloseRoutineBlock,
             external_clause_state: ExternalClauseState::Confirmed,
             implicit_language_target_is_quoted: false,
+            opened_with_as: false,
         }],
         ..SplitState::default()
     };
