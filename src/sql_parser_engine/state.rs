@@ -270,6 +270,23 @@ impl SplitState {
             }
         }
 
+        if self.is_idle()
+            && self.in_create_plsql()
+            && !current_is_empty
+            && self.block_depth() == 1
+            && self.paren_depth == 0
+            && self
+                .active_routine_frame()
+                .is_some_and(|frame| frame.has_pending_external_clause())
+        {
+            let first_word = sql_text::first_meaningful_word(line);
+            if first_word.is_some_and(sql_text::is_statement_head_keyword)
+                && !first_word.is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
+            {
+                return LineBoundaryAction::SplitBeforeLine;
+            }
+        }
+
         LineBoundaryAction::None
     }
 

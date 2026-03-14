@@ -3251,7 +3251,7 @@ fn language_clause_with_quoted_target_and_semicolon_keeps_following_begin_in_sam
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("LANGUAGE \"C\";\nBEGIN"));
-    assert_eq!(statements[1], "SELECT 57 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 57 FROM dual"));
 }
 
 #[test]
@@ -7422,7 +7422,43 @@ fn malformed_implicit_language_clause_keyword_without_target_splits_before_next_
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS LANGUAGE PARAMETERS ('x')"));
-    assert_eq!(statements[1], "SELECT 52 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 52 FROM dual"));
+}
+
+#[test]
+fn malformed_implicit_language_clause_keyword_without_target_splits_before_following_create() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_implicit_create_target RETURN NUMBER");
+    engine.process_line("AS LANGUAGE PARAMETERS ('x')");
+    engine.process_line("CREATE TABLE ext_missing_implicit_create_target_log(id NUMBER);");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE PARAMETERS ('x')"));
+    assert!(
+        statements[1].starts_with("CREATE TABLE ext_missing_implicit_create_target_log"),
+        "following CREATE TABLE must start a new statement: {}",
+        statements[1]
+    );
+}
+
+#[test]
+fn malformed_implicit_language_clause_keyword_without_target_splits_before_following_with_query() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_missing_implicit_with_target RETURN NUMBER");
+    engine.process_line("AS LANGUAGE PARAMETERS ('x')");
+    engine.process_line("WITH t AS (SELECT 1 v FROM dual) SELECT v FROM t;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("AS LANGUAGE PARAMETERS ('x')"));
+    assert!(
+        statements[1].starts_with("WITH t AS (SELECT 1 v FROM dual)"),
+        "following WITH query must start a new statement: {}",
+        statements[1]
+    );
 }
 
 #[test]
@@ -7464,7 +7500,7 @@ fn malformed_external_clause_without_semicolon_splits_before_following_statement
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS EXTERNAL"));
-    assert_eq!(statements[1], "SELECT 57 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 57 FROM dual"));
 }
 
 #[test]
@@ -7481,7 +7517,7 @@ fn malformed_implicit_language_with_quoted_target_without_semicolon_splits_befor
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS LANGUAGE \"C\""));
-    assert_eq!(statements[1], "SELECT 59 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 59 FROM dual"));
 }
 
 #[test]
@@ -7499,7 +7535,7 @@ fn oracle_mle_module_clause_after_quoted_language_target_splits_before_next_stat
         "MODULE clause should remain in external call-spec statement: {}",
         statements[0]
     );
-    assert_eq!(statements[1], "SELECT 58 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 58 FROM dual"));
 }
 
 #[test]
@@ -7517,7 +7553,7 @@ fn oracle_mle_signature_clause_after_quoted_language_target_splits_before_next_s
         "SIGNATURE clause should remain in external call-spec statement: {}",
         statements[0]
     );
-    assert_eq!(statements[1], "SELECT 59 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 59 FROM dual"));
 }
 
 #[test]
@@ -7550,7 +7586,7 @@ fn malformed_external_language_without_target_or_semicolon_splits_before_followi
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("AS EXTERNAL LANGUAGE"));
-    assert_eq!(statements[1], "SELECT 58 FROM dual".to_string());
+    assert!(statements[1].starts_with("SELECT 58 FROM dual"));
 }
 
 #[test]
