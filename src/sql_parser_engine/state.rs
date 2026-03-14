@@ -401,16 +401,54 @@ impl SplitState {
         self.pending_end_label_segments.push(token_upper.to_string());
     }
 
+    fn package_body_end_label_segments_match(&self) -> bool {
+        if self.package_body_name_segments.is_empty() {
+            return false;
+        }
+
+        if self.pending_end_label_segments.is_empty() {
+            return true;
+        }
+
+        let expected = &self.package_body_name_segments;
+        let actual = &self.pending_end_label_segments;
+
+        if actual.len() == 1 {
+            return expected
+                .last()
+                .is_some_and(|last_expected| actual[0] == *last_expected);
+        }
+
+        if actual.len() == expected.len()
+            && actual.iter().zip(expected.iter()).all(|(lhs, rhs)| lhs == rhs)
+        {
+            return true;
+        }
+
+        actual
+            .last()
+            .zip(expected.last())
+            .is_some_and(|(actual_last, expected_last)| actual_last == expected_last)
+    }
+
     fn resolve_pending_end_with_policy(&mut self, policy: EndResolutionPolicy) {
         if self.pending_end != PendingEnd::End {
             return;
         }
 
-        let pending_end_label = self
-            .pending_end_label_segments
-            .last()
-            .cloned()
-            .unwrap_or_default();
+        let pending_end_label = if self.package_body_init_end_context()
+            && !self.package_body_end_label_segments_match()
+        {
+            self.pending_end_label_segments
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.pending_end_label_segments
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        };
         self.resolve_plain_end(&pending_end_label);
         if policy == EndResolutionPolicy::ResetCreateStateWhenTopLevel
             && self.block_depth() == 0
@@ -1035,6 +1073,11 @@ impl SplitState {
     }
 
     pub(crate) fn resolve_pending_end_on_separator(&mut self) {
+        if self.package_body_init_end_context() && !self.pending_end_label_segments.is_empty() {
+            // Keep collecting optional qualified END labels (`END owner.pkg;`) until
+            // statement terminator so package-body closure is decided with the full label.
+            return;
+        }
         self.resolve_pending_end_with_policy(EndResolutionPolicy::KeepCreateState);
     }
 
