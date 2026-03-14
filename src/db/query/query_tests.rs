@@ -257,8 +257,7 @@ fn test_split_script_items_test16_final_ultimate_boss_regression() {
     );
     assert!(
         statements.iter().any(|stmt| {
-            stmt.starts_with("WITH base_data AS")
-                && stmt.contains("ORDER BY f.grp, f.rn, f.id")
+            stmt.starts_with("WITH base_data AS") && stmt.contains("ORDER BY f.grp, f.rn, f.id")
         }),
         "WITH query should stay intact: {statements:?}"
     );
@@ -419,8 +418,7 @@ SELECT 1 FROM dual;"#;
 
     assert_eq!(statements.len(), 2, "unexpected split: {statements:?}");
     assert!(
-        statements[0].contains("UPDATE dual")
-            && statements[0].contains("END nested_proc"),
+        statements[0].contains("UPDATE dual") && statements[0].contains("END nested_proc"),
         "procedure body should stay intact: {}",
         statements[0]
     );
@@ -564,7 +562,9 @@ fn test_split_format_items_test17_execution_unit_final_boss_regression() {
         "lexical trap anonymous block should stay intact in format splitter: {statements:?}"
     );
     assert!(
-        statements.iter().all(|stmt| stmt.trim() != "END qt_split_proc"),
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_split_proc"),
         "orphan END label should not remain standalone in format splitter: {statements:?}"
     );
 }
@@ -615,12 +615,54 @@ fn test_split_format_items_test19_execution_unit_splitter_final_boss_regression(
         "verification anonymous block should stay intact in format splitter: {statements:?}"
     );
     assert!(
-        statements.iter().all(|stmt| stmt.trim() != "END qt_boss_pkg"),
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_boss_pkg"),
         "orphan package END label should not remain standalone in format splitter: {statements:?}"
     );
     assert!(
         statements.iter().all(|stmt| stmt.trim() != "END qt_boss_proc"),
         "orphan procedure END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_oracle_splitter_final_boss_sql() {
+    let sql = load_query_test_file("oracle splitter final boss test.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 1,
+        "unexpected tool command split for oracle final boss script: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 40,
+        "unexpected SQL statement split for oracle final boss script: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY complex_pkg")
+                && stmt.contains("END complex_pkg")
+        }),
+        "package body execution unit should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE TRIGGER trg_employee_compound")
+                && stmt.contains("END trg_employee_compound")
+        }),
+        "trigger execution unit should stay intact: {statements:?}"
     );
 }
 

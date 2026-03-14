@@ -24,13 +24,15 @@ fn count_slash_lines(text: &str) -> usize {
 }
 
 fn count_script_statements(items: &[ScriptItem]) -> usize {
-    items.iter()
+    items
+        .iter()
         .filter(|item| matches!(item, ScriptItem::Statement(_)))
         .count()
 }
 
 fn count_script_tool_commands(items: &[ScriptItem]) -> usize {
-    items.iter()
+    items
+        .iter()
         .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
         .count()
 }
@@ -784,6 +786,63 @@ fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test19.sql"
+    );
+}
+
+#[test]
+fn format_sql_preserves_oracle_splitter_final_boss_script() {
+    let input = load_test_file("oracle splitter final boss test.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    let expected_lines = vec![
+        "CREATE OR REPLACE PACKAGE BODY complex_pkg",
+        "END complex_pkg;",
+        "CREATE OR REPLACE TRIGGER trg_employee_compound",
+        "END trg_employee_compound;",
+        "q'[She said \"it's done\"; then left/]'",
+        "MODEL",
+    ];
+
+    assert_contains_all(&formatted, &expected_lines);
+
+    let input_slashes = count_slash_lines(&input);
+    let output_slashes = count_slash_lines(&formatted);
+    assert_eq!(
+        input_slashes, output_slashes,
+        "Slash terminator count differs for oracle splitter final boss test.sql"
+    );
+
+    let original_items = QueryExecutor::split_script_items(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !original_items.is_empty() && !formatted_items.is_empty(),
+        "Splitter should return non-empty items for oracle splitter final boss test.sql"
+    );
+    assert!(
+        !formatted_statements.is_empty(),
+        "Formatted oracle splitter final boss script should still produce SQL statements"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY complex_pkg")
+                && stmt.contains("END complex_pkg")
+        }),
+        "Formatting should preserve package body execution unit for oracle splitter final boss test.sql: {formatted_statements:?}"
+    );
+    assert!(
+        formatted_statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE TRIGGER trg_employee_compound")
+                && stmt.contains("END trg_employee_compound")
+        }),
+        "Formatting should preserve trigger execution unit for oracle splitter final boss test.sql: {formatted_statements:?}"
     );
 }
 
