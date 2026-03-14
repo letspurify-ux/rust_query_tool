@@ -694,8 +694,16 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
     "HIERARCHY",
 ];
 
-const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] =
-    &["C", "JAVA", "JAVASCRIPT", "PYTHON", "R", "RUST", "WASM", "MLE"];
+const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] = &[
+    "C",
+    "JAVA",
+    "JAVASCRIPT",
+    "PYTHON",
+    "R",
+    "RUST",
+    "WASM",
+    "MLE",
+];
 
 const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "EXTERNAL",

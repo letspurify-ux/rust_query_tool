@@ -2,60 +2,47 @@
 use crate::splash::animation::AnimationState;
 
 #[cfg(feature = "gpu-splash")]
-use fltk::{
-    draw,
-    enums::{Align, Color, Font},
-    prelude::{ImageExt, SurfaceDevice},
-    surface::ImageSurface,
-};
-
-#[cfg(feature = "gpu-splash")]
 use glow::HasContext;
 
 #[cfg(feature = "gpu-splash")]
 pub struct GpuRenderer {
     gl: glow::Context,
-    program: glow::Program,
+    background_program: glow::Program,
+    overlay_program: glow::Program,
     vao: glow::VertexArray,
     resolution_uniform: Option<glow::UniformLocation>,
     time_uniform: Option<glow::UniformLocation>,
     camera_uniform: Option<glow::UniformLocation>,
     progress_uniform: Option<glow::UniformLocation>,
-    title_sampler_uniform: Option<glow::UniformLocation>,
-    title_origin_uniform: Option<glow::UniformLocation>,
-    title_size_uniform: Option<glow::UniformLocation>,
-    title_texture: Option<TitleTexture>,
-    title_texture_failed: bool,
-    title_text: &'static str,
+    overlay_viewport_uniform: Option<glow::UniformLocation>,
+    overlay_origin_uniform: Option<glow::UniformLocation>,
+    overlay_size_uniform: Option<glow::UniformLocation>,
+    overlay_sampler_uniform: Option<glow::UniformLocation>,
+    overlay_texture: Option<OverlayTexture>,
 }
 
 #[cfg(feature = "gpu-splash")]
-struct TitleTexture {
+struct OverlayTexture {
     texture: glow::Texture,
-    width: i32,
-    height: i32,
-    screen_width: i32,
-    screen_height: i32,
-}
-
-#[cfg(feature = "gpu-splash")]
-struct TitleMaskData {
-    pixels: Vec<u8>,
-    width: i32,
-    height: i32,
 }
 
 #[cfg(feature = "gpu-splash")]
 impl GpuRenderer {
-    /// Build a tiny shader-driven renderer that draws the entire background in a
-    /// single full-screen pass. This keeps CPU cost low while still producing a
-    /// richer scene than manual 2D painting.
-    pub unsafe fn new<F>(loader: F, title_text: &'static str) -> Result<Self, String>
+    pub unsafe fn new<F>(loader: F) -> Result<Self, String>
     where
         F: FnMut(&str) -> *const std::os::raw::c_void,
     {
         let gl = glow::Context::from_loader_function(loader);
-        let program = compile_program(&gl)?;
+        let background_program = compile_program(
+            &gl,
+            background_vertex_shader_source,
+            background_fragment_shader_source,
+        )?;
+        let overlay_program = compile_program(
+            &gl,
+            overlay_vertex_shader_source,
+            overlay_fragment_shader_source,
+        )?;
         let vao = gl
             .create_vertex_array()
             .map_err(|err| format!("Failed to create splash VAO: {err}"))?;
@@ -64,50 +51,52 @@ impl GpuRenderer {
         gl.bind_vertex_array(None);
 
         Ok(Self {
-            resolution_uniform: gl.get_uniform_location(program, "u_resolution"),
-            time_uniform: gl.get_uniform_location(program, "u_time"),
-            camera_uniform: gl.get_uniform_location(program, "u_camera"),
-            progress_uniform: gl.get_uniform_location(program, "u_progress"),
-            title_sampler_uniform: gl.get_uniform_location(program, "u_title_tex"),
-            title_origin_uniform: gl.get_uniform_location(program, "u_title_origin"),
-            title_size_uniform: gl.get_uniform_location(program, "u_title_size"),
-            title_texture: None,
-            title_texture_failed: false,
-            title_text,
+            resolution_uniform: gl.get_uniform_location(background_program, "u_resolution"),
+            time_uniform: gl.get_uniform_location(background_program, "u_time"),
+            camera_uniform: gl.get_uniform_location(background_program, "u_camera"),
+            progress_uniform: gl.get_uniform_location(background_program, "u_progress"),
+            overlay_viewport_uniform: gl.get_uniform_location(overlay_program, "u_viewport"),
+            overlay_origin_uniform: gl.get_uniform_location(overlay_program, "u_origin"),
+            overlay_size_uniform: gl.get_uniform_location(overlay_program, "u_size"),
+            overlay_sampler_uniform: gl.get_uniform_location(overlay_program, "u_overlay_tex"),
+            overlay_texture: None,
             gl,
-            program,
+            background_program,
+            overlay_program,
             vao,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn render(
         &mut self,
         animation: &AnimationState,
         progress: f32,
-        width: i32,
-        height: i32,
-    ) {
-        if let Err(error) = self.ensure_title_texture(width, height) {
-            if !self.title_texture_failed {
-                crate::utils::logging::log_warning(
-                    "splash",
-                    &format!("Unable to build splash title texture: {error}"),
-                );
-                self.title_texture_failed = true;
-            }
-        }
+        viewport_width: i32,
+        viewport_height: i32,
+        overlay_origin: (i32, i32),
+        overlay_size: (i32, i32),
+        overlay_pixels: &[u8],
+        overlay_width: i32,
+        overlay_height: i32,
+    ) -> Result<(), String> {
+        self.upload_overlay_texture(overlay_pixels, overlay_width, overlay_height)?;
 
-        self.gl.viewport(0, 0, width.max(1), height.max(1));
+        self.gl
+            .viewport(0, 0, viewport_width.max(1), viewport_height.max(1));
         self.gl.disable(glow::DEPTH_TEST);
         self.gl.disable(glow::BLEND);
         self.gl.clear_color(0.01, 0.01, 0.02, 1.0);
         self.gl.clear(glow::COLOR_BUFFER_BIT);
-        self.gl.use_program(Some(self.program));
         self.gl.bind_vertex_array(Some(self.vao));
 
+        self.gl.use_program(Some(self.background_program));
         if let Some(uniform) = &self.resolution_uniform {
-            self.gl
-                .uniform_2_f32(Some(uniform), width as f32, height as f32);
+            self.gl.uniform_2_f32(
+                Some(uniform),
+                viewport_width.max(1) as f32,
+                viewport_height.max(1) as f32,
+            );
         }
         if let Some(uniform) = &self.time_uniform {
             self.gl
@@ -121,106 +110,107 @@ impl GpuRenderer {
             self.gl
                 .uniform_1_f32(Some(uniform), progress.clamp(0.0, 1.0));
         }
-        if let Some(uniform) = &self.title_sampler_uniform {
-            self.gl.uniform_1_i32(Some(uniform), 0);
-        }
-
-        let mut title_origin = (0.0_f32, 0.0_f32);
-        let mut title_size = (0.0_f32, 0.0_f32);
-        self.gl.active_texture(glow::TEXTURE0);
-        if let Some(title_texture) = &self.title_texture {
-            self.gl
-                .bind_texture(glow::TEXTURE_2D, Some(title_texture.texture));
-            title_size = (
-                title_texture.width as f32 / width.max(1) as f32,
-                title_texture.height as f32 / height.max(1) as f32,
-            );
-            title_origin = (
-                (1.0 - title_size.0) * 0.5,
-                ((1.0 - title_size.1) * 0.5 + 0.10).min(0.85 - title_size.1),
-            );
-        } else {
-            self.gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        if let Some(uniform) = &self.title_origin_uniform {
-            self.gl
-                .uniform_2_f32(Some(uniform), title_origin.0, title_origin.1);
-        }
-        if let Some(uniform) = &self.title_size_uniform {
-            self.gl
-                .uniform_2_f32(Some(uniform), title_size.0, title_size.1);
-        }
-
         self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
-        self.gl.bind_texture(glow::TEXTURE_2D, None);
-        self.gl.bind_vertex_array(None);
+
+        if let Some(texture) = &self.overlay_texture {
+            self.gl.enable(glow::BLEND);
+            self.gl
+                .blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            self.gl.use_program(Some(self.overlay_program));
+            if let Some(uniform) = &self.overlay_viewport_uniform {
+                self.gl.uniform_2_f32(
+                    Some(uniform),
+                    viewport_width.max(1) as f32,
+                    viewport_height.max(1) as f32,
+                );
+            }
+            if let Some(uniform) = &self.overlay_origin_uniform {
+                self.gl.uniform_2_f32(
+                    Some(uniform),
+                    overlay_origin.0.max(0) as f32,
+                    overlay_origin.1.max(0) as f32,
+                );
+            }
+            if let Some(uniform) = &self.overlay_size_uniform {
+                self.gl.uniform_2_f32(
+                    Some(uniform),
+                    overlay_size.0.max(1) as f32,
+                    overlay_size.1.max(1) as f32,
+                );
+            }
+            if let Some(uniform) = &self.overlay_sampler_uniform {
+                self.gl.uniform_1_i32(Some(uniform), 0);
+            }
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(texture.texture));
+            self.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+            self.gl.disable(glow::BLEND);
+        }
+
         self.gl.use_program(None);
+        self.gl.bind_vertex_array(None);
+        Ok(())
     }
 
-    unsafe fn ensure_title_texture(&mut self, width: i32, height: i32) -> Result<(), String> {
-        let width = width.max(1);
-        let height = height.max(1);
-
-        if let Some(title_texture) = &self.title_texture {
-            if title_texture.screen_width == width && title_texture.screen_height == height {
-                return Ok(());
-            }
+    unsafe fn upload_overlay_texture(
+        &mut self,
+        overlay_pixels: &[u8],
+        overlay_width: i32,
+        overlay_height: i32,
+    ) -> Result<(), String> {
+        if overlay_width <= 0 || overlay_height <= 0 {
+            return Ok(());
         }
 
-        let title_mask = create_title_mask(self.title_text, width, height)?;
-        let texture = self
-            .gl
-            .create_texture()
-            .map_err(|err| format!("Failed to create splash title texture: {err}"))?;
-
-        self.gl.active_texture(glow::TEXTURE0);
-        self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        self.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
-        );
-        self.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
-        self.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        self.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        self.gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::R8 as i32,
-            title_mask.width,
-            title_mask.height,
-            0,
-            glow::RED,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(Some(title_mask.pixels.as_slice())),
-        );
-        self.gl.bind_texture(glow::TEXTURE_2D, None);
-
-        if let Some(previous_texture) = self.title_texture.take() {
-            self.gl.delete_texture(previous_texture.texture);
+        if self.overlay_texture.is_none() {
+            let texture = self
+                .gl
+                .create_texture()
+                .map_err(|err| format!("Failed to create splash overlay texture: {err}"))?;
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            self.overlay_texture = Some(OverlayTexture { texture });
         }
 
-        self.title_texture = Some(TitleTexture {
-            texture,
-            width: title_mask.width,
-            height: title_mask.height,
-            screen_width: width,
-            screen_height: height,
-        });
-        self.title_texture_failed = false;
+        if let Some(texture) = &self.overlay_texture {
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(texture.texture));
+            self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                overlay_width,
+                overlay_height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(overlay_pixels)),
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
 
         Ok(())
     }
@@ -230,101 +220,25 @@ impl GpuRenderer {
 impl Drop for GpuRenderer {
     fn drop(&mut self) {
         unsafe {
-            if let Some(title_texture) = self.title_texture.take() {
-                self.gl.delete_texture(title_texture.texture);
+            if let Some(texture) = self.overlay_texture.take() {
+                self.gl.delete_texture(texture.texture);
             }
-            self.gl.delete_program(self.program);
+            self.gl.delete_program(self.background_program);
+            self.gl.delete_program(self.overlay_program);
             self.gl.delete_vertex_array(self.vao);
         }
     }
 }
 
 #[cfg(feature = "gpu-splash")]
-fn create_title_mask(
-    title_text: &str,
-    screen_width: i32,
-    screen_height: i32,
-) -> Result<TitleMaskData, String> {
-    let subtitle_text = "Built with Rust";
-    // Reserve extra texture margin so the GPU halo can expand beyond the glyph edges
-    // without being clipped by the title texture bounds.
-    let target_width = ((screen_width as f32) * 0.42).round() as i32;
-    let mut font_size = ((screen_height as f32) * 0.17).round() as i32;
-    font_size = font_size.clamp(44, 92);
-
-    loop {
-        draw::set_font(Font::HelveticaBold, font_size);
-        let (measured_width, _) = draw::measure(title_text, false);
-        if measured_width <= target_width || font_size <= 36 {
-            break;
-        }
-        font_size -= 1;
-    }
-
-    draw::set_font(Font::HelveticaBold, font_size);
-    let (measured_width, measured_height) = draw::measure(title_text, false);
-    let subtitle_font_size = ((font_size as f32) * 0.24).round() as i32;
-    let subtitle_font_size = subtitle_font_size.clamp(12, 22);
-    draw::set_font(Font::Helvetica, subtitle_font_size);
-    let (subtitle_width, subtitle_height) = draw::measure(subtitle_text, false);
-    let line_gap = ((font_size as f32) * 0.18).round() as i32;
-    let padding_x = (font_size as f32 * 1.20).round() as i32;
-    let padding_y = (font_size as f32 * 0.88).round() as i32;
-    let content_width = measured_width.max(subtitle_width);
-    let texture_width = (content_width + padding_x * 2).max(64);
-    let texture_height = (measured_height + line_gap + subtitle_height + padding_y * 2).max(64);
-
-    let surface = ImageSurface::new(texture_width, texture_height, false);
-    ImageSurface::push_current(&surface);
-    draw::set_draw_color(Color::Black);
-    draw::draw_rectf(0, 0, texture_width, texture_height);
-
-    draw::set_font(Font::HelveticaBold, font_size);
-    draw::set_draw_color(Color::White);
-    draw::draw_text2(
-        title_text,
-        padding_x,
-        padding_y - ((font_size as f32) * 0.08).round() as i32,
-        texture_width - padding_x * 2,
-        measured_height + font_size / 4,
-        Align::Center | Align::Inside,
-    );
-
-    draw::set_font(Font::Helvetica, subtitle_font_size);
-    draw::set_draw_color(Color::from_rgb(170, 176, 188));
-    draw::draw_text2(
-        subtitle_text,
-        padding_x,
-        padding_y + measured_height + line_gap,
-        texture_width - padding_x * 2,
-        subtitle_height + subtitle_font_size / 2,
-        Align::Right | Align::Inside,
-    );
-    ImageSurface::pop_current();
-
-    let image = surface
-        .image()
-        .ok_or_else(|| "Image surface did not produce a title image".to_string())?;
-    let data = image.to_rgb_data();
-    let width = image.data_w();
-    let height = image.data_h();
-    let pixel_count = width.max(0).saturating_mul(height.max(0)) as usize;
-    let mut pixels = Vec::with_capacity(pixel_count);
-
-    for chunk in data.chunks_exact(3) {
-        let alpha = chunk[0].max(chunk[1]).max(chunk[2]);
-        pixels.push(alpha);
-    }
-
-    Ok(TitleMaskData {
-        pixels,
-        width,
-        height,
-    })
-}
+type ShaderSourceFactory = fn(&str) -> String;
 
 #[cfg(feature = "gpu-splash")]
-unsafe fn compile_program(gl: &glow::Context) -> Result<glow::Program, String> {
+unsafe fn compile_program(
+    gl: &glow::Context,
+    vertex_source: ShaderSourceFactory,
+    fragment_source: ShaderSourceFactory,
+) -> Result<glow::Program, String> {
     let variants = [
         ShaderVariant {
             label: "410 core",
@@ -344,10 +258,10 @@ unsafe fn compile_program(gl: &glow::Context) -> Result<glow::Program, String> {
     let mut errors: Vec<String> = Vec::new();
 
     for variant in variants {
-        let vertex_source = vertex_shader_source(variant.directive);
-        let fragment_source = fragment_shader_source(variant.directive);
+        let vertex = vertex_source(variant.directive);
+        let fragment = fragment_source(variant.directive);
 
-        match build_program(gl, &vertex_source, &fragment_source) {
+        match build_program(gl, &vertex, &fragment) {
             Ok(program) => return Ok(program),
             Err(err) => {
                 errors.push(format!("GLSL {} compile failed: {err}", variant.label));
@@ -420,7 +334,7 @@ unsafe fn build_program(
 }
 
 #[cfg(feature = "gpu-splash")]
-fn vertex_shader_source(version_directive: &str) -> String {
+fn background_vertex_shader_source(version_directive: &str) -> String {
     format!(
         r#"{version_directive}
 out vec2 v_uv;
@@ -440,7 +354,7 @@ void main() {{
 }
 
 #[cfg(feature = "gpu-splash")]
-fn fragment_shader_source(version_directive: &str) -> String {
+fn background_fragment_shader_source(version_directive: &str) -> String {
     format!(
         r#"{version_directive}
 in vec2 v_uv;
@@ -450,9 +364,6 @@ uniform vec2 u_resolution;
 uniform float u_time;
 uniform vec2 u_camera;
 uniform float u_progress;
-uniform sampler2D u_title_tex;
-uniform vec2 u_title_origin;
-uniform vec2 u_title_size;
 
 float hash21(vec2 p) {{
     p = fract(p * vec2(123.34, 456.21));
@@ -563,85 +474,6 @@ vec3 render_planet_corona(vec2 uv, float aspect) {{
     return corona_base * corona * 0.55 + corona_hot * corona * 0.22;
 }}
 
-float sd_segment(vec2 p, vec2 a, vec2 b) {{
-    vec2 pa = p - a;
-    vec2 ba = b - a;
-    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
-    return length(pa - ba * h);
-}}
-
-float glyph_distance(int glyph, vec2 p) {{
-    float d = 1000.0;
-    float l = -0.42;
-    float r = 0.42;
-    float t = 0.60;
-    float b = -0.60;
-    float m = 0.0;
-
-    if (glyph == 0) {{
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(l, m), vec2(r, m)));
-        d = min(d, sd_segment(p, vec2(l, b), vec2(r, b)));
-        d = min(d, sd_segment(p, vec2(l, m), vec2(l, t)));
-        d = min(d, sd_segment(p, vec2(r, b), vec2(r, m)));
-    }} else if (glyph == 1) {{
-        d = min(d, sd_segment(p, vec2(l, b), vec2(l, t)));
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(l, m), vec2(r, m)));
-        d = min(d, sd_segment(p, vec2(r, m), vec2(r, t)));
-    }} else if (glyph == 2) {{
-        d = min(d, sd_segment(p, vec2(l, b), vec2(0.0, t)));
-        d = min(d, sd_segment(p, vec2(r, b), vec2(0.0, t)));
-        d = min(d, sd_segment(p, vec2(l * 0.52, m), vec2(r * 0.52, m)));
-    }} else if (glyph == 3) {{
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r * 0.82, t)));
-        d = min(d, sd_segment(p, vec2(l, b), vec2(r * 0.82, b)));
-        d = min(d, sd_segment(p, vec2(l, b + 0.06), vec2(l, t - 0.06)));
-    }} else if (glyph == 4) {{
-        d = min(d, sd_segment(p, vec2(l, b), vec2(l, t)));
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(l, m), vec2(r * 0.92, m)));
-        d = min(d, sd_segment(p, vec2(l, b), vec2(r, b)));
-    }} else if (glyph == 5) {{
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(r, t), vec2(r, b)));
-        d = min(d, sd_segment(p, vec2(l, b), vec2(r, b)));
-        d = min(d, sd_segment(p, vec2(l, t), vec2(l, b)));
-        d = min(d, sd_segment(p, vec2(0.06, -0.02), vec2(r + 0.06, b - 0.12)));
-    }} else if (glyph == 6) {{
-        d = min(d, sd_segment(p, vec2(l, t), vec2(l, b)));
-        d = min(d, sd_segment(p, vec2(r, t), vec2(r, b)));
-        d = min(d, sd_segment(p, vec2(l, b), vec2(r, b)));
-    }} else if (glyph == 7) {{
-        d = min(d, sd_segment(p, vec2(l, b), vec2(l, t)));
-        d = min(d, sd_segment(p, vec2(l, t), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(l, m), vec2(r * 0.92, m)));
-        d = min(d, sd_segment(p, vec2(r, m), vec2(r, t)));
-        d = min(d, sd_segment(p, vec2(-0.02, -0.04), vec2(r, b)));
-    }} else if (glyph == 8) {{
-        d = min(d, sd_segment(p, vec2(l, t), vec2(0.0, 0.02)));
-        d = min(d, sd_segment(p, vec2(r, t), vec2(0.0, 0.02)));
-        d = min(d, sd_segment(p, vec2(0.0, 0.02), vec2(0.0, b)));
-    }}
-
-    return d;
-}}
-
-float title_distance(vec2 p) {{
-    float d = 1000.0;
-    d = min(d, glyph_distance(0, p - vec2(-5.95, 0.0)));
-    d = min(d, glyph_distance(1, p - vec2(-4.58, 0.0)));
-    d = min(d, glyph_distance(2, p - vec2(-3.21, 0.0)));
-    d = min(d, glyph_distance(3, p - vec2(-1.84, 0.0)));
-    d = min(d, glyph_distance(4, p - vec2(-0.47, 0.0)));
-    d = min(d, glyph_distance(5, p - vec2(1.52, 0.0)));
-    d = min(d, glyph_distance(6, p - vec2(2.89, 0.0)));
-    d = min(d, glyph_distance(4, p - vec2(4.26, 0.0)));
-    d = min(d, glyph_distance(7, p - vec2(5.63, 0.0)));
-    d = min(d, glyph_distance(8, p - vec2(7.00, 0.0)));
-    return d;
-}}
-
 void main() {{
     vec2 uv = v_uv;
     float aspect = u_resolution.x / max(u_resolution.y, 1.0);
@@ -681,62 +513,57 @@ void main() {{
     float accent_arc = smoothstep(0.0, 0.012, abs(uv.y - 0.86 + sin(uv.x * 9.0 + u_time * 0.25) * 0.006));
     color += vec3(0.00, 0.02, 0.05) * (1.0 - accent_arc) * (0.08 + u_progress * 0.04);
 
-    if (u_title_size.x > 0.0 && u_title_size.y > 0.0) {{
-        vec2 title_uv = (uv - u_title_origin) / u_title_size;
-        if (title_uv.x >= 0.0 && title_uv.x <= 1.0 && title_uv.y >= 0.0 && title_uv.y <= 1.0) {{
-            vec2 sample_uv = vec2(title_uv.x, 1.0 - title_uv.y);
-            float title_mask = texture(u_title_tex, sample_uv).r;
-            float title_shadow = texture(u_title_tex, clamp(sample_uv + vec2(-0.004, 0.010), 0.0, 1.0)).r;
-            vec2 title_texel = vec2(
-                1.0 / max(u_title_size.x * u_resolution.x, 1.0),
-                1.0 / max(u_title_size.y * u_resolution.y, 1.0)
-            );
-            float inner_halo = 0.0;
-            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(3.0, 0.0), 0.0, 1.0)).r;
-            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-3.0, 0.0), 0.0, 1.0)).r;
-            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 3.0), 0.0, 1.0)).r;
-            inner_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -3.0), 0.0, 1.0)).r;
-            inner_halo *= 0.25;
-
-            float outer_halo = 0.0;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(10.0, 0.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-10.0, 0.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 10.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -10.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(8.0, 8.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-8.0, 8.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(8.0, -8.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-8.0, -8.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(16.0, 0.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-16.0, 0.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, 16.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(0.0, -16.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(18.0, 18.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-18.0, 18.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(18.0, -18.0), 0.0, 1.0)).r;
-            outer_halo += texture(u_title_tex, clamp(sample_uv + title_texel * vec2(-18.0, -18.0), 0.0, 1.0)).r;
-            outer_halo *= (1.0 / 16.0);
-
-            float title_heat = 0.86
-                + 0.14 * sin(u_time * 1.25 + sample_uv.x * 9.0 + sample_uv.y * 4.0);
-            float title_glow = max(inner_halo - title_mask * 0.78, 0.0) * title_heat;
-            float title_aura = max(outer_halo - title_mask * 0.18, 0.0) * (0.98 + title_heat * 0.24);
-            float title_core = title_mask * (0.97 + 0.03 * sin(u_time * 1.10 + sample_uv.x * 8.0));
-            color = mix(color, vec3(0.01, 0.02, 0.05), title_shadow * 0.28);
-            color += vec3(0.05, 0.10, 0.26) * title_aura * 0.84;
-            color += vec3(0.24, 0.38, 0.80) * pow(title_aura, 1.02) * 0.66;
-            color += vec3(0.84, 0.92, 1.00) * pow(title_aura, 1.32) * 0.12;
-            color += vec3(0.18, 0.28, 0.58) * title_glow * 0.50;
-            color += vec3(0.92, 0.96, 1.00) * pow(title_glow, 1.50) * 0.12;
-            color = mix(color, vec3(0.97, 0.98, 1.0), title_core);
-        }}
-    }}
-
     float vignette = smoothstep(1.34, 0.24, length(centered * vec2(1.04, 0.92)));
     color *= mix(0.50, 1.0, vignette);
     color += vec3(0.04, 0.05, 0.08) * (1.0 - vignette) * 0.16;
 
     frag_color = vec4(pow(color, vec3(0.96)), 1.0);
+}}
+"#
+    )
+}
+
+#[cfg(feature = "gpu-splash")]
+fn overlay_vertex_shader_source(version_directive: &str) -> String {
+    format!(
+        r#"{version_directive}
+out vec2 v_uv;
+
+uniform vec2 u_viewport;
+uniform vec2 u_origin;
+uniform vec2 u_size;
+
+void main() {{
+    vec2 corners[4] = vec2[](
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 1.0)
+    );
+    vec2 uv = corners[gl_VertexID];
+    vec2 pixel = u_origin + uv * u_size;
+    vec2 ndc = vec2(
+        (pixel.x / max(u_viewport.x, 1.0)) * 2.0 - 1.0,
+        1.0 - (pixel.y / max(u_viewport.y, 1.0)) * 2.0
+    );
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_uv = uv;
+}}
+"#
+    )
+}
+
+#[cfg(feature = "gpu-splash")]
+fn overlay_fragment_shader_source(version_directive: &str) -> String {
+    format!(
+        r#"{version_directive}
+in vec2 v_uv;
+out vec4 frag_color;
+
+uniform sampler2D u_overlay_tex;
+
+void main() {{
+    frag_color = texture(u_overlay_tex, v_uv);
 }}
 "#
     )

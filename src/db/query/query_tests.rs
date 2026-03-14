@@ -257,8 +257,7 @@ fn test_split_script_items_test16_final_ultimate_boss_regression() {
     );
     assert!(
         statements.iter().any(|stmt| {
-            stmt.starts_with("WITH base_data AS")
-                && stmt.contains("ORDER BY f.grp, f.rn, f.id")
+            stmt.starts_with("WITH base_data AS") && stmt.contains("ORDER BY f.grp, f.rn, f.id")
         }),
         "WITH query should stay intact: {statements:?}"
     );
@@ -401,6 +400,125 @@ fn test_split_script_items_test19_execution_unit_splitter_final_boss_regression(
 }
 
 #[test]
+fn test_split_script_items_test20_execution_unit_splitter_regression() {
+    let sql = load_query_test_file("test20.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 0,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 39,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_fb_pkg")
+                && stmt.contains("g_last_message :=")
+                && stmt.contains("END qt_fb_pkg")
+        }),
+        "package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE TRIGGER qt_fb_trg")
+                && stmt.contains("negative salary is invalid; / ;")
+                && stmt.trim_end().ends_with("END")
+        }),
+        "trigger body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("p_module => 'final_validation'")
+                && stmt.contains("SELECT COUNT(*) INTO v_pipe_cnt")
+                && stmt.contains("DBMS_OUTPUT.PUT_LINE(v_text)")
+        }),
+        "final validation block should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT audit_id, module_name, action_name")
+                && stmt.contains("AS msg_preview")
+                && stmt.contains("ORDER BY audit_id")
+        }),
+        "final audit preview query should stay intact: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_test21_execution_unit_splitter_regression() {
+    let sql = load_query_test_file("test21.sql");
+    let items = QueryExecutor::split_script_items(&sql);
+
+    let statement_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::Statement(_)))
+        .count();
+    let tool_command_count = items
+        .iter()
+        .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
+        .count();
+
+    assert_eq!(
+        tool_command_count, 0,
+        "unexpected tool command split: {items:?}"
+    );
+    assert_eq!(
+        statement_count, 47,
+        "unexpected SQL statement split: {items:?}"
+    );
+
+    let statements = get_statements(&items);
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_x_util_pkg")
+                && stmt.contains("fake package:")
+                && stmt.contains("END qt_x_util_pkg")
+        }),
+        "utility package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_x_chaos_pkg")
+                && stmt.contains("PROCEDURE execute_dynamic_hell")
+                && stmt.contains("FINAL PACKAGE MESSAGE")
+                && stmt.contains("END qt_x_chaos_pkg")
+        }),
+        "chaos package body should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("p_module => 'selection_killer'")
+                && stmt.contains("SELECT COUNT(*) FROM qt_x_emp WHERE emp_name LIKE :x")
+                && stmt.contains("END IF;")
+        }),
+        "selection execution killer block should stay intact: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("SELECT err_id,")
+                && stmt.contains("AS err_msg_preview")
+                && stmt.contains("ORDER BY err_id")
+        }),
+        "final error preview query should stay intact: {statements:?}"
+    );
+}
+
+#[test]
 fn test_split_script_items_standalone_procedure_nested_block_followed_by_dml() {
     let sql = r#"CREATE OR REPLACE PROCEDURE nested_proc IS
 BEGIN
@@ -419,8 +537,7 @@ SELECT 1 FROM dual;"#;
 
     assert_eq!(statements.len(), 2, "unexpected split: {statements:?}");
     assert!(
-        statements[0].contains("UPDATE dual")
-            && statements[0].contains("END nested_proc"),
+        statements[0].contains("UPDATE dual") && statements[0].contains("END nested_proc"),
         "procedure body should stay intact: {}",
         statements[0]
     );
@@ -564,7 +681,9 @@ fn test_split_format_items_test17_execution_unit_final_boss_regression() {
         "lexical trap anonymous block should stay intact in format splitter: {statements:?}"
     );
     assert!(
-        statements.iter().all(|stmt| stmt.trim() != "END qt_split_proc"),
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_split_proc"),
         "orphan END label should not remain standalone in format splitter: {statements:?}"
     );
 }
@@ -615,12 +734,121 @@ fn test_split_format_items_test19_execution_unit_splitter_final_boss_regression(
         "verification anonymous block should stay intact in format splitter: {statements:?}"
     );
     assert!(
-        statements.iter().all(|stmt| stmt.trim() != "END qt_boss_pkg"),
+        statements
+            .iter()
+            .all(|stmt| stmt.trim() != "END qt_boss_pkg"),
         "orphan package END label should not remain standalone in format splitter: {statements:?}"
     );
     assert!(
         statements.iter().all(|stmt| stmt.trim() != "END qt_boss_proc"),
         "orphan procedure END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_test20_execution_unit_splitter_regression() {
+    let sql = load_query_test_file("test20.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 36, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_fb_pkg")
+                && stmt.contains("g_last_message :=")
+                && stmt.contains("END qt_fb_pkg")
+        }),
+        "package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE TRIGGER qt_fb_trg")
+                && stmt.contains("negative salary is invalid; / ;")
+                && stmt.trim_end().ends_with("END")
+        }),
+        "trigger should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("p_module => 'final_validation'")
+                && stmt.contains("SELECT COUNT(*) INTO v_pipe_cnt")
+                && stmt.contains("DBMS_OUTPUT.PUT_LINE(v_text)")
+        }),
+        "final validation block should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_fb_pkg"),
+        "orphan package END label should not remain standalone in format splitter: {statements:?}"
+    );
+}
+
+#[test]
+fn test_split_format_items_test21_execution_unit_splitter_regression() {
+    let sql = load_query_test_file("test21.sql");
+    let items = QueryExecutor::split_format_items(&sql);
+
+    let slash_count = items
+        .iter()
+        .filter(|item| matches!(item, FormatItem::Slash))
+        .count();
+
+    assert_eq!(slash_count, 45, "unexpected slash split: {items:?}");
+
+    let statements: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            FormatItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_x_util_pkg")
+                && stmt.contains("fake package:")
+                && stmt.contains("END qt_x_util_pkg")
+        }),
+        "utility package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.contains("CREATE OR REPLACE PACKAGE BODY qt_x_chaos_pkg")
+                && stmt.contains("PROCEDURE execute_dynamic_hell")
+                && stmt.contains("FINAL PACKAGE MESSAGE")
+                && stmt.contains("END qt_x_chaos_pkg")
+        }),
+        "chaos package body should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().any(|stmt| {
+            stmt.starts_with("DECLARE")
+                && stmt.contains("p_module => 'selection_killer'")
+                && stmt.contains("SELECT COUNT(*) FROM qt_x_emp WHERE emp_name LIKE :x")
+                && stmt.contains("END IF;")
+        }),
+        "selection execution killer block should stay intact in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_x_util_pkg"),
+        "orphan utility package END label should not remain standalone in format splitter: {statements:?}"
+    );
+    assert!(
+        statements.iter().all(|stmt| stmt.trim() != "END qt_x_chaos_pkg"),
+        "orphan chaos package END label should not remain standalone in format splitter: {statements:?}"
     );
 }
 

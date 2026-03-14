@@ -5,6 +5,7 @@ use std::time::Instant;
 /// The splash intentionally avoids a full scene graph. A small deterministic
 /// state vector is enough for subtle camera drift, progress shimmer, and the
 /// loading text pulse.
+#[cfg_attr(not(feature = "gpu-splash"), allow(dead_code))]
 #[derive(Debug)]
 pub struct AnimationState {
     #[cfg(feature = "gpu-splash")]
@@ -13,6 +14,7 @@ pub struct AnimationState {
     time_seconds: f32,
 }
 
+#[cfg_attr(not(feature = "gpu-splash"), allow(dead_code))]
 impl AnimationState {
     pub fn new() -> Self {
         let now = Instant::now();

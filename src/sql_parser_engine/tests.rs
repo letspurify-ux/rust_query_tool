@@ -7415,7 +7415,6 @@ fn create_function_is_language_call_spec_splits_before_following_statement() {
     assert_eq!(statements[1], "SELECT 777 FROM dual".to_string());
 }
 
-
 #[test]
 fn create_procedure_is_language_java_name_splits_before_following_statement() {
     let mut engine = SqlParserEngine::new();
@@ -7634,13 +7633,16 @@ fn oracle_mle_env_import_export_clause_after_quoted_language_target_splits_befor
     let mut engine = SqlParserEngine::new();
 
     engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_env RETURN NUMBER");
-    engine.process_line("AS LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod;");
+    engine.process_line(
+        "AS LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod;",
+    );
     engine.process_line("SELECT 78 FROM dual;");
 
     let statements = engine.finalize_and_take_statements();
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(
-        statements[0].contains("LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod"),
+        statements[0]
+            .contains("LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod"),
         "ENV/IMPORT/EXPORT clauses should remain in external call-spec statement: {}",
         statements[0]
     );
@@ -7826,7 +7828,6 @@ fn package_body_end_label_with_whitespace_around_dot_splits_following_statement(
     assert!(statements[0].contains("END owner . pkg_ws"));
     assert_eq!(statements[1], "SELECT 900 FROM dual".to_string());
 }
-
 
 #[test]
 fn create_function_is_language_rust_call_spec_splits_before_following_statement() {

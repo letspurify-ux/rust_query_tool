@@ -1,4 +1,4 @@
-use fltk::app;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 const AUTO_DISMISS_AFTER_READY: Duration = Duration::from_millis(1500);
@@ -9,12 +9,11 @@ const AUTO_DISMISS_AFTER_READY: Duration = Duration::from_millis(1500);
 pub enum SplashEvent {
     Loading(LoadingSnapshot),
     BootstrapFinished,
-    #[cfg(feature = "gpu-splash")]
-    GpuUnavailable(String),
 }
 
 /// Immutable progress snapshot so the worker thread never shares mutable state
 /// with the UI thread directly.
+#[cfg_attr(not(feature = "gpu-splash"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct LoadingSnapshot {
     pub stage: String,
@@ -35,11 +34,11 @@ impl LoadingSnapshot {
 /// Thread-safe handle passed into application bootstrap work.
 #[derive(Clone)]
 pub struct LoadingHandle {
-    sender: app::Sender<SplashEvent>,
+    sender: Sender<SplashEvent>,
 }
 
 impl LoadingHandle {
-    pub(crate) fn new(sender: app::Sender<SplashEvent>) -> Self {
+    pub(crate) fn new(sender: Sender<SplashEvent>) -> Self {
         Self { sender }
     }
 
@@ -49,7 +48,7 @@ impl LoadingHandle {
         S1: Into<String>,
         S2: Into<String>,
     {
-        self.sender.send(SplashEvent::Loading(LoadingSnapshot::new(
+        let _ = self.sender.send(SplashEvent::Loading(LoadingSnapshot::new(
             stage.into(),
             detail.into(),
             progress,
@@ -57,12 +56,13 @@ impl LoadingHandle {
     }
 
     pub(crate) fn finish(&self) {
-        self.sender.send(SplashEvent::BootstrapFinished);
+        let _ = self.sender.send(SplashEvent::BootstrapFinished);
     }
 }
 
 /// UI-owned loading model. The splash keeps this state on the main thread and
 /// mutates it only in response to events.
+#[cfg_attr(not(feature = "gpu-splash"), allow(dead_code))]
 #[derive(Debug)]
 pub struct LoadingState {
     snapshot: LoadingSnapshot,
@@ -72,6 +72,7 @@ pub struct LoadingState {
     dismiss_requested: bool,
 }
 
+#[cfg_attr(not(feature = "gpu-splash"), allow(dead_code))]
 impl LoadingState {
     pub fn new(
         minimum_display: Duration,

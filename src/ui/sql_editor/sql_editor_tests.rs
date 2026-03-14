@@ -24,13 +24,15 @@ fn count_slash_lines(text: &str) -> usize {
 }
 
 fn count_script_statements(items: &[ScriptItem]) -> usize {
-    items.iter()
+    items
+        .iter()
         .filter(|item| matches!(item, ScriptItem::Statement(_)))
         .count()
 }
 
 fn count_script_tool_commands(items: &[ScriptItem]) -> usize {
-    items.iter()
+    items
+        .iter()
         .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
         .count()
 }

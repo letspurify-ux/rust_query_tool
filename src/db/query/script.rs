@@ -2664,7 +2664,9 @@ impl QueryExecutor {
         Self::merge_fragmented_standalone_routine_script_statements(items)
     }
 
-    fn merge_fragmented_standalone_routine_script_statements(items: Vec<ScriptItem>) -> Vec<ScriptItem> {
+    fn merge_fragmented_standalone_routine_script_statements(
+        items: Vec<ScriptItem>,
+    ) -> Vec<ScriptItem> {
         let mut merged: Vec<ScriptItem> = Vec::with_capacity(items.len());
         let mut index = 0usize;
 
@@ -2785,8 +2787,9 @@ impl QueryExecutor {
     }
 
     fn statement_has_matching_end_label(statement: &str, routine_name: &str) -> bool {
-        Self::extract_end_label_chain(statement)
-            .is_some_and(|end_label| Self::identifier_chain_matches_routine(&end_label, routine_name))
+        Self::extract_end_label_chain(statement).is_some_and(|end_label| {
+            Self::identifier_chain_matches_routine(&end_label, routine_name)
+        })
     }
 
     fn is_orphan_end_label_statement_matching_routine(statement: &str, routine_name: &str) -> bool {

@@ -12,3 +12,4 @@ Connect system/password@localhost:1521/FREE
 @test/test10.txt;
 @test/test11.txt;
 @test/test18.sql;
+@test/test22.sql;

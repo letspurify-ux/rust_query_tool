@@ -2,8 +2,6 @@ use crate::splash::{self, LoadingHandle, SplashOptions};
 use crate::ui::{theme, MainWindow};
 use crate::utils::{self, AppConfig};
 use fltk::app;
-#[cfg(feature = "gpu-splash")]
-use fltk::enums::Mode;
 
 pub struct StartupContext {
     pub config: AppConfig,
@@ -47,12 +45,7 @@ impl App {
     }
 
     pub fn run(&self) {
-        let app = app::App::default()
-            .with_scheme(app::Scheme::Gtk)
-            .load_system_fonts();
-
-        let prefer_gpu = configure_gpu_visual();
-        let startup = if prefer_gpu {
+        let startup = if splash::gpu_splash_enabled() {
             splash::run_with_splash(
                 SplashOptions::space_query(),
                 Self::bootstrap,
@@ -61,6 +54,11 @@ impl App {
         } else {
             Self::bootstrap_without_splash()
         };
+
+        let app = app::App::default()
+            .with_scheme(app::Scheme::Gtk)
+            .load_system_fonts();
+
         configure_fltk_globals(&startup.config);
 
         let current_group = fltk::group::Group::try_current();
@@ -103,31 +101,4 @@ pub(crate) fn configure_fltk_globals(config: &AppConfig) {
     app::background(bg_r, bg_g, bg_b);
     let (fg_r, fg_g, fg_b) = theme::app_foreground().to_rgb();
     app::foreground(fg_r, fg_g, fg_b);
-}
-
-fn configure_gpu_visual() -> bool {
-    #[cfg(feature = "gpu-splash")]
-    {
-        let mode = Mode::Rgb8
-            | Mode::Double
-            | Mode::Depth
-            | Mode::Alpha
-            | Mode::MultiSample
-            | Mode::Opengl3;
-        match app::set_gl_visual(mode) {
-            Ok(()) => true,
-            Err(err) => {
-                utils::logging::log_warning(
-                    "splash",
-                    &format!("OpenGL splash visual unavailable, skipping splash: {err}"),
-                );
-                false
-            }
-        }
-    }
-
-    #[cfg(not(feature = "gpu-splash"))]
-    {
-        false
-    }
 }

@@ -132,13 +132,9 @@ impl QueryExecutor {
         ))
     }
 
-    fn nested_cursor_display_to_text(
-        display: &NestedCursorDisplay,
-    ) -> Result<String, OracleError> {
+    fn nested_cursor_display_to_text(display: &NestedCursorDisplay) -> Result<String, OracleError> {
         serde_json::to_string(display).map_err(|err| {
-            Self::invalid_argument_error(format!(
-                "Failed to serialize nested cursor result: {err}"
-            ))
+            Self::invalid_argument_error(format!("Failed to serialize nested cursor result: {err}"))
         })
     }
 

@@ -9467,13 +9467,15 @@ mod formatter_regression_tests {
     }
 
     fn count_statement_items(items: &[ScriptItem]) -> usize {
-        items.iter()
+        items
+            .iter()
             .filter(|item| matches!(item, ScriptItem::Statement(_)))
             .count()
     }
 
     fn count_tool_command_items(items: &[ScriptItem]) -> usize {
-        items.iter()
+        items
+            .iter()
             .filter(|item| matches!(item, ScriptItem::ToolCommand(_)))
             .count()
     }
@@ -10902,6 +10904,96 @@ FROM DUAL;"
     }
 
     #[test]
+    fn full_auto_formatting_test20_keeps_statement_boundaries() {
+        let source = load_formatter_test_file("test20.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
+
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Full auto-formatting changed test20.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Full auto-formatting changed test20.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("AS msg_preview")
+            .expect("expected final audit preview query after full auto-formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected final audit preview query bounds after full auto-formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("SELECT")
+                && statement.contains("FROM qt_fb_audit")
+                && statement.contains("AS msg_preview"),
+            "Full auto-formatting should keep the final audit preview query isolated, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("FROM qt_fb_view"),
+            "Full auto-formatting must not merge the preceding view query into the audit preview query, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("p_module => 'final_validation'"),
+            "Full auto-formatting must not merge the final validation block into the audit preview query, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_test21_keeps_statement_boundaries() {
+        let source = load_formatter_test_file("test21.sql");
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
+
+        let original_items = QueryExecutor::split_script_items(&source);
+        let formatted_items = QueryExecutor::split_script_items(&formatted);
+
+        assert_eq!(
+            count_statement_items(&formatted_items),
+            count_statement_items(&original_items),
+            "Full auto-formatting changed test21.sql statement count"
+        );
+        assert_eq!(
+            count_tool_command_items(&formatted_items),
+            count_tool_command_items(&original_items),
+            "Full auto-formatting changed test21.sql tool command count"
+        );
+
+        let cursor = formatted
+            .find("AS err_msg_preview")
+            .expect("expected final error preview query after full auto-formatting");
+        let bounds = QueryExecutor::statement_bounds_at_cursor(&formatted, cursor)
+            .expect("expected final error preview query bounds after full auto-formatting");
+        let statement = &formatted[bounds.0..bounds.1];
+
+        assert!(
+            statement.trim_start().starts_with("SELECT")
+                && statement.contains("FROM qt_x_err_log")
+                && statement.contains("AS err_msg_preview"),
+            "Full auto-formatting should keep the final error preview query isolated, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("FROM qt_x_audit"),
+            "Full auto-formatting must not merge the preceding audit preview query into the error preview query, got:\n{}",
+            statement
+        );
+        assert!(
+            !statement.contains("p_module => 'final_validation'"),
+            "Full auto-formatting must not merge the final validation block into the error preview query, got:\n{}",
+            statement
+        );
+    }
+
+    #[test]
     fn format_sql_basic_keeps_trigger_slash_and_alter_trigger_tightly_grouped() {
         let sql = r#"CREATE OR REPLACE TRIGGER trg_demo
 BEFORE INSERT ON demo
@@ -11475,10 +11567,13 @@ PROMPT done;";
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
 
         assert!(
-            formatted.contains("FROM DUAL
-PROMPT done;")
-                || formatted.contains("FROM DUAL;
-PROMPT done;"),
+            formatted.contains(
+                "FROM DUAL
+PROMPT done;"
+            ) || formatted.contains(
+                "FROM DUAL;
+PROMPT done;"
+            ),
             "Selected auto-format should preserve the trailing PROMPT line, got:
 {}",
             formatted
