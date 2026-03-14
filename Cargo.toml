@@ -6,10 +6,6 @@ description = "SPACE Query: a Toad-like Oracle Query Tool built with Rust and FL
 authors = ["Developer"]
 build = "build.rs"
 
-[features]
-default = ["gpu-splash"]
-gpu-splash = ["dep:glow", "dep:glfw", "dep:font8x8"]
-
 [[bin]]
 name = "space_query"
 path = "src/main.rs"
@@ -17,9 +13,6 @@ test = false
 
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }
-glow = { version = "0.16", optional = true }
-glfw = { version = "0.60", optional = true, default-features = false, features = ["src-build", "raw-window-handle-v0-6", "static-link"] }
-font8x8 = { version = "0.3", optional = true }
 oracle = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

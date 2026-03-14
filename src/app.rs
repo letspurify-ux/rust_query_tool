@@ -1,4 +1,3 @@
-use crate::splash::{self, LoadingHandle, SplashOptions};
 use crate::ui::{theme, MainWindow};
 use crate::utils::{self, AppConfig};
 use fltk::app;
@@ -15,25 +14,6 @@ impl App {
         Self
     }
 
-    fn bootstrap(loading: LoadingHandle) -> StartupContext {
-        loading.update("BOOTSTRAPPING WORKSPACE", "Loading user settings", 0.18);
-        let config = AppConfig::load();
-
-        loading.update(
-            "BOOTSTRAPPING WORKSPACE",
-            "Inspecting previous session diagnostics",
-            0.64,
-        );
-        let crash_report = utils::logging::take_crash_log();
-
-        loading.update("BOOTSTRAPPING WORKSPACE", "Preparing main workspace", 0.92);
-
-        StartupContext {
-            config,
-            crash_report,
-        }
-    }
-
     fn bootstrap_without_splash() -> StartupContext {
         let config = AppConfig::load();
         let crash_report = utils::logging::take_crash_log();
@@ -45,15 +25,7 @@ impl App {
     }
 
     pub fn run(&self) {
-        let startup = if splash::gpu_splash_enabled() {
-            splash::run_with_splash(
-                SplashOptions::space_query(),
-                Self::bootstrap,
-                Self::bootstrap_without_splash,
-            )
-        } else {
-            Self::bootstrap_without_splash()
-        };
+        let startup = Self::bootstrap_without_splash();
 
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)

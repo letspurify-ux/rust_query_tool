@@ -3051,9 +3051,8 @@ impl QueryExecutor {
                 continue;
             }
 
-            match items.get(index) {
-                Some(item) => merged.push(item.clone()),
-                None => {}
+            if let Some(item) = items.get(index) {
+                merged.push(item.clone());
             }
             index += 1;
         }
