@@ -970,14 +970,6 @@ impl SqlEditorWidget {
                 Self::is_alter_trigger_statement(right)
             }
             _ if Self::is_prompt_format_item(current) && Self::is_prompt_format_item(next) => true,
-            (FormatItem::Statement(left), next_item)
-                if Self::is_prompt_format_item(next_item) && {
-                    let tokens = Self::tokenize_sql(left);
-                    Self::statement_has_code(left, &tokens)
-                } =>
-            {
-                true
-            }
             (
                 FormatItem::ToolCommand(ToolCommand::ClearBreaks),
                 FormatItem::ToolCommand(ToolCommand::ClearComputes),
@@ -11568,23 +11560,31 @@ PROMPT done;";
 
         assert!(
             formatted.contains(
-                "FROM DUAL
-PROMPT done;"
-            ) || formatted.contains(
-                "FROM DUAL;
-PROMPT done;"
+                "FROM DUAL;\n\nPROMPT done;"
             ),
-            "Selected auto-format should preserve the trailing PROMPT line, got:
+            "Selected auto-format should keep the trailing PROMPT line separated from SQL by a blank line, got:
 {}",
             formatted
         );
+    }
+
+    #[test]
+    fn format_sql_basic_inserts_blank_line_before_trailing_prompt_after_set_operator_query() {
+        let source = "SELECT empno
+FROM a
+MINUS
+SELECT empno
+FROM b
+ORDER BY empno;
+PROMPT [DONE] Hardcore SELECT tests finished.";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
         assert!(
             formatted.contains(
-                "FROM DUAL;
-PROMPT done;"
+                "ORDER BY empno;\n\nPROMPT [DONE] Hardcore SELECT tests finished."
             ),
-            "Selected auto-format should keep the canonical SQL terminator before PROMPT, got:
-{}",
+            "Formatter should separate trailing PROMPT from the SQL statement with a blank line, got:\n{}",
             formatted
         );
     }
