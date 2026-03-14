@@ -695,7 +695,7 @@ const WITH_NON_PLSQL_CLAUSE_KEYWORDS: &[&str] = &[
 ];
 
 const EXTERNAL_LANGUAGE_TARGET_KEYWORDS: &[&str] =
-    &["C", "JAVA", "JAVASCRIPT", "PYTHON", "R", "WASM", "MLE"];
+    &["C", "JAVA", "JAVASCRIPT", "PYTHON", "R", "RUST", "WASM", "MLE"];
 
 const EXTERNAL_LANGUAGE_CLAUSE_KEYWORDS: &[&str] = &[
     "EXTERNAL",
@@ -1502,6 +1502,7 @@ mod tests {
         assert!(is_with_plsql_declaration_keyword("procedure"));
         assert!(is_external_language_target_keyword("javascript"));
         assert!(is_external_language_target_keyword("mle"));
+        assert!(is_external_language_target_keyword("rust"));
         assert!(is_external_language_clause_keyword("LANGUAGE"));
         assert!(is_external_language_clause_keyword("AGENT"));
         assert!(is_external_language_clause_keyword("CREDENTIAL"));

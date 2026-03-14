@@ -7398,6 +7398,43 @@ fn oracle_external_language_without_semicolon_splits_before_following_statement_
 }
 
 #[test]
+fn create_function_is_language_call_spec_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_is_lang RETURN NUMBER");
+    engine.process_line("IS LANGUAGE C NAME 'ext_is_lang'");
+    engine.process_line("SELECT 777 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("IS LANGUAGE C NAME 'ext_is_lang'"),
+        "external call-spec must stay in CREATE FUNCTION statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 777 FROM dual".to_string());
+}
+
+
+#[test]
+fn create_procedure_is_language_java_name_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PROCEDURE ext_proc_is_lang");
+    engine.process_line("IS LANGUAGE JAVA NAME 'pkg.Ext.proc()'");
+    engine.process_line("SELECT 778 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("IS LANGUAGE JAVA NAME 'pkg.Ext.proc()'"),
+        "external Java call-spec must stay in CREATE PROCEDURE statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 778 FROM dual".to_string());
+}
+
+#[test]
 fn malformed_external_clause_without_language_target_still_splits_before_next_statement() {
     let mut engine = SqlParserEngine::new();
 
@@ -7723,4 +7760,23 @@ fn package_body_end_label_with_whitespace_around_dot_splits_following_statement(
     assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
     assert!(statements[0].contains("END owner . pkg_ws"));
     assert_eq!(statements[1], "SELECT 900 FROM dual".to_string());
+}
+
+
+#[test]
+fn create_function_is_language_rust_call_spec_splits_before_following_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_is_lang_rust RETURN NUMBER");
+    engine.process_line("IS LANGUAGE RUST NAME 'ext_is_lang_rust'");
+    engine.process_line("SELECT 779 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("IS LANGUAGE RUST NAME 'ext_is_lang_rust'"),
+        "RUST external call-spec must stay in CREATE FUNCTION statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 779 FROM dual".to_string());
 }
