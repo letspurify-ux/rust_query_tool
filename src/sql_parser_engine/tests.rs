@@ -7593,6 +7593,24 @@ fn package_body_init_exception_block_with_keyword_label_keeps_depth_balanced() {
 }
 
 #[test]
+fn oracle_mle_env_import_export_clause_after_quoted_language_target_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION ext_mle_env RETURN NUMBER");
+    engine.process_line("AS LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod;");
+    engine.process_line("SELECT 78 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("LANGUAGE \"JavaScript\" ENV env_ctx IMPORT imports_mod EXPORT exports_mod"),
+        "ENV/IMPORT/EXPORT clauses should remain in external call-spec statement: {}",
+        statements[0]
+    );
+    assert_eq!(statements[1], "SELECT 78 FROM dual".to_string());
+}
+
+#[test]
 fn package_body_name_end_if_closes_outer_as_is_depth() {
     let mut engine = SqlParserEngine::new();
 
@@ -7607,6 +7625,22 @@ fn package_body_name_end_if_closes_outer_as_is_depth() {
         0,
         "END IF label for package body should close outer AS/IS depth"
     );
+}
+
+#[test]
+fn quoted_package_body_name_end_label_splits_before_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE PACKAGE BODY \"Pkg$Quoted\" AS");
+    engine.process_line("BEGIN");
+    engine.process_line("  NULL;");
+    engine.process_line("END \"Pkg$Quoted\";");
+    engine.process_line("SELECT 77 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("END \"Pkg$Quoted\""));
+    assert_eq!(statements[1], "SELECT 77 FROM dual".to_string());
 }
 
 #[test]
