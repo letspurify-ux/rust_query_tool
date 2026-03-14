@@ -3176,9 +3176,7 @@ impl MainWindow {
             | "Tools/Security Manager..."
             | "Tools/RMAN Dashboard..."
             | "Tools/AWR/ASH Dashboard..."
-            | "Tools/Data Guard Dashboard..." => {
-                true
-            }
+            | "Tools/Data Guard Dashboard..." => true,
             "Tools/Export Results..." => {
                 let has_data = state
                     .lock()

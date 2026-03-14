@@ -2,7 +2,7 @@ use fltk::{
     app,
     browser::HoldBrowser,
     button::Button,
-    enums::FrameType,
+    enums::{Event, FrameType, Key},
     frame::Frame,
     group::Flex,
     input::{Input, SecretInput},
@@ -251,27 +251,31 @@ impl ConnectionDialog {
         host_flex.end();
         right_col.fixed(&host_flex, INPUT_ROW_HEIGHT);
 
-        // Port + Service on same row
-        let mut port_svc_flex = Flex::default();
-        port_svc_flex.set_type(fltk::group::FlexType::Row);
-        port_svc_flex.set_spacing(DIALOG_SPACING);
+        // Port
+        let mut port_flex = Flex::default();
+        port_flex.set_type(fltk::group::FlexType::Row);
         let mut port_label = Frame::default().with_label("Port:");
         port_label.set_label_color(theme::text_primary());
-        port_svc_flex.fixed(&port_label, 40);
+        port_flex.fixed(&port_label, FORM_LABEL_WIDTH);
         let mut port_input = Input::default();
         port_input.set_value("1521");
         port_input.set_color(theme::input_bg());
         port_input.set_text_color(theme::text_primary());
-        port_svc_flex.fixed(&port_input, 60);
+        port_flex.end();
+        right_col.fixed(&port_flex, INPUT_ROW_HEIGHT);
+
+        // Service
+        let mut service_flex = Flex::default();
+        service_flex.set_type(fltk::group::FlexType::Row);
         let mut svc_label = Frame::default().with_label("Service:");
         svc_label.set_label_color(theme::text_primary());
-        port_svc_flex.fixed(&svc_label, 60);
+        service_flex.fixed(&svc_label, FORM_LABEL_WIDTH);
         let mut service_input = Input::default();
         service_input.set_value("ORCL");
         service_input.set_color(theme::input_bg());
         service_input.set_text_color(theme::text_primary());
-        port_svc_flex.end();
-        right_col.fixed(&port_svc_flex, INPUT_ROW_HEIGHT);
+        service_flex.end();
+        right_col.fixed(&service_flex, INPUT_ROW_HEIGHT);
 
         // Save connection button
         let mut save_flex = Flex::default();
@@ -279,7 +283,7 @@ impl ConnectionDialog {
         let _spacer = Frame::default();
         save_flex.fixed(&_spacer, FORM_LABEL_WIDTH);
         let mut save_btn = Button::default().with_label("Save this connection");
-        save_btn.set_color(theme::button_secondary());
+        save_btn.set_color(theme::button_success());
         save_btn.set_label_color(theme::text_primary());
         save_btn.set_frame(FrameType::RFlatBox);
         save_flex.end();
@@ -313,7 +317,7 @@ impl ConnectionDialog {
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Cancel");
-        cancel_btn.set_color(theme::button_subtle());
+        cancel_btn.set_color(theme::button_secondary());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
 
@@ -328,6 +332,19 @@ impl ConnectionDialog {
         root.end();
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
+
+        let mut connect_btn_for_enter = connect_btn.clone();
+        dialog.handle(move |_, ev| match ev {
+            Event::KeyDown => {
+                if matches!(app::event_key(), Key::Enter | Key::KPEnter) {
+                    connect_btn_for_enter.do_callback();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        });
 
         popups
             .lock()
