@@ -180,7 +180,9 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     extinction = dark_mask * 0.5;
 
     // Forward scattering — dust lit from behind by stars/nebula
-    vec2 light_dir_2d = normalize(vec2(0.42, 0.03) - p);
+    vec2 light_delta = vec2(0.42, 0.03) - p;
+    float light_dist = length(light_delta);
+    vec2 light_dir_2d = (light_dist > 0.001) ? light_delta / light_dist : vec2(1.0, 0.0);
     float p_len = length(p);
     vec2 p_safe = (p_len > 0.001) ? p / p_len : vec2(0.0, 1.0);
     float scatter_angle = dot(p_safe, light_dir_2d) * 0.5 + 0.5;
@@ -294,8 +296,8 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
                 // Diagonal spikes
                 float d45a = abs(star_pos.x - star_pos.y) * 0.707;
                 float d45b = abs(star_pos.x + star_pos.y) * 0.707;
-                float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b + d45a));
-                float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a + d45b));
+                float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b));
+                float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a));
                 float spikes = (spike_h + spike_v + spike_d1 * 0.5 + spike_d2 * 0.5) * twinkle * 0.4;
                 col += star_col * spikes;
 
