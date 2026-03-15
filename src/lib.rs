@@ -7,6 +7,7 @@
 pub mod app;
 pub mod app_icon;
 pub mod db;
+#[cfg(not(feature = "no-splash"))]
 pub mod splash;
 pub mod sql_parser_engine;
 pub mod sql_text;
