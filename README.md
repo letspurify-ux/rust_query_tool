@@ -70,30 +70,6 @@ src/
     ├── logging.rs          # 애플리케이션 로그 저장/조회
 ```
 
-## 실행
-
-```bash
-./run.sh
-```
-
-> macOS에서는 `run.sh`가 `DYLD_LIBRARY_PATH`를 설정해 Oracle Instant Client를 참조합니다.
->
-> Apple Silicon(`arm64`)에서는 `x86_64` Instant Client를 사용할 수 없습니다. Oracle 공식 ARM64 Instant Client를 설치하고, 필요하면 `ORACLE_CLIENT_LIB_DIR`를 `~/Downloads/instantclient_23_3` 같은 `libclntsh.dylib` 포함 디렉터리로 지정하세요.
-
-## 빌드 (`SPACE Query` 실행파일 생성)
-
-```bash
-./build_space_query.sh
-```
-
-릴리즈 빌드:
-
-```bash
-./build_space_query.sh --release
-```
-
-`build_space_query.sh`는 빌드 후 `target/<profile>/SPACE Query`를 생성합니다.
-
 ## 테스트
 
 ```bash
