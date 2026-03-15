@@ -436,10 +436,12 @@ vec3 lens_flare(vec2 p) {
     }
 
     // Iris starburst — hexagonal blade pattern
-    float flare_angle = atan(d.y, d.x);
-    float blades = abs(sin(flare_angle * 3.0));  // 6-blade pattern
-    float iris = blades * (1.0 - smoothstep(0.0, 0.12, dist)) * 0.08;
-    col += vec3(0.2, 0.35, 0.8) * iris;
+    if (dist > 0.001) {
+        float flare_angle = atan(d.y, d.x);
+        float blades = abs(sin(flare_angle * 3.0));  // 6-blade pattern
+        float iris = blades * (1.0 - smoothstep(0.0, 0.12, dist)) * 0.08;
+        col += vec3(0.2, 0.35, 0.8) * iris;
+    }
 
     return col;
 }
@@ -750,7 +752,10 @@ vec3 orbital_ring(vec2 p, float time) {
     float ring_dist = abs(length(rp) - 0.25);
     float ring = (1.0 - smoothstep(0.0, 0.003, ring_dist)) * 0.12;
     // Dotted/moving pattern
-    float dots = sin(atan(rp.y, rp.x) * 20.0 + time * 2.0) * 0.5 + 0.5;
+    float rp_len = length(rp);
+    float dots = (rp_len > 0.001)
+        ? sin(atan(rp.y, rp.x) * 20.0 + time * 2.0) * 0.5 + 0.5
+        : 0.5;
     ring *= dots;
     return vec3(0.2, 0.5, 1.0) * ring;
 }
