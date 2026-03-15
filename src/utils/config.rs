@@ -51,10 +51,10 @@ impl AppConfig {
         Self {
             recent_connections: Vec::new(),
             last_connection: None,
-            editor_font: "Courier".to_string(),
+            editor_font: "맑은 고딕".to_string(),
             ui_font_size: 16,
             editor_font_size: 16,
-            result_font: "Helvetica".to_string(),
+            result_font: "맑은 고딕".to_string(),
             result_font_size: 16,
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             max_rows: 1000,
