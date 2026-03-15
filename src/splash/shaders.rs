@@ -681,13 +681,6 @@ void main() {
     // Orbital ring
     col += orbital_ring(centered, u_time);
 
-    // Shooting stars
-    col += shooting_star(uv, 1.0, u_time);
-    col += shooting_star(uv, 2.7, u_time);
-    col += shooting_star(uv, 4.2, u_time);
-    col += shooting_star(uv, 5.9, u_time);
-    col += shooting_star(uv, 7.3, u_time);
-
     // --- Title wordmark texture with sweep reveal ---
     vec2 title_center = vec2(0.0, 0.16);
     vec2 title_size = vec2(1.0571429, 0.2114286);
