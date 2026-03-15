@@ -31,9 +31,10 @@ pub fn run_splash() {
     let result = std::panic::catch_unwind(|| {
         let conf = miniquad::conf::Conf {
             window_title: "SPACE Query".to_string(),
-            window_width: 720,
-            window_height: 450,
+            window_width: 504,
+            window_height: 315,
             window_resizable: false,
+            borderless: true,
             high_dpi: true,
             ..Default::default()
         };

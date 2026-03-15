@@ -45,3 +45,6 @@ strip = true
 
 [build-dependencies]
 cc = "1.2"
+
+[patch.crates-io]
+miniquad = { path = "vendor/miniquad" }

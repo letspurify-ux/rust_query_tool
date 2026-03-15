@@ -16,6 +16,7 @@ varying highp vec2 uv;
 uniform float u_time;
 uniform vec2 u_resolution;
 uniform float u_alpha;
+uniform sampler2D title_tex;
 
 // ========================================================
 //  Utility
@@ -71,7 +72,7 @@ float sd_segment(vec2 p, vec2 a, vec2 b) {
 // ========================================================
 
 vec2 camera_offset() {
-    return vec2(sin(u_time * 0.15) * 0.008, cos(u_time * 0.12) * 0.006);
+    return vec2(sin(u_time * 0.08) * 0.0035, cos(u_time * 0.07) * 0.0028);
 }
 
 // ========================================================
@@ -166,13 +167,13 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     float n2 = fbm(p * 2.5 + vec2(-time * 0.008, time * 0.004) + 50.0);
     float mask1 = smoothstep(0.35, 0.65, n1) * (1.0 - smoothstep(0.3, 0.9, length(p)));
     float mask2 = smoothstep(0.4, 0.7, n2) * (1.0 - smoothstep(0.2, 1.0, length(p + vec2(0.15, -0.1))));
-    col += vec3(0.04, 0.08, 0.2) * mask1 * 1.2;
-    col += vec3(0.12, 0.04, 0.18) * mask2 * 0.8;
+    col += vec3(0.03, 0.055, 0.14) * mask1 * 0.72;
+    col += vec3(0.08, 0.03, 0.12) * mask2 * 0.45;
 
     // Layer 2: fine filaments — reflection nebula
     float n3 = fbm(p * 6.0 + vec2(time * 0.003, -time * 0.002) + 150.0);
     float filament = smoothstep(0.42, 0.58, n3) * (1.0 - smoothstep(0.25, 0.7, length(p - vec2(-0.1, 0.05))));
-    col += vec3(0.06, 0.1, 0.25) * filament * 0.6;
+    col += vec3(0.04, 0.07, 0.18) * filament * 0.35;
 
     // Dark nebula — opaque dust that absorbs background light
     float dark_n = fbm(p * 3.0 + vec2(-time * 0.004, 0.0) + 250.0);
@@ -187,7 +188,7 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     vec2 p_safe = (p_len > 0.001) ? p / p_len : vec2(0.0, 1.0);
     float scatter_angle = dot(p_safe, light_dir_2d) * 0.5 + 0.5;
     float forward_scatter = pow(scatter_angle, 4.0) * dark_mask;
-    col += vec3(0.08, 0.12, 0.3) * forward_scatter * 0.4;
+    col += vec3(0.05, 0.08, 0.2) * forward_scatter * 0.22;
 
     return col;
 }
@@ -215,18 +216,18 @@ vec3 nebula(vec2 p, float time) {
     float falloff = 1.0 - smoothstep(0.08, 0.65, dist);
 
     vec3 col = vec3(0.0);
-    col += vec3(0.06, 0.18, 0.55) * n1 * 1.8;     // Deep blue core
-    col += vec3(0.0, 0.4, 0.75) * n2 * 1.0;        // Bright accent blue
-    col += vec3(0.3, 0.1, 0.5) * n3 * 0.9;         // Purple wisps
-    col += vec3(0.6, 0.2, 0.4) * n4 * 0.3;         // Pink highlights
-    col += vec3(0.5, 0.7, 1.0) * pow(falloff, 4.0) * 0.2;  // Hot core
+    col += vec3(0.04, 0.11, 0.34) * n1 * 1.0;      // Deep blue core
+    col += vec3(0.0, 0.24, 0.46) * n2 * 0.52;      // Bright accent blue
+    col += vec3(0.18, 0.07, 0.3) * n3 * 0.46;      // Purple wisps
+    col += vec3(0.34, 0.12, 0.22) * n4 * 0.14;     // Pink highlights
+    col += vec3(0.35, 0.48, 0.7) * pow(falloff, 4.0) * 0.08;  // Hot core
     col *= falloff;
 
     // Emission edges — bright rims where gas density changes sharply
     float edge_n = fbm(warped * 6.0 + 300.0);
     float edge = abs(edge_n - 0.5);
     float emission = (1.0 - smoothstep(0.0, 0.06, edge)) * falloff;
-    col += vec3(0.25, 0.5, 1.0) * emission * 0.2;
+    col += vec3(0.18, 0.36, 0.72) * emission * 0.08;
 
     // Dark dust absorption lanes
     float dust = fbm(rp * 3.5 + vec2(time * 0.005, 0.0) + 500.0);
@@ -241,7 +242,7 @@ vec3 nebula(vec2 p, float time) {
 // ========================================================
 
 vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
-    vec2 drifted = uv_in + camera_offset() * drift;
+    vec2 drifted = uv_in + camera_offset() * drift * 0.03;
     vec2 grid_uv = drifted * scale;
     vec2 grid_id = floor(grid_uv);
     vec2 grid_frac = fract(grid_uv) - 0.5;
@@ -265,7 +266,7 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
 
             // Size
             float brightness_h = hash21(cell_id + 300.0);
-            float star_size = mix(0.008, 0.04, brightness_h * brightness_h);
+            float star_size = mix(0.012, 0.04, brightness_h * brightness_h);
             float star = (1.0 - smoothstep(0.0, star_size, dist)) * twinkle;
 
             // Color temperature
@@ -554,150 +555,34 @@ vec3 shooting_star(vec2 uv_in, float seed, float time) {
 }
 
 // ========================================================
-//  SDF Text — "SPACE Query"
+//  Title texture
 // ========================================================
 
-float letter_S(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.8, 1.5), vec2(0.2, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.2, 1.5), vec2(0.2, 0.9)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.9), vec2(0.8, 0.75)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.75), vec2(0.8, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.0), vec2(0.2, 0.0)));
-    return d;
+float title_alpha(vec2 p) {
+    vec2 title_center = vec2(0.0, 0.16);
+    vec2 title_size = vec2(1.0571429, 0.2114286);
+    vec2 title_uv = (p - title_center) / title_size + 0.5;
+    title_uv.y = 1.0 - title_uv.y;
+
+    if (title_uv.x < 0.0 || title_uv.x > 1.0 || title_uv.y < 0.0 || title_uv.y > 1.0) {
+        return 0.0;
+    }
+
+    return texture2D(title_tex, title_uv).a;
 }
 
-float letter_P(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 0.0), vec2(0.2, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.2, 1.5), vec2(0.7, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.7, 1.5), vec2(0.8, 1.35)));
-    d = min(d, sd_segment(p, vec2(0.8, 1.35), vec2(0.8, 0.9)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.9), vec2(0.7, 0.75)));
-    d = min(d, sd_segment(p, vec2(0.7, 0.75), vec2(0.2, 0.75)));
-    return d;
-}
+float title_glow(vec2 p) {
+    vec2 offset_x = vec2(0.008, 0.0);
+    vec2 offset_y = vec2(0.0, 0.008);
 
-float letter_A(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.1, 0.0), vec2(0.5, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.5, 1.5), vec2(0.9, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.25, 0.6), vec2(0.75, 0.6)));
-    return d;
-}
+    float center = title_alpha(p);
+    float near_glow = title_alpha(p + offset_x) + title_alpha(p - offset_x);
+    near_glow += title_alpha(p + offset_y) + title_alpha(p - offset_y);
 
-float letter_C(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.8, 1.35), vec2(0.6, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.6, 1.5), vec2(0.3, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.3, 1.5), vec2(0.2, 1.35)));
-    d = min(d, sd_segment(p, vec2(0.2, 1.35), vec2(0.2, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.15), vec2(0.3, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.3, 0.0), vec2(0.6, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.6, 0.0), vec2(0.8, 0.15)));
-    return d;
-}
+    float far_glow = title_alpha(p + offset_x * 2.0) + title_alpha(p - offset_x * 2.0);
+    far_glow += title_alpha(p + offset_y * 2.0) + title_alpha(p - offset_y * 2.0);
 
-float letter_E(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 0.0), vec2(0.2, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.2, 1.5), vec2(0.8, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.75), vec2(0.7, 0.75)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.0), vec2(0.8, 0.0)));
-    return d;
-}
-
-float letter_Q(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.3, 1.5), vec2(0.7, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.7, 1.5), vec2(0.8, 1.35)));
-    d = min(d, sd_segment(p, vec2(0.8, 1.35), vec2(0.8, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.15), vec2(0.7, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.7, 0.0), vec2(0.3, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.3, 0.0), vec2(0.2, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.15), vec2(0.2, 1.35)));
-    d = min(d, sd_segment(p, vec2(0.2, 1.35), vec2(0.3, 1.5)));
-    d = min(d, sd_segment(p, vec2(0.55, 0.3), vec2(0.9, -0.15)));
-    return d;
-}
-
-float letter_u_lower(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 1.0), vec2(0.2, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.15), vec2(0.3, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.3, 0.0), vec2(0.6, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.6, 0.0), vec2(0.7, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.7, 0.15), vec2(0.7, 1.0)));
-    return d;
-}
-
-float letter_e_lower(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 0.5), vec2(0.8, 0.5)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.5), vec2(0.8, 0.75)));
-    d = min(d, sd_segment(p, vec2(0.8, 0.75), vec2(0.6, 1.0)));
-    d = min(d, sd_segment(p, vec2(0.6, 1.0), vec2(0.3, 1.0)));
-    d = min(d, sd_segment(p, vec2(0.3, 1.0), vec2(0.2, 0.85)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.85), vec2(0.2, 0.15)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.15), vec2(0.4, 0.0)));
-    d = min(d, sd_segment(p, vec2(0.4, 0.0), vec2(0.8, 0.1)));
-    return d;
-}
-
-float letter_r_lower(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 0.0), vec2(0.2, 1.0)));
-    d = min(d, sd_segment(p, vec2(0.2, 0.85), vec2(0.4, 1.0)));
-    d = min(d, sd_segment(p, vec2(0.4, 1.0), vec2(0.7, 1.0)));
-    return d;
-}
-
-float letter_y_lower(vec2 p) {
-    float d = 1e10;
-    d = min(d, sd_segment(p, vec2(0.2, 1.0), vec2(0.5, 0.35)));
-    d = min(d, sd_segment(p, vec2(0.8, 1.0), vec2(0.5, 0.35)));
-    d = min(d, sd_segment(p, vec2(0.5, 0.35), vec2(0.3, -0.3)));
-    return d;
-}
-
-// Per-character distance with x-position for sequential reveal
-float render_text_with_pos(vec2 p, out float char_x_pos) {
-    float d = 1e10;
-    char_x_pos = 0.0;
-    float char_w = 1.15;
-    float total_w = 12.0;
-    float x_off = -total_w * 0.5;
-
-    // S P A C E
-    float ds = letter_S(p - vec2(x_off, 0.0));
-    float dp = letter_P(p - vec2(x_off + char_w, 0.0));
-    float da = letter_A(p - vec2(x_off + char_w * 2.0, 0.0));
-    float dc = letter_C(p - vec2(x_off + char_w * 3.0, 0.0));
-    float de = letter_E(p - vec2(x_off + char_w * 4.0, 0.0));
-
-    if (ds < d) { d = ds; char_x_pos = 0.0; }
-    if (dp < d) { d = dp; char_x_pos = 1.0; }
-    if (da < d) { d = da; char_x_pos = 2.0; }
-    if (dc < d) { d = dc; char_x_pos = 3.0; }
-    if (de < d) { d = de; char_x_pos = 4.0; }
-
-    float gap = 0.7;
-    float qx = x_off + char_w * 5.0 + gap;
-    float lx = qx + char_w;
-
-    float dq  = letter_Q(p - vec2(qx, 0.0));
-    float du  = letter_u_lower(p - vec2(lx, 0.0));
-    float de2 = letter_e_lower(p - vec2(lx + char_w * 0.85, 0.0));
-    float dr  = letter_r_lower(p - vec2(lx + char_w * 1.7, 0.0));
-    float dy  = letter_y_lower(p - vec2(lx + char_w * 2.4, 0.0));
-
-    if (dq  < d) { d = dq;  char_x_pos = 5.0; }
-    if (du  < d) { d = du;  char_x_pos = 6.0; }
-    if (de2 < d) { d = de2; char_x_pos = 7.0; }
-    if (dr  < d) { d = dr;  char_x_pos = 8.0; }
-    if (dy  < d) { d = dy;  char_x_pos = 9.0; }
-
-    return d;
+    return center * 0.65 + near_glow * 0.18 + far_glow * 0.06;
 }
 
 // ========================================================
@@ -705,7 +590,7 @@ float render_text_with_pos(vec2 p, out float char_x_pos) {
 // ========================================================
 
 vec3 progress_bar(vec2 uv_in, float progress) {
-    float bar_y = 0.055;
+    float bar_y = 0.5;
     float bar_h = 0.0025;
     float margin = 0.22;
 
@@ -781,28 +666,17 @@ void main() {
     col += cosmic_dust(centered, u_time, dust_extinction);
 
     // Nebula
-    col += nebula(centered * 1.1, u_time);
+    col += nebula(centered * 0.78, u_time);
 
     // Aurora ribbons
     col += aurora(centered, u_time);
 
     // Stars (4 layers with parallax drift) — dimmed by foreground dust
     float star_dim = 1.0 - dust_extinction;
-    col += star_layer(uv, 60.0, 0.0, 1.0) * star_dim;
-    col += star_layer(uv, 120.0, 2.0, 1.5) * star_dim;
-    col += star_layer(uv, 240.0, 4.0, 2.0) * mix(star_dim, 1.0, 0.3);
-    col += star_layer(uv, 400.0, 6.0, 3.0) * mix(star_dim, 1.0, 0.5);
-
-    // Planet — mask background behind opaque body, then composite
-    vec2 planet_center = vec2(0.32, -0.05);
-    float planet_radius = 0.12;
-    float planet_dist = length(centered - planet_center);
-    float planet_body_mask = 1.0 - smoothstep(planet_radius - 0.001, planet_radius, planet_dist);
-    col *= 1.0 - planet_body_mask;  // erase background behind planet body
-    col += planet(centered);
-
-    // Lens flare
-    col += lens_flare(centered);
+    col += star_layer(uv, 60.0, 0.0, 0.45) * star_dim;
+    col += star_layer(uv, 120.0, 2.0, 0.7) * star_dim;
+    col += star_layer(uv, 240.0, 4.0, 0.95) * mix(star_dim, 1.0, 0.3);
+    col += star_layer(uv, 400.0, 6.0, 1.2) * mix(star_dim, 1.0, 0.5);
 
     // Orbital ring
     col += orbital_ring(centered, u_time);
@@ -814,51 +688,24 @@ void main() {
     col += shooting_star(uv, 5.9, u_time);
     col += shooting_star(uv, 7.3, u_time);
 
-    // --- Text "SPACE Query" with sequential reveal ---
-    float text_scale = 0.065;
-    vec2 text_p = centered / text_scale;
-    text_p.y += 0.3 / text_scale;
+    // --- Title wordmark texture with sweep reveal ---
+    vec2 title_center = vec2(0.0, 0.16);
+    vec2 title_size = vec2(1.0571429, 0.2114286);
+    vec2 title_uv = (centered - title_center) / title_size + 0.5;
+    float title_sweep = smoothstep(0.38, 1.65, u_time) * smoothstep(-0.1, 0.18, title_uv.x);
+    title_sweep *= 1.0 - smoothstep(0.18, 1.25, title_uv.x - u_time * 0.11);
 
-    float char_x_pos;
-    float text_d = render_text_with_pos(text_p, char_x_pos);
-    text_d *= text_scale;
+    float title_fill = title_alpha(centered) * clamp(title_sweep * 1.2, 0.0, 1.0);
+    float pulse = sin(u_time * 1.1) * 0.08 + 0.92;
+    float glow_reveal = smoothstep(0.55, 1.8, u_time);
+    float title_halo = title_glow(centered) * glow_reveal * pulse;
+    float sweep_flash = exp(-pow((title_uv.x - clamp(u_time * 0.18, 0.0, 1.0)) * 7.0, 2.0));
+    sweep_flash *= smoothstep(0.45, 1.55, u_time) * (1.0 - smoothstep(1.55, 2.4, u_time));
 
-    // Sequential reveal: each character appears 0.12s apart starting at t=0.5
-    float reveal_time = 0.5 + char_x_pos * 0.12;
-    float char_reveal = smoothstep(reveal_time, reveal_time + 0.3, u_time);
-
-    // Smooth position-based reveal for wide glow layers (avoids seam at char boundaries)
-    float glow_x = (text_p.x + 6.0) / 12.0;
-    float glow_reveal_time = 0.5 + clamp(glow_x, 0.0, 1.0) * 1.08;
-    float glow_reveal = smoothstep(glow_reveal_time, glow_reveal_time + 0.3, u_time);
-
-    // Pulsing glow
-    float pulse = sin(u_time * 1.5 - char_x_pos * 0.3) * 0.15 + 0.85;
-
-    // Text rendering
-    float text_fill = (1.0 - smoothstep(0.001, 0.004, text_d)) * char_reveal;
-    float text_glow = (1.0 - smoothstep(0.0, 0.05, text_d)) * 0.6 * char_reveal * pulse;
-    float text_glow_outer = (1.0 - smoothstep(0.0, 0.12, text_d)) * 0.2 * glow_reveal;
-    float text_glow_far = (1.0 - smoothstep(0.0, 0.2, text_d)) * 0.05 * glow_reveal;
-
-    // Arrival flash per character
-    float flash_t = u_time - reveal_time;
-    float arrival_flash = smoothstep(0.0, 0.05, flash_t) * (1.0 - smoothstep(0.1, 0.4, flash_t));
-    float flash_glow = (1.0 - smoothstep(0.0, 0.08, text_d)) * arrival_flash * 0.8;
-
-    col += vec3(1.0, 1.0, 1.0) * text_fill;
-    col += vec3(0.3, 0.55, 1.0) * text_glow;
-    col += vec3(0.15, 0.35, 0.85) * text_glow_outer;
-    col += vec3(0.1, 0.2, 0.6) * text_glow_far;
-    col += vec3(0.6, 0.8, 1.0) * flash_glow;
-
-    // Decorative separator line with fade-in
-    float sep_reveal = smoothstep(2.0, 3.0, u_time);
-    float sep_y = -0.6 / text_scale;
-    float sep_d = abs(text_p.y - sep_y) * text_scale;
-    float sep_x_range = smoothstep(-4.0, -2.5, text_p.x) * (1.0 - smoothstep(2.5, 4.0, text_p.x));
-    float separator = (1.0 - smoothstep(0.0004, 0.002, sep_d)) * sep_x_range * 0.35 * sep_reveal;
-    col += vec3(0.3, 0.55, 1.0) * separator;
+    col += vec3(0.96, 0.98, 1.0) * title_fill;
+    col += vec3(0.18, 0.34, 0.72) * title_halo * 0.55;
+    col += vec3(0.08, 0.18, 0.44) * title_halo * 0.28;
+    col += vec3(0.55, 0.74, 1.0) * sweep_flash * title_halo * 0.4;
 
     // --- Progress bar ---
     float progress = clamp(u_time / 10.0, 0.0, 1.0);
@@ -880,7 +727,7 @@ void main() {
     col = col * (2.51 * col + 0.03) / (col * (2.43 * col + 0.59) + 0.14);
 
     // Subtle film grain for cinematic feel
-    float grain = (hash21(uv * u_resolution + u_time * 100.0) - 0.5) * 0.012;
+    float grain = (hash21(uv * u_resolution * 0.35) - 0.5) * 0.006;
     col += grain;
 
     col = clamp(col, 0.0, 1.0);
@@ -892,7 +739,7 @@ void main() {
 
 pub fn meta() -> miniquad::ShaderMeta {
     miniquad::ShaderMeta {
-        images: vec![],
+        images: vec!["title_tex".to_string()],
         uniforms: miniquad::UniformBlockLayout {
             uniforms: vec![
                 miniquad::UniformDesc::new("u_time", miniquad::UniformType::Float1),
