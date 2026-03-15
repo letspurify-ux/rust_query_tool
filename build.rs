@@ -85,7 +85,7 @@ fn write_ico_file(path: &Path) -> std::io::Result<()> {
         .iter()
         .map(|&sz| {
             let mut buf = vec![0u8; sz * sz * 4];
-            fill_icon_bld(&mut buf, sz);
+            fill_icon(&mut buf, sz);
             buf
         })
         .collect();
@@ -173,12 +173,5 @@ fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
 }
 
 // ── Icon pixel generation (shared with src/app_icon.rs via icon_fill.rs) ──
-// Re-named to avoid collision with the crate's fill_icon in the same binary.
 
 include!("src/icon_fill.rs");
-
-// build.rs sees `fill_icon` from the include above, but we call it through
-// a thin wrapper so the name is unambiguous within this file.
-fn fill_icon_bld(buf: &mut [u8], size: usize) {
-    fill_icon(buf, size);
-}
