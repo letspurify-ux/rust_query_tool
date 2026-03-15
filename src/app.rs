@@ -14,7 +14,7 @@ impl App {
         Self
     }
 
-    fn bootstrap_without_splash() -> StartupContext {
+    fn bootstrap() -> StartupContext {
         let config = AppConfig::load();
         let crash_report = utils::logging::take_crash_log();
 
@@ -25,7 +25,9 @@ impl App {
     }
 
     pub fn run(&self) {
-        let startup = Self::bootstrap_without_splash();
+        crate::splash::run_splash();
+
+        let startup = Self::bootstrap();
 
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)

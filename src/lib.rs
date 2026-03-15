@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod db;
+pub mod splash;
 pub mod sql_parser_engine;
 pub mod sql_text;
 pub mod ui;
