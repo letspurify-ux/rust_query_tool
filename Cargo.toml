@@ -11,6 +11,12 @@ name = "space_query"
 path = "src/main.rs"
 test = false
 
+[features]
+# Build without the OpenGL splash screen (useful for CI, headless environments,
+# or users who prefer a faster startup).
+# Usage: cargo build --features no-splash
+no-splash = []
+
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }
 oracle = "0.6"
