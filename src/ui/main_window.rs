@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::app_icon;
 use crate::db::{
     create_shared_connection, format_connection_busy_message, lock_connection_with_activity,
     try_lock_connection_with_activity, ObjectBrowser, QueryResult, SharedConnection,
@@ -956,6 +957,7 @@ impl MainWindow {
             .center_screen();
         window.set_id("main_window");
         window.set_color(theme::window_bg());
+        app_icon::apply_window_icon(&mut window);
 
         let mut main_flex = Flex::default_fill();
         main_flex.set_type(FlexType::Column);

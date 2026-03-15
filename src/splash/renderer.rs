@@ -256,10 +256,18 @@ impl SplashStage {
 
         // Fullscreen quad: two triangles covering [-1, 1] in both axes
         let vertices: [Vertex; 4] = [
-            Vertex { position: [-1.0, -1.0] },
-            Vertex { position: [ 1.0, -1.0] },
-            Vertex { position: [ 1.0,  1.0] },
-            Vertex { position: [-1.0,  1.0] },
+            Vertex {
+                position: [-1.0, -1.0],
+            },
+            Vertex {
+                position: [1.0, -1.0],
+            },
+            Vertex {
+                position: [1.0, 1.0],
+            },
+            Vertex {
+                position: [-1.0, 1.0],
+            },
         ];
         let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
 

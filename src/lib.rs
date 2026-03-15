@@ -5,6 +5,7 @@
 )]
 
 pub mod app;
+pub mod app_icon;
 pub mod db;
 pub mod splash;
 pub mod sql_parser_engine;

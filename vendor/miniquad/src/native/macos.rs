@@ -261,7 +261,9 @@ pub fn define_app_delegate() -> *const Class {
 
 pub fn define_cocoa_window_delegate() -> *const Class {
     extern "C" fn window_should_close(this: &Object, _: Sel, _: ObjcId) -> BOOL {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return YES;
+        };
 
         unsafe {
             let capture_manager = msg_send_![class![MTLCaptureManager], sharedCaptureManager];
@@ -290,7 +292,9 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     }
 
     extern "C" fn window_did_resize(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         if let Some((w, h)) = unsafe { payload.update_dimensions() } {
             if let Some(event_handler) = payload.context() {
                 event_handler.resize_event(w as _, h as _);
@@ -299,7 +303,9 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     }
 
     extern "C" fn window_did_move(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         if payload.gl_context.is_null() {
             // Startup: the gl_context has not yet been created.
             return;
@@ -310,7 +316,9 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     }
 
     extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         if let Some((w, h)) = unsafe { payload.update_dimensions() } {
             if let Some(event_handler) = payload.context() {
                 event_handler.resize_event(w as _, h as _);
@@ -318,16 +326,22 @@ pub fn define_cocoa_window_delegate() -> *const Class {
         }
     }
     extern "C" fn window_did_enter_fullscreen(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         payload.fullscreen = true;
     }
     extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         payload.fullscreen = false;
     }
     extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: ObjcId) {
         unsafe {
-            let payload = get_window_payload(this);
+            let Some(payload) = get_window_payload(this) else {
+                return;
+            };
             let responds: bool = msg_send![payload.window, respondsToSelector:sel!(occlusionState)];
             if responds {
                 let state: u64 = msg_send![payload.window, occlusionState];
@@ -408,7 +422,9 @@ unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
 // methods for both metal or OPENGL view
 unsafe fn view_base_decl(decl: &mut ClassDecl) {
     extern "C" fn mouse_moved(this: &Object, _sel: Sel, event: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
 
         unsafe {
             if payload.cursor_grabbed {
@@ -428,7 +444,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     }
 
     fn fire_mouse_event(this: &Object, event: ObjcId, down: bool, btn: MouseButton) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
 
         unsafe {
             let point: NSPoint = msg_send!(event, locationInWindow);
@@ -461,7 +479,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         fire_mouse_event(this, event, false, MouseButton::Middle);
     }
     extern "C" fn scroll_wheel(this: &Object, _sel: Sel, event: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         unsafe {
             let mut dx: f64 = msg_send![event, scrollingDeltaX];
             let mut dy: f64 = msg_send![event, scrollingDeltaY];
@@ -476,7 +496,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         }
     }
     extern "C" fn reset_cursor_rects(this: &Object, _sel: Sel) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
 
         unsafe {
             let cursor_id = {
@@ -499,7 +521,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     }
 
     extern "C" fn key_down(this: &Object, _sel: Sel, event: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         let mods = get_event_key_modifier(event);
         let repeat: bool = unsafe { msg_send!(event, isARepeat) };
         if let Some(key) = get_event_keycode(event) {
@@ -516,7 +540,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     }
 
     extern "C" fn key_up(this: &Object, _sel: Sel, event: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         let mods = get_event_key_modifier(event);
         if let Some(key) = get_event_keycode(event) {
             if let Some(event_handler) = payload.context() {
@@ -546,7 +572,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             }
         }
 
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         let mods = get_event_key_modifier(event);
         let flags: u64 = unsafe { msg_send![event, modifierFlags] };
         let new_modifiers = Modifiers::new(flags);
@@ -681,7 +709,9 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
 
 pub fn define_opengl_view_class() -> *const Class {
     extern "C" fn reshape(this: &Object, _sel: Sel) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         unsafe {
             if let Some((w, h)) = payload.update_dimensions() {
                 if let Some(event_handler) = payload.context() {
@@ -693,7 +723,9 @@ pub fn define_opengl_view_class() -> *const Class {
 
     extern "C" fn draw_rect(this: &Object, _sel: Sel, _: ObjcId) {
         // For opengl draw_rect called only during resize
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         unsafe {
             // Need this update_dimensions so it sets right dpi_scale at the beggining
             if let Some((w, h)) = payload.update_dimensions() {
@@ -747,7 +779,9 @@ pub fn define_metal_view_class() -> *const Class {
     decl.add_ivar::<*mut c_void>("display_ptr");
 
     extern "C" fn draw_rect(this: &Object, _sel: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let Some(payload) = get_window_payload(this) else {
+            return;
+        };
         unsafe {
             let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
             let current_mode: ObjcId = msg_send![current_runloop, currentMode];
@@ -770,10 +804,14 @@ pub fn define_metal_view_class() -> *const Class {
     decl.register()
 }
 
-fn get_window_payload(this: &Object) -> &mut MacosDisplay {
+fn get_window_payload(this: &Object) -> Option<&mut MacosDisplay> {
     unsafe {
         let ptr: *mut c_void = *this.get_ivar("display_ptr");
-        &mut *(ptr as *mut MacosDisplay)
+        if ptr.is_null() {
+            None
+        } else {
+            Some(&mut *(ptr as *mut MacosDisplay))
+        }
     }
 }
 
@@ -1212,9 +1250,11 @@ where
     }
 
     msg_send_![timer, invalidate];
+    let null_display_ptr = std::ptr::null_mut::<c_void>();
+    (*window_delegate).set_ivar("display_ptr", null_display_ptr);
+    (*view).set_ivar("display_ptr", null_display_ptr);
+    let () = msg_send![window, setDelegate: nil];
+    let () = msg_send![window, setIgnoresMouseEvents: YES];
     let () = msg_send![window, orderOut: nil];
-
-    // macOS may still deliver a late drawRect after the startup splash loop exits.
-    // Keep the display payload alive to avoid use-after-free through display_ptr.
-    let _ = Box::into_raw(display);
+    let () = msg_send![window, close];
 }

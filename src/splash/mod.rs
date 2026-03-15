@@ -36,6 +36,7 @@ pub fn run_splash() {
             window_resizable: false,
             borderless: true,
             high_dpi: true,
+            icon: Some(crate::app_icon::miniquad_icon()),
             ..Default::default()
         };
 
