@@ -88,6 +88,68 @@ vec3 background(vec2 uv_c) {
     col = mix(col, deep, smoothstep(0.5, 1.0, d));
     // Very faint warm corner
     col += vec3(0.015, 0.005, 0.0) * (1.0 - smoothstep(0.2, 0.8, length(uv_c - vec2(0.5, 0.3))));
+
+    // Milky Way band — diagonal luminous streak with noise structure
+    float mw_angle = 0.35;
+    float mw_ca = cos(mw_angle), mw_sa = sin(mw_angle);
+    vec2 mw_uv = vec2(mw_ca * uv_c.x + mw_sa * uv_c.y,
+                      -mw_sa * uv_c.x + mw_ca * uv_c.y);
+    float mw_dist = abs(mw_uv.y + 0.05);
+    float mw_band = 1.0 - smoothstep(0.0, 0.25, mw_dist);
+    mw_band *= mw_band;
+    // Add noise structure within the band
+    float mw_noise = fbm(vec2(mw_uv.x * 4.0 + 10.0, mw_uv.y * 8.0 + 20.0));
+    float mw_detail = fbm(vec2(mw_uv.x * 12.0 + 30.0, mw_uv.y * 6.0 + 40.0));
+    // Dark rift — central dust lane
+    float dark_rift = smoothstep(0.45, 0.55, mw_detail) * smoothstep(0.0, 0.1, mw_band);
+    col += vec3(0.025, 0.02, 0.04) * mw_band * mw_noise * 1.5;
+    col += vec3(0.01, 0.015, 0.03) * mw_band * 0.5;
+    col *= 1.0 - dark_rift * 0.3;
+
+    return col;
+}
+
+// ========================================================
+//  Distant galaxies — tiny fuzzy blobs for depth
+// ========================================================
+
+vec3 distant_galaxies(vec2 uv_in) {
+    vec3 col = vec3(0.0);
+    // Grid-based placement of faint distant galaxies
+    vec2 grid = uv_in * 18.0;
+    vec2 gid = floor(grid);
+    vec2 gf = fract(grid) - 0.5;
+
+    float h = hash21(gid + 700.0);
+    if (h < 0.06) {  // ~6% of cells get a galaxy
+        vec2 pos = hash22(gid + 800.0) - 0.5;
+        vec2 dp = gf - pos;
+
+        // Elliptical shape — random orientation and ellipticity
+        float ga = hash21(gid + 900.0) * 3.14159;
+        float ellip = 0.3 + hash21(gid + 1000.0) * 0.5;
+        float gca = cos(ga), gsa = sin(ga);
+        vec2 rotated = vec2(gca * dp.x + gsa * dp.y, (-gsa * dp.x + gca * dp.y) * (1.0 / ellip));
+        float gdist = length(rotated);
+
+        // Core + exponential halo
+        float galaxy = (1.0 - smoothstep(0.0, 0.06, gdist)) * 0.4;
+        galaxy += (1.0 - smoothstep(0.0, 0.02, gdist)) * 0.6;
+
+        // Subtle spiral hint via noise
+        float spiral = fbm(rotated * 15.0 + hash21(gid + 1100.0) * 50.0);
+        galaxy *= 0.6 + spiral * 0.4;
+
+        // Color varies: some yellowish, some bluish
+        float color_h = hash21(gid + 1200.0);
+        vec3 gal_col;
+        if (color_h < 0.4) {
+            gal_col = vec3(0.9, 0.85, 0.6);    // Elliptical — warm
+        } else {
+            gal_col = vec3(0.5, 0.6, 0.9);      // Spiral — blue
+        }
+        col += gal_col * galaxy * 0.04;
+    }
     return col;
 }
 
@@ -95,15 +157,38 @@ vec3 background(vec2 uv_c) {
 //  Cosmic dust — layered wispy clouds
 // ========================================================
 
-vec3 cosmic_dust(vec2 p, float time) {
+vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     vec3 col = vec3(0.0);
-    // Layer 1: large blue dust
+    extinction = 0.0;
+
+    // Layer 1: large blue emission nebulosity
     float n1 = fbm(p * 1.5 + vec2(time * 0.005, time * 0.003));
     float n2 = fbm(p * 2.5 + vec2(-time * 0.008, time * 0.004) + 50.0);
     float mask1 = smoothstep(0.35, 0.65, n1) * (1.0 - smoothstep(0.3, 0.9, length(p)));
     float mask2 = smoothstep(0.4, 0.7, n2) * (1.0 - smoothstep(0.2, 1.0, length(p + vec2(0.15, -0.1))));
     col += vec3(0.04, 0.08, 0.2) * mask1 * 1.2;
     col += vec3(0.12, 0.04, 0.18) * mask2 * 0.8;
+
+    // Layer 2: fine filaments — reflection nebula
+    float n3 = fbm(p * 6.0 + vec2(time * 0.003, -time * 0.002) + 150.0);
+    float filament = smoothstep(0.42, 0.58, n3) * (1.0 - smoothstep(0.25, 0.7, length(p - vec2(-0.1, 0.05))));
+    col += vec3(0.06, 0.1, 0.25) * filament * 0.6;
+
+    // Dark nebula — opaque dust that absorbs background light
+    float dark_n = fbm(p * 3.0 + vec2(-time * 0.004, 0.0) + 250.0);
+    float dark_mask = smoothstep(0.5, 0.65, dark_n) * (1.0 - smoothstep(0.4, 0.85, length(p + vec2(0.2, 0.15))));
+    extinction = dark_mask * 0.5;
+
+    // Forward scattering — dust lit from behind by stars/nebula
+    vec2 light_delta = vec2(0.42, 0.03) - p;
+    float light_dist = length(light_delta);
+    vec2 light_dir_2d = (light_dist > 0.001) ? light_delta / light_dist : vec2(1.0, 0.0);
+    float p_len = length(p);
+    vec2 p_safe = (p_len > 0.001) ? p / p_len : vec2(0.0, 1.0);
+    float scatter_angle = dot(p_safe, light_dir_2d) * 0.5 + 0.5;
+    float forward_scatter = pow(scatter_angle, 4.0) * dark_mask;
+    col += vec3(0.08, 0.12, 0.3) * forward_scatter * 0.4;
+
     return col;
 }
 
@@ -117,8 +202,12 @@ vec3 nebula(vec2 p, float time) {
     float ca = cos(angle), sa = sin(angle);
     vec2 rp = vec2(ca * p.x - sa * p.y, sa * p.x + ca * p.y);
 
-    float n1 = fbm(rp * 3.0 + vec2(time * 0.015, 0.0));
-    float n2 = fbm(rp * 4.0 + vec2(0.0, time * 0.012) + 50.0);
+    // Domain warping for organic filament structure
+    float warp_n = fbm(p * 2.0 + vec2(time * 0.008, -time * 0.006));
+    vec2 warped = rp + vec2(warp_n - 0.5, fbm(p * 2.5 + 40.0) - 0.5) * 0.15;
+
+    float n1 = fbm(warped * 3.0 + vec2(time * 0.015, 0.0));
+    float n2 = fbm(warped * 4.0 + vec2(0.0, time * 0.012) + 50.0);
     float n3 = fbm(rp * 2.0 - vec2(time * 0.01, time * 0.008) + 100.0);
     float n4 = fbm(p * 5.0 + vec2(time * 0.02, -time * 0.01) + 200.0);
 
@@ -132,6 +221,17 @@ vec3 nebula(vec2 p, float time) {
     col += vec3(0.6, 0.2, 0.4) * n4 * 0.3;         // Pink highlights
     col += vec3(0.5, 0.7, 1.0) * pow(falloff, 4.0) * 0.2;  // Hot core
     col *= falloff;
+
+    // Emission edges — bright rims where gas density changes sharply
+    float edge_n = fbm(warped * 6.0 + 300.0);
+    float edge = abs(edge_n - 0.5);
+    float emission = (1.0 - smoothstep(0.0, 0.06, edge)) * falloff;
+    col += vec3(0.25, 0.5, 1.0) * emission * 0.2;
+
+    // Dark dust absorption lanes
+    float dust = fbm(rp * 3.5 + vec2(time * 0.005, 0.0) + 500.0);
+    float absorption = smoothstep(0.45, 0.55, dust) * falloff * 0.6;
+    col *= 1.0 - absorption;
 
     return col;
 }
@@ -181,6 +281,14 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
                 star_col = vec3(1.0, 0.8, 0.6);      // Orange giant
             }
 
+            // Soft halo glow — Airy disk-like falloff for bright stars
+            if (brightness_h > 0.4) {
+                float halo_radius = star_size * 3.0;
+                float halo = (1.0 - smoothstep(0.0, halo_radius, dist));
+                halo = halo * halo;  // Quadratic falloff
+                col += star_col * halo * (brightness_h - 0.4) * twinkle * 0.3;
+            }
+
             // Diffraction spikes on bright stars
             if (brightness_h > 0.7 && dist < 0.15) {
                 float spike_h = (1.0 - smoothstep(0.0, 0.003, abs(star_pos.x))) * (1.0 - smoothstep(0.0, 0.1, abs(star_pos.y)));
@@ -188,10 +296,14 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
                 // Diagonal spikes
                 float d45a = abs(star_pos.x - star_pos.y) * 0.707;
                 float d45b = abs(star_pos.x + star_pos.y) * 0.707;
-                float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b + d45a));
-                float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a + d45b));
+                float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b));
+                float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a));
                 float spikes = (spike_h + spike_v + spike_d1 * 0.5 + spike_d2 * 0.5) * twinkle * 0.4;
                 col += star_col * spikes;
+
+                // Chromatic fringe on brightest stars — subtle color bleed
+                float fringe = (1.0 - smoothstep(0.0, star_size * 2.5, dist));
+                col += vec3(0.1, 0.0, 0.2) * fringe * twinkle * 0.1;
             }
 
             col += star_col * star * mix(0.7, 1.0, brightness_h);
@@ -212,13 +324,17 @@ vec3 planet(vec2 p) {
 
     vec3 col = vec3(0.0);
 
-    // Atmosphere outer glow
-    float atmo_outer = 1.0 - smoothstep(radius + 0.01, radius + 0.08, dist);
-    col += vec3(0.1, 0.3, 0.8) * atmo_outer * 0.3;
+    // Atmosphere outer glow — Rayleigh-like blue scatter
+    float atmo_outer = 1.0 - smoothstep(radius + 0.01, radius + 0.10, dist);
+    col += vec3(0.08, 0.22, 0.65) * atmo_outer * 0.25;
+    // Secondary warm scatter on the lit side
+    vec2 light_side = normalize(vec2(0.5, 0.4));
+    float lit_factor = (dist > 0.001) ? dot(d / dist, light_side) * 0.5 + 0.5 : 0.5;
+    col += vec3(0.15, 0.25, 0.6) * atmo_outer * lit_factor * 0.15;
 
     // Atmosphere rim
-    float atmo = 1.0 - smoothstep(radius, radius + 0.025, dist);
-    col += vec3(0.2, 0.5, 1.0) * atmo * 0.5;
+    float atmo = 1.0 - smoothstep(radius, radius + 0.03, dist);
+    col += vec3(0.2, 0.5, 1.0) * atmo * 0.45;
 
     if (dist < radius) {
         // Surface
@@ -231,17 +347,47 @@ vec3 planet(vec2 p) {
         float diffuse = max(0.0, dot(normal, light_dir));
         float fresnel = pow(1.0 - z, 3.0);
 
-        // Surface detail
+        // Terminator — soft day/night transition
+        float terminator = smoothstep(-0.05, 0.2, diffuse);
+
+        // Surface detail — multi-octave for realism
         float surf_n = fbm(uv_sphere * 4.0 + 30.0);
+        float surf_detail = fbm(uv_sphere * 8.0 + 60.0);
         vec3 base_col = mix(vec3(0.02, 0.05, 0.15), vec3(0.05, 0.12, 0.3), surf_n);
 
-        // Bands
-        float bands = sin(uv_sphere.y * 12.0 + surf_n * 3.0) * 0.5 + 0.5;
+        // Bands with turbulence
+        float bands = sin(uv_sphere.y * 12.0 + surf_n * 3.0 + surf_detail * 1.5) * 0.5 + 0.5;
         base_col = mix(base_col, vec3(0.08, 0.15, 0.35), bands * 0.3);
 
-        col = base_col * (diffuse * 0.8 + 0.15);
-        col += vec3(0.2, 0.5, 1.0) * fresnel * 0.6;   // Rim light
-        col += vec3(0.4, 0.6, 1.0) * pow(fresnel, 6.0) * 0.8;  // Strong rim
+        // Storm spots
+        float storm = 1.0 - smoothstep(0.0, 0.08, length(uv_sphere - vec2(-0.3, 0.2)));
+        base_col = mix(base_col, vec3(0.12, 0.18, 0.4), storm * 0.5);
+
+        // Apply lighting with terminator
+        col = base_col * (diffuse * 0.8 + 0.1) * terminator;
+        // Night-side faint ambient
+        col += base_col * 0.02 * (1.0 - terminator);
+
+        // Cloud layer — semi-transparent wisps that rotate slowly
+        float cloud_angle = u_time * 0.008;
+        vec2 cloud_uv = vec2(
+            uv_sphere.x * cos(cloud_angle) - uv_sphere.y * sin(cloud_angle),
+            uv_sphere.x * sin(cloud_angle) + uv_sphere.y * cos(cloud_angle)
+        );
+        float clouds = fbm(cloud_uv * 5.0 + 15.0);
+        clouds = smoothstep(0.4, 0.7, clouds);
+        vec3 cloud_col = vec3(0.15, 0.22, 0.4) * (diffuse * 0.9 + 0.15) * terminator;
+        col = mix(col, cloud_col, clouds * 0.5);
+
+        // Specular highlight — sharp sun reflection on cloud/surface
+        vec3 view_dir = vec3(0.0, 0.0, 1.0);
+        vec3 half_dir = normalize(light_dir + view_dir);
+        float spec = pow(max(0.0, dot(normal, half_dir)), 60.0);
+        col += vec3(0.7, 0.85, 1.0) * spec * 0.5 * terminator;
+
+        // Rim / atmosphere scatter on the lit limb
+        col += vec3(0.2, 0.5, 1.0) * fresnel * 0.5 * terminator;
+        col += vec3(0.4, 0.6, 1.0) * pow(fresnel, 6.0) * 0.7;
     }
 
     return col;
@@ -258,22 +404,43 @@ vec3 lens_flare(vec2 p) {
 
     vec3 col = vec3(0.0);
 
-    // Central glow
+    // Central glow — warm core fading to blue
     float glow = 0.015 / (dist * dist + 0.015);
-    col += vec3(0.4, 0.6, 1.0) * glow * 0.15;
+    col += mix(vec3(0.6, 0.7, 1.0), vec3(0.3, 0.5, 1.0), smoothstep(0.0, 0.15, dist)) * glow * 0.15;
 
-    // Anamorphic horizontal streak
-    float streak = 0.001 / (d.y * d.y + 0.001) * (1.0 - smoothstep(0.0, 0.5, abs(d.x)));
-    col += vec3(0.3, 0.5, 1.0) * streak * 0.03;
+    // Anamorphic horizontal streak with chromatic separation
+    float streak_r = 0.001 / (d.y * d.y + 0.001) * (1.0 - smoothstep(0.0, 0.55, abs(d.x + 0.005)));
+    float streak_g = 0.001 / (d.y * d.y + 0.001) * (1.0 - smoothstep(0.0, 0.50, abs(d.x)));
+    float streak_b = 0.001 / (d.y * d.y + 0.001) * (1.0 - smoothstep(0.0, 0.45, abs(d.x - 0.005)));
+    col += vec3(streak_r * 0.4, streak_g * 0.5, streak_b * 1.0) * 0.03;
 
-    // Ghost circles
-    for (int i = 1; i <= 3; i++) {
+    // Ghost circles with chromatic aberration — each color channel offset
+    for (int i = 1; i <= 4; i++) {
         float fi = float(i);
-        vec2 ghost_p = p + d * fi * 0.4;
-        float ghost_dist = length(ghost_p - light_pos);
-        float ring = abs(ghost_dist - 0.05 * fi);
-        float ghost = (1.0 - smoothstep(0.0, 0.008, ring)) * 0.1 / fi;
-        col += vec3(0.2, 0.4, 0.9) * ghost;
+        float scale = fi * 0.35 + 0.1;
+        vec2 ghost_center = light_pos - d * scale;
+        float ghost_radius = 0.04 * fi;
+
+        // Separate R/G/B radii for chromatic fringing
+        float ring_r = abs(length(p - ghost_center) - ghost_radius * 1.03);
+        float ring_g = abs(length(p - ghost_center) - ghost_radius);
+        float ring_b = abs(length(p - ghost_center) - ghost_radius * 0.97);
+        float gr = (1.0 - smoothstep(0.0, 0.006, ring_r)) * 0.08 / fi;
+        float gg = (1.0 - smoothstep(0.0, 0.006, ring_g)) * 0.08 / fi;
+        float gb = (1.0 - smoothstep(0.0, 0.006, ring_b)) * 0.08 / fi;
+
+        // Filled disc behind the ring (faint)
+        float disc = (1.0 - smoothstep(0.0, ghost_radius, length(p - ghost_center)));
+        col += vec3(0.1, 0.15, 0.3) * disc * 0.02 / fi;
+        col += vec3(gr, gg, gb);
+    }
+
+    // Iris starburst — hexagonal blade pattern
+    if (dist > 0.001) {
+        float flare_angle = atan(d.y, d.x);
+        float blades = abs(sin(flare_angle * 3.0));  // 6-blade pattern
+        float iris = blades * (1.0 - smoothstep(0.0, 0.12, dist)) * 0.08;
+        col += vec3(0.2, 0.35, 0.8) * iris;
     }
 
     return col;
@@ -290,14 +457,33 @@ vec3 aurora(vec2 p, float time) {
         float y_base = 0.15 - fi * 0.12;
         float wave = sin(p.x * (3.0 + fi) + time * (0.3 + fi * 0.1) + fi * 2.0) * 0.04;
         wave += sin(p.x * (7.0 + fi * 2.0) - time * 0.2 + fi) * 0.015;
+
+        // Curtain width varies with noise — thicker and thinner patches
+        float curtain_width = 0.025 + fbm(vec2(p.x * 3.0 + fi * 10.0, time * 0.1)) * 0.02;
         float y_dist = abs(p.y - y_base - wave);
-        float ribbon = 1.0 - smoothstep(0.0, 0.025, y_dist);
+        float ribbon = 1.0 - smoothstep(0.0, curtain_width, y_dist);
         ribbon *= 1.0 - smoothstep(0.3, 0.8, abs(p.x));  // Fade at edges
 
+        // Vertical ray structure — shimmer columns
+        float ray_noise = fbm(vec2(p.x * 25.0 + fi * 7.0, time * 0.5 + fi));
+        float rays = smoothstep(0.3, 0.6, ray_noise);
+        // Fast shimmer within rays
+        float shimmer = sin(p.x * 80.0 + time * (3.0 + fi) + fi * 5.0) * 0.3 + 0.7;
+        ribbon *= mix(0.4, 1.0, rays * shimmer);
+
+        // Height-dependent fade — brighter at top, fading downward
+        float height_fade = smoothstep(y_base - curtain_width, y_base + curtain_width * 0.5, p.y);
+        ribbon *= height_fade;
+
         vec3 ribbon_col;
-        if (i == 0) ribbon_col = vec3(0.1, 0.4, 0.9);   // Blue
-        else if (i == 1) ribbon_col = vec3(0.05, 0.6, 0.7);  // Cyan
-        else ribbon_col = vec3(0.3, 0.15, 0.6);               // Purple
+        if (i == 0) ribbon_col = vec3(0.1, 0.4, 0.9);        // Blue
+        else if (i == 1) ribbon_col = vec3(0.05, 0.6, 0.7);   // Cyan
+        else ribbon_col = vec3(0.3, 0.15, 0.6);                // Purple
+
+        // Color shift along height — green tint at lower altitude
+        vec3 low_col = vec3(0.1, 0.5, 0.2);
+        float altitude_mix = smoothstep(y_base - 0.03, y_base + 0.02, p.y);
+        ribbon_col = mix(low_col, ribbon_col, altitude_mix);
 
         col += ribbon_col * ribbon * (0.15 - fi * 0.03);
     }
@@ -313,7 +499,7 @@ vec3 shooting_star(vec2 uv_in, float seed, float time) {
     float t = mod(time + seed * 3.0, cycle) / cycle;
     float active_window = 0.15;
 
-    if (t > active_window) return vec3(0.0);
+    if (t > active_window || t < 0.001) return vec3(0.0);
 
     float anim_t = t / active_window;
 
@@ -328,18 +514,43 @@ vec3 shooting_star(vec2 uv_in, float seed, float time) {
     vec2 tail = head - dir * tail_len * min(anim_t * 4.0, 1.0);
 
     float d = sd_segment(uv_in, tail, head);
-    float core = 1.0 - smoothstep(0.0, 0.003, d);
-    float glow = (1.0 - smoothstep(0.0, 0.015, d)) * 0.5;
+    float core = 1.0 - smoothstep(0.0, 0.002, d);
+    float glow = (1.0 - smoothstep(0.0, 0.012, d)) * 0.5;
+    // Wider outer glow for atmospheric ionization
+    float outer_glow = (1.0 - smoothstep(0.0, 0.035, d)) * 0.15;
 
     float fade = smoothstep(0.0, 0.15, anim_t) * (1.0 - smoothstep(0.7, 1.0, anim_t));
 
-    // Gradient from white head to blue tail
+    // Ionization color gradient: white head → green → blue tail
     float head_dist = length(uv_in - head);
     float tail_dist = length(uv_in - tail);
     float gradient = clamp(head_dist / (head_dist + tail_dist + 0.001), 0.0, 1.0);
-    vec3 col = mix(vec3(1.0, 1.0, 1.0), vec3(0.3, 0.5, 1.0), gradient);
+    vec3 head_col = vec3(1.0, 1.0, 0.95);           // Hot white
+    vec3 mid_col  = vec3(0.4, 0.9, 0.5);             // Ionized green (Mg/Fe)
+    vec3 tail_col = vec3(0.2, 0.4, 0.9);             // Cooled blue
+    vec3 col = mix(head_col, mid_col, smoothstep(0.0, 0.4, gradient));
+    col = mix(col, tail_col, smoothstep(0.4, 1.0, gradient));
 
-    return col * (core + glow) * fade;
+    vec3 result = col * (core + glow) * fade;
+    result += vec3(0.15, 0.3, 0.6) * outer_glow * fade;
+
+    // Fragment sparks — small particles shed behind
+    for (int i = 0; i < 3; i++) {
+        float fi = float(i);
+        float spark_t = anim_t - fi * 0.06 - 0.05;
+        if (spark_t < 0.0 || spark_t > 1.0) continue;
+        vec2 spark_pos = start + dir * speed * spark_t;
+        // Offset perpendicular to travel direction
+        vec2 perp = vec2(-dir.y, dir.x);
+        float offset_h = hash11(seed * 31.7 + fi * 17.0) - 0.5;
+        spark_pos += perp * offset_h * 0.015;
+        float spark_d = length(uv_in - spark_pos);
+        float spark = 1.0 - smoothstep(0.0, 0.003, spark_d);
+        float spark_fade = (1.0 - smoothstep(0.0, 0.3, anim_t - spark_t));
+        result += vec3(1.0, 0.8, 0.5) * spark * spark_fade * fade * 0.4;
+    }
+
+    return result;
 }
 
 // ========================================================
@@ -541,7 +752,10 @@ vec3 orbital_ring(vec2 p, float time) {
     float ring_dist = abs(length(rp) - 0.25);
     float ring = (1.0 - smoothstep(0.0, 0.003, ring_dist)) * 0.12;
     // Dotted/moving pattern
-    float dots = sin(atan(rp.y, rp.x) * 20.0 + time * 2.0) * 0.5 + 0.5;
+    float rp_len = length(rp);
+    float dots = (rp_len > 0.001)
+        ? sin(atan(rp.y, rp.x) * 20.0 + time * 2.0) * 0.5 + 0.5
+        : 0.5;
     ring *= dots;
     return vec3(0.2, 0.5, 1.0) * ring;
 }
@@ -559,8 +773,12 @@ void main() {
     // Background
     col += background(centered);
 
-    // Cosmic dust
-    col += cosmic_dust(centered, u_time);
+    // Distant galaxies — behind everything else
+    col += distant_galaxies(uv);
+
+    // Cosmic dust (returns extinction for dimming stars behind dark nebulae)
+    float dust_extinction;
+    col += cosmic_dust(centered, u_time, dust_extinction);
 
     // Nebula
     col += nebula(centered * 1.1, u_time);
@@ -568,11 +786,12 @@ void main() {
     // Aurora ribbons
     col += aurora(centered, u_time);
 
-    // Stars (4 layers with parallax drift)
-    col += star_layer(uv, 60.0, 0.0, 1.0);
-    col += star_layer(uv, 120.0, 2.0, 1.5);
-    col += star_layer(uv, 240.0, 4.0, 2.0);
-    col += star_layer(uv, 400.0, 6.0, 3.0);
+    // Stars (4 layers with parallax drift) — dimmed by foreground dust
+    float star_dim = 1.0 - dust_extinction;
+    col += star_layer(uv, 60.0, 0.0, 1.0) * star_dim;
+    col += star_layer(uv, 120.0, 2.0, 1.5) * star_dim;
+    col += star_layer(uv, 240.0, 4.0, 2.0) * mix(star_dim, 1.0, 0.3);
+    col += star_layer(uv, 400.0, 6.0, 3.0) * mix(star_dim, 1.0, 0.5);
 
     // Planet
     col += planet(centered);
@@ -635,13 +854,23 @@ void main() {
     float progress = clamp(u_time / 10.0, 0.0, 1.0);
     col += progress_bar(uv, progress);
 
-    // --- Vignette ---
-    float vig = 1.0 - smoothstep(0.4, 1.1, length(centered));
+    // --- Vignette with chromatic aberration ---
+    float vig_dist = length(centered);
+    float vig = 1.0 - smoothstep(0.4, 1.1, vig_dist);
     col *= mix(0.6, 1.0, vig);
+    // Subtle chromatic shift at edges — red shifts outward, blue inward
+    float ca_amount = smoothstep(0.3, 0.9, vig_dist) * 0.008;
+    float ca_r = length((uv - 0.5) * (1.0 + ca_amount));
+    float ca_b = length((uv - 0.5) * (1.0 - ca_amount));
+    col.r *= 1.0 + smoothstep(0.3, 0.8, ca_r) * 0.04;
+    col.b *= 1.0 + smoothstep(0.3, 0.8, ca_b) * 0.03;
 
     // --- Final ---
+    // ACES-like tone mapping for natural highlight rolloff
+    col = col * (2.51 * col + 0.03) / (col * (2.43 * col + 0.59) + 0.14);
+
     // Subtle film grain for cinematic feel
-    float grain = (hash21(uv * u_resolution + u_time * 100.0) - 0.5) * 0.015;
+    float grain = (hash21(uv * u_resolution + u_time * 100.0) - 0.5) * 0.012;
     col += grain;
 
     col = clamp(col, 0.0, 1.0);
