@@ -31,6 +31,10 @@ mod wgl;
 
 use libopengl32::LibOpengl32;
 
+const MIN_BORDERLESS_CORNER_RADIUS: i32 = 18;
+const MAX_BORDERLESS_CORNER_RADIUS: i32 = 36;
+const BORDERLESS_CORNER_RADIUS_DIVISOR: i32 = 14;
+
 pub(crate) struct WindowsDisplay {
     fullscreen: bool,
     borderless: bool,
@@ -134,6 +138,9 @@ impl WindowsDisplay {
                 SWP_NOMOVE,
             )
         };
+        unsafe {
+            apply_window_shape(self.wnd, self.fullscreen, self.borderless);
+        }
     }
     /// Set the window position in screen coordinates.
     fn set_window_position(&mut self, new_x: u32, new_y: u32) {
@@ -196,6 +203,7 @@ impl WindowsDisplay {
                 );
             }
 
+            apply_window_shape(self.wnd, self.fullscreen, self.borderless);
             ShowWindow(self.wnd, SW_SHOW);
         };
     }
@@ -242,6 +250,40 @@ unsafe fn update_clip_rect(hwnd: HWND) {
         lower_right.y,
     );
     ClipCursor(&mut rect as *mut _ as _);
+}
+
+fn rounded_corner_radius(width: i32, height: i32) -> i32 {
+    (width.min(height) / BORDERLESS_CORNER_RADIUS_DIVISOR)
+        .max(MIN_BORDERLESS_CORNER_RADIUS)
+        .min(MAX_BORDERLESS_CORNER_RADIUS)
+}
+
+unsafe fn apply_window_shape(hwnd: HWND, fullscreen: bool, borderless: bool) {
+    if fullscreen || !borderless {
+        SetWindowRgn(hwnd, std::ptr::null_mut(), TRUE);
+        return;
+    }
+
+    let mut rect: RECT = std::mem::zeroed();
+    if GetClientRect(hwnd, &mut rect as *mut _ as _) == 0 {
+        return;
+    }
+
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let radius = rounded_corner_radius(width, height);
+    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+    if region.is_null() {
+        return;
+    }
+
+    if SetWindowRgn(hwnd, region, TRUE) == 0 {
+        DeleteObject(region as *mut _);
+    }
 }
 
 unsafe fn key_mods() -> KeyMods {
@@ -332,6 +374,7 @@ unsafe extern "system" fn win32_wndproc(
             if payload.cursor_grabbed {
                 update_clip_rect(hwnd);
             }
+            apply_window_shape(hwnd, payload.fullscreen, payload.borderless);
 
             let iconified = wparam == SIZE_MINIMIZED;
             if iconified != payload.iconified {
@@ -692,6 +735,16 @@ unsafe fn create_window(
     AdjustWindowRectEx(&rect as *const _ as _, win_style, false as _, win_ex_style);
     let win_width = rect.right - rect.left;
     let win_height = rect.bottom - rect.top;
+    let (window_x, window_y) = if borderless && !fullscreen {
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+        (
+            (screen_width - win_width).max(0) / 2,
+            (screen_height - win_height).max(0) / 2,
+        )
+    } else {
+        (CW_USEDEFAULT, CW_USEDEFAULT)
+    };
     let class_name = "MINIQUADAPP\0".encode_utf16().collect::<Vec<u16>>();
     let mut window_name = window_title.encode_utf16().collect::<Vec<u16>>();
     window_name.push(0);
@@ -700,8 +753,8 @@ unsafe fn create_window(
         class_name.as_ptr(),         // lpClassName
         window_name.as_ptr(),        // lpWindowName
         win_style,                   // dwStyle
-        CW_USEDEFAULT,               // X
-        CW_USEDEFAULT,               // Y
+        window_x,                    // X
+        window_y,                    // Y
         win_width,                   // nWidth
         win_height,                  // nHeight
         NULL as _,                   // hWndParent
@@ -725,6 +778,7 @@ unsafe fn create_window(
         "Win32: failed to register for raw mouse input!"
     );
 
+    apply_window_shape(hwnd, fullscreen, borderless);
     ShowWindow(hwnd, SW_SHOW);
     let dc = GetDC(hwnd);
     assert!(!dc.is_null());
