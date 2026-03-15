@@ -87,7 +87,7 @@ vec3 background(vec2 uv_c) {
     vec3 col = mix(bright, mid, smoothstep(0.0, 0.5, d));
     col = mix(col, deep, smoothstep(0.5, 1.0, d));
     // Very faint warm corner
-    col += vec3(0.015, 0.005, 0.0) * smoothstep(0.8, 0.2, length(uv_c - vec2(0.5, 0.3)));
+    col += vec3(0.015, 0.005, 0.0) * (1.0 - smoothstep(0.2, 0.8, length(uv_c - vec2(0.5, 0.3))));
     return col;
 }
 
@@ -100,8 +100,8 @@ vec3 cosmic_dust(vec2 p, float time) {
     // Layer 1: large blue dust
     float n1 = fbm(p * 1.5 + vec2(time * 0.005, time * 0.003));
     float n2 = fbm(p * 2.5 + vec2(-time * 0.008, time * 0.004) + 50.0);
-    float mask1 = smoothstep(0.35, 0.65, n1) * smoothstep(0.9, 0.3, length(p));
-    float mask2 = smoothstep(0.4, 0.7, n2) * smoothstep(1.0, 0.2, length(p + vec2(0.15, -0.1)));
+    float mask1 = smoothstep(0.35, 0.65, n1) * (1.0 - smoothstep(0.3, 0.9, length(p)));
+    float mask2 = smoothstep(0.4, 0.7, n2) * (1.0 - smoothstep(0.2, 1.0, length(p + vec2(0.15, -0.1))));
     col += vec3(0.04, 0.08, 0.2) * mask1 * 1.2;
     col += vec3(0.12, 0.04, 0.18) * mask2 * 0.8;
     return col;
@@ -123,7 +123,7 @@ vec3 nebula(vec2 p, float time) {
     float n4 = fbm(p * 5.0 + vec2(time * 0.02, -time * 0.01) + 200.0);
 
     float dist = length(p);
-    float falloff = smoothstep(0.65, 0.08, dist);
+    float falloff = 1.0 - smoothstep(0.08, 0.65, dist);
 
     vec3 col = vec3(0.0);
     col += vec3(0.06, 0.18, 0.55) * n1 * 1.8;     // Deep blue core
@@ -166,7 +166,7 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
             // Size
             float brightness_h = hash21(cell_id + 300.0);
             float star_size = mix(0.008, 0.04, brightness_h * brightness_h);
-            float star = smoothstep(star_size, 0.0, dist) * twinkle;
+            float star = (1.0 - smoothstep(0.0, star_size, dist)) * twinkle;
 
             // Color temperature
             float temp = hash21(cell_id + 500.0);
@@ -183,13 +183,13 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
 
             // Diffraction spikes on bright stars
             if (brightness_h > 0.7 && dist < 0.15) {
-                float spike_h = smoothstep(0.003, 0.0, abs(star_pos.x)) * smoothstep(0.1, 0.0, abs(star_pos.y));
-                float spike_v = smoothstep(0.003, 0.0, abs(star_pos.y)) * smoothstep(0.1, 0.0, abs(star_pos.x));
+                float spike_h = (1.0 - smoothstep(0.0, 0.003, abs(star_pos.x))) * (1.0 - smoothstep(0.0, 0.1, abs(star_pos.y)));
+                float spike_v = (1.0 - smoothstep(0.0, 0.003, abs(star_pos.y))) * (1.0 - smoothstep(0.0, 0.1, abs(star_pos.x)));
                 // Diagonal spikes
                 float d45a = abs(star_pos.x - star_pos.y) * 0.707;
                 float d45b = abs(star_pos.x + star_pos.y) * 0.707;
-                float spike_d1 = smoothstep(0.002, 0.0, d45a) * smoothstep(0.07, 0.0, d45b + d45a);
-                float spike_d2 = smoothstep(0.002, 0.0, d45b) * smoothstep(0.07, 0.0, d45a + d45b);
+                float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b + d45a));
+                float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a + d45b));
                 float spikes = (spike_h + spike_v + spike_d1 * 0.5 + spike_d2 * 0.5) * twinkle * 0.4;
                 col += star_col * spikes;
             }
@@ -213,11 +213,11 @@ vec3 planet(vec2 p) {
     vec3 col = vec3(0.0);
 
     // Atmosphere outer glow
-    float atmo_outer = smoothstep(radius + 0.08, radius + 0.01, dist);
+    float atmo_outer = 1.0 - smoothstep(radius + 0.01, radius + 0.08, dist);
     col += vec3(0.1, 0.3, 0.8) * atmo_outer * 0.3;
 
     // Atmosphere rim
-    float atmo = smoothstep(radius + 0.025, radius, dist);
+    float atmo = 1.0 - smoothstep(radius, radius + 0.025, dist);
     col += vec3(0.2, 0.5, 1.0) * atmo * 0.5;
 
     if (dist < radius) {
@@ -263,7 +263,7 @@ vec3 lens_flare(vec2 p) {
     col += vec3(0.4, 0.6, 1.0) * glow * 0.15;
 
     // Anamorphic horizontal streak
-    float streak = 0.001 / (d.y * d.y + 0.001) * smoothstep(0.5, 0.0, abs(d.x));
+    float streak = 0.001 / (d.y * d.y + 0.001) * (1.0 - smoothstep(0.0, 0.5, abs(d.x)));
     col += vec3(0.3, 0.5, 1.0) * streak * 0.03;
 
     // Ghost circles
@@ -272,7 +272,7 @@ vec3 lens_flare(vec2 p) {
         vec2 ghost_p = p + d * fi * 0.4;
         float ghost_dist = length(ghost_p - light_pos);
         float ring = abs(ghost_dist - 0.05 * fi);
-        float ghost = smoothstep(0.008, 0.0, ring) * 0.1 / fi;
+        float ghost = (1.0 - smoothstep(0.0, 0.008, ring)) * 0.1 / fi;
         col += vec3(0.2, 0.4, 0.9) * ghost;
     }
 
@@ -291,8 +291,8 @@ vec3 aurora(vec2 p, float time) {
         float wave = sin(p.x * (3.0 + fi) + time * (0.3 + fi * 0.1) + fi * 2.0) * 0.04;
         wave += sin(p.x * (7.0 + fi * 2.0) - time * 0.2 + fi) * 0.015;
         float y_dist = abs(p.y - y_base - wave);
-        float ribbon = smoothstep(0.025, 0.0, y_dist);
-        ribbon *= smoothstep(0.8, 0.3, abs(p.x));  // Fade at edges
+        float ribbon = 1.0 - smoothstep(0.0, 0.025, y_dist);
+        ribbon *= 1.0 - smoothstep(0.3, 0.8, abs(p.x));  // Fade at edges
 
         vec3 ribbon_col;
         if (i == 0) ribbon_col = vec3(0.1, 0.4, 0.9);   // Blue
@@ -328,10 +328,10 @@ vec3 shooting_star(vec2 uv_in, float seed, float time) {
     vec2 tail = head - dir * tail_len * min(anim_t * 4.0, 1.0);
 
     float d = sd_segment(uv_in, tail, head);
-    float core = smoothstep(0.003, 0.0, d);
-    float glow = smoothstep(0.015, 0.0, d) * 0.5;
+    float core = 1.0 - smoothstep(0.0, 0.003, d);
+    float glow = (1.0 - smoothstep(0.0, 0.015, d)) * 0.5;
 
-    float fade = smoothstep(0.0, 0.15, anim_t) * smoothstep(1.0, 0.7, anim_t);
+    float fade = smoothstep(0.0, 0.15, anim_t) * (1.0 - smoothstep(0.7, 1.0, anim_t));
 
     // Gradient from white head to blue tail
     float head_dist = length(uv_in - head);
@@ -500,7 +500,7 @@ vec3 progress_bar(vec2 uv_in, float progress) {
 
     float in_bar = step(margin, uv_in.x) * step(uv_in.x, 1.0 - margin);
     float in_y = smoothstep(bar_y - bar_h * 3.0, bar_y - bar_h, uv_in.y)
-               * smoothstep(bar_y + bar_h * 3.0, bar_y + bar_h, uv_in.y);
+               * (1.0 - smoothstep(bar_y + bar_h, bar_y + bar_h * 3.0, uv_in.y));
 
     // Track
     vec3 col = vec3(0.15, 0.2, 0.35) * in_bar * in_y * 0.3;
@@ -516,11 +516,11 @@ vec3 progress_bar(vec2 uv_in, float progress) {
 
     // Glow at leading edge
     float edge_dist = abs(uv_in.x - fill_x);
-    float edge_glow = smoothstep(0.03, 0.0, edge_dist) * smoothstep(0.02, 0.0, abs(uv_in.y - bar_y));
+    float edge_glow = (1.0 - smoothstep(0.0, 0.03, edge_dist)) * (1.0 - smoothstep(0.0, 0.02, abs(uv_in.y - bar_y)));
     col += vec3(0.4, 0.7, 1.0) * edge_glow * 0.6 * step(margin, fill_x);
 
     // Particle sparkle at tip
-    float sparkle = smoothstep(0.008, 0.0, length(vec2(uv_in.x - fill_x, uv_in.y - bar_y)));
+    float sparkle = 1.0 - smoothstep(0.0, 0.008, length(vec2(uv_in.x - fill_x, uv_in.y - bar_y)));
     sparkle *= (sin(u_time * 8.0) * 0.3 + 0.7);
     col += vec3(0.8, 0.9, 1.0) * sparkle * step(margin, fill_x);
 
@@ -539,7 +539,7 @@ vec3 orbital_ring(vec2 p, float time) {
         (-p.x * sin(angle * 0.3) + p.y * cos(angle * 0.3)) * 3.0
     );
     float ring_dist = abs(length(rp) - 0.25);
-    float ring = smoothstep(0.003, 0.0, ring_dist) * 0.12;
+    float ring = (1.0 - smoothstep(0.0, 0.003, ring_dist)) * 0.12;
     // Dotted/moving pattern
     float dots = sin(atan(rp.y, rp.x) * 20.0 + time * 2.0) * 0.5 + 0.5;
     ring *= dots;
@@ -607,15 +607,15 @@ void main() {
     float pulse = sin(u_time * 1.5 - char_x_pos * 0.3) * 0.15 + 0.85;
 
     // Text rendering
-    float text_fill = smoothstep(0.004, 0.001, text_d) * char_reveal;
-    float text_glow = smoothstep(0.05, 0.0, text_d) * 0.6 * char_reveal * pulse;
-    float text_glow_outer = smoothstep(0.12, 0.0, text_d) * 0.2 * char_reveal;
-    float text_glow_far = smoothstep(0.2, 0.0, text_d) * 0.05 * char_reveal;
+    float text_fill = (1.0 - smoothstep(0.001, 0.004, text_d)) * char_reveal;
+    float text_glow = (1.0 - smoothstep(0.0, 0.05, text_d)) * 0.6 * char_reveal * pulse;
+    float text_glow_outer = (1.0 - smoothstep(0.0, 0.12, text_d)) * 0.2 * char_reveal;
+    float text_glow_far = (1.0 - smoothstep(0.0, 0.2, text_d)) * 0.05 * char_reveal;
 
     // Arrival flash per character
     float flash_t = u_time - reveal_time;
-    float arrival_flash = smoothstep(0.0, 0.05, flash_t) * smoothstep(0.4, 0.1, flash_t);
-    float flash_glow = smoothstep(0.08, 0.0, text_d) * arrival_flash * 0.8;
+    float arrival_flash = smoothstep(0.0, 0.05, flash_t) * (1.0 - smoothstep(0.1, 0.4, flash_t));
+    float flash_glow = (1.0 - smoothstep(0.0, 0.08, text_d)) * arrival_flash * 0.8;
 
     col += vec3(1.0, 1.0, 1.0) * text_fill;
     col += vec3(0.3, 0.55, 1.0) * text_glow;
@@ -627,8 +627,8 @@ void main() {
     float sep_reveal = smoothstep(2.0, 3.0, u_time);
     float sep_y = -0.6 / text_scale;
     float sep_d = abs(text_p.y - sep_y) * text_scale;
-    float sep_x_range = smoothstep(-4.0, -2.5, text_p.x) * smoothstep(4.0, 2.5, text_p.x);
-    float separator = smoothstep(0.002, 0.0004, sep_d) * sep_x_range * 0.35 * sep_reveal;
+    float sep_x_range = smoothstep(-4.0, -2.5, text_p.x) * (1.0 - smoothstep(2.5, 4.0, text_p.x));
+    float separator = (1.0 - smoothstep(0.0004, 0.002, sep_d)) * sep_x_range * 0.35 * sep_reveal;
     col += vec3(0.3, 0.55, 1.0) * separator;
 
     // --- Progress bar ---
