@@ -227,7 +227,7 @@ vec3 nebula(vec2 p, float time) {
     col += vec3(0.25, 0.5, 1.0) * emission * 0.2;
 
     // Dark dust absorption lanes
-    float dust = fbm(rp * 3.5 + vec2(time * 0.005) + 500.0);
+    float dust = fbm(rp * 3.5 + vec2(time * 0.005, 0.0) + 500.0);
     float absorption = smoothstep(0.45, 0.55, dust) * falloff * 0.6;
     col *= 1.0 - absorption;
 
