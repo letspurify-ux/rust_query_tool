@@ -793,7 +793,12 @@ void main() {
     col += star_layer(uv, 240.0, 4.0, 2.0) * mix(star_dim, 1.0, 0.3);
     col += star_layer(uv, 400.0, 6.0, 3.0) * mix(star_dim, 1.0, 0.5);
 
-    // Planet
+    // Planet — mask background behind opaque body, then composite
+    vec2 planet_center = vec2(0.32, -0.05);
+    float planet_radius = 0.12;
+    float planet_dist = length(centered - planet_center);
+    float planet_body_mask = 1.0 - smoothstep(planet_radius - 0.001, planet_radius, planet_dist);
+    col *= 1.0 - planet_body_mask;  // erase background behind planet body
     col += planet(centered);
 
     // Lens flare
