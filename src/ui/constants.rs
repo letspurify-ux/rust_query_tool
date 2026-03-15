@@ -120,4 +120,4 @@ pub const MIN_RESULTS_HEIGHT: i32 = RESULT_TOOLBAR_HEIGHT + MIN_RESULTS_BODY_HEI
 // -- Default font size --
 
 /// Default font size used when no config value is available.
-pub const DEFAULT_FONT_SIZE: i32 = 14;
+pub const DEFAULT_FONT_SIZE: i32 = 16;
