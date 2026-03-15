@@ -33,6 +33,7 @@ use libopengl32::LibOpengl32;
 
 pub(crate) struct WindowsDisplay {
     fullscreen: bool,
+    borderless: bool,
     dpi_aware: bool,
     window_resizable: bool,
     cursor_grabbed: bool,
@@ -107,7 +108,7 @@ impl WindowsDisplay {
         rect.right = (rect.left + new_width as i32) as _;
         rect.top = (rect.bottom - new_height as i32) as _;
 
-        let win_style = get_win_style(self.fullscreen, self.window_resizable);
+        let win_style = get_win_style(self.fullscreen, self.window_resizable, self.borderless);
         let win_style_ex: DWORD = unsafe { GetWindowLongA(self.wnd, GWL_EXSTYLE) as _ };
         if unsafe {
             AdjustWindowRectEx(
@@ -158,7 +159,8 @@ impl WindowsDisplay {
     fn set_fullscreen(&mut self, fullscreen: bool) {
         self.fullscreen = fullscreen as _;
 
-        let win_style: DWORD = get_win_style(self.fullscreen, self.window_resizable);
+        let win_style: DWORD =
+            get_win_style(self.fullscreen, self.window_resizable, self.borderless);
 
         unsafe {
             #[cfg(target_arch = "x86_64")]
@@ -199,8 +201,8 @@ impl WindowsDisplay {
     }
 }
 
-fn get_win_style(is_fullscreen: bool, is_resizable: bool) -> DWORD {
-    if is_fullscreen {
+fn get_win_style(is_fullscreen: bool, is_resizable: bool, is_borderless: bool) -> DWORD {
+    if is_fullscreen || is_borderless {
         WS_POPUP | WS_SYSMENU | WS_VISIBLE
     } else {
         let mut win_style: DWORD =
@@ -630,6 +632,7 @@ unsafe fn set_icon(wnd: HWND, icon: &Icon) {
 unsafe fn create_window(
     window_title: &str,
     fullscreen: bool,
+    borderless: bool,
     resizable: bool,
     width: i32,
     height: i32,
@@ -648,7 +651,11 @@ unsafe fn create_window(
     RegisterClassW(&wndclassw);
 
     let win_style: DWORD;
-    let win_ex_style: DWORD = WS_EX_APPWINDOW | WS_EX_WINDOWEDGE;
+    let win_ex_style: DWORD = if borderless {
+        WS_EX_APPWINDOW
+    } else {
+        WS_EX_APPWINDOW | WS_EX_WINDOWEDGE
+    };
     let mut rect = RECT {
         left: 0,
         top: 0,
@@ -656,10 +663,15 @@ unsafe fn create_window(
         bottom: 0,
     };
 
-    if fullscreen {
+    if fullscreen || borderless {
         win_style = WS_POPUP | WS_SYSMENU | WS_VISIBLE;
-        rect.right = GetSystemMetrics(SM_CXSCREEN);
-        rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+        if fullscreen {
+            rect.right = GetSystemMetrics(SM_CXSCREEN);
+            rect.bottom = GetSystemMetrics(SM_CYSCREEN);
+        } else {
+            rect.right = width;
+            rect.bottom = height;
+        }
     } else {
         win_style = if resizable {
             WS_CLIPSIBLINGS
@@ -884,6 +896,7 @@ where
         let (wnd, dc) = create_window(
             &conf.window_title,
             conf.fullscreen,
+            conf.borderless,
             conf.window_resizable,
             conf.window_width as _,
             conf.window_height as _,
@@ -897,6 +910,7 @@ where
         let (msg_wnd, msg_dc) = create_msg_window();
         let mut display = WindowsDisplay {
             fullscreen: false,
+            borderless: conf.borderless,
             dpi_aware: false,
             window_resizable: conf.window_resizable,
             cursor_grabbed: false,
