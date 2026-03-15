@@ -175,13 +175,15 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     col += vec3(0.06, 0.1, 0.25) * filament * 0.6;
 
     // Dark nebula — opaque dust that absorbs background light
-    float dark_n = fbm(p * 3.0 + vec2(-time * 0.004) + 250.0);
+    float dark_n = fbm(p * 3.0 + vec2(-time * 0.004, 0.0) + 250.0);
     float dark_mask = smoothstep(0.5, 0.65, dark_n) * (1.0 - smoothstep(0.4, 0.85, length(p + vec2(0.2, 0.15))));
     extinction = dark_mask * 0.5;
 
     // Forward scattering — dust lit from behind by stars/nebula
     vec2 light_dir_2d = normalize(vec2(0.42, 0.03) - p);
-    float scatter_angle = dot(normalize(p), light_dir_2d) * 0.5 + 0.5;
+    float p_len = length(p);
+    vec2 p_safe = (p_len > 0.001) ? p / p_len : vec2(0.0, 1.0);
+    float scatter_angle = dot(p_safe, light_dir_2d) * 0.5 + 0.5;
     float forward_scatter = pow(scatter_angle, 4.0) * dark_mask;
     col += vec3(0.08, 0.12, 0.3) * forward_scatter * 0.4;
 
@@ -325,7 +327,7 @@ vec3 planet(vec2 p) {
     col += vec3(0.08, 0.22, 0.65) * atmo_outer * 0.25;
     // Secondary warm scatter on the lit side
     vec2 light_side = normalize(vec2(0.5, 0.4));
-    float lit_factor = dot(normalize(d), light_side) * 0.5 + 0.5;
+    float lit_factor = (dist > 0.001) ? dot(d / dist, light_side) * 0.5 + 0.5 : 0.5;
     col += vec3(0.15, 0.25, 0.6) * atmo_outer * lit_factor * 0.15;
 
     // Atmosphere rim
@@ -851,7 +853,6 @@ void main() {
     col *= mix(0.6, 1.0, vig);
     // Subtle chromatic shift at edges — red shifts outward, blue inward
     float ca_amount = smoothstep(0.3, 0.9, vig_dist) * 0.008;
-    vec2 ca_dir = normalize(centered);
     float ca_r = length((uv - 0.5) * (1.0 + ca_amount));
     float ca_b = length((uv - 0.5) * (1.0 - ca_amount));
     col.r *= 1.0 + smoothstep(0.3, 0.8, ca_r) * 0.04;
