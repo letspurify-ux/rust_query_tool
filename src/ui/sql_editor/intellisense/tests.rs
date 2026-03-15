@@ -21,6 +21,520 @@
         runtime
     }
 
+    fn load_intellisense_test_file(name: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("test");
+        path.push(name);
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn analyze_full_script_marker(
+        script_with_cursor: &str,
+    ) -> (String, usize, intellisense_context::CursorContext) {
+        const CURSOR_MARKER: &str = "__CODEX_CURSOR__";
+
+        let cursor = script_with_cursor
+            .find(CURSOR_MARKER)
+            .expect("cursor marker should exist");
+        let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
+        let (stmt_start, stmt_end) = SqlEditorWidget::statement_bounds_in_text(&sql, cursor);
+        let statement = sql
+            .get(stmt_start..stmt_end)
+            .unwrap_or("")
+            .to_string();
+        let cursor_in_statement = cursor.saturating_sub(stmt_start).min(statement.len());
+        let (normalized_statement, normalized_cursor) =
+            SqlEditorWidget::normalize_intellisense_context_with_cursor(
+                &statement,
+                cursor_in_statement,
+            );
+        let deep_ctx =
+            SqlEditorWidget::analyze_statement_context(&normalized_statement, normalized_cursor);
+        (normalized_statement, normalized_cursor, deep_ctx)
+    }
+
+    fn assert_has_case_insensitive(values: &[String], expected: &str) {
+        assert!(
+            values.iter().any(|value| value.eq_ignore_ascii_case(expected)),
+            "expected `{expected}` in values: {:?}",
+            values
+        );
+    }
+
+    fn collect_virtual_columns_from_ctes(
+        deep_ctx: &intellisense_context::CursorContext,
+        data: &Arc<Mutex<IntellisenseData>>,
+        sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> HashMap<String, Vec<String>> {
+        let mut virtual_table_columns = HashMap::new();
+        for cte in &deep_ctx.ctes {
+            let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
+                deep_ctx,
+                cte,
+                &virtual_table_columns,
+                data,
+                sender,
+                connection,
+            );
+            if !columns.is_empty() {
+                virtual_table_columns.insert(cte.name.clone(), columns);
+            }
+        }
+        virtual_table_columns
+    }
+
+    #[test]
+    fn test7_set_operator_order_by_keeps_compound_statement_context() {
+        let script = load_intellisense_test_file("test7.txt");
+
+        for target in [
+            "SELECT empno FROM b\nORDER BY __CODEX_CURSOR__empno;",
+            "SELECT empno FROM b\nORDER BY __CODEX_CURSOR__empno;\n\nPROMPT [DONE]",
+        ] {
+            let marked = script.replacen(
+                target.replace("__CODEX_CURSOR__", "").as_str(),
+                target,
+                1,
+            );
+            assert_ne!(marked, script, "expected target to exist in test7.txt");
+            let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+            assert!(
+                statement.contains("INTERSECT") || statement.contains("MINUS"),
+                "compound set-operator statement should be preserved, got:\n{statement}"
+            );
+            assert!(
+                statement.contains("ORDER BY empno"),
+                "ORDER BY should remain inside the same statement, got:\n{statement}"
+            );
+            assert_eq!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::OrderByClause,
+                "cursor inside set-operator ORDER BY should stay in OrderByClause"
+            );
+        }
+    }
+
+    #[test]
+    fn test7_match_recognize_generated_columns_are_extracted_from_full_script_statement() {
+        let script = load_intellisense_test_file("test7.txt");
+        let marked = script.replacen(
+            "FIRST(ename) AS start_name,",
+            "FIRST(ename) AS __CODEX_CURSOR__start_name,",
+            1,
+        );
+        assert_ne!(marked, script, "expected MATCH_RECOGNIZE target in test7.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("MATCH_RECOGNIZE"),
+            "current statement should contain MATCH_RECOGNIZE, got:\n{statement}"
+        );
+
+        let generated = intellisense_context::extract_match_recognize_generated_columns(
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        for expected in ["start_name", "end_name", "run_len"] {
+            assert_has_case_insensitive(&generated, expected);
+        }
+    }
+
+    #[test]
+    fn test7_nested_inline_view_wildcard_expands_columns_from_nested_cte() {
+        let script = load_intellisense_test_file("test7.txt");
+        let marked = script.replacen(
+            "ORDER BY v.amt DESC, v.order_dt;",
+            "ORDER BY v.__CODEX_CURSOR__amt DESC, v.order_dt;",
+            1,
+        );
+        assert_ne!(marked, script, "expected inline-view target in test7.txt");
+        let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        let data = Arc::new(Mutex::new(IntellisenseData::new()));
+        let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        let connection = create_shared_connection();
+        let virtual_table_columns =
+            collect_virtual_columns_from_ctes(&deep_ctx, &data, &sender, &connection);
+
+        let v_subquery = deep_ctx
+            .subqueries
+            .iter()
+            .find(|subq| subq.alias.eq_ignore_ascii_case("v"))
+            .expect("expected inline view alias v");
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            v_subquery.body_range,
+        );
+        let body_ctx = intellisense_context::analyze_cursor_context(body_tokens, body_tokens.len());
+        let mut body_virtual_table_columns = virtual_table_columns.clone();
+        for cte in &body_ctx.ctes {
+            let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
+                &body_ctx,
+                cte,
+                &body_virtual_table_columns,
+                &data,
+                &sender,
+                &connection,
+            );
+            if !columns.is_empty() {
+                body_virtual_table_columns.insert(cte.name.clone(), columns);
+            }
+        }
+        let body_tables_in_scope = body_ctx.tables_in_scope.clone();
+        let (wildcard_columns, wildcard_tables) = SqlEditorWidget::expand_virtual_table_wildcards(
+            body_tokens,
+            &body_tables_in_scope,
+            &body_virtual_table_columns,
+            &data,
+            &sender,
+            &connection,
+        );
+
+        assert_eq!(wildcard_tables, vec!["x".to_string()]);
+        for expected in ["order_id", "cust_name", "order_dt", "amt"] {
+            assert_has_case_insensitive(&wildcard_columns, expected);
+        }
+    }
+
+    #[test]
+    fn test8_package_body_select_context_stays_inside_open_rc_query() {
+        let script = load_intellisense_test_file("test8.txt");
+        let marked = script.replacen(
+            "                t.grp,",
+            "                t.__CODEX_CURSOR__grp,",
+            1,
+        );
+        assert_ne!(marked, script, "expected open_rc SELECT target in test8.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("PROCEDURE open_rc"),
+            "cursor should stay inside package body statement, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("FROM oqt_t_test t"),
+            "open_rc query should remain in scope, got:\n{statement}"
+        );
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("t", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["oqt_t_test".to_string()]);
+    }
+
+    #[test]
+    fn test8_summary_query_statement_isolated_after_plsql_and_print() {
+        let script = load_intellisense_test_file("test8.txt");
+        let marked = script.replacen(
+            "    COUNT (*) AS cnt,",
+            "    COUNT (*) AS __CODEX_CURSOR__cnt,",
+            1,
+        );
+        assert_ne!(marked, script, "expected summary query target in test8.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.starts_with("SELECT grp,"),
+            "summary query should start at final SELECT, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("FROM oqt_t_test"),
+            "summary query should include oqt_t_test, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("PRINT v_rc"),
+            "summary query statement should not include preceding PRINT command:\n{statement}"
+        );
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList);
+        let tables: Vec<String> = deep_ctx
+            .tables_in_scope
+            .iter()
+            .map(|table| table.name.to_ascii_uppercase())
+            .collect();
+        assert!(tables.contains(&"OQT_T_TEST".to_string()));
+    }
+
+    #[test]
+    fn test8_log_query_order_by_statement_isolated_from_previous_summary_query() {
+        let script = load_intellisense_test_file("test8.txt");
+        let marked = script.replacen(
+            "ORDER BY log_id",
+            "ORDER BY __CODEX_CURSOR__log_id",
+            1,
+        );
+        assert_ne!(marked, script, "expected log query ORDER BY target in test8.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("FROM oqt_t_log"),
+            "log query should include oqt_t_log, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("FETCH FIRST 40 ROWS ONLY"),
+            "log query should preserve trailing FETCH clause, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("FROM oqt_t_test"),
+            "log query should not leak previous summary query:\n{statement}"
+        );
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
+    }
+
+    #[test]
+    fn test10_with_function_statement_isolated_after_bulk_collect_block() {
+        let script = load_intellisense_test_file("test10.txt");
+        let marked = script.replacen(
+            "    calc_bonus (NVL (e.salary, 0)) AS calc_bonus",
+            "    calc_bonus (NVL (e.salary, 0)) AS __CODEX_CURSOR__calc_bonus",
+            1,
+        );
+        assert_ne!(marked, script, "expected WITH FUNCTION target in test10.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("WITH FUNCTION calc_bonus"),
+            "WITH FUNCTION statement should remain isolated, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("FROM qt_emp e"),
+            "WITH FUNCTION query should include qt_emp alias e, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("FETCH c_emp BULK COLLECT"),
+            "WITH FUNCTION statement should not include previous PL/SQL block:\n{statement}"
+        );
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("e", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["qt_emp".to_string()]);
+    }
+
+    #[test]
+    fn test10_recursive_with_statement_keeps_ctes_and_order_by() {
+        let script = load_intellisense_test_file("test10.txt");
+        let marked = script.replacen(
+            "    r.dept_rank,",
+            "    r.__CODEX_CURSOR__dept_rank,",
+            1,
+        );
+        assert_ne!(marked, script, "expected recursive WITH target in test10.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("WITH dept_tree"),
+            "recursive WITH statement should include dept_tree CTE, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("sales_ranked AS"),
+            "recursive WITH statement should include sales_ranked CTE, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("ORDER BY t.path_txt"),
+            "recursive WITH statement should preserve final ORDER BY, got:\n{statement}"
+        );
+        let tables: Vec<String> = deep_ctx
+            .tables_in_scope
+            .iter()
+            .map(|table| table.name.to_ascii_uppercase())
+            .collect();
+        assert!(tables.contains(&"DEPT_TREE".to_string()));
+        assert!(tables.contains(&"SALES_RANKED".to_string()));
+    }
+
+    #[test]
+    fn test10_cross_apply_alias_columns_resolve_in_full_script() {
+        let script = load_intellisense_test_file("test10.txt");
+        let marked = script.replacen(
+            "    x.max_amt,",
+            "    x.__CODEX_CURSOR__max_amt,",
+            1,
+        );
+        assert_ne!(marked, script, "expected CROSS APPLY target in test10.txt");
+        let (_statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("x", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["x".to_string()]);
+
+        let x_subquery = deep_ctx
+            .subqueries
+            .iter()
+            .find(|subq| subq.alias.eq_ignore_ascii_case("x"))
+            .expect("expected CROSS APPLY alias x");
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            x_subquery.body_range,
+        );
+        let columns = intellisense_context::extract_select_list_columns(body_tokens);
+        for expected in ["max_amt", "min_amt"] {
+            assert_has_case_insensitive(&columns, expected);
+        }
+    }
+
+    #[test]
+    fn test10_pipelined_table_query_isolated_from_adjacent_final_queries() {
+        let script = load_intellisense_test_file("test10.txt");
+        let marked = script.replacen(
+            "FROM TABLE (qt_pipe_emp (NULL))\nORDER BY emp_id;",
+            "FROM TABLE (qt_pipe_emp (NULL))\nORDER BY __CODEX_CURSOR__emp_id;",
+            1,
+        );
+        assert_ne!(marked, script, "expected final TABLE(...) query target in test10.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("FROM TABLE (qt_pipe_emp (NULL))"),
+            "TABLE(...) statement should be isolated, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("json_like_report"),
+            "TABLE(...) statement should not include previous final validation query:\n{statement}"
+        );
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
+    }
+
+    #[test]
+    fn test11_with_function_statement_isolated_after_package_execution_block() {
+        let script = load_intellisense_test_file("test11.txt");
+        let marked = script.replacen(
+            "    score_fn (e.salary, e.bonus_pct) AS score",
+            "    score_fn (e.salary, e.bonus_pct) AS __CODEX_CURSOR__score",
+            1,
+        );
+        assert_ne!(marked, script, "expected WITH FUNCTION target in test11.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("WITH FUNCTION score_fn"),
+            "WITH FUNCTION statement should remain isolated, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("FROM qt_employees e"),
+            "WITH FUNCTION query should include qt_employees alias e, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("qt_torture_pkg.complex_block"),
+            "WITH FUNCTION statement should not include previous PL/SQL block:\n{statement}"
+        );
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("e", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["qt_employees".to_string()]);
+    }
+
+    #[test]
+    fn test11_recursive_with_search_cycle_statement_keeps_cte_and_order_by() {
+        let script = load_intellisense_test_file("test11.txt");
+        let marked = script.replacen(
+            "    dfs_ord,",
+            "    __CODEX_CURSOR__dfs_ord,",
+            1,
+        );
+        assert_ne!(marked, script, "expected recursive WITH target in test11.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("WITH dept_tree"),
+            "recursive WITH statement should include dept_tree CTE, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("SEARCH DEPTH FIRST BY dept_id"),
+            "recursive WITH statement should preserve SEARCH clause, got:\n{statement}"
+        );
+        assert!(
+            statement.contains("ORDER BY dfs_ord"),
+            "recursive WITH statement should preserve final ORDER BY, got:\n{statement}"
+        );
+        let tables: Vec<String> = deep_ctx
+            .tables_in_scope
+            .iter()
+            .map(|table| table.name.to_ascii_uppercase())
+            .collect();
+        assert!(tables.contains(&"DEPT_TREE".to_string()));
+    }
+
+    #[test]
+    fn test11_match_recognize_generated_columns_are_extracted_from_full_script_statement() {
+        let script = load_intellisense_test_file("test11.txt");
+        let marked = script.replacen(
+            "MATCH_NUMBER () AS match_no,",
+            "MATCH_NUMBER () AS __CODEX_CURSOR__match_no,",
+            1,
+        );
+        assert_ne!(marked, script, "expected MATCH_RECOGNIZE target in test11.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("MATCH_RECOGNIZE"),
+            "MATCH_RECOGNIZE statement should remain isolated, got:\n{statement}"
+        );
+        let generated = intellisense_context::extract_match_recognize_generated_columns(
+            deep_ctx.statement_tokens.as_ref(),
+        );
+        for expected in ["match_no", "cls", "start_dt", "end_dt", "total_amt"] {
+            assert_has_case_insensitive(&generated, expected);
+        }
+    }
+
+    #[test]
+    fn test11_json_table_statement_exposes_table_function_columns() {
+        let script = load_intellisense_test_file("test11.txt");
+        let marked = script.replacen(
+            "ORDER BY jt.emp_id,",
+            "ORDER BY jt.__CODEX_CURSOR__emp_id,",
+            1,
+        );
+        assert_ne!(marked, script, "expected JSON_TABLE target in test11.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("FROM JSON_TABLE"),
+            "JSON_TABLE statement should remain isolated, got:\n{statement}"
+        );
+        let column_tables =
+            intellisense_context::resolve_qualifier_tables("jt", &deep_ctx.tables_in_scope);
+        assert_eq!(column_tables, vec!["jt".to_string()]);
+        let jt_subquery = deep_ctx
+            .subqueries
+            .iter()
+            .find(|subq| subq.alias.eq_ignore_ascii_case("jt"))
+            .expect("expected JSON_TABLE alias jt");
+        let body_tokens = intellisense_context::token_range_slice(
+            deep_ctx.statement_tokens.as_ref(),
+            jt_subquery.body_range,
+        );
+        let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
+        if columns.is_empty() {
+            columns = intellisense_context::extract_table_function_columns(body_tokens);
+        }
+        for expected in ["emp_id", "skill"] {
+            assert_has_case_insensitive(&columns, expected);
+        }
+    }
+
+    #[test]
+    fn test11_table_function_query_isolated_from_adjacent_queries() {
+        let script = load_intellisense_test_file("test11.txt");
+        let marked = script.replacen(
+            "FROM TABLE (qt_torture_pkg.pipe_sales (NULL))\nORDER BY sale_id;",
+            "FROM TABLE (qt_torture_pkg.pipe_sales (NULL))\nORDER BY __CODEX_CURSOR__sale_id;",
+            1,
+        );
+        assert_ne!(marked, script, "expected TABLE(...) target in test11.txt");
+        let (statement, _cursor, deep_ctx) = analyze_full_script_marker(&marked);
+
+        assert!(
+            statement.contains("FROM TABLE (qt_torture_pkg.pipe_sales (NULL))"),
+            "TABLE(...) statement should be isolated, got:\n{statement}"
+        );
+        assert!(
+            !statement.contains("XMLTABLE"),
+            "TABLE(...) statement should not include previous XMLTABLE query:\n{statement}"
+        );
+        assert!(
+            !statement.contains("qt_complex_v"),
+            "TABLE(...) statement should not include following view query:\n{statement}"
+        );
+        assert_eq!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause);
+    }
+
     #[test]
     fn statement_bounds_ignore_semicolon_in_string_literal() {
         let sql = "SELECT 'a;b' AS txt FROM dual; SELECT 2 FROM dual";
@@ -1063,6 +1577,7 @@ FROM d
         let (columns, tables) = SqlEditorWidget::expand_virtual_table_wildcards(
             &tokens,
             &tables_in_scope,
+            &HashMap::new(),
             &data,
             &sender,
             &connection,
@@ -1195,6 +1710,7 @@ ORDER BY x.deptno
                 SqlEditorWidget::expand_virtual_table_wildcards(
                     body_tokens,
                     &body_tables_in_scope,
+                    &HashMap::new(),
                     &data,
                     &sender,
                     &connection,
@@ -1309,6 +1825,7 @@ ORDER BY f.deptno, f.sal DESC, f.empno;
                     SqlEditorWidget::expand_virtual_table_wildcards(
                         body_tokens,
                         &body_tables_in_scope,
+                        &HashMap::new(),
                         &data,
                         &sender,
                         &connection,
@@ -1726,6 +2243,7 @@ SELECT * FROM r
         let (columns, _) = SqlEditorWidget::collect_cte_virtual_columns_for_completion(
             &deep_ctx,
             cte,
+            &HashMap::new(),
             &data,
             &sender,
             &connection,

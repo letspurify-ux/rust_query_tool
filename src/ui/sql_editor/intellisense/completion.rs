@@ -482,6 +482,7 @@ impl SqlEditorWidget {
                 let (columns, wildcard_tables) = Self::collect_cte_virtual_columns_for_completion(
                     deep_ctx,
                     cte,
+                    &virtual_table_columns,
                     intellisense_data,
                     column_sender,
                     connection,
@@ -499,9 +500,25 @@ impl SqlEditorWidget {
                     deep_ctx.statement_tokens.as_ref(),
                     subq.body_range,
                 );
+                let body_ctx =
+                    intellisense_context::analyze_cursor_context(body_tokens, body_tokens.len());
+                let mut body_virtual_table_columns = virtual_table_columns.clone();
+                for cte in &body_ctx.ctes {
+                    let (nested_columns, _) = Self::collect_cte_virtual_columns_for_completion(
+                        &body_ctx,
+                        cte,
+                        &body_virtual_table_columns,
+                        intellisense_data,
+                        column_sender,
+                        connection,
+                    );
+                    if !nested_columns.is_empty() {
+                        body_virtual_table_columns.insert(cte.name.clone(), nested_columns);
+                    }
+                }
                 let mut columns = intellisense_context::extract_select_list_columns(body_tokens);
                 let body_tables_in_scope =
-                    intellisense_context::collect_tables_in_statement(body_tokens);
+                    body_ctx.tables_in_scope.clone();
                 if columns.is_empty() {
                     columns = intellisense_context::extract_table_function_columns(body_tokens);
                 }
@@ -510,7 +527,7 @@ impl SqlEditorWidget {
                         body_tokens,
                         &body_tables_in_scope,
                         &deep_ctx.tables_in_scope,
-                        &virtual_table_columns,
+                        &body_virtual_table_columns,
                         intellisense_data,
                         column_sender,
                         connection,
@@ -519,6 +536,7 @@ impl SqlEditorWidget {
                 let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
                     body_tokens,
                     &body_tables_in_scope,
+                    &body_virtual_table_columns,
                     intellisense_data,
                     column_sender,
                     connection,
@@ -670,6 +688,7 @@ impl SqlEditorWidget {
     fn expand_virtual_table_wildcards(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
@@ -685,16 +704,36 @@ impl SqlEditorWidget {
         let mut wildcard_columns = Vec::new();
         for table in &wildcard_tables {
             Self::request_table_columns(table, intellisense_data, column_sender, connection);
-            let columns = {
-                let data = intellisense_data
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                data.get_columns_for_table(table)
-            };
+            let columns = Self::columns_for_virtual_or_cached_table(
+                table,
+                virtual_table_columns,
+                intellisense_data,
+            );
             wildcard_columns.extend(columns);
         }
         Self::dedup_column_names_case_insensitive(&mut wildcard_columns);
         (wildcard_columns, wildcard_tables)
+    }
+
+    fn columns_for_virtual_or_cached_table(
+        table: &str,
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+    ) -> Vec<String> {
+        for candidate in Self::table_lookup_key_candidates(table) {
+            if let Some(columns) = virtual_table_columns
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&candidate))
+                .map(|(_, columns)| columns.clone())
+            {
+                return columns;
+            }
+        }
+
+        let data = intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        data.get_columns_for_table(table)
     }
 
     fn dedup_column_names_case_insensitive(columns: &mut Vec<String>) {

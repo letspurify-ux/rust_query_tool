@@ -4545,9 +4545,15 @@ fn extract_select_list_tokens(tokens: &[SqlToken]) -> &[SqlToken] {
 
 fn select_list_start_index(tokens: &[SqlToken]) -> usize {
     let mut idx = 0usize;
+    let token_depths = paren_depths(tokens);
 
-    // Find SELECT keyword.
+    // Find the statement-level SELECT keyword. Ignore nested SELECTs inside
+    // CTE bodies, subqueries, and scalar expressions.
     while idx < tokens.len() {
+        if !is_top_level_depth(&token_depths, idx) {
+            idx += 1;
+            continue;
+        }
         match &tokens[idx] {
             SqlToken::Word(w) if w.eq_ignore_ascii_case("SELECT") => {
                 idx += 1;

@@ -14,3 +14,5 @@ Connect system/password@localhost:1521/FREE
 @test/test18.sql;
 @test/test22.sql;
 @test/test23.sql;
+
+-- intelli : 7,8,10,11

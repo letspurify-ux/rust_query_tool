@@ -109,6 +109,7 @@ impl SqlEditorWidget {
     fn collect_cte_virtual_columns_for_completion(
         deep_ctx: &intellisense_context::CursorContext,
         cte: &intellisense_context::CteDefinition,
+        virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
@@ -132,6 +133,7 @@ impl SqlEditorWidget {
             let (wildcard_columns, deps) = Self::expand_virtual_table_wildcards(
                 body_tokens,
                 &body_tables_in_scope,
+                virtual_table_columns,
                 intellisense_data,
                 column_sender,
                 connection,
