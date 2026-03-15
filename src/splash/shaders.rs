@@ -495,7 +495,7 @@ vec3 shooting_star(vec2 uv_in, float seed, float time) {
     float t = mod(time + seed * 3.0, cycle) / cycle;
     float active_window = 0.15;
 
-    if (t > active_window) return vec3(0.0);
+    if (t > active_window || t < 0.001) return vec3(0.0);
 
     float anim_t = t / active_window;
 
