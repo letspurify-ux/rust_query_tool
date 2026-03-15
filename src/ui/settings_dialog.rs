@@ -304,7 +304,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut cancel_btn = Button::default()
         .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
         .with_label("Cancel");
-    cancel_btn.set_color(theme::button_secondary());
+    cancel_btn.set_color(theme::button_cancel());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
     let mut ok_btn = Button::default()

@@ -82,6 +82,10 @@ pub fn button_warning() -> Color {
     Color::from_rgb(202, 80, 16)
 }
 
+pub fn button_cancel() -> Color {
+    button_warning()
+}
+
 pub fn button_danger() -> Color {
     Color::from_rgb(232, 17, 35)
 }

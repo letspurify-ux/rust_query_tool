@@ -981,7 +981,7 @@ impl MainWindow {
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Cancel");
-        cancel_btn.set_color(theme::button_warning());
+        cancel_btn.set_color(theme::button_cancel());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&cancel_btn, BUTTON_WIDTH);
@@ -1240,7 +1240,7 @@ impl MainWindow {
         let mut edit_cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Cancel");
-        edit_cancel_btn.set_color(theme::button_danger());
+        edit_cancel_btn.set_color(theme::button_cancel());
         edit_cancel_btn.set_label_color(theme::text_primary());
         edit_cancel_btn.set_frame(FrameType::RFlatBox);
         edit_cancel_btn.set_tooltip("Discard staged edits and restore rows");

@@ -7312,7 +7312,7 @@ fn prompt_secret_text(prompt: &str) -> Option<String> {
     button_row.fixed(&ok_btn, BUTTON_WIDTH);
 
     let mut cancel_btn = Button::default().with_label("Cancel");
-    cancel_btn.set_color(theme::button_subtle());
+    cancel_btn.set_color(theme::button_cancel());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
     button_row.fixed(&cancel_btn, BUTTON_WIDTH);
