@@ -827,14 +827,19 @@ void main() {
     float reveal_time = 0.5 + char_x_pos * 0.12;
     float char_reveal = smoothstep(reveal_time, reveal_time + 0.3, u_time);
 
+    // Smooth position-based reveal for wide glow layers (avoids seam at char boundaries)
+    float glow_x = (text_p.x + 6.0) / 12.0;
+    float glow_reveal_time = 0.5 + clamp(glow_x, 0.0, 1.0) * 1.08;
+    float glow_reveal = smoothstep(glow_reveal_time, glow_reveal_time + 0.3, u_time);
+
     // Pulsing glow
     float pulse = sin(u_time * 1.5 - char_x_pos * 0.3) * 0.15 + 0.85;
 
     // Text rendering
     float text_fill = (1.0 - smoothstep(0.001, 0.004, text_d)) * char_reveal;
     float text_glow = (1.0 - smoothstep(0.0, 0.05, text_d)) * 0.6 * char_reveal * pulse;
-    float text_glow_outer = (1.0 - smoothstep(0.0, 0.12, text_d)) * 0.2 * char_reveal;
-    float text_glow_far = (1.0 - smoothstep(0.0, 0.2, text_d)) * 0.05 * char_reveal;
+    float text_glow_outer = (1.0 - smoothstep(0.0, 0.12, text_d)) * 0.2 * glow_reveal;
+    float text_glow_far = (1.0 - smoothstep(0.0, 0.2, text_d)) * 0.05 * glow_reveal;
 
     // Arrival flash per character
     float flash_t = u_time - reveal_time;
