@@ -207,6 +207,17 @@ impl SelectListLayoutState {
         matches!(self, Self::Multiline { .. })
     }
 
+    fn has_active_indent(self) -> bool {
+        matches!(self, Self::Pending { .. } | Self::Multiline { .. })
+    }
+
+    fn indentation_or(self, fallback: usize) -> usize {
+        match self {
+            Self::Pending { indent, .. } | Self::Multiline { indent } => indent,
+            Self::Inactive => fallback,
+        }
+    }
+
     fn force_newline_if_possible(self, out: &mut String) -> Self {
         match self {
             Self::Pending { anchor, indent } => {
@@ -1630,6 +1641,13 @@ impl SqlEditorWidget {
             open_cursor_state.base_indent(indent_level)
         };
 
+        let list_item_indent = |indent_level: usize,
+                                open_cursor_state: OpenCursorFormatState,
+                                select_list_layout_state: SelectListLayoutState| {
+            let base = base_indent(indent_level, open_cursor_state);
+            select_list_layout_state.indentation_or(base + 1)
+        };
+
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
                 out.push_str(&" ".repeat(line_indent * 4));
@@ -2400,6 +2418,7 @@ impl SqlEditorWidget {
                         in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     let top_level_set_list =
                         in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
+                    let active_list_layout = select_list_layout_state.has_active_indent();
                     if (top_level_select_list || top_level_set_list)
                         && !has_leading_newline
                         && !is_hint_comment
@@ -2448,7 +2467,11 @@ impl SqlEditorWidget {
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
-                        let current_select_indent = base + 1;
+                        let current_select_indent = list_item_indent(
+                            indent_level,
+                            open_cursor_state,
+                            select_list_layout_state,
+                        );
                         if has_leading_newline {
                             line_indent = if in_set_clause {
                                 current_select_indent
@@ -2465,6 +2488,7 @@ impl SqlEditorWidget {
                             };
                         } else if in_select_list
                             || in_set_clause
+                            || active_list_layout
                             || column_list_stack.last().copied().unwrap_or(false)
                         {
                             line_indent = current_select_indent;
@@ -2484,11 +2508,16 @@ impl SqlEditorWidget {
                             out.push('\n');
                         }
                         if in_select_list
+                            || in_set_clause
+                            || active_list_layout
                             || column_list_stack.last().copied().unwrap_or(false)
                             || hint_after_select
                         {
-                            let select_list_indent =
-                                base_indent(indent_level, open_cursor_state) + 1;
+                            let select_list_indent = list_item_indent(
+                                indent_level,
+                                open_cursor_state,
+                                select_list_layout_state,
+                            );
                             line_indent = select_list_indent;
                             if hint_after_select {
                                 select_list_layout_state = SelectListLayoutState::Multiline {
@@ -2502,10 +2531,16 @@ impl SqlEditorWidget {
                         at_line_start = true;
                         needs_space = false;
                         if in_select_list
+                            || in_set_clause
+                            || active_list_layout
                             || column_list_stack.last().copied().unwrap_or(false)
                             || hint_after_select
                         {
-                            line_indent = base_indent(indent_level, open_cursor_state) + 1;
+                            line_indent = list_item_indent(
+                                indent_level,
+                                open_cursor_state,
+                                select_list_layout_state,
+                            );
                         }
                     } else if is_block_comment && next_is_word_like {
                         let keep_inline_alias_comment = matches!(
@@ -2515,10 +2550,16 @@ impl SqlEditorWidget {
                         if !keep_inline_alias_comment {
                             let list_extra = if in_select_list
                                 || in_set_clause
+                                || active_list_layout
                                 || column_list_stack.last().copied().unwrap_or(false)
                                 || hint_after_select
                             {
-                                1
+                                list_item_indent(
+                                    indent_level,
+                                    open_cursor_state,
+                                    select_list_layout_state,
+                                )
+                                .saturating_sub(base_indent(indent_level, open_cursor_state))
                             } else {
                                 0
                             };
@@ -2553,7 +2594,8 @@ impl SqlEditorWidget {
                             trim_trailing_space(&mut out);
                             if out.ends_with('\n') || at_line_start {
                                 if line_indent == 0
-                                    && (matches!(current_clause.as_deref(), Some("SELECT"))
+                                    && (matches!(current_clause.as_deref(), Some("SELECT" | "SET"))
+                                        || select_list_layout_state.has_active_indent()
                                         || column_list_stack.last().copied().unwrap_or(false)
                                         || matches!(
                                             tokens.get(idx.saturating_sub(1)),
@@ -2561,7 +2603,11 @@ impl SqlEditorWidget {
                                                 if comment.trim_start().starts_with("--")
                                         ))
                                 {
-                                    line_indent = base_indent(indent_level, open_cursor_state) + 1;
+                                    line_indent = list_item_indent(
+                                        indent_level,
+                                        open_cursor_state,
+                                        select_list_layout_state,
+                                    );
                                 }
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
                             }
@@ -12943,6 +12989,85 @@ END"
         assert!(
             formatted.contains("FROM qwer;"),
             "formatted package body should keep the complete UPDATE statement, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_set_comment_and_comma_aligned_to_existing_multiline_set_depth() {
+        let sql = "BEGIN
+    UPDATE t
+    SET a = 1,
+        b = 2
+        -- comment
+        , c = 3
+    WHERE id = 1;
+END;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "SET a = 1,
+        b = 2
+        -- comment
+        ,
+        c = 3"
+            ),
+            "SET-list comment/comma should reuse active multiline SET depth indentation, got:
+{}",
+            formatted
+        );
+    }
+
+
+
+    #[test]
+    fn format_sql_basic_keeps_set_block_comment_and_comma_aligned_to_existing_multiline_set_depth() {
+        let sql = "BEGIN
+    UPDATE t
+    SET a = 1,
+        b = 2
+        /* comment */
+        , c = 3
+    WHERE id = 1;
+END;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "SET a = 1,
+        b = 2
+        /* comment */
+        ,
+        c = 3"
+            ),
+            "SET-list block comment/comma should reuse active multiline SET depth indentation, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comma_indent_after_line_comment_in_merge_using_clause() {
+        let sql = "MERGE INTO t trg
+USING src
+ON (trg.id = src.id)
+WHEN MATCHED THEN UPDATE SET
+    trg.a = src.a -- comment
+    , trg.b = src.b;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "SET trg.a = src.a -- comment
+    ,
+    trg.b = src.b;"
+            ),
+            "line comment/comma after MERGE USING UPDATE SET should keep active list depth, got:
 {}",
             formatted
         );
