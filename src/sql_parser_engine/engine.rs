@@ -816,17 +816,8 @@ impl SqlParserEngine {
         self.process_line_with_observers(line, |_, _, _, _| {}, on_statement_boundary);
     }
 
-    pub(crate) fn process_line_with_observer<F>(&mut self, line: &str, on_symbol: F)
-    where
-        F: FnMut(&[char], usize, char, Option<char>),
-    {
-        self.process_line_with_observers(line, on_symbol, |_, _| {});
-    }
-
-    /// Like [`process_line_with_observer`] but the callback receives the original
-    /// line bytes and the **byte offset** of the symbol instead of a `&[char]`
-    /// slice and char index.  This satisfies the byte-offset policy for callers
-    /// that need to perform lookahead on the raw line.
+    /// Observes symbols using the original line bytes and the symbol byte offset.
+    /// This keeps callers aligned with the engine's byte-offset indexing policy.
     pub(crate) fn process_line_with_byte_observer<F>(&mut self, line: &str, mut on_symbol: F)
     where
         F: FnMut(&[u8], usize, u8),

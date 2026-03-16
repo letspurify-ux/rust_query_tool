@@ -18,6 +18,8 @@ uniform vec2 u_resolution;
 uniform float u_alpha;
 uniform sampler2D title_tex;
 
+const float NEBULA_SCALE = 0.26;
+
 // ========================================================
 //  Utility
 // ========================================================
@@ -651,7 +653,8 @@ vec3 orbital_ring(vec2 p, float time) {
 
 void main() {
     vec2 aspect = vec2(u_resolution.x / u_resolution.y, 1.0);
-    vec2 centered = (uv - 0.5) * aspect + camera_offset();
+    vec2 screen_centered = (uv - 0.5) * aspect;
+    vec2 centered = screen_centered + camera_offset();
 
     vec3 col = vec3(0.0);
 
@@ -665,8 +668,8 @@ void main() {
     float dust_extinction;
     col += cosmic_dust(centered, u_time, dust_extinction);
 
-    // Nebula
-    col += nebula(centered * 0.39, u_time);
+    // Nebula: anchor the core to the screen center instead of the drifting camera.
+    col += nebula(screen_centered * NEBULA_SCALE, u_time);
 
     // Aurora ribbons
     col += aurora(centered, u_time);
