@@ -1641,12 +1641,13 @@ impl SqlEditorWidget {
             open_cursor_state.base_indent(indent_level)
         };
 
-        let list_item_indent = |indent_level: usize,
-                                open_cursor_state: OpenCursorFormatState,
-                                select_list_layout_state: SelectListLayoutState| {
-            let base = base_indent(indent_level, open_cursor_state);
-            select_list_layout_state.indentation_or(base + 1)
-        };
+        let list_item_indent =
+            |indent_level: usize,
+             open_cursor_state: OpenCursorFormatState,
+             select_list_layout_state: SelectListLayoutState| {
+                let base = base_indent(indent_level, open_cursor_state);
+                select_list_layout_state.indentation_or(base + 1)
+            };
 
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
@@ -2500,13 +2501,9 @@ impl SqlEditorWidget {
                             // Align comment with ELSE/ELSIF which renders at
                             // one level below the current body in IF blocks,
                             // or at base+1 in CASE blocks.
-                            let in_if_block =
-                                block_stack.last().is_some_and(|s| s == "IF");
+                            let in_if_block = block_stack.last().is_some_and(|s| s == "IF");
                             line_indent = if in_if_block {
-                                base_indent(
-                                    indent_level.saturating_sub(1),
-                                    open_cursor_state,
-                                )
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
                             } else {
                                 base + 1
                             };
@@ -2571,10 +2568,9 @@ impl SqlEditorWidget {
                                 && !select_list_layout_state.is_multiline()
                                 && comment_starts_line
                             {
-                                select_list_layout_state =
-                                    SelectListLayoutState::Multiline {
-                                        indent: select_list_indent,
-                                    };
+                                select_list_layout_state = SelectListLayoutState::Multiline {
+                                    indent: select_list_indent,
+                                };
                             }
                         }
                     } else if is_block_comment && next_is_word_like {
@@ -2976,7 +2972,16 @@ impl SqlEditorWidget {
 
                 let leading_spaces = line.len().saturating_sub(trimmed.len());
                 let existing_indent = leading_spaces / 4;
-                let extra_indent = if into_list_active { 1 } else { 0 };
+                let previous_line_ends_with_list_comma = last_code_line_trimmed
+                    .as_deref()
+                    .is_some_and(Self::line_ends_with_comma_before_inline_comment);
+                let extra_indent = if into_list_active
+                    || (in_dml_statement && previous_line_ends_with_list_comma)
+                {
+                    1
+                } else {
+                    0
+                };
                 let parser_depth = depth + extra_indent;
                 // Look ahead to find the next non-comment, non-empty line.
                 // If it starts with ELSE/ELSIF/ELSEIF, align this comment
@@ -3465,6 +3470,22 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) => {
                     let trailing_symbol = sym.trim_end();
                     return trailing_symbol.ends_with('(');
+                }
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    let trailing_symbol = sym.trim_end();
+                    return trailing_symbol.ends_with(',');
                 }
                 _ => return false,
             }
@@ -13141,10 +13162,9 @@ END;";
         );
     }
 
-
-
     #[test]
-    fn format_sql_basic_keeps_set_block_comment_and_comma_aligned_to_existing_multiline_set_depth() {
+    fn format_sql_basic_keeps_set_block_comment_and_comma_aligned_to_existing_multiline_set_depth()
+    {
         let sql = "BEGIN
     UPDATE t
     SET a = 1,
@@ -13298,8 +13318,21 @@ mod format_comment_indent_tests {
         let source = "select * from (select col1\n-- comment\n,col2\nfrom t1);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("SELECT col1\n            -- comment\n            ,\n            col2"),
+            formatted
+                .contains("SELECT col1\n            -- comment\n            ,\n            col2"),
             "Comment in subquery select list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_after_comma_in_open_for_select_list() {
+        let source = "begin\n    open c for\n        select b,\n        -- comment\n            d\n        from e;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("        SELECT\n            b,\n            -- comment\n            d\n        FROM e;"),
+            "Line comment after a trailing comma should keep select-list depth, got:\n{}",
             formatted
         );
     }
@@ -13317,7 +13350,8 @@ mod format_comment_indent_tests {
 
     #[test]
     fn format_sql_basic_indents_interleaved_comments_and_commas_in_select() {
-        let source = "select\ncol1\n-- first section\n,col2\n,col3\n-- second section\n,col4\nfrom t1;";
+        let source =
+            "select\ncol1\n-- first section\n,col2\n,col3\n-- second section\n,col4\nfrom t1;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted.contains("    -- first section\n"),
@@ -13393,7 +13427,8 @@ mod format_comment_indent_tests {
 
     #[test]
     fn format_sql_basic_indents_comment_before_and_in_join_on() {
-        let source = "select * from t1 join t2 on t1.id = t2.id\n-- extra condition\nand t1.status = 'A';";
+        let source =
+            "select * from t1 join t2 on t1.id = t2.id\n-- extra condition\nand t1.status = 'A';";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
             formatted.contains("    -- extra condition\n    AND t1.status"),
