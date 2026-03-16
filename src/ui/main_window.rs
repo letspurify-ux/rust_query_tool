@@ -1222,7 +1222,7 @@ impl MainWindow {
         let mut edit_delete_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Delete");
-        edit_delete_btn.set_color(theme::button_warning());
+        edit_delete_btn.set_color(theme::button_danger());
         edit_delete_btn.set_label_color(theme::text_primary());
         edit_delete_btn.set_frame(FrameType::RFlatBox);
         edit_delete_btn.set_tooltip("Delete selected row(s) in staged edit mode");

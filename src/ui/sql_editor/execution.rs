@@ -2542,6 +2542,20 @@ impl SqlEditorWidget {
                                 force_select_list_newline(&mut out, &mut select_list_layout_state);
                             }
                             trim_trailing_space(&mut out);
+                            if out.ends_with('\n') || at_line_start {
+                                if line_indent == 0
+                                    && (matches!(current_clause.as_deref(), Some("SELECT"))
+                                        || column_list_stack.last().copied().unwrap_or(false)
+                                        || matches!(
+                                            tokens.get(idx.saturating_sub(1)),
+                                            Some(SqlToken::Comment(comment))
+                                                if comment.trim_start().starts_with("--")
+                                        ))
+                                {
+                                    line_indent = base_indent(indent_level, open_cursor_state) + 1;
+                                }
+                                ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            }
                             out.push(',');
                             between_pending = false;
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
@@ -3023,10 +3037,22 @@ impl SqlEditorWidget {
                         .to_ascii_uppercase()
                         .starts_with("SELECT /*+")
                 });
+            let previous_line_has_line_comment =
+                last_code_line_trimmed.as_deref().is_some_and(|prev| {
+                    let prev_trimmed = prev.trim_start();
+                    prev_trimmed.starts_with("--")
+                        || prev.contains("--")
+                        || Self::is_sqlplus_remark_comment_statement(prev_trimmed)
+                });
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
             let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
+                effective_depth.max(1)
+            } else {
+                effective_depth
+            };
+            let effective_depth = if trimmed.starts_with(',') && previous_line_has_line_comment {
                 effective_depth.max(1)
             } else {
                 effective_depth
@@ -11068,6 +11094,19 @@ ALTER TRIGGER trg_demo ENABLE;"#;
         assert!(
             !formatted.contains("; \n-- trailing note"),
             "Formatter should not leave whitespace before newline-attached line comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comma_indent_after_line_comment_in_select_list() {
+        let source = "select abc -- comment\n, def\nfrom efg;";
+
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("SELECT\n    abc -- comment\n    ,\n    def\nFROM efg;"),
+            "Formatter should keep select-list depth for leading comma after line comment, got:\n{}",
             formatted
         );
     }
