@@ -2911,7 +2911,7 @@ impl SqlEditorWidget {
             return formatted.to_string();
         }
 
-        let depths = QueryExecutor::line_block_depths(formatted);
+        let depths = QueryExecutor::line_auto_format_depths(formatted);
         let line_count = formatted.lines().count();
         if depths.len() != line_count {
             return formatted.to_string();
@@ -2921,7 +2921,6 @@ impl SqlEditorWidget {
             Self::multiline_string_continuation_lines(formatted, line_count);
 
         let mut out = String::new();
-        let mut into_list_active = false;
         let mut in_dml_statement = false;
         let mut in_block_comment = false;
         let mut paren_case_expression_depth = 0usize;
@@ -2972,17 +2971,7 @@ impl SqlEditorWidget {
 
                 let leading_spaces = line.len().saturating_sub(trimmed.len());
                 let existing_indent = leading_spaces / 4;
-                let previous_line_ends_with_list_comma = last_code_line_trimmed
-                    .as_deref()
-                    .is_some_and(Self::line_ends_with_comma_before_inline_comment);
-                let extra_indent = if into_list_active
-                    || (in_dml_statement && previous_line_ends_with_list_comma)
-                {
-                    1
-                } else {
-                    0
-                };
-                let parser_depth = depth + extra_indent;
+                let parser_depth = depth;
                 // Look ahead to find the next non-comment, non-empty line.
                 // If it starts with ELSE/ELSIF/ELSEIF, align this comment
                 // with that keyword (one level less than the body depth).
@@ -3039,15 +3028,7 @@ impl SqlEditorWidget {
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
             if starts_dml {
                 in_dml_statement = true;
-                into_list_active = false;
             }
-            let starts_into = crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
-            let starts_into_ender = Self::ends_into_list_context(&trimmed_upper);
-            let extra_indent = if into_list_active && !starts_into_ender {
-                1
-            } else {
-                0
-            };
             let paren_case_extra_indent = if !in_dml_statement
                 && in_paren_case_expression
                 && (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
@@ -3122,7 +3103,7 @@ impl SqlEditorWidget {
 
             let leading_spaces = line.len().saturating_sub(trimmed.len());
             let existing_indent = leading_spaces / 4;
-            let parser_depth = depth + extra_indent + paren_case_extra_indent;
+            let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
             let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
             let paren_case_closer_extra_indent = usize::from(is_paren_case_closer);
@@ -3193,18 +3174,8 @@ impl SqlEditorWidget {
                 pending_paren_case_closer_indent = false;
             }
 
-            if starts_into_ender {
-                into_list_active = false;
-            }
-            if starts_into {
-                into_list_active = true;
-            }
-            if trimmed.ends_with(';') {
-                into_list_active = false;
-            }
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
-                into_list_active = false;
             }
             last_code_line_trimmed = Some(trimmed.to_string());
         }
@@ -3282,28 +3253,6 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
-    }
-
-    fn ends_into_list_context(trimmed_upper: &str) -> bool {
-        Self::is_dml_clause_starter(trimmed_upper)
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "END")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "EXCEPTION")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSIF")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSEIF")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ELSE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHEN")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "BEGIN")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "LOOP")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CASE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INSERT")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UPDATE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "DELETE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MERGE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "FETCH")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "OPEN")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CLOSE")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "RETURN")
-            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "EXIT")
     }
 
     fn multiline_string_continuation_lines(formatted: &str, line_count: usize) -> Vec<bool> {
@@ -3470,22 +3419,6 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) => {
                     let trailing_symbol = sym.trim_end();
                     return trailing_symbol.ends_with('(');
-                }
-                _ => return false,
-            }
-        }
-
-        false
-    }
-
-    fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
-        let tokens = super::query_text::tokenize_sql(line);
-        for token in tokens.iter().rev() {
-            match token {
-                SqlToken::Comment(_) => continue,
-                SqlToken::Symbol(sym) => {
-                    let trailing_symbol = sym.trim_end();
-                    return trailing_symbol.ends_with(',');
                 }
                 _ => return false,
             }
