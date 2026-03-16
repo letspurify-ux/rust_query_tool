@@ -1045,6 +1045,54 @@ pub(crate) fn is_sqlplus_comment_line(line: &str) -> bool {
     trimmed.starts_with("--") || is_sqlplus_remark_comment_line(trimmed)
 }
 
+/// Updates `in_block_comment` state for a single trimmed line.
+///
+/// This properly handles lines that contain both `*/` (closing) and `/*` (opening)
+/// on the same line (e.g. `*/ SELECT /* ... `).  Both `line_auto_format_depths` and
+/// `apply_parser_depth_indentation` must use this instead of ad-hoc `contains("*/")`.
+pub(crate) fn update_block_comment_state(trimmed: &str, in_block_comment: &mut bool) {
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if *in_block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                *in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        } else {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                *in_block_comment = true;
+                i += 2;
+                continue;
+            }
+            // Stop scanning at line comment
+            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                break;
+            }
+            // Skip string literals to avoid false matches on /* */ inside strings
+            if bytes[i] == b'\'' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Returns true if `word` is one of the shared Oracle SQL keywords.
 #[inline]
 pub(crate) fn is_oracle_sql_keyword(word: &str) -> bool {

@@ -1134,7 +1134,7 @@ fn semicolon_split_resets_transient_state_at_top_level() {
         armed_at_block_depth: 0,
     };
     engine.state.if_state = IfState::AwaitingThen;
-    engine.state.paren_depth = 0;
+    engine.state.clear_paren_stack();
 
     engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
 
@@ -1143,7 +1143,7 @@ fn semicolon_split_resets_transient_state_at_top_level() {
     assert_eq!(engine.state.pending_end, PendingEnd::None);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 
 #[test]
@@ -1215,7 +1215,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
         armed_at_block_depth: 1,
     };
     engine.state.if_state = IfState::AfterConditionParen;
-    engine.state.paren_depth = 0;
+    engine.state.clear_paren_stack();
 
     engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
 
@@ -1225,7 +1225,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
     assert_eq!(engine.state.pending_end, PendingEnd::None);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 
 #[test]
@@ -1962,14 +1962,17 @@ fn finalize_clears_transient_parser_state_for_reuse() {
     let mut engine = SqlParserEngine::new();
     engine.process_line("FOR i IN 1..10");
     engine.process_line("IF flag");
-    engine.state.paren_depth = 3;
+    // Simulate 3 unmatched open parens via the stack API.
+    engine.state.push_open_paren('(');
+    engine.state.push_open_paren('(');
+    engine.state.push_open_paren('(');
 
     let statements = engine.finalize_and_take_statements();
 
     assert_eq!(statements, vec!["FOR i IN 1..10\nIF flag".to_string()]);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 #[test]
 fn type_spec_as_is_follow_state_is_cleared_by_declarative_kind_token() {

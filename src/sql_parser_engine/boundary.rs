@@ -766,16 +766,16 @@ impl SemicolonAction {
             return Self::AppendToCurrent;
         }
 
-        if state.block_depth() == 0 && state.paren_depth == 0 && !state.in_with_plsql_declaration()
+        if state.block_depth() == 0 && state.paren_depth() == 0 && !state.in_with_plsql_declaration()
         {
             return Self::SplitTopLevel;
         }
 
-        if state.paren_depth == 0 && state.should_split_on_semicolon() {
+        if state.paren_depth() == 0 && state.should_split_on_semicolon() {
             return Self::SplitForcedRoutine;
         }
 
-        if state.paren_depth == 0 && state.should_close_routine_block_on_semicolon() {
+        if state.paren_depth() == 0 && state.should_close_routine_block_on_semicolon() {
             return Self::CloseRoutineBlock;
         }
 
@@ -789,7 +789,7 @@ impl AsIsBlockStart {
             return Self::None;
         }
 
-        if state.paren_depth != 0 {
+        if state.paren_depth() != 0 {
             return Self::None;
         }
 

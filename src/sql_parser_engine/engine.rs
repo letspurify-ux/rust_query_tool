@@ -210,7 +210,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn paren_depth(&self) -> usize {
-        self.state.paren_depth
+        self.state.paren_depth()
     }
 
     pub(crate) fn can_terminate_on_slash(&self) -> bool {
@@ -315,10 +315,10 @@ impl SqlParserEngine {
 
     fn handle_identifier_start_candidate(&mut self, chars: &[char], i: usize) {
         let should_preview = self.state.token.is_empty()
-            && ((self.state.block_depth() == 1 && self.state.paren_depth == 0)
+            && ((self.state.block_depth() == 1 && self.state.paren_depth() == 0)
                 || (self.state.in_with_plsql_declaration()
                     && self.state.block_depth() == 0
-                    && self.state.paren_depth == 0));
+                    && self.state.paren_depth() == 0));
 
         if !should_preview {
             return;
@@ -567,7 +567,7 @@ impl SqlParserEngine {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth() == 0
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();
@@ -583,7 +583,7 @@ impl SqlParserEngine {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth() == 0
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();
@@ -738,7 +738,7 @@ impl SqlParserEngine {
                             // Keep waiting.
                         }
                         IfSymbolEvent::OpenParen => {
-                            let condition_depth = self.state.paren_depth.saturating_add(1);
+                            let condition_depth = self.state.paren_depth().saturating_add(1);
                             self.state.if_state = IfState::InConditionParen {
                                 depth: condition_depth,
                             };
@@ -765,19 +765,19 @@ impl SqlParserEngine {
             // Check if closing paren matches IF condition paren
             if symbol_role == SymbolRole::CloseParen {
                 if let IfState::InConditionParen { depth } = self.state.if_state {
-                    if depth == self.state.paren_depth {
+                    if depth == self.state.paren_depth() {
                         self.state.if_state = IfState::AfterConditionParen;
                     }
                 }
             }
 
-            // Track parenthesis depth
+            // Track parenthesis depth via stack (mismatch-safe)
             match symbol_role {
                 SymbolRole::OpenParen => {
-                    self.state.paren_depth += 1;
+                    self.state.push_open_paren(c);
                 }
                 SymbolRole::CloseParen => {
-                    self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+                    self.state.pop_close_paren(c);
                 }
                 _ => {}
             }
@@ -823,6 +823,39 @@ impl SqlParserEngine {
         self.process_line_with_observers(line, on_symbol, |_, _| {});
     }
 
+    /// Like [`process_line_with_observer`] but the callback receives the original
+    /// line bytes and the **byte offset** of the symbol instead of a `&[char]`
+    /// slice and char index.  This satisfies the byte-offset policy for callers
+    /// that need to perform lookahead on the raw line.
+    pub(crate) fn process_line_with_byte_observer<F>(&mut self, line: &str, mut on_symbol: F)
+    where
+        F: FnMut(&[u8], usize, u8),
+    {
+        // Pre-compute a char-index → byte-offset mapping for `line + '\n'`.
+        let line_bytes = line.as_bytes();
+        let line_byte_len = line_bytes.len();
+        let mut char_to_byte: Vec<usize> = Vec::with_capacity(line.len() + 1);
+        for (byte_pos, _) in line.char_indices() {
+            char_to_byte.push(byte_pos);
+        }
+        // Trailing '\n' appended by the engine maps to `line_byte_len`.
+        char_to_byte.push(line_byte_len);
+
+        self.process_line_with_observers(
+            line,
+            |_chars, char_idx, ch, _next| {
+                if !ch.is_ascii() {
+                    return;
+                }
+                let byte_idx = char_to_byte.get(char_idx).copied().unwrap_or(line_byte_len);
+                if byte_idx < line_byte_len {
+                    on_symbol(line_bytes, byte_idx, ch as u8);
+                }
+            },
+            |_, _| {},
+        );
+    }
+
     fn process_line_with_observers<F, G>(
         &mut self,
         line: &str,
@@ -836,7 +869,7 @@ impl SqlParserEngine {
         let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
             && self.state.with_clause_waiting_main_query()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0;
+            && self.state.paren_depth() == 0;
         let mut on_symbol = on_symbol;
         let mut on_statement_boundary = on_statement_boundary;
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
@@ -854,7 +887,7 @@ impl SqlParserEngine {
 
         let line_starts_at_statement_boundary = self.state.is_idle()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0
+            && self.state.paren_depth() == 0
             && !self.state.in_with_plsql_declaration()
             && self.current.trim().is_empty();
         if line_starts_at_statement_boundary && sql_text::is_auto_terminated_tool_command(line) {
@@ -875,7 +908,7 @@ impl SqlParserEngine {
         if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
             && self.state.is_idle()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0
+            && self.state.paren_depth() == 0
             && sql_text::is_auto_terminated_tool_command(line)
         {
             self.finish_current_statement();

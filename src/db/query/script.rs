@@ -250,26 +250,26 @@ impl QueryExecutor {
             }
         }
 
-        fn chars_word_eq_ignore_ascii_case(
-            chars: &[char],
+        fn bytes_word_eq_ignore_ascii_case(
+            bytes: &[u8],
             start: usize,
             end: usize,
             keyword: &str,
         ) -> bool {
-            let expected_len = keyword.chars().count();
-            if end.saturating_sub(start) != expected_len {
+            let span = end.saturating_sub(start);
+            if span != keyword.len() {
                 return false;
             }
-            chars[start..end]
+            bytes[start..end]
                 .iter()
-                .zip(keyword.chars())
-                .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+                .zip(keyword.as_bytes())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
         }
 
-        fn chars_word_is_subquery_head_keyword(chars: &[char], start: usize, end: usize) -> bool {
+        fn bytes_word_is_subquery_head_keyword(bytes: &[u8], start: usize, end: usize) -> bool {
             sql_text::SUBQUERY_HEAD_KEYWORDS
                 .iter()
-                .any(|keyword| chars_word_eq_ignore_ascii_case(chars, start, end, keyword))
+                .any(|keyword| bytes_word_eq_ignore_ascii_case(bytes, start, end, keyword))
         }
 
         fn leading_keyword_after_comments<'a>(
@@ -405,16 +405,16 @@ impl QueryExecutor {
             subquery_closes
         }
 
-        fn skip_ws_and_comments(chars: &[char], mut idx: usize) -> usize {
+        fn skip_ws_and_comments_bytes(bytes: &[u8], mut idx: usize) -> usize {
             loop {
-                while idx < chars.len() && chars[idx].is_whitespace() {
+                while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
                     idx += 1;
                 }
 
-                if idx + 1 < chars.len() && chars[idx] == '/' && chars[idx + 1] == '*' {
+                if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
                     idx += 2;
-                    while idx + 1 < chars.len() {
-                        if chars[idx] == '*' && chars[idx + 1] == '/' {
+                    while idx + 1 < bytes.len() {
+                        if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
                             idx += 2;
                             break;
                         }
@@ -423,9 +423,9 @@ impl QueryExecutor {
                     continue;
                 }
 
-                if idx + 1 < chars.len() && chars[idx] == '-' && chars[idx + 1] == '-' {
+                if idx + 1 < bytes.len() && bytes[idx] == b'-' && bytes[idx + 1] == b'-' {
                     idx += 2;
-                    while idx < chars.len() && chars[idx] != '\n' {
+                    while idx < bytes.len() && bytes[idx] != b'\n' {
                         idx += 1;
                     }
                     continue;
@@ -434,15 +434,15 @@ impl QueryExecutor {
                 // SQL*Plus comment command (REM/REMARK) can appear after
                 // an opening parenthesis on the same line, and the nested
                 // SELECT/WITH may start on the next line.
-                if idx < chars.len() && sql_text::is_identifier_char(chars[idx]) {
+                if idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
                     let start = idx;
-                    while idx < chars.len() && sql_text::is_identifier_char(chars[idx]) {
+                    while idx < bytes.len() && sql_text::is_identifier_byte(bytes[idx]) {
                         idx += 1;
                     }
-                    if chars_word_eq_ignore_ascii_case(chars, start, idx, "REM")
-                        || chars_word_eq_ignore_ascii_case(chars, start, idx, "REMARK")
+                    if bytes_word_eq_ignore_ascii_case(bytes, start, idx, "REM")
+                        || bytes_word_eq_ignore_ascii_case(bytes, start, idx, "REMARK")
                     {
-                        while idx < chars.len() && chars[idx] != '\n' {
+                        while idx < bytes.len() && bytes[idx] != b'\n' {
                             idx += 1;
                         }
                         continue;
@@ -1018,22 +1018,24 @@ impl QueryExecutor {
                 }
             }
 
-            builder.process_line_with_observer(line, |chars, symbol_idx, symbol, _next| {
-                if symbol == '(' {
-                    let j = skip_ws_and_comments(chars, symbol_idx.saturating_add(1));
+            builder.process_line_with_byte_observer(line, |bytes, byte_idx, symbol| {
+                if symbol == b'(' {
+                    let j = skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
                     let mut k = j;
                     let mut paren_kind = SubqueryParenKind::NonSubquery;
-                    while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_') {
+                    while k < bytes.len()
+                        && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    {
                         k += 1;
                     }
                     if k > j {
-                        if chars_word_is_subquery_head_keyword(chars, j, k) {
+                        if bytes_word_is_subquery_head_keyword(bytes, j, k) {
                             subquery_paren_depth = subquery_paren_depth.saturating_add(1);
                             paren_kind = SubqueryParenKind::Subquery;
                         }
-                    } else if j >= chars.len()
-                        || (chars[j] == '-' && j + 1 < chars.len() && chars[j + 1] == '-')
-                        || (chars[j] == '/' && j + 1 < chars.len() && chars[j + 1] == '*')
+                    } else if j >= bytes.len()
+                        || (bytes[j] == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'-')
+                        || (bytes[j] == b'/' && j + 1 < bytes.len() && bytes[j + 1] == b'*')
                     {
                         pending_subquery_paren = pending_subquery_paren.saturating_add(1);
                         paren_kind = SubqueryParenKind::Pending;
@@ -1044,7 +1046,7 @@ impl QueryExecutor {
                             *paren_depth += 1;
                         }
                     }
-                } else if symbol == ')' {
+                } else if symbol == b')' {
                     let closed_kind = subquery_paren_stack.pop();
                     if closed_kind == Some(SubqueryParenKind::Subquery) {
                         subquery_paren_depth = subquery_paren_depth.saturating_sub(1);
@@ -1224,17 +1226,13 @@ impl QueryExecutor {
 
             if state.in_block_comment {
                 depths.push(base_depth);
-                if trimmed.contains("*/") {
-                    state.in_block_comment = false;
-                }
+                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
                 continue;
             }
 
             if trimmed.starts_with("/*") {
                 depths.push(base_depth);
-                if !trimmed.contains("*/") {
-                    state.in_block_comment = true;
-                }
+                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
                 continue;
             }
 
