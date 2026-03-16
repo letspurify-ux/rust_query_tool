@@ -129,6 +129,378 @@ fn text_columns(text: &str) -> usize {
     text.chars().count().saturating_mul(6).saturating_sub(1)
 }
 
+const GLYPH_ROWS: usize = 7;
+const GLYPH_COLS: usize = 5;
+const PADDED_GLYPH_ROWS: usize = GLYPH_ROWS + 2;
+const PADDED_GLYPH_COLS: usize = GLYPH_COLS + 2;
+
+#[derive(Clone, Copy)]
+enum TriangleCutCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+fn fill_mask_pixel(mask: &mut [u8], width: usize, height: usize, x: usize, y: usize, alpha: u8) {
+    if x >= width || y >= height {
+        return;
+    }
+
+    let idx = y.saturating_mul(width).saturating_add(x);
+    if let Some(cell) = mask.get_mut(idx) {
+        *cell = (*cell).max(alpha);
+    }
+}
+
+fn fill_mask_rect(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    alpha: u8,
+) {
+    let max_y = origin_y.saturating_add(rect_height).min(height);
+    let max_x = origin_x.saturating_add(rect_width).min(width);
+
+    for py in origin_y..max_y {
+        for px in origin_x..max_x {
+            fill_mask_pixel(mask, width, height, px, py, alpha);
+        }
+    }
+}
+
+fn triangle_edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
+    (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+}
+
+fn fill_mask_triangle(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    vertices: [(f32, f32); 3],
+    alpha: u8,
+) {
+    let min_x = vertices
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as usize;
+    let max_x = vertices
+        .iter()
+        .map(|(x, _)| *x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(width as f32) as usize;
+    let min_y = vertices
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as usize;
+    let max_y = vertices
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(height as f32) as usize;
+
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    let area = triangle_edge(
+        vertices[0].0,
+        vertices[0].1,
+        vertices[1].0,
+        vertices[1].1,
+        vertices[2].0,
+        vertices[2].1,
+    );
+    if area.abs() <= f32::EPSILON {
+        return;
+    }
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let sample_x = px as f32 + 0.5;
+            let sample_y = py as f32 + 0.5;
+
+            let w0 = triangle_edge(
+                vertices[1].0,
+                vertices[1].1,
+                vertices[2].0,
+                vertices[2].1,
+                sample_x,
+                sample_y,
+            );
+            let w1 = triangle_edge(
+                vertices[2].0,
+                vertices[2].1,
+                vertices[0].0,
+                vertices[0].1,
+                sample_x,
+                sample_y,
+            );
+            let w2 = triangle_edge(
+                vertices[0].0,
+                vertices[0].1,
+                vertices[1].0,
+                vertices[1].1,
+                sample_x,
+                sample_y,
+            );
+
+            let inside = if area > 0.0 {
+                w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
+            } else {
+                w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
+            };
+
+            if inside {
+                fill_mask_pixel(mask, width, height, px, py, alpha);
+            }
+        }
+    }
+}
+
+fn draw_cell_corner_triangle(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    scale: usize,
+    cut_corner: TriangleCutCorner,
+    alpha: u8,
+) {
+    let x0 = origin_x as f32;
+    let y0 = origin_y as f32;
+    let x1 = origin_x.saturating_add(scale) as f32;
+    let y1 = origin_y.saturating_add(scale) as f32;
+
+    let vertices = match cut_corner {
+        TriangleCutCorner::TopLeft => [(x1, y0), (x0, y1), (x1, y1)],
+        TriangleCutCorner::TopRight => [(x0, y0), (x0, y1), (x1, y1)],
+        TriangleCutCorner::BottomLeft => [(x0, y0), (x1, y0), (x1, y1)],
+        TriangleCutCorner::BottomRight => [(x0, y0), (x1, y0), (x0, y1)],
+    };
+
+    fill_mask_triangle(mask, width, height, vertices, alpha);
+}
+
+fn glyph_cell_filled(rows: &[u8; 7], row: usize, col: usize) -> bool {
+    let Some(row_bits) = rows.get(row).copied() else {
+        return false;
+    };
+    if col >= GLYPH_COLS {
+        return false;
+    }
+
+    let mask_bit = 1u8 << (4usize.saturating_sub(col));
+    row_bits & mask_bit != 0
+}
+
+fn padded_glyph_cell_filled(rows: &[u8; 7], padded_row: usize, padded_col: usize) -> bool {
+    if padded_row == 0
+        || padded_col == 0
+        || padded_row > GLYPH_ROWS
+        || padded_col > GLYPH_COLS
+    {
+        return false;
+    }
+
+    glyph_cell_filled(rows, padded_row - 1, padded_col - 1)
+}
+
+fn build_glyph_exterior_map(rows: &[u8; 7]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
+    let mut exterior = [false; GLYPH_ROWS * GLYPH_COLS];
+    let mut visited = [false; PADDED_GLYPH_ROWS * PADDED_GLYPH_COLS];
+    let mut stack = vec![(0usize, 0usize)];
+
+    while let Some((row, col)) = stack.pop() {
+        if row >= PADDED_GLYPH_ROWS || col >= PADDED_GLYPH_COLS {
+            continue;
+        }
+
+        let visited_idx = row
+            .saturating_mul(PADDED_GLYPH_COLS)
+            .saturating_add(col);
+        if visited.get(visited_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        if padded_glyph_cell_filled(rows, row, col) {
+            continue;
+        }
+
+        if let Some(cell) = visited.get_mut(visited_idx) {
+            *cell = true;
+        }
+
+        if (1..=GLYPH_ROWS).contains(&row) && (1..=GLYPH_COLS).contains(&col) {
+            let glyph_idx = (row - 1)
+                .saturating_mul(GLYPH_COLS)
+                .saturating_add(col - 1);
+            if let Some(cell) = exterior.get_mut(glyph_idx) {
+                *cell = true;
+            }
+        }
+
+        if row > 0 {
+            stack.push((row - 1, col));
+        }
+        if row + 1 < PADDED_GLYPH_ROWS {
+            stack.push((row + 1, col));
+        }
+        if col > 0 {
+            stack.push((row, col - 1));
+        }
+        if col + 1 < PADDED_GLYPH_COLS {
+            stack.push((row, col + 1));
+        }
+    }
+
+    exterior
+}
+
+fn glyph_cell_exterior_empty(
+    rows: &[u8; 7],
+    exterior: &[bool; GLYPH_ROWS * GLYPH_COLS],
+    row: usize,
+    col: usize,
+) -> bool {
+    if glyph_cell_filled(rows, row, col) {
+        return false;
+    }
+
+    let idx = row.saturating_mul(GLYPH_COLS).saturating_add(col);
+    exterior.get(idx).copied().unwrap_or(false)
+}
+
+fn glyph_cell_exterior_score(
+    rows: &[u8; 7],
+    exterior: &[bool; GLYPH_ROWS * GLYPH_COLS],
+    row: usize,
+    col: usize,
+) -> usize {
+    let mut score = 0usize;
+
+    for row_offset in -1isize..=1 {
+        for col_offset in -1isize..=1 {
+            if row_offset == 0 && col_offset == 0 {
+                continue;
+            }
+
+            let next_row = row as isize + row_offset;
+            let next_col = col as isize + col_offset;
+            if next_row < 0
+                || next_col < 0
+                || next_row >= GLYPH_ROWS as isize
+                || next_col >= GLYPH_COLS as isize
+            {
+                score = score.saturating_add(1);
+                continue;
+            }
+
+            let neighbor_row = next_row as usize;
+            let neighbor_col = next_col as usize;
+            if glyph_cell_exterior_empty(rows, exterior, neighbor_row, neighbor_col) {
+                score = score.saturating_add(1);
+            }
+        }
+    }
+
+    score
+}
+
+fn draw_glyph_triangle_fills(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    rows: &[u8; 7],
+    scale: usize,
+    origin_x: usize,
+    origin_y: usize,
+) {
+    let exterior = build_glyph_exterior_map(rows);
+
+    for row in 0..(GLYPH_ROWS - 1) {
+        for col in 0..(GLYPH_COLS - 1) {
+            let tl = glyph_cell_filled(rows, row, col);
+            let tr = glyph_cell_filled(rows, row, col + 1);
+            let bl = glyph_cell_filled(rows, row + 1, col);
+            let br = glyph_cell_filled(rows, row + 1, col + 1);
+
+            let base_x = origin_x.saturating_add(col.saturating_mul(scale));
+            let base_y = origin_y.saturating_add(row.saturating_mul(scale));
+
+            if tl && br && !tr && !bl {
+                let tr_score = glyph_cell_exterior_score(rows, &exterior, row, col + 1);
+                let bl_score = glyph_cell_exterior_score(rows, &exterior, row + 1, col);
+                let tr_exterior = glyph_cell_exterior_empty(rows, &exterior, row, col + 1);
+                let bl_exterior = glyph_cell_exterior_empty(rows, &exterior, row + 1, col);
+
+                if tr_exterior && (!bl_exterior || tr_score > bl_score) {
+                    draw_cell_corner_triangle(
+                        mask,
+                        width,
+                        height,
+                        base_x.saturating_add(scale),
+                        base_y,
+                        scale,
+                        TriangleCutCorner::TopRight,
+                        255,
+                    );
+                } else if bl_exterior && (!tr_exterior || bl_score > tr_score) {
+                    draw_cell_corner_triangle(
+                        mask,
+                        width,
+                        height,
+                        base_x,
+                        base_y.saturating_add(scale),
+                        scale,
+                        TriangleCutCorner::BottomLeft,
+                        255,
+                    );
+                }
+            } else if tr && bl && !tl && !br {
+                let tl_score = glyph_cell_exterior_score(rows, &exterior, row, col);
+                let br_score = glyph_cell_exterior_score(rows, &exterior, row + 1, col + 1);
+                let tl_exterior = glyph_cell_exterior_empty(rows, &exterior, row, col);
+                let br_exterior = glyph_cell_exterior_empty(rows, &exterior, row + 1, col + 1);
+
+                if tl_exterior && (!br_exterior || tl_score > br_score) {
+                    draw_cell_corner_triangle(
+                        mask,
+                        width,
+                        height,
+                        base_x,
+                        base_y,
+                        scale,
+                        TriangleCutCorner::TopLeft,
+                        255,
+                    );
+                } else if br_exterior && (!tl_exterior || br_score > tl_score) {
+                    draw_cell_corner_triangle(
+                        mask,
+                        width,
+                        height,
+                        base_x.saturating_add(scale),
+                        base_y.saturating_add(scale),
+                        scale,
+                        TriangleCutCorner::BottomRight,
+                        255,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn draw_text_mask(
     mask: &mut [u8],
     width: usize,
@@ -153,19 +525,11 @@ fn draw_text_mask(
 
                 let x = glyph_origin_x.saturating_add(col_index.saturating_mul(scale));
                 let y = origin_y.saturating_add(row_index.saturating_mul(scale));
-                let max_y = y.saturating_add(scale).min(height);
-                let max_x = x.saturating_add(scale).min(width);
-
-                for py in y..max_y {
-                    for px in x..max_x {
-                        let idx = py * width + px;
-                        if let Some(cell) = mask.get_mut(idx) {
-                            *cell = 255;
-                        }
-                    }
-                }
+                fill_mask_rect(mask, width, height, x, y, scale, scale, 255);
             }
         }
+
+        draw_glyph_triangle_fills(mask, width, height, &rows, scale, glyph_origin_x, origin_y);
     }
 }
 
