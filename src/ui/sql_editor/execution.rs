@@ -2494,6 +2494,8 @@ impl SqlEditorWidget {
                     let comment_starts_line = at_line_start;
                     if comment_starts_line {
                         let base = base_indent(indent_level, open_cursor_state);
+                        let paren_extra =
+                            if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         let current_select_indent = list_item_indent(
                             indent_level,
                             open_cursor_state,
@@ -2543,13 +2545,13 @@ impl SqlEditorWidget {
                             } else if in_if_block {
                                 base_indent(indent_level.saturating_sub(1), open_cursor_state)
                             } else {
-                                base + 1
+                                base + 1 + paren_extra
                             };
                         } else if next_is_condition_keyword {
                             // Condition keywords (AND/OR/WHEN/ON) are
-                            // indented at base+1 regardless of stored
-                            // select-list layout state.
-                            line_indent = base + 1;
+                            // indented at base+1, matching the token
+                            // handler's paren_extra offset.
+                            line_indent = base + 1 + paren_extra;
                         } else if in_confirmed_list {
                             line_indent = current_select_indent;
                         } else if line_indent == 0 {
@@ -14220,6 +14222,73 @@ mod format_comment_indent_tests {
         assert!(
             formatted.contains("    -- update col2\n    ,"),
             "Comment in MERGE UPDATE SET list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── paren_extra: 괄호 내부에서 condition/ELSE 주석 정렬 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_and_inside_parens() {
+        let source = "select * from t1 where func(col1 = 1\n-- extra\nand col2 = 2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- extra")).unwrap();
+        let and_line = lines.iter().find(|l| l.trim_start().starts_with("AND col2")).unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(and_line),
+            "Comment before AND inside parens should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_else_in_case_inside_parens() {
+        let source =
+            "select func(case when col1 = 1 then 'a'\n-- default\nelse 'b' end) from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- default")).unwrap();
+        let else_line = lines.iter().find(|l| l.trim_start().starts_with("ELSE")).unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(else_line),
+            "Comment before ELSE in CASE inside parens should match ELSE indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_when_in_case_inside_parens() {
+        let source =
+            "select func(case\n-- first branch\nwhen col1 = 1 then 'a'\n-- second branch\nwhen col1 = 2 then 'b' end) from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- first branch")).unwrap();
+        let when_line = lines
+            .iter()
+            .find(|l| l.trim_start().starts_with("WHEN col1 = 1"))
+            .unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(when_line),
+            "Comment before WHEN in CASE inside parens should match WHEN indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_or_inside_parens() {
+        let source = "select * from t1 where (col1 = 1\n-- alt condition\nor col2 = 2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_line = lines.iter().find(|l| l.contains("-- alt condition")).unwrap();
+        let or_line = lines.iter().find(|l| l.trim_start().starts_with("OR col2")).unwrap();
+        assert_eq!(
+            leading_spaces(comment_line),
+            leading_spaces(or_line),
+            "Comment before OR inside parens should match OR indent, got:\n{}",
             formatted
         );
     }
