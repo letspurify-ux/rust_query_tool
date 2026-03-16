@@ -1053,7 +1053,7 @@ impl QueryExecutor {
                     }
                     if with_cte_depth > 0 {
                         for paren_depth in &mut with_cte_paren_stack {
-                            *paren_depth -= 1;
+                            *paren_depth = paren_depth.saturating_sub(1);
                         }
                     }
                 }
