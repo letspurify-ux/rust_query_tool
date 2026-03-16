@@ -2476,11 +2476,20 @@ impl SqlEditorWidget {
                             next_non_comment,
                             Some(SqlToken::Symbol(s)) if s == ","
                         );
+                        let next_is_condition_keyword =
+                            if let Some(SqlToken::Word(w)) = next_non_comment {
+                                let upper = w.to_ascii_uppercase();
+                                condition_keywords.contains(&upper.as_str())
+                                    && !(upper == "AND" && between_pending)
+                            } else {
+                                false
+                            };
                         let in_confirmed_list = in_set_clause
                             || column_list_stack.last().copied().unwrap_or(false)
                             || ((in_select_list || active_list_layout)
-                                && (select_list_layout_state.is_multiline()
-                                    || next_is_comma));
+                                && select_list_layout_state.is_multiline())
+                            || next_is_comma
+                            || next_is_condition_keyword;
                         if in_confirmed_list {
                             line_indent = current_select_indent;
                         } else if line_indent == 0 {
@@ -3634,7 +3643,7 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let mut formatted_cols: Vec<(bool, String, String, String)> = Vec::new();
+        let mut formatted_cols: Vec<(bool, String, String, String, Vec<String>)> = Vec::new();
         let mut max_name = 0usize;
         let mut max_type = 0usize;
 
@@ -3651,13 +3660,33 @@ impl SqlEditorWidget {
                 _ => false,
             };
 
+            // Collect line comments from this column group
+            let mut col_comments: Vec<String> = Vec::new();
+            for token in column {
+                if let SqlToken::Comment(comment) = token {
+                    let body = comment.strip_prefix('\n').unwrap_or(comment);
+                    let trimmed = body.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        col_comments.push(trimmed.to_string());
+                    }
+                }
+            }
+
             if is_constraint {
-                let text = Self::join_tokens_spaced(column, 0);
-                formatted_cols.push((true, text, String::new(), String::new()));
+                let non_comment_tokens: Vec<SqlToken> = column
+                    .iter()
+                    .filter(|t| !matches!(t, SqlToken::Comment(_)))
+                    .cloned()
+                    .collect();
+                let text = Self::join_tokens_spaced(&non_comment_tokens, 0);
+                formatted_cols.push((true, text, String::new(), String::new(), col_comments));
                 continue;
             }
 
-            let mut tokens_iter = column.iter().peekable();
+            let mut tokens_iter = column
+                .iter()
+                .filter(|t| !matches!(t, SqlToken::Comment(_)))
+                .peekable();
             let name_token = tokens_iter.next();
             let name = name_token.map(Self::token_text).unwrap_or_default();
 
@@ -3687,7 +3716,7 @@ impl SqlEditorWidget {
 
             max_name = max_name.max(name.len());
             max_type = max_type.max(type_str.len());
-            formatted_cols.push((false, name, type_str, rest_str));
+            formatted_cols.push((false, name, type_str, rest_str, col_comments));
         }
 
         let mut out = String::new();
@@ -3696,7 +3725,7 @@ impl SqlEditorWidget {
         out.push_str(" (\n");
 
         let indent = " ".repeat(4);
-        for (idx, (is_constraint, name, type_str, rest_str)) in
+        for (idx, (is_constraint, name, type_str, rest_str, col_comments)) in
             formatted_cols.into_iter().enumerate()
         {
             out.push_str(&indent);
@@ -3719,6 +3748,12 @@ impl SqlEditorWidget {
                 out.push(',');
             }
             out.push('\n');
+            // Output any trailing comments for this column on separate lines
+            for comment in &col_comments {
+                out.push_str(&indent);
+                out.push_str(comment);
+                out.push('\n');
+            }
         }
         out.push(')');
 
@@ -13208,6 +13243,110 @@ mod format_comment_indent_tests {
         assert!(
             formatted.contains("    -- second section\n"),
             "Second section comment should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_group_by_list() {
+        let source = "select col1, col2, count(*) from t1 group by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("GROUP BY col1\n    -- comment\n    ,\n    col2;"),
+            "Comment in GROUP BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_order_by_list() {
+        let source = "select col1, col2 from t1 order by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ORDER BY col1\n    -- comment\n    ,\n    col2;"),
+            "Comment in ORDER BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_from_list() {
+        let source = "select * from t1\n-- join next table\n,t2\n,t3 where t1.id = t2.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FROM t1\n    -- join next table\n    ,\n    t2"),
+            "Comment in FROM table list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_returning_list() {
+        let source = "insert into t1 values (1, 2) returning col1\n-- comment\n,col2 into v1, v2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RETURNING col1\n    -- comment\n    ,\n    col2"),
+            "Comment in RETURNING list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_before_and_in_where() {
+        let source = "select * from t1 where col1 = 1\n-- check col2\nand col2 = 2\n-- check col3\nand col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- check col2\n    AND col2 = 2"),
+            "Comment before AND should match AND indent, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- check col3\n    AND col3 = 3"),
+            "Comment before second AND should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_before_and_in_join_on() {
+        let source = "select * from t1 join t2 on t1.id = t2.id\n-- extra condition\nand t1.status = 'A';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- extra condition\n    AND t1.status"),
+            "Comment before AND in ON clause should match AND indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_insert_column_list() {
+        let source = "insert into t1 (col1\n-- comment\n,col2\n,col3) values (1, 2, 3);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in INSERT column list should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_values_list() {
+        let source = "insert into t1 (col1, col2, col3) values (1\n-- comment\n,2\n,3);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in VALUES list should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_create_table_columns() {
+        let source = "create table t1 (col1 number\n-- comment\n,col2 varchar2(100)\n,col3 date);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("col1 NUMBER,\n    -- comment\n    col2"),
+            "Comment in CREATE TABLE column list should be at column indent, got:\n{}",
             formatted
         );
     }
