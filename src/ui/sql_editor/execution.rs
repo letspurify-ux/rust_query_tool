@@ -2472,25 +2472,16 @@ impl SqlEditorWidget {
                             open_cursor_state,
                             select_list_layout_state,
                         );
-                        if has_leading_newline {
-                            line_indent = if in_set_clause {
-                                current_select_indent
-                            } else if in_select_list && select_list_layout_state.is_multiline() {
-                                current_select_indent
-                            } else {
-                                base
-                            };
-                        } else if top_level_select_list || top_level_set_list {
-                            line_indent = if select_list_layout_state.is_multiline() {
-                                current_select_indent
-                            } else {
-                                base
-                            };
-                        } else if in_select_list
-                            || in_set_clause
-                            || active_list_layout
+                        let next_is_comma = matches!(
+                            next_non_comment,
+                            Some(SqlToken::Symbol(s)) if s == ","
+                        );
+                        let in_confirmed_list = in_set_clause
                             || column_list_stack.last().copied().unwrap_or(false)
-                        {
+                            || ((in_select_list || active_list_layout)
+                                && (select_list_layout_state.is_multiline()
+                                    || next_is_comma));
+                        if in_confirmed_list {
                             line_indent = current_select_indent;
                         } else if line_indent == 0 {
                             line_indent = base;
@@ -2536,11 +2527,21 @@ impl SqlEditorWidget {
                             || column_list_stack.last().copied().unwrap_or(false)
                             || hint_after_select
                         {
-                            line_indent = list_item_indent(
+                            let select_list_indent = list_item_indent(
                                 indent_level,
                                 open_cursor_state,
                                 select_list_layout_state,
                             );
+                            line_indent = select_list_indent;
+                            if (in_select_list || in_set_clause)
+                                && !select_list_layout_state.is_multiline()
+                                && comment_starts_line
+                            {
+                                select_list_layout_state =
+                                    SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
+                            }
                         }
                     } else if is_block_comment && next_is_word_like {
                         let keep_inline_alias_comment = matches!(
@@ -13133,5 +13134,81 @@ mod query_running_reservation_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(*running);
+    }
+}
+
+#[cfg(test)]
+mod format_comment_indent_tests {
+    use crate::ui::sql_editor::SqlEditorWidget;
+
+    #[test]
+    fn format_sql_basic_indents_line_comment_in_select_list_before_comma() {
+        let source = "select col1\n-- comment\n,col2\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SELECT col1\n    -- comment\n    ,\n    col2\nFROM t1;"),
+            "Line comment between select items should be indented at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_mid_list_comment_at_list_depth() {
+        let source = "select col1\n-- comment2\n,col2\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment2\n    ,\n    col2"),
+            "Mid-list comment (before comma) should be indented at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_at_base_indent_before_from_single_item() {
+        let source = "select col1\n-- last column\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SELECT col1\n-- last column\nFROM t1;"),
+            "Inter-clause comment before FROM should stay at base indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_subquery_select_list() {
+        let source = "select * from (select col1\n-- comment\n,col2\nfrom t1);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SELECT col1\n            -- comment\n            ,\n            col2"),
+            "Comment in subquery select list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_update_set_clause() {
+        let source = "update t1 set col1 = 1\n-- comment\n,col2 = 2\n,col3 = 3;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SET col1 = 1\n    -- comment\n    ,\n    col2 = 2"),
+            "Comment in UPDATE SET clause should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_interleaved_comments_and_commas_in_select() {
+        let source = "select\ncol1\n-- first section\n,col2\n,col3\n-- second section\n,col4\nfrom t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- first section\n"),
+            "First section comment should be indented, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- second section\n"),
+            "Second section comment should be indented, got:\n{}",
+            formatted
+        );
     }
 }
