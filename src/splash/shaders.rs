@@ -267,13 +267,15 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
             float twinkle_phase = u_time * (1.2 + h * 4.0) + h * 6.28 + time_offset;
             float twinkle = sin(twinkle_phase) * 0.5 + 0.5;
             float scintillation = sin(twinkle_phase * 2.4 + brightness_h * 9.0) * 0.5 + 0.5;
-            float flare_burst = pow(max(0.0, sin(twinkle_phase * 1.7 + brightness_h * 5.0)), 6.0);
-            twinkle = mix(0.18, 1.18, twinkle);
-            twinkle *= mix(0.9, 1.35, scintillation);
-            twinkle += flare_burst * mix(0.08, 0.32, brightness_h);
+            float flare_burst = pow(max(0.0, sin(twinkle_phase * 1.9 + brightness_h * 5.0)), 7.0);
+            float micro_burst = pow(max(0.0, sin(twinkle_phase * 3.6 + h * 11.0)), 10.0);
+            twinkle = mix(0.1, 1.32, twinkle);
+            twinkle *= mix(0.82, 1.55, scintillation);
+            twinkle += flare_burst * mix(0.14, 0.48, brightness_h);
+            twinkle += micro_burst * mix(0.04, 0.16, brightness_h);
 
             // Size
-            float star_size = mix(0.012, 0.04, brightness_h * brightness_h);
+            float star_size = mix(0.014, 0.048, brightness_h * brightness_h);
             float star = (1.0 - smoothstep(0.0, star_size, dist)) * twinkle;
 
             // Color temperature
@@ -291,10 +293,15 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
 
             // Soft halo glow — Airy disk-like falloff for bright stars
             if (brightness_h > 0.4) {
-                float halo_radius = star_size * 3.6;
+                float halo_radius = star_size * 4.1;
                 float halo = (1.0 - smoothstep(0.0, halo_radius, dist));
                 halo = halo * halo;  // Quadratic falloff
-                col += star_col * halo * (brightness_h - 0.4) * twinkle * 0.48;
+                col += star_col * halo * (brightness_h - 0.4) * twinkle * 0.72;
+
+                float outer_glow_radius = star_size * 7.0;
+                float outer_glow = 1.0 - smoothstep(0.0, outer_glow_radius, dist);
+                outer_glow = outer_glow * outer_glow * outer_glow;
+                col += star_col * outer_glow * (brightness_h - 0.4) * twinkle * 0.18;
             }
 
             // Diffraction spikes on bright stars
@@ -306,15 +313,15 @@ vec3 star_layer(vec2 uv_in, float scale, float time_offset, float drift) {
                 float d45b = abs(star_pos.x + star_pos.y) * 0.707;
                 float spike_d1 = (1.0 - smoothstep(0.0, 0.002, d45a)) * (1.0 - smoothstep(0.0, 0.07, d45b));
                 float spike_d2 = (1.0 - smoothstep(0.0, 0.002, d45b)) * (1.0 - smoothstep(0.0, 0.07, d45a));
-                float spikes = (spike_h + spike_v + spike_d1 * 0.5 + spike_d2 * 0.5) * twinkle * 0.6;
+                float spikes = (spike_h + spike_v + spike_d1 * 0.5 + spike_d2 * 0.5) * twinkle * 0.75;
                 col += star_col * spikes;
 
                 // Chromatic fringe on brightest stars — subtle color bleed
-                float fringe = (1.0 - smoothstep(0.0, star_size * 2.5, dist));
-                col += vec3(0.1, 0.0, 0.2) * fringe * twinkle * 0.1;
+                float fringe = (1.0 - smoothstep(0.0, star_size * 3.2, dist));
+                col += vec3(0.1, 0.0, 0.2) * fringe * twinkle * 0.14;
             }
 
-            col += star_col * star * mix(0.82, 1.18, brightness_h);
+            col += star_col * star * mix(0.95, 1.34, brightness_h);
         }
     }
     return col;
