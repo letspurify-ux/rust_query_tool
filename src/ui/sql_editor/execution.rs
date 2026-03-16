@@ -2395,9 +2395,15 @@ impl SqlEditorWidget {
                         Some(SqlToken::Word(_) | SqlToken::String(_))
                     );
                     let in_select_list = matches!(current_clause.as_deref(), Some("SELECT"));
+                    let in_set_clause = matches!(current_clause.as_deref(), Some("SET"));
                     let top_level_select_list =
                         in_select_list && suppress_comma_break_depth == 0 && paren_stack.is_empty();
-                    if top_level_select_list && !has_leading_newline && !is_hint_comment {
+                    let top_level_set_list =
+                        in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
+                    if (top_level_select_list || top_level_set_list)
+                        && !has_leading_newline
+                        && !is_hint_comment
+                    {
                         force_select_list_newline(&mut out, &mut select_list_layout_state);
                     }
 
@@ -2444,19 +2450,21 @@ impl SqlEditorWidget {
                         let base = base_indent(indent_level, open_cursor_state);
                         let current_select_indent = base + 1;
                         if has_leading_newline {
-                            line_indent =
-                                if in_select_list && select_list_layout_state.is_multiline() {
-                                    current_select_indent
-                                } else {
-                                    base
-                                };
-                        } else if top_level_select_list {
+                            line_indent = if in_set_clause {
+                                current_select_indent
+                            } else if in_select_list && select_list_layout_state.is_multiline() {
+                                current_select_indent
+                            } else {
+                                base
+                            };
+                        } else if top_level_select_list || top_level_set_list {
                             line_indent = if select_list_layout_state.is_multiline() {
                                 current_select_indent
                             } else {
                                 base
                             };
                         } else if in_select_list
+                            || in_set_clause
                             || column_list_stack.last().copied().unwrap_or(false)
                         {
                             line_indent = current_select_indent;
@@ -2506,6 +2514,7 @@ impl SqlEditorWidget {
                         );
                         if !keep_inline_alias_comment {
                             let list_extra = if in_select_list
+                                || in_set_clause
                                 || column_list_stack.last().copied().unwrap_or(false)
                                 || hint_after_select
                             {
@@ -12911,6 +12920,30 @@ END"
         assert!(
             !formatted.contains("\nIF.amount"),
             "member access in WHERE clause should not be split as control keyword block token, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn full_auto_formatting_test24_package_body_set_comment_and_comma_follow_set_depth() {
+        let source = include_str!("../../../test/test24.sql").to_string();
+        let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
+
+        assert!(
+            formatted.contains(
+                "SET abcd = edfg
+            -- comment
+            ,
+            ghij = klmo"
+            ),
+            "SET-list inline comment and comma should follow SET depth indentation, got:
+{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("FROM qwer;"),
+            "formatted package body should keep the complete UPDATE statement, got:
+{}",
             formatted
         );
     }

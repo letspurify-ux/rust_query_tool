@@ -666,7 +666,7 @@ void main() {
     col += cosmic_dust(centered, u_time, dust_extinction);
 
     // Nebula
-    col += nebula(centered * 0.78, u_time);
+    col += nebula(centered * 0.39, u_time);
 
     // Aurora ribbons
     col += aurora(centered, u_time);
