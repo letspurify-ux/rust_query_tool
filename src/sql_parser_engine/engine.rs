@@ -823,6 +823,39 @@ impl SqlParserEngine {
         self.process_line_with_observers(line, on_symbol, |_, _| {});
     }
 
+    /// Like [`process_line_with_observer`] but the callback receives the original
+    /// line bytes and the **byte offset** of the symbol instead of a `&[char]`
+    /// slice and char index.  This satisfies the byte-offset policy for callers
+    /// that need to perform lookahead on the raw line.
+    pub(crate) fn process_line_with_byte_observer<F>(&mut self, line: &str, mut on_symbol: F)
+    where
+        F: FnMut(&[u8], usize, u8),
+    {
+        // Pre-compute a char-index → byte-offset mapping for `line + '\n'`.
+        let line_bytes = line.as_bytes();
+        let line_byte_len = line_bytes.len();
+        let mut char_to_byte: Vec<usize> = Vec::with_capacity(line.len() + 1);
+        for (byte_pos, _) in line.char_indices() {
+            char_to_byte.push(byte_pos);
+        }
+        // Trailing '\n' appended by the engine maps to `line_byte_len`.
+        char_to_byte.push(line_byte_len);
+
+        self.process_line_with_observers(
+            line,
+            |_chars, char_idx, ch, _next| {
+                if !ch.is_ascii() {
+                    return;
+                }
+                let byte_idx = char_to_byte.get(char_idx).copied().unwrap_or(line_byte_len);
+                if byte_idx < line_byte_len {
+                    on_symbol(line_bytes, byte_idx, ch as u8);
+                }
+            },
+            |_, _| {},
+        );
+    }
+
     fn process_line_with_observers<F, G>(
         &mut self,
         line: &str,
