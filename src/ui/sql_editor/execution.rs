@@ -2484,13 +2484,38 @@ impl SqlEditorWidget {
                             } else {
                                 false
                             };
+                        let next_is_else = matches!(
+                            next_non_comment,
+                            Some(SqlToken::Word(w))
+                                if w.eq_ignore_ascii_case("ELSE")
+                                    || w.eq_ignore_ascii_case("ELSIF")
+                        );
                         let in_confirmed_list = in_set_clause
                             || column_list_stack.last().copied().unwrap_or(false)
                             || ((in_select_list || active_list_layout)
                                 && select_list_layout_state.is_multiline())
                             || next_is_comma
                             || next_is_condition_keyword;
-                        if in_confirmed_list {
+                        if next_is_else {
+                            // Align comment with ELSE/ELSIF which renders at
+                            // one level below the current body in IF blocks,
+                            // or at base+1 in CASE blocks.
+                            let in_if_block =
+                                block_stack.last().is_some_and(|s| s == "IF");
+                            line_indent = if in_if_block {
+                                base_indent(
+                                    indent_level.saturating_sub(1),
+                                    open_cursor_state,
+                                )
+                            } else {
+                                base + 1
+                            };
+                        } else if next_is_condition_keyword {
+                            // Condition keywords (AND/OR/WHEN/ON) are
+                            // indented at base+1 regardless of stored
+                            // select-list layout state.
+                            line_indent = base + 1;
+                        } else if in_confirmed_list {
                             line_indent = current_select_indent;
                         } else if line_indent == 0 {
                             line_indent = base;
@@ -2953,7 +2978,32 @@ impl SqlEditorWidget {
                 let existing_indent = leading_spaces / 4;
                 let extra_indent = if into_list_active { 1 } else { 0 };
                 let parser_depth = depth + extra_indent;
-                let effective_depth = if in_dml_statement {
+                // Look ahead to find the next non-comment, non-empty line.
+                // If it starts with ELSE/ELSIF/ELSEIF, align this comment
+                // with that keyword (one level less than the body depth).
+                let next_code_trimmed = lines[idx + 1..].iter().find_map(|next| {
+                    let nt = next.trim_start();
+                    if nt.is_empty()
+                        || Self::is_sqlplus_comment_line(nt)
+                        || nt.starts_with("/*")
+                        || nt == "*/"
+                    {
+                        None
+                    } else {
+                        Some(nt)
+                    }
+                });
+                let next_is_else_keyword = next_code_trimmed.is_some_and(|nt| {
+                    let upper = nt.to_ascii_uppercase();
+                    upper.starts_with("ELSE")
+                        || upper.starts_with("ELSIF")
+                        || upper.starts_with("ELSEIF")
+                });
+                let effective_depth = if next_is_else_keyword && !in_dml_statement {
+                    // Comment before ELSE/ELSIF should align with ELSE
+                    // which is rendered at depth-1 in IF blocks.
+                    existing_indent.min(parser_depth)
+                } else if in_dml_statement {
                     existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
                 } else {
                     parser_depth
@@ -3643,7 +3693,9 @@ impl SqlEditorWidget {
             return None;
         }
 
-        let mut formatted_cols: Vec<(bool, String, String, String, Vec<String>)> = Vec::new();
+        // (is_constraint, name, type_str, rest_str, leading_comments, trailing_comments)
+        let mut formatted_cols: Vec<(bool, String, String, String, Vec<String>, Vec<String>)> =
+            Vec::new();
         let mut max_name = 0usize;
         let mut max_type = 0usize;
 
@@ -3660,14 +3712,26 @@ impl SqlEditorWidget {
                 _ => false,
             };
 
-            // Collect line comments from this column group
-            let mut col_comments: Vec<String> = Vec::new();
+            // Separate leading comments (before first non-comment token)
+            // from trailing comments (after first non-comment token)
+            let mut leading_comments: Vec<String> = Vec::new();
+            let mut trailing_comments: Vec<String> = Vec::new();
+            let mut seen_code = false;
             for token in column {
-                if let SqlToken::Comment(comment) = token {
-                    let body = comment.strip_prefix('\n').unwrap_or(comment);
-                    let trimmed = body.trim_end_matches('\n');
-                    if !trimmed.is_empty() {
-                        col_comments.push(trimmed.to_string());
+                match token {
+                    SqlToken::Comment(comment) => {
+                        let body = comment.strip_prefix('\n').unwrap_or(comment);
+                        let trimmed = body.trim_end_matches('\n');
+                        if !trimmed.is_empty() {
+                            if seen_code {
+                                trailing_comments.push(trimmed.to_string());
+                            } else {
+                                leading_comments.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        seen_code = true;
                     }
                 }
             }
@@ -3679,7 +3743,14 @@ impl SqlEditorWidget {
                     .cloned()
                     .collect();
                 let text = Self::join_tokens_spaced(&non_comment_tokens, 0);
-                formatted_cols.push((true, text, String::new(), String::new(), col_comments));
+                formatted_cols.push((
+                    true,
+                    text,
+                    String::new(),
+                    String::new(),
+                    leading_comments,
+                    trailing_comments,
+                ));
                 continue;
             }
 
@@ -3716,7 +3787,14 @@ impl SqlEditorWidget {
 
             max_name = max_name.max(name.len());
             max_type = max_type.max(type_str.len());
-            formatted_cols.push((false, name, type_str, rest_str, col_comments));
+            formatted_cols.push((
+                false,
+                name,
+                type_str,
+                rest_str,
+                leading_comments,
+                trailing_comments,
+            ));
         }
 
         let mut out = String::new();
@@ -3725,9 +3803,15 @@ impl SqlEditorWidget {
         out.push_str(" (\n");
 
         let indent = " ".repeat(4);
-        for (idx, (is_constraint, name, type_str, rest_str, col_comments)) in
+        for (idx, (is_constraint, name, type_str, rest_str, leading_comments, trailing_comments)) in
             formatted_cols.into_iter().enumerate()
         {
+            // Output leading comments (originally before the column)
+            for comment in &leading_comments {
+                out.push_str(&indent);
+                out.push_str(comment);
+                out.push('\n');
+            }
             out.push_str(&indent);
             if is_constraint {
                 out.push_str(&name);
@@ -3748,8 +3832,8 @@ impl SqlEditorWidget {
                 out.push(',');
             }
             out.push('\n');
-            // Output any trailing comments for this column on separate lines
-            for comment in &col_comments {
+            // Output trailing comments (originally after the column definition)
+            for comment in &trailing_comments {
                 out.push_str(&indent);
                 out.push_str(comment);
                 out.push('\n');
@@ -13347,6 +13431,82 @@ mod format_comment_indent_tests {
         assert!(
             formatted.contains("col1 NUMBER,\n    -- comment\n    col2"),
             "Comment in CREATE TABLE column list should be at column indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_with_else_in_plsql_if() {
+        let source = "begin\nif true then\n-- do something\nnull;\n-- else branch\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Comment before ELSE should be at same indent as ELSE (4 spaces)
+        assert!(
+            formatted.contains("\n    -- else branch\n    ELSE"),
+            "Comment before ELSE should align with ELSE keyword, got:\n{}",
+            formatted
+        );
+        // Comment inside IF body should be at body indent (8 spaces)
+        assert!(
+            formatted.contains("\n        -- do something\n"),
+            "Comment inside IF body should be at body indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_with_when_in_case() {
+        let source = "select case\n-- first case\nwhen col1 = 1 then 'a'\n-- second case\nwhen col1 = 2 then 'b'\n-- default\nelse 'c'\nend from t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Comments before WHEN should be at same indent as WHEN (8 spaces)
+        assert!(
+            formatted.contains("        -- first case\n        WHEN"),
+            "Comment before WHEN should align with WHEN keyword, got:\n{}",
+            formatted
+        );
+        // Comment before ELSE in CASE should align with ELSE
+        assert!(
+            formatted.contains("        -- default\n        ELSE"),
+            "Comment before ELSE in CASE should align with ELSE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_or_in_where() {
+        let source = "select * from t1 where col1 = 1\n-- or branch\nor col2 = 2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- or branch\n    OR"),
+            "Comment before OR should align with OR keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_nested_plsql_comment_depth() {
+        let source = "begin\nif true then\nfor i in 1..10 loop\n-- deep comment\nnull;\nend loop;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("            -- deep comment\n            NULL;"),
+            "Comment in nested PL/SQL block should be at correct depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_create_table_leading_comment_placement() {
+        let source = "create table t1 (\n-- primary key\ncol1 number\n-- description\n,col2 varchar2(100)\n,col3 date);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Leading comment before col1 should appear before col1
+        assert!(
+            formatted.contains("    -- primary key\n    col1 NUMBER,"),
+            "Leading comment should appear before its column, got:\n{}",
+            formatted
+        );
+        // Comment before col2 should appear before col2
+        assert!(
+            formatted.contains("    -- description\n    col2"),
+            "Comment before col2 should appear before col2, got:\n{}",
             formatted
         );
     }
