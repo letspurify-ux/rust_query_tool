@@ -2093,7 +2093,7 @@ END;"#;
 }
 
 #[test]
-fn format_sql_does_not_apply_depth_indent_to_block_comments() {
+fn format_sql_preserves_multiline_block_comment_internal_indentation() {
     let input = r#"BEGIN
 IF 1 = 1 THEN
 /* block comment
@@ -4332,14 +4332,12 @@ SELECT
     d.loc,
     s.cnt,
     ROUND (s.avg_sal, 2) AS avg_sal,
-    s.sum_comm,
-    -- scalar subquery (correlated)
+    s.sum_comm, -- scalar subquery (correlated)
     (
         SELECT MAX (e2.sal)
         FROM e e2
         WHERE e2.deptno = d.deptno
-    ) AS max_sal_in_dept,
-    -- case + analytic in select list via scalar subquery
+    ) AS max_sal_in_dept, -- case + analytic in select list via scalar subquery
     CASE
         WHEN s.cnt = 0 THEN 'EMPTY'
         WHEN s.avg_sal >= 2500 THEN 'HIGH'
@@ -4454,8 +4452,7 @@ SELECT f.deptno,
     f.masked_name,
     f.job,
     f.sal,
-    f.sal_band,
-    -- window frame with last_value (needs careful frame)
+    f.sal_band, -- window frame with last_value (needs careful frame)
     LAST_VALUE (f.sal) OVER (PARTITION BY f.deptno ORDER BY f.sal ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS max_sal_via_last_value
 FROM filtered f
 ORDER BY f.deptno,
@@ -4487,10 +4484,8 @@ SELECT
     SUM (sal) OVER (PARTITION BY deptno) AS sum_sal_dept,
     AVG (sal) OVER (PARTITION BY deptno) AS avg_sal_dept,
     PERCENT_RANK () OVER (PARTITION BY deptno ORDER BY sal) AS pct_rank,
-    CUME_DIST () OVER (PARTITION BY deptno ORDER BY sal) AS CUME_DIST,
-    -- running total with frame
-    SUM (sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal,
-    -- windowed listagg
+    CUME_DIST () OVER (PARTITION BY deptno ORDER BY sal) AS CUME_DIST, -- running total with frame
+    SUM (sal) OVER (PARTITION BY deptno ORDER BY hiredate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sal, -- windowed listagg
     LISTAGG (ename, ',') WITHIN
     GROUP (ORDER BY ename) OVER (PARTITION BY deptno) AS names_in_dept
 FROM base b

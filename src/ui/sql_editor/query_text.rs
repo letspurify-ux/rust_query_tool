@@ -826,15 +826,12 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
     let mut rowid_qualifier: Option<String> = None;
     while idx < tokens.len() {
         let depth = paren_state.depth();
-        match tokens.get(idx) {
-            Some(SqlToken::Word(word)) => {
-                if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
-                    in_select = true;
-                } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
-                    break;
-                }
+        if let Some(SqlToken::Word(word)) = tokens.get(idx) {
+            if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
+                in_select = true;
+            } else if in_select && depth == 0 && word.eq_ignore_ascii_case("FROM") {
+                break;
             }
-            _ => {}
         }
 
         if in_select && depth == 0 {

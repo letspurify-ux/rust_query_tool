@@ -48,6 +48,26 @@ struct SelectTransformState {
     compute_seen_numeric: Vec<bool>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineLayoutKind {
+    Blank,
+    Code,
+    CommentOnly,
+    CommaOnly,
+    Verbatim,
+}
+
+struct LineLayout<'a> {
+    raw: &'a str,
+    trimmed: &'a str,
+    kind: LineLayoutKind,
+    preserve_raw: bool,
+    parser_depth: usize,
+    existing_indent: usize,
+    final_depth: usize,
+    anchor_group: Option<usize>,
+}
+
 // Flush streamed rows in bounded batches so very large fetches still surface
 // progressive UI updates without waiting for oversized buffers.
 // Send buffered rows when either:
@@ -2420,19 +2440,25 @@ impl SqlEditorWidget {
                     let top_level_set_list =
                         in_set_clause && suppress_comma_break_depth == 0 && paren_stack.is_empty();
                     let active_list_layout = select_list_layout_state.has_active_indent();
-                    if (top_level_select_list || top_level_set_list)
-                        && !has_leading_newline
-                        && !is_hint_comment
-                    {
-                        force_select_list_newline(&mut out, &mut select_list_layout_state);
-                    }
-
                     let attachment = Self::classify_comment_attachment(
                         &out,
                         at_line_start,
                         has_leading_newline,
                         is_multiline_block_comment,
                     );
+                    let comment_ends_source_line = comment_body.contains('\n');
+                    let attached_previous_keeps_inline = matches!(
+                        attachment,
+                        CommentAttachment::Previous
+                    ) && !(comment_ends_source_line
+                        && matches!(next_non_comment, Some(SqlToken::Symbol(s)) if s == ","));
+                    if (top_level_select_list || top_level_set_list)
+                        && !has_leading_newline
+                        && !is_hint_comment
+                        && !attached_previous_keeps_inline
+                    {
+                        force_select_list_newline(&mut out, &mut select_list_layout_state);
+                    }
 
                     if is_multiline_block_comment
                         && !at_line_start
@@ -2615,6 +2641,11 @@ impl SqlEditorWidget {
                     let started_line = at_line_start;
                     match sym.as_str() {
                         "," => {
+                            let next_is_inline_comment = matches!(
+                                tokens.get(idx + 1),
+                                Some(SqlToken::Comment(comment))
+                                    if !comment.starts_with('\n') && comment.contains('\n')
+                            );
                             if statement_has_with_clause
                                 && matches!(current_clause.as_deref(), Some("SELECT"))
                                 && !open_cursor_state.in_select()
@@ -2663,6 +2694,15 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
+                            } else if next_is_inline_comment {
+                                needs_space = true;
+                                if matches!(current_clause.as_deref(), Some("SELECT")) {
+                                    let select_list_indent =
+                                        base_indent(indent_level, open_cursor_state) + 1;
+                                    select_list_layout_state = SelectListLayoutState::Multiline {
+                                        indent: select_list_indent,
+                                    };
+                                }
                             } else if suppress_comma_break_depth == 0 {
                                 newline_with(
                                     &mut out,
@@ -2919,65 +2959,178 @@ impl SqlEditorWidget {
 
         let multiline_string_continuation_lines =
             Self::multiline_string_continuation_lines(formatted, line_count);
+        let mut layouts =
+            Self::build_line_layouts(formatted, &depths, &multiline_string_continuation_lines);
+        let (previous_code_indices, next_code_indices) = Self::line_layout_code_neighbors(&layouts);
 
-        let mut out = String::new();
-        let mut in_dml_statement = false;
+        Self::resolve_code_line_layouts(&mut layouts, &next_code_indices);
+        Self::align_case_close_paren_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+        );
+        Self::resolve_non_code_line_layouts(
+            &mut layouts,
+            &previous_code_indices,
+            &next_code_indices,
+        );
+
+        Self::render_line_layouts(&layouts)
+    }
+
+    fn build_line_layouts<'a>(
+        formatted: &'a str,
+        depths: &[usize],
+        multiline_string_continuation_lines: &[bool],
+    ) -> Vec<LineLayout<'a>> {
+        let lines: Vec<&'a str> = formatted.lines().collect();
+        let mut layouts = Vec::with_capacity(lines.len());
         let mut in_block_comment = false;
-        let mut paren_case_expression_depth = 0usize;
-        let mut pending_paren_case_closer_indent = false;
-        let mut last_code_line_trimmed: Option<String> = None;
-        let lines: Vec<&str> = formatted.lines().collect();
-        for (idx, line) in lines.iter().enumerate() {
-            let line = *line;
-            let depth = depths.get(idx).copied().unwrap_or(0);
-            if idx > 0 {
-                out.push('\n');
-            }
 
-            if multiline_string_continuation_lines
+        for (idx, line) in lines.iter().enumerate() {
+            let raw = *line;
+            let trimmed = raw.trim_start();
+            let (kind, preserve_raw) = if multiline_string_continuation_lines
                 .get(idx)
                 .copied()
                 .unwrap_or(false)
             {
-                out.push_str(line);
-                continue;
-            }
-
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() {
-                out.push_str(trimmed);
-                continue;
-            }
-
-            if in_block_comment {
-                out.push_str(line);
-                crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
-                continue;
-            }
-
-            let is_comment = Self::is_sqlplus_comment_line(trimmed)
-                || trimmed.starts_with("/*")
-                || trimmed == "*/";
-            if is_comment {
-                if trimmed.starts_with("/*") {
-                    out.push_str(line);
+                (LineLayoutKind::Verbatim, true)
+            } else {
+                let was_in_block_comment = in_block_comment;
+                let is_comment_only = if was_in_block_comment && trimmed.is_empty() {
+                    true
+                } else if trimmed.is_empty() {
+                    false
+                } else {
+                    Self::line_is_comment_only_with_block_state(raw, &mut in_block_comment)
+                };
+                if !is_comment_only && !trimmed.is_empty() {
                     crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
-                    continue;
                 }
 
-                let effective_depth = depth;
-                out.push_str(&" ".repeat(effective_depth * 4));
-                out.push_str(trimmed);
+                if is_comment_only {
+                    (LineLayoutKind::CommentOnly, was_in_block_comment)
+                } else if trimmed.is_empty() {
+                    (LineLayoutKind::Blank, false)
+                } else if trimmed == "," {
+                    (LineLayoutKind::CommaOnly, false)
+                } else {
+                    (LineLayoutKind::Code, false)
+                }
+            };
+
+            layouts.push(LineLayout {
+                raw,
+                trimmed,
+                kind,
+                preserve_raw,
+                parser_depth: depths.get(idx).copied().unwrap_or(0),
+                existing_indent: raw.len().saturating_sub(trimmed.len()) / 4,
+                final_depth: 0,
+                anchor_group: None,
+            });
+        }
+
+        layouts
+    }
+
+    fn line_layout_code_neighbors(
+        layouts: &[LineLayout<'_>],
+    ) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+        let mut previous_code_indices = vec![None; layouts.len()];
+        let mut last_code_idx = None;
+        for (idx, layout) in layouts.iter().enumerate() {
+            previous_code_indices[idx] = last_code_idx;
+            if layout.kind == LineLayoutKind::Code {
+                last_code_idx = Some(idx);
+            }
+        }
+
+        let mut next_code_indices = vec![None; layouts.len()];
+        let mut next_code_idx = None;
+        for idx in (0..layouts.len()).rev() {
+            next_code_indices[idx] = next_code_idx;
+            if layouts[idx].kind == LineLayoutKind::Code {
+                next_code_idx = Some(idx);
+            }
+        }
+
+        (previous_code_indices, next_code_indices)
+    }
+
+    fn line_layout_preceding_comment_or_comma_run_has_comma(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+    ) -> bool {
+        let mut scan_idx = idx;
+        let mut saw_comma = false;
+
+        while scan_idx > 0 {
+            scan_idx = scan_idx.saturating_sub(1);
+            match layouts[scan_idx].kind {
+                LineLayoutKind::CommentOnly => continue,
+                LineLayoutKind::CommaOnly => {
+                    saw_comma = true;
+                }
+                LineLayoutKind::Blank | LineLayoutKind::Verbatim | LineLayoutKind::Code => break,
+            }
+        }
+
+        saw_comma
+    }
+
+    fn previous_dml_clause_starter_depth(
+        layouts: &[LineLayout<'_>],
+        idx: usize,
+        target_depth: usize,
+    ) -> Option<usize> {
+        for prev_idx in (0..idx).rev() {
+            if layouts[prev_idx].kind != LineLayoutKind::Code {
                 continue;
             }
 
+            let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+            if Self::is_dml_clause_starter(&prev_upper)
+                && layouts[prev_idx].final_depth == target_depth
+            {
+                return Some(target_depth);
+            }
+        }
+
+        None
+    }
+
+    fn resolve_code_line_layouts(
+        layouts: &mut [LineLayout<'_>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        let mut in_dml_statement = false;
+        let mut paren_case_expression_depth = 0usize;
+        let mut pending_paren_case_closer_indent = false;
+        let mut last_code_idx: Option<usize> = None;
+        let mut next_anchor_group = 0usize;
+
+        for idx in 0..layouts.len() {
+            if layouts[idx].kind != LineLayoutKind::Code {
+                continue;
+            }
+
+            let trimmed = layouts[idx].trimmed;
+            let depth = layouts[idx].parser_depth;
+            let existing_indent = layouts[idx].existing_indent;
             let trimmed_upper = trimmed.to_ascii_uppercase();
-            let previous_line_ends_with_open_paren = last_code_line_trimmed
-                .as_deref()
-                .is_some_and(Self::line_ends_with_open_paren_before_inline_comment);
-            let previous_line_is_parenthesized_plsql_condition = last_code_line_trimmed
-                .as_deref()
-                .is_some_and(Self::is_parenthesized_plsql_condition_header);
+
+            let previous_line_ends_with_open_paren = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_open_paren_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_is_parenthesized_plsql_condition =
+                last_code_idx.is_some_and(|prev_idx| {
+                    Self::is_parenthesized_plsql_condition_header(layouts[prev_idx].trimmed)
+                });
+            let previous_line_is_cte_definition_header = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_is_cte_definition_header(layouts[prev_idx].trimmed)
+            });
             let starts_paren_case_expression =
                 crate::sql_text::starts_with_keyword_token(&trimmed_upper, "CASE")
                     && previous_line_ends_with_open_paren;
@@ -2990,6 +3143,8 @@ impl SqlEditorWidget {
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "UPDATE")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "DELETE")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "MERGE");
+            let starts_subquery_head =
+                starts_dml || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WITH");
             if starts_dml {
                 in_dml_statement = true;
             }
@@ -3004,54 +3159,34 @@ impl SqlEditorWidget {
             } else {
                 0
             };
-            let previous_line_is_plain_end =
-                last_code_line_trimmed.as_deref().is_some_and(|prev| {
-                    let prev_upper = prev.to_ascii_uppercase();
-                    Self::starts_with_plain_end(&prev_upper)
-                });
-            let mut next_significant_line: Option<(usize, &str)> = None;
-            let mut in_peek_block_comment = false;
-            for (next_idx, next) in lines.iter().enumerate().skip(idx + 1) {
-                let next_trimmed = next.trim_start();
-                if next_trimmed.is_empty() || Self::is_sqlplus_comment_line(next_trimmed) {
-                    continue;
-                }
-
-                if in_peek_block_comment {
-                    if next_trimmed.contains("*/") {
-                        in_peek_block_comment = false;
-                    }
-                    continue;
-                }
-
-                if next_trimmed.starts_with("/*") {
-                    if !next_trimmed.contains("*/") {
-                        in_peek_block_comment = true;
-                    }
-                    continue;
-                }
-
-                if next_trimmed == "*/" {
-                    continue;
-                }
-
-                next_significant_line = Some((next_idx, next_trimmed));
-                break;
-            }
-            let next_significant_line_trimmed = next_significant_line.map(|(_, next)| next);
-            let next_line_is_named_plain_end = next_significant_line_trimmed.is_some_and(|next| {
+            let previous_line_is_plain_end = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::starts_with_plain_end(&prev_upper)
+            });
+            let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
+            });
+            let previous_line_is_dml_clause_line = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::is_dml_clause_starter(&prev_upper)
+                    || crate::sql_text::starts_with_keyword_token(&prev_upper, "INTO")
+            });
+            let previous_line_is_dml_clause_starter = last_code_idx.is_some_and(|prev_idx| {
+                let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+                Self::is_dml_clause_starter(&prev_upper)
+            });
+            let next_code_trimmed =
+                next_code_indices[idx].map(|next_idx| layouts[next_idx].trimmed);
+            let next_line_is_named_plain_end = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 Self::starts_with_plain_end(&next_upper) && !Self::starts_with_bare_end(&next_upper)
             });
-            let next_line_is_case_branch = next_significant_line_trimmed.is_some_and(|next| {
+            let next_line_is_case_branch = next_code_trimmed.is_some_and(|next| {
                 let next_upper = next.to_ascii_uppercase();
                 next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE")
             });
             let next_line_existing_indent =
-                next_significant_line.map(|(next_idx, next_trimmed)| {
-                    let next_line = lines[next_idx];
-                    next_line.len().saturating_sub(next_trimmed.len()) / 4
-                });
+                next_code_indices[idx].map(|next_idx| layouts[next_idx].existing_indent);
             let force_end_suffix_depth = Self::starts_with_end_suffix_terminator(&trimmed_upper)
                 && !previous_line_is_plain_end
                 && !next_line_is_named_plain_end;
@@ -3065,22 +3200,56 @@ impl SqlEditorWidget {
                     || Self::starts_with_bare_end(&trimmed_upper)
                     || force_end_suffix_depth);
 
-            let leading_spaces = line.len().saturating_sub(trimmed.len());
-            let existing_indent = leading_spaces / 4;
             let parser_depth = depth + paren_case_extra_indent;
             let starts_with_close_paren = trimmed.starts_with(')');
             let is_paren_case_closer = pending_paren_case_closer_indent && starts_with_close_paren;
-            let paren_case_closer_extra_indent = usize::from(is_paren_case_closer);
-            let parser_depth = parser_depth + paren_case_closer_extra_indent;
+            let parser_depth = parser_depth + usize::from(is_paren_case_closer);
+            let last_code_indent = last_code_idx.map(|prev_idx| layouts[prev_idx].final_depth);
+            let follows_comma_run =
+                Self::line_layout_preceding_comment_or_comma_run_has_comma(layouts, idx);
             let effective_depth = if force_block_depth {
                 parser_depth
+            } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
+                last_code_indent
+                    .map(|indent| indent.max(parser_depth))
+                    .unwrap_or(parser_depth.max(existing_indent))
+            } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
+            {
+                let nested_subquery_depth = if previous_line_is_cte_definition_header
+                    || previous_line_is_parenthesized_plsql_condition
+                {
+                    parser_depth
+                } else {
+                    parser_depth.saturating_add(1)
+                };
+                last_code_indent
+                    .map(|indent| indent.saturating_add(1).max(nested_subquery_depth))
+                    .unwrap_or(nested_subquery_depth)
             } else if !in_dml_statement && previous_line_is_parenthesized_plsql_condition {
                 parser_depth.saturating_add(1)
+            } else if in_dml_statement
+                && previous_line_ends_with_trailing_comma
+                && !previous_line_is_dml_clause_line
+            {
+                last_code_indent.unwrap_or(parser_depth)
+            } else if in_dml_statement
+                && Self::is_dml_clause_starter(&trimmed_upper)
+                && previous_line_is_dml_clause_starter
+            {
+                if last_code_indent.is_some_and(|indent| indent > parser_depth) {
+                    last_code_indent.unwrap_or(parser_depth)
+                } else {
+                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
+                }
             } else if in_dml_statement && starts_with_close_paren {
                 if next_line_is_case_branch {
                     next_line_existing_indent.unwrap_or(parser_depth)
                 } else if is_paren_case_closer {
                     parser_depth
+                } else if previous_line_is_dml_clause_line {
+                    last_code_indent
+                        .map(|indent| indent.saturating_sub(1).max(parser_depth))
+                        .unwrap_or(parser_depth)
                 } else if previous_line_is_plain_end {
                     parser_depth.saturating_add(2)
                 } else {
@@ -3089,19 +3258,26 @@ impl SqlEditorWidget {
             } else if in_dml_statement {
                 let is_dml_clause_line = Self::is_dml_clause_starter(&trimmed_upper)
                     || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO");
-                let max_extra = if is_dml_clause_line { 1 } else { 2 };
+                let closes_into_list = Self::is_into_continuation_ender(&trimmed_upper);
+                let max_extra = if closes_into_list || follows_comma_run {
+                    0
+                } else if is_dml_clause_line {
+                    1
+                } else {
+                    2
+                };
                 existing_indent.clamp(parser_depth, parser_depth.saturating_add(max_extra))
             } else if existing_indent > parser_depth.saturating_add(3) {
                 parser_depth
             } else {
                 parser_depth.max(existing_indent)
             };
-            let previous_line_is_select_hint =
-                last_code_line_trimmed.as_deref().is_some_and(|prev| {
-                    prev.trim_start()
-                        .to_ascii_uppercase()
-                        .starts_with("SELECT /*+")
-                });
+            let previous_line_is_select_hint = last_code_idx.is_some_and(|prev_idx| {
+                layouts[prev_idx]
+                    .trimmed
+                    .to_ascii_uppercase()
+                    .starts_with("SELECT /*+")
+            });
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
@@ -3110,8 +3286,41 @@ impl SqlEditorWidget {
             } else {
                 effective_depth
             };
-            out.push_str(&" ".repeat(effective_depth * 4));
-            out.push_str(trimmed);
+            let clause_anchor_depth = if Self::is_dml_clause_starter(&trimmed_upper) {
+                Self::previous_dml_clause_starter_depth(layouts, idx, parser_depth).or_else(|| {
+                    Self::previous_dml_clause_starter_depth(
+                        layouts,
+                        idx,
+                        parser_depth.saturating_add(1),
+                    )
+                })
+            } else {
+                None
+            };
+            let effective_depth = clause_anchor_depth
+                .map(|anchor_depth| effective_depth.max(anchor_depth))
+                .unwrap_or(effective_depth);
+
+            layouts[idx].final_depth = effective_depth;
+            let anchor_group = if !in_dml_statement
+                && previous_line_ends_with_trailing_comma
+                && last_code_indent.is_some_and(|indent| indent == effective_depth)
+            {
+                if let Some(group) =
+                    last_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+                {
+                    group
+                } else {
+                    let group = next_anchor_group;
+                    next_anchor_group = next_anchor_group.saturating_add(1);
+                    group
+                }
+            } else {
+                let group = next_anchor_group;
+                next_anchor_group = next_anchor_group.saturating_add(1);
+                group
+            };
+            layouts[idx].anchor_group = Some(anchor_group);
 
             if in_paren_case_expression
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "END")
@@ -3129,65 +3338,199 @@ impl SqlEditorWidget {
             if trimmed.ends_with(';') {
                 in_dml_statement = false;
             }
-            last_code_line_trimmed = Some(trimmed.to_string());
+            last_code_idx = Some(idx);
         }
-
-        Self::align_case_close_parens_with_branch_depth(&out)
     }
 
-    fn align_case_close_parens_with_branch_depth(formatted: &str) -> String {
-        let lines: Vec<&str> = formatted.lines().collect();
+    fn align_case_close_paren_layouts(
+        layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        for idx in 0..layouts.len() {
+            if layouts[idx].kind != LineLayoutKind::Code || !layouts[idx].trimmed.starts_with(')') {
+                continue;
+            }
+
+            let Some(prev_idx) = previous_code_indices[idx] else {
+                continue;
+            };
+            let Some(next_idx) = next_code_indices[idx] else {
+                continue;
+            };
+
+            let previous_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
+            let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
+            let next_is_case_branch =
+                next_upper.starts_with("WHEN ") || next_upper.starts_with("ELSE");
+            if Self::starts_with_plain_end(&previous_upper) && next_is_case_branch {
+                layouts[idx].final_depth = layouts[next_idx].final_depth;
+                layouts[idx].anchor_group = layouts[next_idx].anchor_group;
+            }
+        }
+    }
+
+    fn resolve_non_code_line_layouts(
+        layouts: &mut [LineLayout<'_>],
+        previous_code_indices: &[Option<usize>],
+        next_code_indices: &[Option<usize>],
+    ) {
+        let anchor_depths = Self::line_layout_anchor_depths(layouts);
+        let mut idx = 0usize;
+
+        while idx < layouts.len() {
+            let kind = layouts[idx].kind;
+            if kind != LineLayoutKind::CommentOnly && kind != LineLayoutKind::CommaOnly {
+                idx += 1;
+                continue;
+            }
+
+            let start = idx;
+            while idx < layouts.len() {
+                let run_kind = layouts[idx].kind;
+                if run_kind != LineLayoutKind::CommentOnly && run_kind != LineLayoutKind::CommaOnly
+                {
+                    break;
+                }
+                idx += 1;
+            }
+
+            let previous_code_idx = previous_code_indices[start];
+            let next_code_idx = next_code_indices[start];
+            let prefer_previous_scope = match (previous_code_idx, next_code_idx) {
+                (Some(prev_idx), Some(next_idx)) => {
+                    let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
+                    let next_is_named_plain_end = Self::starts_with_plain_end(&next_upper)
+                        && !Self::starts_with_bare_end(&next_upper);
+                    next_is_named_plain_end
+                        && layouts[prev_idx].final_depth > layouts[next_idx].final_depth
+                }
+                _ => false,
+            };
+            let anchor_group = if prefer_previous_scope {
+                previous_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+            } else {
+                next_code_idx
+                    .and_then(|next_idx| layouts[next_idx].anchor_group)
+                    .or_else(|| {
+                        previous_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
+                    })
+            };
+            let target_depth = anchor_group
+                .and_then(|group| anchor_depths.get(group).copied().flatten())
+                .or_else(|| next_code_idx.map(|next_idx| layouts[next_idx].final_depth))
+                .or_else(|| previous_code_idx.map(|prev_idx| layouts[prev_idx].final_depth))
+                .unwrap_or(0);
+
+            for layout in &mut layouts[start..idx] {
+                layout.anchor_group = anchor_group;
+                layout.final_depth = target_depth;
+            }
+        }
+    }
+
+    fn line_layout_anchor_depths(layouts: &[LineLayout<'_>]) -> Vec<Option<usize>> {
+        let max_anchor_group = layouts
+            .iter()
+            .filter_map(|layout| layout.anchor_group)
+            .max();
+        let Some(max_anchor_group) = max_anchor_group else {
+            return Vec::new();
+        };
+
+        let mut anchor_depths = vec![None; max_anchor_group.saturating_add(1)];
+        for layout in layouts {
+            if layout.kind != LineLayoutKind::Code {
+                continue;
+            }
+            if let Some(anchor_group) = layout.anchor_group {
+                anchor_depths[anchor_group] = Some(layout.final_depth);
+            }
+        }
+
+        anchor_depths
+    }
+
+    fn render_line_layouts(layouts: &[LineLayout<'_>]) -> String {
         let mut out = String::new();
 
-        for (idx, line) in lines.iter().enumerate() {
+        for (idx, layout) in layouts.iter().enumerate() {
             if idx > 0 {
                 out.push('\n');
             }
 
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with(')') {
-                out.push_str(line);
+            if layout.preserve_raw || layout.kind == LineLayoutKind::Verbatim {
+                out.push_str(layout.raw);
                 continue;
             }
 
-            let previous_code_line = lines[..idx].iter().rev().find(|candidate| {
-                let candidate_trimmed = candidate.trim_start();
-                !candidate_trimmed.is_empty()
-                    && !Self::is_sqlplus_comment_line(candidate_trimmed)
-                    && !candidate_trimmed.starts_with("/*")
-                    && candidate_trimmed != "*/"
-            });
-            let next_code_line = lines[idx + 1..].iter().find(|candidate| {
-                let candidate_trimmed = candidate.trim_start();
-                !candidate_trimmed.is_empty()
-                    && !Self::is_sqlplus_comment_line(candidate_trimmed)
-                    && !candidate_trimmed.starts_with("/*")
-                    && candidate_trimmed != "*/"
-            });
-
-            let previous_is_plain_end = previous_code_line.is_some_and(|candidate| {
-                let upper = candidate.trim_start().to_ascii_uppercase();
-                Self::starts_with_plain_end(&upper)
-            });
-            let next_is_case_branch = next_code_line.is_some_and(|candidate| {
-                let upper = candidate.trim_start().to_ascii_uppercase();
-                upper.starts_with("WHEN ") || upper.starts_with("ELSE")
-            });
-
-            if previous_is_plain_end && next_is_case_branch {
-                let branch_indent = next_code_line
-                    .map(|candidate| {
-                        candidate.len().saturating_sub(candidate.trim_start().len()) / 4
-                    })
-                    .unwrap_or(0);
-                out.push_str(&" ".repeat(branch_indent * 4));
-                out.push_str(trimmed);
-            } else {
-                out.push_str(line);
+            match layout.kind {
+                LineLayoutKind::Blank => {}
+                LineLayoutKind::Code
+                | LineLayoutKind::CommentOnly
+                | LineLayoutKind::CommaOnly
+                | LineLayoutKind::Verbatim => {
+                    out.push_str(&" ".repeat(layout.final_depth * 4));
+                    out.push_str(layout.trimmed);
+                }
             }
         }
 
         out
+    }
+
+    fn line_is_comment_only_with_block_state(line: &str, in_block_comment: &mut bool) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if !*in_block_comment && Self::is_sqlplus_comment_line(trimmed) {
+            return true;
+        }
+
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            if *in_block_comment {
+                let mut closed = false;
+                while idx + 1 < bytes.len() {
+                    if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                        *in_block_comment = false;
+                        idx += 2;
+                        closed = true;
+                        break;
+                    }
+                    idx += 1;
+                }
+                if !closed {
+                    return true;
+                }
+                continue;
+            }
+
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+
+            if idx >= bytes.len() {
+                return true;
+            }
+
+            let tail = trimmed.get(idx..).unwrap_or_default();
+            if Self::is_sqlplus_comment_line(tail) {
+                return true;
+            }
+
+            if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*' {
+                *in_block_comment = true;
+                idx += 2;
+                continue;
+            }
+
+            return false;
+        }
+
+        true
     }
 
     fn is_dml_clause_starter(trimmed_upper: &str) -> bool {
@@ -3202,6 +3545,18 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "SET")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "START")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
+    }
+
+    fn is_into_continuation_ender(trimmed_upper: &str) -> bool {
+        crate::sql_text::starts_with_keyword_token(trimmed_upper, "FROM")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "WHERE")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "GROUP")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "ORDER")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "CONNECT")
+            || crate::sql_text::starts_with_keyword_token(trimmed_upper, "HAVING")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "UNION")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "INTERSECT")
             || crate::sql_text::starts_with_keyword_token(trimmed_upper, "MINUS")
@@ -3379,6 +3734,22 @@ impl SqlEditorWidget {
         false
     }
 
+    fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+        let tokens = super::query_text::tokenize_sql(line);
+        for token in tokens.iter().rev() {
+            match token {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Symbol(sym) => {
+                    let trailing_symbol = sym.trim_end();
+                    return trailing_symbol.ends_with(',');
+                }
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
     fn line_has_unclosed_open_paren_before_inline_comment(line: &str) -> bool {
         let tokens = super::query_text::tokenize_sql(line);
         let mut paren_balance = 0usize;
@@ -3398,6 +3769,20 @@ impl SqlEditorWidget {
         paren_balance > 0
     }
 
+    fn line_is_cte_definition_header(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !Self::line_ends_with_open_paren_before_inline_comment(trimmed) {
+            return false;
+        }
+
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("WITH ") {
+            return upper.contains(" AS ");
+        }
+
+        upper.contains(" AS (")
+    }
+
     fn is_parenthesized_plsql_condition_header(line: &str) -> bool {
         if !Self::line_has_unclosed_open_paren_before_inline_comment(line) {
             return false;
@@ -3408,6 +3793,8 @@ impl SqlEditorWidget {
             || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSIF")
             || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "ELSEIF")
             || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "WHILE")
+            || (crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FOR")
+                && trimmed_upper.contains(" IN "))
     }
 
     fn is_plsql_like_tokens(statement: &str, tokens: &[SqlToken]) -> bool {
@@ -11819,7 +12206,7 @@ FROM t;
             formatted
         );
         assert!(
-            formatted.contains("/* commented-out code\nSELECT *\nFROM dual;\n*/"),
+            formatted.contains("        /* commented-out code\nSELECT *\nFROM dual;\n*/"),
             "{}",
             formatted
         );
@@ -12277,6 +12664,80 @@ END;"#;
             WITH filt AS ("),
             "WITH clause should align to nested query depth instead of preserving excess manual indent, got:
 {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn open_for_with_inline_block_comment_keeps_comment_inline_and_subquery_indented() {
+        let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
+    l_rc t_refcur;
+BEGIN
+    OPEN l_rc FOR
+        WITH base AS (
+            SELECT e.emp_id,
+                e.emp_name,
+                e.salary,
+                e.bonus_pct,
+                d.dept_name, /*asdf*/
+                NVL (
+                    (
+                    SELECT SUM (s.amount)
+                    FROM qt_sales s
+                    WHERE s.emp_id = e.emp_id
+                ),
+                0
+                ) AS total_sales
+            FROM qt_emp e
+        )
+        SELECT *
+        FROM base;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "d.dept_name, /*asdf*/\n                NVL (\n                    (\n                        SELECT SUM (s.amount)\n                        FROM qt_sales s\n                        WHERE s.emp_id = e.emp_id\n                    ),\n                    0\n                ) AS total_sales"
+            ),
+            "{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn open_for_with_inline_line_comment_keeps_next_select_item_depth() {
+        let sql = r#"FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur IS
+    l_rc t_refcur;
+BEGIN
+    OPEN l_rc FOR
+        WITH base AS (
+            SELECT e.emp_id,
+                e.emp_name,
+                e.salary,
+                e.bonus_pct,
+                d.dept_name, --asdf
+                NVL (
+                    (
+                    SELECT SUM (s.amount)
+                    FROM qt_sales s
+                    WHERE s.emp_id = e.emp_id
+                ),
+                0
+                ) AS total_sales
+            FROM qt_emp e
+        )
+        SELECT *
+        FROM base;
+END;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic(sql);
+
+        assert!(
+            formatted.contains(
+                "d.dept_name, --asdf\n                NVL (\n                    (\n                        SELECT SUM (s.amount)\n                        FROM qt_sales s\n                        WHERE s.emp_id = e.emp_id\n                    ),\n                    0\n                ) AS total_sales"
+            ),
+            "{}",
             formatted
         );
     }
@@ -13165,6 +13626,10 @@ mod query_running_reservation_tests {
 mod format_comment_indent_tests {
     use crate::ui::sql_editor::SqlEditorWidget;
 
+    fn leading_spaces(line: &str) -> usize {
+        line.len().saturating_sub(line.trim_start().len())
+    }
+
     #[test]
     fn format_sql_basic_indents_line_comment_in_select_list_before_comma() {
         let source = "select col1\n-- comment\n,col2\nfrom t1;";
@@ -13216,8 +13681,145 @@ mod format_comment_indent_tests {
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("        SELECT\n            b,\n            -- comment\n            d\n        FROM e;"),
+            formatted.contains("SELECT b,\n            -- comment\n            d\n        FROM e;"),
             "Line comment after a trailing comma should keep select-list depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_cursor_select_comment_at_select_list_depth_in_package_body() {
+        let source = "create or replace package body pkg_fmt as\n    procedure validate_and_process (p_root_id in number, p_mode in varchar2 default 'NORMAL') is\n        cursor c_units (cp_root_id number) is\n        select id,\n            parent_id\n        -- comment\n            ,\n            code,\n            qty,\n            pri\n        from fmtx_unit;\n    begin\n        null;\n    end validate_and_process;\nend pkg_fmt;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains(
+                "SELECT id,\n            parent_id\n            -- comment\n            ,\n            code,\n            qty,\n            pri\n        FROM fmtx_unit;"
+            ),
+            "Cursor SELECT comment in package body should match select-list depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_cursor_select_block_comment_at_select_list_depth_in_package_body() {
+        let source = "create or replace package body pkg_fmt as\n    procedure validate_and_process is\n        cursor c_units is\n        select id,\n            parent_id\n        /* keep\n           block */\n            ,\n            code\n        from fmtx_unit;\n    begin\n        null;\n    end validate_and_process;\nend pkg_fmt;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let block_open_idx = lines
+            .iter()
+            .position(|line| line.trim() == "/* keep")
+            .unwrap_or(0);
+        let block_close_idx = lines
+            .iter()
+            .position(|line| line.trim() == "block */")
+            .unwrap_or(0);
+        let comma_idx = lines
+            .iter()
+            .position(|line| line.trim() == ",")
+            .unwrap_or(0);
+        let code_idx = lines
+            .iter()
+            .position(|line| line.trim() == "code")
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[block_open_idx]),
+            leading_spaces(lines[code_idx]),
+            "Block comment opener should match code depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            lines[block_close_idx], "           block */",
+            "Multiline block comment internal line should preserve original indentation, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[comma_idx]),
+            leading_spaces(lines[code_idx]),
+            "Comma line should stay aligned with code after block comment, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_aligned_before_case_close_paren() {
+        let source = "begin\n    v_val := case\n        when flag = 1 then (\n            case\n                when score > 0 then 1\n                else 0\n            end\n            -- keep\n        )\n        else 2\n    end;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let comment_idx = lines
+            .iter()
+            .position(|line| line.trim() == "-- keep")
+            .unwrap_or(0);
+        let close_paren_idx = lines
+            .iter()
+            .position(|line| line.trim() == ")")
+            .unwrap_or(0);
+        let else_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_paren_idx.saturating_add(1))
+            .find_map(|(idx, line)| {
+                if line.trim() == "ELSE" {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[comment_idx]),
+            leading_spaces(lines[close_paren_idx]),
+            "Comment before parenthesized CASE closer should match close-paren depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[close_paren_idx]),
+            leading_spaces(lines[else_idx]),
+            "Parenthesized CASE closer should align with following ELSE branch depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_open_cursor_using_comment_aligned_with_following_items() {
+        let source = "BEGIN\n    IF a IS NOT NULL THEN\n        OPEN c FOR\n            b,\n            USING d,\n            -- e\n            f,\n                g;\n    END IF;\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let using_idx = lines
+            .iter()
+            .position(|line| line.trim() == "USING d,")
+            .unwrap_or(0);
+        let comment_idx = lines
+            .iter()
+            .position(|line| line.trim() == "-- e")
+            .unwrap_or(0);
+        let f_idx = lines
+            .iter()
+            .position(|line| line.trim() == "f,")
+            .unwrap_or(0);
+        let g_idx = lines
+            .iter()
+            .position(|line| line.trim() == "g;")
+            .unwrap_or(0);
+
+        assert_eq!(
+            leading_spaces(lines[comment_idx]),
+            leading_spaces(lines[f_idx]),
+            "OPEN ... FOR USING comment should match following item depth, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[f_idx]),
+            leading_spaces(lines[g_idx]),
+            "OPEN ... FOR USING continuation items should stay aligned after trailing comma, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[using_idx]),
+            leading_spaces(lines[f_idx]),
+            "USING clause item depth should stay consistent across comment-separated items, got:\n{}",
             formatted
         );
     }

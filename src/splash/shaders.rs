@@ -164,18 +164,22 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     vec3 col = vec3(0.0);
     extinction = 0.0;
 
-    // Layer 1: large blue emission nebulosity
+    // Layer 1: broad multicolor emission nebulosity
     float n1 = fbm(p * 1.5 + vec2(time * 0.005, time * 0.003));
     float n2 = fbm(p * 2.5 + vec2(-time * 0.008, time * 0.004) + 50.0);
     float mask1 = smoothstep(0.35, 0.65, n1) * (1.0 - smoothstep(0.3, 0.9, length(p)));
     float mask2 = smoothstep(0.4, 0.7, n2) * (1.0 - smoothstep(0.2, 1.0, length(p + vec2(0.15, -0.1))));
-    col += vec3(0.03, 0.055, 0.14) * mask1 * 0.72;
-    col += vec3(0.08, 0.03, 0.12) * mask2 * 0.45;
+    col += vec3(0.04, 0.07, 0.18) * mask1 * 0.46;
+    col += vec3(0.12, 0.05, 0.08) * mask1 * 0.26;
+    col += vec3(0.03, 0.12, 0.1) * mask2 * 0.22;
+    col += vec3(0.11, 0.04, 0.13) * mask2 * 0.34;
 
-    // Layer 2: fine filaments — reflection nebula
+    // Layer 2: fine filaments — reflection and ionized gas
     float n3 = fbm(p * 6.0 + vec2(time * 0.003, -time * 0.002) + 150.0);
     float filament = smoothstep(0.42, 0.58, n3) * (1.0 - smoothstep(0.25, 0.7, length(p - vec2(-0.1, 0.05))));
-    col += vec3(0.04, 0.07, 0.18) * filament * 0.35;
+    col += vec3(0.05, 0.08, 0.2) * filament * 0.22;
+    col += vec3(0.16, 0.07, 0.14) * filament * 0.12;
+    col += vec3(0.05, 0.14, 0.1) * filament * 0.11;
 
     // Dark nebula — opaque dust that absorbs background light
     float dark_n = fbm(p * 3.0 + vec2(-time * 0.004, 0.0) + 250.0);
@@ -190,7 +194,8 @@ vec3 cosmic_dust(vec2 p, float time, out float extinction) {
     vec2 p_safe = (p_len > 0.001) ? p / p_len : vec2(0.0, 1.0);
     float scatter_angle = dot(p_safe, light_dir_2d) * 0.5 + 0.5;
     float forward_scatter = pow(scatter_angle, 4.0) * dark_mask;
-    col += vec3(0.05, 0.08, 0.2) * forward_scatter * 0.22;
+    col += vec3(0.08, 0.12, 0.24) * forward_scatter * 0.16;
+    col += vec3(0.16, 0.07, 0.12) * forward_scatter * 0.08;
 
     return col;
 }
@@ -217,19 +222,25 @@ vec3 nebula(vec2 p, float time) {
     float dist = length(p);
     float falloff = 1.0 - smoothstep(0.08, 0.65, dist);
 
+    float color_swirl = fbm(rp * 1.8 + vec2(time * 0.01, -time * 0.008) + 320.0);
+    float green_veil = smoothstep(0.45, 0.72, fbm(warped * 2.3 + 430.0)) * falloff;
+
     vec3 col = vec3(0.0);
-    col += vec3(0.04, 0.11, 0.34) * n1 * 1.0;      // Deep blue core
-    col += vec3(0.0, 0.24, 0.46) * n2 * 0.52;      // Bright accent blue
-    col += vec3(0.18, 0.07, 0.3) * n3 * 0.46;      // Purple wisps
-    col += vec3(0.34, 0.12, 0.22) * n4 * 0.14;     // Pink highlights
-    col += vec3(0.35, 0.48, 0.7) * pow(falloff, 4.0) * 0.08;  // Hot core
+    col += vec3(0.08, 0.15, 0.4) * n1 * 0.78;      // Deep blue body
+    col += vec3(0.05, 0.3, 0.46) * n2 * 0.34;      // Cyan/teal emission
+    col += vec3(0.22, 0.08, 0.34) * n3 * 0.42;     // Purple wisps
+    col += vec3(0.42, 0.14, 0.22) * n4 * 0.24;     // Pink-red knots
+    col += vec3(0.18, 0.42, 0.18) * green_veil * (0.12 + color_swirl * 0.18); // Green veil
+    col += vec3(0.58, 0.32, 0.46) * pow(falloff, 4.0) * 0.08;  // Hot mixed-color core
     col *= falloff;
 
     // Emission edges — bright rims where gas density changes sharply
     float edge_n = fbm(warped * 6.0 + 300.0);
     float edge = abs(edge_n - 0.5);
     float emission = (1.0 - smoothstep(0.0, 0.06, edge)) * falloff;
-    col += vec3(0.18, 0.36, 0.72) * emission * 0.08;
+    col += vec3(0.2, 0.38, 0.72) * emission * 0.05;
+    col += vec3(0.46, 0.18, 0.32) * emission * 0.035;
+    col += vec3(0.16, 0.42, 0.22) * emission * 0.03;
 
     // Dark dust absorption lanes
     float dust = fbm(rp * 3.5 + vec2(time * 0.005, 0.0) + 500.0);

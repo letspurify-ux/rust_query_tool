@@ -1023,8 +1023,7 @@ impl QueryExecutor {
                     let j = skip_ws_and_comments_bytes(bytes, byte_idx.saturating_add(1));
                     let mut k = j;
                     let mut paren_kind = SubqueryParenKind::NonSubquery;
-                    while k < bytes.len()
-                        && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
                     {
                         k += 1;
                     }
@@ -1093,9 +1092,7 @@ impl QueryExecutor {
             }
 
             fn has_context(&self, context: ContinuationContext) -> bool {
-                self.continuation_stack
-                    .iter()
-                    .any(|entry| *entry == context)
+                self.continuation_stack.contains(&context)
             }
 
             fn enter_context(&mut self, context: ContinuationContext) {
@@ -1250,13 +1247,14 @@ impl QueryExecutor {
                 state.clear_all_contexts();
             }
 
+            if is_into_ender(&trimmed_upper) {
+                state.clear_context(ContinuationContext::IntoList);
+            }
+
             depths.push(base_depth.saturating_add(state.extra_depth()));
 
             let starts_into = sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 && !trimmed_upper.contains("SELECT INTO");
-            if is_into_ender(&trimmed_upper) {
-                state.clear_context(ContinuationContext::IntoList);
-            }
             if starts_into {
                 state.enter_context(ContinuationContext::IntoList);
             }

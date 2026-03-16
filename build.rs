@@ -137,7 +137,7 @@ fn write_ico_file(path: &Path) -> std::io::Result<()> {
 fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
     // AND mask: 1-bit per pixel, padded to DWORD rows.  All zeros = fully opaque
     // at the legacy mask level; real transparency is carried by the alpha channel.
-    let and_row_stride = ((size + 31) / 32) * 4;
+    let and_row_stride = size.div_ceil(32) * 4;
     let and_size = and_row_stride * size;
     let total = 40 + size * size * 4 + and_size;
     let mut out = Vec::with_capacity(total);
@@ -167,7 +167,7 @@ fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
     }
 
     // AND mask (all zeros)
-    out.extend(std::iter::repeat(0u8).take(and_size));
+    out.extend(std::iter::repeat_n(0u8, and_size));
 
     out
 }

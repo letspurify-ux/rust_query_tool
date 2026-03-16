@@ -1546,8 +1546,10 @@ fn test_entry_state_in_block_comment_continues() {
     // "still commenting */" should be comment
     let comment_end = text.find("*/").unwrap() + 2;
     assert!(
-        styles[..comment_end].chars().all(|c| c == STYLE_COMMENT),
-        "continued block comment should be COMMENT"
+        styles[..comment_end]
+            .chars()
+            .all(|c| c == STYLE_BLOCK_COMMENT),
+        "continued block comment should keep BLOCK_COMMENT continuation style"
     );
     // "SELECT" after should be keyword
     let select_pos = text.find("SELECT").unwrap();
@@ -1806,9 +1808,32 @@ fn test_incremental_highlight_inherits_comment_entry_state() {
     });
     assert!(updated.end >= updated.start);
     if !updated.styles.is_empty() {
-        assert!(updated.styles.chars().all(|c| c == STYLE_COMMENT));
-        assert!(!updated.styles.chars().any(|c| c == STYLE_BLOCK_COMMENT));
+        let comment_end = text[start..]
+            .find("*/")
+            .map(|idx| idx + 2)
+            .unwrap_or(updated.styles.len());
+        assert!(
+            updated.styles[..comment_end]
+                .chars()
+                .all(|c| c == STYLE_BLOCK_COMMENT),
+            "continued block comment bytes should keep BLOCK_COMMENT style"
+        );
     }
+}
+
+#[test]
+fn test_closed_multiline_block_comment_keeps_continuation_style() {
+    let highlighter = SqlHighlighter::new();
+    let text = "/* header\nasdf\nfooter */\nSELECT 1";
+    let styles = highlighter.generate_styles(text);
+    let comment_end = text.find("*/").unwrap() + 2;
+
+    assert!(
+        styles[..comment_end]
+            .chars()
+            .all(|c| c == STYLE_BLOCK_COMMENT),
+        "closed multiline block comment should keep BLOCK_COMMENT style for incremental continuation"
+    );
 }
 
 #[test]

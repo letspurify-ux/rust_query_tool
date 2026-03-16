@@ -306,11 +306,7 @@ fn glyph_cell_filled(rows: &[u8; 7], row: usize, col: usize) -> bool {
 }
 
 fn padded_glyph_cell_filled(rows: &[u8; 7], padded_row: usize, padded_col: usize) -> bool {
-    if padded_row == 0
-        || padded_col == 0
-        || padded_row > GLYPH_ROWS
-        || padded_col > GLYPH_COLS
-    {
+    if padded_row == 0 || padded_col == 0 || padded_row > GLYPH_ROWS || padded_col > GLYPH_COLS {
         return false;
     }
 
@@ -327,9 +323,7 @@ fn build_glyph_exterior_map(rows: &[u8; 7]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
             continue;
         }
 
-        let visited_idx = row
-            .saturating_mul(PADDED_GLYPH_COLS)
-            .saturating_add(col);
+        let visited_idx = row.saturating_mul(PADDED_GLYPH_COLS).saturating_add(col);
         if visited.get(visited_idx).copied().unwrap_or(false) {
             continue;
         }
@@ -342,9 +336,7 @@ fn build_glyph_exterior_map(rows: &[u8; 7]) -> [bool; GLYPH_ROWS * GLYPH_COLS] {
         }
 
         if (1..=GLYPH_ROWS).contains(&row) && (1..=GLYPH_COLS).contains(&col) {
-            let glyph_idx = (row - 1)
-                .saturating_mul(GLYPH_COLS)
-                .saturating_add(col - 1);
+            let glyph_idx = (row - 1).saturating_mul(GLYPH_COLS).saturating_add(col - 1);
             if let Some(cell) = exterior.get_mut(glyph_idx) {
                 *cell = true;
             }

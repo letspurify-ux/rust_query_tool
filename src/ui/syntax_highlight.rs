@@ -516,7 +516,7 @@ impl SqlHighlighter {
                 match scan_until_block_comment_end(bytes, idx, BlockCommentKind::Regular) {
                     ScanResult::Closed { next_idx } => {
                         idx = next_idx;
-                        styles[..idx].fill(STYLE_COMMENT as u8);
+                        styles[..idx].fill(STYLE_BLOCK_COMMENT as u8);
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_BLOCK_COMMENT as u8);
@@ -638,6 +638,12 @@ impl SqlHighlighter {
                     }
                 };
                 let style_byte = match scan_result {
+                    ScanResult::Closed { .. }
+                        if matches!(comment_kind, BlockCommentKind::Regular)
+                            && text[start..idx].bytes().any(is_line_terminator) =>
+                    {
+                        STYLE_BLOCK_COMMENT as u8
+                    }
                     ScanResult::Closed { .. } => comment_kind.closed_style_byte(),
                     ScanResult::Unterminated { .. } => comment_kind.style_byte(),
                 };
