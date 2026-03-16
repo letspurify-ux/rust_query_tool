@@ -45,7 +45,9 @@ pub(crate) struct SplitState {
     // used by `ui::sql_depth::ParenDepthState`.
     paren_stack: Vec<char>,
     // Derived depth kept in sync for efficient reads; equals `paren_stack.len()`.
-    pub(crate) paren_depth: usize,
+    // Private — use `paren_depth()` to read, `push_open_paren`/`pop_close_paren`/
+    // `clear_paren_stack` to mutate.
+    paren_depth: usize,
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
     with_clause_state: WithClauseState,
@@ -88,6 +90,12 @@ impl SplitState {
             self.paren_stack.pop();
             self.paren_depth = self.paren_stack.len();
         }
+    }
+
+    /// Returns the current parenthesis depth.
+    #[inline]
+    pub(crate) fn paren_depth(&self) -> usize {
+        self.paren_depth
     }
 
     /// Clear paren stack (used on statement boundary reset).

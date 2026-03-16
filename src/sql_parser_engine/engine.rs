@@ -210,7 +210,7 @@ impl SqlParserEngine {
     }
 
     pub(crate) fn paren_depth(&self) -> usize {
-        self.state.paren_depth
+        self.state.paren_depth()
     }
 
     pub(crate) fn can_terminate_on_slash(&self) -> bool {
@@ -315,10 +315,10 @@ impl SqlParserEngine {
 
     fn handle_identifier_start_candidate(&mut self, chars: &[char], i: usize) {
         let should_preview = self.state.token.is_empty()
-            && ((self.state.block_depth() == 1 && self.state.paren_depth == 0)
+            && ((self.state.block_depth() == 1 && self.state.paren_depth() == 0)
                 || (self.state.in_with_plsql_declaration()
                     && self.state.block_depth() == 0
-                    && self.state.paren_depth == 0));
+                    && self.state.paren_depth() == 0));
 
         if !should_preview {
             return;
@@ -567,7 +567,7 @@ impl SqlParserEngine {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth() == 0
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();
@@ -583,7 +583,7 @@ impl SqlParserEngine {
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
-                    && self.state.paren_depth == 0
+                    && self.state.paren_depth() == 0
                     && self.state.token.is_empty()
                 {
                     self.split_current_statement();
@@ -738,7 +738,7 @@ impl SqlParserEngine {
                             // Keep waiting.
                         }
                         IfSymbolEvent::OpenParen => {
-                            let condition_depth = self.state.paren_depth.saturating_add(1);
+                            let condition_depth = self.state.paren_depth().saturating_add(1);
                             self.state.if_state = IfState::InConditionParen {
                                 depth: condition_depth,
                             };
@@ -765,7 +765,7 @@ impl SqlParserEngine {
             // Check if closing paren matches IF condition paren
             if symbol_role == SymbolRole::CloseParen {
                 if let IfState::InConditionParen { depth } = self.state.if_state {
-                    if depth == self.state.paren_depth {
+                    if depth == self.state.paren_depth() {
                         self.state.if_state = IfState::AfterConditionParen;
                     }
                 }
@@ -869,7 +869,7 @@ impl SqlParserEngine {
         let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
             && self.state.with_clause_waiting_main_query()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0;
+            && self.state.paren_depth() == 0;
         let mut on_symbol = on_symbol;
         let mut on_statement_boundary = on_statement_boundary;
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
@@ -887,7 +887,7 @@ impl SqlParserEngine {
 
         let line_starts_at_statement_boundary = self.state.is_idle()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0
+            && self.state.paren_depth() == 0
             && !self.state.in_with_plsql_declaration()
             && self.current.trim().is_empty();
         if line_starts_at_statement_boundary && sql_text::is_auto_terminated_tool_command(line) {
@@ -908,7 +908,7 @@ impl SqlParserEngine {
         if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
             && self.state.is_idle()
             && self.state.block_depth() == 0
-            && self.state.paren_depth == 0
+            && self.state.paren_depth() == 0
             && sql_text::is_auto_terminated_tool_command(line)
         {
             self.finish_current_statement();

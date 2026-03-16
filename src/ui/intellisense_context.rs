@@ -707,8 +707,8 @@ fn close_parenthesis_scope(
         *query_depth = query_depth.saturating_sub(1);
     }
 
-    parser_state.paren_depth = parser_state.paren_depth.saturating_sub(1);
-    *depth = parser_state.paren_depth;
+    parser_state.pop_close_paren(')');
+    *depth = parser_state.paren_depth();
 
     if scope_stack.len() > 1 {
         scope_stack.pop();
@@ -813,7 +813,7 @@ impl Default for ParserDepthFrame {
 /// - Shares one keyword transition table for both phase and table collection
 fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorScanResult {
     let mut parser_state = SplitState::default();
-    let mut depth: usize = parser_state.paren_depth;
+    let mut depth: usize = parser_state.paren_depth();
     let mut query_depth: usize = 0;
     let mut depth_frames: Vec<ParserDepthFrame> = vec![ParserDepthFrame::default()];
     let mut last_word: Option<String> = None;
@@ -867,8 +867,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .map(|frame| frame.phase)
                     .unwrap_or(SqlPhase::Initial);
                 let parent_scope_id = *scope_stack.last().unwrap_or(&0);
-                parser_state.paren_depth = parser_state.paren_depth.saturating_add(1);
-                depth = parser_state.paren_depth;
+                parser_state.push_open_paren('(');
+                depth = parser_state.paren_depth();
 
                 let inherited_phase = if parent_phase.is_column_context()
                     || matches!(
@@ -1071,7 +1071,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 last_word = None;
                 relation_state.clear();
                 cte_state = CteState::Inactive;
-                parser_state.paren_depth = 0;
+                parser_state.clear_paren_stack();
                 depth = 0;
 
                 next_scope_id = 1;

@@ -1143,7 +1143,7 @@ fn semicolon_split_resets_transient_state_at_top_level() {
     assert_eq!(engine.state.pending_end, PendingEnd::None);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 
 #[test]
@@ -1225,7 +1225,7 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
     assert_eq!(engine.state.pending_end, PendingEnd::None);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 
 #[test]
@@ -1972,7 +1972,7 @@ fn finalize_clears_transient_parser_state_for_reuse() {
     assert_eq!(statements, vec!["FOR i IN 1..10\nIF flag".to_string()]);
     assert_eq!(engine.state.pending_do, PendingDo::None);
     assert_eq!(engine.state.if_state, IfState::None);
-    assert_eq!(engine.state.paren_depth, 0);
+    assert_eq!(engine.state.paren_depth(), 0);
 }
 #[test]
 fn type_spec_as_is_follow_state_is_cleared_by_declarative_kind_token() {
