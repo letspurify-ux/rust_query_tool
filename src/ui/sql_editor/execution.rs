@@ -2516,6 +2516,7 @@ impl SqlEditorWidget {
                             Some(SqlToken::Word(w))
                                 if w.eq_ignore_ascii_case("ELSE")
                                     || w.eq_ignore_ascii_case("ELSIF")
+                                    || w.eq_ignore_ascii_case("EXCEPTION")
                         );
                         let in_confirmed_list = in_set_clause
                             || column_list_stack.last().copied().unwrap_or(false)
@@ -2524,11 +2525,22 @@ impl SqlEditorWidget {
                             || next_is_comma
                             || next_is_condition_keyword;
                         if next_is_else {
-                            // Align comment with ELSE/ELSIF which renders at
-                            // one level below the current body in IF blocks,
-                            // or at base+1 in CASE blocks.
+                            // Align comment with ELSE/ELSIF/EXCEPTION which
+                            // renders at one level below the current body in
+                            // IF blocks, or at base+1 in CASE blocks.
+                            // EXCEPTION drops to the enclosing BEGIN level
+                            // just like ELSE does in IF blocks.
                             let in_if_block = block_stack.last().is_some_and(|s| s == "IF");
-                            line_indent = if in_if_block {
+                            let next_is_exception = matches!(
+                                next_non_comment,
+                                Some(SqlToken::Word(w))
+                                    if w.eq_ignore_ascii_case("EXCEPTION")
+                            );
+                            line_indent = if next_is_exception {
+                                // EXCEPTION always drops to the enclosing
+                                // BEGIN level regardless of block type.
+                                base_indent(indent_level.saturating_sub(1), open_cursor_state)
+                            } else if in_if_block {
                                 base_indent(indent_level.saturating_sub(1), open_cursor_state)
                             } else {
                                 base + 1
@@ -14072,6 +14084,142 @@ mod format_comment_indent_tests {
         assert!(
             formatted.contains("    -- description\n    col2"),
             "Comment before col2 should appear before col2, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 1: next_is_else 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_exception() {
+        let source =
+            "begin\nnull;\n-- handle errors\nexception\nwhen others then\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // EXCEPTION is at BEGIN level (indent 0), comment should match
+        assert!(
+            formatted.contains("\n-- handle errors\nEXCEPTION"),
+            "Comment before EXCEPTION should align with EXCEPTION at base indent, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_exception_nested() {
+        let source =
+            "begin\nif true then\nbegin\nnull;\n-- nested exception\nexception\nwhen others then\nnull;\nend;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        // Nested BEGIN..EXCEPTION: comment should be at nested BEGIN level (8 spaces)
+        assert!(
+            formatted.contains("        -- nested exception\n        EXCEPTION"),
+            "Comment before nested EXCEPTION should align with EXCEPTION, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_elsif() {
+        let source =
+            "begin\nif a = 1 then\nnull;\n-- check second\nelsif a = 2 then\nnull;\n-- fallback\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- check second\n    ELSIF"),
+            "Comment before ELSIF should align with ELSIF, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- fallback\n    ELSE"),
+            "Comment before ELSE should align with ELSE, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_block_comment_before_else_in_plsql_if() {
+        let source =
+            "begin\nif true then\nnull;\n/* else branch */\nelse\nnull;\nend if;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    /* else branch */\n    ELSE"),
+            "Block comment before ELSE should align with ELSE keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 2: next_is_condition_keyword 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_when_in_plsql_exception() {
+        let source =
+            "begin\nnull;\nexception\n-- not found\nwhen no_data_found then\nnull;\n-- others\nwhen others then\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- not found\n    WHEN"),
+            "Comment before WHEN in EXCEPTION should align with WHEN, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("    -- others\n    WHEN"),
+            "Comment before second WHEN in EXCEPTION should align with WHEN, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_on_in_join() {
+        let source = "select * from t1 join t2\n-- join condition\non t1.id = t2.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- join condition\n    ON"),
+            "Comment before ON in JOIN should align with ON keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_aligns_comment_before_and_in_having() {
+        let source =
+            "select col1, count(*) from t1 group by col1 having count(*) > 1\n-- extra filter\nand sum(col2) > 10;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- extra filter\n    AND"),
+            "Comment before AND in HAVING should align with AND keyword, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── Pattern 3: in_confirmed_list 누락 케이스 ──
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_having_list() {
+        let source =
+            "select col1, col2, count(*) from t1 group by col1\n-- comment\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- comment\n    ,"),
+            "Comment in GROUP BY list should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_window_clause_list() {
+        let source =
+            "select col1 from t1 order by col1\n-- secondary sort\n,col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- secondary sort\n    ,"),
+            "Comment between ORDER BY items should be at list item depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_comment_in_merge_matched_set_list() {
+        let source = "merge into t1 using t2 on (t1.id = t2.id) when matched then update set t1.col1 = t2.col1\n-- update col2\n,t1.col2 = t2.col2;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    -- update col2\n    ,"),
+            "Comment in MERGE UPDATE SET list should be at list item depth, got:\n{}",
             formatted
         );
     }
