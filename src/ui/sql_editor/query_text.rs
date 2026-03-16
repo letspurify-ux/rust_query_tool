@@ -820,18 +820,13 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
         return Err("Cannot edit rows: no base table was resolved from this query.".to_string());
     }
 
-    let mut depth = 0usize;
+    let mut paren_state = crate::ui::sql_depth::ParenDepthState::default();
     let mut in_select = false;
     let mut idx = 0usize;
     let mut rowid_qualifier: Option<String> = None;
     while idx < tokens.len() {
+        let depth = paren_state.depth();
         match tokens.get(idx) {
-            Some(SqlToken::Symbol(sym)) if sym == "(" => {
-                depth = depth.saturating_add(1);
-            }
-            Some(SqlToken::Symbol(sym)) if sym == ")" => {
-                depth = depth.saturating_sub(1);
-            }
             Some(SqlToken::Word(word)) => {
                 if depth == 0 && word.eq_ignore_ascii_case("SELECT") {
                     in_select = true;
@@ -858,6 +853,9 @@ pub(crate) fn resolve_edit_target_table(source_sql: &str) -> Result<String, Stri
             }
         }
 
+        if let Some(token) = tokens.get(idx) {
+            paren_state.apply_token(token);
+        }
         idx += 1;
     }
 

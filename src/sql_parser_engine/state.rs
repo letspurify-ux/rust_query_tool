@@ -39,6 +39,12 @@ pub(crate) struct SplitState {
     awaiting_package_body_name_dot: bool,
 
     // -- Parenthesis depth (for formatting / intellisense) --
+    //
+    // `paren_stack` tracks open-paren characters so that mismatched closers
+    // (e.g. `)` when top-of-stack is `[`) are ignored – matching the policy
+    // used by `ui::sql_depth::ParenDepthState`.
+    paren_stack: Vec<char>,
+    // Derived depth kept in sync for efficient reads; equals `paren_stack.len()`.
     pub(crate) paren_depth: usize,
 
     // -- Oracle top-level WITH FUNCTION/PROCEDURE declarations --
@@ -61,6 +67,35 @@ enum PlainEndParentClosure {
 }
 
 impl SplitState {
+    /// Push an open-paren character onto the stack and update `paren_depth`.
+    pub(crate) fn push_open_paren(&mut self, ch: char) {
+        self.paren_stack.push(ch);
+        self.paren_depth = self.paren_stack.len();
+    }
+
+    /// Attempt to pop a close-paren character from the stack.
+    ///
+    /// If the stack is empty or the top does not match the expected opener for
+    /// `close_ch`, the call is ignored – mirroring `sql_depth::ParenDepthState`.
+    pub(crate) fn pop_close_paren(&mut self, close_ch: char) {
+        let expected_open = match close_ch {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => return,
+        };
+        if self.paren_stack.last().copied() == Some(expected_open) {
+            self.paren_stack.pop();
+            self.paren_depth = self.paren_stack.len();
+        }
+    }
+
+    /// Clear paren stack (used on statement boundary reset).
+    pub(crate) fn clear_paren_stack(&mut self) {
+        self.paren_stack.clear();
+        self.paren_depth = 0;
+    }
+
     fn plain_end_parent_closure(&self, token_upper: &str) -> PlainEndParentClosure {
         let top = self.block_stack.last().copied();
         let closes_active_routine_declare = self
@@ -1262,7 +1297,7 @@ impl SplitState {
         self.skip_next_end_label_token = false;
         self.pending_do = PendingDo::None;
         self.if_state = IfState::None;
-        self.paren_depth = 0;
+        self.clear_paren_stack();
         self.with_clause_state = WithClauseState::None;
         self.top_level_token_state = TopLevelTokenState::NoneSeen;
         self.pending_implicit_external_top_level_split = false;

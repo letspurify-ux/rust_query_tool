@@ -1224,17 +1224,13 @@ impl QueryExecutor {
 
             if state.in_block_comment {
                 depths.push(base_depth);
-                if trimmed.contains("*/") {
-                    state.in_block_comment = false;
-                }
+                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
                 continue;
             }
 
             if trimmed.starts_with("/*") {
                 depths.push(base_depth);
-                if !trimmed.contains("*/") {
-                    state.in_block_comment = true;
-                }
+                sql_text::update_block_comment_state(trimmed, &mut state.in_block_comment);
                 continue;
             }
 

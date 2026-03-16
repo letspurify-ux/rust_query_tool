@@ -2951,9 +2951,7 @@ impl SqlEditorWidget {
 
             if in_block_comment {
                 out.push_str(line);
-                if trimmed.contains("*/") {
-                    in_block_comment = false;
-                }
+                crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
                 continue;
             }
 
@@ -2963,9 +2961,7 @@ impl SqlEditorWidget {
             if is_comment {
                 if trimmed.starts_with("/*") {
                     out.push_str(line);
-                    if !trimmed.contains("*/") {
-                        in_block_comment = true;
-                    }
+                    crate::sql_text::update_block_comment_state(trimmed, &mut in_block_comment);
                     continue;
                 }
 

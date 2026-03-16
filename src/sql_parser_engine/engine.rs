@@ -771,13 +771,13 @@ impl SqlParserEngine {
                 }
             }
 
-            // Track parenthesis depth
+            // Track parenthesis depth via stack (mismatch-safe)
             match symbol_role {
                 SymbolRole::OpenParen => {
-                    self.state.paren_depth += 1;
+                    self.state.push_open_paren(c);
                 }
                 SymbolRole::CloseParen => {
-                    self.state.paren_depth = self.state.paren_depth.saturating_sub(1);
+                    self.state.pop_close_paren(c);
                 }
                 _ => {}
             }
