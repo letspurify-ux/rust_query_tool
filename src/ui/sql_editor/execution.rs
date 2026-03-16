@@ -2969,39 +2969,7 @@ impl SqlEditorWidget {
                     continue;
                 }
 
-                let leading_spaces = line.len().saturating_sub(trimmed.len());
-                let existing_indent = leading_spaces / 4;
-                let parser_depth = depth;
-                // Look ahead to find the next non-comment, non-empty line.
-                // If it starts with ELSE/ELSIF/ELSEIF, align this comment
-                // with that keyword (one level less than the body depth).
-                let next_code_trimmed = lines[idx + 1..].iter().find_map(|next| {
-                    let nt = next.trim_start();
-                    if nt.is_empty()
-                        || Self::is_sqlplus_comment_line(nt)
-                        || nt.starts_with("/*")
-                        || nt == "*/"
-                    {
-                        None
-                    } else {
-                        Some(nt)
-                    }
-                });
-                let next_is_else_keyword = next_code_trimmed.is_some_and(|nt| {
-                    let upper = nt.to_ascii_uppercase();
-                    upper.starts_with("ELSE")
-                        || upper.starts_with("ELSIF")
-                        || upper.starts_with("ELSEIF")
-                });
-                let effective_depth = if next_is_else_keyword && !in_dml_statement {
-                    // Comment before ELSE/ELSIF should align with ELSE
-                    // which is rendered at depth-1 in IF blocks.
-                    existing_indent.min(parser_depth)
-                } else if in_dml_statement {
-                    existing_indent.clamp(parser_depth, parser_depth.saturating_add(1))
-                } else {
-                    parser_depth
-                };
+                let effective_depth = depth;
                 out.push_str(&" ".repeat(effective_depth * 4));
                 out.push_str(trimmed);
                 continue;
@@ -3138,22 +3106,10 @@ impl SqlEditorWidget {
                         .to_ascii_uppercase()
                         .starts_with("SELECT /*+")
                 });
-            let previous_line_has_line_comment =
-                last_code_line_trimmed.as_deref().is_some_and(|prev| {
-                    let prev_trimmed = prev.trim_start();
-                    prev_trimmed.starts_with("--")
-                        || prev.contains("--")
-                        || Self::is_sqlplus_remark_comment_statement(prev_trimmed)
-                });
             let starts_clause_keyword = Self::is_dml_clause_starter(&trimmed_upper)
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
                 || crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT");
             let effective_depth = if previous_line_is_select_hint && !starts_clause_keyword {
-                effective_depth.max(1)
-            } else {
-                effective_depth
-            };
-            let effective_depth = if trimmed.starts_with(',') && previous_line_has_line_comment {
                 effective_depth.max(1)
             } else {
                 effective_depth
