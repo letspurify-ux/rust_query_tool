@@ -1637,6 +1637,12 @@ impl SqlEditorWidget {
         let mut statement_has_with_clause = false;
         let mut paren_indent_increase_stack: Vec<usize> = Vec::new();
         let mut trigger_header_state = TriggerHeaderState::None;
+        let mut cursor_decl_pending = false; // CURSOR ... IS/AS → indent the SQL body
+        let mut cursor_sql_active = false; // Inside CURSOR IS ... ;
+        let mut forall_pending = false; // FORALL → indent the DML body
+        let mut forall_body_active = false; // Inside FORALL ... DML ... ;
+        let mut execute_immediate_active = false; // EXECUTE IMMEDIATE → suppress USING clause break
+        let mut create_index_pending = false; // CREATE INDEX → suppress ON condition break
         let is_package_body_statement = {
             let upper = statement.to_ascii_uppercase();
             upper.contains("CREATE OR REPLACE PACKAGE BODY")
@@ -1734,6 +1740,7 @@ impl SqlEditorWidget {
                         && matches!(upper.as_str(), "INSERT" | "UPDATE" | "DELETE");
                     let is_trigger_or_on_keyword =
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
+                    let is_create_index_on = upper == "ON" && create_index_pending;
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
@@ -1978,7 +1985,20 @@ impl SqlEditorWidget {
                         && !is_start_with
                         && !suppress_order_clause_break
                         && !is_trigger_event_keyword
+                        && !(execute_immediate_active
+                            && matches!(upper.as_str(), "INTO" | "USING"))
                     {
+                        // FORALL: indent the DML body under FORALL
+                        if forall_pending
+                            && matches!(
+                                upper.as_str(),
+                                "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+                            )
+                        {
+                            indent_level += 1;
+                            forall_pending = false;
+                            forall_body_active = true;
+                        }
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
@@ -2008,6 +2028,7 @@ impl SqlEditorWidget {
                         && !is_between_and
                         && !is_exit_when
                         && !is_trigger_or_on_keyword
+                        && !is_create_index_on
                     {
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         if upper == "WHEN"
@@ -2041,6 +2062,14 @@ impl SqlEditorWidget {
                     } else if create_pending && upper == "TABLE" {
                         create_table_paren_expected = true;
                         create_pending = false;
+                    } else if create_pending
+                        && matches!(upper.as_str(), "INDEX" | "UNIQUE")
+                    {
+                        if upper == "INDEX" {
+                            create_index_pending = true;
+                            create_pending = false;
+                        }
+                        // UNIQUE stays in create_pending to catch UNIQUE INDEX
                     } else if create_pending
                         && matches!(
                             upper.as_str(),
@@ -2295,6 +2324,27 @@ impl SqlEditorWidget {
                         create_table_paren_expected = false;
                     }
 
+                    // CURSOR ... IS/AS → indent the SQL body
+                    if upper == "CURSOR" && in_plsql_block {
+                        cursor_decl_pending = true;
+                    }
+                    if matches!(upper.as_str(), "IS" | "AS") && cursor_decl_pending {
+                        cursor_decl_pending = false;
+                        cursor_sql_active = true;
+                        indent_level += 1;
+                        newline_after_keyword = true;
+                    }
+
+                    // FORALL → indent the DML body
+                    if upper == "FORALL" && in_plsql_block {
+                        forall_pending = true;
+                    }
+
+                    // EXECUTE IMMEDIATE tracking
+                    if upper == "EXECUTE" && next_word_is("IMMEDIATE") {
+                        execute_immediate_active = true;
+                    }
+
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
                         && (create_object.is_some() || routine_decl_pending);
 
@@ -2388,6 +2438,9 @@ impl SqlEditorWidget {
                         between_pending = true;
                     } else if upper == "AND" && between_pending {
                         between_pending = false;
+                    }
+                    if is_create_index_on {
+                        create_index_pending = false;
                     }
                     exit_condition_state.on_keyword(upper.as_str());
 
@@ -2717,7 +2770,9 @@ impl SqlEditorWidget {
                                         indent: select_list_indent,
                                     };
                                 }
-                            } else if suppress_comma_break_depth == 0 {
+                            } else if suppress_comma_break_depth == 0
+                                && !execute_immediate_active
+                            {
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
@@ -2749,6 +2804,17 @@ impl SqlEditorWidget {
                             between_pending = false;
                             trigger_header_state.clear();
                             exit_condition_state.clear();
+                            execute_immediate_active = false;
+                            cursor_decl_pending = false;
+                            create_index_pending = false;
+                            if cursor_sql_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                cursor_sql_active = false;
+                            }
+                            if forall_body_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                forall_body_active = false;
+                            }
                             if pending_package_member_separator
                                 && (next_word_is("PROCEDURE") || next_word_is("FUNCTION"))
                             {
@@ -14289,6 +14355,140 @@ mod format_comment_indent_tests {
             leading_spaces(comment_line),
             leading_spaces(or_line),
             "Comment before OR inside parens should match OR indent, got:\n{}",
+            formatted
+        );
+    }
+}
+
+#[cfg(test)]
+mod format_indent_gap_tests {
+    use crate::ui::sql_editor::SqlEditorWidget;
+
+    // ── CURSOR IS/AS SELECT body indent ──
+
+    #[test]
+    fn format_sql_basic_indents_cursor_is_select_body() {
+        let source = "declare\ncursor c1 is\nselect col1, col2\nfrom t1\nwhere col1 > 0;\nbegin\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    CURSOR c1 IS\n        SELECT"),
+            "SELECT body should be indented under CURSOR IS, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("        FROM t1"),
+            "FROM should be at CURSOR body depth, got:\n{}",
+            formatted
+        );
+        // BEGIN should return to DECLARE level
+        assert!(
+            formatted.contains("BEGIN\n    NULL;"),
+            "BEGIN should return to top level after CURSOR, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_cursor_with_params_is_select_body() {
+        let source = "declare\ncursor c1 (p1 number) is\nselect col1\nfrom t1\nwhere col1 = p1;\nbegin\nnull;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    CURSOR c1 (p1 NUMBER) IS\n        SELECT"),
+            "Parameterized CURSOR SELECT should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_nested_cursor_declaration() {
+        let source = "begin\ndeclare\ncursor c1 is\nselect col1 from t1;\nbegin\nopen c1;\nend;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("        CURSOR c1 IS\n            SELECT"),
+            "Nested CURSOR SELECT should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── FORALL body indent ──
+
+    #[test]
+    fn format_sql_basic_indents_forall_insert_body() {
+        let source = "begin\nforall i in 1..v_arr.count\ninsert into t1 values (v_arr(i));\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        INSERT INTO"),
+            "FORALL INSERT body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_forall_update_body() {
+        let source = "begin\nforall i in 1..v_arr.count\nupdate t1 set col1 = v_arr(i)\nwhere id = v_id(i);\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        UPDATE"),
+            "FORALL UPDATE body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_forall_delete_body() {
+        let source = "begin\nforall i in 1..v_arr.count\ndelete from t1 where id = v_arr(i);\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        DELETE"),
+            "FORALL DELETE body should be indented, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── EXECUTE IMMEDIATE INTO/USING inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_execute_immediate_into_using_inline() {
+        let source = "begin\nexecute immediate 'select 1 from dual' into v_result using v_param;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("EXECUTE IMMEDIATE 'select 1 from dual' INTO v_result USING v_param;"),
+            "EXECUTE IMMEDIATE INTO/USING should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_execute_immediate_using_only_inline() {
+        let source = "begin\nexecute immediate v_sql using v_param1, v_param2;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("EXECUTE IMMEDIATE v_sql USING v_param1, v_param2;"),
+            "EXECUTE IMMEDIATE USING should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE INDEX ON inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_index_on_inline() {
+        let source = "create index idx1 on t1 (col1, col2);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("CREATE INDEX idx1 ON t1"),
+            "CREATE INDEX ON should stay on same line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_create_unique_index_on_inline() {
+        let source = "create unique index idx1 on t1 (col1, col2) tablespace users;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("CREATE UNIQUE INDEX idx1 ON t1"),
+            "CREATE UNIQUE INDEX ON should stay on same line, got:\n{}",
             formatted
         );
     }
