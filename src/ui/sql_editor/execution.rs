@@ -3163,6 +3163,9 @@ impl SqlEditorWidget {
                 let prev_upper = layouts[prev_idx].trimmed.to_ascii_uppercase();
                 Self::starts_with_plain_end(&prev_upper)
             });
+            let previous_line_starts_with_using_clause = last_code_idx.is_some_and(|prev_idx| {
+                Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
+            });
             let previous_line_ends_with_trailing_comma = last_code_idx.is_some_and(|prev_idx| {
                 Self::line_ends_with_comma_before_inline_comment(layouts[prev_idx].trimmed)
             });
@@ -3210,9 +3213,15 @@ impl SqlEditorWidget {
             let effective_depth = if force_block_depth {
                 parser_depth
             } else if !in_dml_statement && previous_line_ends_with_trailing_comma {
-                last_code_indent
-                    .map(|indent| indent.max(parser_depth))
-                    .unwrap_or(parser_depth.max(existing_indent))
+                if previous_line_starts_with_using_clause {
+                    last_code_indent
+                        .map(|indent| indent.saturating_add(1).max(parser_depth))
+                        .unwrap_or(parser_depth.saturating_add(1).max(existing_indent))
+                } else {
+                    last_code_indent
+                        .map(|indent| indent.max(parser_depth))
+                        .unwrap_or(parser_depth.max(existing_indent))
+                }
             } else if in_dml_statement && starts_subquery_head && previous_line_ends_with_open_paren
             {
                 let nested_subquery_depth = if previous_line_is_cte_definition_header
@@ -3397,6 +3406,13 @@ impl SqlEditorWidget {
 
             let previous_code_idx = previous_code_indices[start];
             let next_code_idx = next_code_indices[start];
+            let previous_code_is_using_continuation_anchor =
+                previous_code_idx.is_some_and(|prev_idx| {
+                    Self::line_starts_with_using_clause(layouts[prev_idx].trimmed)
+                        && Self::line_ends_with_comma_before_inline_comment(
+                            layouts[prev_idx].trimmed,
+                        )
+                });
             let prefer_previous_scope = match (previous_code_idx, next_code_idx) {
                 (Some(prev_idx), Some(next_idx)) => {
                     let next_upper = layouts[next_idx].trimmed.to_ascii_uppercase();
@@ -3416,11 +3432,17 @@ impl SqlEditorWidget {
                         previous_code_idx.and_then(|prev_idx| layouts[prev_idx].anchor_group)
                     })
             };
-            let target_depth = anchor_group
-                .and_then(|group| anchor_depths.get(group).copied().flatten())
-                .or_else(|| next_code_idx.map(|next_idx| layouts[next_idx].final_depth))
-                .or_else(|| previous_code_idx.map(|prev_idx| layouts[prev_idx].final_depth))
-                .unwrap_or(0);
+            let target_depth = if previous_code_is_using_continuation_anchor {
+                previous_code_idx
+                    .map(|prev_idx| layouts[prev_idx].final_depth.saturating_add(1))
+                    .unwrap_or(0)
+            } else {
+                anchor_group
+                    .and_then(|group| anchor_depths.get(group).copied().flatten())
+                    .or_else(|| next_code_idx.map(|next_idx| layouts[next_idx].final_depth))
+                    .or_else(|| previous_code_idx.map(|prev_idx| layouts[prev_idx].final_depth))
+                    .unwrap_or(0)
+            };
 
             for layout in &mut layouts[start..idx] {
                 layout.anchor_group = anchor_group;
@@ -3783,6 +3805,11 @@ impl SqlEditorWidget {
         upper.contains(" AS (")
     }
 
+    fn line_starts_with_using_clause(line: &str) -> bool {
+        let trimmed_upper = line.trim_start().to_ascii_uppercase();
+        crate::sql_text::starts_with_keyword_token(&trimmed_upper, "USING")
+    }
+
     fn is_parenthesized_plsql_condition_header(line: &str) -> bool {
         if !Self::line_has_unclosed_open_paren_before_inline_comment(line) {
             return false;
@@ -3832,7 +3859,7 @@ impl SqlEditorWidget {
             }
         }
 
-        for word in words {
+        for word in &words {
             if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("DECLARE") {
                 return true;
             }
@@ -3851,7 +3878,41 @@ impl SqlEditorWidget {
             }
         }
 
-        false
+        Self::is_plsql_control_fragment(&words)
+    }
+
+    fn is_plsql_control_fragment(words: &[&str]) -> bool {
+        if words.is_empty() {
+            return false;
+        }
+
+        let first = words[0];
+        if first.eq_ignore_ascii_case("IF")
+            && words
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("THEN"))
+        {
+            return true;
+        }
+
+        if first.eq_ignore_ascii_case("ELSIF") || first.eq_ignore_ascii_case("ELSEIF") {
+            return true;
+        }
+
+        if first.eq_ignore_ascii_case("WHILE")
+            && words
+                .iter()
+                .any(|word| word.eq_ignore_ascii_case("LOOP"))
+        {
+            return true;
+        }
+
+        words.windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("END")
+                && (pair[1].eq_ignore_ascii_case("IF")
+                    || pair[1].eq_ignore_ascii_case("LOOP")
+                    || pair[1].eq_ignore_ascii_case("CASE"))
+        })
     }
 
     #[cfg(test)]
@@ -13786,40 +13847,22 @@ mod format_comment_indent_tests {
     fn format_sql_basic_keeps_open_cursor_using_comment_aligned_with_following_items() {
         let source = "BEGIN\n    IF a IS NOT NULL THEN\n        OPEN c FOR\n            b,\n            USING d,\n            -- e\n            f,\n                g;\n    END IF;\nEND;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
-        let lines: Vec<&str> = formatted.lines().collect();
-        let using_idx = lines
-            .iter()
-            .position(|line| line.trim() == "USING d,")
-            .unwrap_or(0);
-        let comment_idx = lines
-            .iter()
-            .position(|line| line.trim() == "-- e")
-            .unwrap_or(0);
-        let f_idx = lines
-            .iter()
-            .position(|line| line.trim() == "f,")
-            .unwrap_or(0);
-        let g_idx = lines
-            .iter()
-            .position(|line| line.trim() == "g;")
-            .unwrap_or(0);
+        assert_eq!(
+            formatted,
+            "BEGIN\n    IF a IS NOT NULL THEN\n        OPEN c FOR\n            b,\n            USING d,\n                -- e\n                f,\n                g;\n    END IF;\nEND;",
+            "OPEN ... FOR USING comment and continuation items should align one level deeper than USING, got:\n{}",
+            formatted
+        );
+    }
 
+    #[test]
+    fn format_sql_basic_keeps_selected_if_fragment_using_comment_aligned_with_following_items() {
+        let source = "IF a IS NOT NULL THEN\n    OPEN c FOR\n        b,\n        USING d,\n        -- e\n        f,\n            g;\nEND IF;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
         assert_eq!(
-            leading_spaces(lines[comment_idx]),
-            leading_spaces(lines[f_idx]),
-            "OPEN ... FOR USING comment should match following item depth, got:\n{}",
-            formatted
-        );
-        assert_eq!(
-            leading_spaces(lines[f_idx]),
-            leading_spaces(lines[g_idx]),
-            "OPEN ... FOR USING continuation items should stay aligned after trailing comma, got:\n{}",
-            formatted
-        );
-        assert_eq!(
-            leading_spaces(lines[using_idx]),
-            leading_spaces(lines[f_idx]),
-            "USING clause item depth should stay consistent across comment-separated items, got:\n{}",
+            formatted,
+            "IF a IS NOT NULL THEN\n    OPEN c FOR\n        b,\n        USING d,\n            -- e\n            f,\n            g;\nEND IF;",
+            "Selected IF fragment should keep USING comment and continuation items one level deeper than USING, got:\n{}",
             formatted
         );
     }
