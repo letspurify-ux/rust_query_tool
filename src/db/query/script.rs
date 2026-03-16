@@ -1063,6 +1063,218 @@ impl QueryExecutor {
         depths
     }
 
+    /// Returns line depths tailored for auto-format indentation.
+    ///
+    /// This builds on [`line_block_depths`] and folds in formatter-specific
+    /// continuation depth for INTO lists and DML comma chains.
+    pub fn line_auto_format_depths(sql: &str) -> Vec<usize> {
+        #[derive(Copy, Clone, Eq, PartialEq)]
+        enum ContinuationContext {
+            IntoList,
+        }
+
+        struct AutoFormatDepthState {
+            in_dml_statement: bool,
+            in_block_comment: bool,
+            continuation_stack: Vec<ContinuationContext>,
+            last_code_had_trailing_comma: bool,
+        }
+
+        impl AutoFormatDepthState {
+            fn new() -> Self {
+                Self {
+                    in_dml_statement: false,
+                    in_block_comment: false,
+                    continuation_stack: Vec::new(),
+                    last_code_had_trailing_comma: false,
+                }
+            }
+
+            fn has_context(&self, context: ContinuationContext) -> bool {
+                self.continuation_stack
+                    .iter()
+                    .any(|entry| *entry == context)
+            }
+
+            fn enter_context(&mut self, context: ContinuationContext) {
+                if !self.has_context(context) {
+                    self.continuation_stack.push(context);
+                }
+            }
+
+            fn clear_context(&mut self, context: ContinuationContext) {
+                self.continuation_stack.retain(|entry| *entry != context);
+            }
+
+            fn clear_all_contexts(&mut self) {
+                self.continuation_stack.clear();
+            }
+
+            fn extra_depth(&self) -> usize {
+                usize::from(
+                    self.has_context(ContinuationContext::IntoList)
+                        || (self.in_dml_statement && self.last_code_had_trailing_comma),
+                )
+            }
+        }
+
+        fn starts_with_any_keyword_token(trimmed_upper: &str, keywords: &[&str]) -> bool {
+            keywords
+                .iter()
+                .any(|keyword| sql_text::starts_with_keyword_token(trimmed_upper, keyword))
+        }
+
+        fn is_dml_starter(trimmed_upper: &str) -> bool {
+            starts_with_any_keyword_token(
+                trimmed_upper,
+                &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"],
+            )
+        }
+
+        fn is_into_ender(trimmed_upper: &str) -> bool {
+            starts_with_any_keyword_token(
+                trimmed_upper,
+                &[
+                    "FROM",
+                    "WHERE",
+                    "GROUP",
+                    "ORDER",
+                    "CONNECT",
+                    "HAVING",
+                    "UNION",
+                    "INTERSECT",
+                    "MINUS",
+                ],
+            )
+        }
+
+        fn line_ends_with_comma_before_inline_comment(line: &str) -> bool {
+            let bytes = line.as_bytes();
+            let mut idx = 0usize;
+            let mut last_non_ws: Option<u8> = None;
+            let mut in_single_quote = false;
+            let mut in_double_quote = false;
+
+            while idx < bytes.len() {
+                let current = bytes[idx];
+
+                if in_single_quote {
+                    if current == b'\'' {
+                        if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                            idx += 2;
+                            continue;
+                        }
+                        in_single_quote = false;
+                    }
+                    idx += 1;
+                    continue;
+                }
+
+                if in_double_quote {
+                    if current == b'"' {
+                        in_double_quote = false;
+                    }
+                    idx += 1;
+                    continue;
+                }
+
+                if current == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+                    break;
+                }
+                if current == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                    break;
+                }
+                if current == b'\'' {
+                    in_single_quote = true;
+                    idx += 1;
+                    continue;
+                }
+                if current == b'"' {
+                    in_double_quote = true;
+                    idx += 1;
+                    continue;
+                }
+
+                if !current.is_ascii_whitespace() {
+                    last_non_ws = Some(current);
+                }
+                idx += 1;
+            }
+
+            last_non_ws == Some(b',')
+        }
+
+        let base_depths = Self::line_block_depths(sql);
+        let lines: Vec<&str> = sql.lines().collect();
+        if base_depths.len() != lines.len() {
+            return base_depths;
+        }
+
+        let mut state = AutoFormatDepthState::new();
+        let mut depths = Vec::with_capacity(base_depths.len());
+
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let base_depth = base_depths.get(idx).copied().unwrap_or(0);
+
+            if trimmed.is_empty() {
+                depths.push(base_depth);
+                continue;
+            }
+
+            if state.in_block_comment {
+                depths.push(base_depth);
+                if trimmed.contains("*/") {
+                    state.in_block_comment = false;
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("/*") {
+                depths.push(base_depth);
+                if !trimmed.contains("*/") {
+                    state.in_block_comment = true;
+                }
+                continue;
+            }
+
+            if trimmed == "*/"
+                || trimmed.starts_with("--")
+                || sql_text::is_sqlplus_comment_line(trimmed)
+            {
+                depths.push(base_depth);
+                continue;
+            }
+
+            let trimmed_upper = trimmed.to_ascii_uppercase();
+            if is_dml_starter(&trimmed_upper) {
+                state.in_dml_statement = true;
+                state.clear_all_contexts();
+            }
+
+            depths.push(base_depth.saturating_add(state.extra_depth()));
+
+            let starts_into = sql_text::starts_with_keyword_token(&trimmed_upper, "INTO")
+                && !trimmed_upper.contains("SELECT INTO");
+            if is_into_ender(&trimmed_upper) {
+                state.clear_context(ContinuationContext::IntoList);
+            }
+            if starts_into {
+                state.enter_context(ContinuationContext::IntoList);
+            }
+
+            if trimmed.ends_with(';') {
+                state.clear_all_contexts();
+                state.in_dml_statement = false;
+            }
+
+            state.last_code_had_trailing_comma =
+                line_ends_with_comma_before_inline_comment(trimmed);
+        }
+
+        depths
+    }
+
     pub fn strip_leading_comments(sql: &str) -> String {
         let mut remaining = sql;
 
@@ -4823,6 +5035,36 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
             .is_none(),
             "hierarchical CONNECT BY with inline comment must remain SQL"
         );
+    }
+
+    #[test]
+    fn line_auto_format_depths_adds_into_list_continuation_depth() {
+        let sql = "SELECT col\nINTO v_a,\nv_b\nFROM dual;";
+        let block_depths = QueryExecutor::line_block_depths(sql);
+        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
+
+        assert_eq!(block_depths.len(), auto_depths.len());
+        assert_eq!(auto_depths[2], block_depths[2].saturating_add(1));
+    }
+
+    #[test]
+    fn line_auto_format_depths_adds_dml_comma_continuation_depth() {
+        let sql = "UPDATE t\nSET a = 1,\nb = 2\nWHERE id = 1;";
+        let block_depths = QueryExecutor::line_block_depths(sql);
+        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
+
+        assert_eq!(block_depths.len(), auto_depths.len());
+        assert_eq!(auto_depths[2], block_depths[2].saturating_add(1));
+    }
+
+    #[test]
+    fn line_auto_format_depths_keeps_comma_continuation_after_comment_line() {
+        let sql = "UPDATE t\nSET a = 1,\n-- keep comma depth\nb = 2\nWHERE id = 1;";
+        let block_depths = QueryExecutor::line_block_depths(sql);
+        let auto_depths = QueryExecutor::line_auto_format_depths(sql);
+
+        assert_eq!(block_depths.len(), auto_depths.len());
+        assert_eq!(auto_depths[3], block_depths[3].saturating_add(1));
     }
 
     #[test]
