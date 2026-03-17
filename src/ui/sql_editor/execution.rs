@@ -1738,20 +1738,19 @@ impl SqlEditorWidget {
                 let base = base_indent(indent_level, open_cursor_state);
                 select_list_layout_state.indentation_or(base + 1)
             };
-        let clause_list_indent =
-            |indent_level: usize,
-             open_cursor_state: OpenCursorFormatState,
-             select_list_layout_state: SelectListLayoutState,
-             current_clause: Option<&str>,
-             merge_active: bool| {
-                let base = base_indent(indent_level, open_cursor_state);
-                if matches!(current_clause, Some("SET")) && merge_active {
-                    base
-                } else {
-                    list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
-                        .max(base + 1)
-                }
-            };
+        let clause_list_indent = |indent_level: usize,
+                                  open_cursor_state: OpenCursorFormatState,
+                                  select_list_layout_state: SelectListLayoutState,
+                                  current_clause: Option<&str>,
+                                  merge_active: bool| {
+            let base = base_indent(indent_level, open_cursor_state);
+            if matches!(current_clause, Some("SET")) && merge_active {
+                base
+            } else {
+                list_item_indent(indent_level, open_cursor_state, select_list_layout_state)
+                    .max(base + 1)
+            }
+        };
 
         let ensure_indent = |out: &mut String, at_line_start: &mut bool, line_indent: usize| {
             if *at_line_start {
@@ -1812,6 +1811,7 @@ impl SqlEditorWidget {
                     let is_within_group =
                         upper == "GROUP" && matches!(prev_word_upper.as_deref(), Some("WITHIN"));
                     let mut newline_after_keyword = false;
+                    let mut newline_after_keyword_extra = 0usize;
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = exit_condition_state.is_exit_when(upper.as_str());
                     let is_trigger_event_keyword = trigger_header_state.is_active()
@@ -1894,13 +1894,13 @@ impl SqlEditorWidget {
                         && !(follows_alias_keyword
                             && sql_text::is_plsql_control_keyword(upper.as_str())
                             && !next_word_is("THEN"));
-                    let suppress_order_clause_break =
-                        (suppress_comma_break_depth > 0 && upper == "ORDER")
-                            || (upper == "ORDER"
-                                && matches!(
-                                    prev_word_upper.as_deref(),
-                                    Some("SEQUENTIAL" | "AUTOMATIC")
-                                ));
+                    let suppress_order_clause_break = (suppress_comma_break_depth > 0
+                        && upper == "ORDER")
+                        || (upper == "ORDER"
+                            && matches!(
+                                prev_word_upper.as_deref(),
+                                Some("SEQUENTIAL" | "AUTOMATIC")
+                            ));
                     let at_package_body_member_depth =
                         is_package_body_statement && indent_level == 1;
                     if upper == "END" && !treat_control_keyword_as_identifier {
@@ -2365,6 +2365,9 @@ impl SqlEditorWidget {
                             && !matches!(current_clause.as_deref(), Some("SELECT"))
                         {
                             newline_after_keyword = true;
+                            if block_stack.last().is_some_and(|s| s == "CASE") {
+                                newline_after_keyword_extra = 1;
+                            }
                         } else if in_sql_case_clause && next_word_is("CASE") {
                             // Nested CASE in SQL expressions should start on its own line.
                             newline_after_keyword = true;
@@ -2758,7 +2761,7 @@ impl SqlEditorWidget {
                         newline_with(
                             &mut out,
                             base_indent(indent_level, open_cursor_state),
-                            0,
+                            newline_after_keyword_extra,
                             &mut at_line_start,
                             &mut needs_space,
                             &mut line_indent,
@@ -3096,15 +3099,16 @@ impl SqlEditorWidget {
                             between_pending = false;
                             let is_with_cte_separator = with_cte_state.can_close_on_select();
                             if column_list_stack.last().copied().unwrap_or(false) {
-                                let comma_extra_indent = if (matches!(current_clause.as_deref(), Some("SET"))
-                                    && merge_active)
-                                    || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                        && cursor_sql_active)
-                                {
-                                    0
-                                } else {
-                                    1
-                                };
+                                let comma_extra_indent =
+                                    if (matches!(current_clause.as_deref(), Some("SET"))
+                                        && merge_active)
+                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                            && cursor_sql_active)
+                                    {
+                                        0
+                                    } else {
+                                        1
+                                    };
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
@@ -3135,15 +3139,16 @@ impl SqlEditorWidget {
                                 && !execute_immediate_active
                                 && !grant_revoke_active
                             {
-                                let comma_extra_indent = if (matches!(current_clause.as_deref(), Some("SET"))
-                                    && merge_active)
-                                    || (matches!(current_clause.as_deref(), Some("SELECT"))
-                                        && cursor_sql_active)
-                                {
-                                    0
-                                } else {
-                                    1
-                                };
+                                let comma_extra_indent =
+                                    if (matches!(current_clause.as_deref(), Some("SET"))
+                                        && merge_active)
+                                        || (matches!(current_clause.as_deref(), Some("SELECT"))
+                                            && cursor_sql_active)
+                                    {
+                                        0
+                                    } else {
+                                        1
+                                    };
                                 newline_with(
                                     &mut out,
                                     base_indent(indent_level, open_cursor_state),
@@ -3380,7 +3385,9 @@ impl SqlEditorWidget {
                             if was_subquery {
                                 current_clause = restore_clause;
                             }
-                            if match_recognize_paren_depth.is_some_and(|depth| paren_stack.len() < depth) {
+                            if match_recognize_paren_depth
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
                                 match_recognize_paren_depth = None;
                             }
                             out.push(')');
@@ -15339,15 +15346,16 @@ mod format_indent_gap_tests {
         );
     }
 
-
-
     #[test]
     fn format_sql_basic_keeps_extract_from_inline_inside_function() {
         let source = "select extract(year from d.dt) as yyyy from dual d;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("YEAR FROM d.dt") && !formatted.contains("YEAR
-FROM"),
+            formatted.contains("YEAR FROM d.dt")
+                && !formatted.contains(
+                    "YEAR
+FROM"
+                ),
             "EXTRACT(... FROM ...) should stay inline inside function, got:
 {}",
             formatted
@@ -15372,8 +15380,10 @@ FROM"),
         let source = "select * from org_enriched oe join qt_fmt_dept d on d.dept_id = oe.dept_id cross apply (select 1 as x from dual) ca;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("ON d.dept_id = oe.dept_id
-CROSS APPLY ("),
+            formatted.contains(
+                "ON d.dept_id = oe.dept_id
+CROSS APPLY ("
+            ),
             "CROSS APPLY should start on a new line after JOIN ON, got:
 {}",
             formatted
@@ -15403,23 +15413,29 @@ CROSS APPLY ("),
         let source = "select * from sales match_recognize (partition by emp_id order by sale_date, sale_id measures match_number() as match_no all rows per match pattern (low+ mid* high) define low as amount < 100, mid as amount between 100 and 500, high as amount > 500);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("ORDER BY sale_date,
+            formatted.contains(
+                "ORDER BY sale_date,
         sale_id
-    MEASURES"),
+    MEASURES"
+            ),
             "MEASURES should start on its own line inside MATCH_RECOGNIZE, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains("ALL ROWS PER MATCH
-    PATTERN"),
+            formatted.contains(
+                "ALL ROWS PER MATCH
+    PATTERN"
+            ),
             "PATTERN should start on its own line inside MATCH_RECOGNIZE, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains(")
-    DEFINE"),
+            formatted.contains(
+                ")
+    DEFINE"
+            ),
             "DEFINE should start on its own line inside MATCH_RECOGNIZE, got:
 {}",
             formatted
@@ -15431,29 +15447,37 @@ CROSS APPLY ("),
         let source = "select * from sales model partition by (year_key, channel_code) dimension by (month_key) measures (base_amt, proj_amt) rules sequential order (proj_amt[any] = base_amt[cv(month_key)]);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("MODEL
-    PARTITION BY"),
+            formatted.contains(
+                "MODEL
+    PARTITION BY"
+            ),
             "MODEL PARTITION BY should break to a new line, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains(")
-    DIMENSION BY"),
+            formatted.contains(
+                ")
+    DIMENSION BY"
+            ),
             "MODEL DIMENSION BY should break to a new line, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains(")
-    MEASURES"),
+            formatted.contains(
+                ")
+    MEASURES"
+            ),
             "MODEL MEASURES should break to a new line, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains(")
-    RULES"),
+            formatted.contains(
+                ")
+    RULES"
+            ),
             "MODEL RULES should break to a new line, got:
 {}",
             formatted
@@ -15466,8 +15490,10 @@ CROSS APPLY ("),
             "select * from sales pivot (sum(amount) for category in ('A' as a, 'B' as b));";
         let pivot_formatted = SqlEditorWidget::format_sql_basic(pivot_source);
         assert!(
-            pivot_formatted.contains("PIVOT (
-"),
+            pivot_formatted.contains(
+                "PIVOT (
+"
+            ),
             "PIVOT block should be treated as subquery-like block for formatting, got:
 {}",
             pivot_formatted
@@ -15477,8 +15503,10 @@ CROSS APPLY ("),
             "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
         let unpivot_formatted = SqlEditorWidget::format_sql_basic(unpivot_source);
         assert!(
-            unpivot_formatted.contains("UNPIVOT (
-"),
+            unpivot_formatted.contains(
+                "UNPIVOT (
+"
+            ),
             "UNPIVOT block should be treated as subquery-like block for formatting, got:
 {}",
             unpivot_formatted
