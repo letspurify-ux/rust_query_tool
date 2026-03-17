@@ -5796,3 +5796,258 @@ END my_pkg;"#;
         "ORDER BY should align with SELECT in package body OPEN FOR, got: {formatted}"
     );
 }
+
+// ── Multiline string + trailing code indent ──────────────────────────
+
+#[test]
+fn format_sql_multiline_string_preserves_content_with_trailing_code() {
+    // The string content must not be altered by re-indentation.
+    // After the closing quote, || b || 'c' should stay on the same line.
+    let input = "BEGIN\n    a := 'b\n              b'     || b || 'c';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    // The multiline string 'b\n              b' must be preserved exactly.
+    assert!(
+        formatted.contains("'b\n              b'"),
+        "multiline string content must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_next_statement_indent() {
+    // After a multiline string assignment, the next statement must
+    // return to the correct PL/SQL block indent level.
+    let input = "BEGIN\n    a := 'hello\nworld';\n    b := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_indent = b_line.len() - b_line.trim_start().len();
+    assert_eq!(
+        b_indent, 4,
+        "statement after multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_concat_then_next_statement() {
+    // Multiline string with concatenation, followed by a new statement.
+    let input = "BEGIN\n    v_msg := 'line1\nline2' || ' extra';\n    v_next := 0;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // String content preserved
+    assert!(
+        formatted.contains("'line1\nline2'"),
+        "multiline string must be preserved, got: {formatted}"
+    );
+
+    // Next statement at correct indent
+    let next_line = lines.iter().find(|l| l.trim_start().starts_with("v_next")).unwrap();
+    let next_indent = next_line.len() - next_line.trim_start().len();
+    assert_eq!(
+        next_indent, 4,
+        "next statement should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_with_large_indent_inside() {
+    // String has very deep indentation inside — must not be altered.
+    let input =
+        "BEGIN\n    v := 'start\n                        deep inside\n    back';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'start\n                        deep inside\n    back'"),
+        "multiline string deep indent must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_closing_quote_alone_on_line() {
+    // Closing quote on its own line.
+    let input = "BEGIN\n    v := 'hello\nworld\n';\n    b := 2;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // The string content must remain intact
+    assert!(
+        formatted.contains("'hello\nworld\n'"),
+        "multiline string with trailing newline must be preserved, got: {formatted}"
+    );
+
+    // b := 2 at correct indent
+    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_indent = b_line.len() - b_line.trim_start().len();
+    assert_eq!(
+        b_indent, 4,
+        "statement after multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_select() {
+    // Multiline string in a SELECT statement.
+    let input = "SELECT 'hello\nworld' AS msg,\n    1 AS num\nFROM dual;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'hello\nworld'"),
+        "multiline string in SELECT must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_plsql_if_block() {
+    // Multiline string inside nested IF block.
+    let input = "BEGIN\n    IF cond THEN\n        v := 'a\n            b\n            c';\n        w := 1;\n    END IF;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // String content preserved
+    assert!(
+        formatted.contains("'a\n            b\n            c'"),
+        "multiline string inside IF must be preserved, got: {formatted}"
+    );
+
+    // w := 1 at correct indent (inside IF, so indent 2)
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 8,
+        "statement after multiline string in IF should be at indent 2, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_followed_by_concat_on_next_line() {
+    // Closing quote on its own line, then concat on a new line.
+    let input = "BEGIN\n    v := 'part1\npart2'\n        || 'part3';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    // String content preserved
+    assert!(
+        formatted.contains("'part1\npart2'"),
+        "multiline string must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiple_multiline_strings_in_sequence() {
+    // Two multiline strings in the same block.
+    let input = "BEGIN\n    a := 'x\ny';\n    b := 'p\nq';\n    c := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    assert!(formatted.contains("'x\ny'"), "first multiline string must be preserved, got: {formatted}");
+    assert!(formatted.contains("'p\nq'"), "second multiline string must be preserved, got: {formatted}");
+
+    let c_line = lines.iter().find(|l| l.trim_start().starts_with("c :=")).unwrap();
+    let c_indent = c_line.len() - c_line.trim_start().len();
+    assert_eq!(
+        c_indent, 4,
+        "statement after two multiline strings should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_with_escaped_quotes() {
+    // String with escaped quotes inside — must not be confused.
+    let input = "BEGIN\n    v := 'it''s\na test';\n    w := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'it''s\na test'"),
+        "multiline string with escaped quotes must be preserved, got: {formatted}"
+    );
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 4,
+        "statement after multiline string with escapes should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_q_quote_preserves_content() {
+    // Q-quoted multiline string must be preserved.
+    let input = "BEGIN\n    v := q'[hello\nworld]';\n    w := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("q'[hello\nworld]'"),
+        "multiline q-quote string must be preserved, got: {formatted}"
+    );
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 4,
+        "statement after q-quote multiline should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_deeply_indented_trailing_code() {
+    // The user's exact scenario: multiline string with deep indent,
+    // followed by concatenation on the same line as closing quote.
+    let input = "BEGIN\n    a := 'b\n              b'     || b || 'c';\n    d := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // The string 'b\n              b' must be exactly preserved
+    assert!(
+        formatted.contains("'b\n              b'"),
+        "multiline string with deep indent must be preserved exactly, got: {formatted}"
+    );
+
+    // d := 1 must be at indent 1
+    let d_line = lines.iter().find(|l| l.trim_start().starts_with("d :=")).unwrap();
+    let d_indent = d_line.len() - d_line.trim_start().len();
+    assert_eq!(
+        d_indent, 4,
+        "statement after deeply-indented multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_insert_values() {
+    // Multiline string in INSERT VALUES clause
+    let input = "INSERT INTO t1 (col1, col2)\nVALUES ('hello\nworld', 1);";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'hello\nworld'"),
+        "multiline string in INSERT VALUES must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_as_procedure_argument() {
+    // Multiline string passed as procedure argument
+    let input = "BEGIN\n    my_proc('arg1\narg2',\n        p_other => 1);\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'arg1\narg2'"),
+        "multiline string in procedure call must be preserved, got: {formatted}"
+    );
+}

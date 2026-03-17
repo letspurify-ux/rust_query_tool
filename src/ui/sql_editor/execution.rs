@@ -3310,9 +3310,7 @@ impl SqlEditorWidget {
                 .get(idx)
                 .copied()
                 .unwrap_or(false);
-            let (kind, preserve_raw) = if continuation_line
-                && Self::should_preserve_multiline_string_continuation_line(raw)
-            {
+            let (kind, preserve_raw) = if continuation_line {
                 (LineLayoutKind::Verbatim, true)
             } else {
                 let was_in_block_comment = in_block_comment;
