@@ -6677,3 +6677,90 @@ fn format_sql_oracle_ultimate_boss_idempotent() {
         "Formatting should be idempotent for oracle_format_ultimate_boss.sql"
     );
 }
+
+#[test]
+fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sensitive() {
+    let input = load_test_file("test25.sql");
+    assert!(
+        !input.is_empty(),
+        "Test file test25.sql should not be empty"
+    );
+
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);
+    assert_eq!(
+        formatted, formatted_again,
+        "Auto-formatting should be idempotent for test25.sql"
+    );
+
+    let expected_snippets = vec![
+        "FUNCTION fmt_mask (",
+        "WHEN b.rn = 1 THEN 'TOP'",
+        "PARTITION BY (deptno)",
+        "WHEN MATCHED THEN",
+        "TYPE t_emp_rec IS RECORD",
+        "WHEN NO_DATA_FOUND THEN",
+    ];
+    assert_contains_all(&formatted, &expected_snippets);
+
+    // Parenthesis-depth anchors (human-visible nesting):
+    // verify representative `(` -> nested SQL line indentation relations.
+    let paren_depth_snippets = vec![
+        "base_emp AS (\n        SELECT",
+        "(\n                SELECT MAX (x.sal)",
+        "b.deptno IN (\n                SELECT",
+        "AND NOT EXISTS (\n                SELECT",
+    ];
+    assert_contains_all(&formatted, &paren_depth_snippets);
+
+    let line_indent = |prefix: &str| -> Option<usize> {
+        formatted
+            .lines()
+            .find(|line| line.trim_start().starts_with(prefix))
+            .map(|line| line.len().saturating_sub(line.trim_start().len()))
+    };
+
+    let with_indent = line_indent("WITH").unwrap_or(0);
+    let function_indent = line_indent("FUNCTION fmt_mask (").unwrap_or(0);
+    let case_indent = line_indent("CASE").unwrap_or(0);
+    let when_indent = line_indent("WHEN b.rn = 1 THEN 'TOP'").unwrap_or(0);
+    let model_indent = line_indent("MODEL").unwrap_or(0);
+    let partition_indent = line_indent("PARTITION BY (deptno)").unwrap_or(0);
+    let declare_indent = line_indent("DECLARE").unwrap_or(0);
+    let type_indent = line_indent("TYPE t_emp_rec IS RECORD").unwrap_or(0);
+    let merge_indent = line_indent("MERGE INTO emp_bonus b").unwrap_or(0);
+    let merge_update_indent = line_indent("UPDATE").unwrap_or(0);
+    let plsql_exception_indent = line_indent("EXCEPTION").unwrap_or(0);
+    let plsql_when_others_indent = line_indent("WHEN OTHERS THEN").unwrap_or(0);
+
+    assert!(
+        function_indent > with_indent,
+        "WITH FUNCTION body should indent deeper than WITH head, got:\n{}",
+        formatted
+    );
+    assert!(
+        when_indent > case_indent,
+        "nested CASE WHEN should indent deeper than CASE line, got:\n{}",
+        formatted
+    );
+    assert!(
+        partition_indent > model_indent,
+        "MODEL subclauses should indent deeper than MODEL line, got:\n{}",
+        formatted
+    );
+    assert!(
+        type_indent > declare_indent,
+        "PL/SQL DECLARE members should indent deeper than DECLARE line, got:\n{}",
+        formatted
+    );
+    assert!(
+        merge_update_indent >= merge_indent,
+        "MERGE UPDATE should not dedent before MERGE head depth, got:\n{}",
+        formatted
+    );
+    assert!(
+        plsql_when_others_indent > plsql_exception_indent,
+        "PL/SQL EXCEPTION handler should indent deeper than EXCEPTION line, got:\n{}",
+        formatted
+    );
+}

@@ -2298,6 +2298,19 @@ impl SqlEditorWidget {
                         }
                         create_pending = false;
                     } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
+                        && prev_word_upper.as_deref() == Some("WITH")
+                    {
+                        if !at_line_start {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
+                    } else if matches!(upper.as_str(), "PROCEDURE" | "FUNCTION")
                         && (block_stack.iter().any(|s| s == "PACKAGE_BODY")
                             || at_package_body_member_depth)
                     {
