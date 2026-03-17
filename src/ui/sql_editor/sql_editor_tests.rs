@@ -4965,3 +4965,1089 @@ fn tokenize_sql_standalone_nq_quote_still_works() {
         tokens
     );
 }
+
+// ── OPEN CURSOR FOR: nested structures & parentheses ─────────────────
+
+#[test]
+fn format_sql_open_cursor_for_nested_subquery_in_where() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a, b
+FROM t1
+WHERE a IN (
+SELECT x FROM t2 WHERE y > 0
+)
+ORDER BY a;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // OPEN p_rc FOR should be at indent 1
+    let open_line = lines.iter().find(|l| l.contains("OPEN p_rc FOR")).unwrap();
+    let open_indent = open_line.len() - open_line.trim_start().len();
+    assert_eq!(open_indent, 4, "OPEN should be at indent 1 (4 spaces), got: {formatted}");
+
+    // SELECT should be at indent 2
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+    assert_eq!(select_indent, 8, "SELECT should be at indent 2, got: {formatted}");
+
+    // WHERE should be at same level as SELECT
+    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE a IN")).unwrap();
+    let where_indent = where_line.len() - where_line.trim_start().len();
+    assert_eq!(where_indent, 8, "WHERE should be at indent 2, got: {formatted}");
+
+    // Subquery SELECT inside IN() should be indented further
+    let sub_select = lines.iter().find(|l| l.trim_start().starts_with("SELECT x")).unwrap();
+    let sub_indent = sub_select.len() - sub_select.trim_start().len();
+    assert!(sub_indent > where_indent, "subquery SELECT should be deeper than WHERE, got: {formatted}");
+
+    // ORDER BY should be back at the outer SELECT level
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(order_indent, select_indent, "ORDER BY should align with SELECT, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_nested_parens_in_select_list() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT
+NVL(a, (SELECT MAX(x) FROM t2)),
+b,
+c
+FROM t1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Verify the NVL line stays coherent and the FROM returns to correct depth
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT in OPEN FOR, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_deeply_nested_parens() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT DECODE(a, 1, (CASE WHEN b > 0 THEN (c + d) ELSE 0 END), 0) AS val
+FROM t1
+WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id);
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Verify FROM returns to correct level after deeply nested parens
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT DECODE")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should stay at SELECT level after nested parens, got: {formatted}"
+    );
+
+    // WHERE should also align
+    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE EXISTS")).unwrap();
+    let where_indent = where_line.len() - where_line.trim_start().len();
+    assert_eq!(
+        where_indent, select_indent,
+        "WHERE should stay at SELECT level, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_multiple_in_same_block() {
+    let input = r#"BEGIN
+OPEN rc1 FOR
+SELECT a FROM t1 WHERE a > 0;
+
+OPEN rc2 FOR
+SELECT b FROM t2 WHERE b < 10
+ORDER BY b;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    // Both OPEN lines should have the same indent
+    let open_lines: Vec<&str> = formatted.lines()
+        .filter(|l| l.trim_start().starts_with("OPEN "))
+        .collect();
+    assert_eq!(open_lines.len(), 2, "should have 2 OPEN lines, got: {formatted}");
+
+    let indent1 = open_lines[0].len() - open_lines[0].trim_start().len();
+    let indent2 = open_lines[1].len() - open_lines[1].trim_start().len();
+    assert_eq!(indent1, indent2, "both OPEN should have same indent, got: {formatted}");
+
+    // Second OPEN's SELECT should also be properly indented
+    let select_lines: Vec<&str> = formatted.lines()
+        .filter(|l| l.trim_start().starts_with("SELECT "))
+        .collect();
+    assert_eq!(select_lines.len(), 2, "should have 2 SELECT lines, got: {formatted}");
+
+    let sel_indent1 = select_lines[0].len() - select_lines[0].trim_start().len();
+    let sel_indent2 = select_lines[1].len() - select_lines[1].trim_start().len();
+    assert_eq!(sel_indent1, sel_indent2, "both SELECTs should have same indent, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_with_nested_case_and_subquery() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT id,
+CASE
+WHEN status IN (SELECT code FROM ref_table) THEN 'VALID'
+WHEN status = 'X' THEN 'EXPIRED'
+ELSE 'UNKNOWN'
+END AS status_label
+FROM main_table
+WHERE active = 1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // CASE should be indented deeper than SELECT columns
+    let case_line = lines.iter().find(|l| l.trim_start() == "CASE").unwrap();
+    let case_indent = case_line.len() - case_line.trim_start().len();
+
+    // END AS should align with CASE
+    let end_line = lines.iter().find(|l| l.trim_start().starts_with("END AS")).unwrap();
+    let end_indent = end_line.len() - end_line.trim_start().len();
+
+    assert_eq!(
+        case_indent, end_indent,
+        "CASE and END should align, got: {formatted}"
+    );
+
+    // FROM should be back at SELECT level
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM main_table")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT in OPEN FOR, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_double_nested_parens() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT ((a + b) * (c - d)) AS calc,
+e
+FROM t1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // FROM should return to SELECT level
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT after double-nested parens, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_nested_open_in_if_block() {
+    let input = r#"BEGIN
+IF p_mode = 1 THEN
+OPEN p_rc FOR
+SELECT a, b FROM t1
+WHERE a > 0;
+ELSE
+OPEN p_rc FOR
+SELECT c, d FROM t2
+WHERE c < 10;
+END IF;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // OPEN inside IF should be at indent 2 (BEGIN + IF)
+    let open_lines: Vec<&str> = lines.iter()
+        .filter(|l| l.trim_start().starts_with("OPEN p_rc FOR"))
+        .copied()
+        .collect();
+    assert_eq!(open_lines.len(), 2, "should have 2 OPEN lines, got: {formatted}");
+
+    let open_indent = open_lines[0].len() - open_lines[0].trim_start().len();
+    assert_eq!(open_indent, 8, "OPEN in IF should be at indent 2 (8 spaces), got: {formatted}");
+
+    // SELECT inside nested OPEN should be at indent 3
+    let select_lines: Vec<&str> = lines.iter()
+        .filter(|l| l.trim_start().starts_with("SELECT "))
+        .copied()
+        .collect();
+    for sel in &select_lines {
+        let sel_indent = sel.len() - sel.trim_start().len();
+        assert_eq!(sel_indent, 12, "SELECT in IF>OPEN should be at indent 3 (12 spaces), got: {formatted}");
+    }
+}
+
+#[test]
+fn format_sql_open_cursor_for_with_union_all() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a, b FROM t1
+UNION ALL
+SELECT c, d FROM t2
+ORDER BY 1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Both SELECTs should be at the same indent
+    let select_lines: Vec<&str> = lines.iter()
+        .filter(|l| l.trim_start().starts_with("SELECT "))
+        .copied()
+        .collect();
+    assert_eq!(select_lines.len(), 2, "should have 2 SELECT lines, got: {formatted}");
+
+    let indent1 = select_lines[0].len() - select_lines[0].trim_start().len();
+    let indent2 = select_lines[1].len() - select_lines[1].trim_start().len();
+    assert_eq!(indent1, indent2, "both SELECTs in UNION should have same indent, got: {formatted}");
+
+    // UNION ALL should be at the same level as SELECT
+    let union_line = lines.iter().find(|l| l.trim_start().starts_with("UNION ALL")).unwrap();
+    let union_indent = union_line.len() - union_line.trim_start().len();
+    assert_eq!(union_indent, indent1, "UNION ALL should align with SELECT in OPEN FOR, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_paren_subquery_in_from() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a.id, b.val
+FROM (
+SELECT id, status FROM t1 WHERE active = 1
+) a
+JOIN t2 b ON b.id = a.id
+WHERE b.val > 0;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // The outer FROM should be at SELECT level
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM (") || l.trim_start().starts_with("FROM(")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT, got: {formatted}"
+    );
+
+    // Subquery SELECT should be deeper
+    let sub_select = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let sub_indent = sub_select.len() - sub_select.trim_start().len();
+    assert!(sub_indent > from_indent, "subquery SELECT should be deeper than FROM, got: {formatted}");
+
+    // JOIN should be at outer FROM level
+    let join_line = lines.iter().find(|l| l.trim_start().starts_with("JOIN ")).unwrap();
+    let join_indent = join_line.len() - join_line.trim_start().len();
+    assert_eq!(join_indent, from_indent, "JOIN should align with FROM, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_semicolon_resets_state() {
+    // After OPEN FOR ... ;  the next statement should be back to normal indent
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a FROM t1;
+v_count := 0;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // v_count assignment should be at indent 1 (BEGIN level), not at OPEN FOR level
+    let assign_line = lines.iter().find(|l| l.trim_start().starts_with("v_count")).unwrap();
+    let assign_indent = assign_line.len() - assign_line.trim_start().len();
+    assert_eq!(assign_indent, 4, "statement after OPEN FOR should be at indent 1, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_nested_case_with_nested_parens() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT
+CASE
+WHEN a = 1 THEN (SELECT MAX(x) FROM t2)
+WHEN a = 2 THEN (
+SELECT MIN(y) FROM t3
+)
+ELSE 0
+END AS val,
+b
+FROM t1;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // END AS should align with CASE
+    let case_line = lines.iter().find(|l| l.trim_start() == "CASE").unwrap();
+    let case_indent = case_line.len() - case_line.trim_start().len();
+
+    let end_line = lines.iter().find(|l| l.trim_start().starts_with("END AS val")).unwrap();
+    let end_indent = end_line.len() - end_line.trim_start().len();
+    assert_eq!(
+        case_indent, end_indent,
+        "CASE and END AS should align even with subquery parens inside, got: {formatted}"
+    );
+
+    // FROM should return to SELECT level
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT after nested CASE+subquery, got: {formatted}"
+    );
+}
+
+// ── OPEN CURSOR FOR: extended edge cases ─────────────────────────────
+
+#[test]
+fn format_sql_open_cursor_for_with_cte_clause_depth_regression() {
+    // CTE WITH inside OPEN FOR: the outer SELECT/FROM should align,
+    // even though the CTE body has its own SELECT at deeper depth.
+    let input = r#"BEGIN
+OPEN p_rc FOR
+WITH cte AS (
+SELECT id, name FROM t_src WHERE active = 1
+)
+SELECT cte.id,
+cte.name,
+t2.val
+FROM cte
+JOIN t2 ON t2.id = cte.id
+WHERE t2.val > 0
+ORDER BY cte.id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Find the main (outer) SELECT that follows the CTE closing paren
+    let cte_close_idx = lines.iter().position(|l| l.trim_start() == ")").unwrap();
+    let outer_select_line = lines[cte_close_idx + 1..].iter()
+        .find(|l| l.trim_start().starts_with("SELECT"))
+        .unwrap();
+    let outer_select_indent = outer_select_line.len() - outer_select_line.trim_start().len();
+
+    // FROM cte should align with outer SELECT
+    let from_cte_line = lines.iter()
+        .find(|l| l.trim_start().starts_with("FROM cte"))
+        .unwrap();
+    let from_cte_indent = from_cte_line.len() - from_cte_line.trim_start().len();
+
+    assert_eq!(
+        from_cte_indent, outer_select_indent,
+        "FROM cte should align with outer SELECT, got: {formatted}"
+    );
+
+    // ORDER BY should also align
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, outer_select_indent,
+        "ORDER BY should align with outer SELECT, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_dynamic_sql_using_does_not_break() {
+    // OPEN cursor FOR dynamic_sql USING param — no SELECT follows
+    let input = r#"BEGIN
+OPEN p_cursor FOR v_sql USING p_dept;
+v_count := 0;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // v_count should be at indent 1 (not affected by OPEN FOR)
+    let assign_line = lines.iter().find(|l| l.trim_start().starts_with("v_count")).unwrap();
+    let assign_indent = assign_line.len() - assign_line.trim_start().len();
+    assert_eq!(assign_indent, 4, "statement after dynamic OPEN FOR should be at indent 1, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_with_multiple_cte() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+WITH cte1 AS (
+SELECT id FROM t1
+),
+cte2 AS (
+SELECT id FROM t2
+)
+SELECT cte1.id, cte2.id
+FROM cte1
+JOIN cte2 ON cte2.id = cte1.id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Find main SELECT (after the second CTE closing paren)
+    let main_select = lines.iter()
+        .find(|l| l.trim_start().starts_with("SELECT cte1"))
+        .unwrap();
+    let main_select_indent = main_select.len() - main_select.trim_start().len();
+
+    // FROM should align with main SELECT
+    let from_line = lines.iter()
+        .find(|l| l.trim_start().starts_with("FROM cte1"))
+        .unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+
+    assert_eq!(
+        from_indent, main_select_indent,
+        "FROM should align with main SELECT after multiple CTEs, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_subquery_in_from_and_where() {
+    // Both FROM and WHERE have subqueries
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a.id, a.val
+FROM (SELECT id, val FROM t1 WHERE val > 0) a
+WHERE a.id IN (SELECT ref_id FROM t2)
+ORDER BY a.id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    // ORDER BY should align with outer SELECT after nested subqueries in both FROM and WHERE
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT after subqueries in FROM+WHERE, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_in_loop_block() {
+    let input = r#"BEGIN
+FOR rec IN 1..3 LOOP
+OPEN p_rc FOR
+SELECT a, b FROM t1
+WHERE a = rec;
+CLOSE p_rc;
+END LOOP;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // OPEN inside FOR LOOP should be at indent 2
+    let open_line = lines.iter().find(|l| l.trim_start().starts_with("OPEN p_rc FOR")).unwrap();
+    let open_indent = open_line.len() - open_line.trim_start().len();
+    assert_eq!(open_indent, 8, "OPEN in LOOP should be at indent 2, got: {formatted}");
+
+    // SELECT should be at indent 3
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+    assert_eq!(select_indent, 12, "SELECT in LOOP>OPEN should be at indent 3, got: {formatted}");
+
+    // CLOSE should be back at indent 2
+    let close_line = lines.iter().find(|l| l.trim_start().starts_with("CLOSE")).unwrap();
+    let close_indent = close_line.len() - close_line.trim_start().len();
+    assert_eq!(close_indent, 8, "CLOSE after OPEN FOR should be at indent 2, got: {formatted}");
+}
+
+#[test]
+fn format_sql_open_cursor_for_correlated_subquery() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a.id,
+a.val,
+(SELECT COUNT(*) FROM t2 WHERE t2.aid = a.id) AS cnt
+FROM t1 a
+WHERE a.val > (SELECT AVG(val) FROM t1)
+ORDER BY a.id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a.id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    // FROM should align with SELECT
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT after correlated subqueries, got: {formatted}"
+    );
+
+    // WHERE should align with SELECT
+    let where_line = lines.iter().find(|l| l.trim_start().starts_with("WHERE a.val")).unwrap();
+    let where_indent = where_line.len() - where_line.trim_start().len();
+    assert_eq!(
+        where_indent, select_indent,
+        "WHERE should align with SELECT, got: {formatted}"
+    );
+
+    // ORDER BY should align with SELECT
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT after correlated subqueries, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_nested_exists_subqueries() {
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT id, name
+FROM t1
+WHERE EXISTS (
+SELECT 1 FROM t2
+WHERE t2.id = t1.id
+AND EXISTS (
+SELECT 1 FROM t3
+WHERE t3.id = t2.id
+)
+)
+ORDER BY id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    // ORDER BY should come back to outer SELECT level
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT after deeply nested EXISTS, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_with_cte_and_nested_subquery_in_main() {
+    // CTE + nested subquery in WHERE of main query
+    let input = r#"BEGIN
+OPEN p_rc FOR
+WITH base AS (
+SELECT id, grp FROM t1 WHERE active = 1
+)
+SELECT b.id, b.grp
+FROM base b
+WHERE b.grp IN (SELECT grp FROM t2 WHERE priority > 0)
+ORDER BY b.id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Outer SELECT
+    let outer_select = lines.iter()
+        .find(|l| l.trim_start().starts_with("SELECT b.id"))
+        .unwrap();
+    let outer_select_indent = outer_select.len() - outer_select.trim_start().len();
+
+    // ORDER BY must align with the outer SELECT
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, outer_select_indent,
+        "ORDER BY should align with outer SELECT after CTE+subquery, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_select_into_before_open_does_not_leak() {
+    // A normal SELECT INTO before OPEN FOR should not interfere
+    let input = r#"BEGIN
+SELECT COUNT(*) INTO v_cnt FROM t0;
+OPEN p_rc FOR
+SELECT a, b FROM t1
+ORDER BY a;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // SELECT a, b should be at indent 2 (OPEN FOR level)
+    let sel_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let sel_indent = sel_line.len() - sel_line.trim_start().len();
+    assert_eq!(sel_indent, 8, "SELECT inside OPEN FOR should be at indent 2, got: {formatted}");
+
+    // ORDER BY should align with it
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, sel_indent,
+        "ORDER BY should align with SELECT in OPEN FOR, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_all_clause_keywords_aligned() {
+    // Comprehensive: all major clause keywords should align
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a, b, c
+FROM t1
+WHERE a > 0
+GROUP BY b
+HAVING COUNT(*) > 1
+ORDER BY c;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    for keyword in &["FROM t1", "WHERE a", "GROUP BY", "HAVING COUNT", "ORDER BY"] {
+        let kw_line = lines.iter()
+            .find(|l| l.trim_start().starts_with(keyword))
+            .unwrap_or_else(|| panic!("expected line starting with {keyword}, got: {formatted}"));
+        let kw_indent = kw_line.len() - kw_line.trim_start().len();
+        assert_eq!(
+            kw_indent, select_indent,
+            "{keyword} should align with SELECT, got: {formatted}"
+        );
+    }
+}
+
+#[test]
+fn format_sql_open_cursor_for_multiline_subquery_in_select_list() {
+    // Subquery in SELECT list that spans multiple lines
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT id,
+(
+SELECT MAX(val)
+FROM t2
+WHERE t2.id = t1.id
+) AS max_val,
+name
+FROM t1
+ORDER BY id;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    // FROM t1 and ORDER BY should be back at SELECT level
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT after multiline subquery in SELECT list, got: {formatted}"
+    );
+
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_second_open_after_subquery_first() {
+    // First OPEN has subquery, second OPEN should be independent
+    let input = r#"BEGIN
+OPEN rc1 FOR
+SELECT a FROM t1
+WHERE a IN (SELECT x FROM t2);
+
+OPEN rc2 FOR
+SELECT b FROM t3
+ORDER BY b;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // Find second OPEN's SELECT
+    let select_lines: Vec<(usize, &&str)> = lines.iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with("SELECT b"))
+        .collect();
+    assert!(!select_lines.is_empty(), "should have SELECT b line, got: {formatted}");
+    let second_select_indent = select_lines[0].1.len() - select_lines[0].1.trim_start().len();
+
+    // ORDER BY in second OPEN should align with second SELECT
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, second_select_indent,
+        "ORDER BY in second OPEN should align with its SELECT, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_inline_subquery_on_same_line() {
+    // Subquery entirely on one line shouldn't break indent
+    let input = r#"BEGIN
+OPEN p_rc FOR
+SELECT a, (SELECT MAX(id) FROM t2) AS mx
+FROM t1
+ORDER BY a;
+END;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT a")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT when subquery is inline, got: {formatted}"
+    );
+
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_open_cursor_for_package_body_procedure() {
+    // OPEN FOR inside a package body procedure
+    let input = r#"CREATE OR REPLACE PACKAGE BODY my_pkg AS
+PROCEDURE get_data(p_rc OUT SYS_REFCURSOR) IS
+BEGIN
+OPEN p_rc FOR
+SELECT id,
+name,
+(SELECT COUNT(*) FROM t2 WHERE t2.pid = t1.id) AS child_cnt
+FROM t1
+WHERE active = 1
+ORDER BY id;
+END get_data;
+END my_pkg;"#;
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let select_line = lines.iter().find(|l| l.trim_start().starts_with("SELECT id")).unwrap();
+    let select_indent = select_line.len() - select_line.trim_start().len();
+
+    let from_line = lines.iter().find(|l| l.trim_start().starts_with("FROM t1")).unwrap();
+    let from_indent = from_line.len() - from_line.trim_start().len();
+    assert_eq!(
+        from_indent, select_indent,
+        "FROM should align with SELECT in package body OPEN FOR, got: {formatted}"
+    );
+
+    let order_line = lines.iter().find(|l| l.trim_start().starts_with("ORDER BY")).unwrap();
+    let order_indent = order_line.len() - order_line.trim_start().len();
+    assert_eq!(
+        order_indent, select_indent,
+        "ORDER BY should align with SELECT in package body OPEN FOR, got: {formatted}"
+    );
+}
+
+// ── Multiline string + trailing code indent ──────────────────────────
+
+#[test]
+fn format_sql_multiline_string_preserves_content_with_trailing_code() {
+    // The string content must not be altered by re-indentation.
+    // After the closing quote, || b || 'c' should stay on the same line.
+    let input = "BEGIN\n    a := 'b\n              b'     || b || 'c';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    // The multiline string 'b\n              b' must be preserved exactly.
+    assert!(
+        formatted.contains("'b\n              b'"),
+        "multiline string content must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_next_statement_indent() {
+    // After a multiline string assignment, the next statement must
+    // return to the correct PL/SQL block indent level.
+    let input = "BEGIN\n    a := 'hello\nworld';\n    b := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_indent = b_line.len() - b_line.trim_start().len();
+    assert_eq!(
+        b_indent, 4,
+        "statement after multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_concat_then_next_statement() {
+    // Multiline string with concatenation, followed by a new statement.
+    let input = "BEGIN\n    v_msg := 'line1\nline2' || ' extra';\n    v_next := 0;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // String content preserved
+    assert!(
+        formatted.contains("'line1\nline2'"),
+        "multiline string must be preserved, got: {formatted}"
+    );
+
+    // Next statement at correct indent
+    let next_line = lines.iter().find(|l| l.trim_start().starts_with("v_next")).unwrap();
+    let next_indent = next_line.len() - next_line.trim_start().len();
+    assert_eq!(
+        next_indent, 4,
+        "next statement should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_with_large_indent_inside() {
+    // String has very deep indentation inside — must not be altered.
+    let input =
+        "BEGIN\n    v := 'start\n                        deep inside\n    back';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'start\n                        deep inside\n    back'"),
+        "multiline string deep indent must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_closing_quote_alone_on_line() {
+    // Closing quote on its own line.
+    let input = "BEGIN\n    v := 'hello\nworld\n';\n    b := 2;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // The string content must remain intact
+    assert!(
+        formatted.contains("'hello\nworld\n'"),
+        "multiline string with trailing newline must be preserved, got: {formatted}"
+    );
+
+    // b := 2 at correct indent
+    let b_line = lines.iter().find(|l| l.trim_start().starts_with("b :=")).unwrap();
+    let b_indent = b_line.len() - b_line.trim_start().len();
+    assert_eq!(
+        b_indent, 4,
+        "statement after multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_select() {
+    // Multiline string in a SELECT statement.
+    let input = "SELECT 'hello\nworld' AS msg,\n    1 AS num\nFROM dual;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'hello\nworld'"),
+        "multiline string in SELECT must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_plsql_if_block() {
+    // Multiline string inside nested IF block.
+    let input = "BEGIN\n    IF cond THEN\n        v := 'a\n            b\n            c';\n        w := 1;\n    END IF;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // String content preserved
+    assert!(
+        formatted.contains("'a\n            b\n            c'"),
+        "multiline string inside IF must be preserved, got: {formatted}"
+    );
+
+    // w := 1 at correct indent (inside IF, so indent 2)
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 8,
+        "statement after multiline string in IF should be at indent 2, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_followed_by_concat_on_next_line() {
+    // Closing quote on its own line, then concat on a new line.
+    let input = "BEGIN\n    v := 'part1\npart2'\n        || 'part3';\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    // String content preserved
+    assert!(
+        formatted.contains("'part1\npart2'"),
+        "multiline string must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiple_multiline_strings_in_sequence() {
+    // Two multiline strings in the same block.
+    let input = "BEGIN\n    a := 'x\ny';\n    b := 'p\nq';\n    c := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    assert!(formatted.contains("'x\ny'"), "first multiline string must be preserved, got: {formatted}");
+    assert!(formatted.contains("'p\nq'"), "second multiline string must be preserved, got: {formatted}");
+
+    let c_line = lines.iter().find(|l| l.trim_start().starts_with("c :=")).unwrap();
+    let c_indent = c_line.len() - c_line.trim_start().len();
+    assert_eq!(
+        c_indent, 4,
+        "statement after two multiline strings should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_with_escaped_quotes() {
+    // String with escaped quotes inside — must not be confused.
+    let input = "BEGIN\n    v := 'it''s\na test';\n    w := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'it''s\na test'"),
+        "multiline string with escaped quotes must be preserved, got: {formatted}"
+    );
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 4,
+        "statement after multiline string with escapes should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_q_quote_preserves_content() {
+    // Q-quoted multiline string must be preserved.
+    let input = "BEGIN\n    v := q'[hello\nworld]';\n    w := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("q'[hello\nworld]'"),
+        "multiline q-quote string must be preserved, got: {formatted}"
+    );
+
+    let lines: Vec<&str> = formatted.lines().collect();
+    let w_line = lines.iter().find(|l| l.trim_start().starts_with("w :=")).unwrap();
+    let w_indent = w_line.len() - w_line.trim_start().len();
+    assert_eq!(
+        w_indent, 4,
+        "statement after q-quote multiline should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_deeply_indented_trailing_code() {
+    // The user's exact scenario: multiline string with deep indent,
+    // followed by concatenation on the same line as closing quote.
+    let input = "BEGIN\n    a := 'b\n              b'     || b || 'c';\n    d := 1;\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+
+    // The string 'b\n              b' must be exactly preserved
+    assert!(
+        formatted.contains("'b\n              b'"),
+        "multiline string with deep indent must be preserved exactly, got: {formatted}"
+    );
+
+    // d := 1 must be at indent 1
+    let d_line = lines.iter().find(|l| l.trim_start().starts_with("d :=")).unwrap();
+    let d_indent = d_line.len() - d_line.trim_start().len();
+    assert_eq!(
+        d_indent, 4,
+        "statement after deeply-indented multiline string should be at indent 1, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_in_insert_values() {
+    // Multiline string in INSERT VALUES clause
+    let input = "INSERT INTO t1 (col1, col2)\nVALUES ('hello\nworld', 1);";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'hello\nworld'"),
+        "multiline string in INSERT VALUES must be preserved, got: {formatted}"
+    );
+}
+
+#[test]
+fn format_sql_multiline_string_as_procedure_argument() {
+    // Multiline string passed as procedure argument
+    let input = "BEGIN\n    my_proc('arg1\narg2',\n        p_other => 1);\nEND;";
+
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("'arg1\narg2'"),
+        "multiline string in procedure call must be preserved, got: {formatted}"
+    );
+}

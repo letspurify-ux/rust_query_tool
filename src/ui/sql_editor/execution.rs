@@ -3310,9 +3310,7 @@ impl SqlEditorWidget {
                 .get(idx)
                 .copied()
                 .unwrap_or(false);
-            let (kind, preserve_raw) = if continuation_line
-                && Self::should_preserve_multiline_string_continuation_line(raw)
-            {
+            let (kind, preserve_raw) = if continuation_line {
                 (LineLayoutKind::Verbatim, true)
             } else {
                 let was_in_block_comment = in_block_comment;
@@ -3668,7 +3666,16 @@ impl SqlEditorWidget {
             if open_for_select_pending
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
             {
-                open_for_select_clause_depth = Some(effective_depth);
+                // Only update if this SELECT is at a shallower (or equal) depth
+                // than the current recorded depth.  This handles CTEs where a
+                // deeper CTE-body SELECT appears before the main outer SELECT,
+                // while still preventing deeper subquery SELECTs from
+                // overwriting the recorded depth.
+                let dominated = open_for_select_clause_depth
+                    .is_some_and(|d| effective_depth >= d);
+                if !dominated {
+                    open_for_select_clause_depth = Some(effective_depth);
+                }
             }
             if let Some(select_depth) = open_for_select_clause_depth {
                 if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
