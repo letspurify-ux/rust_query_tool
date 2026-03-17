@@ -3666,9 +3666,11 @@ impl SqlEditorWidget {
                 open_for_select_clause_depth = None;
             }
             if open_for_select_pending
+                && open_for_select_clause_depth.is_none()
                 && crate::sql_text::starts_with_keyword_token(&trimmed_upper, "SELECT")
             {
                 open_for_select_clause_depth = Some(effective_depth);
+                open_for_select_pending = false;
             }
             if let Some(select_depth) = open_for_select_clause_depth {
                 if crate::sql_text::starts_with_keyword_token(&trimmed_upper, "FROM")
