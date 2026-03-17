@@ -1894,3 +1894,89 @@ fn test_incremental_highlight_stops_when_style_tail_matches() {
         updated.end.saturating_sub(updated.start)
     );
 }
+
+#[test]
+fn test_begin_after_procedure_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "create or replace procedure p is begin null; end;";
+    let styles = highlighter.generate_styles(text);
+
+    let begin_start = text.find("begin").unwrap_or(0);
+    let begin_end = begin_start + "begin".len();
+    assert!(
+        styles[begin_start..begin_end].chars().all(|c| c == STYLE_KEYWORD),
+        "begin styles: {}",
+        &styles[begin_start..begin_end]
+    );
+}
+
+#[test]
+fn test_declare_after_line_comment_newline_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "-- .\ndeclare\n  v number;";
+    let styles = highlighter.generate_styles(text);
+
+    let declare_start = text.find("declare").unwrap_or(0);
+    let declare_end = declare_start + "declare".len();
+    assert!(
+        styles[declare_start..declare_end].chars().all(|c| c == STYLE_KEYWORD),
+        "declare styles: {}",
+        &styles[declare_start..declare_end]
+    );
+}
+
+#[test]
+fn test_var_after_line_comment_newline_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "-- .\nvar x number";
+    let styles = highlighter.generate_styles(text);
+
+    let var_start = text.find("var").unwrap_or(0);
+    let var_end = var_start + "var".len();
+    assert!(
+        styles[var_start..var_end].chars().all(|c| c == STYLE_KEYWORD),
+        "var styles: {}",
+        &styles[var_start..var_end]
+    );
+}
+
+#[test]
+fn test_begin_after_prompt_newline_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "prompt .\nbegin\n  null;\nend;";
+    let styles = highlighter.generate_styles(text);
+
+    let begin_start = text.find("begin").unwrap_or(0);
+    let begin_end = begin_start + "begin".len();
+    assert!(
+        styles[begin_start..begin_end].chars().all(|c| c == STYLE_KEYWORD),
+        "begin-after-prompt styles: {}",
+        &styles[begin_start..begin_end]
+    );
+}
+
+#[test]
+fn test_case_after_else_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "if cond then null; else case when cond2 then null; end case; end if;";
+    let styles = highlighter.generate_styles(text);
+
+    let case_start = text.find("case when").unwrap_or(0);
+    let case_end = case_start + "case".len();
+    assert!(styles[case_start..case_end]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}
+
+#[test]
+fn test_case_after_return_is_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "return case when x = 1 then 'Y' else 'N' end;";
+    let styles = highlighter.generate_styles(text);
+
+    let case_start = text.find("case").unwrap_or(0);
+    let case_end = case_start + "case".len();
+    assert!(styles[case_start..case_end]
+        .chars()
+        .all(|c| c == STYLE_KEYWORD));
+}

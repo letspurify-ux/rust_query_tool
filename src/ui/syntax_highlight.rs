@@ -929,6 +929,15 @@ fn should_treat_control_keyword_as_implicit_alias(
         return false;
     }
 
+    if prev_significant_word_upper(text, bytes, word_start).is_some_and(|prev_word| {
+        matches!(
+            prev_word.as_str(),
+            "IS" | "AS" | "RETURN" | "ELSE" | "THEN" | "LOOP" | "BEGIN" | "DECLARE"
+        )
+    }) {
+        return false;
+    }
+
     let Some(prev_kind) = prev_significant_token_kind(text, bytes, word_start) else {
         return false;
     };
@@ -952,6 +961,9 @@ fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
             break;
         };
         if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            if is_line_terminator(prev) {
+                saw_line_break = true;
+            }
             idx = idx.saturating_sub(1);
             continue;
         }
@@ -1045,6 +1057,10 @@ fn should_treat_keyword_as_identifier_context(
     };
 
     if !sql_text::is_oracle_sql_keyword(upper.as_ref()) {
+        return false;
+    }
+
+    if has_significant_line_break_before(bytes, word_start) {
         return false;
     }
 
