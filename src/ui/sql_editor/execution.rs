@@ -199,7 +199,10 @@ impl Drop for QueryRunningReservation {
 enum OpenCursorFormatState {
     None,
     AwaitingFor,
-    InSelect { anchor_indent: usize },
+    InSelect {
+        anchor_indent: usize,
+        select_paren_depth: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,7 +354,7 @@ impl WithCteFormatState {
 impl OpenCursorFormatState {
     fn base_indent(self, indent_level: usize) -> usize {
         match self {
-            Self::InSelect { anchor_indent } => {
+            Self::InSelect { anchor_indent, .. } => {
                 anchor_indent + indent_level.saturating_sub(anchor_indent.saturating_sub(1))
             }
             _ => indent_level,
@@ -360,6 +363,26 @@ impl OpenCursorFormatState {
 
     fn in_select(self) -> bool {
         matches!(self, Self::InSelect { .. })
+    }
+
+    fn set_select_depth(&mut self, depth: usize) {
+        if let Self::InSelect {
+            select_paren_depth, ..
+        } = self
+        {
+            if select_paren_depth.is_none() {
+                *select_paren_depth = Some(depth);
+            }
+        }
+    }
+
+    fn select_depth(self) -> Option<usize> {
+        match self {
+            Self::InSelect {
+                select_paren_depth, ..
+            } => select_paren_depth,
+            _ => None,
+        }
     }
 }
 
@@ -1628,7 +1651,7 @@ impl SqlEditorWidget {
         let mut current_clause: Option<String> = None;
         let mut pending_package_member_separator = false;
         let mut open_cursor_state = OpenCursorFormatState::None;
-        let mut open_for_select_active = false;
+        let mut open_for_select_stack: Vec<OpenCursorFormatState> = Vec::new();
         let mut case_branch_started: Vec<bool> = Vec::new();
         let mut between_pending = false;
         let mut select_list_layout_state = SelectListLayoutState::Inactive;
@@ -2087,7 +2110,9 @@ impl SqlEditorWidget {
                                     indent_level,
                                     open_cursor_state,
                                     upper.as_str(),
-                                    open_for_select_active,
+                                    open_cursor_state
+                                        .select_depth()
+                                        .is_some_and(|depth| paren_stack.len() == depth),
                                 ),
                                 insert_all_extra,
                                 &mut at_line_start,
@@ -2102,6 +2127,7 @@ impl SqlEditorWidget {
                             }
                             if upper == "SELECT" && open_cursor_state.in_select() {
                                 // Keep OPEN ... FOR SELECT inside the cursor SQL context.
+                                open_cursor_state.set_select_depth(paren_stack.len());
                             }
                             if upper == "WITH" {
                                 with_cte_state.on_clause_keyword("WITH");
@@ -2127,7 +2153,9 @@ impl SqlEditorWidget {
                             indent_level,
                             open_cursor_state,
                             upper.as_str(),
-                            open_for_select_active,
+                            open_cursor_state
+                                .select_depth()
+                                .is_some_and(|depth| paren_stack.len() == depth),
                         );
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         if upper == "WHEN"
@@ -2332,10 +2360,11 @@ impl SqlEditorWidget {
                         } else if upper == "FOR"
                             && open_cursor_state == OpenCursorFormatState::AwaitingFor
                         {
+                            open_for_select_stack.push(open_cursor_state);
                             open_cursor_state = OpenCursorFormatState::InSelect {
                                 anchor_indent: indent_level.saturating_add(1),
+                                select_paren_depth: None,
                             };
-                            open_for_select_active = true;
                             newline_after_keyword = true;
                         } else {
                             // FOR/WHILE starts a line, LOOP will follow on same line
@@ -3021,7 +3050,7 @@ impl SqlEditorWidget {
                             current_clause = None;
                             select_list_layout_state.clear();
                             open_cursor_state = OpenCursorFormatState::None;
-                            open_for_select_active = false;
+                            open_for_select_stack.clear();
                             between_pending = false;
                             trigger_header_state.clear();
                             exit_condition_state.clear();
@@ -3210,6 +3239,14 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                                 ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            }
+                            if open_cursor_state
+                                .select_depth()
+                                .is_some_and(|depth| paren_stack.len() < depth)
+                            {
+                                open_cursor_state = open_for_select_stack
+                                    .pop()
+                                    .unwrap_or(OpenCursorFormatState::None);
                             }
                             if was_subquery {
                                 current_clause = restore_clause;
@@ -3671,8 +3708,7 @@ impl SqlEditorWidget {
                 // deeper CTE-body SELECT appears before the main outer SELECT,
                 // while still preventing deeper subquery SELECTs from
                 // overwriting the recorded depth.
-                let dominated = open_for_select_clause_depth
-                    .is_some_and(|d| effective_depth >= d);
+                let dominated = open_for_select_clause_depth.is_some_and(|d| effective_depth >= d);
                 if !dominated {
                     open_for_select_clause_depth = Some(effective_depth);
                 }
@@ -14153,6 +14189,140 @@ mod format_comment_indent_tests {
                 "OPEN cv FOR\n        SELECT a,\n            b\n        FROM c,\n            d\n        WHERE 1 = 1;"
             ),
             "OPEN ... FOR nested SELECT should keep FROM/WHERE aligned with SELECT body depth, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_connect_by_aligned_in_open_for_parenthesized_select() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT employee_id\n                 FROM employees\n                 START WITH manager_id IS NULL\n                 CONNECT BY PRIOR employee_id = manager_id);\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let select_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("SELECT employee_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let from_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("FROM employees"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let connect_by_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("CONNECT BY PRIOR"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            select_indent > 0,
+            "OPEN ... FOR SELECT line should exist, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            from_indent, select_indent,
+            "FROM in OPEN ... FOR SELECT should align with SELECT, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            connect_by_indent, select_indent,
+            "CONNECT BY in OPEN ... FOR SELECT should align with SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_open_for_subquery_closing_paren_at_open_paren_indent() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT e.employee_id\n                 FROM employees e\n                 WHERE EXISTS (SELECT 1\n                               FROM dual\n                               WHERE 1 = 1));\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let open_paren_indent = lines
+            .iter()
+            .find(|line| line.trim() == "(")
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let close_paren_indent = lines
+            .iter()
+            .rev()
+            .find(|line| line.trim() == ");")
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            open_paren_indent > 0,
+            "OPEN ... FOR parenthesized SELECT should include opening parenthesis line, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            close_paren_indent, open_paren_indent,
+            "Closing parenthesis of OPEN ... FOR SELECT should align with opening parenthesis, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_subquery_connect_by_under_inner_select_in_open_for() {
+        let source = "BEGIN\n    OPEN cv FOR (SELECT root_id\n                 FROM roots r\n                 WHERE EXISTS (SELECT child_id\n                               FROM children c\n                               START WITH c.parent_id = r.root_id\n                               CONNECT BY PRIOR c.child_id = c.parent_id));\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let inner_select_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("SELECT child_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+        let inner_connect_by_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("CONNECT BY PRIOR c.child_id"))
+            .map(|line| leading_spaces(line))
+            .unwrap_or(0);
+
+        assert!(
+            inner_select_indent > 0,
+            "Nested SELECT inside OPEN ... FOR should exist, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            inner_connect_by_indent, inner_select_indent,
+            "Nested CONNECT BY should align with nested SELECT, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_non_select_parenthesis_pairs_aligned_in_open_for_select() {
+        let source = "BEGIN
+    OPEN cv FOR (SELECT e.employee_id
+                 FROM employees e
+                 WHERE (e.manager_id IS NULL
+                        OR e.manager_id = 100));
+END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE (e.manager_id IS NULL\n                OR e.manager_id = 100)"),
+            "Non-SELECT parenthesis pair inside OPEN ... FOR WHERE should stay paired and indented, got:
+{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_nested_non_select_parenthesis_alignment_in_open_for_select() {
+        let source = "BEGIN
+    OPEN cv FOR (SELECT e.employee_id
+                 FROM employees e
+                 WHERE (e.manager_id IN (100, 200)
+                        OR e.department_id = 90));
+END;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+
+        assert!(
+            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                OR e.department_id = 90)"),
+            "Nested non-SELECT parenthesis pairs in OPEN ... FOR WHERE should stay paired and indented, got:
+{}",
             formatted
         );
     }
