@@ -866,38 +866,36 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
 }
 
 #[test]
+fn format_sql_oracle_final_boss_v2_parenthesized_subqueries_indent_deeper_than_openers() {
+    let input = load_test_file("oracle_format_final_boss_v2.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
     let in_open_idx = lines
         .iter()
         .position(|line| line.contains("AND b.bonus_year IN ("))
         .unwrap_or_else(|| {
             panic!(
-                "Expected IN (...) line with opening parenthesis, got:
-{formatted}"
+                "Expected IN (...) line with opening parenthesis, got:\n{formatted}"
             )
         });
     let in_subquery_idx = lines
         .iter()
         .position(|line| line.contains("SELECT y.column_value"))
         .unwrap_or_else(|| {
-            panic!(
-                "Expected nested SELECT inside IN (...), got:
-{formatted}"
-            )
+            panic!("Expected nested SELECT inside IN (...), got:\n{formatted}")
         });
     assert!(
         indent(lines[in_subquery_idx]) > indent(lines[in_open_idx]),
-        "Nested SELECT inside IN (...) should be indented deeper than the opening parenthesis line, got:
-{formatted}"
+        "Nested SELECT inside IN (...) should be indented deeper than the opening parenthesis line, got:\n{formatted}"
     );
 
     let exists_open_idx = lines
         .iter()
         .position(|line| line.contains("WHEN EXISTS ("))
         .unwrap_or_else(|| {
-            panic!(
-                "Expected WHEN EXISTS (...) opening line, got:
-{formatted}"
-            )
+            panic!("Expected WHEN EXISTS (...) opening line, got:\n{formatted}")
         });
     let exists_select_idx = lines
         .iter()
@@ -906,17 +904,96 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
         .find(|(_, line)| line.contains("SELECT 1"))
         .map(|(idx, _)| idx)
         .unwrap_or_else(|| {
-            panic!(
-                "Expected SELECT 1 inside EXISTS (...), got:
-{formatted}"
-            )
+            panic!("Expected SELECT 1 inside EXISTS (...), got:\n{formatted}")
         });
     assert!(
         indent(lines[exists_select_idx]) > indent(lines[exists_open_idx]),
-        "EXISTS (...) SELECT should be indented deeper than the opening parenthesis line, got:
-{formatted}"
+        "EXISTS (...) SELECT should be indented deeper than the opening parenthesis line, got:\n{formatted}"
     );
+}
 
+#[test]
+fn format_sql_keeps_with_attached_to_single_letter_cte_name() {
+    let input = "WITH\n    r\n    AS\n    (\n        SELECT 1 AS id\n        FROM dual\n    )\nSELECT *\nFROM r\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+
+    assert!(
+        formatted.contains("WITH r AS (") || formatted.contains("WITH\n    r\n    AS ("),
+        "single-letter CTE name must remain attached to WITH, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("WITH;\n\nr"),
+        "single-letter CTE name must not be split into WITH + standalone r, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_indents_nested_sql_case_under_then_and_order_by_clause() {
+    let input = "DECLARE\n    l_rc SYS_REFCURSOR;\nBEGIN\n    OPEN l_rc FOR\n        SELECT\n            CASE\n                WHEN salary >= 100000 THEN\n                    CASE\n                        WHEN status_cd = 'ACTIVE' THEN 'HIGH_ACTIVE'\n                        ELSE 'HIGH_NOT_ACTIVE'\n                    END\n                ELSE 'OTHER'\n            END AS band_label,\n            emp_id\n        FROM emp\n        ORDER BY\n            CASE\n                WHEN salary >= 100000 THEN 1\n                WHEN salary >= 80000 THEN 2\n                ELSE 3\n            END,\n            emp_id;\nEND;\n/";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let outer_when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN salary >= 100000 THEN"))
+        .unwrap_or(0);
+    let nested_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(outer_when_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "CASE")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let nested_else_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "ELSE 'HIGH_NOT_ACTIVE'")
+        .unwrap_or(0);
+    let order_by_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "ORDER BY")
+        .unwrap_or(0);
+    let order_case_idx = lines
+        .iter()
+        .enumerate()
+        .skip(order_by_idx.saturating_add(1))
+        .find(|(_, line)| line.trim_start() == "CASE")
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[nested_case_idx]) > indent(lines[outer_when_idx]),
+        "nested SQL CASE after THEN should indent deeper than parent WHEN branch, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[nested_else_idx]) > indent(lines[outer_when_idx]),
+        "nested SQL CASE ELSE should stay aligned inside nested CASE, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[order_case_idx]) > indent(lines[order_by_idx]),
+        "ORDER BY CASE should indent deeper than ORDER BY header, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_breaks_outer_apply_after_from_source() {
+    let input = "SELECT e.emp_id, x.top_bonus_type FROM qt_fmt_emp e OUTER APPLY (SELECT b.bonus_type AS top_bonus_type FROM qt_fmt_bonus b WHERE b.emp_id = e.emp_id FETCH FIRST 1 ROW ONLY) x ORDER BY e.emp_id;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("FROM qt_fmt_emp e\nOUTER APPLY (")
+            || formatted.contains("FROM qt_fmt_emp e\n    OUTER APPLY ("),
+        "OUTER APPLY should start on its own clause line after FROM source, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_preserves_whenever_sqlerror_options() {
     let input = [
         "WHENEVER SQLERROR EXIT SQL.SQLCODE",
@@ -5843,9 +5920,20 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Find main SELECT (after the second CTE closing paren)
+    let last_cte_close_idx = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == ")")
+        .map(|(idx, _)| idx)
+        .next_back()
+        .unwrap();
     let main_select = lines
         .iter()
-        .find(|l| l.trim_start().starts_with("SELECT cte1"))
+        .skip(last_cte_close_idx.saturating_add(1))
+        .find(|l| {
+            let trimmed = l.trim_start();
+            trimmed == "SELECT" || trimmed.starts_with("SELECT cte1")
+        })
         .unwrap();
     let main_select_indent = main_select.len() - main_select.trim_start().len();
 
@@ -6053,9 +6141,19 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
 
     // Outer SELECT
+    let cte_close_idx = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.trim() == ")")
+        .map(|(idx, _)| idx)
+        .unwrap();
     let outer_select = lines
         .iter()
-        .find(|l| l.trim_start().starts_with("SELECT b.id"))
+        .skip(cte_close_idx.saturating_add(1))
+        .find(|l| {
+            let trimmed = l.trim_start();
+            trimmed == "SELECT" || trimmed.starts_with("SELECT b.id")
+        })
         .unwrap();
     let outer_select_indent = outer_select.len() - outer_select.trim_start().len();
 
@@ -6679,6 +6777,166 @@ fn format_sql_oracle_ultimate_boss_idempotent() {
 }
 
 #[test]
+fn format_sql_keeps_multiline_start_with_clause_as_sql() {
+    let input =
+        "SELECT LEVEL\nFROM emp e\nSTART WITH\n    e.mgr IS NULL\nCONNECT BY PRIOR e.empno = e.mgr\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("START WITH e.mgr IS NULL")
+            || formatted.contains("START WITH\n    e.mgr IS NULL"),
+        "START WITH clause should remain SQL, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("@WITH"),
+        "hierarchical START WITH must not become a script command, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_desc_sort_modifier_attached_after_with_function_cte_query() {
+    let input = "WITH\n    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS\n    BEGIN\n        RETURN p_txt;\n    END fmt_mask,\n    base_emp AS (\n        SELECT\n            e.empno,\n            e.ename,\n            ROW_NUMBER () OVER (\n                PARTITION BY e.deptno\n                ORDER BY e.sal DESC, e.empno\n            ) AS rn\n        FROM emp e\n    )\nSELECT\n    b.empno,\n    b.ename\nFROM base_emp b\nORDER BY\n    b.empno,\n    CASE\n        WHEN b.rn = 1 THEN 1\n        ELSE 2\n    END,\n    b.ename DESC,\n    b.empno\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+
+    assert!(
+        formatted.contains("b.ename DESC,\n    b.empno;"),
+        "ORDER BY DESC fragment should stay attached to the preceding sort key, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("\n\nDESC,"),
+        "DESC sort modifier must not split into a standalone statement, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_indents_first_select_item_under_with_function_cte_select_header() {
+    let input = "WITH\n    FUNCTION fmt_mask (p_txt IN VARCHAR2) RETURN VARCHAR2 IS\n    BEGIN\n        RETURN p_txt;\n    END fmt_mask,\n    base_emp AS (\n        SELECT\n            e.empno,\n            e.ename\n        FROM emp e\n    )\nSELECT base_emp.empno\nFROM base_emp\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let select_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "SELECT" && line.starts_with("        "))
+        .unwrap_or(0);
+    let item_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("e.empno"))
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[item_idx]) > indent(lines[select_idx]),
+        "first select-list item inside WITH FUNCTION CTE SELECT should indent deeper than SELECT header, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_indents_insert_first_branches_under_when() {
+    let input = "INSERT FIRST\n    WHEN deptno = 10 THEN\n        INTO emp_bucket_a (empno, deptno)\n        VALUES (empno, deptno)\n    WHEN deptno = 20 THEN\n        INTO emp_bucket_b (empno, deptno)\n        VALUES (empno, deptno)\n    ELSE\n        INTO emp_bucket_c (empno, deptno)\n        VALUES (empno, deptno)\nSELECT empno, deptno\nFROM emp\n;";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+
+    let when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN deptno = 10 THEN"))
+        .unwrap_or(0);
+    let into_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("INTO emp_bucket_a"))
+        .unwrap_or(0);
+    let values_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("VALUES (empno, deptno)"))
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[into_idx]) > indent(lines[when_idx]),
+        "INSERT FIRST INTO branch should indent deeper than WHEN, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[values_idx]) > indent(lines[when_idx]),
+        "INSERT FIRST VALUES branch should indent deeper than WHEN, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_plsql_case_assignment_and_end_loop_depth() {
+    let input = "DECLARE\n    v_text VARCHAR2 (100);\nBEGIN\n    v_text :=\n           CASE\n               WHEN 1 = 1 THEN\n                   'Y'\n               ELSE\n                   'N'\n           END;\n    FOR r IN (SELECT 1 AS n FROM dual) LOOP\n        v_text := v_text || r.n;\n    END LOOP;\nEND;\n/";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let assign_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("v_text :="))
+        .unwrap_or(0);
+    let case_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "CASE")
+        .unwrap_or(0);
+    let loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FOR r IN"))
+        .unwrap_or(0);
+    let end_loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END LOOP;")
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[case_idx]) >= indent(lines[assign_idx]),
+        "CASE assigned after := should stay aligned with or deeper than the assignment line, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[end_loop_idx]) == indent(lines[loop_idx]),
+        "END LOOP should align with its FOR LOOP header, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn format_sql_keeps_test25_cursor_block_case_and_end_loop_aligned() {
+    let input = "DECLARE\n    v_stmt CLOB;\n    v_result NUMBER;\n    v_text VARCHAR2 (4000);\n    v_deptno NUMBER := 20;\n    TYPE t_num_tab IS TABLE OF NUMBER;\n    v_nums t_num_tab := t_num_tab (10, 20, 30);\n    CURSOR c_mix IS\n        SELECT d.deptno,\n               CURSOR (\n                   SELECT e.empno,\n                          e.ename,\n                          e.sal\n                   FROM emp e\n                   WHERE e.deptno = d.deptno\n                   ORDER BY e.sal DESC,\n                            e.empno\n               ) AS emp_cur\n        FROM dept d\n        WHERE d.deptno MEMBER OF v_nums;\nBEGIN\n    v_stmt := q'[\n        SELECT\n            COUNT(*)\n        FROM emp e\n        WHERE e.deptno = :b1\n    ]';\n    EXECUTE IMMEDIATE v_stmt INTO v_result USING v_deptno;\n    v_text :=\n           CASE\n               WHEN v_result > 0 THEN\n                   q'[FOUND_ROWS]'\n               ELSE\n                   q'[NO_ROWS]'\n           END || ' / CNT=' || TO_CHAR (v_result);\n    DBMS_OUTPUT.PUT_LINE (v_text);\n    FOR r IN c_mix LOOP\n        DBMS_OUTPUT.PUT_LINE ('DEPT=' || r.deptno);\n    END LOOP;\nEND;\n/";
+    let formatted = SqlEditorWidget::format_sql_basic(input);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let assign_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("v_text :="))
+        .unwrap_or(0);
+    let case_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "CASE")
+        .unwrap_or(0);
+    let loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("FOR r IN c_mix LOOP"))
+        .unwrap_or(0);
+    let end_loop_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END LOOP;")
+        .unwrap_or(0);
+
+    assert!(
+        indent(lines[case_idx]) >= indent(lines[assign_idx]),
+        "CASE inside test25 cursor block should stay aligned with or deeper than assignment, got:\n{}",
+        formatted
+    );
+    assert!(
+        indent(lines[end_loop_idx]) == indent(lines[loop_idx]),
+        "END LOOP inside test25 cursor block should align with FOR LOOP header, got:\n{}",
+        formatted
+    );
+}
+
+#[test]
 fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sensitive() {
     let input = load_test_file("test25.sql");
     assert!(
@@ -6700,8 +6958,25 @@ fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sens
         "WHEN MATCHED THEN",
         "TYPE t_emp_rec IS RECORD",
         "WHEN NO_DATA_FOUND THEN",
+        "f.sal DESC,\n    f.empno;",
     ];
     assert_contains_all(&formatted, &expected_snippets);
+    assert!(
+        formatted.contains("START WITH e.mgr IS NULL")
+            || formatted.contains("START WITH\n    e.mgr IS NULL"),
+        "START WITH in test25.sql must remain SQL, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("@WITH"),
+        "START WITH in test25.sql must remain SQL, got:\n{}",
+        formatted
+    );
+    assert!(
+        !formatted.contains("\n\nDESC,"),
+        "ORDER BY DESC fragments in test25.sql must not split into standalone statements, got:\n{}",
+        formatted
+    );
 
     // Parenthesis-depth anchors (human-visible nesting):
     // verify representative `(` -> nested SQL line indentation relations.
@@ -6719,11 +6994,19 @@ fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sens
             .find(|line| line.trim_start().starts_with(prefix))
             .map(|line| line.len().saturating_sub(line.trim_start().len()))
     };
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
     let with_indent = line_indent("WITH").unwrap_or(0);
     let function_indent = line_indent("FUNCTION fmt_mask (").unwrap_or(0);
-    let case_indent = line_indent("CASE").unwrap_or(0);
-    let when_indent = line_indent("WHEN b.rn = 1 THEN 'TOP'").unwrap_or(0);
+    let complex_when_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("WHEN (e.sal > 2000"))
+        .unwrap_or(0);
+    let complex_case_idx = (0..complex_when_idx)
+        .rev()
+        .find(|idx| lines[*idx].trim_start() == "CASE")
+        .unwrap_or(0);
     let model_indent = line_indent("MODEL").unwrap_or(0);
     let partition_indent = line_indent("PARTITION BY (deptno)").unwrap_or(0);
     let declare_indent = line_indent("DECLARE").unwrap_or(0);
@@ -6739,7 +7022,7 @@ fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sens
         formatted
     );
     assert!(
-        when_indent > case_indent,
+        indent(lines[complex_when_idx]) > indent(lines[complex_case_idx]),
         "nested CASE WHEN should indent deeper than CASE line, got:\n{}",
         formatted
     );

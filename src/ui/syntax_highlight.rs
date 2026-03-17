@@ -952,6 +952,9 @@ fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
             break;
         };
         if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            if is_line_terminator(prev) {
+                saw_line_break = true;
+            }
             idx = idx.saturating_sub(1);
             continue;
         }

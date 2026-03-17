@@ -2869,7 +2869,74 @@ impl QueryExecutor {
         };
 
         Self::split_items_core(sql, &mut items, add_statement, on_tool_command, |_, _| {});
-        Self::merge_fragmented_standalone_routine_script_statements(items)
+        let items = Self::merge_fragmented_standalone_routine_script_statements(items);
+        Self::merge_fragmented_with_single_letter_cte_script_items(items)
+    }
+
+    fn merge_fragmented_with_single_letter_cte_script_items(
+        items: Vec<ScriptItem>,
+    ) -> Vec<ScriptItem> {
+        let mut merged: Vec<ScriptItem> = Vec::with_capacity(items.len());
+        let mut index = 0usize;
+
+        while index < items.len() {
+            if let Some((combined, consumed)) =
+                Self::combine_fragmented_with_single_letter_cte_script_item(&items, index)
+            {
+                merged.push(ScriptItem::Statement(combined));
+                index += consumed;
+                continue;
+            }
+
+            match items.get(index) {
+                Some(ScriptItem::Statement(statement)) => {
+                    merged.push(ScriptItem::Statement(statement.clone()));
+                }
+                Some(other) => merged.push(other.clone()),
+                None => {}
+            }
+            index += 1;
+        }
+
+        merged
+    }
+
+    fn combine_fragmented_with_single_letter_cte_script_item(
+        items: &[ScriptItem],
+        start_index: usize,
+    ) -> Option<(String, usize)> {
+        let with_head = match items.get(start_index) {
+            Some(ScriptItem::Statement(statement)) if statement.trim().eq_ignore_ascii_case("WITH") => {
+                statement.trim()
+            }
+            _ => return None,
+        };
+
+        let cte_name = match items.get(start_index + 1) {
+            Some(ScriptItem::ToolCommand(ToolCommand::Unsupported { raw, .. })) => raw.trim(),
+            _ => return None,
+        };
+        if !Self::is_single_letter_cte_identifier(cte_name) {
+            return None;
+        }
+
+        let trailing = match items.get(start_index + 2) {
+            Some(ScriptItem::Statement(statement)) => statement.trim_start(),
+            _ => return None,
+        };
+        if !trailing.to_ascii_uppercase().starts_with("AS") {
+            return None;
+        }
+
+        Some((format!("{with_head} {cte_name}\n{trailing}"), 3))
+    }
+
+    fn is_single_letter_cte_identifier(value: &str) -> bool {
+        let mut chars = value.chars();
+        let Some(ch) = chars.next() else {
+            return false;
+        };
+        chars.next().is_none() && (ch.is_ascii_alphabetic() || ch == '_')
     }
 
     fn merge_fragmented_standalone_routine_script_statements(
@@ -4795,8 +4862,11 @@ impl QueryExecutor {
             return true;
         }
 
-        // Hierarchical query clause "START WITH <expr>" must stay as SQL,
-        // but SQL*Plus still allows a script file literally named "with".
+        if second_word.is_some_and(|word| word == "WITH") {
+            return false;
+        }
+
+        // Hierarchical query clause `START WITH <expr>` must stay as SQL.
         let third_word = Self::next_meaningful_word(trimmed, 2);
         !(second_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH")) && third_word.is_some())
     }
@@ -4881,10 +4951,10 @@ impl QueryExecutor {
         // are clearly SQL rather than script paths:
         //   - `r AS (...)` → CTE definition
         //   - `r (col1, col2) AS ...` → recursive CTE with column list
-        if is_abbrev && !is_full {
-            if second.starts_with('(') || second.eq_ignore_ascii_case("AS") {
-                return false;
-            }
+        if is_abbrev && !is_full
+            && (second.starts_with('(') || second.eq_ignore_ascii_case("AS"))
+        {
+            return false;
         }
 
         true
@@ -5034,6 +5104,34 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'";
         assert!(
             QueryExecutor::parse_tool_command("START /*tree*/ WITH manager_id IS NULL").is_none(),
             "hierarchical START WITH with inline comment must remain SQL"
+        );
+    }
+
+    #[test]
+    fn parse_tool_command_bare_start_with_is_not_script_command() {
+        assert!(
+            QueryExecutor::parse_tool_command("START WITH").is_none(),
+            "hierarchical START WITH header must remain SQL"
+        );
+    }
+
+    #[test]
+    fn split_script_items_keeps_with_attached_to_single_letter_cte_name() {
+        let sql =
+            "WITH\n    r\n    AS\n    (\n        SELECT 1 AS id\n        FROM dual\n    )\nSELECT *\nFROM r\n;";
+        let items = QueryExecutor::split_script_items(sql);
+
+        assert_eq!(items.len(), 1, "single-letter CTE should stay a single statement");
+        let statement = match items.first() {
+            Some(super::ScriptItem::Statement(statement)) => statement,
+            other => panic!("expected single statement item, got: {other:?}"),
+        };
+        assert!(
+            statement.contains("WITH r")
+                && statement.contains("AS")
+                && statement.contains("SELECT *"),
+            "single-letter CTE should remain attached to WITH, got:\n{}",
+            statement
         );
     }
 

@@ -1353,6 +1353,59 @@ fn test_plsql_control_keyword_alias_if_before_case_then_is_not_keyword() {
 }
 
 #[test]
+fn test_multiline_case_expression_keywords_remain_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"SELECT
+    e.empno,
+    e.ename,
+    CASE
+        WHEN (
+                 e.sal > 2000
+                 AND (
+                         e.comm IS NOT NULL
+                         OR e.job IN (
+                             'SALESMAN',
+                             'MANAGER',
+                             'ANALYST'
+                         )
+                     )
+             ) THEN
+            CASE
+                WHEN e.deptno = 10 THEN 'A'
+                WHEN e.deptno = 20 THEN
+                    CASE
+                        WHEN e.sal > 3000 THEN 'B1'
+                        ELSE 'B2'
+                    END
+                ELSE 'C'
+            END
+        ELSE
+            DECODE (
+                SIGN (NVL (e.sal, 0) - 1500),
+                -1, 'LOW',
+                0, 'MID',
+                1, COALESCE (e.job, 'UNKNOWN'),
+                'ETC'
+            )
+    END AS complex_flag
+FROM emp e"#;
+    let styles = highlighter.generate_styles(text);
+
+    for keyword in ["CASE", "ELSE", "END"] {
+        let mut search_start = 0usize;
+        while let Some(relative_start) = text[search_start..].find(keyword) {
+            let start = search_start + relative_start;
+            let end = start + keyword.len();
+            assert!(
+                styles[start..end].chars().all(|c| c == STYLE_KEYWORD),
+                "{keyword} at byte offset {start} should remain keyword-highlighted"
+            );
+            search_start = end;
+        }
+    }
+}
+
+#[test]
 fn test_begin_after_set_commands_and_comment_banner_remains_keyword() {
     let highlighter = SqlHighlighter::new();
     let text = "SET SERVEROUTPUT ON\n\
