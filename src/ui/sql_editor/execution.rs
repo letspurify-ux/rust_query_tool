@@ -1643,6 +1643,18 @@ impl SqlEditorWidget {
         let mut forall_body_active = false; // Inside FORALL ... DML ... ;
         let mut execute_immediate_active = false; // EXECUTE IMMEDIATE → suppress USING clause break
         let mut create_index_pending = false; // CREATE INDEX → suppress ON condition break
+        let mut create_sequence_active = false; // CREATE SEQUENCE → suppress START clause break
+        let mut create_synonym_active = false; // CREATE SYNONYM → suppress FOR loop break
+        let mut grant_revoke_active = false; // GRANT/REVOKE → suppress clause keywords
+        let mut comment_on_active = false; // COMMENT ON → suppress ON condition break
+        let mut merge_active = false; // MERGE statement tracking
+        let mut merge_when_branch_active = false; // WHEN MATCHED/NOT MATCHED → indent body
+        let mut returning_active = false; // RETURNING → suppress INTO clause break
+        let mut fetch_active = false; // FETCH cursor → suppress INTO clause break
+        let mut bulk_collect_active = false; // BULK COLLECT → suppress INTO clause break
+        let mut insert_all_active = false; // INSERT ALL → indent INTO/VALUES
+        let mut referential_action_pending = false; // after REFERENCES t(id) → suppress ON DELETE/UPDATE
+        let mut referential_on_active = false; // ON DELETE/UPDATE CASCADE in referential actions
         let is_package_body_statement = {
             let upper = statement.to_ascii_uppercase();
             upper.contains("CREATE OR REPLACE PACKAGE BODY")
@@ -1741,6 +1753,22 @@ impl SqlEditorWidget {
                     let is_trigger_or_on_keyword =
                         trigger_header_state.is_active() && matches!(upper.as_str(), "OR" | "ON");
                     let is_create_index_on = upper == "ON" && create_index_pending;
+                    let is_for_update =
+                        upper == "UPDATE" && matches!(prev_word_upper.as_deref(), Some("FOR"))
+                            && !in_plsql_block;
+                    let is_comment_on =
+                        upper == "ON" && comment_on_active;
+                    let is_returning_into =
+                        upper == "INTO" && returning_active;
+                    let is_fetch_into =
+                        upper == "INTO" && fetch_active;
+                    let is_bulk_collect_into =
+                        upper == "INTO" && bulk_collect_active;
+                    let is_grant_revoke_keyword = grant_revoke_active
+                        && matches!(upper.as_str(),
+                            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "EXECUTE"
+                            | "ALTER" | "DROP" | "CREATE" | "INDEX" | "REFERENCES"
+                            | "ALL" | "PRIVILEGES" | "MERGE");
                     let follows_alias_keyword =
                         matches!(prev_word_upper.as_deref(), Some("AS" | "IS"));
                     let in_table_alias_clause = matches!(
@@ -1985,8 +2013,22 @@ impl SqlEditorWidget {
                         && !is_start_with
                         && !suppress_order_clause_break
                         && !is_trigger_event_keyword
+                        && !is_for_update
+                        && !is_returning_into
+                        && !is_fetch_into
+                        && !is_bulk_collect_into
+                        && !is_grant_revoke_keyword
+                        && !(grant_revoke_active && upper == "ON")
+                        && !(create_sequence_active
+                            && matches!(upper.as_str(), "START" | "CONNECT"))
+                        && !(fetch_active
+                            && matches!(upper.as_str(), "LIMIT" | "BULK"))
                         && !(execute_immediate_active
                             && matches!(upper.as_str(), "INTO" | "USING"))
+                        && !(merge_when_branch_active
+                            && matches!(upper.as_str(), "SET" | "VALUES" | "INTO"))
+                        && !(referential_on_active
+                            && matches!(upper.as_str(), "DELETE" | "UPDATE" | "SET"))
                     {
                         // FORALL: indent the DML body under FORALL
                         if forall_pending
@@ -1999,14 +2041,24 @@ impl SqlEditorWidget {
                             forall_pending = false;
                             forall_body_active = true;
                         }
-                        newline_with(
-                            &mut out,
-                            base_indent(indent_level, open_cursor_state),
-                            if is_within_group { 1 } else { 0 },
-                            &mut at_line_start,
-                            &mut needs_space,
-                            &mut line_indent,
-                        );
+                        if !is_within_group {
+                            let insert_all_extra =
+                                if insert_all_active
+                                    && matches!(upper.as_str(), "INTO" | "VALUES")
+                                { 1 } else { 0 };
+                            // INSERT ALL: stop at SELECT (the trailing query)
+                            if insert_all_active && upper == "SELECT" {
+                                insert_all_active = false;
+                            }
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                insert_all_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
                         if !is_within_group {
                             current_clause = Some(upper.clone());
                             if upper != "SELECT" {
@@ -2029,6 +2081,11 @@ impl SqlEditorWidget {
                         && !is_exit_when
                         && !is_trigger_or_on_keyword
                         && !is_create_index_on
+                        && !is_comment_on
+                        && !(grant_revoke_active && upper == "ON")
+                        && !(upper == "ON"
+                            && (matches!(prev_word_upper.as_deref(), Some("REFERENCES"))
+                                || referential_action_pending))
                     {
                         let paren_extra = if suppress_comma_break_depth > 0 { 1 } else { 0 };
                         if upper == "WHEN"
@@ -2039,14 +2096,32 @@ impl SqlEditorWidget {
                                 *last = true;
                             }
                         }
-                        newline_with(
-                            &mut out,
-                            base_indent(indent_level, open_cursor_state),
-                            1 + paren_extra,
-                            &mut at_line_start,
-                            &mut needs_space,
-                            &mut line_indent,
-                        );
+                        let is_merge_when = upper == "WHEN" && merge_active
+                            && !block_stack.last().is_some_and(|s| s == "CASE");
+                        if is_merge_when {
+                            // MERGE WHEN MATCHED/NOT MATCHED: at base indent
+                            if merge_when_branch_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                merge_when_branch_active = false;
+                            }
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        } else {
+                            newline_with(
+                                &mut out,
+                                base_indent(indent_level, open_cursor_state),
+                                1 + paren_extra,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                        }
                     } else if upper == "CREATE" {
                         create_pending = true;
                         create_object = None;
@@ -2070,6 +2145,12 @@ impl SqlEditorWidget {
                             create_pending = false;
                         }
                         // UNIQUE stays in create_pending to catch UNIQUE INDEX
+                    } else if create_pending && upper == "SEQUENCE" {
+                        create_sequence_active = true;
+                        create_pending = false;
+                    } else if create_pending && upper == "SYNONYM" {
+                        create_synonym_active = true;
+                        create_pending = false;
                     } else if create_pending
                         && matches!(
                             upper.as_str(),
@@ -2140,7 +2221,12 @@ impl SqlEditorWidget {
                             newline_after_keyword = true;
                         }
                     } else if upper == "THEN" {
-                        if in_plsql_block && !matches!(current_clause.as_deref(), Some("SELECT")) {
+                        if merge_active && !block_stack.last().is_some_and(|s| s == "CASE") {
+                            // MERGE WHEN MATCHED THEN / WHEN NOT MATCHED THEN
+                            indent_level += 1;
+                            merge_when_branch_active = true;
+                            newline_after_keyword = true;
+                        } else if in_plsql_block && !matches!(current_clause.as_deref(), Some("SELECT")) {
                             newline_after_keyword = true;
                         } else if in_sql_case_clause && next_word_is("CASE") {
                             // Nested CASE in SQL expressions should start on its own line.
@@ -2184,7 +2270,13 @@ impl SqlEditorWidget {
                         }
                     } else if upper == "OPEN" {
                         open_cursor_state = OpenCursorFormatState::AwaitingFor;
-                    } else if upper == "FOR" || upper == "WHILE" {
+                    } else if (upper == "FOR" || upper == "WHILE")
+                        && !(upper == "FOR"
+                            && (create_synonym_active
+                                || suppress_comma_break_depth > 0
+                                || (next_word_is("UPDATE")
+                                    && !in_plsql_block)))
+                    {
                         if upper == "FOR" && trigger_header_state.is_active() {
                             newline_with(
                                 &mut out,
@@ -2343,6 +2435,75 @@ impl SqlEditorWidget {
                     // EXECUTE IMMEDIATE tracking
                     if upper == "EXECUTE" && next_word_is("IMMEDIATE") {
                         execute_immediate_active = true;
+                    }
+
+                    // REFERENCES → suppress ON DELETE/UPDATE (referential actions)
+                    if upper == "REFERENCES" {
+                        referential_action_pending = true;
+                    }
+                    if referential_action_pending && upper == "ON" {
+                        referential_action_pending = false;
+                        referential_on_active = true;
+                    }
+                    if referential_on_active
+                        && !matches!(upper.as_str(), "ON" | "DELETE" | "UPDATE" | "SET"
+                            | "CASCADE" | "RESTRICT" | "NO" | "ACTION" | "NULL")
+                    {
+                        referential_on_active = false;
+                    }
+
+                    // COMMENT ON tracking
+                    if upper == "COMMENT" && next_word_is("ON") {
+                        comment_on_active = true;
+                    }
+                    if comment_on_active && upper == "ON" {
+                        comment_on_active = false; // one-shot: suppress ON, then done
+                    }
+
+                    // GRANT/REVOKE tracking
+                    if matches!(upper.as_str(), "GRANT" | "REVOKE") && indent_level == 0 {
+                        grant_revoke_active = true;
+                    }
+                    // GRANT/REVOKE ends at ON (for privilege grants) or TO/FROM
+                    if grant_revoke_active
+                        && matches!(upper.as_str(), "TO" | "FROM")
+                    {
+                        grant_revoke_active = false;
+                    }
+
+                    // RETURNING → suppress next INTO
+                    if upper == "RETURNING" {
+                        returning_active = true;
+                    }
+                    if returning_active && upper == "INTO" {
+                        returning_active = false;
+                    }
+
+                    // FETCH cursor → suppress INTO/LIMIT/BULK (PL/SQL FETCH, not SQL FETCH FIRST)
+                    if upper == "FETCH" && in_plsql_block {
+                        fetch_active = true;
+                    }
+
+                    // BULK COLLECT → suppress next INTO
+                    if upper == "BULK" && next_word_is("COLLECT") {
+                        bulk_collect_active = true;
+                    }
+                    if bulk_collect_active && upper == "INTO" {
+                        bulk_collect_active = false;
+                    }
+
+                    // MERGE tracking
+                    if upper == "MERGE"
+                        && matches!(current_clause.as_deref(), None | Some("MERGE"))
+                    {
+                        merge_active = true;
+                    }
+
+                    // INSERT ALL tracking
+                    if upper == "ALL"
+                        && matches!(prev_word_upper.as_deref(), Some("INSERT"))
+                    {
+                        insert_all_active = true;
                     }
 
                     let starts_create_block = matches!(upper.as_str(), "AS" | "IS")
@@ -2772,6 +2933,7 @@ impl SqlEditorWidget {
                                 }
                             } else if suppress_comma_break_depth == 0
                                 && !execute_immediate_active
+                                && !grant_revoke_active
                             {
                                 newline_with(
                                     &mut out,
@@ -2807,6 +2969,21 @@ impl SqlEditorWidget {
                             execute_immediate_active = false;
                             cursor_decl_pending = false;
                             create_index_pending = false;
+                            create_sequence_active = false;
+                            create_synonym_active = false;
+                            grant_revoke_active = false;
+                            comment_on_active = false;
+                            returning_active = false;
+                            fetch_active = false;
+                            bulk_collect_active = false;
+                            insert_all_active = false;
+                            referential_action_pending = false;
+                            referential_on_active = false;
+                            if merge_when_branch_active {
+                                indent_level = indent_level.saturating_sub(1);
+                                merge_when_branch_active = false;
+                            }
+                            merge_active = false;
                             if cursor_sql_active {
                                 indent_level = indent_level.saturating_sub(1);
                                 cursor_sql_active = false;
@@ -14489,6 +14666,220 @@ mod format_indent_gap_tests {
         assert!(
             formatted.contains("CREATE UNIQUE INDEX idx1 ON t1"),
             "CREATE UNIQUE INDEX ON should stay on same line, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── COMMENT ON inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_comment_on_table_inline() {
+        let source = "comment on table t1 is 'This is a table';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("COMMENT ON TABLE"),
+            "COMMENT ON TABLE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_comment_on_column_inline() {
+        let source = "comment on column t1.col1 is 'description';";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("COMMENT ON COLUMN"),
+            "COMMENT ON COLUMN should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── GRANT/REVOKE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_grant_inline() {
+        let source = "grant select, insert on schema1.t1 to user1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("GRANT SELECT, INSERT ON"),
+            "GRANT privileges should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_revoke_inline() {
+        let source = "revoke select on schema1.t1 from user1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("REVOKE SELECT ON"),
+            "REVOKE privileges should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── MERGE WHEN MATCHED indent ──
+
+    #[test]
+    fn format_sql_basic_merge_when_matched_indent() {
+        let source = "merge into t1 using t2 on (t1.id = t2.id) when matched then update set t1.col = t2.col when not matched then insert (col) values (t2.col);";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        // WHEN MATCHED should be at base indent
+        let when_matched = lines.iter().find(|l| l.contains("WHEN MATCHED")).unwrap();
+        assert!(
+            !when_matched.starts_with("    "),
+            "WHEN MATCHED should not be deeply indented, got:\n{}",
+            formatted
+        );
+        // UPDATE should be indented under WHEN MATCHED
+        let update_line = lines.iter().find(|l| l.trim_start().starts_with("UPDATE")).unwrap();
+        assert!(
+            update_line.starts_with("    "),
+            "UPDATE should be indented under WHEN MATCHED, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── FETCH INTO inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_fetch_into_inline() {
+        let source = "begin\nfetch cur into v_rec;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FETCH cur INTO v_rec;"),
+            "FETCH INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_keeps_fetch_bulk_collect_into_inline() {
+        let source = "begin\nfetch cur bulk collect into v_tab limit 100;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FETCH cur BULK COLLECT INTO v_tab LIMIT 100;"),
+            "FETCH BULK COLLECT INTO LIMIT should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── RETURNING INTO inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_returning_into_inline() {
+        let source = "begin\ninsert into t1 (a) values (1) returning id into v_id;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("RETURNING id INTO v_id;"),
+            "RETURNING INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── BULK COLLECT INTO inline (in SELECT) ──
+
+    #[test]
+    fn format_sql_basic_keeps_bulk_collect_into_inline() {
+        let source = "begin\nselect col bulk collect into v_tab from t1;\nend;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("BULK COLLECT INTO v_tab"),
+            "BULK COLLECT INTO should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── SELECT FOR UPDATE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_for_update_inline() {
+        let source = "select a, b from t1 where id = 1 for update of a nowait;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR UPDATE OF"),
+            "FOR UPDATE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── ON DELETE CASCADE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_on_delete_cascade_inline() {
+        let source = "alter table t1 add constraint fk1 foreign key (col1) references t2(id) on delete cascade;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("ON DELETE CASCADE"),
+            "ON DELETE CASCADE should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE SEQUENCE inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_sequence_inline() {
+        let source = "create sequence seq1 start with 1 increment by 1 nocache;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            !formatted.contains("\nSTART"),
+            "CREATE SEQUENCE START WITH should not break, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── CREATE SYNONYM FOR inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_create_synonym_for_inline() {
+        let source = "create or replace synonym syn1 for schema1.t1;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("SYNONYM syn1 FOR schema1"),
+            "CREATE SYNONYM FOR should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── LISTAGG WITHIN GROUP inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_listagg_within_group_inline() {
+        let source = "select deptno, listagg(ename, ', ') within group (order by ename) as names from emp group by deptno;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITHIN GROUP"),
+            "LISTAGG WITHIN GROUP should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── PIVOT FOR inline ──
+
+    #[test]
+    fn format_sql_basic_keeps_pivot_for_inline() {
+        let source = "select * from t1 pivot (sum(amount) for category in ('A' as a, 'B' as b));";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("FOR category"),
+            "PIVOT FOR should stay inline, got:\n{}",
+            formatted
+        );
+    }
+
+    // ── INSERT ALL INTO indent ──
+
+    #[test]
+    fn format_sql_basic_insert_all_into_indented() {
+        let source = "insert all into t1 (a) values (1) into t2 (b) values (2) select * from dual;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let into_line = lines.iter().find(|l| l.trim_start().starts_with("INTO t1")).unwrap();
+        assert!(
+            into_line.starts_with("    "),
+            "INSERT ALL INTO should be indented, got:\n{}",
             formatted
         );
     }
