@@ -6576,6 +6576,16 @@ fn format_sql_test25_oracle_auto_formatting_final_boss_idempotent_and_depth_sens
     ];
     assert_contains_all(&formatted, &expected_snippets);
 
+    // Parenthesis-depth anchors (human-visible nesting):
+    // verify representative `(` -> nested SQL line indentation relations.
+    let paren_depth_snippets = vec![
+        "base_emp AS (\n        SELECT",
+        "(\n                SELECT MAX (x.sal)",
+        "b.deptno IN (\n                SELECT",
+        "AND NOT EXISTS (\n                SELECT",
+    ];
+    assert_contains_all(&formatted, &paren_depth_snippets);
+
     let line_indent = |prefix: &str| -> Option<usize> {
         formatted
             .lines()
