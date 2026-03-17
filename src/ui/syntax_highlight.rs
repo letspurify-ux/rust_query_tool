@@ -923,6 +923,12 @@ fn should_treat_control_keyword_as_implicit_alias(
         return false;
     }
 
+    if word.eq_ignore_ascii_case("FOR")
+        && is_open_cursor_for_keyword_context(text, bytes, word_start)
+    {
+        return false;
+    }
+
     let Some(prev_kind) = prev_significant_token_kind(text, bytes, word_start) else {
         return false;
     };
@@ -945,13 +951,8 @@ fn has_significant_line_break_before(bytes: &[u8], mut idx: usize) -> bool {
         let Some(&prev) = bytes.get(idx - 1) else {
             break;
         };
-        if prev == b' ' || prev == b'\t' {
-            idx -= 1;
-            continue;
-        }
-        if is_line_terminator(prev) {
-            saw_line_break = true;
-            idx -= 1;
+        if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            idx = idx.saturating_sub(1);
             continue;
         }
         if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
@@ -1109,6 +1110,67 @@ fn prev_significant_word_upper(text: &str, bytes: &[u8], mut idx: usize) -> Opti
     }
 
     None
+}
+
+fn is_open_cursor_for_keyword_context(text: &str, bytes: &[u8], word_start: usize) -> bool {
+    let mut idx = word_start;
+    let mut collected_words: Vec<String> = Vec::with_capacity(2);
+
+    while idx > 0 && collected_words.len() < 2 {
+        let prev = match bytes.get(idx.saturating_sub(1)).copied() {
+            Some(byte) => byte,
+            None => break,
+        };
+
+        if prev == b' ' || prev == b'\t' || prev == b'\r' || prev == b'\n' {
+            idx = idx.saturating_sub(1);
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'-') && bytes.get(idx - 1) == Some(&b'-') {
+            idx -= 2;
+            while idx > 0
+                && bytes
+                    .get(idx - 1)
+                    .copied()
+                    .is_some_and(|byte| !is_line_terminator(byte))
+            {
+                idx -= 1;
+            }
+            continue;
+        }
+        if idx >= 2 && bytes.get(idx - 2) == Some(&b'*') && bytes.get(idx - 1) == Some(&b'/') {
+            idx -= 2;
+            while idx > 1 {
+                if bytes.get(idx - 2) == Some(&b'/') && bytes.get(idx - 1) == Some(&b'*') {
+                    idx -= 2;
+                    break;
+                }
+                idx -= 1;
+            }
+            continue;
+        }
+
+        if !sql_text::is_identifier_byte(prev) {
+            idx = idx.saturating_sub(1);
+            continue;
+        }
+
+        let mut start = idx - 1;
+        while start > 0
+            && bytes
+                .get(start - 1)
+                .is_some_and(|&byte| sql_text::is_identifier_byte(byte))
+        {
+            start -= 1;
+        }
+
+        if let Some(word) = text.get(start..idx) {
+            collected_words.push(word.to_ascii_uppercase());
+        }
+        idx = start;
+    }
+
+    collected_words.len() >= 2 && collected_words[0] != "UPDATE" && collected_words[1] == "OPEN"
 }
 
 fn is_relation_identifier_context_word(word: &str) -> bool {

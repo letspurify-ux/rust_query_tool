@@ -74,6 +74,25 @@ fn test_number_highlighting_does_not_consume_incomplete_exponent() {
 }
 
 #[test]
+fn test_open_for_highlights_for_as_keyword() {
+    let highlighter = SqlHighlighter::new();
+    let text = "begin
+    open cv for
+        select 1 from dual;
+end;";
+    let styles = highlighter.generate_styles(text);
+
+    let for_start = text.find("for").unwrap_or(0);
+    let for_end = for_start + 3;
+    assert!(
+        styles[for_start..for_end]
+            .chars()
+            .all(|c| c == STYLE_KEYWORD),
+        "FOR in OPEN ... FOR should be highlighted as a keyword"
+    );
+}
+
+#[test]
 fn test_keyword_highlighting() {
     let highlighter = SqlHighlighter::new();
     let text = "SELECT * FROM";
