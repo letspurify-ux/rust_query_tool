@@ -1877,7 +1877,12 @@ impl SqlEditorWidget {
                             && sql_text::is_plsql_control_keyword(upper.as_str())
                             && !next_word_is("THEN"));
                     let suppress_order_clause_break =
-                        suppress_comma_break_depth > 0 && upper == "ORDER";
+                        (suppress_comma_break_depth > 0 && upper == "ORDER")
+                            || (upper == "ORDER"
+                                && matches!(
+                                    prev_word_upper.as_deref(),
+                                    Some("SEQUENTIAL" | "AUTOMATIC")
+                                ));
                     let at_package_body_member_depth =
                         is_package_body_statement && indent_level == 1;
                     if upper == "END" && !treat_control_keyword_as_identifier {
@@ -3141,7 +3146,11 @@ impl SqlEditorWidget {
                                 || next_word_is("UPDATE")
                                 || next_word_is("DELETE")
                                 || next_word_is("MERGE")
-                                || next_word_is("VALUES");
+                                || next_word_is("VALUES")
+                                || matches!(
+                                    prev_word_upper.as_deref(),
+                                    Some("MATCH_RECOGNIZE")
+                                );
                             if needs_space {
                                 out.push(' ');
                             }

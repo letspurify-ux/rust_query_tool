@@ -6053,7 +6053,6 @@ fn format_sql_multiline_string_as_procedure_argument() {
 }
 
 #[test]
-#[ignore] // Known failures: slash-as-division (UNIT 8), CTE alias 'r' as RUN (UNIT 3)
 fn format_sql_oracle_final_boss_idempotent() {
     let input = load_test_file("oracle_format_final_boss.sql");
     assert!(!input.is_empty(), "Test file oracle_format_final_boss.sql should not be empty");
