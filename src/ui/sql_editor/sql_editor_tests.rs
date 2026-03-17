@@ -866,6 +866,57 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
 }
 
 #[test]
+    let in_open_idx = lines
+        .iter()
+        .position(|line| line.contains("AND b.bonus_year IN ("))
+        .unwrap_or_else(|| {
+            panic!(
+                "Expected IN (...) line with opening parenthesis, got:
+{formatted}"
+            )
+        });
+    let in_subquery_idx = lines
+        .iter()
+        .position(|line| line.contains("SELECT y.column_value"))
+        .unwrap_or_else(|| {
+            panic!(
+                "Expected nested SELECT inside IN (...), got:
+{formatted}"
+            )
+        });
+    assert!(
+        indent(lines[in_subquery_idx]) > indent(lines[in_open_idx]),
+        "Nested SELECT inside IN (...) should be indented deeper than the opening parenthesis line, got:
+{formatted}"
+    );
+
+    let exists_open_idx = lines
+        .iter()
+        .position(|line| line.contains("WHEN EXISTS ("))
+        .unwrap_or_else(|| {
+            panic!(
+                "Expected WHEN EXISTS (...) opening line, got:
+{formatted}"
+            )
+        });
+    let exists_select_idx = lines
+        .iter()
+        .enumerate()
+        .skip(exists_open_idx.saturating_add(1))
+        .find(|(_, line)| line.contains("SELECT 1"))
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "Expected SELECT 1 inside EXISTS (...), got:
+{formatted}"
+            )
+        });
+    assert!(
+        indent(lines[exists_select_idx]) > indent(lines[exists_open_idx]),
+        "EXISTS (...) SELECT should be indented deeper than the opening parenthesis line, got:
+{formatted}"
+    );
+
 fn format_sql_preserves_whenever_sqlerror_options() {
     let input = [
         "WHENEVER SQLERROR EXIT SQL.SQLCODE",
